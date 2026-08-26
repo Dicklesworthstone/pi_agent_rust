@@ -358,13 +358,67 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let readme_path = package_dir.join("README.md").display().to_string();
-    let docs_path = package_dir.join("docs").display().to_string();
-    let examples_path = package_dir.join("examples").display().to_string();
+    let mut prompt = format!(
+        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}"
+    );
+    if let Some(docs) = pi_docs_prompt_section(package_dir) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&docs);
+    }
+    prompt
+}
 
-    format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (extensions, custom tools, SDK)\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
-    )
+/// The "Pi documentation" block of the default system prompt, listing only
+/// the documentation that is actually present under `package_dir`.
+///
+/// Upstream pi ships `README.md`, `docs/`, and `examples/` inside its npm
+/// package, so its prompt can point at them unconditionally. A standalone
+/// `pi` binary provisions none of them, and instructing the model to read
+/// files that do not exist just wastes a tool call and confuses the model
+/// (gh #183). Returns `None` when nothing is available.
+fn pi_docs_prompt_section(package_dir: &Path) -> Option<String> {
+    let readme = package_dir.join("README.md");
+    let docs = package_dir.join("docs");
+    let examples = package_dir.join("examples");
+    let has_readme = readme.is_file();
+    let has_docs = docs.is_dir();
+    let has_examples = examples.is_dir();
+    if !has_readme && !has_docs && !has_examples {
+        return None;
+    }
+
+    let mut lines = vec![String::from(
+        "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):",
+    )];
+    if has_readme {
+        lines.push(format!("- Main documentation: {}", readme.display()));
+    }
+    if has_docs {
+        lines.push(format!("- Additional docs: {}", docs.display()));
+    }
+    if has_examples {
+        lines.push(format!(
+            "- Examples: {} (extensions, custom tools, SDK)",
+            examples.display()
+        ));
+    }
+    if has_docs {
+        let mut topics = String::from("- When asked about: extensions (docs/extensions.md");
+        if has_examples {
+            topics.push_str(", examples/extensions/");
+        }
+        topics.push_str("), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)");
+        lines.push(topics);
+    }
+    lines.push(String::from(if has_docs || has_examples {
+        "- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing"
+    } else {
+        "- When working on pi topics, read the documentation and follow .md cross-references before implementing"
+    }));
+    lines.push(String::from(
+        "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
+    ));
+    Some(lines.join("\n"))
 }
 
 fn load_project_context_files(cwd: &Path, global_dir: &Path) -> Vec<ContextFile> {
@@ -2833,5 +2887,61 @@ mod tests {
             let right = test_model_entry("OPENAI/GPT-4O-MINI", "open-router", false);
             assert!(models_equal(&left, &right));
         }
+    }
+    /// gh #183: the default prompt must not instruct the model to read
+    /// documentation that the standalone install does not provision.
+    #[test]
+    fn default_system_prompt_omits_docs_block_when_package_dir_has_no_docs() {
+        let dir = tempdir().expect("tempdir");
+        let prompt = default_system_prompt(&["read", "bash"], dir.path());
+        assert!(
+            !prompt.contains("Pi documentation"),
+            "docs block leaked into prompt: {prompt}"
+        );
+        assert!(!prompt.contains("README.md"));
+        assert!(!prompt.contains("docs/extensions.md"));
+        assert!(prompt.ends_with("- Show file paths clearly when working with files"));
+
+        // A package dir that does not exist at all behaves the same.
+        let missing = dir.path().join("does-not-exist");
+        let prompt = default_system_prompt(&["read"], &missing);
+        assert!(!prompt.contains("Pi documentation"));
+    }
+
+    #[test]
+    fn default_system_prompt_lists_only_present_docs() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("README.md"), "# pi\n").expect("write readme");
+        let prompt = default_system_prompt(&["read"], dir.path());
+        assert!(prompt.contains("Pi documentation"));
+        assert!(prompt.contains(&format!(
+            "- Main documentation: {}",
+            dir.path().join("README.md").display()
+        )));
+        assert!(!prompt.contains("- Additional docs:"));
+        assert!(!prompt.contains("- Examples:"));
+        assert!(!prompt.contains("docs/extensions.md"));
+        assert!(prompt.contains("read the documentation and follow .md cross-references"));
+
+        std::fs::create_dir(dir.path().join("docs")).expect("mkdir docs");
+        std::fs::create_dir(dir.path().join("examples")).expect("mkdir examples");
+        let prompt = default_system_prompt(&["read"], dir.path());
+        assert!(prompt.contains(&format!(
+            "- Additional docs: {}",
+            dir.path().join("docs").display()
+        )));
+        assert!(prompt.contains(&format!(
+            "- Examples: {} (extensions, custom tools, SDK)",
+            dir.path().join("examples").display()
+        )));
+        assert!(prompt.contains("extensions (docs/extensions.md, examples/extensions/)"));
+        assert!(prompt.contains("read the docs and examples, and follow .md cross-references"));
+
+        // A README that is a directory (or docs that is a file) does not count.
+        let odd = tempdir().expect("tempdir");
+        std::fs::create_dir(odd.path().join("README.md")).expect("mkdir README.md");
+        std::fs::write(odd.path().join("docs"), "").expect("write docs file");
+        let prompt = default_system_prompt(&["read"], odd.path());
+        assert!(!prompt.contains("Pi documentation"));
     }
 }
