@@ -82,6 +82,17 @@ def normalize_config_exclude_pattern(pattern: str) -> str:
     return CONFIG_EXCLUDE_REWRITES.get(pattern, pattern)
 
 
+def unsupported_rsync_pattern_reason(pattern: str) -> str | None:
+    """Return why the bounded matcher cannot safely model an rsync pattern."""
+    if pattern.endswith("***"):
+        return "trailing-*** directory shorthand"
+    if "[[:" in pattern:
+        return "POSIX character class"
+    if "\\" in pattern and any(wildcard in pattern for wildcard in "*?["):
+        return "context-dependent backslash escaping"
+    return None
+
+
 def load_ignore_rules(ignore_file: Path) -> tuple[list[IgnoreRule], list[str]]:
     errors: list[str] = []
     if not ignore_file.exists():
@@ -97,6 +108,11 @@ def load_ignore_rules(ignore_file: Path) -> tuple[list[IgnoreRule], list[str]]:
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        if unsupported_reason := unsupported_rsync_pattern_reason(stripped):
+            errors.append(
+                f"unsupported rsync pattern in {ignore_file}:{line_number}: "
+                f"{unsupported_reason}: {stripped!r}"
+            )
         # RCH deliberately treats a leading `!` literally; unlike .gitignore,
         # its source-sync filters do not support negation/re-inclusion.
         negated = False
@@ -153,6 +169,12 @@ def load_config_rules(config_file: Path) -> tuple[list[IgnoreRule], list[str]]:
                 f"entry at index {index}: {config_file}"
             )
             continue
+        if unsupported_reason := unsupported_rsync_pattern_reason(raw_pattern_text):
+            errors.append(
+                "unsupported rsync pattern in RCH config "
+                f"transfer.exclude_patterns[{index}]: {unsupported_reason}: "
+                f"{raw_pattern_text!r}: {config_file}"
+            )
         line_number = next(
             (
                 line_index

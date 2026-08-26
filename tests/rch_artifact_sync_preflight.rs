@@ -538,6 +538,35 @@ fn single_star_does_not_cross_path_separators() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn unmodeled_rsync_escape_fails_closed() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = "literal*artifact.json";
+    fs::write(repo.join(required_path), "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "literal\\*artifact.json\n")?;
+
+    let output = run_preflight(repo, required_path)?;
+    if output.status.success() {
+        return Err(test_error(
+            "a pattern outside the bounded matcher must fail closed, not claim inclusion",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let unsupported = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason").is_ok_and(|reason| reason == "ignore_file_error")
+            && string_field(violation, "message")
+                .is_ok_and(|message| message.contains("context-dependent backslash escaping"))
+    });
+    if !unsupported {
+        return Err(test_error(format!(
+            "unsupported rsync escape must produce a structured fail-closed diagnostic\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
 fn slashless_exclude_matches_an_intermediate_directory_component() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let repo = temp.path();
