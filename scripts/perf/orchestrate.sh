@@ -5117,10 +5117,13 @@ def read_stable_regular_file(path: Path):
 
 
 def copy_tree(source_root: Path, destination_root: PurePosixPath, required: bool):
+    source_parent_fd = None
     try:
         source_parent_fd, source_name = open_source_parent(source_root)
         root_metadata = os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
     except FileNotFoundError:
+        if source_parent_fd is not None:
+            os.close(source_parent_fd)
         if required:
             raise SystemExit(f"required post-generation evidence root is missing: {source_root}")
         return

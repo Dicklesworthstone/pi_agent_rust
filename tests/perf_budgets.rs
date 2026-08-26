@@ -2494,6 +2494,21 @@ fn evaluate_context_intelligence_budget_contract(
             "Regenerate context-intelligence evidence inside the current orchestrator run.",
         ));
     }
+    let context_run_id = payload.get("run_id").and_then(Value::as_str);
+    let context_correlation_id = payload.get("correlation_id").and_then(Value::as_str);
+    if context_run_id.is_none() || context_run_id != context_correlation_id {
+        failures.push(context_intelligence_failure(
+            "invalid_post_generation_evidence_lineage",
+            None,
+            format!(
+                "context run_id must equal correlation_id (run_id={}, correlation_id={}) in {}",
+                context_run_id.unwrap_or("missing_or_non_string"),
+                context_correlation_id.unwrap_or("missing_or_non_string"),
+                path.display()
+            ),
+            "Regenerate context-intelligence evidence inside one orchestrator run.",
+        ));
+    }
 
     validate_context_intelligence_schema(&mut failures, &path, &payload);
     validate_context_intelligence_environment(&mut failures, &path, &payload);
@@ -5917,6 +5932,28 @@ fn context_intelligence_budget_contract_accepts_valid_artifact() {
         failures.is_empty(),
         "did not expect context intelligence budget failures, got: {failures:?}",
     );
+}
+
+#[test]
+fn context_intelligence_budget_contract_rejects_missing_or_mismatched_run_id() {
+    for replacement in [Value::Null, json!("foreign-run")] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let artifact = tmp
+            .path()
+            .join("target/perf/context_intelligence_planner_budget.json");
+        let mut payload = valid_context_intelligence_budget_artifact_fixture();
+        payload["run_id"] = replacement;
+        write_context_intelligence_budget_artifact(&artifact, &payload);
+
+        let failures = evaluate_context_intelligence_budget_contract(tmp.path(), 24.0);
+        assert!(
+            failures.iter().any(|failure| {
+                failure.contract_id == "invalid_post_generation_evidence_lineage"
+                    && failure.detail.contains("run_id must equal correlation_id")
+            }),
+            "expected run lineage failure, got: {failures:?}",
+        );
+    }
 }
 
 #[test]
