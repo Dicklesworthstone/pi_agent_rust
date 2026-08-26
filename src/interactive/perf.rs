@@ -931,24 +931,61 @@ impl PiApp {
         None
     }
 
-    /// `/retry` (bd-cv653.3.7): re-issue the last user turn (the tree keeps
-    /// the original path).
+    /// `/retry` (bd-cv653.3.7, durable branching bd-r7icz): re-issue the last
+    /// user turn as a SIBLING branch. The durable leaf moves to the abandoned
+    /// turn's parent before the retry is enqueued, so the retried turn no
+    /// longer appends after the abandoned response and a restart rehydrates
+    /// only the active path. The transcript view is rebuilt from the session,
+    /// dropping the abandoned turn from the UI.
     pub(super) fn handle_slash_retry(&mut self) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot retry while processing".to_string());
             return None;
         }
+        let (preparation, ui_messages, usage, agent_messages) = {
+            let Ok(mut session_guard) = self.session.try_lock() else {
+                self.status_message = Some("Session busy; try again".to_string());
+                return None;
+            };
+            let Some(preparation) = crate::checkpoint::prepare_retry_branch(&mut session_guard)
+            else {
+                self.status_message = Some("No user turn to retry".to_string());
+                return None;
+            };
+            let (ui_messages, usage) = conversation_from_session(&session_guard);
+            let agent_messages = session_guard.to_messages_for_current_path();
+            (preparation, ui_messages, usage, agent_messages)
+        };
+        // The session leaf already moved; if the agent lock is gone we must
+        // roll the tree back onto the abandoned turn instead of half-rewinding.
         let Ok(mut agent_guard) = self.agent.try_lock() else {
+            let Ok(mut session_guard) = self.session.try_lock() else {
+                self.status_message = Some("Agent busy; try again".to_string());
+                return None;
+            };
+            if !session_guard.navigate_to(&preparation.abandoned_entry_id) {
+                tracing::error!(
+                    "retry rollback failed: entry {} missing",
+                    preparation.abandoned_entry_id
+                );
+            }
             self.status_message = Some("Agent busy; try again".to_string());
             return None;
         };
-        let Some(text) = crate::checkpoint::take_last_user_turn(&mut agent_guard) else {
-            self.status_message = Some("No user turn to retry".to_string());
-            return None;
-        };
+        agent_guard.replace_messages(agent_messages);
         drop(agent_guard);
+
+        self.messages = ui_messages;
+        self.message_render_cache.clear();
+        self.total_usage = usage;
+        self.current_response.clear();
+        self.current_thinking.clear();
+        self.spawn_save_session();
+        self.scroll_to_bottom();
+
         let cx = asupersync::Cx::for_request();
         let event_tx = self.event_tx.clone();
+        let text = preparation.text;
         self.runtime_handle.spawn(async move {
             crate::interactive::enqueue_pi_event(
                 &event_tx,

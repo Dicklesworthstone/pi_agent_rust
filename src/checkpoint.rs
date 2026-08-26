@@ -275,31 +275,57 @@ pub fn fresh_stream_state(agent: &mut crate::agent::Agent, session: &mut Session
     new_id
 }
 
-/// Extract the last user turn's text for a retry (the original path stays
-/// in the tree; the active context rewinds to just before it).
+/// A prepared `/retry`: the abandoned turn's text plus its tree entry id.
+pub struct RetryPreparation {
+    /// Text of the abandoned user turn to re-issue.
+    pub text: String,
+    /// Tree entry id of the abandoned user entry. After preparation it is
+    /// OFF the active path (its subtree stays in the file for `/tree`).
+    pub abandoned_entry_id: String,
+}
+
+/// Prepare a `/retry` against the DURABLE session tree.
+///
+/// Moves the leaf to the parent of the last plain-text user turn on the
+/// active path, so the retried turn lands as a SIBLING branch instead of
+/// appending after the abandoned turn and its response. The abandoned span
+/// stays in the tree but leaves `entries_for_current_path`, which is
+/// exactly what a restart rehydrates.
+///
+/// Selection is structural: only `SessionEntry::Message` entries with
+/// `SessionMessage::User` text content qualify. Synthetic rewind reports
+/// are `Custom("rewind")` entries in the tree — their user-role message
+/// exists only in rebuilt contexts — so no content sniffing is needed.
 #[must_use]
-pub fn take_last_user_turn(agent: &mut crate::agent::Agent) -> Option<String> {
-    // Skip synthetic user messages (rewind reports) — retrying one of those
-    // instead of the real prompt would replay bookkeeping text as a turn.
-    let last_user_index = agent.messages().iter().rposition(|message| {
-        matches!(
-            message,
-            Message::User(user)
-                if !matches!(
-                    &user.content,
-                    UserContent::Text(text) if text.starts_with("[REWIND REPORT:")
-                )
-        )
+pub fn prepare_retry_branch(session: &mut Session) -> Option<RetryPreparation> {
+    let path = session.entries_for_current_path();
+    let abandoned = path.into_iter().rev().find_map(|entry| {
+        let SessionEntry::Message(message_entry) = entry else {
+            return None;
+        };
+        let SessionMessage::User {
+            content: UserContent::Text(text),
+            ..
+        } = &message_entry.message
+        else {
+            return None;
+        };
+        let id = message_entry.base.id.clone()?;
+        Some((id, text.clone(), message_entry.base.parent_id.clone()))
     })?;
-    let text = match &agent.messages()[last_user_index] {
-        Message::User(user) => match &user.content {
-            UserContent::Text(text) => text.clone(),
-            UserContent::Blocks(_) => return None,
-        },
-        _ => return None,
+    let (abandoned_entry_id, text, parent_id) = abandoned;
+    let navigated = if let Some(parent) = parent_id {
+        session.navigate_to(&parent)
+    } else {
+        // The abandoned turn was itself the root: the retry becomes a new
+        // root sibling (same semantics as /tree re-editing the first turn).
+        session.reset_leaf();
+        true
     };
-    agent.truncate_messages(last_user_index);
-    Some(text)
+    navigated.then_some(RetryPreparation {
+        text,
+        abandoned_entry_id,
+    })
 }
 
 #[cfg(test)]

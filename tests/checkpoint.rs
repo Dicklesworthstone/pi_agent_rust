@@ -238,34 +238,124 @@ fn fresh_resets_stream_state_transcript_untouched() {
 }
 
 #[test]
-fn retry_takes_last_user_turn() {
-    let case = "retry_takes_last_user_turn";
+fn retry_preparation_branches_sibling_of_abandoned_turn() {
+    let case = "retry_preparation_branches_sibling_of_abandoned_turn";
     let harness = TestHarness::new(case);
-    let root = harness.temp_path(".");
-    let mut agent = build_agent(&root);
 
-    agent.add_message(user_text("first question"));
-    agent.add_message(assistant_text("assistant answer"));
-    agent.add_message(user_text("second question"));
-    agent.add_message(assistant_text("second answer"));
+    let mut session = Session::in_memory();
+    let first_user = session.append_message(pi::session::SessionMessage::from(user_text(
+        "first question",
+    )));
+    let first_answer = session.append_message(pi::session::SessionMessage::from(assistant_text(
+        "first answer",
+    )));
+    let abandoned_turn = session.append_message(pi::session::SessionMessage::from(user_text(
+        "second question",
+    )));
+    let abandoned_answer = session.append_message(pi::session::SessionMessage::from(
+        assistant_text("second answer"),
+    ));
 
-    let text = pi::checkpoint::take_last_user_turn(&mut agent).expect("take");
+    let preparation = pi::checkpoint::prepare_retry_branch(&mut session).expect("prepare");
+    assert_eq!(preparation.text, "second question");
+    assert_eq!(preparation.abandoned_entry_id, abandoned_turn);
+
+    // The retried turn must land as a SIBLING of the abandoned turn: same
+    // parent (the first answer), never a child of the abandoned response.
+    let retried = session.append_message(pi::session::SessionMessage::from(user_text(
+        "second question, retried",
+    )));
+    let retried_parent = session
+        .get_entry(&retried)
+        .and_then(|e| e.base().parent_id.clone())
+        .expect("retried parent id");
+    assert_eq!(retried_parent, first_answer);
+    assert_ne!(retried_parent, abandoned_answer);
+
+    // Active path excludes the abandoned span; the tree keeps it.
+    let path_ids: Vec<String> = session
+        .entries_for_current_path()
+        .iter()
+        .filter_map(|e| e.base().id.clone())
+        .collect();
+    assert!(!path_ids.contains(&abandoned_turn));
+    assert!(!path_ids.contains(&abandoned_answer));
+    assert!(path_ids.contains(&first_user));
+    assert!(path_ids.contains(&first_answer));
+    assert!(path_ids.contains(&retried));
+    assert!(session.get_entry(&abandoned_turn).is_some());
+    assert!(session.get_entry(&abandoned_answer).is_some());
+
+    // Rebuilt context (what a restart rehydrates) drops the abandoned span.
+    let rebuilt = session.to_messages_for_current_path();
+    let serialized: Vec<String> = rebuilt
+        .iter()
+        .map(|m| serde_json::to_string(m).expect("ser"))
+        .collect();
+    assert!(
+        serialized.iter().all(|m| !m.contains("second answer")),
+        "rebuilt context must exclude the abandoned assistant response"
+    );
+
     harness.log().info(
         "verify",
-        format!("retry text: {text}; remaining: {}", agent.messages().len()),
+        format!(
+            "retried parent {retried_parent}; path len {}",
+            path_ids.len()
+        ),
     );
-    assert_eq!(text, "second question");
-    // Active context rewinds to just before that turn; the first turn stays.
-    assert_eq!(agent.messages().len(), 2);
-    // No more user turns to retry from here? One remains.
-    let second = pi::checkpoint::take_last_user_turn(&mut agent).expect("take 2");
-    assert_eq!(second, "first question");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn retry_preparation_on_root_turn_resets_leaf() {
+    let case = "retry_preparation_on_root_turn_resets_leaf";
+    let harness = TestHarness::new(case);
+
+    let mut session = Session::in_memory();
+    let root_turn = session.append_message(pi::session::SessionMessage::from(user_text(
+        "only question",
+    )));
+    let answer = session.append_message(pi::session::SessionMessage::from(assistant_text(
+        "only answer",
+    )));
+
+    let preparation = pi::checkpoint::prepare_retry_branch(&mut session).expect("prepare");
+    assert_eq!(preparation.text, "only question");
+    assert_eq!(preparation.abandoned_entry_id, root_turn);
+
+    let retried = session.append_message(pi::session::SessionMessage::from(user_text(
+        "only question, retried",
+    )));
+    let retried_parent = session
+        .get_entry(&retried)
+        .and_then(|e| e.base().parent_id.clone());
+    assert_eq!(
+        retried_parent, None,
+        "retrying the root turn must start a new root sibling"
+    );
+    assert!(session.get_entry(&answer).is_some(), "tree keeps original");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn retry_preparation_without_user_turn_is_none() {
+    let case = "retry_preparation_without_user_turn_is_none";
+    let harness = TestHarness::new(case);
+
+    let mut session = Session::in_memory();
+    session.append_message(pi::session::SessionMessage::from(assistant_text(
+        "unsolicited",
+    )));
+    assert!(
+        pi::checkpoint::prepare_retry_branch(&mut session).is_none(),
+        "no user turn to retry"
+    );
     finish_case(&harness, case);
 }
 
 /// Slow provider: emits nothing for a beat so the cap check fires first.
 struct SlowProvider;
-
 #[async_trait::async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl pi::provider::Provider for SlowProvider {
