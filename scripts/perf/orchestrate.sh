@@ -519,9 +519,8 @@ verify_current_clean_source_identity() {
   return 0
 }
 
-if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
-  && suite_selected "perf_bench_harness"; then
-  if [[ "$CARGO_PROFILE" != "perf" ]]; then
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
+  if suite_selected "perf_bench_harness" && [[ "$CARGO_PROFILE" != "perf" ]]; then
     die "RCH extension benchmark proof requires PERF_PROFILE=perf, got: $CARGO_PROFILE"
   fi
   if [[ ! "$GIT_COMMIT_FULL" =~ ^[0-9a-f]{40}$ ]]; then
@@ -627,7 +626,7 @@ write_cold_load_measurement_control() {
 
   python3 - \
     "$result_dir/stderr.log" \
-    "$TARGET_DIR/criterion/pi-perf-runs/$CORRELATION_ID/criterion_extensions" \
+    "$TARGET_DIR/criterion/pi-perf-runs/$RUN_INSTANCE_ID/criterion_extensions" \
     "$control_path" \
     "$benchmark_exit_code" \
     "$GIT_COMMIT_FULL" \
@@ -911,6 +910,7 @@ fi
 if [[ ! "$CORRELATION_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
   die "CI_CORRELATION_ID must be 1-128 path-safe characters ([A-Za-z0-9._:-]) and start with an alphanumeric character"
 fi
+RUN_INSTANCE_ID="$({ printf '%s\0' "$CORRELATION_ID" "$TIMESTAMP" "$$"; } | sha256sum | cut -d' ' -f1)"
 
 # ─── Setup output directory ─────────────────────────────────────────────────
 
@@ -921,6 +921,7 @@ log_phase "Perf Orchestrator v1.0 (bd-3ar8v.1.8)"
 log_step "Profile:        $PROFILE"
 log_step "Output:         $OUTPUT_DIR"
 log_step "Correlation ID: $CORRELATION_ID"
+log_step "Run instance:   $RUN_INSTANCE_ID"
 log_step "Git commit:     $GIT_COMMIT (dirty=$GIT_DIRTY)"
 log_step "Cargo profile:  $CARGO_PROFILE"
 log_step "Test threads:   $PARALLELISM"
@@ -1581,7 +1582,7 @@ run_criterion_bench() {
   suite_start=$(epoch_ms)
 
   local result_dir="$OUTPUT_DIR/results/$suite_name"
-  local criterion_run_subdir="pi-perf-runs/$CORRELATION_ID/$suite_name"
+  local criterion_run_subdir="pi-perf-runs/$RUN_INSTANCE_ID/$suite_name"
   local criterion_dir="$TARGET_DIR/criterion/$criterion_run_subdir"
   mkdir -p "$result_dir"
 
@@ -4770,7 +4771,7 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
   die "RCH post-generation staging source identity is not stable"
 fi
 
-post_generation_stage_key="$({ printf '%s\0' "$CORRELATION_ID" "$TIMESTAMP" "$$"; } | sha256sum | cut -d' ' -f1)"
+post_generation_stage_key="$RUN_INSTANCE_ID"
 POST_GENERATION_STAGE_RELATIVE=".rch-tmp/pi-perf-evidence/$post_generation_stage_key"
 if ! PROJECT_ROOT="$PROJECT_ROOT" \
   OUTPUT_DIR="$OUTPUT_DIR" \
@@ -4778,6 +4779,7 @@ if ! PROJECT_ROOT="$PROJECT_ROOT" \
   POST_GENERATION_STAGE_RELATIVE="$POST_GENERATION_STAGE_RELATIVE" \
   GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
   CORRELATION_ID="$CORRELATION_ID" \
+  RUN_INSTANCE_ID="$RUN_INSTANCE_ID" \
   SELECTED_SUITES="${SELECTED_SUITES[*]}" \
   python3 - <<'PY'
 import hashlib
@@ -4817,7 +4819,7 @@ sources = [
 ]
 selected_suites = set(os.environ["SELECTED_SUITES"].split())
 criterion_run_root = (
-    target_dir / "criterion" / "pi-perf-runs" / os.environ["CORRELATION_ID"]
+    target_dir / "criterion" / "pi-perf-runs" / os.environ["RUN_INSTANCE_ID"]
 )
 optional_files = [
     (target_dir / "release" / "pi", PurePosixPath("release/pi")),
