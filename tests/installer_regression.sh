@@ -258,6 +258,67 @@ EOF
   chmod +x "$path"
 }
 
+# libstdc++ symbol-version rejection with no GLIBC_* diagnostic at all: the
+# classifier must name the component it actually observed (bd-wmga9).
+write_loader_rejected_artifact_libcxx() {
+  local path="$1"
+  local version="${2:-GLIBCXX_3.4.32}"
+  cat > "$path" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "--version" ]; then
+  echo "\$0: /lib/x86_64-linux-gnu/libstdc++.so.6: version \\\`${version}' not found (required by \$0)" >&2
+  exit 1
+fi
+exit 0
+EOF
+  chmod +x "$path"
+}
+
+# C++ ABI-tag rejection with no versioned GLIBC/GLIBCXX diagnostic.
+write_loader_rejected_artifact_cxxabi() {
+  local path="$1"
+  local version="${2:-CXXABI_1.3.15}"
+  cat > "$path" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "--version" ]; then
+  echo "\$0: /lib/x86_64-linux-gnu/libstdc++.so.6: version \\\`${version}' not found (required by \$0)" >&2
+  exit 1
+fi
+exit 0
+EOF
+  chmod +x "$path"
+}
+
+# An artifact whose exec layer fails fast exactly like a real ELF whose ELF
+# interpreter is missing: exit 127 plus a "required file not found" shape.
+write_missing_interpreter_child127_artifact() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  echo "run-detected $0: cannot execute binary file: required file not found" >&2
+  exit 127
+fi
+exit 0
+EOF
+  chmod +x "$path"
+}
+
+# An artifact that never terminates on --version; the bounded probe must
+# reap it instead of hanging the installer forever (bd-wmga9).
+write_hanging_artifact() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+trap 'exit 124' TERM
+if [ "${1:-}" = "--version" ]; then
+  sleep 900
+fi
+sleep 900
+EOF
+  chmod +x "$path"
+}
+
 assert_output_not_contains() {
   local dir="$1"
   local needle="$2"
@@ -2115,6 +2176,134 @@ test_glibc_guard_only_applies_on_linux() {
   }
 }
 
+# bd-wmga9: unusable timeout wrappers (always exit 127) plus a hanging
+# artifact must terminate inside the bounded probe, never hang the installer,
+# and must leave an existing installation byte-identical.
+test_probe_timeout_with_broken_wrapper_preserves_existing_install() {
+  local dir artifact checksum marker_before
+  dir="$(case_dir "probe-timeout-broken-wrapper")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_timeout_unusable_stubs "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_hanging_artifact "$artifact"
+  checksum="$(sha256_file "$artifact")"
+
+  printf 'EXISTING-INSTALL-MARKER\n' > "${dir}/dest/pi"
+  marker_before="$(sha256_file "${dir}/dest/pi")"
+
+  PI_INSTALLER_PROBE_TIMEOUT=2 \
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${artifact}" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Compatibility probe for the release binary timed out"
+  assert_output_contains "$dir" "leaving the current installation untouched"
+  local marker_after
+  marker_after="$(sha256_file "${dir}/dest/pi")"
+  if [ "$marker_after" != "$marker_before" ]; then
+    echo "an inconclusive probe must preserve the existing executable" >&2
+    return 1
+  fi
+}
+
+# bd-wmga9: a genuine child exit 127 shaped like a missing ELF interpreter is
+# a distinct outcome; it never reruns unbounded and it falls back instead of
+# installing an unloadable binary.
+test_missing_interpreter_child127_falls_back_with_distinct_diagnostic() {
+  local dir artifact checksum
+  dir="$(case_dir "missing-interpreter-child127")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_timeout_unusable_stubs "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_missing_interpreter_child127_artifact "$artifact"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${artifact}" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "missing ELF interpreter and cannot start on this system"
+  assert_output_contains "$dir" "Offline mode cannot fall back to a source build"
+  if [ -e "${dir}/dest/pi" ]; then
+    echo "an interpreter-broken release binary must not be installed" >&2
+    return 1
+  fi
+}
+
+# bd-wmga9: GLIBCXX-only diagnostics name the libstdc++ component actually
+# observed and never claim a glibc version that was not printed.
+test_glibcxx_only_diagnostic_names_component() {
+  local dir artifact checksum
+  dir="$(case_dir "glibcxx-only-diagnostic")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_loader_rejected_artifact_libcxx "$artifact" "GLIBCXX_3.4.32"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${artifact}" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "requires libstdc++ symbol version GLIBCXX_3.4.32"
+  assert_output_not_contains "$dir" "needs glibc"
+  if [ -e "${dir}/dest/pi" ]; then
+    echo "a libstdc++-broken release binary must not be installed" >&2
+    return 1
+  fi
+}
+
+# bd-wmga9: CXXABI-only diagnostics likewise report the C++ ABI tag.
+test_cxxabi_only_diagnostic_names_component() {
+  local dir artifact checksum
+  dir="$(case_dir "cxxabi-only-diagnostic")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_loader_rejected_artifact_cxxabi "$artifact" "CXXABI_1.3.15"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${artifact}" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "(CXXABI) CXXABI_1.3.15"
+  assert_output_not_contains "$dir" "needs glibc"
+  if [ -e "${dir}/dest/pi" ]; then
+    echo "a CXXABI-broken release binary must not be installed" >&2
+    return 1
+  fi
+}
+
 main() {
   if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     usage
@@ -2141,6 +2330,10 @@ main() {
   run_test test_release_binary_needing_newer_glibc_custom_artifact_has_no_source_fallback
   run_test test_glibc_guard_ignores_unrelated_startup_failures
   run_test test_glibc_guard_only_applies_on_linux
+  run_test test_probe_timeout_with_broken_wrapper_preserves_existing_install
+  run_test test_missing_interpreter_child127_falls_back_with_distinct_diagnostic
+  run_test test_glibcxx_only_diagnostic_names_component
+  run_test test_cxxabi_only_diagnostic_names_component
   run_test test_rosetta_prefers_arm64_artifact_naming
   run_test test_wsl_detection_warning_is_emitted
   run_test test_installer_creates_rpi_alias_when_available

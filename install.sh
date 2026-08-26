@@ -246,6 +246,68 @@ run_command_with_timeout_capture() {
   return "$cmd_rc"
 }
 
+# Execute "$@" exactly once under a hard wall-clock deadline that does not
+# depend on any external timeout wrapper. stdout is discarded; stderr is
+# captured verbatim into <err_file> so dynamic-loader diagnostics survive.
+# This is the only sanctioned way to run an untrusted downloaded artifact in
+# the compatibility probe: no code path may rerun it without a deadline
+# (bd-wmga9).
+PI_INSTALLER_PROBE_TIMEOUT="${PI_INSTALLER_PROBE_TIMEOUT:-20}"
+run_bounded_stderr_capture() {
+  local seconds="$1"
+  local err_file="$2"
+  shift 2
+
+  : > "$err_file"
+
+  local out_file=""
+  out_file="$(mktemp 2>/dev/null || true)"
+  if [ -z "$out_file" ]; then
+    return 125
+  fi
+
+  local timed_out_file=""
+  timed_out_file="$(mktemp 2>/dev/null || true)"
+  if [ -z "$timed_out_file" ]; then
+    rm -f "$out_file" 2>/dev/null || true
+    return 125
+  fi
+  : > "$timed_out_file"
+
+  "$@" > "$out_file" 2> "$err_file" &
+  local cmd_pid=$!
+
+  (
+    sleep "$seconds" 2>/dev/null || true
+    if kill -0 "$cmd_pid" 2>/dev/null; then
+      printf '1\n' > "$timed_out_file"
+      kill "$cmd_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -9 "$cmd_pid" >/dev/null 2>&1 || true
+    fi
+  ) &
+  local watchdog_pid=$!
+
+  local cmd_rc=0
+  if wait "$cmd_pid" 2>/dev/null; then
+    cmd_rc=0
+  else
+    cmd_rc=$?
+  fi
+
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  rm -f "$out_file" 2>/dev/null || true
+
+  if [ -s "$timed_out_file" ]; then
+    rm -f "$timed_out_file" 2>/dev/null || true
+    return 124
+  fi
+  rm -f "$timed_out_file" 2>/dev/null || true
+  return "$cmd_rc"
+}
+
 capture_version_line() {
   local bin_path="$1"
   local out=""
@@ -259,46 +321,93 @@ capture_version_line() {
 # refuses to start the program before main() runs, e.g.:
 #   pi: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found (required by pi)
 # Probe a downloaded artifact once, before it is installed, so an unloadable
-# binary never lands on PATH. Only that exact loader signature counts: any
-# other failure (or a non-Linux host) keeps the previous behavior.
+# binary never lands on PATH. Every execution of the artifact is hard-bounded
+# (external timeout wrapper when usable, internal watchdog otherwise); a
+# wrapper reporting 127 is treated as AMBIGUOUS — GNU timeout normally
+# propagates the child's status, and a real ELF whose interpreter is missing
+# can legitimately exit 127 — so the fallback attempt stays under the same
+# internal deadline and nothing is ever rerun unbounded (bd-wmga9).
 #
-# Returns 0 when the loader rejected the binary for a too-new glibc
-# requirement; sets LIBC_PROBE_REQUIRED to the highest version it asked for.
-# Returns 1 otherwise (binary runs, unrelated failure, or not applicable).
+# Outcome contract:
+#   returns 2  probe itself timed out (inconclusive; never overwrite)
+#   returns 0  loader/interpreter definitively rejected the artifact;
+#              sets LIBC_PROBE_KIND to exactly one of:
+#                glibc        — `GLIBC_x.y.z' not found; LIBC_PROBE_REQUIRED
+#                               carries the highest numeric version observed
+#                stdlibcxx    — `GLIBCXX_x.y.z' not found; REQUIRED carries
+#                               the highest full GLIBCXX_ token observed
+#                cxxabi       — `CXXABI_x.y.z' not found; REQUIRED likewise
+#                interpreter  — missing ELF interpreter / shared object with
+#                               no version diagnostic; REQUIRED stays empty
+#   returns 1  otherwise: binary ran fine, unrelated startup failure,
+#              non-Linux host, or missing artifact.
 LIBC_PROBE_REQUIRED=""
+LIBC_PROBE_KIND=""
 release_binary_needs_newer_libc() {
   local bin_path="$1"
   LIBC_PROBE_REQUIRED=""
+  LIBC_PROBE_KIND=""
   [ "$OS" = "linux" ] || return 1
   [ -f "$bin_path" ] || return 1
   chmod +x "$bin_path" 2>/dev/null || true
 
   local probe_err="$TMP/libc-probe.err"
-  : > "$probe_err"
+  local probe_rc=0
+  local probe_timeout="${PI_INSTALLER_PROBE_TIMEOUT:-20}"
   local timeout_cmd=""
   timeout_cmd="$(version_timeout_cmd)"
-  local probe_rc=0
+
   if [ -n "$timeout_cmd" ]; then
-    "$timeout_cmd" 20 "$bin_path" --version >/dev/null 2>"$probe_err" || probe_rc=$?
+    "$timeout_cmd" "$probe_timeout" "$bin_path" --version >/dev/null 2>"$probe_err" || probe_rc=$?
+    if [ "$probe_rc" -eq 124 ]; then
+      LIBC_PROBE_KIND="timeout"
+      return 2
+    fi
     if [ "$probe_rc" -eq 127 ]; then
-      # Broken timeout wrapper: rerun without it (see run_command_with_timeout_capture).
+      # Ambiguous exit: could be an unusable wrapper OR the artifact's own
+      # fast failure. One more attempt, still hard-bounded.
       probe_rc=0
-      "$bin_path" --version >/dev/null 2>"$probe_err" || probe_rc=$?
+      run_bounded_stderr_capture "$probe_timeout" "$probe_err" "$bin_path" --version || probe_rc=$?
     fi
   else
-    "$bin_path" --version >/dev/null 2>"$probe_err" || probe_rc=$?
+    run_bounded_stderr_capture "$probe_timeout" "$probe_err" "$bin_path" --version || probe_rc=$?
   fi
+
   if [ "$probe_rc" -eq 0 ]; then
     return 1
   fi
-
-  # The loader names the missing symbol version; libstdc++ variants are
-  # included so a future C++ dependency reports the same way.
-  if ! grep -Eq "version \`(GLIBC|GLIBCXX|CXXABI)_[0-9][0-9.]*' not found" "$probe_err" 2>/dev/null; then
-    return 1
+  if [ "$probe_rc" -eq 124 ]; then
+    LIBC_PROBE_KIND="timeout"
+    return 2
   fi
-  LIBC_PROBE_REQUIRED="$({ grep -Eo "GLIBC_[0-9][0-9.]*" "$probe_err" 2>/dev/null || true; } | sed 's/^GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1)"
-  return 0
+
+  # Loader diagnostics, most-specific family first. A glibc version is only
+  # ever claimed when one was actually printed by the loader.
+  if grep -Eq "version \`GLIBC_[0-9][0-9.]*' not found" "$probe_err" 2>/dev/null; then
+    LIBC_PROBE_KIND="glibc"
+    LIBC_PROBE_REQUIRED="$({ grep -Eo "GLIBC_[0-9][0-9.]*" "$probe_err" 2>/dev/null || true; } | sed 's/^GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1)"
+    return 0
+  fi
+  if grep -Eq "version \`GLIBCXX_[0-9][0-9.]*' not found" "$probe_err" 2>/dev/null; then
+    LIBC_PROBE_KIND="stdlibcxx"
+    LIBC_PROBE_REQUIRED="$({ grep -Eo "GLIBCXX_[0-9][0-9.]*" "$probe_err" 2>/dev/null || true; } | sort -t. -k1,1n -k2,2n | tail -1)"
+    return 0
+  fi
+  if grep -Eq "version \`CXXABI_[0-9][0-9.]*' not found" "$probe_err" 2>/dev/null; then
+    LIBC_PROBE_KIND="cxxabi"
+    LIBC_PROBE_REQUIRED="$({ grep -Eo "CXXABI_[0-9][0-9.]*" "$probe_err" 2>/dev/null || true; } | sort -t. -k1,1n -k2,2n | tail -1)"
+    return 0
+  fi
+  # Missing ELF interpreter shapes: exec refuses before any version
+  # diagnostic exists ("required file not found", "cannot execute binary
+  # file", or a named ld-linux path that does not exist).
+  if grep -Eq "required file not found|cannot execute binary file|No such file or directory.*(ld-linux|ld-musl|interpreter)" "$probe_err" 2>/dev/null; then
+    LIBC_PROBE_KIND="interpreter"
+    return 0
+  fi
+
+  # Any other failure keeps the historical behavior: install anyway.
+  return 1
 }
 
 # Best-effort description of the host C library for diagnostics.
@@ -3555,8 +3664,31 @@ main() {
     local download_rc=0
     if run_with_spinner "Downloading release binary" download_release_binary > "$TMP/source_bin_path"; then
       source_bin=$(cat "$TMP/source_bin_path")
-      if release_binary_needs_newer_libc "$source_bin"; then
-        warn "The release binary needs glibc ${LIBC_PROBE_REQUIRED:-(newer)} but this system has: $(host_libc_description)"
+      release_binary_needs_newer_libc "$source_bin"
+      local libc_probe_rc=$?
+      if [ "$libc_probe_rc" -eq 2 ]; then
+        # Inconclusive probe (hard deadline elapsed): treat the artifact as
+        # untrustworthy and never touch an existing executable with it.
+        err "Compatibility probe for the release binary timed out after ${PI_INSTALLER_PROBE_TIMEOUT:-20}s; leaving the current installation untouched"
+        exit 1
+      elif [ "$libc_probe_rc" -eq 0 ]; then
+        case "$LIBC_PROBE_KIND" in
+          glibc)
+            warn "The release binary needs glibc ${LIBC_PROBE_REQUIRED:-(newer)} but this system has: $(host_libc_description)"
+            ;;
+          stdlibcxx)
+            warn "The release binary requires libstdc++ symbol version ${LIBC_PROBE_REQUIRED}, which this system's libstdc++ cannot provide: $(host_libc_description)"
+            ;;
+          cxxabi)
+            warn "The release binary requires libstdc++ runtime symbol ${LIBC_PROBE_REQUIRED} (CXXABI), which this system cannot provide: $(host_libc_description)"
+            ;;
+          interpreter)
+            err "The downloaded release binary has a missing ELF interpreter and cannot start on this system"
+            ;;
+          *)
+            warn "The release binary cannot start on this system ($(LIBC_PROBE_KIND)) but this system has: $(host_libc_description)"
+            ;;
+        esac
         warn "Installing it would leave a 'pi' that cannot start, so it was not installed"
         if [ -n "$ARTIFACT_URL" ] && [ "$VERSION" = "custom-artifact" ]; then
           err "Custom artifact cannot run here; pass --version vX.Y.Z with --artifact-url to allow a source build, or use --from-source"
