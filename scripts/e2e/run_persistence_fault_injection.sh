@@ -1115,7 +1115,7 @@ summary = {
         "power_loss_durability_attested": False,
     },
     "cases": [jsonl_case, sqlite_case],
-    "overall_passed": overall_passed,
+    "validation_passed": overall_passed,
 }
 
 summary_path = artifact_dir / ".integrity-summary.pending.json"
@@ -1240,6 +1240,7 @@ def read_stable_regular(path: Path, *, missing_ok: bool = False):
         if not stat.S_ISREG(initial_metadata.st_mode):
             raise ValueError(f"manifest artifact is not a regular file: {path}")
         contents = source.read()
+        os.fsync(source.fileno())
         final_descriptor_metadata = os.fstat(source.fileno())
     final_path_metadata = path.lstat()
     identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
@@ -1294,6 +1295,22 @@ case_artifacts = [
 overall_exit = int(sys.argv[19])
 if overall_exit == 0 and not all(artifact.get("present") is True for artifact in case_artifacts):
     raise ValueError("successful run is missing a mandatory attested artifact")
+for case_id in ("jsonl", "sqlite"):
+    try:
+        case_directory_descriptor = os.open(
+            artifact_dir / case_id,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError:
+        if overall_exit == 0:
+            raise
+        continue
+    try:
+        os.fsync(case_directory_descriptor)
+    finally:
+        os.close(case_directory_descriptor)
 payload = {
     "schema": "pi.e2e.persistence_fault_injection.manifest.v1",
     "run_id": sys.argv[3],
@@ -1312,6 +1329,7 @@ payload = {
     "rch_require_remote": sys.argv[15] == "true",
     "execution_attestation": "configuration_only",
     "terminal_state": "complete",
+    "overall_passed": overall_exit == 0,
     "result_files": [
         str(artifact_dir / "jsonl/result.json"),
         str(artifact_dir / "sqlite/result.json"),
