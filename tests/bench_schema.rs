@@ -1070,11 +1070,6 @@ done
 
 mkdir -p "$target_dir/perf"
 
-if [[ "$no_run" == "1" && -z "$bench_name" ]]; then
-  printf '{"reason":"compiler-artifact","target":{"name":"perf_budgets"},"executable":"%s"}\n' \
-    "$target_dir/perf/deps/perf_budgets-fake"
-fi
-
 if [[ -n "$bench_name" && "$no_run" == "1" ]]; then
   :
 elif [[ -n "$bench_name" && -n "${PI_IDLE_RSS_RAW_RELATIVE_PATH:-}" ]]; then
@@ -2024,69 +2019,6 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
         record
     });
     write_pijs_workload_records(&target_dir.join("perf/pijs_workload.jsonl"), &pijs_records);
-}
-
-#[cfg(unix)]
-fn install_fake_orchestrate_rch_attestation(target_dir: &Path, output_dir: &Path) {
-    let binary_path = target_dir.join("perf/deps/perf_budgets-fake");
-    fs::create_dir_all(binary_path.parent().expect("fake binary parent"))
-        .expect("create fake perf_budgets binary directory");
-    let binary = r#"#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${1:-}" != "ci_enforced_budgets_fail_on_regression_or_missing_data" \
-  || "${2:-}" != "--exact" ]]; then
-  echo "post-generation perf_budgets invocation omitted the exact data-contract test" >&2
-  exit 64
-fi
-python3 - "${PERF_EVIDENCE_DIR:?}" "${CI_CORRELATION_ID:?}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-evidence_dir = Path(sys.argv[1])
-expected_correlation_id = sys.argv[2]
-for name in (
-    "extension_benchmark_stratification.json",
-    "phase1_matrix_validation.json",
-):
-    path = evidence_dir / name
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("correlation_id") != expected_correlation_id:
-        raise SystemExit(f"{name}: correlation_id mismatch")
-print(
-    json.dumps(
-        {
-            "schema": "pi.perf.fake_post_generation_invocation.v1",
-            "correlation_id": expected_correlation_id,
-            "test_filter": "ci_enforced_budgets_fail_on_regression_or_missing_data",
-            "exact": True,
-        },
-        sort_keys=True,
-    )
-)
-PY
-"#;
-    write_executable(&binary_path, binary);
-
-    let attestation_path = output_dir.join("results/perf_budgets_test_binary.json");
-    fs::create_dir_all(attestation_path.parent().expect("fake attestation parent"))
-        .expect("create fake perf_budgets attestation directory");
-    let binary_sha256 = sha256_file(&binary_path).expect("hash fake perf_budgets binary");
-    fs::write(
-        attestation_path,
-        serde_json::to_vec_pretty(&json!({
-            "schema": "pi.perf.test_binary_attestation.v1",
-            "generated_at": "2026-08-24T00:00:00Z",
-            "source_commit": FAKE_ORCHESTRATE_SOURCE_COMMIT,
-            "source_dirty": false,
-            "cargo_profile": "perf",
-            "target_name": "perf_budgets",
-            "binary_path": binary_path,
-            "sha256": binary_sha256,
-        }))
-        .expect("serialize fake perf_budgets attestation"),
-    )
-    .expect("write fake perf_budgets attestation");
 }
 
 fn canonical_protocol_contract() -> Value {
@@ -8080,9 +8012,8 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
 
     for token in [
         "--message-format=json-render-diagnostics",
-        "pi.perf.test_binary_attestation.v1",
-        "perf_budgets binary attestation commit mismatch",
-        "perf_budgets test binary checksum mismatch",
+        "pi.perf.post_generation_producer_admission.v1",
+        "remote_execution_verified",
         "for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT CI_CORRELATION_ID PI_PERF_STRICT; do",
         "POST_GENERATION_STAGE_RELATIVE=\".rch-tmp/pi-perf-evidence/$post_generation_stage_key\"",
         "pi.perf.post_generation_evidence_inventory.v1",
@@ -8189,7 +8120,6 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     fs::create_dir_all(&output_dir).expect("create output dir");
     install_fake_orchestrate_toolchain(&bin_dir);
     install_fake_orchestrate_staging_artifacts(&target_dir);
-    install_fake_orchestrate_rch_attestation(&target_dir, &output_dir);
     if extra_env
         .iter()
         .any(|(key, value)| *key == "PI_FAKE_PRECREATE_RCH_EXTENSION_ARTIFACT" && *value == "1")

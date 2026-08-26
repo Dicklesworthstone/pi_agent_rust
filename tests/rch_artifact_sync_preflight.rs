@@ -961,8 +961,7 @@ fn postcondition_rejects_invocation_identity_mismatch() -> Result<(), Box<dyn Er
     const SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const OTHER_SOURCE_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
     const CORRELATION_ID: &str = "rch-artifact-sync-test";
-    const COMMAND_DIGEST: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const COMMAND_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     let temp = tempfile::tempdir()?;
     let repo = temp.path();
@@ -1081,7 +1080,10 @@ fn postcondition_rejects_empty_baseline_artifact_set() -> Result<(), Box<dyn Err
             "violation_count": 0,
         },
     });
-    fs::write(&before_manifest, serde_json::to_vec_pretty(&empty_baseline)?)?;
+    fs::write(
+        &before_manifest,
+        serde_json::to_vec_pretty(&empty_baseline)?,
+    )?;
 
     let output = run_postcondition_many(repo, &[], &before_manifest)?;
     if output.status.success() {
@@ -1294,8 +1296,7 @@ fn postcondition_reports_malformed_before_manifest_as_json() -> Result<(), Box<d
     let report = parse_json(&output)?;
     require_string_field(&report, "status", "fail")?;
     let read_error = array_field(&report, "violations")?.iter().any(|violation| {
-        string_field(violation, "reason")
-            .is_ok_and(|reason| reason == "before_manifest_read_error")
+        string_field(violation, "reason").is_ok_and(|reason| reason == "before_manifest_read_error")
     });
     if !read_error {
         return Err(test_error(format!(
@@ -1317,7 +1318,9 @@ fn postcondition_baseline_reports_manifest_write_error_as_json() -> Result<(), B
 
     let output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
     if output.status.success() {
-        return Err(test_error("a before-manifest write failure must fail closed"));
+        return Err(test_error(
+            "a before-manifest write failure must fail closed",
+        ));
     }
     let report = parse_json(&output)?;
     let write_error = array_field(&report, "violations")?.iter().any(|violation| {
@@ -1408,8 +1411,8 @@ fn postcondition_preserves_absolute_artifact_paths_outside_repo() -> Result<(), 
 
 #[cfg(unix)]
 #[test]
-fn postcondition_rejects_generated_artifact_with_symlinked_ancestor()
--> Result<(), Box<dyn Error>> {
+fn postcondition_rejects_generated_artifact_with_symlinked_ancestor() -> Result<(), Box<dyn Error>>
+{
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir()?;
@@ -1419,8 +1422,7 @@ fn postcondition_rejects_generated_artifact_with_symlinked_ancestor()
     fs::create_dir_all(&repo)?;
     fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
     let before_manifest = repo.join("before-rch-artifacts.json");
-    let baseline_output =
-        run_postcondition_baseline(&repo, generated_path, &before_manifest)?;
+    let baseline_output = run_postcondition_baseline(&repo, generated_path, &before_manifest)?;
     if !baseline_output.status.success() {
         return Err(test_error(format!(
             "missing generated artifact baseline should pass\n{}",

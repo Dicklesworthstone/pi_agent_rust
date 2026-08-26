@@ -72,7 +72,6 @@ PREFLIGHT_BEFORE_REFRESH_PATH="$OUTPUT_DIR/results/perf_budget_preflight_before_
 PREFLIGHT_AFTER_RUN_PATH="$OUTPUT_DIR/results/perf_budget_preflight.json"
 STAGING_MANIFEST_PATH="$OUTPUT_DIR/results/perf_artifact_staging_manifest.json"
 BUILD_TESTS_JSONL_PATH="$OUTPUT_DIR/logs/build_tests.jsonl"
-PERF_BUDGET_BINARY_ATTESTATION_PATH="$OUTPUT_DIR/results/perf_budgets_test_binary.json"
 PARALLELISM="${PERF_PARALLELISM:-1}"
 BUILD_JOBS="${PERF_BUILD_JOBS:-8}"
 PGO_MODE="${PERF_PGO_MODE:-off}"
@@ -1098,72 +1097,6 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     log_ok "Test binaries built"
   else
     log_warn "Test binary build had warnings (see logs/build_tests.log)"
-  fi
-
-  if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
-    && (suite_selected "perf_budgets" || suite_selected "perf_regression"); then
-    if python3 - \
-      "$BUILD_TESTS_JSONL_PATH" \
-      "$TARGET_DIR" \
-      "$CARGO_PROFILE" \
-      "$PERF_BUDGET_BINARY_ATTESTATION_PATH" \
-      "$GIT_COMMIT_FULL" \
-      "$GIT_DIRTY" <<'PY'
-import hashlib
-import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-messages_path = Path(sys.argv[1])
-target_dir = Path(sys.argv[2])
-profile = sys.argv[3]
-attestation_path = Path(sys.argv[4])
-source_commit = sys.argv[5]
-source_dirty = sys.argv[6] == "true"
-candidates = []
-for line in messages_path.read_text(encoding="utf-8").splitlines():
-    try:
-        message = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    target = message.get("target", {})
-    executable = message.get("executable")
-    if (
-        message.get("reason") == "compiler-artifact"
-        and target.get("name") == "perf_budgets"
-        and isinstance(executable, str)
-        and executable
-    ):
-        local_candidate = target_dir / profile / "deps" / Path(executable).name
-        if local_candidate.is_file() and local_candidate.stat().st_mode & 0o111:
-            candidates.append(local_candidate.resolve())
-if len(candidates) != 1:
-    raise SystemExit(
-        f"expected exactly one downloaded perf_budgets executable, found {len(candidates)}"
-    )
-binary_path = candidates[0]
-payload = {
-    "schema": "pi.perf.test_binary_attestation.v1",
-    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    "source_commit": source_commit,
-    "source_dirty": source_dirty,
-    "cargo_profile": profile,
-    "target_name": "perf_budgets",
-    "binary_path": str(binary_path),
-    "sha256": hashlib.sha256(binary_path.read_bytes()).hexdigest(),
-}
-attestation_path.write_text(
-    json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-)
-PY
-    then
-      log_ok "Attested current-build perf_budgets test binary"
-    elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
-      die "Failed to attest current-build perf_budgets test binary"
-    else
-      log_warn "Current-build perf_budgets binary attestation is unavailable"
-    fi
   fi
 
   # Build criterion benches if needed
