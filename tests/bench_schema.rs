@@ -1138,6 +1138,7 @@ JSON
     if [[ "${PI_FAKE_DROP_INDEX_STAGE_SAMPLE:-0}" == "1" ]]; then
       python3 - "$target_dir/perf/scenario_runner.jsonl" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -1397,6 +1398,7 @@ JSON
         "${CI_CORRELATION_ID:?}" \
         "${PI_PERF_EXPECTED_SOURCE_COMMIT:?}" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -1409,8 +1411,17 @@ if inventory.get("schema") != "pi.perf.post_generation_evidence_inventory.v1":
     raise SystemExit("post-generation evidence inventory schema mismatch")
 if inventory.get("source_commit") != expected_source_commit:
     raise SystemExit("post-generation evidence inventory source_commit mismatch")
+if inventory.get("source_dirty") is not False:
+    raise SystemExit("post-generation evidence inventory source_dirty mismatch")
 if inventory.get("correlation_id") != expected_correlation_id:
     raise SystemExit("post-generation evidence inventory correlation_id mismatch")
+run_instance_id = inventory.get("run_instance_id")
+if (
+    not isinstance(run_instance_id, str)
+    or len(run_instance_id) != 64
+    or any(character not in "0123456789abcdef" for character in run_instance_id)
+):
+    raise SystemExit("post-generation evidence inventory run_instance_id mismatch")
 if not inventory.get("entries"):
     raise SystemExit("post-generation evidence inventory is empty")
 for name in (
@@ -1427,6 +1438,10 @@ marker = {
     "test_filter": "ci_enforced_budgets_fail_on_regression_or_missing_data",
     "exact": True,
 }
+if os.environ.get("PI_FAKE_MUTATE_POST_GENERATION_PACKAGE") == "1":
+    (evidence_dir / "consumer-unlisted.json").write_text(
+        '{"schema":"pi.perf.consumer_mutation.v1"}\n', encoding="utf-8"
+    )
 print(json.dumps(marker, sort_keys=True))
 PY
     fi
@@ -7762,9 +7777,11 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
         "pi.perf.test_binary_attestation.v1",
         "perf_budgets binary attestation commit mismatch",
         "perf_budgets test binary checksum mismatch",
-        "for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT; do",
+        "for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT CI_CORRELATION_ID PI_PERF_STRICT; do",
         "POST_GENERATION_STAGE_RELATIVE=\".rch-tmp/pi-perf-evidence/$post_generation_stage_key\"",
         "pi.perf.post_generation_evidence_inventory.v1",
+        "Post-generation evidence package remained exact after remote consumption",
+        "post_generation_evidence_package",
         "--overlay-path\" \"$POST_GENERATION_STAGE_RELATIVE",
         "\"${POST_GENERATION_RUNNER_ARGS[@]}\" test --test perf_budgets --profile \"$CARGO_PROFILE\"",
         "clean-overlay receipt: base=$GIT_COMMIT_FULL",
@@ -8655,6 +8672,29 @@ fn orchestrate_rejects_head_drift_before_checksums() {
 
 #[cfg(unix)]
 #[test]
+fn orchestrate_rejects_post_generation_consumer_package_mutation() {
+    let (output, _) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_MUTATE_POST_GENERATION_PACKAGE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "a remote consumer must not be allowed to mutate the retained evidence package"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("changed during remote consumption")
+            && combined.contains("consumer-unlisted.json"),
+        "post-consumer revalidation must identify the exact package mutation: {combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestrate_rejects_head_drift_before_final_success() {
     let (output, _) = run_orchestrate_with_fake_toolchain_with_env(&[(
         "PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE",
@@ -9193,6 +9233,55 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
             })
         }),
         "manifest must record a passing post-generation perf budget consumer"
+    );
+    let retained_package = &manifest["post_generation_evidence_package"];
+    assert_eq!(
+        retained_package["status"].as_str(),
+        Some("pass"),
+        "manifest must record successful post-consumer package revalidation"
+    );
+    assert!(
+        retained_package["relative_path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with(".rch-tmp/pi-perf-evidence/")),
+        "manifest must retain the confined package path"
+    );
+    for digest_field in ["inventory_sha256", "package_sha256"] {
+        assert!(
+            retained_package[digest_field].as_str().is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            }),
+            "manifest must bind a lowercase SHA-256 in {digest_field}"
+        );
+    }
+    assert!(
+        retained_package["file_count"].as_u64().is_some_and(|count| count > 0)
+            && retained_package["size_bytes"].as_u64().is_some_and(|size| size > 0),
+        "manifest must bind the retained package size and file count"
+    );
+    assert_eq!(
+        retained_package["source_commit"].as_str(),
+        Some(source_commit),
+        "retained package must bind the current source commit"
+    );
+    assert_eq!(
+        retained_package["source_dirty"].as_bool(),
+        Some(false),
+        "retained package must bind a clean source tree"
+    );
+    assert_eq!(
+        retained_package["correlation_id"].as_str(),
+        Some(expected_correlation_id),
+        "retained package must bind the current correlation"
+    );
+    assert!(
+        retained_package["run_instance_id"]
+            .as_str()
+            .is_some_and(|run_id| run_id.len() == 64),
+        "retained package must bind the per-invocation nonce"
     );
     let post_generation_stdout =
         fs::read_to_string(output_dir.join("results/perf_budgets_post_generation/stdout.log"))

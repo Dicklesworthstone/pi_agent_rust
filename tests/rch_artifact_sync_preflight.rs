@@ -949,6 +949,21 @@ fn postcondition_rejects_invocation_identity_mismatch() -> Result<(), Box<dyn Er
             output_debug(&output)
         )));
     }
+
+    let matching_output = run_postcondition_with_identity(
+        repo,
+        GENERATED_ARTIFACT,
+        &before_manifest,
+        SOURCE_COMMIT,
+        CORRELATION_ID,
+        COMMAND_DIGEST,
+    )?;
+    if !matching_output.status.success() {
+        return Err(test_error(format!(
+            "changed bytes with the exact baseline invocation identity should pass\n{}",
+            output_debug(&matching_output)
+        )));
+    }
     Ok(())
 }
 
@@ -1251,6 +1266,53 @@ fn postcondition_preserves_absolute_artifact_paths_outside_repo() -> Result<(), 
     require_string_field(first_postcondition, "path", generated_path)?;
     if !bool_field(first_postcondition, "updated")? {
         return Err(test_error("new absolute artifact should be marked updated"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn postcondition_rejects_generated_artifact_with_symlinked_ancestor()
+-> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    let external = temp.path().join("external");
+    let generated_path = "generated/linked/current.json";
+    fs::create_dir_all(&repo)?;
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output =
+        run_postcondition_baseline(&repo, generated_path, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "missing generated artifact baseline should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    fs::create_dir_all(&external)?;
+    fs::write(external.join("current.json"), "{\"current_run\":true}\n")?;
+    fs::create_dir_all(repo.join("generated"))?;
+    symlink(&external, repo.join("generated/linked"))?;
+
+    let output = run_postcondition(&repo, generated_path, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(
+            "a symlinked ancestor must not satisfy generated-artifact writeback",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let rejected = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "generated_artifact_not_regular_file")
+    });
+    if !rejected {
+        return Err(test_error(format!(
+            "generated ancestor symlink must report a regular-file violation\n{}",
+            output_debug(&output)
+        )));
     }
     Ok(())
 }

@@ -23,6 +23,9 @@ from typing import Any
 
 
 SCHEMA = "pi.rch.artifact_sync_preflight.v1"
+INVOCATION_IDENTITY_KEYS = frozenset(
+    {"source_commit", "correlation_id", "command_digest"}
+)
 POSTCONDITION_ACTION = (
     "Rerun the gate locally or fix RCH artifact retrieval/writeback so the "
     "checked-in evidence artifact updates after the remote command."
@@ -97,7 +100,6 @@ def load_ignore_rules(ignore_file: Path) -> tuple[list[IgnoreRule], list[str]]:
         # RCH deliberately treats a leading `!` literally; unlike .gitignore,
         # its source-sync filters do not support negation/re-inclusion.
         negated = False
-        stripped = stripped.replace("\\", "/")
         rules.append(
             IgnoreRule(
                 source=".rchignore",
@@ -142,7 +144,9 @@ def load_config_rules(config_file: Path) -> tuple[list[IgnoreRule], list[str]]:
                 f"entry at index {index}: {config_file}"
             )
             continue
-        raw_pattern_text = raw_pattern.strip().replace("\\", "/")
+        # Preserve the exact pattern bytes RCH hands to rsync. A backslash is an
+        # rsync escape on Unix, not a portable path separator to rewrite here.
+        raw_pattern_text = raw_pattern.strip()
         if not raw_pattern_text:
             errors.append(
                 "RCH config transfer.exclude_patterns contains an empty "
@@ -283,12 +287,7 @@ def relative_path_escapes_repo(raw_path: str) -> bool:
     if path.is_absolute():
         return False
     rel_path = normalize_posix_path(raw_path)
-    return (
-        not rel_path
-        or rel_path == ".."
-        or rel_path.startswith("../")
-        or "/../" in rel_path
-    )
+    return not rel_path or any(component == ".." for component in rel_path.split("/"))
 
 
 def matched_rule_payload(rule: IgnoreRule, matched: bool) -> dict[str, Any]:
@@ -514,11 +513,10 @@ def validate_invocation_identity(
     before_manifest: Path,
 ) -> list[dict[str, Any]]:
     violations: list[dict[str, Any]] = []
-    valid_identity = isinstance(raw_identity, dict) and all(
-        key in {"source_commit", "correlation_id", "command_digest"}
-        and isinstance(value, str)
-        and bool(value)
-        for key, value in raw_identity.items()
+    valid_identity = (
+        isinstance(raw_identity, dict)
+        and (not raw_identity or set(raw_identity) == INVOCATION_IDENTITY_KEYS)
+        and all(isinstance(value, str) and bool(value) for value in raw_identity.values())
     )
     if not valid_identity:
         violations.append(
@@ -996,6 +994,7 @@ def build_postcondition_report(
         "status": "fail" if violations else "pass",
         "repo_root": str(repo_root),
         "before_manifest": str(before_manifest),
+        "invocation_identity": invocation_identity or {},
         "postconditions": postconditions,
         "violations": violations,
         "summary": {
@@ -1021,10 +1020,7 @@ def evaluate_required_paths(
 
         if (
             Path(raw_path).is_absolute()
-            or not rel_path
-            or rel_path == ".."
-            or rel_path.startswith("../")
-            or "/../" in rel_path
+            or relative_path_escapes_repo(raw_path)
         ):
             required_results.append(
                 {
@@ -1348,6 +1344,19 @@ def requested_invocation_identity(args: argparse.Namespace) -> dict[str, str] | 
             "postcondition invocation identity requires all of --source-commit, "
             f"--correlation-id, and --command-digest; missing={missing}"
         )
+    if supplied:
+        source_commit = supplied["source_commit"]
+        command_digest = supplied["command_digest"]
+        if len(source_commit) != 40 or any(
+            character not in "0123456789abcdef" for character in source_commit
+        ):
+            raise ValueError("--source-commit must be a full lowercase hexadecimal Git SHA-1")
+        if len(command_digest) != 64 or any(
+            character not in "0123456789abcdef" for character in command_digest
+        ):
+            raise ValueError("--command-digest must be a lowercase hexadecimal SHA-256")
+        if supplied["correlation_id"].strip() != supplied["correlation_id"]:
+            raise ValueError("--correlation-id must not have leading or trailing whitespace")
     return supplied or None
 
 

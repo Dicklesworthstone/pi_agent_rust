@@ -565,9 +565,7 @@ fn post_generation_evidence_policy_from_inputs(
     }
     Ok(Some(PostGenerationEvidencePolicy {
         root: resolve_post_generation_evidence_root(project_root, raw_evidence_root)?,
-        expected_source_commit: validate_post_generation_source_commit(
-            raw_expected_source_commit,
-        )?,
+        expected_source_commit: validate_post_generation_source_commit(raw_expected_source_commit)?,
         correlation_id: validate_post_generation_correlation_id(raw_correlation_id)?,
     }))
 }
@@ -611,16 +609,23 @@ fn collect_post_generation_evidence_files(
     directory: &Path,
     files: &mut BTreeMap<String, (u64, String)>,
 ) -> Result<(), String> {
-    let entries = std::fs::read_dir(directory)
-        .map_err(|error| format!("cannot read evidence directory {}: {error}", directory.display()))?;
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        format!(
+            "cannot read evidence directory {}: {error}",
+            directory.display()
+        )
+    })?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("cannot read evidence entry: {error}"))?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("cannot inspect evidence entry {}: {error}", path.display()))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!("cannot inspect evidence entry {}: {error}", path.display())
+        })?;
         if file_type.is_symlink() {
-            return Err(format!("evidence package contains symlink: {}", path.display()));
+            return Err(format!(
+                "evidence package contains symlink: {}",
+                path.display()
+            ));
         }
         if file_type.is_dir() {
             collect_post_generation_evidence_files(root, &path, files)?;
@@ -643,7 +648,10 @@ fn collect_post_generation_evidence_files(
             .map_err(|error| format!("cannot inspect evidence file {}: {error}", path.display()))?;
         let digest = sha256_file(&path)
             .map_err(|error| format!("cannot hash evidence file {}: {error}", path.display()))?;
-        if files.insert(relative.clone(), (metadata.len(), digest)).is_some() {
+        if files
+            .insert(relative.clone(), (metadata.len(), digest))
+            .is_some()
+        {
             return Err(format!("duplicate evidence path {relative:?}"));
         }
     }
@@ -655,9 +663,7 @@ fn validate_post_generation_evidence_inventory(
 ) -> Result<(), String> {
     let inventory_path = policy.root.join(POST_GENERATION_INVENTORY_FILE);
     let metadata = std::fs::symlink_metadata(&inventory_path).map_err(|error| {
-        format!(
-            "post-generation evidence inventory is missing or unreadable: {error}"
-        )
+        format!("post-generation evidence inventory is missing or unreadable: {error}")
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("post-generation evidence inventory must be a regular file".to_string());
@@ -783,9 +789,7 @@ fn validate_post_generation_record_lineage(
         ));
     }
     match record.get("source_commit").and_then(Value::as_str) {
-        Some(observed_source_commit)
-            if observed_source_commit != policy.expected_source_commit =>
-        {
+        Some(observed_source_commit) if observed_source_commit != policy.expected_source_commit => {
             return Err(format!(
                 "post-generation source_commit mismatch (expected={}, observed={observed_source_commit})",
                 policy.expected_source_commit
@@ -1652,9 +1656,7 @@ fn verify_cold_load_control_for_root(
     let policy = post_generation_measurement_policy(root)?;
     let candidates = cold_load_control_candidates(root);
     let relative = format!("criterion/ext_load_init/load_init_cold/{extension}/new/estimates.json");
-    let relocated_artifact_path = policy
-        .as_ref()
-        .map(|policy| policy.root.join(&relative));
+    let relocated_artifact_path = policy.as_ref().map(|policy| policy.root.join(&relative));
     let verified = verify_cold_load_measurement_control_with_relocated_artifact(
         first_existing_control_path(&candidates)?,
         extension,
@@ -1754,8 +1756,7 @@ fn context_intelligence_budget_candidate_paths(root: &Path) -> Vec<PathBuf> {
             .collect();
     }
     let mut paths = Vec::new();
-    if let Ok(path) = std::env::var("PERF_CONTEXT_INTELLIGENCE_BUDGET_JSON")
-    {
+    if let Ok(path) = std::env::var("PERF_CONTEXT_INTELLIGENCE_BUDGET_JSON") {
         let trimmed = path.trim();
         if !trimmed.is_empty()
             && let Some(path) = resolve_env_path(root, PathBuf::from(trimmed))
@@ -2080,9 +2081,8 @@ fn evaluate_phase1_weighted_attribution_contract(
             contract_id: "invalid_post_generation_evidence_lineage".to_string(),
             budget_name: None,
             detail: format!("{detail} in {}", path.display()),
-            remediation:
-                "Regenerate the phase-1 matrix inside the current orchestrator run."
-                    .to_string(),
+            remediation: "Regenerate the phase-1 matrix inside the current orchestrator run."
+                .to_string(),
         });
     }
 
@@ -2330,9 +2330,8 @@ fn evaluate_required_e2e_ratio_contract(
             contract_id: "invalid_post_generation_evidence_lineage".to_string(),
             budget_name: None,
             detail: format!("{detail} in {}", path.display()),
-            remediation:
-                "Regenerate extension stratification inside the current orchestrator run."
-                    .to_string(),
+            remediation: "Regenerate extension stratification inside the current orchestrator run."
+                .to_string(),
         });
     }
 
@@ -5534,9 +5533,7 @@ fn post_generation_policy_rejects_symlinked_evidence_root_component() {
         Some(OsStr::new("1")),
         Some(OsStr::new("linked-evidence")),
         None,
-        Some(OsStr::new(
-            "1234567890abcdef1234567890abcdef12345678",
-        )),
+        Some(OsStr::new("1234567890abcdef1234567890abcdef12345678")),
         Some(OsStr::new("current-run")),
         &[],
     )
@@ -5587,6 +5584,42 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
             .contains("correlation_id mismatch")
     );
 
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        source_commit,
+        "current-run",
+        entries.clone(),
+    );
+    let inventory_path = evidence_root.join(POST_GENERATION_INVENTORY_FILE);
+    let mut invalid_lineage: Value = serde_json::from_slice(
+        &std::fs::read(&inventory_path).expect("read inventory fixture for mutation"),
+    )
+    .expect("parse inventory fixture for mutation");
+    invalid_lineage["source_dirty"] = json!(true);
+    std::fs::write(
+        &inventory_path,
+        serde_json::to_vec_pretty(&invalid_lineage).expect("serialize dirty inventory"),
+    )
+    .expect("write dirty inventory");
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("dirty source lineage must fail")
+            .contains("source_dirty must equal false")
+    );
+
+    invalid_lineage["source_dirty"] = json!(false);
+    invalid_lineage["run_instance_id"] = json!("foreign-run");
+    std::fs::write(
+        &inventory_path,
+        serde_json::to_vec_pretty(&invalid_lineage).expect("serialize invalid run inventory"),
+    )
+    .expect("write invalid run inventory");
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("invalid run-instance lineage must fail")
+            .contains("run_instance_id must be 64 lowercase hex characters")
+    );
+
     let mut wrong_digest = entries.clone();
     wrong_digest[0]["sha256"] = json!("f".repeat(64));
     write_post_generation_inventory_fixture(
@@ -5613,6 +5646,24 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
         validate_post_generation_evidence_inventory(&policy)
             .expect_err("unlisted evidence must fail")
             .contains("unlisted")
+    );
+
+    let mut unexpected_entry_set = entries.clone();
+    unexpected_entry_set.push(post_generation_inventory_entry(
+        &evidence_root,
+        "unlisted.json",
+        "file:unlisted.json",
+    ));
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        source_commit,
+        "current-run",
+        unexpected_entry_set,
+    );
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("unexpected logical input must fail")
+            .contains("input contract mismatch")
     );
 
     let missing_entry_set = entries[1..].to_vec();
