@@ -8807,9 +8807,12 @@ function __piFiniteNumber(value) {
 //   message: an AssistantMessage ({ stopReason, errorMessage, usage }) as
 //            pi-ai callers pass, or a bare error string.
 //   contextWindow: the model's context window in tokens (optional).
-// Returns true when the provider rejected the request because the prompt
-// exceeded the context window, or when reported input usage
-// (input + cacheRead) silently exceeds `contextWindow`.
+// Upstream-faithful semantics (bd-5tuh8): usage-only
+// "silent" overflow classifies ONLY when stopReason === "stop", and textual
+// overflow classifies ONLY when stopReason === "error". Bare strings keep
+// direct textual classification; every other stop reason ("toolUse",
+// "length", "aborted", unknown, or absent) is never a context overflow, so
+// compaction/recovery hooks cannot fire mid-tool-call or on aborts.
 export function isContextOverflow(message, contextWindow) {
   if (typeof message === "string") {
     return __piOverflowMessageMatches(message);
@@ -8819,17 +8822,20 @@ export function isContextOverflow(message, contextWindow) {
   }
   const usage = message.usage && typeof message.usage === "object" ? message.usage : undefined;
   const window = __piFiniteNumber(contextWindow);
-  if (usage && window !== undefined && window > 0) {
-    const input = __piFiniteNumber(usage.input ?? usage.inputTokens ?? usage.input_tokens) ?? 0;
-    const cacheRead = __piFiniteNumber(usage.cacheRead ?? usage.cache_read) ?? 0;
-    if (input + cacheRead > window) {
-      return true;
+  switch (message.stopReason) {
+    case "stop": {
+      if (!usage || window === undefined || window <= 0) {
+        return false;
+      }
+      const input = __piFiniteNumber(usage.input ?? usage.inputTokens ?? usage.input_tokens) ?? 0;
+      const cacheRead = __piFiniteNumber(usage.cacheRead ?? usage.cache_read) ?? 0;
+      return input + cacheRead > window;
     }
+    case "error":
+      return __piOverflowMessageMatches(message.errorMessage);
+    default:
+      return false;
   }
-  if (message.stopReason !== undefined && message.stopReason !== "error") {
-    return false;
-  }
-  return __piOverflowMessageMatches(message.errorMessage);
 }
 
 export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken, isContextOverflow };
@@ -33730,6 +33736,14 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         globalThis.piAiOverflow.silent = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
                         globalThis.piAiOverflow.silentUnderWindow = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 150000, cacheRead: 40000, output: 5 }} }}, 200000);
                         globalThis.piAiOverflow.silentNoWindow = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 999999 }} }});
+                        // bd-5tuh8: non-stop reasons never classify, even
+                        // when usage blows far past the window or the error
+                        // text matches an overflow pattern.
+                        globalThis.piAiOverflow.toolUseOverWindow = ai.isContextOverflow({{ stopReason: "toolUse", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.lengthOverWindow = ai.isContextOverflow({{ stopReason: "length", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.abortedWithText = ai.isContextOverflow({{ stopReason: "aborted", errorMessage: "prompt is too long" }}, 200000);
+                        globalThis.piAiOverflow.noReasonOverWindow = ai.isContextOverflow({{ usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.stopWindowZeroEdge = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 0);
                         globalThis.piAiOverflow.garbage = [ai.isContextOverflow(null), ai.isContextOverflow(undefined), ai.isContextOverflow(42), ai.isContextOverflow({{}})];
                         globalThis.piAiOverflow.defaultExport = typeof ai.default.isContextOverflow;
                         globalThis.piAiOverflow.done = true;
@@ -33770,6 +33784,11 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 Some(190_000),
                 Some(200_000)
             ));
+            assert_eq!(r["toolUseOverWindow"], serde_json::json!(false));
+            assert_eq!(r["lengthOverWindow"], serde_json::json!(false));
+            assert_eq!(r["abortedWithText"], serde_json::json!(false));
+            assert_eq!(r["noReasonOverWindow"], serde_json::json!(false));
+            assert_eq!(r["stopWindowZeroEdge"], serde_json::json!(false));
             assert_eq!(r["silentNoWindow"], serde_json::json!(false));
             assert_eq!(
                 r["garbage"],
