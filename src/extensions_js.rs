@@ -8765,7 +8765,74 @@ export async function refreshOpenAICodexToken(_refreshToken) {
   failClosedUnsupported("refreshOpenAICodexToken");
 }
 
-export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken };
+// Context-overflow classification. Mirrors the host classifier
+// (`crate::error::is_context_overflow`) so extensions that import
+// `isContextOverflow` from pi-ai (e.g. custom compaction/recovery hooks)
+// reach the same verdict the agent loop itself uses. Keep the two in sync;
+// `pijs_pi_ai_is_context_overflow_matches_host_classifier` pins parity.
+const __piOverflowSubstrings = [
+  "prompt is too long",
+  "input is too long for requested model",
+  "exceeds the context window",
+  "reduce the length of the messages",
+  "exceeds the available context size",
+  "greater than the context length",
+  "context window exceeds limit",
+  "exceeded model token limit",
+  "too many tokens",
+  "token limit exceeded",
+];
+const __piOverflowPatterns = [
+  /input token count.*exceeds the maximum/,
+  /maximum prompt length is \d+/,
+  /maximum context length is \d+ tokens/,
+  /exceeds the limit of \d+/,
+  /context[_ ]length[_ ]exceeded/,
+  /^4(00|13)\s*(status code)?\s*\(no body\)/,
+];
+
+function __piOverflowMessageMatches(text) {
+  const lower = String(text ?? "").toLowerCase();
+  if (!lower) return false;
+  if (__piOverflowSubstrings.some((needle) => lower.includes(needle))) return true;
+  return __piOverflowPatterns.some((pattern) => pattern.test(lower));
+}
+
+function __piFiniteNumber(value) {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+// isContextOverflow(message, contextWindow?)
+//   message: an AssistantMessage ({ stopReason, errorMessage, usage }) as
+//            pi-ai callers pass, or a bare error string.
+//   contextWindow: the model's context window in tokens (optional).
+// Returns true when the provider rejected the request because the prompt
+// exceeded the context window, or when reported input usage
+// (input + cacheRead) silently exceeds `contextWindow`.
+export function isContextOverflow(message, contextWindow) {
+  if (typeof message === "string") {
+    return __piOverflowMessageMatches(message);
+  }
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const usage = message.usage && typeof message.usage === "object" ? message.usage : undefined;
+  const window = __piFiniteNumber(contextWindow);
+  if (usage && window !== undefined && window > 0) {
+    const input = __piFiniteNumber(usage.input ?? usage.inputTokens ?? usage.input_tokens) ?? 0;
+    const cacheRead = __piFiniteNumber(usage.cacheRead ?? usage.cache_read) ?? 0;
+    if (input + cacheRead > window) {
+      return true;
+    }
+  }
+  if (message.stopReason !== undefined && message.stopReason !== "error") {
+    return false;
+  }
+  return __piOverflowMessageMatches(message.errorMessage);
+}
+
+export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken, isContextOverflow };
 "#)
         .trim()
         .to_string(),
@@ -33607,6 +33674,107 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     "{name} error should be fail-closed, got {message:?}"
                 );
             }
+        });
+    }
+
+    /// gh #178 (point 5): `isContextOverflow` from the virtual pi-ai module
+    /// must agree with the host classifier for the same inputs, so custom
+    /// compaction/recovery extensions see the verdict the agent loop uses.
+    #[test]
+    fn pijs_pi_ai_is_context_overflow_matches_host_classifier() {
+        const MESSAGES: &[&str] = &[
+            "prompt is too long: 150000 tokens > 120000 maximum",
+            "Input is too long for requested model.",
+            "This request exceeds the context window of the model",
+            "input token count 210000 exceeds the maximum number of tokens allowed",
+            "maximum prompt length is 32768",
+            "This model's maximum context length is 8192 tokens",
+            "exceeds the limit of 4096",
+            "context_length_exceeded",
+            "context length exceeded",
+            "400 status code (no body)",
+            "413 (no body)",
+            "too many tokens",
+            "token limit exceeded",
+            "rate limit exceeded, retry after 3s",
+            "overloaded_error: the server is overloaded",
+            "connection reset by peer",
+            "invalid api key",
+            "",
+        ];
+        let expected: Vec<bool> = MESSAGES
+            .iter()
+            .map(|m| crate::error::is_context_overflow(m, None, None))
+            .collect();
+        assert!(expected.iter().any(|v| *v) && expected.iter().any(|v| !*v));
+
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&format!(
+                    r#"
+                    globalThis.piAiOverflow = {{}};
+                    (async () => {{
+                        const ai = await import('@mariozechner/pi-ai');
+                        const messages = {messages};
+                        globalThis.piAiOverflow.fromString = messages.map((m) => ai.isContextOverflow(m));
+                        globalThis.piAiOverflow.fromError = messages.map((m) =>
+                            ai.isContextOverflow({{ role: "assistant", stopReason: "error", errorMessage: m, usage: {{ input: 10, output: 1, cacheRead: 0 }} }}, 200000));
+                        // A clean stop never classifies on text alone.
+                        globalThis.piAiOverflow.stopText = ai.isContextOverflow({{ stopReason: "stop", errorMessage: "prompt is too long" }}, 200000);
+                        // Silent overflow: reported input (+ cache reads) above the window.
+                        globalThis.piAiOverflow.silent = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.silentUnderWindow = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 150000, cacheRead: 40000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.silentNoWindow = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 999999 }} }});
+                        globalThis.piAiOverflow.garbage = [ai.isContextOverflow(null), ai.isContextOverflow(undefined), ai.isContextOverflow(42), ai.isContextOverflow({{}})];
+                        globalThis.piAiOverflow.defaultExport = typeof ai.default.isContextOverflow;
+                        globalThis.piAiOverflow.done = true;
+                    }})();
+                    "#,
+                    messages = serde_json::to_string(MESSAGES).expect("json messages"),
+                ))
+                .await
+                .expect("eval isContextOverflow");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let r = get_global_json(&runtime, "piAiOverflow").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["defaultExport"], serde_json::json!("function"));
+            for (idx, message) in MESSAGES.iter().enumerate() {
+                assert_eq!(
+                    r["fromString"][idx],
+                    serde_json::json!(expected[idx]),
+                    "string form disagrees with host classifier for {message:?}"
+                );
+                assert_eq!(
+                    r["fromError"][idx],
+                    serde_json::json!(expected[idx]),
+                    "error-message form disagrees with host classifier for {message:?}"
+                );
+            }
+            assert_eq!(r["stopText"], serde_json::json!(false));
+            assert_eq!(r["silent"], serde_json::json!(true));
+            assert!(crate::error::is_context_overflow(
+                "",
+                Some(210_000),
+                Some(200_000)
+            ));
+            assert_eq!(r["silentUnderWindow"], serde_json::json!(false));
+            assert!(!crate::error::is_context_overflow(
+                "",
+                Some(190_000),
+                Some(200_000)
+            ));
+            assert_eq!(r["silentNoWindow"], serde_json::json!(false));
+            assert_eq!(
+                r["garbage"],
+                serde_json::json!([false, false, false, false])
+            );
         });
     }
 
