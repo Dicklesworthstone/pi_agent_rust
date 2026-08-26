@@ -72,7 +72,16 @@ RUN_STARTED_AT="$(python3 -c 'from datetime import datetime, timezone; print(dat
 RUN_NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
 RUN_ID="$STAMP-$RUN_NONCE"
 ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-$PROJECT_ROOT/tests/e2e_results/persistence-fault-injection/$RUN_ID}"
+if [[ -L "$ARTIFACT_DIR" ]]; then
+    echo "[fault-injection] Refusing symlink artifact directory: $ARTIFACT_DIR" >&2
+    exit 68
+fi
 mkdir -p "$ARTIFACT_DIR"
+if [[ ! -d "$ARTIFACT_DIR" || -L "$ARTIFACT_DIR" ]]; then
+    echo "[fault-injection] Artifact path is not a real directory: $ARTIFACT_DIR" >&2
+    exit 68
+fi
+ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd -P)"
 for aggregate_path in \
     "$ARTIFACT_DIR/integrity-summary.json" \
     "$ARTIFACT_DIR/.integrity-summary.pending.json" \
@@ -176,6 +185,22 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
 else
     PERSISTENCE_RCH_REQUIRE_REMOTE="${PERSISTENCE_RCH_REQUIRE_REMOTE:-false}"
 fi
+case "$PERSISTENCE_RCH_FORCE_REMOTE" in
+    true|1) PERSISTENCE_RCH_FORCE_REMOTE=true ;;
+    false|0) PERSISTENCE_RCH_FORCE_REMOTE=false ;;
+    *)
+        echo "PERSISTENCE_RCH_FORCE_REMOTE must be true, false, 1, or 0." >&2
+        exit 64
+        ;;
+esac
+case "$PERSISTENCE_RCH_REQUIRE_REMOTE" in
+    true|1) PERSISTENCE_RCH_REQUIRE_REMOTE=true ;;
+    false|0) PERSISTENCE_RCH_REQUIRE_REMOTE=false ;;
+    *)
+        echo "PERSISTENCE_RCH_REQUIRE_REMOTE must be true, false, 1, or 0." >&2
+        exit 64
+        ;;
+esac
 declare -a CARGO_RUNNER_PREFIX=()
 
 # RCH retrieves these conventional top-level test reports after `cargo test`.
@@ -966,6 +991,7 @@ summary = {
     "runner_mode": runner_mode,
     "rch_force_remote": rch_force_remote,
     "rch_require_remote": rch_require_remote,
+    "execution_attestation": "configuration_only",
     "terminal_state": "complete",
     "assertions": {
         "crash_windows": ["pre_flush", "mid_flush", "post_flush"],
@@ -1016,6 +1042,7 @@ python3 - \
     "$overall_exit" <<'PY'
 import hashlib
 import json
+import stat
 import sys
 from pathlib import Path
 
@@ -1023,6 +1050,49 @@ manifest_path = Path(sys.argv[1])
 pending_summary_path = Path(sys.argv[2])
 final_summary_path = Path(sys.argv[3])
 summary_bytes = pending_summary_path.read_bytes()
+
+
+def attest_artifact(path: Path) -> dict:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"path": str(path), "present": False}
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"manifest artifact is not a regular file: {path}")
+    contents = path.read_bytes()
+    final_metadata = path.lstat()
+    if (
+        not stat.S_ISREG(final_metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+        != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_size,
+            final_metadata.st_mtime_ns,
+        )
+        or len(contents) != metadata.st_size
+    ):
+        raise ValueError(f"manifest artifact changed while read: {path}")
+    return {
+        "path": str(path),
+        "present": True,
+        "size_bytes": len(contents),
+        "sha256": hashlib.sha256(contents).hexdigest(),
+    }
+
+
+artifact_dir = Path(sys.argv[13])
+case_artifacts = [
+    attest_artifact(artifact_dir / case_id / filename)
+    for case_id in ("jsonl", "sqlite")
+    for filename in (
+        "result.json",
+        "output.log",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        f"{case_id}-fault-window-summary.json",
+    )
+]
 payload = {
     "schema": "pi.e2e.persistence_fault_injection.manifest.v1",
     "run_id": sys.argv[4],
@@ -1039,6 +1109,7 @@ payload = {
     "runner_mode": sys.argv[14],
     "rch_force_remote": sys.argv[15] == "true",
     "rch_require_remote": sys.argv[16] == "true",
+    "execution_attestation": "configuration_only",
     "terminal_state": "complete",
     "result_files": [
         str(Path(sys.argv[13]) / "jsonl/result.json"),
@@ -1050,6 +1121,7 @@ payload = {
         "size_bytes": len(summary_bytes),
         "sha256": hashlib.sha256(summary_bytes).hexdigest(),
     },
+    "artifacts": case_artifacts,
     "exit_codes": {
         "jsonl": int(sys.argv[17]),
         "sqlite": int(sys.argv[18]),
