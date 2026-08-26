@@ -1398,6 +1398,11 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// bound is denied fail-closed immediately so every request receives
     /// exactly one terminal response and no extension can strand on the
     /// TUI bridge waiting for a decision that was silently discarded.
+    ///
+    /// A QUEUED prompt also schedules its OWN expiry wake (bd-yllbn reopen
+    /// audit): its bounded lifetime must not depend on the active overlay
+    /// resolving first, otherwise an unbudgeted embedder-sourced prompt can
+    /// strand bounded successors past their deadlines indefinitely.
     fn enqueue_capability_prompt(&mut self, mut overlay: CapabilityPromptOverlay) -> Option<Cmd> {
         overlay.generation = self.next_capability_prompt_generation();
         if self.capability_prompt.is_none() {
@@ -1412,8 +1417,9 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.send_extension_ui_response_quiet(response);
             return None;
         }
+        let queue_wake = Self::capability_prompt_expiry_cmd(&overlay);
         self.capability_prompt_queue.push_back(overlay);
-        None
+        queue_wake
     }
 
     /// Promote an overlay to the active slot and schedule its expiry wake.
@@ -1448,17 +1454,42 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.activate_capability_prompt(next)
     }
 
-    /// Auto-deny path for an expired capability prompt (bd-yllbn).
+    /// Auto-deny path for an elapsed capability-prompt deadline (bd-yllbn).
     ///
-    /// Only the ACTIVE overlay carrying both the exact id and generation
-    /// may resolve; stale, late, or foreign identities are ignored so a
-    /// wake cannot dismiss or answer a different prompt.
+    /// Two independent resolution targets carry the exact `(id, generation)`
+    /// identity so stale, late, or foreign wakes can never dismiss or answer
+    /// a different prompt:
+    ///
+    /// 1. the ACTIVE overlay — denied, then the FIFO successor promotes;
+    /// 2. any QUEUED prompt whose own deadline passed while it waits behind
+    ///    the active slot — removed and denied WITHOUT touching or promoting
+    ///    anything else. This keeps every bounded successor honest even when
+    ///    the currently displayed prompt carries no timeout of its own
+    ///    (bd-yllbn reopen audit).
     fn handle_capability_prompt_expiry(&mut self, id: String, generation: u64) -> Option<Cmd> {
         let matches_active = self
             .capability_prompt
             .as_ref()
             .is_some_and(|prompt| prompt.request.id == id && prompt.generation == generation);
         if !matches_active {
+            let queue_index = self
+                .capability_prompt_queue
+                .iter()
+                .position(|prompt| prompt.request.id == id && prompt.generation == generation);
+            let Some(queue_index) = queue_index else {
+                return None;
+            };
+            // Ids are unique per request and generations are monotonic, so at
+            // most one queued item can carry this identity.
+            if let Some(expired) = self.capability_prompt_queue.remove(queue_index) {
+                let _ = expired;
+                let response = ExtensionUiResponse {
+                    id,
+                    value: Some(Value::Bool(false)),
+                    cancelled: true,
+                };
+                self.send_extension_ui_response_quiet(response);
+            }
             return None;
         }
         let response = ExtensionUiResponse {
@@ -4627,6 +4658,105 @@ mod stream_delta_batcher_tests {
         assert!(
             app.capability_prompt_queue.is_empty(),
             "and the entire FIFO"
+        );
+    }
+
+    /// bd-yllbn reopen audit: a queued prompt's budget elapses on its own
+    /// clock. With an UNBUDGETED active prompt blocking the slot, the queued
+    /// item must still resolve at its own deadline without touching — or
+    /// promoting past — anything else in the queue.
+    #[test]
+    fn queued_prompt_expires_independently_of_unbudgeted_active() {
+        let mut app = build_test_app();
+
+        // An embedder-sourced confirm carries NO timeout: unbudgeted active.
+        let unbudgeted = ExtensionUiRequest::new(
+            "r0",
+            "confirm",
+            json!({
+                "extension_id": "ext-embed",
+                "capability": "exec",
+                "message": "no deadline supplied"
+            }),
+        )
+        .with_extension_id(Some("ext-embed".to_string()));
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(unbudgeted));
+        let active_before = active_capability(&app).expect("unbudgeted r0 activates");
+        assert!(
+            app.capability_prompt
+                .as_ref()
+                .expect("active")
+                .expires_at
+                .is_none(),
+            "fixture sanity: r0 really is unbudgeted"
+        );
+
+        // Budgeted successor arrives and queues; enqueue must schedule its
+        // own independent wake now (the audited stranding gap).
+        let wake = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "r2", "ext-b", "http",
+        )));
+        assert!(
+            wake.is_some(),
+            "queued bounded prompts schedule their own expiry wake"
+        );
+
+        // Its deadline passes while r0 lingers: resolve r2 by identity only.
+        let expired_wake = app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+            id: "r2".to_string(),
+            generation: app
+                .capability_prompt_queue
+                .front()
+                .expect("r2 still queued")
+                .generation,
+        });
+        assert!(
+            expired_wake.is_none(),
+            "queue-path resolution never promotes or schedules anything"
+        );
+        assert_eq!(
+            active_capability(&app),
+            Some(active_before),
+            "the unbudgeted active overlay is untouched by another prompt's expiry"
+        );
+        assert!(
+            app.capability_prompt_queue.is_empty(),
+            "r2 alone was denied"
+        );
+
+        // A replay of the same identity after removal is inert (stale guard).
+        assert!(
+            app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+                id: "r2".to_string(),
+                generation: u64::MAX,
+            })
+            .is_none()
+        );
+    }
+
+    /// Unbudgeted arrivals activate without scheduling any timer; their wake
+    /// machinery stays fully dormant so no spurious auto-deny can fire.
+    #[test]
+    fn unbudgeted_prompt_schedules_no_expiry_wake() {
+        let mut app = build_test_app();
+        let unbudgeted = ExtensionUiRequest::new(
+            "u1",
+            "confirm",
+            json!({
+                "extension_id": "ext-e",
+                "capability": "http",
+                "message": "no deadline"
+            }),
+        )
+        .with_extension_id(Some("ext-e".to_string()));
+
+        let wake = app.handle_pi_message(PiMsg::ExtensionUiRequest(unbudgeted));
+        assert!(wake.is_none(), "no timeout means no timer");
+        assert!(
+            app.capability_prompt
+                .as_ref()
+                .and_then(|prompt| prompt.expires_at)
+                .is_none()
         );
     }
 }

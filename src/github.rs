@@ -8,14 +8,22 @@
 //! `run_list`, `run_watch` (poll until a terminal conclusion, streaming
 //! status through `on_update` like `bash` does).
 
+use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
+use crate::memory::screen_secrets;
 use crate::model::{ContentBlock, TextContent};
-use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
+use crate::tools::{
+    ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutput, ToolUpdate,
+    attach_child_job_discipline, command_with_default_sigpipe_in_dir,
+    isolate_command_process_group, kill_process_group_tree, read_to_end_capped_and_drain,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Read-cache TTL: repeated PR/issue reads within a turn are common and gh is
@@ -25,6 +33,16 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_WATCH_TIMEOUT_SECS: u64 = 900;
 /// Per-invocation budget for a single `gh` call.
 const GH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Implicit `git remote` lookup should never become a long-running tool call.
+const GIT_REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Subprocess output is drained to EOF, but only these prefixes remain in RAM.
+const MAX_GH_STDOUT_BYTES: u64 = 1_000_000;
+const MAX_GH_STDERR_BYTES: u64 = 64 * 1024;
+const MAX_GIT_REMOTE_BYTES: u64 = 16 * 1024;
+/// Keep the short-lived cache itself proportional to a bounded working set.
+const MAX_CACHE_ENTRIES: usize = 32;
+const MAX_CACHE_KEY_BYTES: usize = 64 * 1024;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Diff output bounds (standard truncation contract).
 const MAX_DIFF_LINES: usize = 2000;
 const MAX_DIFF_BYTES: usize = 1_000_000;
@@ -32,7 +50,230 @@ const MAX_DIFF_BYTES: usize = 1_000_000;
 pub struct GithubTool {
     cwd: PathBuf,
     gh_path: String,
-    cache: Mutex<HashMap<String, (Instant, String)>>,
+    cache: Mutex<HashMap<Vec<String>, (Instant, GhOutput)>>,
+}
+
+#[derive(Clone, Debug)]
+struct GhOutput {
+    text: String,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+enum ProcessTermination {
+    Exited(ExitStatus),
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct BoundedProcessOutput {
+    termination: ProcessTermination,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+/// A process guard with the stricter GithubTool terminal-ordering contract.
+///
+/// The shared [`ProcessGuard`] performs best-effort cleanup in a background
+/// thread on drop. A tool future can be dropped immediately before the agent
+/// records its cancellation result, so this wrapper synchronously kills the
+/// isolated tree and reaps the root before its drop returns.
+struct GithubProcessGuard {
+    process: ProcessGuard,
+    pid: u32,
+    active: bool,
+}
+
+impl GithubProcessGuard {
+    const fn new(process: ProcessGuard, pid: u32) -> Self {
+        Self {
+            process,
+            pid,
+            active: true,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.process.try_wait_child()
+    }
+
+    fn finish_exited(&mut self) -> std::io::Result<ExitStatus> {
+        let status = self.process.wait();
+        // A subprocess can exit after leaving a descendant holding one of its
+        // pipe descriptors. Always close the isolated group before joining the
+        // pipe pumps so successful completion is bounded too.
+        kill_process_group_tree(Some(self.pid));
+        self.active = false;
+        status
+    }
+
+    fn kill_and_reap(&mut self) -> std::io::Result<ExitStatus> {
+        kill_process_group_tree(Some(self.pid));
+        let status = self.process.wait();
+        self.active = false;
+        status
+    }
+}
+
+impl Drop for GithubProcessGuard {
+    fn drop(&mut self) {
+        if self.active {
+            kill_process_group_tree(Some(self.pid));
+            let _ = self.process.wait();
+        }
+    }
+}
+
+async fn run_bounded_process(
+    program: &OsStr,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+    stdout_limit: u64,
+) -> std::io::Result<BoundedProcessOutput> {
+    let cx = AgentCx::for_current_or_request();
+    let started = Instant::now();
+    if cx.checkpoint().is_err() {
+        return Ok(BoundedProcessOutput {
+            termination: ProcessTermination::Cancelled,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+    }
+    let mut command = command_with_default_sigpipe_in_dir(program, cwd)?;
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolate_command_process_group(&mut command);
+
+    let mut child = command.spawn()?;
+    attach_child_job_discipline(&child);
+    let pid = child.id();
+    let stdout = child.stdout.take().ok_or_else(|| {
+        kill_process_group_tree(Some(pid));
+        let _ = child.wait();
+        std::io::Error::other("missing stdout pipe")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        kill_process_group_tree(Some(pid));
+        let _ = child.wait();
+        std::io::Error::other("missing stderr pipe")
+    })?;
+    let process = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
+    let mut guard = GithubProcessGuard::new(process, pid);
+
+    let stdout_thread = spawn_pipe_capture("github-stdout", stdout, stdout_limit)?;
+    let stderr_thread = spawn_pipe_capture("github-stderr", stderr, MAX_GH_STDERR_BYTES)?;
+
+    let termination = loop {
+        match guard.try_wait()? {
+            Some(_) => break ProcessTermination::Exited(guard.finish_exited()?),
+            None => {}
+        }
+        if started.elapsed() >= timeout {
+            guard.kill_and_reap()?;
+            break ProcessTermination::TimedOut;
+        }
+        if cx.checkpoint().is_err() {
+            guard.kill_and_reap()?;
+            break ProcessTermination::Cancelled;
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        asupersync::time::sleep(
+            asupersync::time::wall_now(),
+            PROCESS_POLL_INTERVAL.min(remaining),
+        )
+        .await;
+    };
+
+    let (stdout, stdout_truncated) = join_pipe_capture(stdout_thread, stdout_limit, "stdout")?;
+    let (stderr, stderr_truncated) =
+        join_pipe_capture(stderr_thread, MAX_GH_STDERR_BYTES, "stderr")?;
+    Ok(BoundedProcessOutput {
+        termination,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+fn spawn_pipe_capture<R>(
+    name: &str,
+    reader: R,
+    limit: u64,
+) -> std::io::Result<JoinHandle<std::result::Result<Vec<u8>, String>>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || read_to_end_capped_and_drain(reader, limit))
+}
+
+fn join_pipe_capture(
+    thread: JoinHandle<std::result::Result<Vec<u8>, String>>,
+    limit: u64,
+    stream: &str,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = thread
+        .join()
+        .map_err(|_| std::io::Error::other(format!("{stream} capture thread panicked")))?
+        .map_err(|err| std::io::Error::other(format!("{stream} capture failed: {err}")))?;
+    let truncated = u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit;
+    if truncated {
+        bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
+    Ok((bytes, truncated))
+}
+
+fn stderr_evidence(output: &BoundedProcessOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let brief = sanitize_process_diagnostic(&stderr.lines().take(4).collect::<Vec<_>>().join("\n"));
+    let truncation = output
+        .stderr_truncated
+        .then(|| format!("\n[stderr truncated at {MAX_GH_STDERR_BYTES} bytes]"))
+        .unwrap_or_default();
+    if brief.is_empty() && truncation.is_empty() {
+        String::new()
+    } else {
+        format!("\nstderr:\n{brief}{truncation}")
+    }
+}
+
+/// Keep subprocess diagnostics useful without letting credentials or terminal
+/// control bytes escape into a transcript. Bidi controls are escaped too: they
+/// are not classified as `char::is_control`, but can visually reorder errors.
+fn sanitize_process_diagnostic(raw: &str) -> String {
+    let screened = screen_secrets(raw);
+    let mut safe = String::with_capacity(screened.len());
+    for character in screened.chars() {
+        if matches!(character, '\n' | '\t') {
+            safe.push(character);
+        } else if character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        {
+            safe.extend(character.escape_unicode());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
 }
 
 impl GithubTool {
@@ -44,23 +285,30 @@ impl GithubTool {
         }
     }
 
-    fn cache_get(&self, key: &str) -> Option<String> {
-        let cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache
-            .get(key)
-            .filter(|(at, _)| at.elapsed() < CACHE_TTL)
-            .map(|(_, body)| body.clone())
-    }
-
-    fn cache_put(&self, key: String, body: String) {
+    fn cache_get(&self, key: &[String]) -> Option<GhOutput> {
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
+        cache.get(key).map(|(_, body)| body.clone())
+    }
+
+    fn cache_put(&self, key: Vec<String>, body: GhOutput) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
+        if cache.len() >= MAX_CACHE_ENTRIES
+            && !cache.contains_key(&key)
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
         cache.insert(key, (Instant::now(), body));
     }
 
@@ -73,91 +321,107 @@ impl GithubTool {
 
     /// Run `gh` with a bounded wait; classifies missing-binary and
     /// unauthenticated states into the named error taxonomy.
-    async fn run_gh(&self, args: &[&str]) -> Result<String> {
-        use std::process::{Command, Stdio};
-
-        let mut cmd = Command::new(&self.gh_path);
-        cmd.args(args)
-            .current_dir(&self.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    async fn run_gh_with_timeout(
+        &self,
+        args: &[&str],
+        timeout: Duration,
+        allow_truncated_stdout: bool,
+    ) -> Result<GhOutput> {
+        let output = run_bounded_process(
+            OsStr::new(&self.gh_path),
+            args,
+            &self.cwd,
+            timeout,
+            MAX_GH_STDOUT_BYTES,
+        )
+        .await
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Error::tool(
+                    "github",
+                    "GH_MISSING: configured `gh` executable not found. Install the GitHub CLI \
+                     (https://cli.github.com) or correct ghPath in settings.",
+                )
+            } else {
+                Error::tool(
+                    "github",
+                    format!(
+                        "GH_PROCESS: {}",
+                        sanitize_process_diagnostic(&err.to_string())
+                    ),
+                )
+            }
+        })?;
+        let evidence = stderr_evidence(&output);
+        match &output.termination {
+            ProcessTermination::TimedOut => {
                 return Err(Error::tool(
                     "github",
                     format!(
-                        "GH_MISSING: `{}` not found. Install the GitHub CLI \
-                         (https://cli.github.com) or set ghPath in settings.",
-                        self.gh_path
+                        "GH_TIMEOUT: `gh` invocation exceeded {}ms{evidence}",
+                        timeout.as_millis(),
                     ),
                 ));
             }
-            Err(err) => return Err(Error::tool("github", format!("GH_SPAWN: {err}"))),
-        };
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("gh-wait".into())
-            .spawn(move || {
-                let _ = tx.send(child.wait_with_output());
-            })
-            .map_err(|err| Error::tool("github", format!("GH_SPAWN: {err}")))?;
-
-        let started = Instant::now();
-        let output = loop {
-            match rx.try_recv() {
-                Ok(result) => {
-                    break result
-                        .map_err(|err| Error::tool("github", format!("GH_WAIT: {err}")))?;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if started.elapsed() > GH_CALL_TIMEOUT {
-                        return Err(Error::tool(
-                            "github",
-                            format!("GH_TIMEOUT: `gh {}` exceeded 60s", args.join(" ")),
-                        ));
-                    }
-                    asupersync::time::sleep(
-                        asupersync::time::wall_now(),
-                        Duration::from_millis(50),
-                    )
-                    .await;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(Error::tool("github", "GH_WAIT: worker vanished"));
-                }
-            }
-        };
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            let lower = stderr.to_lowercase();
-            if lower.contains("auth login") || lower.contains("not logged in") {
+            ProcessTermination::Cancelled => {
                 return Err(Error::tool(
                     "github",
-                    "GH_AUTH: `gh` is not authenticated. Run `gh auth login` and retry.",
+                    format!("GH_CANCELLED: `gh` invocation was cancelled{evidence}"),
                 ));
             }
-            let code = output.status.code().unwrap_or(-1);
-            let brief: String = stderr.lines().take(4).collect::<Vec<_>>().join("\n");
+            ProcessTermination::Exited(status) if !status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+                if stderr.contains("auth login") || stderr.contains("not logged in") {
+                    return Err(Error::tool(
+                        "github",
+                        format!(
+                            "GH_AUTH: `gh` is not authenticated. Run `gh auth login` and retry.{evidence}"
+                        ),
+                    ));
+                }
+                let code = status.code().unwrap_or(-1);
+                return Err(Error::tool(
+                    "github",
+                    format!("GH_ERROR (exit {code}){evidence}"),
+                ));
+            }
+            ProcessTermination::Exited(_) => {}
+        }
+        if output.stdout_truncated && !allow_truncated_stdout {
             return Err(Error::tool(
                 "github",
-                format!("GH_ERROR (exit {code}): {brief}"),
+                format!(
+                    "GH_OUTPUT_LIMIT: `gh` invocation stdout exceeded {MAX_GH_STDOUT_BYTES} bytes{evidence}",
+                ),
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(GhOutput {
+            text: String::from_utf8_lossy(&output.stdout).into_owned(),
+            truncated: output.stdout_truncated,
+        })
     }
 
     /// Read op with the short-TTL cache.
-    async fn run_gh_cached(&self, args: &[&str]) -> Result<String> {
-        let key = args.join("\u{1f}");
-        if let Some(hit) = self.cache_get(&key) {
+    async fn run_gh_cached(&self, args: &[&str], allow_truncated_stdout: bool) -> Result<GhOutput> {
+        let key_bytes = args
+            .iter()
+            .fold(0usize, |total, arg| total.saturating_add(arg.len()));
+        let key = (key_bytes <= MAX_CACHE_KEY_BYTES).then(|| {
+            args.iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>()
+        });
+        if let Some(key) = key.as_deref()
+            && let Some(hit) = self.cache_get(key)
+        {
             return Ok(hit);
         }
-        let body = self.run_gh(args).await?;
-        self.cache_put(key, body.clone());
+        let body = self
+            .run_gh_with_timeout(args, GH_CALL_TIMEOUT, allow_truncated_stdout)
+            .await?;
+        if let Some(key) = key {
+            self.cache_put(key, body.clone());
+        }
         Ok(body)
     }
 
@@ -165,30 +429,72 @@ impl GithubTool {
     async fn resolve_repo(&self, explicit: Option<&str>) -> Result<String> {
         if let Some(repo) = explicit {
             let trimmed = repo.trim();
-            if trimmed.split('/').count() == 2 && !trimmed.ends_with('/') {
+            if let Some((owner, name)) = trimmed.split_once('/')
+                && !owner.is_empty()
+                && !name.is_empty()
+                && !name.contains('/')
+            {
                 return Ok(trimmed.to_string());
             }
             return Err(Error::tool(
                 "github",
-                format!("GH_REPO: expected owner/repo, got {trimmed:?}"),
+                "GH_REPO: expected a non-empty owner/repo slug",
             ));
         }
-        let output = std::process::Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .current_dir(&self.cwd)
-            .output()
-            .map_err(|err| Error::tool("github", format!("GH_REPO: git remote failed: {err}")))?;
-        if !output.status.success() {
+        let output = run_bounded_process(
+            OsStr::new("git"),
+            &["remote", "get-url", "origin"],
+            &self.cwd,
+            GIT_REMOTE_TIMEOUT,
+            MAX_GIT_REMOTE_BYTES,
+        )
+        .await
+        .map_err(|err| {
+            Error::tool(
+                "github",
+                format!(
+                    "GH_REPO: git remote failed: {}",
+                    sanitize_process_diagnostic(&err.to_string())
+                ),
+            )
+        })?;
+        let evidence = stderr_evidence(&output);
+        match &output.termination {
+            ProcessTermination::TimedOut => {
+                return Err(Error::tool(
+                    "github",
+                    format!("GH_REPO: git remote lookup timed out{evidence}"),
+                ));
+            }
+            ProcessTermination::Cancelled => {
+                return Err(Error::tool(
+                    "github",
+                    format!("GH_REPO: git remote lookup cancelled{evidence}"),
+                ));
+            }
+            ProcessTermination::Exited(status) if !status.success() => {
+                return Err(Error::tool(
+                    "github",
+                    format!(
+                        "GH_REPO: no origin remote; pass repo: \"owner/name\" explicitly{evidence}"
+                    ),
+                ));
+            }
+            ProcessTermination::Exited(_) => {}
+        }
+        if output.stdout_truncated {
             return Err(Error::tool(
                 "github",
-                "GH_REPO: no origin remote; pass repo: \"owner/name\" explicitly",
+                format!(
+                    "GH_REPO: git remote output exceeded {MAX_GIT_REMOTE_BYTES} bytes{evidence}"
+                ),
             ));
         }
         let url = String::from_utf8_lossy(&output.stdout);
         parse_repo_from_remote(url.trim()).ok_or_else(|| {
             Error::tool(
                 "github",
-                format!("GH_REPO: could not parse owner/repo from remote {url:?}"),
+                "GH_REPO: could not parse owner/repo from the origin remote",
             )
         })
     }
@@ -283,9 +589,12 @@ impl GithubTool {
             ("issue", ISSUE_JSON_FIELDS, "Issue")
         };
         let raw = self
-            .run_gh_cached(&[sub, "view", &number, "--repo", &repo, "--json", fields])
+            .run_gh_cached(
+                &[sub, "view", &number, "--repo", &repo, "--json", fields],
+                false,
+            )
             .await?;
-        let item: Value = serde_json::from_str(&raw)
+        let item: Value = serde_json::from_str(&raw.text)
             .map_err(|err| Error::tool("github", format!("GH_PARSE: {err}")))?;
         Ok(text_output(format_item_card(kind, &item), item))
     }
@@ -298,9 +607,13 @@ impl GithubTool {
             .to_string();
         let repo = self.resolve_repo(repo_arg).await?;
         let raw = self
-            .run_gh_cached(&["pr", "diff", &number, "--repo", &repo])
+            .run_gh_cached(&["pr", "diff", &number, "--repo", &repo], true)
             .await?;
-        let (text, truncated) = truncate_diff(&raw);
+        let (mut text, formatter_truncated) = truncate_diff(&raw.text);
+        let truncated = raw.truncated || formatter_truncated;
+        if raw.truncated && !formatter_truncated {
+            text.push_str("… (diff truncated)\n");
+        }
         Ok(text_output(
             text,
             json!({"repo": repo, "number": number, "truncated": truncated}),
@@ -315,39 +628,48 @@ impl GithubTool {
         let kind = input.get("kind").and_then(Value::as_str).unwrap_or("code");
         let raw = match kind {
             "code" => {
-                self.run_gh_cached(&[
-                    "search",
-                    "code",
-                    query,
-                    "--limit",
-                    limit,
-                    "--json",
-                    "path,repository,textMatches",
-                ])
+                self.run_gh_cached(
+                    &[
+                        "search",
+                        "code",
+                        query,
+                        "--limit",
+                        limit,
+                        "--json",
+                        "path,repository,textMatches",
+                    ],
+                    false,
+                )
                 .await?
             }
             "issues" => {
-                self.run_gh_cached(&[
-                    "search",
-                    "issues",
-                    query,
-                    "--limit",
-                    limit,
-                    "--json",
-                    "number,title,state,repository,url",
-                ])
+                self.run_gh_cached(
+                    &[
+                        "search",
+                        "issues",
+                        query,
+                        "--limit",
+                        limit,
+                        "--json",
+                        "number,title,state,repository,url",
+                    ],
+                    false,
+                )
                 .await?
             }
             "prs" => {
-                self.run_gh_cached(&[
-                    "search",
-                    "prs",
-                    query,
-                    "--limit",
-                    limit,
-                    "--json",
-                    "number,title,state,repository,url",
-                ])
+                self.run_gh_cached(
+                    &[
+                        "search",
+                        "prs",
+                        query,
+                        "--limit",
+                        limit,
+                        "--json",
+                        "number,title,state,repository,url",
+                    ],
+                    false,
+                )
                 .await?
             }
             other => {
@@ -357,7 +679,7 @@ impl GithubTool {
                 ));
             }
         };
-        let items: Value = serde_json::from_str(&raw)
+        let items: Value = serde_json::from_str(&raw.text)
             .map_err(|err| Error::tool("github", format!("GH_PARSE: {err}")))?;
         Ok(text_output(format_search_results(kind, &items), items))
     }
@@ -365,18 +687,21 @@ impl GithubTool {
     async fn op_run_list(&self, repo_arg: Option<&str>, limit: &str) -> Result<ToolOutput> {
         let repo = self.resolve_repo(repo_arg).await?;
         let raw = self
-            .run_gh_cached(&[
-                "run",
-                "list",
-                "--repo",
-                &repo,
-                "--limit",
-                limit,
-                "--json",
-                "databaseId,displayTitle,status,conclusion,workflowName,headBranch,createdAt",
-            ])
+            .run_gh_cached(
+                &[
+                    "run",
+                    "list",
+                    "--repo",
+                    &repo,
+                    "--limit",
+                    limit,
+                    "--json",
+                    "databaseId,displayTitle,status,conclusion,workflowName,headBranch,createdAt",
+                ],
+                false,
+            )
             .await?;
-        let items: Value = serde_json::from_str(&raw)
+        let items: Value = serde_json::from_str(&raw.text)
             .map_err(|err| Error::tool("github", format!("GH_PARSE: {err}")))?;
         Ok(text_output(format_run_list(&items), items))
     }
@@ -387,17 +712,7 @@ impl GithubTool {
         repo_arg: Option<&str>,
         on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     ) -> Result<ToolOutput> {
-        let run_id = input
-            .get("run_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| {
-                input
-                    .get("run_id")
-                    .and_then(Value::as_u64)
-                    .map(|id| id.to_string())
-            })
-            .ok_or_else(|| Error::tool("github", "missing required field: run_id"))?;
+        let run_id = parse_workflow_run_id(input)?;
         let repo = self.resolve_repo(repo_arg).await?;
         let budget = Duration::from_secs(
             input
@@ -409,19 +724,56 @@ impl GithubTool {
         let started = Instant::now();
         let mut poll = Duration::from_secs(2);
         loop {
+            let elapsed = started.elapsed();
+            let Some(remaining) = budget.checked_sub(elapsed) else {
+                return Err(Error::tool(
+                    "github",
+                    format!(
+                        "GH_WATCH_TIMEOUT: run {run_id} exceeded the {}s watch budget",
+                        budget.as_secs()
+                    ),
+                ));
+            };
+            if remaining.is_zero() {
+                return Err(Error::tool(
+                    "github",
+                    format!(
+                        "GH_WATCH_TIMEOUT: run {run_id} exceeded the {}s watch budget",
+                        budget.as_secs()
+                    ),
+                ));
+            }
             // Watch reads bypass the cache (freshness IS the point).
-            let raw = self
-                .run_gh(&[
-                    "run",
-                    "view",
-                    &run_id,
-                    "--repo",
-                    &repo,
-                    "--json",
-                    "status,conclusion,displayTitle,workflowName",
-                ])
-                .await?;
-            let state: Value = serde_json::from_str(&raw)
+            let result = self
+                .run_gh_with_timeout(
+                    &[
+                        "run",
+                        "view",
+                        &run_id,
+                        "--repo",
+                        &repo,
+                        "--json",
+                        "status,conclusion,displayTitle,workflowName",
+                    ],
+                    remaining.min(GH_CALL_TIMEOUT),
+                    false,
+                )
+                .await;
+            let raw = match result {
+                Ok(raw) => raw,
+                Err(err) if started.elapsed() >= budget => {
+                    return Err(Error::tool(
+                        "github",
+                        format!(
+                            "GH_WATCH_TIMEOUT: run {run_id} exceeded the {}s watch budget; \
+                             final poll: {err}",
+                            budget.as_secs(),
+                        ),
+                    ));
+                }
+                Err(err) => return Err(err),
+            };
+            let state: Value = serde_json::from_str(&raw.text)
                 .map_err(|err| Error::tool("github", format!("GH_PARSE: {err}")))?;
             let status = state.get("status").and_then(Value::as_str).unwrap_or("?");
             if status == "completed" {
@@ -440,7 +792,7 @@ impl GithubTool {
                     state,
                 ));
             }
-            if started.elapsed() > budget {
+            if started.elapsed() >= budget {
                 return Err(Error::tool(
                     "github",
                     format!(
@@ -458,10 +810,28 @@ impl GithubTool {
                     details: Some(state),
                 });
             }
-            asupersync::time::sleep(asupersync::time::wall_now(), poll).await;
+            let remaining = budget.saturating_sub(started.elapsed());
+            sleep_with_cancellation(poll.min(remaining)).await?;
             poll = (poll * 2).min(Duration::from_secs(10));
         }
     }
+}
+
+fn parse_workflow_run_id(input: &Value) -> Result<String> {
+    let id = match input.get("run_id") {
+        Some(Value::String(raw)) => raw.parse::<u64>().ok(),
+        Some(value) => value.as_u64(),
+        None => return Err(Error::tool("github", "missing required field: run_id")),
+    };
+    id.filter(|id| *id > 0).map_or_else(
+        || {
+            Err(Error::tool(
+                "github",
+                "run_id must be a positive decimal integer",
+            ))
+        },
+        |id| Ok(id.to_string()),
+    )
 }
 
 const PR_JSON_FIELDS: &str = "number,title,state,author,labels,body,comments,url,headRefName,baseRefName,mergeable,reviewDecision";
@@ -565,9 +935,34 @@ impl Tool for GithubTool {
     }
 
     fn effects(&self) -> ToolEffects {
-        // Network reads only in v1 (no checkout/write operations).
-        ToolEffects::network()
+        // Every operation starts `gh`; implicit repo resolution also starts
+        // `git` and reads cwd configuration. Process is a scheduling barrier.
+        ToolEffects::read()
+            .union(ToolEffects::network())
+            .union(ToolEffects::process())
     }
+}
+
+async fn sleep_with_cancellation(duration: Duration) -> Result<()> {
+    let cx = AgentCx::for_current_or_request();
+    let started = Instant::now();
+    while let Some(remaining) = duration.checked_sub(started.elapsed()) {
+        if remaining.is_zero() {
+            break;
+        }
+        if cx.checkpoint().is_err() {
+            return Err(Error::tool(
+                "github",
+                "GH_CANCELLED: operation was cancelled",
+            ));
+        }
+        asupersync::time::sleep(
+            asupersync::time::wall_now(),
+            remaining.min(PROCESS_POLL_INTERVAL),
+        )
+        .await;
+    }
+    Ok(())
 }
 
 fn truncate_diff(raw: &str) -> (String, bool) {
@@ -649,10 +1044,6 @@ fn format_run_list(items: &Value) -> String {
     out
 }
 
-// Keep OsString referenced for future arg-building parity with share.rs.
-#[allow(dead_code)]
-type ArgList = Vec<OsString>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +1062,88 @@ mod tests {
         ] {
             assert_eq!(parse_repo_from_remote(url).as_deref(), expect, "url: {url}");
         }
+    }
+
+    #[test]
+    fn subprocess_diagnostics_redact_secrets_and_escape_terminal_controls() {
+        let diagnostic = sanitize_process_diagnostic(
+            "failure: ghp_abcdefghijklmnopqrstuvwxyz\x1b]2;spoofed\u{202e}tail",
+        );
+        assert!(diagnostic.contains("[REDACTED_GITHUB_PAT]"));
+        assert!(!diagnostic.contains("ghp_abcdefghijklmnopqrstuvwxyz"));
+        assert!(!diagnostic.contains('\x1b'));
+        assert!(!diagnostic.contains('\u{202e}'));
+        assert!(diagnostic.contains("\\u{1b}"));
+        assert!(diagnostic.contains("\\u{202e}"));
+    }
+
+    #[test]
+    fn explicit_repo_requires_non_empty_owner_and_name() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = GithubTool::new(Path::new("."), Some("/nonexistent/gh-binary"));
+            assert_eq!(
+                tool.resolve_repo(Some(" owner/repo "))
+                    .await
+                    .expect("valid repo"),
+                "owner/repo"
+            );
+            for repo in ["/repo", "owner/", "owner/repo/extra"] {
+                let err = tool
+                    .resolve_repo(Some(repo))
+                    .await
+                    .expect_err("invalid repo slug");
+                assert!(err.to_string().contains("GH_REPO"), "err: {err}");
+            }
+        });
+    }
+
+    #[test]
+    fn workflow_run_id_is_positive_decimal_and_canonicalized() {
+        assert_eq!(
+            parse_workflow_run_id(&json!({"run_id": "00042"})).expect("string id"),
+            "42"
+        );
+        assert_eq!(
+            parse_workflow_run_id(&json!({"run_id": 42})).expect("numeric id"),
+            "42"
+        );
+        for input in [
+            json!({}),
+            json!({"run_id": 0}),
+            json!({"run_id": "run-42"}),
+            json!({"run_id": "42\nGH_WATCH_TIMEOUT: spoofed"}),
+        ] {
+            assert!(parse_workflow_run_id(&input).is_err(), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn invalid_workflow_run_id_is_rejected_before_spawn() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = GithubTool::new(Path::new("."), Some("/nonexistent/gh-binary"));
+            let err = tool
+                .execute(
+                    "t1",
+                    json!({
+                        "op": "run_watch",
+                        "run_id": "123; ghp_abcdefghijklmnopqrstuvwxyz",
+                        "repo": "owner/repo"
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("non-decimal workflow id must fail before gh spawn");
+            assert!(
+                err.to_string()
+                    .contains("run_id must be a positive decimal integer"),
+                "err: {err}"
+            );
+            assert!(!err.to_string().contains("GH_MISSING"), "err: {err}");
+            assert!(
+                !err.to_string().contains("ghp_abcdefghijklmnopqrstuvwxyz"),
+                "err: {err}"
+            );
+        });
     }
 
     #[test]
@@ -706,10 +1179,85 @@ mod tests {
     #[test]
     fn cache_ttl_and_clear() {
         let tool = GithubTool::new(Path::new("."), None);
-        tool.cache_put(String::from("k"), String::from("v"));
-        assert_eq!(tool.cache_get("k").as_deref(), Some("v"));
+        let key = vec![String::from("k")];
+        tool.cache_put(
+            key.clone(),
+            GhOutput {
+                text: String::from("v"),
+                truncated: false,
+            },
+        );
+        assert_eq!(
+            tool.cache_get(&key).map(|value| value.text).as_deref(),
+            Some("v")
+        );
         tool.cache_clear();
-        assert!(tool.cache_get("k").is_none());
+        assert!(tool.cache_get(&key).is_none());
+    }
+
+    #[test]
+    fn cache_has_a_hard_entry_bound_and_collision_free_keys() {
+        let tool = GithubTool::new(Path::new("."), None);
+        for index in 0..(MAX_CACHE_ENTRIES + 8) {
+            tool.cache_put(
+                vec![format!("key-{index}")],
+                GhOutput {
+                    text: format!("value-{index}"),
+                    truncated: false,
+                },
+            );
+        }
+        let cache = tool
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+        drop(cache);
+
+        let collision_tool = GithubTool::new(Path::new("."), None);
+        let delimiter = "\u{1f}";
+        collision_tool.cache_put(
+            vec![format!("a{delimiter}b"), String::from("c")],
+            GhOutput {
+                text: String::from("first"),
+                truncated: false,
+            },
+        );
+        collision_tool.cache_put(
+            vec![String::from("a"), format!("b{delimiter}c")],
+            GhOutput {
+                text: String::from("second"),
+                truncated: false,
+            },
+        );
+        assert_eq!(
+            collision_tool
+                .cache_get(&[format!("a{delimiter}b"), String::from("c")])
+                .map(|value| value.text)
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            collision_tool
+                .cache_get(&[String::from("a"), format!("b{delimiter}c")])
+                .map(|value| value.text)
+                .as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn effects_truthfully_block_process_execution_in_plan_mode() {
+        let tool = GithubTool::new(Path::new("."), None);
+        let effects = tool.effects();
+        assert!(effects.reads());
+        assert!(effects.networks());
+        assert!(effects.processes());
+        assert!(!effects.parallel_safe());
+
+        let plan = crate::plan::PlanState::new();
+        plan.enter_planning();
+        assert!(!plan.allows_effects(effects));
     }
 
     #[test]
@@ -728,6 +1276,186 @@ mod tests {
         }]);
         let out = format_search_results("issues", &issues);
         assert!(out.contains("#7 [open] Broken"));
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+        let pid = sysinfo::Pid::from_u32(pid);
+        let started = Instant::now();
+        loop {
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            if system.process(pid).is_none() {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_capture_is_bounded_and_reports_json_overflow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = GithubTool::new(dir.path(), Some("/bin/sh"));
+        let script = "i=0; while [ \"$i\" -lt 16000 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; i=$((i + 1)); done";
+        let both_streams_script = "i=0; while [ \"$i\" -lt 16000 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; printf 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210' >&2; i=$((i + 1)); done";
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let bounded = run_bounded_process(
+                OsStr::new("/bin/sh"),
+                &["-c", both_streams_script],
+                dir.path(),
+                Duration::from_secs(5),
+                1024,
+            )
+            .await
+            .expect("bounded subprocess capture");
+            assert!(matches!(
+                &bounded.termination,
+                ProcessTermination::Exited(status) if status.success()
+            ));
+            assert!(bounded.stdout_truncated);
+            assert!(bounded.stderr_truncated);
+            assert_eq!(bounded.stdout.len(), 1024);
+            assert_eq!(bounded.stderr.len(), MAX_GH_STDERR_BYTES as usize);
+
+            let allowed = tool
+                .run_gh_with_timeout(&["-c", script], Duration::from_secs(5), true)
+                .await
+                .expect("bounded diff-style capture");
+            assert!(allowed.truncated);
+            assert_eq!(allowed.text.len(), MAX_GH_STDOUT_BYTES as usize);
+
+            let err = tool
+                .run_gh_with_timeout(&["-c", script], Duration::from_secs(5), false)
+                .await
+                .expect_err("JSON-style output must reject an incomplete document");
+            let message = err.to_string();
+            assert!(message.contains("GH_OUTPUT_LIMIT"), "err: {message}");
+            assert!(
+                message.contains(&MAX_GH_STDOUT_BYTES.to_string()),
+                "err: {message}"
+            );
+            assert!(
+                !message.contains(script),
+                "output-limit error leaked the command payload: {message}"
+            );
+
+            let err = tool
+                .run_gh_with_timeout(
+                    &[
+                        "-c",
+                        "printf 'evidence ghp_abcdefghijklmnopqrstuvwxyz \\033]2;spoofed' >&2; exit 7",
+                    ],
+                    Duration::from_secs(5),
+                    false,
+                )
+                .await
+                .expect_err("non-zero exit must retain stderr evidence");
+            let message = err.to_string();
+            assert!(message.contains("GH_ERROR (exit 7)"), "err: {message}");
+            assert!(message.contains("evidence [REDACTED_GITHUB_PAT]"), "err: {message}");
+            assert!(!message.contains("ghp_abcdefghijklmnopqrstuvwxyz"), "err: {message}");
+            assert!(!message.contains('\x1b'), "err: {message}");
+            assert!(message.contains("\\u{1b}"), "err: {message}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_descendants_and_reaps_root_before_return() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_pid_path = dir.path().join("root.pid");
+        let leak_path = dir.path().join("leaked");
+        let script = format!(
+            "echo $$ > '{}'; (sleep 1; printf leaked > '{}') & wait",
+            root_pid_path.display(),
+            leak_path.display()
+        );
+        let tool = GithubTool::new(dir.path(), Some("/bin/sh"));
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime build");
+        let err = runtime.block_on(async {
+            tool.run_gh_with_timeout(&["-c", &script], Duration::from_millis(100), false)
+                .await
+                .expect_err("blocking process must time out")
+        });
+        assert!(err.to_string().contains("GH_TIMEOUT"), "err: {err}");
+        assert!(
+            !err.to_string().contains(&script),
+            "timeout error leaked the command payload: {err}"
+        );
+
+        let root_pid = std::fs::read_to_string(&root_pid_path)
+            .expect("root pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric root pid");
+        assert!(
+            wait_for_pid_exit(root_pid, Duration::from_secs(1)),
+            "root process {root_pid} was not reaped"
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !leak_path.exists(),
+            "descendant survived timeout and performed a delayed side effect"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_production_future_kills_tree_before_drop_returns() {
+        use futures::future::{Either, select};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_pid_path = dir.path().join("root.pid");
+        let leak_path = dir.path().join("leaked");
+        let script = format!(
+            "echo $$ > '{}'; (sleep 1; printf leaked > '{}') & wait",
+            root_pid_path.display(),
+            leak_path.display()
+        );
+        let tool = GithubTool::new(dir.path(), Some("/bin/sh"));
+        // Bind the argv outside the async block: `&["-c", &script]` would
+        // create a temporary that dies while the future still borrows it.
+        let args = ["-c", script.as_str()];
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let process = Box::pin(tool.run_gh_with_timeout(&args, Duration::from_secs(5), false));
+            let cancellation = Box::pin(asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                Duration::from_millis(100),
+            ));
+            match select(process, cancellation).await {
+                Either::Left((result, _)) => {
+                    panic!("process exited before cancellation: {result:?}")
+                }
+                Either::Right(((), pending_process)) => drop(pending_process),
+            }
+        });
+
+        let root_pid = std::fs::read_to_string(&root_pid_path)
+            .expect("root pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric root pid");
+        assert!(
+            wait_for_pid_exit(root_pid, Duration::from_millis(100)),
+            "future drop returned before root process {root_pid} was reaped"
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !leak_path.exists(),
+            "descendant survived future cancellation and performed a delayed side effect"
+        );
     }
 
     /// Hermetic execute() test with a canned `gh` stub on ghPath.
@@ -767,6 +1495,7 @@ mod tests {
                     Ok(Some(_)) => break,
                     Ok(None) if started.elapsed() > Duration::from_secs(2) => {
                         let _ = probe.kill();
+                        let _ = probe.wait();
                         eprintln!("Skipping: host stalls exec of fresh scripts (security tooling)");
                         return;
                     }
@@ -776,8 +1505,7 @@ mod tests {
             }
         }
 
-        // Real runtime: run_gh polls a std channel between wall-clock
-        // sleeps, which the deterministic test runtime never advances.
+        // Use the real runtime for wall-clock polling and real subprocess I/O.
         let runtime = asupersync::runtime::RuntimeBuilder::new()
             .build()
             .expect("runtime build");
@@ -806,7 +1534,9 @@ mod tests {
     #[test]
     fn missing_gh_is_named_error() {
         asupersync::test_utils::run_test(|| async {
-            let tool = GithubTool::new(Path::new("."), Some("/nonexistent/gh-binary"));
+            let malicious_path =
+                "/nonexistent/ghp_abcdefghijklmnopqrstuvwxyz\x1b]2;spoofed\u{202e}gh-binary";
+            let tool = GithubTool::new(Path::new("."), Some(malicious_path));
             let err = tool
                 .execute(
                     "t1",
@@ -815,7 +1545,14 @@ mod tests {
                 )
                 .await
                 .expect_err("should fail");
-            assert!(err.to_string().contains("GH_MISSING"), "err: {err}");
+            let message = err.to_string();
+            assert!(message.contains("GH_MISSING"), "err: {message}");
+            assert!(
+                !message.contains("ghp_abcdefghijklmnopqrstuvwxyz"),
+                "err: {message}"
+            );
+            assert!(!message.contains('\x1b'), "err: {message}");
+            assert!(!message.contains('\u{202e}'), "err: {message}");
         });
     }
 }
