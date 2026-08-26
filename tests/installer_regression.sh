@@ -226,6 +226,49 @@ STUB
   chmod +x "${dir}/fakebin/curl"
 }
 
+# A release artifact whose dynamic loader rejects it because the host glibc
+# is too old: the loader prints its diagnostic and the process never reaches
+# main(). Two versions are named so the highest one must be reported.
+write_loader_rejected_artifact() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  echo "$0: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.38' not found (required by $0)" >&2
+  echo "$0: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.39' not found (required by $0)" >&2
+  exit 1
+fi
+exit 0
+EOF
+  chmod +x "$path"
+}
+
+# A release artifact that fails --version for an unrelated reason; the glibc
+# guard must not misclassify it.
+write_startup_failing_artifact() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  echo "pi fixture: unrelated startup failure" >&2
+  exit 3
+fi
+exit 0
+EOF
+  chmod +x "$path"
+}
+
+assert_output_not_contains() {
+  local dir="$1"
+  local needle="$2"
+  if grep -Fq -- "$needle" "${dir}/output.log"; then
+    echo "unexpected output text: ${needle}" >&2
+    echo "--- output (${dir}) ---" >&2
+    cat "${dir}/output.log" >&2
+    return 1
+  fi
+}
+
 write_artifact_binary() {
   local path="$1"
   local mode="$2"
@@ -1962,6 +2005,116 @@ test_completions_generation_timeout_is_non_fatal() {
   assert_output_contains "$dir" "Shell:     failed (completion generation timed out)"
 }
 
+test_release_binary_needing_newer_glibc_is_not_installed() {
+  local dir artifact checksum
+  dir="$(case_dir "glibc-guard-offline")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_loader_rejected_artifact "$artifact"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${artifact}" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "The release binary needs glibc 2.39 but this system has:"
+  assert_output_contains "$dir" "Offline mode cannot fall back to a source build"
+  if [ -e "${dir}/dest/pi" ]; then
+    echo "an unloadable release binary must not be installed" >&2
+    return 1
+  fi
+}
+
+test_release_binary_needing_newer_glibc_custom_artifact_has_no_source_fallback() {
+  local dir artifact checksum
+  dir="$(case_dir "glibc-guard-custom-artifact")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_loader_rejected_artifact "$artifact"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${artifact}" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "The release binary needs glibc 2.39 but this system has:"
+  assert_output_contains "$dir" "Custom artifact cannot run here"
+  assert_output_not_contains "$dir" "Building pi from source"
+  if [ -e "${dir}/dest/pi" ]; then
+    echo "an unloadable custom artifact must not be installed" >&2
+    return 1
+  fi
+}
+
+test_glibc_guard_ignores_unrelated_startup_failures() {
+  local dir artifact checksum
+  dir="$(case_dir "glibc-guard-unrelated-failure")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_startup_failing_artifact "$artifact"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${artifact}" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  assert_output_not_contains "$dir" "needs glibc"
+  [ -x "${dir}/dest/pi" ] || {
+    echo "an unrelated --version failure must keep the previous install behavior" >&2
+    return 1
+  }
+}
+
+test_glibc_guard_only_applies_on_linux() {
+  local dir artifact checksum
+  dir="$(case_dir "glibc-guard-non-linux")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Darwin" "arm64"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_loader_rejected_artifact "$artifact"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${artifact}" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  assert_output_not_contains "$dir" "needs glibc"
+  [ -x "${dir}/dest/pi" ] || {
+    echo "the glibc guard must not run on non-Linux hosts" >&2
+    return 1
+  }
+}
+
 main() {
   if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     usage
@@ -1984,6 +2137,10 @@ main() {
   run_test test_offline_relative_tarball_path_is_accepted
   run_test test_proxy_args_are_applied_to_curl_downloads
   run_test test_linux_target_uses_supported_linux_artifact_naming
+  run_test test_release_binary_needing_newer_glibc_is_not_installed
+  run_test test_release_binary_needing_newer_glibc_custom_artifact_has_no_source_fallback
+  run_test test_glibc_guard_ignores_unrelated_startup_failures
+  run_test test_glibc_guard_only_applies_on_linux
   run_test test_rosetta_prefers_arm64_artifact_naming
   run_test test_wsl_detection_warning_is_emitted
   run_test test_installer_creates_rpi_alias_when_available

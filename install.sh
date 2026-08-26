@@ -254,6 +254,66 @@ capture_version_line() {
   printf '%s\n' "$out"
 }
 
+# Linux release binaries are dynamically linked against the glibc of the
+# machine that built them. On a host whose libc is older, the dynamic loader
+# refuses to start the program before main() runs, e.g.:
+#   pi: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found (required by pi)
+# Probe a downloaded artifact once, before it is installed, so an unloadable
+# binary never lands on PATH. Only that exact loader signature counts: any
+# other failure (or a non-Linux host) keeps the previous behavior.
+#
+# Returns 0 when the loader rejected the binary for a too-new glibc
+# requirement; sets LIBC_PROBE_REQUIRED to the highest version it asked for.
+# Returns 1 otherwise (binary runs, unrelated failure, or not applicable).
+LIBC_PROBE_REQUIRED=""
+release_binary_needs_newer_libc() {
+  local bin_path="$1"
+  LIBC_PROBE_REQUIRED=""
+  [ "$OS" = "linux" ] || return 1
+  [ -f "$bin_path" ] || return 1
+  chmod +x "$bin_path" 2>/dev/null || true
+
+  local probe_err="$TMP/libc-probe.err"
+  : > "$probe_err"
+  local timeout_cmd=""
+  timeout_cmd="$(version_timeout_cmd)"
+  local probe_rc=0
+  if [ -n "$timeout_cmd" ]; then
+    "$timeout_cmd" 20 "$bin_path" --version >/dev/null 2>"$probe_err" || probe_rc=$?
+    if [ "$probe_rc" -eq 127 ]; then
+      # Broken timeout wrapper: rerun without it (see run_command_with_timeout_capture).
+      probe_rc=0
+      "$bin_path" --version >/dev/null 2>"$probe_err" || probe_rc=$?
+    fi
+  else
+    "$bin_path" --version >/dev/null 2>"$probe_err" || probe_rc=$?
+  fi
+  if [ "$probe_rc" -eq 0 ]; then
+    return 1
+  fi
+
+  # The loader names the missing symbol version; libstdc++ variants are
+  # included so a future C++ dependency reports the same way.
+  if ! grep -Eq "version \`(GLIBC|GLIBCXX|CXXABI)_[0-9][0-9.]*' not found" "$probe_err" 2>/dev/null; then
+    return 1
+  fi
+  LIBC_PROBE_REQUIRED="$({ grep -Eo "GLIBC_[0-9][0-9.]*" "$probe_err" 2>/dev/null || true; } | sed 's/^GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1)"
+  return 0
+}
+
+# Best-effort description of the host C library for diagnostics.
+host_libc_description() {
+  local desc=""
+  desc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  if [ -z "$desc" ] && command -v ldd >/dev/null 2>&1; then
+    desc="$(ldd --version 2>/dev/null | head -1 || true)"
+  fi
+  if [ -z "$desc" ]; then
+    desc="unknown (no getconf/ldd available)"
+  fi
+  printf '%s\n' "$desc"
+}
+
 is_managed_alias() {
   local path="$1"
   [ -f "$path" ] || return 1
@@ -3495,6 +3555,26 @@ main() {
     local download_rc=0
     if run_with_spinner "Downloading release binary" download_release_binary > "$TMP/source_bin_path"; then
       source_bin=$(cat "$TMP/source_bin_path")
+      if release_binary_needs_newer_libc "$source_bin"; then
+        warn "The release binary needs glibc ${LIBC_PROBE_REQUIRED:-(newer)} but this system has: $(host_libc_description)"
+        warn "Installing it would leave a 'pi' that cannot start, so it was not installed"
+        if [ -n "$ARTIFACT_URL" ] && [ "$VERSION" = "custom-artifact" ]; then
+          err "Custom artifact cannot run here; pass --version vX.Y.Z with --artifact-url to allow a source build, or use --from-source"
+          exit 1
+        fi
+        if [ "$OFFLINE" -eq 1 ]; then
+          err "Offline mode cannot fall back to a source build; re-run with --from-source --source-dir <checkout>, or install on a system with a newer glibc"
+          exit 1
+        fi
+        warn "Falling back to building pi from source with the local Rust toolchain"
+        FROM_SOURCE=1
+        INSTALL_SOURCE="source (release binary needs newer glibc)"
+        CHECKSUM_STATUS="not applicable (source fallback)"
+        SIGSTORE_STATUS="not applicable (source fallback)"
+        check_dependencies
+        run_with_spinner "Building pi from source" build_from_source > "$TMP/source_bin_path"
+        source_bin=$(cat "$TMP/source_bin_path")
+      fi
     else
       download_rc=$?
       if [ "$download_rc" -eq 2 ] || [ "$download_rc" -eq 3 ] || [ "$download_rc" -eq 4 ]; then
