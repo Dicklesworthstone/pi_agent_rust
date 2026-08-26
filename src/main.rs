@@ -8572,12 +8572,32 @@ fn emit_json_event(event: &AgentEvent) {
     }
 }
 
+/// Terminal marker check (bd-8188r): a session-persistence failure means
+/// provider/tool side effects may already have happened while the durable
+/// record is missing or stale. Re-entering the provider (retry, credential
+/// rotation, model failover) could repeat those effects, so callers must
+/// treat this as final regardless of what the wrapped prose looks like.
+fn message_marks_session_persistence(error_text: &str) -> bool {
+    // `contains`, not `starts_with`: the flattened Display form embeds the
+    // marker after thiserror's own "Session error: " prefix. A false
+    // positive here merely refuses a retry — the safe direction.
+    error_text.contains(pi::error::Error::SESSION_PERSISTENCE_PREFIX)
+}
+
 /// Check whether a prompt result is a retryable error.
+///
+/// Session-persistence failures are never retryable, even when their wrapped
+/// message contains transient-looking phrases ("connection reset", "500"):
+/// the flattening loses the typed boundary, so the stable prefix is checked
+/// first.
 fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
     if !matches!(msg.stop_reason, StopReason::Error) {
         return false;
     }
     let err_msg = msg.error_message.as_deref().unwrap_or("Request error");
+    if message_marks_session_persistence(err_msg) {
+        return false;
+    }
     pi::error::is_retryable_error(err_msg, Some(msg.usage.input), None)
 }
 
@@ -8794,6 +8814,22 @@ where
                 // Success or non-retryable error or max retries reached.
                 let success = !matches!(msg.stop_reason, StopReason::Error);
                 if !success {
+                    // Terminal guard (bd-8188r): never walk the failover
+                    // chain for a session-persistence failure.
+                    if msg
+                        .error_message
+                        .as_deref()
+                        .is_some_and(message_marks_session_persistence)
+                    {
+                        if retry_count > 0 && is_json {
+                            emit_json_event(&AgentEvent::AutoRetryEnd {
+                                success: false,
+                                attempt: retry_count,
+                                final_error: msg.error_message.clone(),
+                            });
+                        }
+                        return Ok(msg);
+                    }
                     // Failover (bd-cv653.3.2): a classified transient failure
                     // on the final retry walks the fallback chain.
                     if let Some(_swapped) = try_print_failover(
@@ -8831,6 +8867,20 @@ where
                 return Ok(msg);
             }
             Err(err) => {
+                // Terminal guard (bd-8188r): a session-persistence failure
+                // must never reach quota bookkeeping, retry classification,
+                // or failover — the wrapped prose can look transient while
+                // repeating effects would be unsafe.
+                if err.is_session_persistence() {
+                    if retry_count > 0 && is_json {
+                        emit_json_event(&AgentEvent::AutoRetryEnd {
+                            success: false,
+                            attempt: retry_count,
+                            final_error: Some(err.to_string()),
+                        });
+                    }
+                    return Err(anyhow::Error::new(err));
+                }
                 let err_str = err.to_string();
                 // Rotation bookkeeping (bd-cv653.3.2): a 429 backs the current
                 // key off so the next resolve rotates to a healthy sibling.
@@ -10470,6 +10520,49 @@ mod tests {
             ..retryable
         };
         assert!(!is_retryable_prompt_result(&success));
+    }
+
+    /// (bd-8188r) A session-persistence failure whose wrapped prose contains
+    /// transient-looking phrases must never classify as retryable: the
+    /// flattening into `error_message` loses the typed boundary, so the
+    /// stable prefix is the only reliable signal left.
+    #[test]
+    fn is_retryable_prompt_result_rejects_session_persistence_marker() {
+        use pi::model::{AssistantMessage, Usage};
+
+        let build_error_turn = |flattened: String| AssistantMessage {
+            content: vec![],
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            stop_details: None,
+            error_message: Some(flattened),
+            timestamp: 0,
+        };
+
+        let persistence_failure = build_error_turn(format!(
+            "{}persist failed: connection reset by peer",
+            pi::error::Error::SESSION_PERSISTENCE_PREFIX
+        ));
+        assert!(!is_retryable_prompt_result(&persistence_failure));
+
+        let same_prose_without_marker =
+            build_error_turn("persist failed: connection reset by peer".to_string());
+        assert!(is_retryable_prompt_result(&same_prose_without_marker));
+    }
+
+    /// (bd-8188r) The marker helper agrees with the error constructor's
+    /// flattened form and rejects ordinary transient prose.
+    #[test]
+    fn message_marks_session_persistence_matches_error_prefix() {
+        let flattened = pi::error::Error::session_persistence("jsonl sync failed").to_string();
+        assert!(message_marks_session_persistence(&flattened));
+        assert!(!message_marks_session_persistence("connection reset"));
+        assert!(!message_marks_session_persistence(
+            "500 internal server error"
+        ));
     }
 
     /// End-to-end (`pi_agent_rust#118`): a transient connection drop must be

@@ -163,7 +163,10 @@ pub struct AuthDiagnostic {
 }
 
 impl Error {
-    const SESSION_PERSISTENCE_PREFIX: &'static str = "[SESSION_PERSISTENCE_FAILED] ";
+    /// Stable flattened-message marker for terminal session-persistence
+    /// failures. Callers that retry, rotate credentials, or fail over MUST
+    /// treat any error carrying this prefix as final (bd-8188r).
+    pub const SESSION_PERSISTENCE_PREFIX: &'static str = "[SESSION_PERSISTENCE_FAILED] ";
 
     /// Create a configuration error.
     pub fn config(message: impl Into<String>) -> Self {
