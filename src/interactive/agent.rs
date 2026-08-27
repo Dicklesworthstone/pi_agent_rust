@@ -904,6 +904,7 @@ impl PiApp {
                 self.todo_summary = summary;
             }
             PiMsg::AskUiRequest(request) => {
+                self.input_card_order.push_back(InputCardKind::Ask);
                 self.ask_ui_queue.push_back(request);
                 self.advance_ask_ui_queue();
             }
@@ -1376,9 +1377,72 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
         if request.expects_response() {
+            self.input_card_order.push_back(InputCardKind::Extension);
             self.extension_ui_queue.push_back(request);
             self.advance_extension_ui_queue();
         } else {
+            self.apply_extension_ui_effect(&request);
+        }
+        None
+    }
+
+    /// Invalidate every live or queued input card bound to the finished turn
+    /// BEFORE idle handling hands control back (bd-1qol9): asks respond as
+    /// dismissed and extension prompts receive cancelled responses so their
+    /// senders fail fast instead of leaking past the turn.
+    fn invalidate_input_cards_for_turn_end(&mut self) {
+        // Snapshot first so slot/order bookkeeping stays consistent while we
+        // drain.
+        let order = std::mem::take(&mut self.input_card_order);
+        let mut saw_kind = |slot: &mut Option<InputCardKind>, kind| {
+            if *slot == Some(kind) {
+                *slot = None;
+            }
+        };
+        if let Some(card) = self.active_ask_ui.take() {
+            let _ = &mut saw_kind;
+            self.active_input_card_kind = if self.active_input_card_kind == Some(InputCardKind::Ask)
+            {
+                None
+            } else {
+                self.active_input_card_kind
+            };
+            self.finish_ask_ui(&card, true);
+            let _ = order_front_skip(&order, InputCardKind::Ask);
+        }
+        if let Some(active) = self.active_extension_ui.take() {
+            self.active_input_card_kind =
+                (self.active_input_card_kind != Some(InputCardKind::Extension))
+                    .then_some(self.active_input_card_kind)
+                    .flatten();
+            self.send_extension_ui_response_quiet(ExtensionUiResponse {
+                id: active.id,
+                value: None,
+                cancelled: true,
+            });
+            let _ = order_front_skip(&order, InputCardKind::Extension);
+        }
+        for kind in order {
+            match kind {
+                InputCardKind::Ask => {
+                    if let Some(request) = self.ask_ui_queue.pop_front() {
+                        let _ = request;
+                    }
+                }
+                InputCardKind::Extension => {
+                    if let Some(request) = self.extension_ui_queue.pop_front() {
+                        self.send_extension_ui_response_quiet(ExtensionUiResponse {
+                            id: request.id,
+                            value: None,
+                            cancelled: true,
+                        });
+                    }
+                }
+            }
+        }
+        self.active_input_card_kind = None;
+        self.restore_card_draft_after_cards_settle();
+    }
             self.apply_extension_ui_effect(&request);
         }
         None

@@ -1838,6 +1838,16 @@ pub(crate) struct ActiveAskCard {
     pub(crate) answers: Vec<crate::ask::AskAnswer>,
 }
 
+/// Which kind of input card currently owns the editor (bd-1qol9).
+///
+/// Exactly one may be active at a time; `PiApp::input_card_order` preserves
+/// global arrival order across both kinds so answers can never reorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputCardKind {
+    Ask,
+    Extension,
+}
+
 /// Custom message types for async agent events.
 #[derive(Debug, Clone)]
 pub enum PiMsg {
@@ -2435,6 +2445,15 @@ pub struct PiApp {
     ask_tool: Option<crate::ask::AskTool>,
     ask_ui_queue: VecDeque<crate::ask::AskUiRequest>,
     active_ask_ui: Option<ActiveAskCard>,
+    /// bd-1qol9: globally ordered, mutually exclusive input-card state.
+    /// One of {Ask, Extension} matches whichever slot above holds a card.
+    active_input_card_kind: Option<InputCardKind>,
+    /// Global arrival order across BOTH card kinds; activation pops the head
+    /// once its slot frees up.
+    input_card_order: VecDeque<InputCardKind>,
+    /// Draft captured on FIRST card activation of a turn and restored after
+    /// the final card resolves (explicit merge: only into an empty editor).
+    card_draft_snapshot: Option<String>,
     extension_custom_overlay: Option<ExtensionCustomOverlay>,
     extension_custom_active: bool,
     extension_custom_key_queue: VecDeque<String>,
@@ -2821,6 +2840,9 @@ impl PiApp {
             ask_tool: None,
             ask_ui_queue: VecDeque::new(),
             active_ask_ui: None,
+            active_input_card_kind: None,
+            input_card_order: VecDeque::new(),
+            card_draft_snapshot: None,
             extension_custom_overlay: None,
             extension_custom_active: false,
             extension_custom_key_queue: VecDeque::new(),
