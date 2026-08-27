@@ -748,6 +748,13 @@ fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) 
     }
 }
 
+#[derive(Debug, Clone)]
+struct RpcFailoverPrimary {
+    provider: String,
+    model_id: String,
+    requested_thinking_level: ThinkingLevel,
+}
+
 #[derive(Debug)]
 struct RpcSharedState {
     steering: VecDeque<QueuedAgentMessage>,
@@ -767,7 +774,7 @@ struct RpcSharedState {
     /// The provider/model active before the first failover in the current
     /// chain. This identity is explicit because the Session header and newest
     /// ModelChange both advance to the fallback during a committed failover.
-    failover_primary_model: Option<(String, String)>,
+    failover_primary: Option<RpcFailoverPrimary>,
     active_failover_model: Option<(String, String)>,
     /// Position of the last used entry in the active chain (per-chain walk).
     failover_chain_position: Option<usize>,
@@ -867,7 +874,7 @@ impl RpcSharedState {
                 .as_ref()
                 .and_then(|r| r.fallback_chains.as_ref())
                 .map(|_| crate::failover::CooldownTracker::new(config.failover_cooldown_secs())),
-            failover_primary_model: None,
+            failover_primary: None,
             active_failover_model: None,
             failover_chain_position: None,
             provider_admission,
@@ -1036,7 +1043,7 @@ impl RpcSharedState {
     }
 
     fn clear_failover_lifecycle(&mut self) {
-        self.failover_primary_model = None;
+        self.failover_primary = None;
         self.active_failover_model = None;
         self.failover_chain_position = None;
         if let Some(tracker) = self.failover_cooldown.as_mut() {
