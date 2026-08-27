@@ -224,6 +224,20 @@ struct ServerEntry {
     tools_cache: Mutex<Option<(Instant, Vec<McpToolMeta>)>>,
     health: Mutex<ServerHealth>,
     restarts: Mutex<RestartState>,
+    /// bd-hyik7: extension-supplied working-directory override for this
+    /// server; relative spec values anchor to the manager cwd at
+    /// registration so the bound identity stays deterministic.
+    cwd_override: Option<PathBuf>,
+}
+
+impl ServerEntry {
+    /// The working directory every execution-relevant decision (fingerprint,
+    /// identity, spawn) must use for this entry (bd-hyik7).
+    fn effective_cwd(&self, manager_default: &Path) -> PathBuf {
+        self.cwd_override
+            .clone()
+            .unwrap_or_else(|| manager_default.to_path_buf())
+    }
 }
 
 /// Owns a transport until its initialize handshake is published. Dropping a
@@ -326,6 +340,7 @@ impl McpManager {
             .map(|config| {
                 let entry = Arc::new(ServerEntry {
                     config,
+                    cwd_override: None,
                     connect_lane: Arc::new(asupersync::sync::Mutex::new(())),
                     transport: Mutex::new(None),
                     tools_cache: Mutex::new(None),
@@ -377,6 +392,16 @@ impl McpManager {
         config.fingerprint(&self.inner.cwd)
     }
 
+    /// bd-hyik7: fingerprint honoring a per-entry cwd override (extension
+    /// servers may carry their own working directory; the fingerprint binds
+    /// every execution-relevant field, cwd included). Prefer this whenever
+    /// the caller holds the [`ServerEntry`].
+    fn trust_fingerprint_for(&self, entry: &Arc<ServerEntry>) -> String {
+        entry
+            .config
+            .fingerprint(&entry.effective_cwd(&self.inner.cwd))
+    }
+
     fn check_running(&self) -> Result<()> {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             Err(tool_err(
@@ -405,7 +430,7 @@ impl McpManager {
             .values()
             .map(|entry| {
                 let config = &entry.config;
-                let fingerprint = self.trust_fingerprint(config);
+                let fingerprint = self.trust_fingerprint_for(entry);
                 let decision = store.decision(&config.name, &fingerprint);
                 let trust = match decision {
                     TrustDecision::Acknowledged => "acknowledged",
@@ -452,14 +477,14 @@ impl McpManager {
     /// the eager connect fails (the trust decision still stands).
     pub async fn trust(&self, name: &str) -> Result<Vec<McpToolMeta>> {
         let entry = self.entry(name)?;
-        let fingerprint = self.trust_fingerprint(&entry.config);
+        let fingerprint = self.trust_fingerprint_for(&entry);
         {
             let _guard = Self::lock(&self.inner.trust_lock);
             // bd-sp5o3: resolve and bind the CANONICAL executable identity
             // the operator is approving — never ack on the raw string alone.
             let identity = entry
                 .config
-                .execution_identity(&self.inner.cwd)
+                .execution_identity(&entry.effective_cwd(&self.inner.cwd))
                 .map_err(|err| {
                     tool_err(
                         "MCP_TRUST_UNRESOLVED",
@@ -510,7 +535,7 @@ impl McpManager {
             asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
                 .await
                 .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while denying server"))?;
-        let fingerprint = self.trust_fingerprint(&entry.config);
+        let fingerprint = self.trust_fingerprint_for(&entry);
         {
             let _guard = Self::lock(&self.inner.trust_lock);
             let mut store = TrustStore::load(&self.inner.trust_path)?;
@@ -770,7 +795,7 @@ impl McpManager {
     fn check_trust(&self, entry: &Arc<ServerEntry>) -> Result<()> {
         let decision = self
             .trust_store()?
-            .decision(&entry.config.name, &self.trust_fingerprint(&entry.config));
+            .decision(&entry.config.name, &self.trust_fingerprint_for(&entry));
         match decision {
             TrustDecision::Acknowledged => Ok(()),
             TrustDecision::Pending => Err(tool_err(
@@ -1083,7 +1108,7 @@ impl McpManager {
 
     async fn spawn_transport(&self, entry: &Arc<ServerEntry>) -> Result<Box<dyn McpTransport>> {
         let config = entry.config.clone();
-        let cwd = self.inner.cwd.clone();
+        let cwd = entry.effective_cwd(&self.inner.cwd);
         let trust_path = self.inner.trust_path.clone();
         #[cfg(test)]
         let factory = Self::lock(&self.inner.transport_factory).clone();
@@ -1365,7 +1390,7 @@ impl McpManager {
         servers
             .values()
             .filter_map(|entry| {
-                if store.decision(&entry.config.name, &self.trust_fingerprint(&entry.config))
+                if store.decision(&entry.config.name, &self.trust_fingerprint_for(&entry))
                     != TrustDecision::Acknowledged
                 {
                     return None;
@@ -1456,7 +1481,7 @@ impl McpManager {
         let mut tracked = Vec::new();
         let mut pending = Vec::new();
         for entry in servers.values().filter(|entry| {
-            store.decision(&entry.config.name, &self.trust_fingerprint(&entry.config))
+            store.decision(&entry.config.name, &self.trust_fingerprint_for(&entry))
                 == TrustDecision::Acknowledged
         }) {
             let entry = Arc::clone(entry);
@@ -1636,8 +1661,33 @@ impl McpManager {
             );
             return;
         }
+        // bd-hyik7: preserve the spec's working-directory intent, anchored
+        // against the manager cwd when relative so the bound identity and
+        // spawn environment stay deterministic.
+        let cwd_override = match optional_string(spec, "cwd") {
+            Ok(Some(raw)) => {
+                let raw_path = PathBuf::from(raw.trim());
+                let anchored = if raw_path.is_absolute() {
+                    raw_path
+                } else {
+                    self.inner.cwd.join(raw_path)
+                };
+                std::fs::canonicalize(&anchored).unwrap_or(anchored).into()
+            }
+            Ok(None) => None,
+            Err(reason) => {
+                tracing::warn!(
+                    event = "pi.mcp.extension_config_rejected",
+                    server = name,
+                    %reason,
+                    "extension MCP server configuration rejected"
+                );
+                return;
+            }
+        };
         let entry = Arc::new(ServerEntry {
             config,
+            cwd_override,
             connect_lane: Arc::new(asupersync::sync::Mutex::new(())),
             transport: Mutex::new(None),
             tools_cache: Mutex::new(None),
@@ -2065,7 +2115,7 @@ mod tests {
             },
         );
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         TrustStore::load(&global.join("mcp-trust.json"))
             .expect("load trust")
             .acknowledge("fixture", &fingerprint, "operator")
@@ -2295,7 +2345,7 @@ mod tests {
             },
         );
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
         trust
             .acknowledge("fixture", &fingerprint, "operator")
@@ -2381,7 +2431,7 @@ mod tests {
             },
         );
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
         trust
             .acknowledge("fixture", &fingerprint, "operator")
@@ -2575,7 +2625,7 @@ mod tests {
             },
         );
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
         trust
             .acknowledge("fixture", &fingerprint, "operator")
@@ -2633,7 +2683,7 @@ mod tests {
             },
         );
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
         trust
             .acknowledge("fixture", &fingerprint, "operator")
@@ -2751,7 +2801,7 @@ mod tests {
             },
         );
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
         trust
             .acknowledge("fixture", &fingerprint, "operator")
@@ -3006,7 +3056,7 @@ mod tests {
             },
         ));
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         let trust_path = global.join("mcp-trust.json");
         TrustStore::load(&trust_path)
             .expect("load trust")
@@ -3119,7 +3169,7 @@ mod tests {
             },
         ));
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
         trust
             .acknowledge("fixture", &fingerprint, "operator")
@@ -3236,7 +3286,7 @@ mod tests {
             },
         ));
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint(&entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&entry);
         let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
         trust
             .acknowledge("fixture", &fingerprint, "operator")
@@ -3292,6 +3342,83 @@ mod tests {
             "the manager observing revocation must close its transport"
         );
         assert!(McpManager::lock(&entry.transport).is_none());
+    }
+
+    // ===== bd-hyik7: extension spec field preservation =====
+
+    /// Authenticated HTTP extension servers keep their configured headers
+    /// through normalization.
+    #[test]
+    fn extension_registration_preserves_http_headers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _entry_unused) = trusted_fixture_manager(&temp);
+        manager.register_extension_server(
+            "auth-http",
+            &serde_json::json!({
+                "url": "https://example.invalid/mcp",
+                "transport": "http",
+                "headers": {"Authorization": "Bearer abc"}
+            }),
+        );
+        let entry = manager.entry("auth-http").expect("registered");
+        assert_eq!(
+            entry.config.headers,
+            vec![("Authorization".to_string(), "Bearer abc".to_string())]
+        );
+    }
+
+    /// stdio cwd intent is honored: the per-entry override anchors relative
+    /// commands, and the bound fingerprint changes with it.
+    #[test]
+    fn extension_registration_honors_cwd_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, fixture_entry) = trusted_fixture_manager(&temp);
+        let helper_dir = temp.path().join("ext-cwd");
+        std::fs::create_dir_all(&helper_dir).expect("mkdir ext cwd");
+
+        manager.register_extension_server(
+            "cwd-srv",
+            &serde_json::json!({
+                "command": "./serve.sh",
+                "type": "stdio",
+                "cwd": helper_dir.display().to_string()
+            }),
+        );
+        let entry = manager.entry("cwd-srv").expect("registered cwd server");
+        assert_eq!(
+            entry.cwd_override.as_ref().map(PathBuf::as_path),
+            Some(helper_dir.as_path()),
+            "cwd override stored (canonicalized)"
+        );
+
+        let with_override = manager.trust_fingerprint_for(&entry);
+        let without_override = manager.trust_fingerprint(&entry.config);
+        assert_ne!(
+            with_override, without_override,
+            "fingerprint must bind the per-entry cwd"
+        );
+        assert_ne!(
+            manager.trust_fingerprint_for(&fixture_entry),
+            with_override,
+            "unrelated entry unaffected"
+        );
+    }
+
+    /// Malformed header shapes fail closed: registration is rejected and no
+    /// entry exists.
+    #[test]
+    fn extension_registration_rejects_malformed_headers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _unused) = trusted_fixture_manager(&temp);
+        manager.register_extension_server(
+            "bad-headers",
+            &serde_json::json!({
+                "url": "https://example.invalid/mcp",
+                "transport": "http",
+                "headers": {"Authorization": 42}
+            }),
+        );
+        assert!(manager.entry("bad-headers").is_err());
     }
 
     /// bd-vjfol (defect b): `/mcp test` deliberately resets the restart
@@ -3363,7 +3490,7 @@ mod tests {
             }),
         );
         let ext_entry = manager.entry("ext-srv").expect("ext entry");
-        let fingerprint = manager.trust_fingerprint(&ext_entry.config);
+        let fingerprint = manager.trust_fingerprint_for(&ext_entry);
         // Extension-provided definitions reach the SAME trust gate; a spec
         // acknowledged up front participates in the startup pass.
         TrustStore::load(&manager.inner.trust_path)

@@ -4271,7 +4271,10 @@ mod stream_delta_batcher_tests {
                 Ordering::SeqCst,
             );
             self.state.saw_expected_system_prompt.store(
-                context.system_prompt == Some(self.expected_system_prompt.as_ref()),
+                context
+                    .system_prompt
+                    .as_deref()
+                    .is_some_and(|prompt| prompt == self.expected_system_prompt),
                 Ordering::SeqCst,
             );
 

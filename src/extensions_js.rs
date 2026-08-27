@@ -20900,13 +20900,34 @@ function __pi_register_mcp_server(name, spec) {
         }
     }
 
+    // bd-hyik7: headers previously dropped here, silently stripping
+    // authentication from authenticated HTTP extension servers.
+    let headers = undefined;
+    if (spec.headers !== undefined && spec.headers !== null) {
+        if (typeof spec.headers !== 'object' || Array.isArray(spec.headers)) {
+            throw new Error('registerMcpServer: spec.headers must be an object');
+        }
+        headers = Object.create(null);
+        for (const [key, value] of Object.entries(spec.headers)) {
+            headers[String(key)] = String(value);
+        }
+    }
+
+    // bd-hyik7: preserve the `type` alias alongside `transport` so the
+    // unified manager's disagreement check sees both spellings.
+    const typeAlias = spec.type !== undefined && spec.type !== null
+        ? String(spec.type).trim()
+        : undefined;
+
     const mcpSpec = {
         name: serverName,
         transport: spec.transport ? String(spec.transport) : undefined,
+        type: typeAlias,
         command: command || undefined,
         url: url || undefined,
         args: args,
         env: env,
+        headers: headers,
     };
     if (spec.description !== undefined) {
         mcpSpec.description = String(spec.description);
