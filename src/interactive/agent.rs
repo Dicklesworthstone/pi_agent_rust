@@ -870,16 +870,48 @@ async fn flush_ui_stream_batcher_with_backpressure(batcher: &StdMutex<UiStreamDe
     }
 }
 
+enum SessionEventOwnership {
+    Current,
+    Stale,
+    Busy,
+}
+
 impl PiApp {
-    fn event_session_is_current(&self, expected_session_id: &str) -> bool {
-        self.session
-            .try_lock()
-            .is_ok_and(|session| session.header.id.as_str() == expected_session_id)
+    fn session_event_ownership(&self, expected_session_id: &str) -> SessionEventOwnership {
+        match self.session.try_lock() {
+            Ok(session) if session.header.id == expected_session_id => {
+                SessionEventOwnership::Current
+            }
+            Ok(_) => SessionEventOwnership::Stale,
+            Err(_) => SessionEventOwnership::Busy,
+        }
+    }
+
+    fn retry_busy_session_event(
+        &mut self,
+        event: PiMsg,
+        attempts_remaining: u8,
+    ) -> Option<Cmd> {
+        let retry = session_event_retry_cmd(event, attempts_remaining);
+        if retry.is_none() {
+            self.status_message = Some(
+                "Session remained busy; a delayed session update was not applied".to_string(),
+            );
+        }
+        retry
     }
 
     /// Handle custom Pi messages from the agent.
-    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_pi_message(&mut self, msg: PiMsg) -> Option<Cmd> {
+        self.handle_pi_message_with_session_retry(msg, SESSION_EVENT_LOCK_RETRY_ATTEMPTS)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_pi_message_with_session_retry(
+        &mut self,
+        msg: PiMsg,
+        attempts_remaining: u8,
+    ) -> Option<Cmd> {
         match msg {
             PiMsg::AgentStart => {
                 self.agent_state = AgentState::Processing;
@@ -891,15 +923,34 @@ impl PiApp {
                 return self.run_next_pending();
             }
             PiMsg::EnqueuePendingInput { session_id, input } => {
-                if self.agent_state != AgentState::Idle
-                    || !self.event_session_is_current(&session_id)
-                {
+                if self.agent_state != AgentState::Idle {
                     return None;
+                }
+                match self.session_event_ownership(&session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => return None,
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::EnqueuePendingInput { session_id, input },
+                            attempts_remaining,
+                        );
+                    }
                 }
                 self.pending_inputs.push_back(input);
                 if self.agent_state == AgentState::Idle {
                     return self.run_next_pending();
                 }
+            }
+            PiMsg::SessionEventRetry {
+                event,
+                attempts_remaining,
+            } => {
+                if matches!(event.as_ref(), PiMsg::SessionEventRetry { .. }) {
+                    self.status_message =
+                        Some("Rejected nested session-event retry envelope".to_string());
+                    return None;
+                }
+                return self.handle_pi_message_with_session_retry(*event, attempts_remaining);
             }
             PiMsg::UiShutdown => {
                 // Internal signal for shutting down the async→UI bridge; should not normally reach
@@ -1097,13 +1148,26 @@ impl PiApp {
                 // during the title call always wins), the originating session
                 // is still current, and persistence is on.
                 if self.save_enabled {
-                    if let Ok(mut guard) = self.session.try_lock()
-                        && guard.header.id == owner_session_id
-                        && guard.get_name().is_none()
-                    {
-                        guard.set_name(&title);
-                        drop(guard);
-                        self.status_message = Some(format!("Session named: {title}"));
+                    let session = Arc::clone(&self.session);
+                    match session.try_lock() {
+                        Ok(mut guard)
+                            if guard.header.id == owner_session_id
+                                && guard.get_name().is_none() =>
+                        {
+                            guard.set_name(&title);
+                            drop(guard);
+                            self.status_message = Some(format!("Session named: {title}"));
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            return self.retry_busy_session_event(
+                                PiMsg::SessionTitleSuggestion {
+                                    owner_session_id,
+                                    title,
+                                },
+                                attempts_remaining,
+                            );
+                        }
                     }
                 }
             }
@@ -1187,8 +1251,18 @@ impl PiApp {
                 owner_session_id,
                 message,
             } => {
-                if !self.event_session_is_current(&owner_session_id) {
-                    return None;
+                match self.session_event_ownership(&owner_session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => return None,
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::SessionSystemNote {
+                                owner_session_id,
+                                message,
+                            },
+                            attempts_remaining,
+                        );
+                    }
                 }
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
@@ -1270,8 +1344,20 @@ After approving access in the browser, press Enter in Pi to complete login."
                 usage,
                 status,
             } => {
-                if !self.event_session_is_current(&session_id) {
-                    return None;
+                match self.session_event_ownership(&session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => return None,
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::ConversationReset {
+                                session_id,
+                                messages,
+                                usage,
+                                status,
+                            },
+                            attempts_remaining,
+                        );
+                    }
                 }
                 let is_replacement =
                     self.displayed_session_id.as_deref() != Some(session_id.as_str());
@@ -1306,8 +1392,18 @@ After approving access in the browser, press Enter in Pi to complete login."
                 owner_session_id,
                 text,
             } => {
-                if !self.event_session_is_current(&owner_session_id) {
-                    return None;
+                match self.session_event_ownership(&owner_session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => return None,
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::SetEditorText {
+                                owner_session_id,
+                                text,
+                            },
+                            attempts_remaining,
+                        );
+                    }
                 }
                 self.input.set_value(&text);
                 self.input.focus();
@@ -1322,9 +1418,19 @@ After approving access in the browser, press Enter in Pi to complete login."
                     return None;
                 }
 
-                let Ok(session_guard) = self.session.try_lock() else {
-                    self.status_message = Some("Session busy; try again".to_string());
-                    return None;
+                let session = Arc::clone(&self.session);
+                let session_guard = match session.try_lock() {
+                    Ok(session_guard) => session_guard,
+                    Err(_) => {
+                        return self.retry_busy_session_event(
+                            PiMsg::OpenTree {
+                                owner_session_id,
+                                initial_selected_id,
+                                label,
+                            },
+                            attempts_remaining,
+                        );
+                    }
                 };
                 if session_guard.header.id != owner_session_id {
                     return None;
@@ -5000,6 +5106,58 @@ mod stream_delta_batcher_tests {
         assert_eq!(
             app.displayed_session_id.as_deref(),
             Some(replacement_session_id.as_str())
+        );
+    }
+
+    #[test]
+    fn contended_current_session_reset_is_retried_then_applied() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+        app.agent_state = AgentState::Processing;
+        app.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: "pre-reset state".to_string(),
+            thinking: None,
+            collapsed: false,
+        });
+
+        let session = Arc::clone(&app.session);
+        let session_guard = session.try_lock().expect("hold session lock");
+        let retry = app.handle_pi_message(PiMsg::ConversationReset {
+            session_id: session_id.clone(),
+            messages: Vec::new(),
+            usage: Usage::default(),
+            status: Some("Conversation compacted".to_string()),
+        });
+        assert!(
+            retry.is_some(),
+            "a current-session event must be retried when only the lock is busy"
+        );
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert_eq!(app.messages.len(), 1);
+        drop(session_guard);
+
+        let completed = app.handle_pi_message(PiMsg::SessionEventRetry {
+            event: Box::new(PiMsg::ConversationReset {
+                session_id,
+                messages: Vec::new(),
+                usage: Usage::default(),
+                status: Some("Conversation compacted".to_string()),
+            }),
+            attempts_remaining: SESSION_EVENT_LOCK_RETRY_ATTEMPTS - 1,
+        });
+        assert!(completed.is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.messages.is_empty());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Conversation compacted")
         );
     }
 

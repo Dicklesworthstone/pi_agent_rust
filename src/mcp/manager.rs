@@ -512,6 +512,41 @@ impl McpManager {
         Ok(())
     }
 
+    /// bd-vjfol: tear down every live transport and await child exit.
+    ///
+    /// FTUI `/new` and `/resume` must guarantee singleton shutdown before
+    /// swapping manager handles: dropping the old manager only aborts
+    /// transports without awaiting stdio children. This detaches all live
+    /// handles under each entry's short lock, then awaits `close()` outside
+    /// those locks so one slow child cannot serialize unrelated entries.
+    ///
+    /// Runtime-only teardown: persisted trust, definitions, provenance, and
+    /// on-disk caches are untouched; per-entry slots reset to `NotStarted`
+    /// exactly like [`Self::deny`] does for a single server. Returns the
+    /// names of transports that were actually closed (empty when idle).
+    pub async fn shutdown_all(&self) -> Vec<String> {
+        let servers = Self::lock(&self.inner.servers).clone();
+        let detached: Vec<(String, Arc<dyn McpTransport>)> = servers
+            .iter()
+            .filter_map(|(name, entry)| {
+                Self::lock(&entry.transport)
+                    .take()
+                    .map(|transport| (name.clone(), transport))
+            })
+            .collect();
+
+        let mut closed: Vec<String> = Vec::with_capacity(detached.len());
+        for (name, transport) in detached {
+            transport.close().await;
+            if let Some(entry) = servers.get(&name) {
+                *Self::lock(&entry.health) = ServerHealth::NotStarted;
+                Self::lock(&entry.tools_cache).take();
+            }
+            closed.push(name);
+        }
+        closed
+    }
+
     /// Ping + tool list (the `/mcp test` surface).
     ///
     /// # Errors

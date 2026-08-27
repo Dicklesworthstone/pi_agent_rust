@@ -135,9 +135,10 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// `Instant` overflow never turns a valid request into a panic.
 const MAX_ASYNC_WAIT_SLICE: Duration = Duration::from_secs(60 * 60);
 
-/// Maximum undelivered completion notices across background job and `/tan`
-/// producers. The oldest notice is discarded first if a session never
-/// reaches another delivery boundary.
+/// Maximum completion notices retained per session in each storage tier: the
+/// registry and the Agent's one staged batch. A transition can therefore
+/// temporarily hold two batches; restoring the older staged batch reapplies
+/// this newest-wins cap and emits telemetry for any eviction.
 pub(crate) const MAX_COMPLETION_NOTICES_PER_SESSION: usize = 64;
 
 /// Process-wide backstop across many session identities in a long-lived RPC
@@ -1593,13 +1594,27 @@ pub(crate) fn restore_completion_notices(notices: Vec<(String, Message)>) {
     let mut reg = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dropped = restore_completion_notices_into(&mut reg, restored);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "restored completion notices exceeded bounded retention; discarded oldest notices"
+        );
+    }
+}
+
+fn restore_completion_notices_into(
+    reg: &mut JobRegistry,
+    restored: Vec<CompletionNotice>,
+) -> usize {
     for notice in restored.into_iter().rev() {
         reg.notices.push_front(notice);
     }
-    prune_completion_notices(&mut reg);
+    prune_completion_notices(reg)
 }
 
-fn prune_completion_notices(reg: &mut JobRegistry) {
+fn prune_completion_notices(reg: &mut JobRegistry) -> usize {
+    let before = reg.notices.len();
     let mut owner_counts = HashMap::<String, usize>::new();
     for notice in &reg.notices {
         *owner_counts
@@ -1621,6 +1636,7 @@ fn prune_completion_notices(reg: &mut JobRegistry) {
     while reg.notices.len() > MAX_TOTAL_COMPLETION_NOTICES {
         let _ = reg.notices.pop_front();
     }
+    before.saturating_sub(reg.notices.len())
 }
 
 fn completion_notice_message(text: String) -> Message {
@@ -2333,6 +2349,60 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.text == format!("notice-{MAX_TOTAL_COMPLETION_NOTICES}")));
+    }
+
+    #[test]
+    fn restored_completion_notices_preserve_fifo_before_newer_registry_entries() {
+        let mut reg = JobRegistry::default();
+        enqueue_completion_notice(&mut reg, "owner-a", "newer".to_string());
+        let restored = ["older-1", "older-2"]
+            .into_iter()
+            .map(|text| CompletionNotice {
+                owner_session_id: "owner-a".to_string(),
+                text: text.to_string(),
+            })
+            .collect();
+
+        assert_eq!(restore_completion_notices_into(&mut reg, restored), 0);
+        assert_eq!(
+            reg.notices
+                .iter()
+                .map(|notice| notice.text.as_str())
+                .collect::<Vec<_>>(),
+            ["older-1", "older-2", "newer"]
+        );
+    }
+
+    #[test]
+    fn saturated_restore_keeps_the_newest_per_owner_batch() {
+        let mut reg = JobRegistry::default();
+        for index in MAX_COMPLETION_NOTICES_PER_SESSION
+            ..MAX_COMPLETION_NOTICES_PER_SESSION.saturating_mul(2)
+        {
+            enqueue_completion_notice(&mut reg, "owner-a", format!("notice-{index}"));
+        }
+        let restored = (0..MAX_COMPLETION_NOTICES_PER_SESSION)
+            .map(|index| CompletionNotice {
+                owner_session_id: "owner-a".to_string(),
+                text: format!("notice-{index}"),
+            })
+            .collect();
+
+        assert_eq!(
+            restore_completion_notices_into(&mut reg, restored),
+            MAX_COMPLETION_NOTICES_PER_SESSION
+        );
+        assert_eq!(reg.notices.len(), MAX_COMPLETION_NOTICES_PER_SESSION);
+        assert_eq!(
+            reg.notices
+                .front()
+                .map(|notice| notice.text.as_str()),
+            Some("notice-64")
+        );
+        assert_eq!(
+            reg.notices.back().map(|notice| notice.text.as_str()),
+            Some("notice-127")
+        );
     }
 
     #[test]

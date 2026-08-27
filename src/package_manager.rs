@@ -242,6 +242,9 @@ impl PackageManager {
     pub const fn new(cwd: PathBuf) -> Self {
         Self {
             cwd,
+            // Callers that have an established workspace-trust decision must
+            // override this explicitly. The CLI and SDK startup paths do so;
+            // the default preserves the direct PackageManager API contract.
             project_trust: true,
         }
     }
@@ -463,7 +466,7 @@ impl PackageManager {
 
     /// Synchronous variant of [`Self::list_packages`] for startup fast paths.
     pub fn list_packages_blocking(&self) -> Result<Vec<PackageEntry>> {
-        let roots = ResolveRoots::from_env(&self.cwd);
+        let roots = self.effective_roots();
         Self::list_packages_with_roots(&roots)
     }
 
@@ -498,7 +501,7 @@ impl PackageManager {
     /// install/update behavior (for example, missing npm/git package files), allowing callers
     /// to fall back to the canonical async `resolve()` path.
     pub fn resolve_package_resources_blocking(&self) -> Result<Option<ResolvedPaths>> {
-        let roots = ResolveRoots::from_env(&self.cwd);
+        let roots = self.effective_roots();
         self.resolve_package_resources_with_roots_blocking(&roots)
     }
 
@@ -672,7 +675,10 @@ impl PackageManager {
     /// project resources (see `test_config_override_roots_ignore_project_
     /// package_filters` for what a disabled flag excludes).
     fn effective_roots(&self) -> ResolveRoots {
-        let mut roots = ResolveRoots::from_env(&self.cwd);
+        self.apply_project_trust(ResolveRoots::from_env(&self.cwd))
+    }
+
+    fn apply_project_trust(&self, mut roots: ResolveRoots) -> ResolveRoots {
         roots.project_settings_enabled &= self.project_trust;
         roots
     }
@@ -4955,6 +4961,54 @@ mod tests {
                 "untrusted workspaces must resolve with project settings disabled"
             );
         }
+    }
+
+    #[test]
+    fn project_trust_filters_blocking_package_listing_roots() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cwd = temp_dir.path().join("workspace");
+        let global_dir = temp_dir.path().join("global");
+        let project_dir = cwd.join(".pi");
+        fs::create_dir_all(&global_dir).expect("create global dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            global_dir.join("settings.json"),
+            r#"{"packages":["npm:global-pkg"]}"#,
+        )
+        .expect("write global settings");
+        fs::write(
+            project_dir.join("settings.json"),
+            r#"{"packages":["npm:project-pkg"]}"#,
+        )
+        .expect("write project settings");
+        let roots = ResolveRoots {
+            global_settings_path: global_dir.join("settings.json"),
+            project_settings_path: project_dir.join("settings.json"),
+            global_base_dir: global_dir,
+            project_base_dir: project_dir,
+            project_settings_enabled: true,
+        };
+
+        let trusted = PackageManager::new(cwd.clone());
+        let trusted_packages = PackageManager::list_packages_with_roots(
+            &trusted.apply_project_trust(roots.clone()),
+        )
+        .expect("list trusted packages");
+        assert_eq!(trusted_packages.len(), 2);
+        assert!(
+            trusted_packages
+                .iter()
+                .any(|entry| entry.source == "npm:project-pkg")
+        );
+
+        let untrusted = PackageManager::new(cwd).with_project_trust(false);
+        let untrusted_packages = PackageManager::list_packages_with_roots(
+            &untrusted.apply_project_trust(roots),
+        )
+        .expect("list untrusted packages");
+        assert_eq!(untrusted_packages.len(), 1);
+        assert_eq!(untrusted_packages[0].source, "npm:global-pkg");
+        assert_eq!(untrusted_packages[0].scope, PackageScope::User);
     }
 
     #[test]

@@ -2684,6 +2684,31 @@ impl Agent {
                     break 'agent;
                 }
 
+                let delivering_follow_up = follow_up_staged;
+                if delivering_follow_up {
+                    let current_follow_up = self.pop_follow_up_for_current_session().await;
+                    follow_up_staged = false;
+                    required_initial_follow_up_pending = false;
+                    if current_follow_up.is_empty() {
+                        // The session changed after staging and every queued
+                        // job notice belonged to the previous owner. Reach the
+                        // normal idle restaging boundary without emitting a
+                        // lifecycle start or invoking the provider empty.
+                        has_more_tool_calls = false;
+                        break;
+                    }
+                    // Follow-ups are new logical user turns. Restore the
+                    // caller's baseline before scanning their keywords so
+                    // steering-only effort and directives cannot leak across
+                    // the boundary.
+                    self.config.stream_options.thinking_level = turn_baseline_thinking;
+                    self.config
+                        .system_prompt
+                        .clone_from(&turn_baseline_system_prompt);
+                    turn_keyword_words.clear();
+                    pending_messages = current_follow_up;
+                }
+
                 let current_turn_index = turn_index;
                 let turn_latency = Arc::new(StdMutex::new(TurnLatencyAccumulator::started()));
                 let turn_start_event = AgentEvent::TurnStart {
@@ -2694,22 +2719,6 @@ impl Agent {
                 self.dispatch_extension_lifecycle_event(&turn_start_event)
                     .await;
                 on_event(turn_start_event);
-
-                let delivering_follow_up = follow_up_staged;
-                if delivering_follow_up {
-                    // Follow-ups are new logical user turns. Restore the
-                    // caller's baseline before scanning their keywords so
-                    // steering-only effort and directives cannot leak across
-                    // the boundary.
-                    self.config.stream_options.thinking_level = turn_baseline_thinking;
-                    self.config
-                        .system_prompt
-                        .clone_from(&turn_baseline_system_prompt);
-                    turn_keyword_words.clear();
-                    pending_messages = self.pop_follow_up_for_current_session().await;
-                    follow_up_staged = false;
-                    required_initial_follow_up_pending = false;
-                }
 
                 for delivery in std::mem::take(&mut pending_messages) {
                     self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
@@ -3309,7 +3318,8 @@ impl Agent {
             for message in owning_surface {
                 // The owning surface already applied its queue mode and
                 // admission bound. Preserve its complete accepted batch until
-                // the synchronous delivery point after TurnStart.
+                // the owner-validated delivery point immediately before
+                // TurnStart.
                 self.message_queue.push_follow_up_lossless(message);
             }
         }
@@ -3320,7 +3330,7 @@ impl Agent {
             // continuously replenished RPC queue cannot starve the notice
             // registry until its oldest completions are evicted.
             self.fetch_job_follow_up_messages().await;
-            return true;
+            return self.message_queue.follow_up_batch_len() > 0;
         }
 
         self.fetch_additive_follow_up_messages().await;
@@ -13902,6 +13912,41 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CountingStopProvider {
+        stream_calls: StdArc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for CountingStopProvider {
+        fn name(&self) -> &str {
+            "counting-stop-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message: assistant_message("done"),
+            })])))
+        }
+    }
+
     #[test]
     fn background_job_follow_ups_track_the_live_agent_session() {
         let runtime = RuntimeBuilder::current_thread()
@@ -13940,6 +13985,14 @@ mod tests {
                 let mut guard = session.lock(cx.cx()).await.expect("session lock");
                 guard.header.id.clone_from(&second_id);
             }
+            let stale_delivery = agent_session
+                .agent
+                .pop_follow_up_for_current_session()
+                .await;
+            assert!(
+                stale_delivery.is_empty(),
+                "delivery-time owner validation must not expose the staged first-session notice"
+            );
             agent_session.agent.fetch_additive_follow_up_messages().await;
             let second_delivery = agent_session
                 .agent
@@ -13973,6 +14026,50 @@ mod tests {
                 "first-session-notice",
             );
             assert!(crate::jobs::take_completion_notices(&first_id).is_empty());
+            assert!(crate::jobs::take_completion_notices(&second_id).is_empty());
+        });
+    }
+
+    #[test]
+    fn stale_only_job_handoff_does_not_invoke_the_provider_empty() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let first_id = format!("stale-owner-a-{}", uuid::Uuid::new_v4().simple());
+            let second_id = format!("stale-owner-b-{}", uuid::Uuid::new_v4().simple());
+            let resolver_calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+            let resolver_calls_for_scope = StdArc::clone(&resolver_calls);
+            let first_id_for_scope = first_id.clone();
+            let second_id_for_scope = second_id.clone();
+            let tools = ToolRegistry::from_tools(Vec::new());
+            tools.bind_job_session_resolver(StdArc::new(move || {
+                let resolved = if resolver_calls_for_scope.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_id_for_scope.clone()
+                } else {
+                    second_id_for_scope.clone()
+                };
+                Box::pin(async move { Some(resolved) })
+            }));
+            let stream_calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+            let provider = StdArc::new(CountingStopProvider {
+                stream_calls: StdArc::clone(&stream_calls),
+            });
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+
+            crate::jobs::push_completion_notice(&first_id, "stale-only-notice")
+                .expect("first owner notice");
+            agent.run("initial prompt", |_| {}).await.expect("agent run");
+
+            assert_eq!(
+                stream_calls.load(Ordering::SeqCst),
+                1,
+                "a stale-only staged batch must not create an empty provider turn"
+            );
+            let restored = crate::jobs::take_completion_notices(&first_id);
+            assert_eq!(restored.len(), 1);
+            assert_user_text(&restored[0], "stale-only-notice");
             assert!(crate::jobs::take_completion_notices(&second_id).is_empty());
         });
     }
