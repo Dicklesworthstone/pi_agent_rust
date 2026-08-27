@@ -1268,6 +1268,56 @@ impl HttpCancellationDispatch {
     }
 }
 
+struct HttpSessionDeleteDispatch {
+    client: crate::http::client::Client,
+    url: String,
+    headers: Vec<(String, String)>,
+    wire_state: HttpWireState,
+}
+
+impl HttpSessionDeleteDispatch {
+    async fn send(self, timeout: Duration) -> Result<()> {
+        let Some(session_id) = self.wire_state.session_id else {
+            return Ok(());
+        };
+        let mut request = self.client.delete(&self.url);
+        for (name, value) in self.headers {
+            request = request.header(name, value);
+        }
+        request = request.header("Mcp-Session-Id", session_id);
+        // A server may assign a session in initialize response headers before
+        // its body can be validated. That provisional state deliberately has
+        // no negotiated version (so the GET supervisor stays dormant), but a
+        // cleanup DELETE still identifies the version the client proposed.
+        let protocol_version = self
+            .wire_state
+            .protocol_version
+            .unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_string());
+        request = request.header("Mcp-Protocol-Version", protocol_version);
+        HttpTransport::run_with_deadline(
+            async move {
+                let response = request.no_timeout().send().await.map_err(|err| {
+                    tool_err("MCP_TRANSPORT_IO", format!("terminate HTTP session: {err}"))
+                })?;
+                let status = response.status();
+                if (200..300).contains(&status) || status == 405 {
+                    // Session teardown is complete once the status arrives.
+                    // The body is non-semantic and must not extend close time.
+                    return Ok(());
+                }
+                let body = response.text_limited(4096).await.unwrap_or_default();
+                Err(tool_err(
+                    "MCP_HTTP_STATUS",
+                    format!("HTTP {status} terminating session: {}", body.trim()),
+                ))
+            },
+            timeout,
+            "HTTP session termination",
+        )
+        .await
+    }
+}
+
 struct PendingHttpRequest<'a> {
     transport: &'a HttpTransport,
     cancellation: Option<HttpCancellationDispatch>,
@@ -1421,25 +1471,6 @@ impl BoundedHttpSseDecoder {
     }
 }
 
-struct ProvisionalHttpSession<'a> {
-    transport: &'a HttpTransport,
-    active: bool,
-}
-
-impl ProvisionalHttpSession<'_> {
-    fn commit(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for ProvisionalHttpSession<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            self.transport.reset_session_state();
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum HttpRoundTripKind<'a> {
     Request { expected_id: u64, method: &'a str },
@@ -1509,6 +1540,37 @@ impl HttpTransport {
         Self::lock(&self.session).generation
     }
 
+    fn session_delete_dispatch(&self, wire_state: HttpWireState) -> HttpSessionDeleteDispatch {
+        HttpSessionDeleteDispatch {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            headers: self.headers.clone(),
+            wire_state,
+        }
+    }
+
+    /// Seal the transport and atomically take the latest negotiated session
+    /// for orderly DELETE. Session publication uses the same lock, so close
+    /// cannot snapshot an older state while a newer initialize commits.
+    fn seal_and_take_session(&self) -> HttpWireState {
+        let mut session = Self::lock(&self.session);
+        self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        let wire_state = HttpWireState {
+            generation: session.generation,
+            session_id: session.session_id.clone(),
+            protocol_version: session.protocol_version.clone(),
+        };
+        let generation = session.generation.wrapping_add(1);
+        *session = HttpSessionState {
+            generation,
+            ..HttpSessionState::default()
+        };
+        drop(session);
+        self.abort_notify.notify_waiters();
+        self.session_changed.notify_waiters();
+        wire_state
+    }
+
     /// Retire the transport only if `generation` still names the active
     /// protocol session. Holding the session lock across the terminal state
     /// transition prevents an old GET listener from racing a successful
@@ -1558,23 +1620,46 @@ impl HttpTransport {
         self.session_changed.notify_waiters();
     }
 
-    fn begin_provisional_session(
-        &self,
-        candidate_session_id: Option<&str>,
-    ) -> Result<Option<ProvisionalHttpSession<'_>>> {
+    fn begin_provisional_session(&self, candidate_session_id: Option<&str>) -> Result<()> {
         let Some(session_id) = candidate_session_id else {
-            return Ok(None);
+            return Ok(());
         };
         validate_http_session_id(session_id)?;
         let mut session = Self::lock(&self.session);
+        if !self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(tool_err(
+                "MCP_TRANSPORT_CLOSED",
+                "HTTP transport closed before initialize session publication",
+            ));
+        }
         session.generation = session.generation.wrapping_add(1);
         session.session_id = Some(session_id.to_string());
         drop(session);
         self.session_changed.notify_waiters();
-        Ok(Some(ProvisionalHttpSession {
-            transport: self,
-            active: true,
-        }))
+        Ok(())
+    }
+
+    /// Admit only the first public initialize call. A failed initialize may
+    /// leave a server-assigned provisional session for `close()` to retire;
+    /// rejecting retries without mutation preserves that cleanup ownership.
+    fn ensure_explicit_initialize_admissible(&self) -> Result<()> {
+        let session = Self::lock(&self.session);
+        if !self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(tool_err(
+                "MCP_TRANSPORT_CLOSED",
+                "cannot initialize a closed HTTP transport",
+            ));
+        }
+        if session.session_id.is_some()
+            || session.protocol_version.is_some()
+            || session.initialize_params.is_some()
+        {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "HTTP transport is already initialized or has an initialize in progress",
+            ));
+        }
+        Ok(())
     }
 
     async fn run_until_abort<F, T>(&self, operation: F) -> Result<T>
@@ -1594,7 +1679,19 @@ impl HttpTransport {
             .fuse();
         futures::pin_mut!(operation, aborted);
         match futures::future::select(operation, aborted).await {
-            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Left((result, _)) => {
+                // The operation and abort wakeup can become ready together.
+                // Treat the result as linearized before close only when the
+                // terminal flag still says the transport is live.
+                if self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+                    result
+                } else {
+                    Err(tool_err(
+                        "MCP_TRANSPORT_CLOSED",
+                        "HTTP transport was aborted during an in-flight request",
+                    ))
+                }
+            }
             futures::future::Either::Right(((), _)) => Err(tool_err(
                 "MCP_TRANSPORT_CLOSED",
                 "HTTP transport was aborted during an in-flight request",
@@ -1745,6 +1842,41 @@ impl HttpTransport {
                 format!("HTTP {status} from {}: {}", self.url, body.trim()),
             ));
         }
+        let initialize_session_id = match kind {
+            HttpRoundTripKind::Request {
+                method: "initialize",
+                ..
+            } => candidate_session_id.as_deref(),
+            _ => None,
+        };
+        if let Some(session_id) = initialize_session_id {
+            validate_http_session_id(session_id)?;
+        }
+        if matches!(
+            kind,
+            HttpRoundTripKind::Request {
+                method: "initialize",
+                ..
+            }
+        ) && let Err(error) = self.begin_provisional_session(initialize_session_id)
+        {
+            // A close that won before the response headers were processed
+            // could not have observed this server-created session. If the
+            // response future is still being polled, retire that late session
+            // before returning the terminal error.
+            if is_transport_closed(&error)
+                && let Some(session_id) = initialize_session_id
+            {
+                let _ = self
+                    .send_session_delete(HttpWireState {
+                        generation: self.session_generation(),
+                        session_id: Some(session_id.to_string()),
+                        protocol_version: Some(MCP_PROTOCOL_VERSION.to_string()),
+                    })
+                    .await;
+            }
+            return Err(error);
+        }
         match kind {
             HttpRoundTripKind::AcceptedMessage { .. } if status == 202 => {
                 let body = response.bytes_limited(1).await.map_err(|err| {
@@ -1784,12 +1916,6 @@ impl HttpTransport {
             unreachable!("notification status handling returned above");
         };
         let media_type = classify_http_response_media_type(&content_type)?;
-        let mut provisional_session =
-            if method == "initialize" && matches!(media_type, HttpResponseMediaType::EventStream) {
-                self.begin_provisional_session(candidate_session_id.as_deref())?
-            } else {
-                None
-            };
         let response_wire_state = if method == "initialize" {
             self.wire_state()
         } else {
@@ -1798,28 +1924,27 @@ impl HttpTransport {
         let result = match media_type {
             HttpResponseMediaType::EventStream => {
                 self.receive_sse_response(response, expected_id, timeout, &response_wire_state)
-                    .await?
-            }
-            HttpResponseMediaType::Json => {
-                let body = response
-                    .text_limited(MAX_HTTP_BODY)
                     .await
-                    .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read body: {err}")))?;
-                let value: Value = serde_json::from_str(&body).map_err(|err| {
-                    tool_err(
-                        "MCP_PROTOCOL",
-                        format!("response is not JSON: {err} (body: {:.200})", body.trim()),
-                    )
-                })?;
-                validate_jsonrpc_response(&value, expected_id)?
             }
+            HttpResponseMediaType::Json => match response.text_limited(MAX_HTTP_BODY).await {
+                Ok(body) => serde_json::from_str::<Value>(&body)
+                    .map_err(|err| {
+                        tool_err(
+                            "MCP_PROTOCOL",
+                            format!("response is not JSON: {err} (body: {:.200})", body.trim()),
+                        )
+                    })
+                    .and_then(|value| validate_jsonrpc_response(&value, expected_id)),
+                Err(error) => Err(tool_err("MCP_TRANSPORT_IO", format!("read body: {error}"))),
+            },
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => return Err(error),
         };
 
         if method == "initialize" {
-            self.capture_initialize_state(&result, candidate_session_id, frame)?;
-            if let Some(session) = provisional_session.as_mut() {
-                session.commit();
-            }
+            self.capture_initialize_state(&result, candidate_session_id.clone(), frame)?;
         }
         Ok(result)
     }
@@ -1880,6 +2005,12 @@ impl HttpTransport {
             validate_http_session_id(session_id)?;
         }
         let mut session = Self::lock(&self.session);
+        if !self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(tool_err(
+                "MCP_TRANSPORT_CLOSED",
+                "HTTP transport closed before initialize state publication",
+            ));
+        }
         let generation = session.generation.wrapping_add(1);
         *session = HttpSessionState {
             generation,
@@ -2097,38 +2228,7 @@ impl HttpTransport {
         wire_state: HttpWireState,
         timeout: Duration,
     ) -> Result<()> {
-        let Some(session_id) = wire_state.session_id else {
-            return Ok(());
-        };
-        let mut request = self.client.delete(&self.url);
-        for (name, value) in &self.headers {
-            request = request.header(name.clone(), value.clone());
-        }
-        request = request.header("Mcp-Session-Id", session_id);
-        if let Some(protocol_version) = wire_state.protocol_version {
-            request = request.header("Mcp-Protocol-Version", protocol_version);
-        }
-        Self::run_with_deadline(
-            async move {
-                let response = request.no_timeout().send().await.map_err(|err| {
-                    tool_err("MCP_TRANSPORT_IO", format!("terminate HTTP session: {err}"))
-                })?;
-                let status = response.status();
-                if (200..300).contains(&status) || status == 405 {
-                    // Session teardown is complete once the status arrives.
-                    // The body is non-semantic and must not extend close time.
-                    return Ok(());
-                }
-                let body = response.text_limited(4096).await.unwrap_or_default();
-                Err(tool_err(
-                    "MCP_HTTP_STATUS",
-                    format!("HTTP {status} terminating session: {}", body.trim()),
-                ))
-            },
-            timeout,
-            "HTTP session termination",
-        )
-        .await
+        self.session_delete_dispatch(wire_state).send(timeout).await
     }
 
     async fn handle_sse_message(
@@ -2562,6 +2662,14 @@ fn is_transport_io(error: &Error) -> bool {
     )
 }
 
+fn is_transport_closed(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Tool { tool, message }
+            if tool == "mcp" && message.starts_with("[MCP_TRANSPORT_CLOSED]")
+    )
+}
+
 fn is_server_error(error: &Error) -> bool {
     matches!(
         error,
@@ -2679,9 +2787,7 @@ impl McpTransport for HttpTransport {
                 .await
                 .map_err(|_| tool_err("MCP_CANCELLED", "cancelled by ambient context"))?;
         if method == "initialize" {
-            // An explicit initialize always starts a fresh protocol session
-            // and must not replay headers negotiated by an older one.
-            self.reset_session_state();
+            self.ensure_explicit_initialize_admissible()?;
         }
         let result = match self.request_once(method, &params, timeout).await {
             Err(error) if method != "initialize" && is_session_expired(&error) => {
@@ -2737,7 +2843,10 @@ impl McpTransport for HttpTransport {
     }
 
     fn abort(&self) {
+        // Serialize terminal admission with initialize-state publication.
+        let session = Self::lock(&self.session);
         self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(session);
         self.abort_notify.notify_waiters();
     }
 
@@ -2809,11 +2918,9 @@ impl McpTransport for HttpTransport {
     }
 
     async fn close(&self) {
-        let wire_state = self.wire_state();
-        // Cancel the optional GET stream and reject new request dispatch
-        // before telling the server to discard the captured session.
-        self.abort();
-        self.reset_session_state();
+        // Atomically reject new publication and take the latest session, then
+        // tell the server to discard exactly that captured state.
+        let wire_state = self.seal_and_take_session();
         let _ = self.send_session_delete(wire_state).await;
     }
 
@@ -3470,6 +3577,173 @@ mod tests {
 
     impl Drop for DripBodyHttpServer {
         fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    struct ControlledInitializeHttpServer {
+        addr: std::net::SocketAddr,
+        request_received: std::sync::Arc<AtomicBool>,
+        release_headers: std::sync::Arc<AtomicBool>,
+        headers_sent: std::sync::Arc<AtomicBool>,
+        release_body: std::sync::Arc<AtomicBool>,
+        delete_count: std::sync::Arc<AtomicU64>,
+        shutdown: std::sync::Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ControlledInitializeHttpServer {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind controlled initialize server");
+            let addr = listener.local_addr().expect("listener addr");
+            let request_received = std::sync::Arc::new(AtomicBool::new(false));
+            let request_received_for_thread = std::sync::Arc::clone(&request_received);
+            let release_headers = std::sync::Arc::new(AtomicBool::new(false));
+            let release_headers_for_thread = std::sync::Arc::clone(&release_headers);
+            let headers_sent = std::sync::Arc::new(AtomicBool::new(false));
+            let headers_sent_for_thread = std::sync::Arc::clone(&headers_sent);
+            let release_body = std::sync::Arc::new(AtomicBool::new(false));
+            let release_body_for_thread = std::sync::Arc::clone(&release_body);
+            let delete_count = std::sync::Arc::new(AtomicU64::new(0));
+            let delete_count_for_thread = std::sync::Arc::clone(&delete_count);
+            let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+            let shutdown_for_thread = std::sync::Arc::clone(&shutdown);
+            let handle = std::thread::spawn(move || {
+                let read_request = |stream: &mut std::net::TcpStream| {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut reader =
+                        std::io::BufReader::new(stream.try_clone().expect("clone request stream"));
+                    let mut request_line = String::new();
+                    std::io::BufRead::read_line(&mut reader, &mut request_line)
+                        .expect("read request line");
+                    let mut headers = Vec::new();
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        std::io::BufRead::read_line(&mut reader, &mut line)
+                            .expect("read request header");
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = trimmed.split_once(':') {
+                            let name = name.trim().to_string();
+                            let value = value.trim().to_string();
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.parse().unwrap_or(0);
+                            }
+                            headers.push((name, value));
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        std::io::Read::read_exact(&mut reader, &mut body)
+                            .expect("read request body");
+                    }
+                    (request_line.trim_end().to_string(), headers, body)
+                };
+
+                let (mut initialize, _) = listener.accept().expect("accept initialize");
+                let (_, _, body) = read_request(&mut initialize);
+                let request_id = serde_json::from_slice::<Value>(&body)
+                    .expect("initialize JSON")
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .expect("initialize request id");
+                request_received_for_thread.store(true, Ordering::Release);
+                for _ in 0..500 {
+                    if release_headers_for_thread.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let response_body = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{}}}",
+                    initialize_success_body()
+                );
+                let response_headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nmcp-session-id: sid-close-race\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                    response_body.len()
+                );
+                initialize
+                    .write_all(response_headers.as_bytes())
+                    .expect("write initialize response headers");
+                initialize
+                    .flush()
+                    .expect("flush initialize response headers");
+                headers_sent_for_thread.store(true, Ordering::Release);
+
+                listener
+                    .set_nonblocking(true)
+                    .expect("set cleanup accept nonblocking");
+                let mut body_sent = false;
+                let mut shutdown_ticks = 0u16;
+                for _ in 0..2_000 {
+                    if !body_sent && release_body_for_thread.load(Ordering::Acquire) {
+                        let _ = initialize.write_all(response_body.as_bytes());
+                        let _ = initialize.flush();
+                        body_sent = true;
+                    }
+                    match listener.accept() {
+                        Ok((mut delete, _)) => {
+                            let (request_line, headers, _) = read_request(&mut delete);
+                            if request_line == "DELETE /mcp HTTP/1.1"
+                                && headers.iter().any(|(name, value)| {
+                                    name.eq_ignore_ascii_case("Mcp-Session-Id")
+                                        && value == "sid-close-race"
+                                })
+                                && headers.iter().any(|(name, value)| {
+                                    name.eq_ignore_ascii_case("Mcp-Protocol-Version")
+                                        && value == MCP_PROTOCOL_VERSION
+                                })
+                            {
+                                delete_count_for_thread.fetch_add(1, Ordering::AcqRel);
+                            }
+                            let _ = delete.write_all(http_empty(204, "No Content").as_bytes());
+                            let _ = delete.flush();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                    if shutdown_for_thread.load(Ordering::Acquire) {
+                        shutdown_ticks += 1;
+                        if shutdown_ticks >= 40 {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                addr,
+                request_received,
+                release_headers,
+                headers_sent,
+                release_body,
+                delete_count,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/mcp", self.addr)
+        }
+
+        fn delete_count(&self) -> u64 {
+            self.delete_count.load(Ordering::Acquire)
+        }
+    }
+
+    impl Drop for ControlledInitializeHttpServer {
+        fn drop(&mut self) {
+            self.release_headers.store(true, Ordering::Release);
+            self.release_body.store(true, Ordering::Release);
+            self.shutdown.store(true, Ordering::Release);
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
             }
@@ -4148,6 +4422,194 @@ mod tests {
         assert_eq!(
             transport.wire_state().session_id.as_deref(),
             Some("sid-new")
+        );
+    }
+
+    #[test]
+    fn streamable_http_abort_wins_simultaneously_ready_operation() {
+        let transport =
+            HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new()).expect("HTTP transport");
+        let error = runtime_for_tests()
+            .block_on(transport.run_until_abort(async {
+                // The operation becomes ready in the same poll that makes the
+                // abort waiter ready. The terminal post-check must win.
+                transport.abort();
+                Ok::<(), Error>(())
+            }))
+            .expect_err("success must not escape after transport abort");
+        assert!(
+            error.to_string().contains("MCP_TRANSPORT_CLOSED"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn streamable_http_close_during_initialize_rejects_and_deletes_session() {
+        let server = ControlledInitializeHttpServer::start();
+        let transport = std::sync::Arc::new(
+            HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport"),
+        );
+        let runtime = runtime_for_tests();
+        let pending_initialize = runtime.block_on(async {
+            let initialize = Box::pin(transport.request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ));
+            let request_started = Box::pin(async {
+                wait_for_flag(&server.request_received, "controlled initialize dispatch").await;
+            });
+            let pending_initialize =
+                match futures::future::select(initialize, request_started).await {
+                    futures::future::Either::Left((result, _)) => {
+                        panic!("controlled initialize unexpectedly completed: {result:?}");
+                    }
+                    futures::future::Either::Right(((), pending_initialize)) => pending_initialize,
+                };
+
+            server.release_headers.store(true, Ordering::Release);
+            wait_for_flag(&server.headers_sent, "controlled initialize headers").await;
+            let provisional_published = Box::pin(async {
+                for _ in 0..300 {
+                    if transport.wire_state().session_id.as_deref() == Some("sid-close-race") {
+                        return;
+                    }
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(10),
+                    )
+                    .await;
+                }
+                panic!("timed out waiting for provisional initialize session publication");
+            });
+            let pending_initialize =
+                match futures::future::select(pending_initialize, provisional_published).await {
+                    futures::future::Either::Left((result, _)) => {
+                        panic!("initialize completed before its body was released: {result:?}");
+                    }
+                    futures::future::Either::Right(((), pending_initialize)) => pending_initialize,
+                };
+
+            pending_initialize
+        });
+
+        // Exercise cancellation outside an active runtime. Dropping the armed
+        // request must abort dispatch without erasing the provisional session
+        // that an orderly close still owns.
+        drop(pending_initialize);
+        assert!(!transport.is_alive());
+        assert_eq!(
+            transport.wire_state().session_id.as_deref(),
+            Some("sid-close-race"),
+            "future drop must preserve the provisional cleanup candidate"
+        );
+
+        runtime.block_on(transport.close());
+        assert_eq!(
+            server.delete_count(),
+            1,
+            "close must await exactly one DELETE for the provisional session"
+        );
+        assert!(transport.wire_state().session_id.is_none());
+    }
+
+    #[test]
+    fn streamable_http_failed_initialize_retry_preserves_session_for_close() {
+        let malformed_body = "{";
+        let server = ScriptedHttpServer::start(vec![
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nmcp-session-id: sid-malformed\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{malformed_body}",
+                malformed_body.len()
+            ),
+            http_empty(204, "No Content"),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport");
+        let runtime = runtime_for_tests();
+
+        let first_error = runtime
+            .block_on(transport.request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect_err("malformed initialize body must fail");
+        assert!(first_error.to_string().contains("MCP_PROTOCOL"));
+        assert!(!transport.is_alive());
+        assert_eq!(
+            transport.wire_state().session_id.as_deref(),
+            Some("sid-malformed"),
+            "the provisional session remains owned until close"
+        );
+
+        let retry_error = runtime
+            .block_on(transport.request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect_err("closed transport must reject initialize retry");
+        assert!(
+            retry_error.to_string().contains("MCP_TRANSPORT_CLOSED"),
+            "{retry_error}"
+        );
+        assert_eq!(
+            transport.wire_state().session_id.as_deref(),
+            Some("sid-malformed"),
+            "rejected retry must not erase the cleanup candidate"
+        );
+
+        runtime.block_on(transport.close());
+        assert!(transport.wire_state().session_id.is_none());
+        assert_eq!(
+            server.request_lines(),
+            vec!["POST /mcp HTTP/1.1", "DELETE /mcp HTTP/1.1"],
+            "failed initialize, rejected local retry, then exactly one DELETE"
+        );
+        let captured = server.captured();
+        assert!(captured[1].0.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("Mcp-Session-Id") && value == "sid-malformed"
+        }));
+        assert!(captured[1].0.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("Mcp-Protocol-Version") && value == MCP_PROTOCOL_VERSION
+        }));
+    }
+
+    #[test]
+    fn streamable_http_reinitialize_rejects_without_abandoning_live_session() {
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-live"),
+            http_empty(204, "No Content"),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport");
+        let runtime = runtime_for_tests();
+
+        runtime
+            .block_on(transport.request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect("first initialize");
+        let error = runtime
+            .block_on(transport.request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect_err("an initialized transport must reject reinitialize");
+        assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+        assert!(transport.is_alive());
+        assert_eq!(
+            transport.wire_state().session_id.as_deref(),
+            Some("sid-live"),
+            "rejected reinitialize must preserve the live session"
+        );
+
+        runtime.block_on(transport.close());
+        assert_eq!(
+            server.request_lines(),
+            vec!["POST /mcp HTTP/1.1", "DELETE /mcp HTTP/1.1"],
+            "only the first initialize and orderly DELETE reach the server"
         );
     }
 
