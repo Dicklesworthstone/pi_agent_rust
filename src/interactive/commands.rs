@@ -151,7 +151,7 @@ impl SlashCommand {
   /compact [shake|aggressive] [notes] - Compact older context (shake: instant no-LLM tool-result dropping)
   /reload            - Reload skills/prompts from disk
   /template <name> [args] - Expand a prompt template by name
-  /share             - Upload session HTML to a secret GitHub gist and show URL
+  /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
   /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode

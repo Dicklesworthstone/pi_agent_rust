@@ -92,6 +92,7 @@ fn log_test_event(test_name: &str, event: &str, data: &serde_json::Value) {
 fn write_mock_gh_script(dir: &std::path::Path, gist_url: &str) -> std::path::PathBuf {
     let gh_path = dir.join("gh");
     let args_path = dir.join("gh_args.log");
+    let uploaded_path = dir.join("uploaded.html");
     let script = format!(
         r#"#!/bin/sh
 set -e
@@ -104,6 +105,11 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
 fi
 
 if [ "$1" = "gist" ] && [ "$2" = "create" ]; then
+  upload_path=""
+  for arg in "$@"; do
+    upload_path="$arg"
+  done
+  cp "$upload_path" "{uploaded}"
   echo "{gist_url}"
   exit 0
 fi
@@ -112,6 +118,7 @@ echo "unexpected gh args: $@" >&2
 exit 2
 "#,
         args_log = args_path.display(),
+        uploaded = uploaded_path.display(),
         gist_url = gist_url,
     );
     fs::write(&gh_path, script).expect("write mock gh");
@@ -128,15 +135,15 @@ exit 2
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-/// E2E: `/share` creates gist and shows viewer URL.
+/// E2E: `/share` creates a secret, unlisted gist and shows viewer URL.
 #[test]
-fn e2e_tui_share_creates_gist_with_privacy_and_description() {
+fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
     let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_share_creates_gist") else {
         eprintln!("Skipping: tmux not available");
         return;
     };
 
-    let test_name = "e2e_tui_share_creates_gist_with_privacy_and_description";
+    let test_name = "e2e_tui_share_creates_secret_gist_with_visibility_warning";
     log_test_event(test_name, "test_start", &json!({}));
 
     // Set up mock gh in a temporary bin directory.
@@ -168,13 +175,20 @@ fn e2e_tui_share_creates_gist_with_privacy_and_description() {
     session.launch(&minimal_interactive_args());
     session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
 
-    log_test_event(test_name, "share_initiated", &json!({"privacy": "private"}));
+    session.send_text_and_wait(
+        "name_shared_session",
+        "/name share-upload-sentinel",
+        "Session name: share-upload-sentinel",
+        COMMAND_TIMEOUT,
+    );
 
-    // Issue /share command (default: private).
+    log_test_event(test_name, "share_initiated", &json!({"visibility": "secret"}));
+
+    // Issue /share command (secret/unlisted, but not access-controlled).
     let pane = session.send_text_and_wait(
-        "share_private",
+        "share_secret",
         "/share",
-        "Created private gist",
+        "Created secret gist",
         SHARE_TIMEOUT,
     );
 
@@ -184,10 +198,25 @@ fn e2e_tui_share_creates_gist_with_privacy_and_description() {
         "Expected viewer URL"
     );
 
+    let uploaded_html = fs::read_to_string(session.harness.temp_path("mock_bin/uploaded.html"))
+        .expect("mock gh must preserve the exact uploaded HTML");
+    assert!(
+        uploaded_html.contains("share-upload-sentinel"),
+        "uploaded HTML omitted current session content"
+    );
+    assert!(
+        !uploaded_html.contains(session.harness.temp_dir().to_string_lossy().as_ref()),
+        "uploaded HTML leaked local cwd: {uploaded_html}"
+    );
+    assert!(
+        !uploaded_html.contains("cwd:"),
+        "uploaded HTML retained cwd metadata: {uploaded_html}"
+    );
+
     log_test_event(
         test_name,
         "share_completed",
-        &json!({"privacy": "private", "gist_url": gist_url}),
+        &json!({"visibility": "secret", "access_controlled": false, "gist_url": gist_url}),
     );
 
     // Verify mock gh was called with --public=false and --desc.
@@ -212,15 +241,17 @@ fn e2e_tui_share_creates_gist_with_privacy_and_description() {
     session.write_artifacts();
 }
 
-/// E2E: `/share public` creates a public gist.
+/// E2E: `/share` rejects public sharing before invoking `gh`.
 #[test]
-fn e2e_tui_share_public_flag() {
-    let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_share_public_flag") else {
+fn e2e_tui_share_rejects_public_argument_without_invoking_gh() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_share_rejects_public_argument")
+    else {
         eprintln!("Skipping: tmux not available");
         return;
     };
 
-    let test_name = "e2e_tui_share_public_flag";
+    let test_name = "e2e_tui_share_rejects_public_argument_without_invoking_gh";
     log_test_event(test_name, "test_start", &json!({}));
 
     let mock_bin = session.harness.temp_path("mock_bin");
@@ -249,32 +280,31 @@ fn e2e_tui_share_public_flag() {
     session.launch(&minimal_interactive_args());
     session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
 
-    log_test_event(test_name, "share_initiated", &json!({"privacy": "public"}));
+    log_test_event(test_name, "public_share_rejected", &json!({}));
 
     let pane = session.send_text_and_wait(
-        "share_public",
+        "share_public_rejected",
         "/share public",
-        "Created public gist",
+        "public sharing is disabled",
         SHARE_TIMEOUT,
     );
 
     assert!(
-        pane.contains("Created public gist"),
-        "Expected 'Created public gist' in output"
+        pane.contains("public sharing is disabled"),
+        "Expected explicit secret-gist guidance"
     );
 
-    // Verify mock gh was called with --public=true.
     let args_log = session.harness.temp_path("mock_bin/gh_args.log");
-    let args_content = fs::read_to_string(&args_log).unwrap_or_default();
     assert!(
-        args_content.contains("--public=true"),
-        "Expected --public=true in gh args: {args_content}"
+        !args_log.exists(),
+        "rejected public share unexpectedly invoked gh: {}",
+        fs::read_to_string(&args_log).unwrap_or_default()
     );
 
     log_test_event(
         test_name,
-        "share_completed",
-        &json!({"privacy": "public", "public_flag_passed": true}),
+        "gh_not_invoked",
+        &json!({"secret_by_construction": true}),
     );
 
     session.exit_gracefully();

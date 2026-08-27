@@ -4855,9 +4855,11 @@ fn e2e_cli_handoff_defaults_to_newest_session_and_preserves_explicit_session() {
 
     let default_result = harness.run(&["handoff", "--print"]);
     assert_exit_code(&harness.harness, &default_result, 0);
+    assert_contains(&harness.harness, &default_result.stdout, newer_id);
     assert_contains(&harness.harness, &default_result.stdout, newer_marker);
     assert!(
-        !default_result.stdout.contains(older_marker),
+        !default_result.stdout.contains(older_id)
+            && !default_result.stdout.contains(older_marker),
         "default handoff must not select the older session\nstdout:\n{}\nstderr:\n{}",
         default_result.stdout,
         default_result.stderr
@@ -4865,9 +4867,11 @@ fn e2e_cli_handoff_defaults_to_newest_session_and_preserves_explicit_session() {
 
     let explicit_result = harness.run(&["handoff", "--session", older_id, "--print"]);
     assert_exit_code(&harness.harness, &explicit_result, 0);
+    assert_contains(&harness.harness, &explicit_result.stdout, older_id);
     assert_contains(&harness.harness, &explicit_result.stdout, older_marker);
     assert!(
-        !explicit_result.stdout.contains(newer_marker),
+        !explicit_result.stdout.contains(newer_id)
+            && !explicit_result.stdout.contains(newer_marker),
         "explicit handoff must select the requested session\nstdout:\n{}\nstderr:\n{}",
         explicit_result.stdout,
         explicit_result.stderr

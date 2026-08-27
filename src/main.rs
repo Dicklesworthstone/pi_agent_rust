@@ -95,6 +95,13 @@ const USAGE_ERROR_PATTERNS: &[&str] = &[
 ];
 
 fn main() {
+    // `/share` uses a gated copy of Pi on Windows so the real `gh` child cannot
+    // spawn until its wrapper is covered by kill-on-close Job discipline.
+    #[cfg(windows)]
+    if let Some(exit_code) = pi::tools::run_windows_share_job_child_if_requested() {
+        std::process::exit(exit_code);
+    }
+
     // On Windows CMD.exe, ANSI escape sequences render as garbage (e.g. "←[92m")
     // unless we call SetConsoleMode with ENABLE_VIRTUAL_TERMINAL_PROCESSING first.
     // This must happen before any colored output. Silently ignored on non-Windows

@@ -7476,7 +7476,8 @@ impl Tool for JobsTool {
                     .ok_or_else(|| Error::validation("jobs wait requires jobId".to_string()))?;
                 let budget_ms = input.timeout_ms.unwrap_or(30_000).min(600_000);
                 let snapshot =
-                    crate::jobs::wait(job_id, std::time::Duration::from_millis(budget_ms))?;
+                    crate::jobs::wait_async(job_id, std::time::Duration::from_millis(budget_ms))
+                        .await?;
                 serde_json::to_value(&snapshot)?
             }
             "cancel" => {
@@ -7484,7 +7485,7 @@ impl Tool for JobsTool {
                     .job_id
                     .as_deref()
                     .ok_or_else(|| Error::validation("jobs cancel requires jobId".to_string()))?;
-                let snapshot = crate::jobs::cancel(job_id)?;
+                let snapshot = crate::jobs::cancel_async(job_id).await?;
                 serde_json::to_value(&snapshot)?
             }
             other => {
@@ -8231,8 +8232,11 @@ impl HubTool {
                             Error::validation("hub jobs wait requires jobId".to_string())
                         })?;
                         let budget = input.timeout_ms.unwrap_or(30_000).min(600_000);
-                        let snapshot =
-                            crate::jobs::wait(&job_id, std::time::Duration::from_millis(budget))?;
+                        let snapshot = crate::jobs::wait_async(
+                            &job_id,
+                            std::time::Duration::from_millis(budget),
+                        )
+                        .await?;
                         let details = serde_json::to_value(&snapshot)?;
                         (
                             format!(
@@ -8250,7 +8254,7 @@ impl HubTool {
                         let job_id = input.job_id.clone().ok_or_else(|| {
                             Error::validation("hub jobs cancel requires jobId".to_string())
                         })?;
-                        let snapshot = crate::jobs::cancel(&job_id)?;
+                        let snapshot = crate::jobs::cancel_async(&job_id).await?;
                         let details = serde_json::to_value(&snapshot)?;
                         (format!("job {}: {}", snapshot.id, snapshot.status), details)
                     }
@@ -12972,12 +12976,13 @@ impl Drop for ProcessGuard {
 // branch calls non-const job registration, so the lint cannot hold for both
 // targets at once.
 #[allow(clippy::missing_const_for_fn)]
-pub(crate) fn attach_child_job_discipline(child: &std::process::Child) {
+pub(crate) fn attach_child_job_discipline(child: &std::process::Child) -> bool {
     #[cfg(windows)]
-    win_job::attach(child);
+    return win_job::attach(child);
     #[cfg(not(windows))]
     {
         let _ = child;
+        true
     }
 }
 
@@ -13003,25 +13008,27 @@ mod win_job {
 
     /// Assign `child` to a fresh kill-on-close job and remember it by pid.
     ///
-    /// Best-effort: any failure leaves the walk-based discipline below in
-    /// charge (e.g. systems that reject nested-job assignment fall back).
-    pub(crate) fn attach(child: &Child) {
+    /// Returns whether the child is now covered by a registered Job. Most
+    /// callers can retain the walk-based fallback on failure; subprocess
+    /// surfaces that cannot safely tolerate inherited handles can fail closed.
+    pub(crate) fn attach(child: &Child) -> bool {
         let Ok(mut map) = REGISTRY.lock() else {
-            return;
+            return false;
         };
         prune_dead_entries(&mut map);
         let mut info = ExtendedLimitInfo::new();
         info.limit_kill_on_job_close();
         let Ok(job) = Job::create_with_limit_info(&info) else {
-            return;
+            return false;
         };
         // RawHandle is *mut c_void; win32job takes the isize numeric handle.
         if job.assign_process(child.as_raw_handle() as isize).is_err() {
             // Never assigned, so closing harms nothing.
             drop(job);
-            return;
+            return false;
         }
         map.insert(child.id(), job);
+        true
     }
 
     /// Kill the tree rooted at `pid` via its job, returning whether one
@@ -13111,19 +13118,18 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal, include_pro
         // When they do, killing the group first catches background children even
         // if they have already been reparented away from the original root PID.
         #[cfg(unix)]
+        if let Ok(raw_pid) = i32::try_from(pid)
+            && let Some(process_group) = rustix::process::Pid::from_raw(raw_pid)
         {
-            let sig_num = match signal {
-                sysinfo::Signal::Kill => "9",
-                _ => "15",
+            let group_signal = match signal {
+                sysinfo::Signal::Kill => rustix::process::Signal::KILL,
+                _ => rustix::process::Signal::TERM,
             };
-            let _ = Command::new("kill")
-                .arg(format!("-{sig_num}"))
-                .arg("--")
-                .arg(format!("-{pid}"))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            // Use the direct syscall wrapper rather than an ambient-PATH
+            // `kill` executable. Cleanup runs from timeout and Drop paths, so
+            // it must neither execute user-controlled code nor wait on a
+            // subprocess that can hang before the real child is reaped.
+            let _ = rustix::process::kill_process_group(process_group, group_signal);
         }
     }
 
@@ -13177,6 +13183,158 @@ pub(crate) fn command_with_default_sigpipe_in_dir(
     cwd: &Path,
 ) -> std::io::Result<Command> {
     command_with_default_sigpipe_for_cwd(program.as_ref(), Some(cwd))
+}
+
+#[cfg(windows)]
+const WINDOWS_SHARE_JOB_SPEC_ENV: &str = "PI_INTERNAL_SHARE_JOB_SPEC";
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize)]
+struct WindowsShareJobSpec {
+    program: Vec<u16>,
+    args: Vec<Vec<u16>>,
+    cwd: Vec<u16>,
+    gate_path: Vec<u16>,
+}
+
+/// Keeps the private launch directory alive until a gated `/share` child exits.
+pub(crate) struct JobGatedChildLaunch {
+    #[cfg(windows)]
+    gate_path: PathBuf,
+    #[cfg(windows)]
+    _launch_dir: tempfile::TempDir,
+}
+
+impl JobGatedChildLaunch {
+    /// Allow the wrapper to start its target after process-tree discipline is live.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn release(&self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.gate_path)?;
+        }
+        Ok(())
+    }
+}
+
+/// Prepare a command whose Windows target cannot spawn before Job attachment.
+///
+/// Unix already creates a new process-group leader before the target image
+/// runs. Windows has no equivalent `Command` API for atomic Job assignment, so
+/// a copy of Pi waits on a private file gate using only in-process operations.
+/// Once the parent attaches that wrapper to the Job and opens the gate, the
+/// real target is spawned as a Job member and all of its descendants inherit
+/// the same kill-on-close discipline.
+pub(crate) fn command_with_job_gate_in_dir(
+    program: impl AsRef<OsStr>,
+    args: &[OsString],
+    cwd: &Path,
+) -> std::io::Result<(Command, JobGatedChildLaunch)> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let launch_dir = tempfile::Builder::new()
+            .prefix("pi-share-job-gate-")
+            .tempdir()?;
+        let spec_path = launch_dir.path().join("spec.json");
+        let gate_path = launch_dir.path().join("start");
+        let spec = WindowsShareJobSpec {
+            program: program.as_ref().encode_wide().collect(),
+            args: args
+                .iter()
+                .map(|arg| arg.as_os_str().encode_wide().collect())
+                .collect(),
+            cwd: cwd.as_os_str().encode_wide().collect(),
+            gate_path: gate_path.as_os_str().encode_wide().collect(),
+        };
+        let encoded = serde_json::to_vec(&spec).map_err(std::io::Error::other)?;
+        std::fs::write(&spec_path, encoded)?;
+
+        let mut command = Command::new(std::env::current_exe()?);
+        command.env(WINDOWS_SHARE_JOB_SPEC_ENV, spec_path);
+        Ok((
+            command,
+            JobGatedChildLaunch {
+                gate_path,
+                _launch_dir: launch_dir,
+            },
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = command_with_default_sigpipe_in_dir(program, cwd)?;
+        command.args(args);
+        Ok((command, JobGatedChildLaunch {}))
+    }
+}
+
+/// Run the Windows half of the private pre-Job launch gate, if requested.
+///
+/// This is called before normal CLI initialization. The wait itself never
+/// spawns a process, which is the property that closes the spawn-to-Job race.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn run_windows_share_job_child_if_requested() -> Option<i32> {
+    let spec_path = std::env::var_os(WINDOWS_SHARE_JOB_SPEC_ENV)?;
+    Some(match run_windows_share_job_child(Path::new(&spec_path)) {
+        Ok(exit_code) => exit_code,
+        Err(err) => {
+            eprintln!("pi internal share child failed: {err}");
+            1
+        }
+    })
+}
+
+#[cfg(windows)]
+fn run_windows_share_job_child(spec_path: &Path) -> std::io::Result<i32> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    const MAX_SPEC_BYTES: u64 = 1024 * 1024;
+    const GATE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+    const GATE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    let metadata = std::fs::metadata(spec_path)?;
+    if metadata.len() > MAX_SPEC_BYTES {
+        return Err(std::io::Error::other(
+            "internal share child specification is too large",
+        ));
+    }
+    let encoded = std::fs::read(spec_path)?;
+    let spec: WindowsShareJobSpec =
+        serde_json::from_slice(&encoded).map_err(std::io::Error::other)?;
+    let gate_path = PathBuf::from(OsString::from_wide(&spec.gate_path));
+    if gate_path.parent() != spec_path.parent() {
+        return Err(std::io::Error::other(
+            "internal share launch gate is outside its specification directory",
+        ));
+    }
+
+    let deadline = std::time::Instant::now() + GATE_WAIT_TIMEOUT;
+    while !gate_path.is_file() {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "internal share launch gate timed out",
+            ));
+        }
+        std::thread::sleep(GATE_POLL_INTERVAL);
+    }
+
+    let program = OsString::from_wide(&spec.program);
+    let args = spec.args.iter().map(|arg| OsString::from_wide(arg));
+    let cwd = PathBuf::from(OsString::from_wide(&spec.cwd));
+    // ubs:ignore argv comes from the parent-generated private share spec and is
+    // launched without a shell after the Job gate opens.
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .env_remove(WINDOWS_SHARE_JOB_SPEC_ENV)
+        .status()?;
+    Ok(status.code().unwrap_or(1))
 }
 
 #[cfg(unix)]

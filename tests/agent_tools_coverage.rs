@@ -1584,3 +1584,26 @@ fn tool_bash_stdout_stderr_capture() {
         );
     });
 }
+
+/// Keep the user-facing limitation table aligned with the shipped default
+/// tool surface. Provider availability may vary; the capability itself is not
+/// absent from Pi.
+#[test]
+fn readme_describes_default_web_search_without_obsolete_no_browsing_claim() {
+    let defaults = pi::xdev::default_enabled_tools();
+    assert!(
+        defaults.contains(&"web_search"),
+        "production defaults must still expose web_search before README can advertise it"
+    );
+
+    let readme = include_str!("../README.md");
+    assert!(
+        !readme.to_ascii_lowercase().contains("no web browsing"),
+        "README restored the obsolete no-web-browsing limitation"
+    );
+    assert!(
+        readme.contains("**Search backend availability varies**")
+            && readme.contains("`web_search` uses the configured ranked providers"),
+        "README must describe provider availability without denying the shipped capability"
+    );
+}

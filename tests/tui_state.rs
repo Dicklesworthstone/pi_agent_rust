@@ -3557,7 +3557,8 @@ fn tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file() {
         .find(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
         .expect("expected share result");
     let step = apply_pi(&harness, &mut app, "PiMsg share result", msg);
-    assert_after_contains(&harness, &step, "Created private gist");
+    assert_after_contains(&harness, &step, "Created secret gist");
+    assert_after_contains(&harness, &step, "not private; anyone with the URL can view it");
     assert_after_contains(&harness, &step, "Share URL:");
     assert_after_contains(
         &harness,
@@ -3649,13 +3650,14 @@ fn tui_state_slash_share_is_cancellable_and_cleans_temp_file() {
 
 #[test]
 #[cfg(unix)]
-fn tui_state_slash_share_public_flag_creates_public_gist() {
-    let harness = TestHarness::new("tui_state_slash_share_public_flag_creates_public_gist");
+fn tui_state_slash_share_rejects_public_argument_before_invoking_gh() {
+    let harness =
+        TestHarness::new("tui_state_slash_share_rejects_public_argument_before_invoking_gh");
 
     let args_record = harness.temp_path("gh_args.txt");
     let gh_path = harness.temp_path("gh");
     let script = format!(
-        "#!/bin/sh\nset -e\n\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then\n  exit 0\nfi\n\nif [ \"$1\" = \"gist\" ] && [ \"$2\" = \"create\" ]; then\n  printf '%s\\n' \"$@\" > \"{args_record}\"\n  echo \"https://gist.github.com/testuser/pub123public456\"\n  exit 0\nfi\n\necho \"unexpected gh args: $@\" >&2\nexit 2\n",
+        "#!/bin/sh\nset -e\nprintf '%s\\n' \"$@\" >> \"{args_record}\"\nexit 0\n",
         args_record = args_record.display(),
     );
     fs::write(&gh_path, script).expect("write fake gh");
@@ -3665,7 +3667,7 @@ fn tui_state_slash_share_public_flag_creates_public_gist() {
         gh_path: Some(gh_path.display().to_string()),
         ..Default::default()
     };
-    let (mut app, mut event_rx) = build_app_with_session_and_events_and_config(
+    let (mut app, _event_rx) = build_app_with_session_and_events_and_config(
         &harness,
         Vec::new(),
         Session::in_memory(),
@@ -3674,37 +3676,24 @@ fn tui_state_slash_share_public_flag_creates_public_gist() {
     log_initial_state(&harness, &app);
 
     log_test_event(
-        "tui_state_slash_share_public_flag_creates_public_gist",
-        "share_initiated",
-        &json!({"privacy": "public"}),
+        "tui_state_slash_share_rejects_public_argument_before_invoking_gh",
+        "public_share_rejected",
+        &json!({}),
     );
 
     type_text(&harness, &mut app, "/share public");
     let step = press_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "Sharing session...");
-
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(3), |msgs| {
-        msgs.iter()
-            .any(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
-    });
-    let msg = events
-        .into_iter()
-        .find(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
-        .expect("expected share result");
-    let step = apply_pi(&harness, &mut app, "PiMsg share result", msg);
-    assert_after_contains(&harness, &step, "Created public gist");
-
-    // Verify the mock gh received --public=true
-    let recorded_args = fs::read_to_string(&args_record).expect("read recorded args");
+    assert_after_contains(&harness, &step, "public sharing is disabled");
     assert!(
-        recorded_args.contains("--public=true"),
-        "expected --public=true in gh args, got: {recorded_args}"
+        !args_record.exists(),
+        "rejected public share invoked gh: {}",
+        fs::read_to_string(&args_record).unwrap_or_default()
     );
 
     log_test_event(
-        "tui_state_slash_share_public_flag_creates_public_gist",
-        "share_completed",
-        &json!({"privacy": "public", "public_flag_passed": true}),
+        "tui_state_slash_share_rejects_public_argument_before_invoking_gh",
+        "gh_not_invoked",
+        &json!({"secret_by_construction": true}),
     );
 }
 
