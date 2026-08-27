@@ -860,6 +860,9 @@ pub struct PiFtuiModel {
     state: AgentUiState,
     /// Sanitized transcript lines (completed messages / system notes).
     transcript: Vec<TranscriptEntry>,
+    /// Session identity represented by the transcript. Owner-tagged async
+    /// notes are accepted only when they match this reset-installed value.
+    displayed_session_id: Option<String>,
     /// Sanitized in-flight assistant text (streaming deltas accumulate here).
     streaming: String,
     /// Running tool (name shown in the status region while active).
@@ -983,6 +986,7 @@ impl PiFtuiModel {
         Self {
             state: AgentUiState::Ready,
             transcript: Vec::new(),
+            displayed_session_id: None,
             streaming: String::new(),
             current_tool: None,
             todo_summary: None,
@@ -1348,9 +1352,22 @@ impl PiFtuiModel {
                 let text = sanitize(&text).into_owned();
                 self.push_entry(EntryRole::System, text);
             }
-            PiMsg::ConversationReset {
-                messages, status, ..
+            PiMsg::SessionSystemNote {
+                owner_session_id,
+                message,
             } => {
+                if self.displayed_session_id.as_deref() == Some(owner_session_id.as_str()) {
+                    let text = sanitize(&message).into_owned();
+                    self.push_entry(EntryRole::System, text);
+                }
+            }
+            PiMsg::ConversationReset {
+                session_id,
+                messages,
+                status,
+                ..
+            } => {
+                self.displayed_session_id = Some(session_id);
                 self.apply_conversation_reset(messages, status);
             }
             PiMsg::BashResult { display, .. } => {
@@ -3238,11 +3255,16 @@ async fn send_conversation_reset(
     status: &str,
 ) {
     match handle
-        .with_session(crate::interactive::conversation_from_session)
+        .with_session(|session| {
+            let session_id = session.header.id.clone();
+            let (messages, usage) = crate::interactive::conversation_from_session(session);
+            (session_id, messages, usage)
+        })
         .await
     {
-        Ok((messages, usage)) => {
+        Ok((session_id, messages, usage)) => {
             let _ = agent_tx.send(PiMsg::ConversationReset {
+                session_id,
                 messages,
                 usage,
                 status: Some(status.to_string()),
@@ -3399,9 +3421,12 @@ pub fn run(
                 };
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
-                let _ = agent_tx.send(PiMsg::System(String::from(
+                send_conversation_reset(
+                    &handle,
+                    &agent_tx,
                     "ftui preview stack — experimental (bd-cv653.9.1)",
-                )));
+                )
+                .await;
                 loop {
                     match submit_rx.try_recv() {
                         Ok(UiCommand::Prompt(prompt)) => {
@@ -4661,6 +4686,7 @@ mod tests {
         // Preexisting content is replaced wholesale.
         sim.send(PiFtuiMsg::Agent(PiMsg::System("old line".into())));
         sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "resumed-session".into(),
             messages: vec![
                 ConversationMessage {
                     role: MessageRole::User,
@@ -4697,6 +4723,30 @@ mod tests {
             transcript
                 .iter()
                 .any(|e| e.text.contains("session resumed"))
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::SessionSystemNote {
+            owner_session_id: "replaced-session".into(),
+            message: "stale note".into(),
+        }));
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "stale note"),
+            "an old session's note must not enter the replacement transcript"
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::SessionSystemNote {
+            owner_session_id: "resumed-session".into(),
+            message: "current note".into(),
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "current note"),
+            "the displayed session's note must remain visible"
         );
     }
 

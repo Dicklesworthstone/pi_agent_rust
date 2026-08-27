@@ -1984,6 +1984,13 @@ pub enum PiMsg {
         initial_selected_id: Option<String>,
         label: Option<String>,
     },
+    /// Internal bounded retry for a session-scoped event whose authoritative
+    /// Session lock was transiently busy. The boxed event is always the
+    /// original owner-tagged event, never another retry envelope.
+    SessionEventRetry {
+        event: Box<Self>,
+        attempts_remaining: u8,
+    },
     /// Reloaded skills/prompts/themes/extensions.
     ResourcesReloaded {
         resources: ResourceLoader,
@@ -2006,6 +2013,27 @@ pub enum PiMsg {
     /// OAuth callback server received the browser redirect.
     /// The string is the full callback URL (e.g. `http://localhost:1455/auth/callback?code=abc&state=xyz`).
     OAuthCallbackReceived(String),
+}
+
+/// Retry a contended session-scoped UI event for at most two seconds. This is
+/// long enough to bridge normal transition critical sections while keeping a
+/// broken lock path bounded and observable to the handler at exhaustion.
+pub(super) const SESSION_EVENT_LOCK_RETRY_ATTEMPTS: u8 = 80;
+const SESSION_EVENT_LOCK_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(25);
+
+pub(super) fn session_event_retry_cmd(
+    event: PiMsg,
+    attempts_remaining: u8,
+) -> Option<Cmd> {
+    let next_attempts = attempts_remaining.checked_sub(1)?;
+    Some(Cmd::blocking(move || {
+        std::thread::sleep(SESSION_EVENT_LOCK_RETRY_DELAY);
+        Message::new(PiMsg::SessionEventRetry {
+            event: Box::new(event),
+            attempts_remaining: next_attempts,
+        })
+    }))
 }
 
 /// Read the current git branch from `.git/HEAD` in the given directory.

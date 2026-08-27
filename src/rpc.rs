@@ -13669,7 +13669,8 @@ export default function init(pi) {
             crate::jobs::push_completion_notice(
                 &foreign_session_id,
                 "must remain outside this RPC session",
-            );
+            )
+            .expect("foreign notice");
 
             let auth_path = tempfile::tempdir()
                 .expect("tempdir")

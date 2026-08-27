@@ -847,6 +847,23 @@ pub struct McpDiscovery {
 /// `global_dir`: the pi global agent dir (`~/.pi/agent`).
 #[must_use]
 pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDiscovery {
+    discover_with_project_trust(cwd, global_dir, cli_paths, true)
+}
+
+/// Discover and merge MCP server configs with an explicit workspace-trust
+/// decision.
+///
+/// When `project_trusted` is false, project-native and foreign project files
+/// are skipped without being opened. Explicit `--mcp-config` paths and the
+/// global Pi config remain eligible because neither is discovered from the
+/// untrusted workspace.
+#[must_use]
+pub fn discover_with_project_trust(
+    cwd: &Path,
+    global_dir: &Path,
+    cli_paths: &[PathBuf],
+    project_trusted: bool,
+) -> McpDiscovery {
     let mut layered: Vec<(String, RawServer, Provenance, PathBuf)> = Vec::new();
     let mut warnings = Vec::new();
     let mut claimed_names = std::collections::HashSet::new();
@@ -868,7 +885,7 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
             &mut claimed_names,
         );
     }
-    if !lower_layers_blocked {
+    if !lower_layers_blocked && project_trusted {
         lower_layers_blocked = load_file(
             &cwd.join(".pi/mcp.json"),
             Provenance::ProjectPi,
@@ -877,7 +894,7 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
             &mut claimed_names,
         );
     }
-    if !lower_layers_blocked {
+    if !lower_layers_blocked && project_trusted {
         lower_layers_blocked = load_file(
             &cwd.join(".agents/mcp.json"),
             Provenance::ProjectAgents,
@@ -895,7 +912,7 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
             &mut claimed_names,
         );
     }
-    if !lower_layers_blocked {
+    if !lower_layers_blocked && project_trusted {
         for foreign in FOREIGN_PROJECT_FILES {
             load_file(
                 &cwd.join(foreign),

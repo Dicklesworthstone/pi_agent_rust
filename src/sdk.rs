@@ -306,6 +306,10 @@ pub struct SessionOptions {
     pub append_system_prompt: Option<String>,
     pub enabled_tools: Option<Vec<String>>,
     pub working_directory: Option<PathBuf>,
+    /// Whether project-local configuration under the working directory may
+    /// be loaded. Programmatic callers default to fail-closed; CLI hosts pass
+    /// the decision produced by `workspace_trust::establish`.
+    pub workspace_trusted: bool,
     pub no_session: bool,
     pub session_path: Option<PathBuf>,
     pub session_dir: Option<PathBuf>,
@@ -415,6 +419,7 @@ impl Default for SessionOptions {
             append_system_prompt: None,
             enabled_tools: None,
             working_directory: None,
+            workspace_trusted: false,
             package_dir: None,
             no_session: true,
             session_path: None,
@@ -1846,6 +1851,20 @@ fn resolve_path_for_cwd(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+fn load_session_config(
+    cwd: &Path,
+    global_dir: &Path,
+    config_override: Option<&Path>,
+    workspace_trusted: bool,
+) -> Result<Config> {
+    Config::load_with_roots_and_project_trust(
+        config_override,
+        global_dir,
+        cwd,
+        workspace_trusted,
+    )
+}
+
 fn build_stream_options_with_optional_key(
     config: &Config,
     api_key: Option<String>,
@@ -1946,12 +1965,18 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         }
     }
 
-    let config = Config::load()?;
+    let global_dir = Config::global_dir();
+    let config_override = Config::config_path_override_from_env(&cwd);
+    let config = load_session_config(
+        &cwd,
+        &global_dir,
+        config_override.as_deref(),
+        options.workspace_trusted,
+    )?;
 
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
 
-    let global_dir = Config::global_dir();
     let raw_package_dir = options
         .package_dir
         .clone()
@@ -2162,10 +2187,11 @@ pub(crate) async fn create_agent_session_deferred_mcp(
 
     let mcp_manager = if let Some(mcp) = &options.mcp {
         let global_dir = mcp.global_dir.clone().unwrap_or_else(Config::global_dir);
-        let manager = Arc::new(crate::mcp::McpManager::bootstrap(
+        let manager = Arc::new(crate::mcp::bootstrap_with_project_trust(
             &cwd,
             &global_dir,
             &mcp.config_paths,
+            options.workspace_trusted,
         )?);
         if let Some(extension_manager) = agent_session
             .extensions
@@ -2271,6 +2297,33 @@ mod tests {
             no_session: true,
             ..SessionOptions::default()
         }
+    }
+
+    #[test]
+    fn sdk_config_loader_uses_session_root_and_workspace_trust() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let global_dir = tmp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi")).expect("create project config dir");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        std::fs::write(
+            global_dir.join("settings.json"),
+            r#"{"defaultThinkingLevel":"low"}"#,
+        )
+        .expect("write global settings");
+        std::fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{"defaultThinkingLevel":"high"}"#,
+        )
+        .expect("write project settings");
+
+        let untrusted = load_session_config(&cwd, &global_dir, None, false)
+            .expect("load untrusted config");
+        assert_eq!(untrusted.default_thinking_level.as_deref(), Some("low"));
+
+        let trusted =
+            load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
+        assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
     }
 
     #[test]

@@ -3546,11 +3546,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         runtime.spawn(async move {
             let card = match tool.run_background_tan(&work).await {
                 Ok(completion) => {
-                    pi::jobs::push_completion_notice(
+                    let follow_up_result = pi::jobs::push_completion_notice(
                         &owner_session_id,
                         completion.follow_up_text(),
                     );
-                    completion.card_text()
+                    follow_up_result.map_or_else(
+                        |err| format!("(/tan failed to queue follow-up)\n{err}"),
+                        |()| completion.card_text(),
+                    )
                 }
                 Err(err) => format!("(/tan failed)\n{err}"),
             };

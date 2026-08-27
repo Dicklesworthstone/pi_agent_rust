@@ -18,9 +18,26 @@ pub use trust::{TrustDecision, TrustStore};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 use crate::model::{ContentBlock, TextContent};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
+
+/// Build an MCP manager while enforcing the established workspace-trust
+/// decision at discovery time.
+///
+/// Denied workspaces never open project-native or foreign project configs;
+/// explicit CLI files and global Pi configuration remain eligible.
+pub fn bootstrap_with_project_trust(
+    cwd: &Path,
+    global_dir: &Path,
+    cli_paths: &[PathBuf],
+    project_trusted: bool,
+) -> crate::error::Result<McpManager> {
+    let discovery =
+        config::discover_with_project_trust(cwd, global_dir, cli_paths, project_trusted);
+    Ok(McpManager::new(cwd, global_dir, discovery))
+}
 
 /// Mounted tool name cap (provider schemas reject longer names).
 const MAX_MOUNTED_NAME: usize = 64;

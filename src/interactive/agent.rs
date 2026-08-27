@@ -1270,6 +1270,9 @@ After approving access in the browser, press Enter in Pi to complete login."
                 usage,
                 status,
             } => {
+                if !self.event_session_is_current(&session_id) {
+                    return None;
+                }
                 let is_replacement =
                     self.displayed_session_id.as_deref() != Some(session_id.as_str());
                 self.displayed_session_id = Some(session_id);
@@ -4952,6 +4955,55 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn conversation_reset_rejects_stale_session_payloads() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let old_session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+        let replacement_session_id = "replacement-session".to_string();
+        app.session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone_from(&replacement_session_id);
+        app.agent_state = AgentState::Processing;
+        app.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: "replacement UI state".to_string(),
+            thinking: None,
+            collapsed: false,
+        });
+
+        let _ = app.handle_pi_message(PiMsg::ConversationReset {
+            session_id: old_session_id.clone(),
+            messages: Vec::new(),
+            usage: Usage::default(),
+            status: Some("stale reset".to_string()),
+        });
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.displayed_session_id.as_deref(), Some(old_session_id.as_str()));
+
+        let _ = app.handle_pi_message(PiMsg::ConversationReset {
+            session_id: replacement_session_id.clone(),
+            messages: Vec::new(),
+            usage: Usage::default(),
+            status: Some("current reset".to_string()),
+        });
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.messages.is_empty());
+        assert_eq!(
+            app.displayed_session_id.as_deref(),
+            Some(replacement_session_id.as_str())
+        );
+    }
+
+    #[test]
     fn same_session_conversation_reset_preserves_session_scoped_ui_state() {
         let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app.title_requested = true;
@@ -5152,6 +5204,88 @@ mod stream_delta_batcher_tests {
             agent_guard.stream_options().thinking_level,
             Some(crate::model::ThinkingLevel::Off)
         );
+    }
+
+    #[test]
+    fn fast_tree_navigation_is_atomic_when_agent_is_busy() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let (session_id, current_leaf_id, target_leaf_id, session_before) =
+            runtime().block_on(async {
+                let cx = Cx::for_request();
+                let mut session_guard =
+                    asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
+                        .await
+                        .expect("lock session");
+                let root_id =
+                    session_guard.append_message(crate::session::SessionMessage::User {
+                        content: crate::model::UserContent::Text("root".to_string()),
+                        timestamp: Some(0),
+                    });
+                let current_leaf_id =
+                    session_guard.append_message(crate::session::SessionMessage::User {
+                        content: crate::model::UserContent::Text("current".to_string()),
+                        timestamp: Some(0),
+                    });
+                assert!(session_guard.create_branch_from(&root_id));
+                let target_leaf_id =
+                    session_guard.append_message(crate::session::SessionMessage::User {
+                        content: crate::model::UserContent::Text("target".to_string()),
+                        timestamp: Some(0),
+                    });
+                assert!(session_guard.navigate_to(&current_leaf_id));
+                (
+                    session_guard.header.id.clone(),
+                    Some(current_leaf_id),
+                    Some(target_leaf_id),
+                    serde_json::to_value(session_guard.to_messages_for_current_path())
+                        .expect("serialize session history"),
+                )
+            });
+        let ui_before = app
+            .messages
+            .iter()
+            .map(|message| (message.role, message.content.clone()))
+            .collect::<Vec<_>>();
+        let agent = Arc::clone(&app.agent);
+        let agent_guard = agent.try_lock().expect("lock agent");
+        let agent_before =
+            serde_json::to_value(agent_guard.messages()).expect("serialize agent history");
+
+        let switched = app.start_tree_navigation(
+            super::super::tree::PendingTreeNavigation {
+                session_id,
+                old_leaf_id: current_leaf_id.clone(),
+                new_leaf_id: target_leaf_id,
+                editor_text: None,
+                entries_to_summarize: Vec::new(),
+                summary_from_id: String::new(),
+                api_key_present: false,
+            },
+            super::super::tree::TreeSummaryChoice::NoSummary,
+            None,
+        );
+
+        assert!(!switched, "a busy Agent must reject the entire branch switch");
+        assert_eq!(app.status_message.as_deref(), Some("Agent busy; try again"));
+        assert_eq!(
+            serde_json::to_value(agent_guard.messages()).expect("serialize agent history"),
+            agent_before
+        );
+        drop(agent_guard);
+        let session_guard = app.session.try_lock().expect("lock session");
+        assert_eq!(session_guard.leaf_id(), current_leaf_id.as_deref());
+        assert_eq!(
+            serde_json::to_value(session_guard.to_messages_for_current_path())
+                .expect("serialize session history"),
+            session_before
+        );
+        drop(session_guard);
+        let ui_after = app
+            .messages
+            .iter()
+            .map(|message| (message.role, message.content.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(ui_after, ui_before);
     }
 
     #[test]
