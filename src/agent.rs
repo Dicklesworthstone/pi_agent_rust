@@ -5307,6 +5307,20 @@ impl ProviderAdmissionGate {
 pub(crate) struct SessionActionAdmissionGate {
     permit: Arc<Mutex<()>>,
     generation: Arc<AtomicU64>,
+    #[cfg(test)]
+    pending_generation_checks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+struct PendingSessionActionGenerationCheck {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Drop for PendingSessionActionGenerationCheck {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Default for SessionActionAdmissionGate {
@@ -5314,6 +5328,8 @@ impl Default for SessionActionAdmissionGate {
         Self {
             permit: Arc::new(Mutex::new(())),
             generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            pending_generation_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -5331,10 +5347,23 @@ impl SessionActionAdmissionGate {
 
     async fn acquire_current_generation(&self) -> Result<OwnedMutexGuard<()>> {
         let generation = self.generation();
+        #[cfg(test)]
+        let _pending_generation_check = {
+            self.pending_generation_checks
+                .fetch_add(1, Ordering::SeqCst);
+            PendingSessionActionGenerationCheck {
+                count: Arc::clone(&self.pending_generation_checks),
+            }
+        };
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let permit = self.acquire(cx.cx()).await?;
         self.ensure_generation(generation)?;
         Ok(permit)
+    }
+
+    #[cfg(test)]
+    fn pending_generation_check_count(&self) -> usize {
+        self.pending_generation_checks.load(Ordering::SeqCst)
     }
 
     pub(crate) fn ensure_generation(&self, expected: u64) -> Result<()> {
@@ -6907,7 +6936,18 @@ mod extensions_integration_tests {
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    async fn wait_for_session_action_generation_capture(gate: &SessionActionAdmissionGate) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.pending_generation_check_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "session action did not capture its source generation before the deadline"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(1)).await;
+        }
+    }
 
     /// bd-cv653.6.2: a glob-scoped imported rule is queued as steering the
     /// first time a tool call touches a matching path — exactly once — and
@@ -7656,7 +7696,7 @@ mod extensions_integration_tests {
                     })
                     .await
             });
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(25)).await;
+            wait_for_session_action_generation_capture(&session_action_admission).await;
             {
                 let cx = crate::agent_cx::AgentCx::for_request();
                 let guard = session.lock(cx.cx()).await.expect("session lock");
@@ -8390,7 +8430,7 @@ mod extensions_integration_tests {
                 )
                 .await
             });
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(25)).await;
+            wait_for_session_action_generation_capture(&session_action_admission).await;
 
             let replacement_session_id = {
                 let cx = crate::agent_cx::AgentCx::for_request();
@@ -8490,7 +8530,7 @@ mod extensions_integration_tests {
                     .execute_command("append-late", "", 5_000)
                     .await
             });
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(25)).await;
+            wait_for_session_action_generation_capture(&session_action_admission).await;
 
             let replacement_session_id = {
                 let cx = crate::agent_cx::AgentCx::for_request();

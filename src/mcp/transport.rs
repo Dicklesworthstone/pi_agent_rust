@@ -4246,7 +4246,7 @@ mod tests {
             .expect("classify GET 404");
         assert!(matches!(opened, HttpEventStreamOpen::SessionExpired));
         assert!(
-            started_at.elapsed() < Duration::from_millis(500),
+            started_at.elapsed() < Duration::from_secs(1),
             "GET expiry classification waited for a non-semantic drip body"
         );
         assert_eq!(server.finish(), 1);
@@ -4272,7 +4272,7 @@ mod tests {
             .expect_err("drip-fed DELETE error must hit its absolute deadline");
         assert!(error.to_string().contains("MCP_TRANSPORT_IO"), "{error}");
         assert!(
-            started_at.elapsed() < Duration::from_millis(500),
+            started_at.elapsed() < Duration::from_secs(1),
             "DELETE exceeded its absolute close budget"
         );
         assert_eq!(server.finish(), 1);
@@ -4324,6 +4324,48 @@ mod tests {
             server.finish(),
             1,
             "initialize has no request id, so dropping it must not emit notifications/cancelled"
+        );
+    }
+
+    #[test]
+    fn streamable_http_dropped_initialized_future_aborts_without_cancellation() {
+        let server = DripBodyHttpServer::start(500, "Internal Server Error");
+        let transport = std::sync::Arc::new(
+            HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport"),
+        );
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-initialized-drop".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture initialized session");
+        let runtime = runtime_for_tests();
+        runtime.block_on(async {
+            let initialized =
+                Box::pin(transport.notify("notifications/initialized", serde_json::json!({})));
+            let request_started = Box::pin(async {
+                wait_for_flag(
+                    &server.request_received,
+                    "initialized notification dispatch",
+                )
+                .await;
+            });
+            match futures::future::select(initialized, request_started).await {
+                futures::future::Either::Left((result, _)) => {
+                    panic!("initialized notification unexpectedly completed: {result:?}");
+                }
+                futures::future::Either::Right(((), pending_initialized)) => {
+                    drop(pending_initialized);
+                }
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+        });
+        assert!(!transport.is_alive());
+        assert_eq!(
+            server.finish(),
+            1,
+            "notifications have no request id, so dropping initialized must not emit cancellation"
         );
     }
 

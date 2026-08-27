@@ -1593,6 +1593,11 @@ fn events_send_message_dispatches_to_host_actions() {
         let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
         let actions = Arc::new(MockHostActions::new());
         manager.set_host_actions(actions.clone());
+        let generation_before = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ctx_generation;
 
         let outcome = dispatch_hostcall_events(
             "call-1",
@@ -1644,11 +1649,6 @@ fn events_send_message_requires_custom_type() {
         let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
         let actions = Arc::new(MockHostActions::new());
         manager.set_host_actions(actions.clone());
-        let generation_before = manager
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ctx_generation;
 
         let outcome = dispatch_hostcall_events(
             "call-1",
