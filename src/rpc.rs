@@ -3937,6 +3937,11 @@ async fn preserve_terminal_rpc_state(
     let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
         .await
         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+    if let Some(reason) = state.provider_reentry_blocked.as_ref() {
+        return Err(Error::session_persistence(format!(
+            "terminal RPC persistence is quarantined after an indeterminate transition: {reason}"
+        )));
+    }
     let completed_tool_transcript =
         completed_live_tool_effect_suffix(&inner, guard.agent.messages())?;
     state.stage_completed_tool_transcript(&inner, &completed_tool_transcript)?;
@@ -4770,8 +4775,22 @@ async fn run_prompt_with_retry(
         // immediately after parent cancellation and can strand input that was
         // already acknowledged to the RPC client.
         let preservation_cx = AgentCx::for_request();
-        if let Err(err) =
-            preserve_terminal_rpc_input(&session, &shared_state, &preservation_cx).await
+        let preservation_quarantined =
+            match OwnedMutexGuard::lock(Arc::clone(&shared_state), &preservation_cx).await {
+                Ok(state) => state.provider_reentry_blocked.is_some(),
+                Err(err) => {
+                    let preservation_error =
+                        format!("failed to inspect RPC persistence quarantine: {err}");
+                    final_error = Some(final_error.map_or_else(
+                        || preservation_error.clone(),
+                        |terminal| format!("{terminal}; {preservation_error}"),
+                    ));
+                    true
+                }
+            };
+        if !preservation_quarantined
+            && let Err(err) =
+                preserve_terminal_rpc_input(&session, &shared_state, &preservation_cx).await
         {
             let preservation_error = format!("failed to preserve queued RPC input: {err}");
             final_error = Some(final_error.map_or_else(
@@ -5010,6 +5029,22 @@ async fn try_failover_to_next_chain_entry(
     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx)
         .await
         .map_err(|err| Error::session(format!("failover state lock failed: {err}")))?;
+    let primary_model = match (
+        state.active_failover_model.as_ref(),
+        state.failover_primary_model.as_ref(),
+    ) {
+        (None, None) => (current_provider.clone(), current_model.clone()),
+        (Some(_), Some(primary)) => primary.clone(),
+        (active, primary) => {
+            let reason = format!(
+                "failover state invariant failed: active fallback presence={} recorded primary presence={}",
+                active.is_some(),
+                primary.is_some()
+            );
+            state.provider_reentry_blocked = Some(reason.clone());
+            return Err(Error::session_persistence(reason));
+        }
+    };
     let mut position = state.failover_chain_position.unwrap_or(0);
     let cap = options.config.max_failovers_per_turn() as usize;
 
@@ -5055,8 +5090,7 @@ async fn try_failover_to_next_chain_entry(
         // provider/options, shared cooldown, and event stream remain untouched
         // if restoration, the inner lock, or persistence fails.
         let session_store = Arc::clone(&guard.session);
-        let mut inner = session_store
-            .lock(cx.cx())
+        let mut inner = OwnedMutexGuard::lock(session_store, cx)
             .await
             .map_err(|err| Error::session(format!("failover inner session lock failed: {err}")))?;
         let mut candidate = inner.clone();
@@ -5077,7 +5111,11 @@ async fn try_failover_to_next_chain_entry(
                 "attempt": position,
             })),
         );
-        candidate.append_model_change(to_provider.clone(), to_model.clone());
+        candidate.append_model_change_with_role(
+            to_provider.clone(),
+            to_model.clone(),
+            Some("failover".to_string()),
+        );
         if guard.save_enabled()
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -5091,19 +5129,18 @@ async fn try_failover_to_next_chain_entry(
 
         // No fallible operation remains in the transition after installation.
         *inner = candidate;
-        drop(inner);
         guard.agent.replace_messages(restored_messages);
         guard.agent.set_provider(provider_impl);
         guard.agent.set_keyword_max_thinking_level(
             entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
         );
-        guard.agent.stream_options_mut().api_key.clone_from(&key);
-        guard
-            .agent
-            .stream_options_mut()
-            .headers
-            .clone_from(&entry.headers);
+        guard.agent.set_tool_call_dialect(entry.tool_call_dialect());
+        let stream_options = guard.agent.stream_options_mut();
+        stream_options.api_key.clone_from(&key);
+        stream_options.headers.clone_from(&entry.headers);
+        stream_options.max_tokens = Some(entry.model.max_tokens);
 
+        state.failover_primary_model = Some(primary_model.clone());
         state.active_failover_model = Some((to_provider.clone(), to_model.clone()));
         state.failover_chain_position = Some(position);
         if let Some(tracker) = state.failover_cooldown.as_mut() {
@@ -5118,6 +5155,7 @@ async fn try_failover_to_next_chain_entry(
             class: format!("{class:?}").to_ascii_lowercase(),
             attempt: position as u32,
         });
+        drop(inner);
         drop(state);
         drop(guard);
         if let Some(attempt) = retry_attempt_to_end {
@@ -6968,6 +7006,7 @@ mod retry_tests {
             drop(guard);
 
             let state = shared_state.lock(&cx).await.expect("shared state lock");
+            assert!(state.failover_primary_model.is_none());
             assert!(state.active_failover_model.is_none());
             assert!(state.failover_chain_position.is_none());
             assert!(state.provider_reentry_blocked.is_none());
@@ -7021,7 +7060,7 @@ mod retry_tests {
                     &options,
                     Some("server error"),
                     true,
-                    None,
+                    Some(2),
                     &cx,
                 )
                 .await
@@ -7051,6 +7090,12 @@ mod retry_tests {
                 .await
                 .expect("inner session lock");
             let path = inner.entries_for_current_path();
+            assert_eq!(
+                serde_json::to_value(guard.agent.messages()).expect("serialize Agent messages"),
+                serde_json::to_value(inner.to_messages_for_current_path())
+                    .expect("serialize Session path messages"),
+                "Agent transcript must match the installed Session candidate"
+            );
             assert!(path.iter().all(|entry| !matches!(
                 entry,
                 SessionEntry::Message(message)
@@ -7067,12 +7112,21 @@ mod retry_tests {
             assert!(path.iter().any(|entry| matches!(
                 entry,
                 SessionEntry::ModelChange(change)
-                    if change.provider == "anthropic" && change.model_id == "fallback-model"
+                    if change.provider == "anthropic"
+                        && change.model_id == "fallback-model"
+                        && change.role.as_deref() == Some("failover")
             )));
             drop(inner);
             drop(guard);
 
             let state = shared_state.lock(&cx).await.expect("shared state lock");
+            assert_eq!(
+                state
+                    .failover_primary_model
+                    .as_ref()
+                    .map(|(provider, model)| (provider.as_str(), model.as_str())),
+                Some(("test-provider", "test-model"))
+            );
             assert_eq!(
                 state
                     .active_failover_model
@@ -7084,9 +7138,21 @@ mod retry_tests {
             assert!(state.provider_reentry_blocked.is_none());
             drop(state);
 
-            let event = out_rx.try_recv().expect("failover_start event");
-            let event: Value = serde_json::from_str(&event).expect("failover event JSON");
-            assert_eq!(event.get("type").and_then(Value::as_str), Some("failover_start"));
+            let retry_end = out_rx.try_recv().expect("auto_retry_end event");
+            let retry_end: Value =
+                serde_json::from_str(&retry_end).expect("retry-end event JSON");
+            assert_eq!(
+                retry_end.get("type").and_then(Value::as_str),
+                Some("auto_retry_end")
+            );
+            assert_eq!(retry_end.get("attempt").and_then(Value::as_u64), Some(2));
+            let failover_start = out_rx.try_recv().expect("failover_start event");
+            let failover_start: Value =
+                serde_json::from_str(&failover_start).expect("failover event JSON");
+            assert_eq!(
+                failover_start.get("type").and_then(Value::as_str),
+                Some("failover_start")
+            );
             assert!(out_rx.try_recv().is_err(), "unexpected extra failover event");
         });
     }
