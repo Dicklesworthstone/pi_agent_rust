@@ -9,9 +9,9 @@ use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender, TrySendError};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -198,9 +198,7 @@ fn try_enqueue_client_command(
         TrySendError::Full(_) => {
             McpStdioError::Backpressure("outbound stdio queue is full".to_string())
         }
-        TrySendError::Disconnected(_) => {
-            McpStdioError::Closed("stdio writer stopped".to_string())
-        }
+        TrySendError::Disconnected(_) => McpStdioError::Closed("stdio writer stopped".to_string()),
     })
 }
 
@@ -323,16 +321,16 @@ fn route_stdio_message(
             })
         };
         let encoded = encode_stdio_message(&response)?;
-        return writer_tx.try_send(WriterCommand::Message(encoded)).map_err(|error| {
-            match error {
+        return writer_tx
+            .try_send(WriterCommand::Message(encoded))
+            .map_err(|error| match error {
                 TrySendError::Full(_) => {
                     McpStdioError::Io("outbound stdio queue is full".to_string())
                 }
                 TrySendError::Disconnected(_) => {
                     McpStdioError::Closed("stdio writer stopped".to_string())
                 }
-            }
-        });
+            });
     }
 
     let Some(id) = id.and_then(Value::as_u64) else {
@@ -433,11 +431,7 @@ struct ReaderConnectionStop<'a> {
 }
 
 impl ReaderConnectionStop<'_> {
-    fn finish(
-        self,
-        error: McpStdioError,
-        wake_writer: impl FnOnce(&StdSyncSender<WriterCommand>),
-    ) {
+    fn finish(self, error: McpStdioError, wake_writer: impl FnOnce(&StdSyncSender<WriterCommand>)) {
         // Publish the stopped state before the best-effort queue wake. If the
         // bounded queue is full, every queued write variant observes `alive`
         // and exits; if the writer drains first, Close wakes its recv.
@@ -626,19 +620,14 @@ struct McpStdioClient {
 }
 
 impl McpStdioClient {
-    fn spawn(
-        command: &str,
-        args: &[String],
-        env: &[(String, String)],
-        cwd: &Path,
-    ) -> Result<Self> {
+    fn spawn(command: &str, args: &[String], env: &[(String, String)], cwd: &Path) -> Result<Self> {
         let mut command_builder = crate::tools::command_with_default_sigpipe_in_dir(command, cwd)
             .map_err(|error| {
-                tool_err(
-                    "MCP_SERVER_MISSING",
-                    format!("failed to prepare MCP server {command:?}: {error}"),
-                )
-            })?;
+            tool_err(
+                "MCP_SERVER_MISSING",
+                format!("failed to prepare MCP server {command:?}: {error}"),
+            )
+        })?;
         command_builder
             .args(args)
             .current_dir(cwd)
@@ -699,10 +688,8 @@ impl McpStdioClient {
         let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
         let alive = std::sync::Arc::new(AtomicBool::new(true));
         let closing = std::sync::Arc::new(AtomicBool::new(false));
-        let tree_cleanup_state =
-            std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending));
-        let stderr_tail =
-            std::sync::Arc::new(Mutex::new(PublicTailBuffer::new()));
+        let tree_cleanup_state = std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending));
+        let stderr_tail = std::sync::Arc::new(Mutex::new(PublicTailBuffer::new()));
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(STDIO_WRITER_QUEUE_CAP);
         let mut child_guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
 
@@ -819,10 +806,11 @@ impl McpStdioClient {
         try_enqueue_client_command(&self.writer_tx, command)
     }
 
-    fn request(&self, method: &str, params: Value) -> std::result::Result<
-        (u64, StdReceiver<StdioOutcome>),
-        McpStdioError,
-    > {
+    fn request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<(u64, StdReceiver<StdioOutcome>), McpStdioError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         if id == u64::MAX {
             self.abort();
@@ -980,8 +968,7 @@ impl PendingStdioRequest<'_> {
 impl Drop for PendingStdioRequest<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.client
-                .cancel_request(self.id, self.send_cancellation);
+            self.client.cancel_request(self.id, self.send_cancellation);
             self.client.abort();
         }
     }
@@ -1424,13 +1411,12 @@ impl HttpTransport {
             unreachable!("notification status handling returned above");
         };
         let media_type = classify_http_response_media_type(&content_type)?;
-        let mut provisional_session = if method == "initialize"
-            && matches!(media_type, HttpResponseMediaType::EventStream)
-        {
-            self.begin_provisional_session(candidate_session_id.as_deref())?
-        } else {
-            None
-        };
+        let mut provisional_session =
+            if method == "initialize" && matches!(media_type, HttpResponseMediaType::EventStream) {
+                self.begin_provisional_session(candidate_session_id.as_deref())?
+            } else {
+                None
+            };
         let result = match media_type {
             HttpResponseMediaType::EventStream => {
                 self.receive_sse_response(response, expected_id).await?
@@ -1465,9 +1451,9 @@ impl HttpTransport {
         candidate_session_id: Option<String>,
         initialize_frame: &Value,
     ) -> Result<()> {
-        let result = result.as_object().ok_or_else(|| {
-            tool_err("MCP_PROTOCOL", "initialize result must be an object")
-        })?;
+        let result = result
+            .as_object()
+            .ok_or_else(|| tool_err("MCP_PROTOCOL", "initialize result must be an object"))?;
         let protocol_version = result
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -1527,12 +1513,7 @@ impl HttpTransport {
         Ok(())
     }
 
-    async fn request_once(
-        &self,
-        method: &str,
-        params: &Value,
-        timeout: Duration,
-    ) -> Result<Value> {
+    async fn request_once(&self, method: &str, params: &Value, timeout: Duration) -> Result<Value> {
         validate_outgoing_params(method, params)?;
         let id = self.next_request_id()?;
         let mut frame = serde_json::json!({
@@ -1611,10 +1592,13 @@ impl HttpTransport {
                     "SSE JSON-RPC request or notification must not contain result or error",
                 ));
             }
-            let method = method.as_str().ok_or_else(|| {
-                tool_err("MCP_PROTOCOL", "SSE JSON-RPC method must be a string")
-            })?;
-            if object.get("params").is_some_and(|params| !params.is_object()) {
+            let method = method
+                .as_str()
+                .ok_or_else(|| tool_err("MCP_PROTOCOL", "SSE JSON-RPC method must be a string"))?;
+            if object
+                .get("params")
+                .is_some_and(|params| !params.is_object())
+            {
                 return Err(tool_err(
                     "MCP_PROTOCOL",
                     "SSE JSON-RPC request or notification params must be an object",
@@ -1809,11 +1793,7 @@ fn validate_outgoing_params(method: &str, params: &Value) -> Result<()> {
 }
 
 fn validate_http_session_id(session_id: &str) -> Result<()> {
-    if session_id.is_empty()
-        || !session_id
-            .bytes()
-            .all(|byte| matches!(byte, 0x21..=0x7e))
-    {
+    if session_id.is_empty() || !session_id.bytes().all(|byte| matches!(byte, 0x21..=0x7e)) {
         return Err(tool_err(
             "MCP_PROTOCOL",
             "initialize response Mcp-Session-Id must contain only visible ASCII bytes",
@@ -1852,14 +1832,13 @@ fn validate_jsonrpc_response(value: &Value, expected_id: u64) -> Result<Value> {
     match (object.get("result"), object.get("error")) {
         (Some(result), None) => Ok(result.clone()),
         (None, Some(error)) => {
-            let error = error.as_object().ok_or_else(|| {
-                tool_err("MCP_PROTOCOL", "JSON-RPC error must be an object")
-            })?;
+            let error = error
+                .as_object()
+                .ok_or_else(|| tool_err("MCP_PROTOCOL", "JSON-RPC error must be an object"))?;
             if !matches!(
                 error.get("code"),
                 Some(Value::Number(code)) if code.is_i64() || code.is_u64()
-            )
-                || error.get("message").and_then(Value::as_str).is_none()
+            ) || error.get("message").and_then(Value::as_str).is_none()
             {
                 return Err(tool_err(
                     "MCP_PROTOCOL",
@@ -1969,8 +1948,7 @@ impl McpTransport for HttpTransport {
     }
 
     fn abort(&self) {
-        self.alive
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
         self.abort_notify.notify_waiters();
     }
 
@@ -2013,8 +1991,14 @@ mod tests {
         let mut writer = CappedJsonWriter::new(8);
         let error = serde_json::to_writer(&mut writer, &value)
             .expect_err("escaped JSON must exceed the small cap");
-        assert!(writer.exceeded, "cap error must be distinguished from JSON errors");
-        assert!(writer.bytes.len() <= 8, "capped writer over-allocated: {error}");
+        assert!(
+            writer.exceeded,
+            "cap error must be distinguished from JSON errors"
+        );
+        assert!(
+            writer.bytes.len() <= 8,
+            "capped writer over-allocated: {error}"
+        );
 
         let error = encode_stdio_message_with_limit(&value, 8)
             .expect_err("outbound encoder must surface its cap");
@@ -2093,8 +2077,7 @@ mod tests {
         let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
         let alive = std::sync::Arc::new(AtomicBool::new(true));
         let closing = std::sync::Arc::new(AtomicBool::new(true));
-        let tree_cleanup_state =
-            std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending));
+        let tree_cleanup_state = std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending));
         let release = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let writer_release = std::sync::Arc::clone(&release);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -2118,9 +2101,7 @@ mod tests {
             );
             let _ = done_tx.send(());
         });
-        let first_write_entered = entered_rx
-            .recv_timeout(Duration::from_millis(500))
-            .is_ok();
+        let first_write_entered = entered_rx.recv_timeout(Duration::from_millis(500)).is_ok();
         let second_cancellation_queued = writer_tx
             .try_send(WriterCommand::Cancellation(vec![2]))
             .is_ok();
@@ -2145,9 +2126,7 @@ mod tests {
                 let (released, wake) = &*release;
                 *lock(released) = true;
                 wake.notify_all();
-                completed_after_wake = done_rx
-                    .recv_timeout(Duration::from_millis(500))
-                    .is_ok();
+                completed_after_wake = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
             },
         );
         // Always release and join a mutated writer before asserting so a red
@@ -2175,8 +2154,14 @@ mod tests {
         let mut bytes = encode_stdio_message(&first).expect("first");
         bytes.extend_from_slice(&encode_stdio_message(&second).expect("second"));
         let mut reader = BufReader::new(bytes.as_slice());
-        assert_eq!(read_stdio_message(&mut reader).expect("first read"), Some(first));
-        assert_eq!(read_stdio_message(&mut reader).expect("second read"), Some(second));
+        assert_eq!(
+            read_stdio_message(&mut reader).expect("first read"),
+            Some(first)
+        );
+        assert_eq!(
+            read_stdio_message(&mut reader).expect("second read"),
+            Some(second)
+        );
         assert_eq!(read_stdio_message(&mut reader).expect("EOF"), None);
     }
 
@@ -2373,8 +2358,7 @@ mod tests {
     #[test]
     fn http_abort_cancels_in_flight_work_and_rejects_later_dispatch() {
         let transport = std::sync::Arc::new(
-            HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new())
-                .expect("HTTP transport"),
+            HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new()).expect("HTTP transport"),
         );
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let aborting_transport = std::sync::Arc::clone(&transport);
@@ -2417,5 +2401,360 @@ mod tests {
             .block_on(transport.request("tools/list", serde_json::json!({}), Duration::MAX))
             .expect_err("an aborted HTTP transport must reject later dispatch");
         assert!(error.to_string().contains("MCP_TRANSPORT_UNAVAILABLE"));
+    }
+
+    // ===== bd-zz6yo: streamable HTTP protocol contract =====
+
+    /// One-connection-per-request HTTP fixture: serves scripted responses in
+    /// order, captures each request's headers/body, and replaces the
+    /// __ECHO_ID__ token with the captured request's JSON-RPC id so scripted
+    /// results always satisfy the exact-id rule regardless of transport
+    /// id allocation.
+    struct ScriptedHttpServer {
+        addr: std::net::SocketAddr,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ScriptedHttpServer {
+        fn start(responses: Vec<String>) -> Self {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted http server");
+            let addr = listener.local_addr().expect("listener addr");
+            let captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured_for_thread = std::sync::Arc::clone(&captured);
+            let handle = std::thread::spawn(move || {
+                for response in responses {
+                    let (stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut reader =
+                        std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                    let mut request_line = String::new();
+                    if std::io::BufRead::read_line(&mut reader, &mut request_line).is_err() {
+                        break;
+                    }
+                    let mut headers: Vec<(String, String)> = Vec::new();
+                    let mut content_length = 0usize;
+                    let mut request_body_id: Option<u64> = None;
+                    loop {
+                        let mut line = String::new();
+                        match std::io::BufRead::read_line(&mut reader, &mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let trimmed = line.trim_end();
+                                if trimmed.is_empty() {
+                                    break;
+                                }
+                                if let Some((name, value)) = trimmed.split_once(':') {
+                                    let name = name.trim().to_string();
+                                    let value = value.trim().to_string();
+                                    if name.eq_ignore_ascii_case("content-length") {
+                                        content_length = value.parse().unwrap_or(0);
+                                    }
+                                    headers.push((name, value));
+                                }
+                            }
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        std::io::Read::read_exact(&mut reader, &mut body).ok();
+                    }
+                    let body_text = String::from_utf8_lossy(&body).to_string();
+                    if request_body_id.is_none() {
+                        request_body_id = body_text.split("\"id\":").nth(1).and_then(|rest| {
+                            rest.chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .collect::<String>()
+                                .parse::<u64>()
+                                .ok()
+                        });
+                    }
+                    captured_for_thread
+                        .lock()
+                        .expect("capture lock")
+                        .push((headers, body_text));
+                    let id_text = request_body_id
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    let response = response.replace("__ECHO_ID__", &id_text);
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            Self {
+                addr,
+                captured,
+                handle: Some(handle),
+            }
+        }
+
+        fn captured(&self) -> Vec<(Vec<(String, String)>, String)> {
+            self.captured.lock().expect("capture lock").clone()
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/mcp", self.addr)
+        }
+    }
+
+    impl Drop for ScriptedHttpServer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn http_ok_with_session(
+        id_placeholder: &str,
+        body: serde_json::Value,
+        session: &str,
+    ) -> String {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id_placeholder,
+            "result": body,
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nmcp-session-id: {session}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn http_ok_plain(id_placeholder: &str, body: serde_json::Value) -> String {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id_placeholder,
+            "result": body,
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn initialize_success_body() -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "serverInfo": {"name": "fixture", "version": "0.0.1"}
+        })
+    }
+
+    fn runtime_for_tests() -> asupersync::runtime::Runtime {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    /// HTTP 202 is a notification-only status: a JSON-RPC request receiving
+    /// it must fail closed (bd-zz6yo).
+    #[test]
+    fn streamable_http_rejects_202_for_requests() {
+        let server = ScriptedHttpServer::start(vec![format!(
+            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+        )]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let runtime = runtime_for_tests();
+        let error = runtime
+            .block_on(transport.request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect_err("202 must reject a JSON-RPC request");
+        assert!(
+            error.to_string().contains("202 cannot acknowledge"),
+            "{error}"
+        );
+    }
+
+    /// Notifications REQUIRE 202-with-empty-body; a 202 carrying a body
+    /// violates the contract, while an empty 202 resolves (bd-zz6yo).
+    #[test]
+    fn streamable_http_notification_202_body_rules() {
+        let with_body = ScriptedHttpServer::start(vec![format!(
+            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 1\r\n\r\nx"
+        )]);
+        let transport = HttpTransport::new(&with_body.url(), Vec::new()).expect("transport");
+        let runtime = runtime_for_tests();
+        let error = runtime
+            .block_on(transport.notify("notifications/initialized", serde_json::json!({})))
+            .expect_err("202 with a body must violate the notification contract");
+        assert!(error.to_string().contains("must have no body"), "{error}");
+        drop(transport);
+
+        let without_body = ScriptedHttpServer::start(vec![format!(
+            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+        )]);
+        let transport = HttpTransport::new(&without_body.url(), Vec::new()).expect("transport");
+        runtime
+            .block_on(transport.notify("notifications/initialized", serde_json::json!({})))
+            .expect("empty 202 accepts the notification");
+    }
+
+    /// Wrong response id and missing/incorrect jsonrpc version are rejected
+    /// before any result is surfaced (bd-zz6yo).
+    #[test]
+    fn streamable_http_rejects_wrong_id_and_version() {
+        let wrong_id_body = r#"{"jsonrpc":"2.0","id":999,"result":{}}"#;
+        let wrong_id = ScriptedHttpServer::start(vec![format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{wrong_id_body}",
+            wrong_id_body.len()
+        )]);
+        let transport = HttpTransport::new(&wrong_id.url(), Vec::new()).expect("transport");
+        let runtime = runtime_for_tests();
+        let error = runtime
+            .block_on(transport.request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect_err("wrong id must be rejected");
+        assert!(
+            error.to_string().contains("did not match request"),
+            "{error}"
+        );
+        drop(transport);
+
+        let wrong_version_body = r#"{"jsonrpc":"1.0","id":1,"result":{}}"#;
+        let wrong_version = ScriptedHttpServer::start(vec![format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{wrong_version_body}",
+            wrong_version_body.len()
+        )]);
+        let transport = HttpTransport::new(&wrong_version.url(), Vec::new()).expect("transport");
+        let error = runtime
+            .block_on(transport.request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect_err("wrong jsonrpc version must be rejected");
+        assert!(error.to_string().contains("jsonrpc"), "{error}");
+    }
+
+    /// After a validated initialize, subsequent requests propagate BOTH the
+    /// negotiated MCP-Protocol-Version and the assigned Mcp-Session-Id
+    /// (bd-zz6yo).
+    #[test]
+    fn streamable_http_propagates_version_and_session_headers() {
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-77"),
+            http_ok_plain("__ECHO_ID__", serde_json::json!({"tools": []})),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let runtime = runtime_for_tests();
+        runtime
+            .block_on(transport.request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect("initialize round trip");
+        runtime
+            .block_on(transport.request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect("tools/list round trip");
+
+        let captured = server.captured();
+        assert_eq!(captured.len(), 2);
+        let header = |index: usize, name: &str| {
+            captured[index]
+                .0
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            header(1, "Mcp-Session-Id").as_deref(),
+            Some("sid-77"),
+            "session id replays after initialize"
+        );
+        assert_eq!(
+            header(1, "MCP-Protocol-Version").as_deref(),
+            Some(MCP_PROTOCOL_VERSION),
+            "negotiated version propagates on subsequent requests"
+        );
+        assert!(
+            header(0, "Mcp-Session-Id").is_none(),
+            "the initialize request itself sends no session id"
+        );
+    }
+
+    /// Session-expiry 404 clears stale state and performs EXACTLY ONE
+    /// bounded reinitialize/retry; a second consecutive expiry surfaces to
+    /// the caller instead of looping (bd-zz6yo).
+    #[test]
+    fn streamable_http_session_expiry_renews_exactly_once() {
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-old"),
+            "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string(),
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-new"),
+            http_ok_plain("__ECHO_ID__", serde_json::json!({"tools": []})),
+            "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string(),
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-new2"),
+            "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string(),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let runtime = runtime_for_tests();
+
+        runtime
+            .block_on(transport.request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect("initial initialize");
+        runtime
+            .block_on(transport.request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect("expired session renews exactly once and retries successfully");
+
+        let captured = server.captured();
+        assert_eq!(
+            captured.len(),
+            7,
+            "first expiry: init, list-404, renewal-init, list-ok; \
+             second expiry: list-404, renewal-init, list-404; got {captured:#?}"
+        );
+        let initialize_count = captured
+            .iter()
+            .filter(|(_, body)| body.contains("\"initialize\"") || body.contains("protocolVersion"))
+            .count();
+        let initialize_requests = captured
+            .iter()
+            .filter(|(headers, body)| {
+                body.contains("\"method\":\"initialize\"")
+                    || headers.iter().any(|(k, v)| {
+                        k.eq_ignore_ascii_case("mcp-session-id") == false
+                            && body.contains("\"method\":\"initialize\"")
+                    })
+            })
+            .count();
+        let _ = initialize_count;
+        let _ = initialize_requests;
+
+        // A second consecutive expiry surfaces to the caller (no loop).
+        let error = runtime
+            .block_on(transport.request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect_err("second expiry must surface instead of looping forever");
+        assert!(error.to_string().contains("404"), "{error}");
     }
 }

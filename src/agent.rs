@@ -5168,18 +5168,26 @@ impl Default for ExtensionHostConfiguration {
 
 /// RAII guard that resets an `AtomicBool` to `false` on drop, ensuring the
 /// flag is cleared even if the enclosing async task is cancelled.
-struct AtomicBoolGuard(Arc<AtomicBool>);
+struct AtomicBoolGuard(Option<Arc<AtomicBool>>);
 
 impl AtomicBoolGuard {
     fn activate(flag: &Arc<AtomicBool>) -> Self {
         flag.store(true, Ordering::SeqCst);
-        Self(Arc::clone(flag))
+        Self(Some(Arc::clone(flag)))
+    }
+
+    /// Transfer responsibility for clearing the flag to an independently
+    /// running operation (for example, a registered background worker).
+    fn keep_active(mut self) {
+        self.0.take();
     }
 }
 
 impl Drop for AtomicBoolGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        if let Some(flag) = &self.0 {
+            flag.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -11637,7 +11645,40 @@ impl AgentSession {
             session_id: session.header.id.clone(),
             provider_id: provider.name().to_string(),
             model_id: provider.model_id().to_string(),
+            snapshot_leaf_id: session.leaf_id().map(str::to_string),
         })
+    }
+
+    async fn compaction_origin_matches_current(
+        &self,
+        origin: &CompactionOrigin,
+    ) -> Result<(bool, CompactionOrigin)> {
+        let provider = self.agent.provider();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let current = CompactionOrigin {
+            session_id: session.header.id.clone(),
+            provider_id: provider.name().to_string(),
+            model_id: provider.model_id().to_string(),
+            snapshot_leaf_id: session.leaf_id().map(str::to_string),
+        };
+        let snapshot_is_ancestor = match &origin.snapshot_leaf_id {
+            Some(snapshot_leaf_id) => session.entries_for_current_path().iter().any(|entry| {
+                entry
+                    .base_id()
+                    .is_some_and(|entry_id| entry_id == snapshot_leaf_id)
+            }),
+            None => session.leaf_id().is_none(),
+        };
+        let matches = origin.session_id == current.session_id
+            && origin.provider_id == current.provider_id
+            && origin.model_id == current.model_id
+            && snapshot_is_ancestor;
+        Ok((matches, current))
     }
 
     /// Force-run compaction synchronously (used by `/compact` slash command).
@@ -11716,36 +11757,63 @@ impl AgentSession {
 
         // Phase 1: apply completed background result.
         if let Some((origin, outcome)) = self.compaction_worker.try_recv_bound().await {
-            self.extensions_is_compacting
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            let current_origin = self.current_compaction_origin().await?;
-            if origin.as_ref() != Some(&current_origin) {
-                let origin_description = origin.map_or_else(
-                    || "missing origin metadata".to_string(),
-                    |origin| {
-                        format!(
-                            "session {}/{}/{}",
-                            origin.session_id, origin.provider_id, origin.model_id
-                        )
-                    },
-                );
+            // Preserve legacy lifecycle semantics: isCompacting remains true
+            // while the terminal event is delivered, then clears on scope exit.
+            let _terminal_compacting_guard =
+                AtomicBoolGuard::activate(&self.extensions_is_compacting);
+            let origin_description = origin.as_ref().map_or_else(
+                || "missing origin metadata".to_string(),
+                |origin| {
+                    format!(
+                        "session {}/{}/{} at leaf {}",
+                        origin.session_id,
+                        origin.provider_id,
+                        origin.model_id,
+                        origin.snapshot_leaf_id.as_deref().unwrap_or("<root>")
+                    )
+                },
+            );
+            let Some(origin) = origin else {
+                let current_origin = self.current_compaction_origin().await?;
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
                     aborted: true,
                     will_retry: false,
                     error_message: Some(format!(
-                        "Discarded stale background compaction from {origin_description}; current context is session {}/{}/{}",
+                        "Discarded background compaction with {origin_description}; current context is session {}/{}/{} at leaf {}",
                         current_origin.session_id,
                         current_origin.provider_id,
-                        current_origin.model_id
+                        current_origin.model_id,
+                        current_origin
+                            .snapshot_leaf_id
+                            .as_deref()
+                            .unwrap_or("<root>")
+                    )),
+                });
+                return Ok(());
+            };
+            let (origin_matches, current_origin) =
+                self.compaction_origin_matches_current(&origin).await?;
+            if !origin_matches {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: true,
+                    will_retry: false,
+                    error_message: Some(format!(
+                        "Discarded stale background compaction from {origin_description}; current context is session {}/{}/{} at leaf {}",
+                        current_origin.session_id,
+                        current_origin.provider_id,
+                        current_origin.model_id,
+                        current_origin
+                            .snapshot_leaf_id
+                            .as_deref()
+                            .unwrap_or("<root>")
                     )),
                 });
                 return Ok(());
             }
             match outcome {
                 Ok(result) => {
-                    let _compacting_guard =
-                        AtomicBoolGuard::activate(&self.extensions_is_compacting);
                     let cx = crate::agent_cx::AgentCx::for_current_or_request();
                     let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
                         Ok(provider_admission) => provider_admission,
@@ -11768,12 +11836,9 @@ impl AgentSession {
                         });
                         return Err(err);
                     }
-                    self.apply_compaction_result(
-                        result,
-                        Arc::clone(&on_event),
-                        &provider_admission,
-                    )
-                    .await?;
+                    self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
+                        .await?;
+                    self.compaction_worker.mark_applied_success();
                 }
                 Err(e) => {
                     on_event(AgentEvent::AutoCompactionEnd {
@@ -11793,7 +11858,10 @@ impl AgentSession {
             return self.force_local_compaction_if_oversized(on_event).await;
         }
 
-        let (entries, preparation) = {
+        let active_provider = self.agent.provider();
+        let origin_provider_id = active_provider.name().to_string();
+        let origin_model_id = active_provider.model_id().to_string();
+        let (entries, preparation, origin) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
                 .session
@@ -11807,7 +11875,13 @@ impl AgentSession {
                 .cloned()
                 .collect::<Vec<_>>();
             let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
-            (entries, prep)
+            let origin = CompactionOrigin {
+                session_id: session.header.id.clone(),
+                provider_id: origin_provider_id,
+                model_id: origin_model_id,
+                snapshot_leaf_id: session.leaf_id().map(str::to_string),
+            };
+            (entries, prep, origin)
         };
 
         if let Some(prep) = preparation {
@@ -11826,6 +11900,7 @@ impl AgentSession {
             on_event(AgentEvent::AutoCompactionStart {
                 reason: format!("threshold;admission={}", admission.reason.as_str()),
             });
+            let compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
 
             let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
             if before_outcome.cancel {
@@ -11838,8 +11913,32 @@ impl AgentSession {
                 return Ok(());
             }
 
+            let (origin_matches, current_origin) =
+                self.compaction_origin_matches_current(&origin).await?;
+            if !origin_matches {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: true,
+                    will_retry: false,
+                    error_message: Some(format!(
+                        "Compaction context changed during session_before_compact; snapshot session {}/{}/{} at leaf {}, current session {}/{}/{} at leaf {}",
+                        origin.session_id,
+                        origin.provider_id,
+                        origin.model_id,
+                        origin.snapshot_leaf_id.as_deref().unwrap_or("<root>"),
+                        current_origin.session_id,
+                        current_origin.provider_id,
+                        current_origin.model_id,
+                        current_origin
+                            .snapshot_leaf_id
+                            .as_deref()
+                            .unwrap_or("<root>")
+                    )),
+                });
+                return Ok(());
+            }
+
             if let Some(compaction) = before_outcome.compaction {
-                let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
                 let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
                     Ok(provider_admission) => provider_admission,
@@ -11860,7 +11959,7 @@ impl AgentSession {
                         compaction.tokens_before,
                         compaction.details.clone(),
                         true,
-                        &provider_admission,
+                        provider_admission,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -11912,18 +12011,6 @@ impl AgentSession {
                 }
             };
 
-            let origin = match self.current_compaction_origin().await {
-                Ok(origin) => origin,
-                Err(err) => {
-                    on_event(AgentEvent::AutoCompactionEnd {
-                        result: None,
-                        aborted: false,
-                        will_retry: false,
-                        error_message: Some(err.to_string()),
-                    });
-                    return Err(err);
-                }
-            };
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
             let provider_permit = match self.provider_admission.acquire(cx.cx()).await {
                 Ok(provider_permit) => provider_permit,
@@ -11946,9 +12033,7 @@ impl AgentSession {
                 });
                 return Err(err);
             }
-            self.extensions_is_compacting
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            self.compaction_worker.start_for_origin(
+            if let Err(err) = self.compaction_worker.start_for_origin(
                 origin,
                 provider_permit,
                 &runtime_handle,
@@ -11956,7 +12041,16 @@ impl AgentSession {
                 provider,
                 credential,
                 None,
-            );
+            ) {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(err.to_string()),
+                });
+                return Err(err);
+            }
+            compacting_guard.keep_active();
         }
 
         Ok(())
@@ -12014,9 +12108,9 @@ impl AgentSession {
         on_event(AgentEvent::AutoCompactionStart {
             reason: format!("forced_local;blocked={}", decision.reason.as_str()),
         });
+        let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
 
         let result = compaction::compact_local(prep);
-        let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
             Ok(provider_admission) => provider_admission,
@@ -12031,7 +12125,7 @@ impl AgentSession {
             }
         };
         let apply_result = self
-            .apply_compaction_result(result, Arc::clone(&on_event), &provider_admission)
+            .apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
             .await;
         apply_result
     }
@@ -12083,7 +12177,7 @@ impl AgentSession {
         tokens_before: u64,
         details: Option<Value>,
         from_extension: bool,
-        _provider_admission: &OwnedMutexGuard<()>,
+        provider_admission: OwnedMutexGuard<()>,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
@@ -12135,6 +12229,9 @@ impl AgentSession {
             self.provider_admission.clear();
         }
         drop(session);
+        // The Session transition is complete. Release provider admission
+        // before dispatching the re-entrant post-install extension hook.
+        drop(provider_admission);
 
         if let (Some(region), Some(compaction_entry)) = (&self.extensions, compaction_entry) {
             let payload = json!({
@@ -12158,7 +12255,7 @@ impl AgentSession {
         &self,
         result: compaction::CompactionResult,
         on_event: AgentEventHandler,
-        provider_admission: &OwnedMutexGuard<()>,
+        provider_admission: OwnedMutexGuard<()>,
     ) -> Result<()> {
         let details = match compaction::compaction_details_to_value(&result.details) {
             Ok(details) => Some(details),
@@ -12240,6 +12337,7 @@ impl AgentSession {
             on_event(AgentEvent::AutoCompactionStart {
                 reason: "threshold".to_string(),
             });
+            let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
 
             let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
             if before_outcome.cancel {
@@ -12253,7 +12351,6 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
-                let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
                 let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
                     Ok(provider_admission) => provider_admission,
@@ -12274,7 +12371,7 @@ impl AgentSession {
                         compaction.tokens_before,
                         compaction.details.clone(),
                         true,
-                        &provider_admission,
+                        provider_admission,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -12314,7 +12411,6 @@ impl AgentSession {
                 .unwrap_or_default();
 
             self.invalidate_background_compaction();
-            let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
             let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
                 Ok(provider_admission) => provider_admission,
@@ -12341,12 +12437,8 @@ impl AgentSession {
 
             match compaction_result {
                 Ok(result) => {
-                    self.apply_compaction_result(
-                        result,
-                        Arc::clone(&on_event),
-                        &provider_admission,
-                    )
-                    .await?;
+                    self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
+                        .await?;
                 }
                 Err(e) => {
                     on_event(AgentEvent::AutoCompactionEnd {
@@ -18126,7 +18218,7 @@ mod tests {
                 .expect("provider admission");
 
             agent_session
-                .apply_compaction_result(result, on_event, &provider_admission)
+                .apply_compaction_result(result, on_event, provider_admission)
                 .await
                 .expect("apply compaction result");
 
@@ -18217,7 +18309,7 @@ mod tests {
                 .expect("provider admission");
 
             let err = agent_session
-                .apply_compaction_result(result, on_event, &provider_admission)
+                .apply_compaction_result(result, on_event, provider_admission)
                 .await
                 .expect_err("blocked persistence must fail");
             assert!(

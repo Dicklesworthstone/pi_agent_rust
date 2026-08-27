@@ -5195,15 +5195,24 @@ impl Session {
         model_id: Option<String>,
         thinking_level: Option<String>,
     ) {
-        let changed = provider.is_some() || model_id.is_some() || thinking_level.is_some();
-        if provider.is_some() {
-            self.header.provider = provider;
+        let mut changed = false;
+        if let Some(provider) = provider
+            && self.header.provider.as_deref() != Some(provider.as_str())
+        {
+            self.header.provider = Some(provider);
+            changed = true;
         }
-        if model_id.is_some() {
-            self.header.model_id = model_id;
+        if let Some(model_id) = model_id
+            && self.header.model_id.as_deref() != Some(model_id.as_str())
+        {
+            self.header.model_id = Some(model_id);
+            changed = true;
         }
-        if thinking_level.is_some() {
-            self.header.thinking_level = thinking_level;
+        if let Some(thinking_level) = thinking_level
+            && self.header.thinking_level.as_deref() != Some(thinking_level.as_str())
+        {
+            self.header.thinking_level = Some(thinking_level);
+            changed = true;
         }
         if changed {
             self.header_dirty = true;
@@ -12604,6 +12613,37 @@ mod tests {
         assert_eq!(session.header.provider.as_deref(), Some("anthropic"));
         assert_eq!(session.header.model_id.as_deref(), Some("claude-opus"));
         assert_eq!(session.header.thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn set_model_header_noop_does_not_enqueue_unsaved_metadata() {
+        let mut session = Session::in_memory();
+        session.set_model_header(
+            Some("anthropic".to_string()),
+            Some("claude-opus".to_string()),
+            Some("high".to_string()),
+        );
+        let after_change = session.autosave_metrics();
+
+        session.set_model_header(
+            Some("anthropic".to_string()),
+            Some("claude-opus".to_string()),
+            Some("high".to_string()),
+        );
+        let after_noop = session.autosave_metrics();
+
+        assert_eq!(
+            after_noop.pending_mutations, after_change.pending_mutations,
+            "an identical header update must not enqueue unsaved metadata"
+        );
+        assert_eq!(
+            after_noop.coalesced_mutations, after_change.coalesced_mutations,
+            "an identical header update must not advance the mutation sequence"
+        );
+        assert_eq!(
+            after_noop.backpressure_events, after_change.backpressure_events,
+            "an identical header update must not create autosave backpressure"
+        );
     }
 
     #[test]

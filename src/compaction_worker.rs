@@ -172,6 +172,7 @@ pub(crate) struct CompactionOrigin {
     pub session_id: String,
     pub provider_id: String,
     pub model_id: String,
+    pub snapshot_leaf_id: Option<String>,
 }
 
 struct PendingCompaction {
@@ -298,8 +299,16 @@ impl CompactionWorkerState {
         if timed_out {
             if let Some(mut pending) = self.pending.take() {
                 pending.abort();
+                let origin = pending.origin;
+                // Join the aborted task before publishing the timeout so its
+                // provider future and admission permit are definitely gone.
+                // The worker task races the same timeout internally; this is
+                // only a defensive path for delayed polling/scheduling.
+                let _ = std::panic::AssertUnwindSafe(pending.join)
+                    .catch_unwind()
+                    .await;
                 return Some((
-                    pending.origin,
+                    origin,
                     Err(Error::session(
                         "Background compaction timed out".to_string(),
                     )),
@@ -318,16 +327,22 @@ impl CompactionWorkerState {
 
         let pending = self.pending.take()?;
         let origin = pending.origin;
-        let outcome = pending.join.await;
-        if outcome.is_ok() {
-            // A successful compaction ends any failure streak. The per-session
-            // attempt quota exists to stop futile retry loops, not to cap how
-            // many times a long-lived session may successfully compact; without
-            // this reset the counter is monotonic and compaction is permanently
-            // blocked once it crosses `max_attempts_per_session`.
-            self.attempt_count = 0;
-        }
+        let outcome = std::panic::AssertUnwindSafe(pending.join)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::session(
+                    "Background compaction task was cancelled before producing an outcome"
+                        .to_string(),
+                ))
+            });
         Some((origin, outcome))
+    }
+
+    /// Record a completed background compaction only after its origin was
+    /// accepted and its Session mutation was durably installed.
+    pub(crate) const fn mark_applied_success(&mut self) {
+        self.attempt_count = 0;
     }
 
     #[cfg(test)]
@@ -345,7 +360,7 @@ impl CompactionWorkerState {
         provider: Arc<dyn Provider>,
         api_key: String,
         custom_instructions: Option<String>,
-    ) {
+    ) -> Result<()> {
         self.start_inner(
             Some(origin),
             Some(provider_permit),
@@ -354,7 +369,7 @@ impl CompactionWorkerState {
             provider,
             api_key,
             custom_instructions,
-        );
+        )
     }
 
     #[cfg(test)]
@@ -374,7 +389,8 @@ impl CompactionWorkerState {
             provider,
             api_key,
             custom_instructions,
-        );
+        )
+        .expect("test compaction runtime must admit the task");
     }
 
     fn start_inner(
@@ -386,7 +402,7 @@ impl CompactionWorkerState {
         provider: Arc<dyn Provider>,
         api_key: String,
         custom_instructions: Option<String>,
-    ) {
+    ) -> Result<()> {
         debug_assert!(
             self.can_start(),
             "start() called while can_start() is false"
@@ -394,7 +410,8 @@ impl CompactionWorkerState {
 
         let (abort_tx, abort_rx) = oneshot::channel();
         let now = Instant::now();
-        let join = runtime_handle.spawn(async move {
+        let timeout = self.quota.timeout;
+        let task = async move {
             let _provider_permit = provider_permit;
             run_compaction_task(
                 preparation,
@@ -402,9 +419,13 @@ impl CompactionWorkerState {
                 api_key,
                 custom_instructions,
                 abort_rx,
+                timeout,
             )
             .await
-        });
+        };
+        let join =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime_handle.spawn(task)))
+                .map_err(|_| Error::session("Background compaction runtime rejected the task"))?;
 
         self.pending = Some(PendingCompaction {
             join,
@@ -414,6 +435,7 @@ impl CompactionWorkerState {
         });
         self.last_start = Some(now);
         self.attempt_count = self.attempt_count.saturating_add(1);
+        Ok(())
     }
 
     /// Test-only: force the session attempt counter to simulate quota state.
@@ -475,6 +497,7 @@ async fn run_compaction_task(
     api_key: String,
     custom_instructions: Option<String>,
     abort_rx: oneshot::Receiver<()>,
+    timeout: Duration,
 ) -> CompactionOutcome {
     let abort_fut = async move {
         if abort_rx.await.is_err() {
@@ -490,7 +513,20 @@ async fn run_compaction_task(
         custom_instructions.as_deref(),
     ))
     .catch_unwind();
-    futures::pin_mut!(abort_fut, compaction_fut);
+    let timed_compaction_fut = async move {
+        match asupersync::time::timeout(asupersync::time::wall_now(), timeout, compaction_fut).await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::session(
+                "Background compaction worker panicked".to_string(),
+            )),
+            Err(_) => Err(Error::session(
+                "Background compaction timed out".to_string(),
+            )),
+        }
+    }
+    .fuse();
+    futures::pin_mut!(abort_fut, timed_compaction_fut);
 
     // bd-ajg8l #3: panics inside background compaction are recovered here,
     // so suppress crash-bundle capture while this future is polled. The
@@ -498,12 +534,9 @@ async fn run_compaction_task(
     // polling thread.
     let _panic_guard = pi::crash::SuppressPanicHook::new();
 
-    match futures::future::select(abort_fut, compaction_fut).await {
+    match futures::future::select(abort_fut, timed_compaction_fut).await {
         futures::future::Either::Left((abort_result, _)) => abort_result,
-        futures::future::Either::Right((Ok(result), _)) => result,
-        futures::future::Either::Right((Err(_), _)) => Err(Error::session(
-            "Background compaction worker panicked".to_string(),
-        )),
+        futures::future::Either::Right((result, _)) => result,
     }
 }
 
@@ -967,6 +1000,7 @@ mod tests {
                 session_id: "session-a".to_string(),
                 provider_id: "provider-a".to_string(),
                 model_id: "model-a".to_string(),
+                snapshot_leaf_id: Some("leaf-a".to_string()),
             };
             let mut pending =
                 ready_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
@@ -1005,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_result_resets_attempt_count() {
+    fn successful_result_resets_attempt_count_only_after_durable_apply() {
         run_async(|runtime_handle| async move {
             let mut w = default_worker();
             w.attempt_count = 41;
@@ -1021,9 +1055,11 @@ mod tests {
             let outcome = w.try_recv().await.expect("should have result");
             assert!(outcome.is_ok());
             assert_eq!(
-                w.attempt_count, 0,
-                "successful compaction must reset the session attempt counter"
+                w.attempt_count, 42,
+                "provider generation alone must not reset the attempt counter"
             );
+            w.mark_applied_success();
+            assert_eq!(w.attempt_count, 0);
         });
     }
 
@@ -1095,8 +1131,13 @@ mod tests {
             let outcome = w.try_recv().await.expect("should have result");
             assert!(outcome.is_ok());
             assert!(
+                !w.can_start(),
+                "an unapplied provider result must remain at the attempt limit"
+            );
+            w.mark_applied_success();
+            assert!(
                 w.can_start(),
-                "reaching the attempt limit via successes must not permanently block compaction"
+                "durably applying a successful result must reopen compaction admission"
             );
         });
     }
