@@ -397,10 +397,10 @@ fn open_permissions_lock_file(path: &Path) -> Result<File> {
 fn lock_permissions_file(file: File, timeout: Duration) -> Result<PermissionsLockGuard> {
     let start = Instant::now();
     loop {
-        match FileExt::try_lock(&file) {
-            Ok(()) => return Ok(PermissionsLockGuard { file }),
-            Err(fs4::TryLockError::WouldBlock) => {}
-            Err(fs4::TryLockError::Error(err)) => {
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(true) => return Ok(PermissionsLockGuard { file }),
+            Ok(false) => {}
+            Err(err) => {
                 return Err(Error::config(format!(
                     "Failed to lock permissions file: {err}"
                 )));

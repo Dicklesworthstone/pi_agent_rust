@@ -973,8 +973,8 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             Err(err) => return Err(err),
         };
         match artifact.try_lock_exclusive() {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Ok(true) => {}
+            Ok(false) => continue,
             Err(err) => return Err(err),
         }
         let opened = artifact.metadata()?;
@@ -1029,8 +1029,8 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         Err(err) => return Err(err),
     };
     match artifact.try_lock_exclusive() {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
         Err(err) => return Err(err),
     }
     let opened = artifact.metadata()?;
@@ -1086,8 +1086,8 @@ fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
                     )));
                 }
                 match artifact.try_lock_exclusive() {
-                    Ok(()) => fs4::fs_std::FileExt::unlock(&artifact)?,
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    Ok(true) => fs4::fs_std::FileExt::unlock(&artifact)?,
+                    Ok(false) => {
                         bytes = bytes.saturating_add(
                             u64::try_from(MAX_ARTIFACT_BYTES)
                                 .unwrap_or(u64::MAX)
@@ -4310,8 +4310,9 @@ mod tests {
             .jobs
             .insert(id.clone(), entry);
 
-        let error =
-            request_cancel(TEST_SESSION_ID, &id).expect_err("reaped process must not be signalled");
+        let error = request_cancel(TEST_SESSION_ID, &id)
+            .err()
+            .expect("reaped process must not be signalled");
         assert!(error.to_string().contains("PI_JOBS_NOT_RUNNING"));
         registry()
             .lock()
@@ -4633,7 +4634,9 @@ mod tests {
         assert!(list(&foreign_owner).expect("foreign list").is_empty());
         for error in [
             wait(&foreign_owner, &id, Duration::ZERO).expect_err("foreign wait"),
-            request_cancel(&foreign_owner, &id).expect_err("foreign cancel"),
+            request_cancel(&foreign_owner, &id)
+                .err()
+                .expect("foreign cancel"),
         ] {
             let rendered = error.to_string();
             assert!(rendered.contains("PI_JOBS_UNKNOWN_ID"));
@@ -5210,9 +5213,12 @@ mod tests {
             .write(true)
             .open(artifacts[0].path())
             .expect("rejected job artifact remains inspectable");
-        artifact
-            .try_lock_exclusive()
-            .expect("rejected job artifact lock must be released");
+        assert!(
+            artifact
+                .try_lock_exclusive()
+                .expect("inspect rejected job artifact lock"),
+            "rejected job artifact lock must be released"
+        );
         fs4::fs_std::FileExt::unlock(&artifact).expect("release test artifact lock");
 
         drop(descendant_cleanup);

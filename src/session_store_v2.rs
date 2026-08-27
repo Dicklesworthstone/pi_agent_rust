@@ -2618,7 +2618,7 @@ impl SessionStoreV2 {
             true,
             ArtifactWriteMode::Preserve,
         )?;
-        FileExt::lock(&file)?;
+        FileExt::lock_exclusive(&file)?;
         Ok(StoreMutationLockGuard { file })
     }
 

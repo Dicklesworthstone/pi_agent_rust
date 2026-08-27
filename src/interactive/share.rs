@@ -170,7 +170,8 @@ impl ShareProcess {
 #[cfg(unix)]
 fn set_share_pipe_nonblocking(pipe: &impl std::os::fd::AsFd) -> std::io::Result<()> {
     let flags = rustix::fs::fcntl_getfl(pipe)?;
-    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok(())
 }
 
 fn read_share_pipe<R: Read>(
