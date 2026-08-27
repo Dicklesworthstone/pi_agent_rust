@@ -90,7 +90,7 @@ command surface implemented in `src/interactive.rs`.
 | `/compact [notes]` | Compact older context with optional instructions. |
 | `/reload` | Reload skills/prompts from disk. |
 | `/template <name> [args]` | Expand a prompt template by name. |
-| `/share` | Upload session HTML to a secret GitHub gist and show URL. |
+| `/share` | Upload the current branch as bounded HTML to a secret, unlisted GitHub gist and show its URL. Secret gists are not private; anyone with the URL can view them. Pi redacts recognized secrets and the exact workspace cwd, but the transcript may still contain other sensitive local context. |
 | `/exit` (`/quit`, `/q`) | Exit Pi. |
 
 ### Model selection

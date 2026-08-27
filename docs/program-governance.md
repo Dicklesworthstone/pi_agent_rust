@@ -206,7 +206,7 @@ Next provider rollup checkpoint: `2026-02-13` (UTC), focused on `bd-3uqg.3.8.4` 
 
 | Task | Owner | Verification |
 |------|-------|-------------|
-| Full conformance campaign (223 extensions) | Automated | `conformance.yml` nightly |
+| Full conformance campaign (223 extensions) | Primary maintainer | DSR quality/campaign receipt |
 | Security review of capability policies | Primary maintainer | Threat model doc |
 | Dependency major version updates | Primary maintainer | `cargo update` + full test |
 | Roadmap review and bead reprioritization | Primary maintainer | `bv --robot-plan` + `bv --robot-priority` |
@@ -303,7 +303,7 @@ activation criteria are met.
 | GitHub repository/admin access | Rotate compromised credentials, review SSH/GPG keys, revoke unknown tokens, and confirm branch rulesets still protect `main`. | GitHub security log + ruleset snapshot |
 | `CARGO_REGISTRY_TOKEN` | Revoke the old crates.io token, issue a least-privilege replacement, and update the DSR secret source outside Git. | DSR publication dry-run or pre-release receipt |
 | Release authority | Verify the DSR recipe, credentials, signing identity, and native-host inventory before publication. | DSR status and release receipts |
-| Installer artifact integrity | Regenerate release assets, `SHA256SUMS`, and Sigstore/checksum evidence before advising users to install. | GitHub Release artifact list + checksum proof |
+| Installer artifact integrity | Regenerate the exact DSR release assets and per-asset `.sha256` sidecars before advising users to install. | DSR release-verification receipt + public asset list |
 | Local signing or recovery material | Rotate outside Git, then document only the rotation event and operator identity. | Private escrow audit log |
 
 After rotation, invalidate all emergency session tokens, remove temporary
@@ -313,13 +313,13 @@ normal governance.
 ### Emergency Release Process
 
 1. Rebase on latest `main` and keep the patch scoped to the emergency.
-2. Run the mandatory local gates from [AGENTS.md](../AGENTS.md), including
-   `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`,
-   `cargo fmt --check`, and `./scripts/reconcile_beads_ledger.sh`.
+2. Run the mandatory DSR gate from [AGENTS.md](../AGENTS.md):
+   `dsr quality --tool pi_agent_rust`. The retired strict drop-in ledger is not
+   an emergency-release gate.
 3. Cut a pre-release tag first when time allows: `vX.Y.Z-rc.N`.
-4. Verify the `Publish` and `Release (GitHub binaries)` workflows in
-   [releasing.md](releasing.md), including installer regression and checksum
-   artifacts.
+4. Complete the DSR build/release/verify sequence in
+   [releasing.md](releasing.md), including installer regression and exact
+   per-asset checksum sidecars. Never invoke a GitHub Actions workflow.
 5. Promote to the final SemVer tag only after the release artifact path and
    installer path both pass smoke tests.
 6. Document the reason for emergency authority in `CHANGELOG.md` and the
@@ -332,12 +332,12 @@ protection, code review evidence, or release artifact verification.
 ### Branch-Protection Authority
 
 Only the primary maintainer or the designated emergency repo admin may change
-branch protection, required checks, release workflow permissions, or tag
+branch protection, required checks, DSR release authority, or tag
 protection. During an emergency, any such change requires:
 
 1. A linked emergency bead.
 2. A second human or agent review recorded in the bead.
-3. A before/after snapshot of the GitHub ruleset or workflow permission diff.
+3. A before/after snapshot of the GitHub ruleset or DSR authority change.
 4. Immediate restoration of the stricter rule after the emergency release.
 
 Branch protection must never be relaxed to make unrelated work mergeable during
@@ -353,17 +353,18 @@ Run this review quarterly or after any release-process change:
 3. Walk through credential rotation for `CARGO_REGISTRY_TOKEN` as a dry run:
    do not rotate unless there is a real incident, but verify the owner and
    storage location are known.
-4. Trigger or inspect a non-publishing release rehearsal, preferably a
-   pre-release tag or workflow dry run.
-5. Confirm the installer path verifies `SHA256SUMS` and published install
+4. Inspect a non-publishing DSR rehearsal with
+   `dsr build pi_agent_rust --dry-run`; do not dispatch any workflow.
+5. Confirm the installer path verifies the selected asset's exact `.sha256`
+   sidecar and published install
    commands never pass the installer's testing-only `--no-verify` flag. This is
    distinct from the credential-scoped Cargo upload described in the release
    runbook.
-6. File beads for any missing role, stale secret owner, failing workflow, or
+6. File beads for any missing role, stale secret owner, failing DSR recipe, or
    ambiguous branch-protection authority.
 
 The tabletop outcome is pass only when every role is named in private escrow,
-the release workflow can be rehearsed without publishing a final release, and
+the DSR release lane can be rehearsed without publishing a final release, and
 no unresolved Critical/High operations gap remains untracked.
 
 ---

@@ -35,18 +35,21 @@ repository gates that cover the utility explicitly enable its internal feature.
 ### Historical GitHub Actions publishing design (retired)
 
 The material in this subsection documents the former automation design. It is
-not an authorized publication path. Stable publication, when desired, must be
-performed and verified by DSR.
+not an authorized publication path and none of the referenced workflows may be
+dispatched. Stable publication, when desired, must be performed and verified
+by a DSR-native operation.
 
 ### Publishing to crates.io
-`.github/workflows/publish.yml` is a manual-dispatch, non-authoritative
-diagnostic. It validates an annotated tag, the exact root package identity, a
+`.github/workflows/publish.yml` records a former manual-dispatch diagnostic and
+must never be dispatched. It was designed to validate an annotated tag, the exact root package identity, a
 clean frozen checkout, the release gate, and `cargo publish --dry-run --locked`.
 It has no registry secret and never publishes anything.
 
-Stable crates.io publication has exactly one authorized lane: DSR. No workflow
-or ad hoc operator command is an authorized publisher. The former automated
-lane described below is historical only.
+Stable crates.io publication has exactly one authorized authority: DSR. The
+current DSR command set does not yet include a Cargo registry publisher, so
+stable crates.io publication is **HOLD** until that capability and its
+fail-closed recipe exist in DSR. No workflow or ad hoc `cargo publish` command
+may fill that gap. The former automated lane described below is historical only.
 In the automated lane, `release.yml` first creates or safely completes a
 verified GitHub draft, builds and inspects the exact `.crate` without a secret,
 then passes the crate and a source-bound checksum receipt to a fresh
@@ -70,7 +73,7 @@ checkouts. Per-target build manifests therefore record selected locked crate
 versions, registry sources, and checksums rather than unrelated repository HEADs.
 
 ### Historical GitHub Actions binary-release design (retired)
-`.github/workflows/release.yml` is triggered on tag pushes matching `v*` and will:
+`.github/workflows/release.yml` records a former tag-triggered design that would:
 - run the full frozen-SHA format/check/clippy/test and release-evidence gates
 - build `pi` for Linux/macOS/Windows and reject every native binary whose raw
   executable size is greater than or equal to 26 MiB (27,262,976 bytes)
@@ -89,8 +92,9 @@ heading. Ensure that exact heading exists for the tag you are cutting.
 ### Historical GitHub governance notes (retired)
 
 Workflow YAML cannot make tag refs immutable or turn an auto-created
-environment into a protected one. Before enabling the automated lane, an owner
-must configure all of the following in repository settings:
+environment into a protected one. The former design called for the following
+repository settings; they are retained as history and must not be configured as
+a way to reactivate the workflow:
 
 - an environment named `release` with at least one required reviewer and
   self-review prevention; store `CARGO_REGISTRY_TOKEN` there and disable
@@ -106,20 +110,20 @@ fails closed when either is absent, unreadable, inactive, or malformed. GitHub
 normally redacts ruleset `bypass_actors` from read-only callers; omission is
 treated as unproven and fails closed rather than being confused with an empty
 list. The environment API also does not independently prove the
-administrator-bypass setting. Consequently, the automated lane must remain
-disabled unless its workflow identity can read an explicit empty bypass list
-and the owner has supplied the exact audit acknowledgement above. Do not add a
-broad administrator token to a tag-triggered workflow merely to make this gate
-green. The manual no-Actions lane also requires server-side tag immutability;
-local Git ref checks are defense in depth, not a substitute for it.
+administrator-bypass setting. Consequently, the former automated lane was
+never eligible without stronger proof. It is now permanently retired regardless
+of those settings. Do not add a broad administrator token or any other
+credential to a workflow. DSR releases still require server-side tag
+immutability; local Git ref checks are defense in depth, not a substitute for it.
 
 **Current state:** ruleset `20418963` was created and read back on 2026-08-04
 as active for `refs/tags/v*`, with update and deletion forbidden and no bypass
-actors. The manual lane must still re-run the exact governance check below
-before tagging and immediately before publication; a missing or changed control
-is a hard stop. The automated lane remains disabled because the protected
-`release` environment and acknowledgement described above are not configured.
-Repeated local ref comparisons are never a substitute for the server-side rule.
+actors. That dated observation is not current release evidence. The registered
+DSR recipe does not yet encode the equivalent live ruleset check, so release is
+**HOLD** until DSR verifies it before tagging and immediately before
+publication. The former automated lane is permanently retired, not waiting for
+an environment or acknowledgement. Repeated local ref comparisons are never a
+substitute for the server-side rule or a reason to bypass DSR.
 
 ## Distribution and migration strategy
 Goal: make installation and upgrades predictable without treating legacy Pi
@@ -127,8 +131,10 @@ compatibility as a product or release gate.
 
 ### Supported distribution paths
 - **Installer path (`install.sh`)**: default channel for end users; installs GitHub release binary, verifies checksums, and manages migration state.
-- **Release artifact path (GitHub Releases)**: direct binary download per OS/arch with `SHA256SUMS` verification.
-- **Source path (`cargo build --release --locked`)**: deterministic fallback for constrained/air-gapped environments.
+- **Release artifact path (GitHub Releases)**: direct binary download per OS/arch with the asset's same-name `.sha256` sidecar.
+- **DSR source-build path**: deterministic fallback for constrained or
+  air-gapped environments, invoked through the registered DSR build recipe.
+  Direct Cargo/RCH builds are not an operator fallback.
 
 ### Executable compatibility path
 - Canonical command is `pi`.
@@ -151,14 +157,15 @@ Run this matrix before declaring distribution parity complete for a release cand
    - `pi` remains TypeScript CLI, `pi-rust --version` resolves to Rust build
 4. Pinned managed rollout:
    - `install.sh --version vX.Y.Z`
-   - binary checksum validation passes against release `SHA256SUMS`
+   - binary checksum validation passes against the selected asset's `.sha256` sidecar
 
 ## Perf-vs-size artifact policy (bd-3ar8v.5.5)
 
 Release operations must keep benchmark evidence and shipping artifacts distinct.
 
 - **Shipping/distribution artifacts**: built, packaged, and published by DSR
-  using the Cargo `release` profile (`pi` binaries + `SHA256SUMS`).
+  using the Cargo `release` profile (exact `pi` archives + same-name `.sha256`
+  sidecars).
 - **Benchmark evidence artifacts**: produced by PERF-3X lanes (`scripts/perf/orchestrate.sh`,
   `scripts/bench_extension_workloads.sh`) using benchmark profile labeling (typically `perf`)
   with run-level provenance (`correlation_id`, build/profile metadata, allocator/PGO metadata).
@@ -223,7 +230,9 @@ When the report blocks:
 - Regenerate the exact artifact path listed when the claim is still intended to be release-facing.
 - Split the claim by run when the report identifies multiple provenance values for one category.
 - Soften or remove release-facing copy when the only available evidence is a historical snapshot.
-- Do not use `docs/parity-certification.json` to override `docs/evidence/dropin-certification-verdict.json` or the report's drop-in blockers.
+- Treat every drop-in field or blocker in this historical report as
+  informational only. It must not gate or authorize current product or release
+  decisions.
 
 ## When do we call it 1.0?
 We call it `1.0.0` when:
@@ -269,6 +278,15 @@ dsr release verify pi_agent_rust X.Y.Z
 GitHub Actions. A tag, Cargo build, or uploaded-but-unverified asset set is not
 a completed release.
 
+Before the first real release, `dsr status` must report a configured signing
+key and every required native host healthy, and
+`dsr repos validate --repo pi_agent_rust` must pass. As of 2026-08-26, signing
+is unconfigured, the required Windows host is unhealthy, and the registered
+recipe does not verify the live immutable-tag ruleset, so release is blocked.
+GitHub asset publication through DSR does not authorize a stable crates.io
+publication; that remains blocked until DSR grows and validates its own Cargo
+registry operation.
+
 ## Historical manual no-Actions procedure (retired)
 
 The remainder of this long-form procedure records the predecessor to native
@@ -276,9 +294,10 @@ DSR orchestration. It is retained for incident archaeology only. Do not execute
 it, and do not substitute any of its ad hoc shell steps for the canonical DSR
 commands above.
 
-Use this lane when the release is intentionally built and published from the
-operator hosts. It does not query, dispatch, rerun, cancel, or otherwise use a
-GitHub Actions workflow as execution or evidence. The frozen Windows build leg uses DSR host `wsurf`, mapped
+The retired procedure assumed a release built and published from operator
+hosts. It did not query, dispatch, rerun, cancel, or otherwise use a GitHub
+Actions workflow as execution or evidence. Its frozen Windows build leg used
+DSR host `wsurf`, mapped
 to SSH host `oldsurface`; `wlap` is only the post-build Windows execution-smoke
 host. Keep every pushed release-preparation, source, and evidence
 commit marked with `[skip actions]`; the commit ultimately referenced by the
@@ -4001,7 +4020,7 @@ When an operator intentionally chooses Pi Rust as their canonical `pi` command:
 2. **Promote Rust Pi to Canonical**:
    ```bash
    # Re-run installer targeting the primary user bin directory
-   ./install.sh --force --install-dir "$HOME/.local/bin"
+   ./install.sh --force --dest "$HOME/.local/bin"
    ```
 3. **Verify Resolution**:
    ```bash
@@ -4012,19 +4031,16 @@ When an operator intentionally chooses Pi Rust as their canonical `pi` command:
 
 ### Upgrade Path for Installed v0.1.x Binaries
 
-For environments with older `v0.1.x` binaries installed:
-- Upgrade via source build:
-  ```bash
-  cargo build --release --bin pi
-  cp target/release/pi "$HOME/.local/bin/pi"
-  ```
-- Or upgrade via cargo install:
-  ```bash
-  cargo install --path . --locked --force
-  ```
+For environments with older `v0.1.x` binaries installed, use the current
+installer against a DSR-published release. Do not substitute an ad hoc local
+Cargo build for the DSR artifact:
+
+```bash
+./install.sh --yes --version vX.Y.Z --dest "$HOME/.local/bin"
+```
 
 ## Post-release checklist
 - GitHub Release exists and includes expected artifacts for each platform.
-- `SHA256SUMS` matches downloaded artifacts.
+- Every downloaded archive matches its same-name `.sha256` sidecar.
 - Crates.io publish succeeded (if configured) and the version matches the tag.
 - Smoke test install paths (download binary + run `pi --version`).

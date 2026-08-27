@@ -142,38 +142,32 @@ non-authoritative and must stay disabled.
 - Use `dsr quality --tool pi_agent_rust`, `dsr build pi_agent_rust`, and
   `dsr release pi_agent_rust <version>` (or the corresponding fail-closed DSR
   operation) instead of any Actions workflow or ad hoc release upload.
-- RCH remains available as a development-time Cargo compilation offloader. It
-  is not a release authority and cannot substitute for a successful DSR run.
+- RCH is an implementation detail that DSR may use to offload compilation.
+  Agents must not invoke Cargo or RCH directly as an alternate quality path.
 - A tag, local binary, RCH result, or source build is not a release. A release
   exists only after DSR publishes the expected artifacts and DSR verification
   succeeds against the public release.
 
 ---
 
-## Compiler Checks (CRITICAL)
+## Compiler and Test Checks (CRITICAL)
 
-**After any substantive code changes, you MUST verify no errors were introduced:**
-
-```bash
-# Check for compiler errors and warnings
-cargo check --all-targets
-
-# Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --all-targets -- -D warnings
-
-# Verify formatting
-cargo fmt --check
-```
-
-For heavyweight local runs (especially `--all-targets`) in multi-agent environments, set both build artifacts and test temp files to a high-capacity tmpfs to avoid `No space left on device` failures:
+**After any substantive code changes, use the one authoritative quality entry
+point:**
 
 ```bash
-export CARGO_TARGET_DIR="/data/tmp/pi_agent_rust_cargo/${USER:-agent}/target"
-export TMPDIR="/data/tmp/pi_agent_rust_cargo/${USER:-agent}/tmp"
-mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
+dsr quality --tool pi_agent_rust
 ```
 
-Use an agent-specific suffix (for example `/data/tmp/pi_agent_rust_cargo/topazfalcon`) to avoid collisions across concurrent agents.
+The registered DSR recipe owns formatting, compiler checks, Clippy, unit,
+conformance, integration, and required feature lanes. Do not run the underlying
+Cargo commands directly, and do not use a direct RCH invocation as a substitute.
+DSR owns target/temp placement and any RCH delegation needed to avoid local
+contention.
+
+If the repository's load-admission rule blocks DSR, record the exact hold and
+leave the relevant Bead open. Static review is useful but does not become a
+compile, test, or quality claim.
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
@@ -181,22 +175,9 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ## Testing
 
-### Unit Tests
-
-The test suite covers all core functionality:
-
-```bash
-# Run all tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run specific test module
-cargo test sse::tests
-cargo test tools::tests
-cargo test conformance
-```
+The DSR quality recipe runs the project's required test lanes. Individual
+test names below describe coverage domains; they are not permission to bypass
+DSR with direct Cargo commands.
 
 ### Test Categories
 
@@ -350,13 +331,11 @@ The port uses fixture-based conformance tests to validate behavior matches expec
 ### Running Conformance Tests
 
 ```bash
-# All conformance tests
-cargo test conformance
-
-# Specific tool
-cargo test conformance::test_read
-cargo test conformance::test_bash
+dsr quality --tool pi_agent_rust
 ```
+
+Conformance is part of that fail-closed recipe. Do not substitute a hand-picked
+subset for the authoritative result.
 
 ---
 
@@ -667,30 +646,12 @@ That failure happened at epic scale on 2026-08-24 (bd-33df9): five modules lande
 
 ---
 
-## RCH — Remote Compilation Helper
+## RCH — DSR-Managed Compilation Transport
 
-RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
-
-**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
-
-To manually offload a build:
-```bash
-rch exec -- cargo build --release
-rch exec -- cargo test
-rch exec -- cargo clippy
-```
-
-Quick commands:
-```bash
-rch doctor                    # Health check
-rch workers probe --all       # Test connectivity to all 8 workers
-rch status                    # Overview of current state
-rch queue                     # See active/waiting builds
-```
-
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
-
-**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+RCH can offload compilation to remote workers, but agents do not invoke it
+directly in this repository. DSR decides when and how RCH is used and remains
+the only quality/build authority. An RCH result outside DSR is diagnostic only
+and cannot satisfy a Bead, integration, or release gate.
 
 ---
 
@@ -903,7 +864,7 @@ Next steps (pick one)
 
 1. Decide how to handle the unrelated modified files above so we can resume cleanly.
 2. Triage beads_rust-orko (clippy/cargo warnings) and beads_rust-ydqr (rustfmt failures).
-3. If you want a full suite run later, fix conformance/clippy blockers and re‑run cargo test --all.
+3. If you want a full suite run later, fix the reported blockers and re-run `dsr quality --tool pi_agent_rust`.
 ```
 
 NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.

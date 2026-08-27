@@ -58,6 +58,13 @@ that produces a simpler, safer, or better coding agent. Historical drop-in and
 parity artifacts remain in the repository as records; they do not gate product
 work, releases, or user-facing claims.
 
+All repository quality checks, builds, and releases run through Doodlestein
+Self-Releaser (DSR). Contributors must not invoke Cargo or RCH directly, and
+GitHub Actions is never an execution or evidence authority for this project.
+Use `dsr quality --tool pi_agent_rust` for the registered quality recipe and
+the canonical DSR build/release commands documented in
+[docs/releasing.md](docs/releasing.md).
+
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
 - **[rich_rust](https://github.com/Dicklesworthstone/rich_rust)**: A Rust port of [Rich](https://github.com/Textualize/rich) by [Will McGugan](https://github.com/willmcgugan), providing beautiful terminal output with markup syntax
@@ -587,8 +594,8 @@ This project validates extension compatibility with a three-track pipeline:
 
 1. **Fetch unvendored source corpus**
    - Binary: `ext_unvendored_fetch_run`
-   - Typical command:
-     - `cargo run --example ext_unvendored_fetch_run -- run-all --workers 8 --no-probe`
+   - Execution authority: the registered DSR extension-validation lane; do not
+     invoke the example directly with Cargo
    - Purpose:
      - Clones GitHub repos and unpacks npm tarballs into `.tmp-codex-unvendored-cache/`
      - Produces machine-readable acquisition status for all unvendored candidates
@@ -598,8 +605,7 @@ This project validates extension compatibility with a three-track pipeline:
 
 2. **Run end-to-end validation orchestration**
    - Binary: `ext_full_validation`
-   - Typical command:
-     - `cargo run --example ext_full_validation --`
+   - Execution authority: the registered DSR extension-validation lane
    - Stages (in order):
      1. `refresh_onboarding_queue` (runs `ext_onboarding_queue`)
      2. `conformance_shard_0..N` (runs `ext_conformance_generated` sharded matrix)
@@ -615,9 +621,7 @@ This project validates extension compatibility with a three-track pipeline:
 
 3. **Run dev-firstset live-provider gate (must pass before release build)**
    - Binary: `ext_release_binary_e2e`
-   - Typical command:
-     - `cargo build --bin pi --bin ext_release_binary_e2e`
-     - `PI_HTTP_REQUEST_TIMEOUT_SECS=0 target/debug/ext_release_binary_e2e --pi-bin target/debug/pi --provider ollama --model qwen2.5:0.5b --jobs 10 --timeout-secs 600 --max-cases 20 --extension-policy balanced --out-json tests/ext_conformance/reports/release_binary_e2e/ollama_firstset_dev_20260219_jobs10_timeout600.json --out-md tests/ext_conformance/reports/release_binary_e2e/ollama_firstset_dev_20260219_jobs10_timeout600.md`
+   - Execution authority: DSR quality with its configured live-provider inputs
    - Purpose:
      - Proves the current codepath works end-to-end on a representative first-set before paying release-build cost.
      - Serves as the promotion gate to full release-binary validation.
@@ -629,9 +633,7 @@ This project validates extension compatibility with a three-track pipeline:
 
 4. **Run full release-binary live-provider E2E (after step 3 passes)**
    - Binary: `ext_release_binary_e2e`
-   - Typical command:
-     - `cargo build --release --bin pi --bin ext_release_binary_e2e`
-     - `PI_HTTP_REQUEST_TIMEOUT_SECS=0 target/release/ext_release_binary_e2e --pi-bin target/release/pi --provider ollama --model qwen2.5:0.5b --jobs 10 --timeout-secs 600 --extension-policy balanced --out-json tests/ext_conformance/reports/release_binary_e2e/ollama_full_release_20260219_jobs10_timeout600.json --out-md tests/ext_conformance/reports/release_binary_e2e/ollama_full_release_20260219_jobs10_timeout600.md`
+   - Execution authority: the DSR release-validation lane after DSR quality passes
    - Purpose:
      - Executes `target/release/pi` directly for each selected extension case.
      - Uses a live provider/model path (default `ollama` + `qwen2.5:0.5b`) to exercise non-mocked end-to-end behavior.
@@ -654,19 +656,11 @@ This project validates extension compatibility with a three-track pipeline:
 
 ### Recommended run environment
 
-These runs compile many crates and can be disk-heavy. Point Cargo artifacts and temp files to a large volume:
+These runs compile many crates and can be disk-heavy. DSR owns target/temp
+placement, load admission, and any remote offload. Run the registered recipe:
 
 ```bash
-export CARGO_TARGET_DIR="/data/tmp/pi_agent_rust_cargo/${USER:-agent}/target"
-export TMPDIR="/data/tmp/pi_agent_rust_cargo/${USER:-agent}/tmp"
-mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
-```
-
-Then run:
-
-```bash
-cargo run --example ext_unvendored_fetch_run -- run-all --workers 8 --no-probe
-cargo run --example ext_full_validation --
+dsr quality --tool pi_agent_rust
 ```
 
 ### Historical run snapshot (extension gate refresh 2026-05-15)
@@ -715,7 +709,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.3.0/install.sh" | \
   bash -s -- \
     --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/pi-linux-amd64.tar.xz" \
-    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/SHA256SUMS"
+    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/pi-linux-amd64.tar.xz.sha256"
 
 # Skip completion setup (CI/non-interactive minimal install)
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
@@ -732,7 +726,10 @@ Notable installer flags:
 - `--offline [TARBALL]`: enforce offline mode; optional local artifact path (`.tar.gz`, `.tar.xz`, `.zip`, or raw binary)
 - `--artifact-url`: force a specific release artifact URL
 - `--checksum` / `--checksum-url`: override checksum source for explicit artifacts
-- `--sigstore-bundle-url`: override Sigstore bundle URL used by `cosign verify-blob`
+- `--sigstore-bundle-url`: override the optional Sigstore bundle URL used by
+  `cosign verify-blob`; set both `COSIGN_IDENTITY_RE` and
+  `COSIGN_OIDC_ISSUER` to the trusted signer policy (there is deliberately no
+  GitHub Actions identity default)
 - `--completions auto|off|bash|zsh|fish`: force shell completion install target (`off` is equivalent to `--no-completions`)
 - `--no-completions`: disable completion installation
 - `--no-agent-skills`: skip automatic installation of the `pi-agent-rust` skill into `~/.claude/skills/` and `~/.codex/skills/`
@@ -765,7 +762,8 @@ For migration adoption, packaging and invocation compatibility follows this cont
 - If you keep TypeScript `pi` as canonical (`--keep-existing-pi`), Rust Pi is installed as `pi-rust`.
 - On Apple Silicon, the installer prefers the native arm64 artifact even when launched from a Rosetta-translated shell.
 - Version-pinned installs are supported via `install.sh --version vX.Y.Z` for deterministic rollouts.
-- Every GitHub release ships platform binaries plus `SHA256SUMS` for integrity validation.
+- Every DSR release ships each platform archive with a same-name `.sha256`
+  sidecar for integrity validation.
 
 Representative smoke checks:
 
@@ -779,27 +777,19 @@ pi --help >/dev/null
 command -v legacy-pi && legacy-pi --version
 ```
 
-### From Source
+### Source builds
 
 Repository builds are tested with the exact toolchain pinned in
 `rust-toolchain.toml` (`nightly-2026-07-05`). The locked dependency graph
-requires Rust 1.95 or newer; use the pin for release-reproducible builds:
+requires Rust 1.95 or newer. Project builds are DSR-only:
 
 ```bash
-# Install the repository's pinned toolchain and components
-rustup toolchain install nightly-2026-07-05 --component rustfmt --component clippy
-
-# Clone and build
-git clone https://github.com/Dicklesworthstone/pi_agent_rust.git
-cd pi_agent_rust
-cargo build --release
-
-# Binary is at target/release/pi
-./target/release/pi --version
-
-# To install system-wide (--locked ensures reproducible dependency resolution)
-cargo install --path . --bin pi --locked
+dsr quality --tool pi_agent_rust
+dsr build pi_agent_rust
 ```
+
+End users should install a DSR-published archive through `install.sh`. There is
+no supported direct-Cargo contributor or installation lane.
 
 ### Dependencies
 
@@ -1749,7 +1739,7 @@ The interactive mode uses the **Elm Architecture** (Model-Update-View) via the `
 | `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
 | `/btw <question>`, `/tan <work>` | Ephemeral smol-role side question; background task-role tangential work |
 | `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
-| `/export`, `/share`, `/copy` (`/cp`) | HTML export, GitHub Gist share, copy last reply |
+| `/export`, `/share`, `/copy` (`/cp`) | HTML export, secret/unlisted GitHub Gist share (not private; anyone with the URL can view it), copy last reply |
 | `/handoff`, `/commit`, `/review` | Handoff document, dependency-ordered commit splitting, review |
 | `/template`, `/skill:<name>` | Expand a prompt template; invoke a skill |
 | `/reload` | Reload skills/prompts/themes/extensions from disk |
@@ -2123,31 +2113,28 @@ Current checked-in performance evidence state:
 - Progress SLO closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, source-boundary checks, stress-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/swarm-progress-slo-closeout-gate.json; historical snapshot)*
 - Runtime-intelligence closeout gate: `pass`, with child Beads mapped to compaction admission, tool-output artifacts, provider routing, scheduler fairness, frame-budget telemetry, cancellation cleanup, extension safety provenance, docs/evidence, source-boundary checks, pushed commits, staged UBS, and Beads ledger reconciliation *(from docs/evidence/runtime-intelligence-closeout-gate.json; historical snapshot)*
 
-### Fast Loop vs Definitive Benchmarks
+### Quality and benchmark authority
 
-For day-to-day implementation, use targeted checks to keep iteration fast. Reserve definitive
-benchmark conclusions for integration boundaries where full evidence is regenerated.
+Use the registered DSR recipe for day-to-day validation and definitive
+benchmark evidence:
 
-- **Fast loop (non-authoritative):** file-scoped `cargo fmt --check` and targeted test replays (`rch exec -- cargo test --test ...` when compilation is non-trivial).
-- **Definitive pass (authoritative):** offload heavy runs with strict remote gating (`rch exec -- ...` or script wrappers with `--require-rch`), then require
-  updated evidence artifacts:
+- **Quality gate:** `dsr quality --tool pi_agent_rust`.
+- **Definitive evidence:** require the DSR run to regenerate and validate these
+  artifacts:
   - `tests/perf/reports/phase1_matrix_validation.json`
   - `tests/full_suite_gate/full_suite_verdict.json`
   - `tests/full_suite_gate/certification_verdict.json`
   - `tests/full_suite_gate/extension_remediation_backlog.json`
 
-This keeps inner loops responsive while preserving strict claim-integrity at release time.
+Direct Cargo, RCH, and repository wrapper invocations are not evidence and are
+not an authorized fast path around DSR.
 
 ### Extension Workload Hotspot Profiling
 
-Pi includes a dedicated workload harness for extension runtime bottlenecks:
-
-```bash
-cargo run --example ext_workloads -- \
-  --out artifacts/perf/ext_workloads.jsonl \
-  --matrix-out artifacts/perf/ext_hostcall_hotspot_matrix.json \
-  --trace-out artifacts/perf/ext_hostcall_bridge_trace.jsonl
-```
+Pi includes a dedicated `ext_workloads` workload harness for extension runtime
+bottlenecks. Run it only through the registered DSR performance lane, which
+writes `ext_workloads.jsonl`, `ext_hostcall_hotspot_matrix.json`, and
+`ext_hostcall_bridge_trace.jsonl` with DSR provenance.
 
 This harness does more than raw timing:
 
@@ -2181,7 +2168,7 @@ The runpack also embeds `validation_scheduler_plan`
 `--out-validation-scheduler-plan-json` or print it with
 `--print-validation-scheduler-plan`. This is an advisory RCH-aware simulator:
 it ranks fast script checks, evidence regeneration, focused tests,
-E2E/conformance, `cargo check --all-targets`, and clippy from the current git
+E2E/conformance, compiler checks, and linting from the current git
 change profile, predictive telemetry, RCH admission, remote proof, and target
 cache evidence. It preserves exact command strings and required RCH env, but it
 does not execute cargo, mutate RCH, reserve Agent Mail, claim Beads, delete temp
@@ -2190,8 +2177,8 @@ artifacts, or allow heavy cargo to fail open into a local build.
 If validation-broker status or plan JSON is supplied with
 `--validation-broker-json`, the runpack projects source status, slot counts,
 stale slot warnings, duplicate-gate opportunities, and recommended next actions
-as advisory handoff data. This projection does not replace RCH, Doctor, Beads,
-Agent Mail, CI, UBS, `cargo_headroom.sh`, or release-claim gates. Operator
+as advisory handoff data. This projection does not replace DSR, Doctor, Beads,
+Agent Mail, UBS, or release-claim gates. Operator
 workflow, privacy, and degraded-data guidance lives in
 [docs/swarm-operations-runbook.md#validation-broker-operator-workflow](docs/swarm-operations-runbook.md#validation-broker-operator-workflow).
 
@@ -2828,23 +2815,13 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 ### Building
 
 ```bash
-./scripts/cargo_headroom.sh build           # Debug build (remote offload)
-./scripts/cargo_headroom.sh build --release # Release build (optimized, remote offload)
-./scripts/cargo_headroom.sh test --all-targets # Full test run with disk preflight
-# Lint checks (remote-safe split to avoid rch clippy timeout fail-open)
-./scripts/cargo_headroom.sh clippy --lib --bins -- -D warnings
-./scripts/cargo_headroom.sh clippy --tests -- -D warnings
-./scripts/cargo_headroom.sh clippy --benches -- -D warnings
-./scripts/cargo_headroom.sh clippy --examples -- -D warnings
+dsr quality --tool pi_agent_rust
+dsr build pi_agent_rust
 ```
 
-When those variables are unset, `cargo_headroom.sh` defaults `CARGO_TARGET_DIR`
-and `TMPDIR` to a per-agent directory under `/data/tmp/pi_agent_rust_cargo/...`,
-writes a `CACHEDIR.TAG`, rejects accidental repo-root target directories, and
-fails before compilation if the target or temp mount has insufficient free
-space. Set `PI_CARGO_RUNNER=local` for a local-only run,
-`PI_CARGO_BUILD_ROOT=<dir>` for a different large volume, or
-`PI_CARGO_HEADROOM_MIN_FREE_MB=<mb>` for smaller focused checks.
+DSR owns formatting, compilation, linting, tests, target/temp placement, and
+any remote offload. RCH and repository wrappers are DSR implementation details,
+not alternate contributor entry points.
 
 Before launching swarms or heavyweight all-target gates, run
 `pi doctor --only swarm --format json`. The
@@ -2871,105 +2848,27 @@ slot posture for runpacks and operator handoff. Missing broker configuration is
 reported as optional and non-blocking; stale or degraded broker stores remain
 visible instead of being promoted to green validation evidence.
 
-### Cargo Feature Defaults
+### Feature defaults
 
-Default builds enable `sqlite-sessions` only. The `sqlite-sessions` feature is
-therefore on for normal `cargo build`, `cargo test`, release, and installer
-builds; JSONL remains the default session store unless configuration selects
-SQLite storage. Heavyweight extras (`image-resize`, `jemalloc`, `clipboard`,
-`wasm-host`, and syntax highlighting) are opt-in so the default release binary
-stays under the size budget. To build all optional user-facing extras, use:
-
-```bash
-./scripts/cargo_headroom.sh build --features full
-```
-
-To build a smaller custom subset without SQLite session backend support, use
-`--no-default-features` and explicitly re-enable only the features you need:
-
-```bash
-./scripts/cargo_headroom.sh build --no-default-features --features clipboard
-```
+Default DSR builds enable `sqlite-sessions` only; JSONL remains the default
+session store unless configuration selects SQLite. Heavyweight extras
+(`image-resize`, `jemalloc`, `clipboard`, `wasm-host`, and syntax highlighting)
+are opt-in so the default release binary stays under the size budget. Feature
+variants must be declared in the DSR recipe instead of injected through a
+direct Cargo invocation.
 
 ### Testing
 
 ```bash
-# Unified verification runner (recommended for deterministic evidence artifacts)
-./scripts/e2e/run_all.sh --profile focused
-./scripts/e2e/run_all.sh --profile ci
-./scripts/e2e/run_all.sh --rerun-from tests/e2e_results/<timestamp>/summary.json --skip-unit
-
-# Fast smoke/extension quality wrappers with strict remote enforcement
-./scripts/smoke.sh --require-rch
-./scripts/ext_quality_pipeline.sh --require-rch
-
-# Multi-agent safety: with CODEX_THREAD_ID set, run_all defaults
-# CARGO_TARGET_DIR to target/agents/<CODEX_THREAD_ID> unless overridden.
-# Set CARGO_TARGET_DIR explicitly if you want a custom shared or isolated target.
-
-# All tests
-./scripts/cargo_headroom.sh test --all-targets
-
-# Specific module
-./scripts/cargo_headroom.sh test tools::tests
-./scripts/cargo_headroom.sh test sse::tests
-
-# Conformance tests
-./scripts/cargo_headroom.sh test conformance
+dsr quality --tool pi_agent_rust
 ```
 
-Focused validation tools:
+The registered recipe owns unit, integration, conformance, E2E, installer,
+extension, formatting, lint, security, reachability, ledger-reconciliation,
+and evidence-integrity gates. If a required focused lane is missing, add it to
+DSR; do not bypass DSR by invoking Cargo, RCH, or a repository wrapper directly.
 
-```bash
-# Dev-firstset gate before release build
-rch exec -- cargo build --bin pi --bin ext_release_binary_e2e
-PI_HTTP_REQUEST_TIMEOUT_SECS=0 rch exec -- \
-  cargo run --example ext_release_binary_e2e -- \
-  --pi-bin target/debug/pi \
-  --provider ollama --model qwen2.5:0.5b \
-  --jobs 10 --timeout-secs 600 --max-cases 20 --extension-policy balanced
-
-# Full optimized release-binary run after gate passes
-rch exec -- cargo build --release --bin pi --bin ext_release_binary_e2e
-PI_HTTP_REQUEST_TIMEOUT_SECS=0 target/release/ext_release_binary_e2e \
-  --pi-bin target/release/pi \
-  --provider ollama --model qwen2.5:0.5b \
-  --jobs 10 --timeout-secs 600 --extension-policy balanced
-
-# Runtime risk ledger forensics (verify, replay, calibrate)
-rch exec -- cargo run --example ext_runtime_risk_ledger -- verify --input path/to/runtime_risk_ledger.json
-rch exec -- cargo run --example ext_runtime_risk_ledger -- replay --input path/to/runtime_risk_ledger.json
-rch exec -- cargo run --example ext_runtime_risk_ledger -- calibrate --input path/to/runtime_risk_ledger.json --objective balanced_accuracy
-
-# Release evidence ledger (build, verify, replay)
-rch exec -- cargo run --example release_evidence_ledger -- build --repo-root . --output docs/evidence/release-evidence-ledger.json
-rch exec -- cargo run --example release_evidence_ledger -- verify --input docs/evidence/release-evidence-ledger.json --repo-root .
-rch exec -- cargo run --example release_evidence_ledger -- replay --input docs/evidence/release-evidence-ledger.json
-
-# Multi-run N-run evidence protocol (evaluate, verify)
-rch exec -- cargo run --example nrun_evidence_evaluator -- evaluate --input docs/evidence/nrun-measurement-series.json --output docs/evidence/nrun-budget-evaluation.json
-rch exec -- cargo run --example nrun_evidence_evaluator -- verify --input docs/evidence/nrun-budget-evaluation.json --contract docs/contracts/nrun-evidence-protocol-contract.json
-
-# Anytime-valid sequential budget gate (evaluate, verify)
-rch exec -- cargo run --example sequential_budget_gate -- evaluate --input docs/evidence/nrun-measurement-series.json --output docs/evidence/sequential-budget-gate-evaluations.json
-rch exec -- cargo run --example sequential_budget_gate -- verify --input docs/evidence/sequential-budget-gate-evaluations.json --contract docs/contracts/sequential-budget-gate-contract.json
-
-# Performance budget regime drift & shift watch (analyze, verify)
-rch exec -- cargo run --example perf_drift_watch -- analyze --input docs/evidence/nrun-measurement-series.json --output docs/evidence/perf-drift-watch.json
-rch exec -- cargo run --example perf_drift_watch -- verify --input docs/evidence/perf-drift-watch.json --contract docs/contracts/drift-watch-contract.json
-
-# Data-derived conformal budget calibration (calibrate, verify)
-rch exec -- cargo run --example conformal_budget_calibration -- calibrate --input docs/evidence/nrun-measurement-series.json --output docs/evidence/conformal-budget-calibration.json
-rch exec -- cargo run --example conformal_budget_calibration -- verify --input docs/evidence/conformal-budget-calibration.json --contract docs/contracts/conformal-budget-calibration-contract.json
-
-# Fresh release startup p95 and binary size benchmark (bench, verify)
-rch exec -- cargo run --example startup_benchmark_runner -- bench --output docs/evidence/startup-benchmark-report.json
-rch exec -- cargo run --example startup_benchmark_runner -- verify --input docs/evidence/startup-benchmark-report.json --contract docs/contracts/startup-benchmark-contract.json
-
-# Performance variance gating & host topology fingerprint validation (evaluate, verify)
-rch exec -- cargo run --example variance_gate -- evaluate --input docs/evidence/nrun-measurement-series.json --output docs/evidence/variance-gate-evaluations.json
-rch exec -- cargo run --example variance_gate -- verify --input docs/evidence/variance-gate-evaluations.json --contract docs/contracts/variance-gating-contract.json
-```
+Important validation components include:
 
 - `ext_runtime_risk_ledger` operates on `pi.ext.runtime_risk_ledger.v1` artifacts (for example, from incident bundle exports).
 - `release_evidence_ledger` operates on `pi.release_evidence.ledger.v1` artifacts, ensuring proof-carrying tamper-evident hash chaining across all release evidence artifacts.
@@ -2985,42 +2884,38 @@ rch exec -- cargo run --example variance_gate -- verify --input docs/evidence/va
 Releases are tag-driven, must align with `Cargo.toml` versions, and are built
 and published exclusively through Doodlestein Self-Releaser (DSR).
 
-- Tag format: `vX.Y.Z` (pre-releases like `vX.Y.Z-rc.N` are allowed but skip crates.io publish).
+- Tag format: `vX.Y.Z` (pre-releases like `vX.Y.Z-rc.N` are allowed).
 - The tag version **must** match `package.version` in `Cargo.toml`.
 - Publish order for dependencies: `asupersync` → `rich_rust` → `charmed-*` (lipgloss, bubbletea, bubbles, glamour) → `pi_agent_rust`.
+- Cargo registry publication is currently **HOLD** until DSR provides and
+  validates a fail-closed crates.io publisher. Neither stable nor pre-release
+  tags authorize an ad hoc `cargo publish` fallback.
 - GitHub Actions is never used for this repository. Files under
   `.github/workflows/` are disabled historical references and are not build,
   test, publication, or evidence authorities.
 - DSR owns quality checks, native cross-platform builds, packaging, signing,
-  publication, and public-release verification. RCH may offload development
-  compilation but cannot authorize or publish a release.
+  publication, and public-release verification. DSR may use RCH internally;
+  contributors never invoke RCH as a parallel build or evidence lane.
 - The canonical DSR operating details are documented in
   [docs/releasing.md](docs/releasing.md). A tag or source build without
   DSR-published, publicly verified artifacts is not a release.
   Immutable `v*` tag ruleset `20418963` was created and read back on 2026-08-04
-  with update/deletion forbidden and no bypass actors. The manual lane
-  re-verifies that live control before tagging and publication and stops on any
-  drift. No automated GitHub Actions lane exists or may be enabled.
+  with update/deletion forbidden and no bypass actors. That historical
+  observation is not current proof: DSR must gain a fail-closed live ruleset
+  check before any release. The retired manual lane is not a fallback, and no
+  GitHub Actions lane exists or may be enabled.
 
 ### Coverage
 
-Coverage uses `cargo-llvm-cov`:
+Coverage is a component of the registered DSR quality recipe:
 
 ```bash
-# One-time install
-cargo install cargo-llvm-cov --locked
-rustup component add llvm-tools-preview
-
-# Summary (fastest)
-cargo llvm-cov --all-targets --workspace --summary-only
-
-# LCOV report (for CI/artifacts)
-CI=true VCR_MODE=playback VCR_CASSETTE_DIR=tests/fixtures/vcr \
-  cargo llvm-cov --all-targets --workspace --lcov --output-path lcov.info
-
-# HTML report (defaults to target/llvm-cov/html)
-cargo llvm-cov --all-targets --workspace --html
+dsr quality --tool pi_agent_rust
 ```
+
+DSR provisions the coverage toolchain and records summary, LCOV, and HTML
+artifacts with source provenance; direct coverage-tool invocations are not an
+accepted project gate.
 
 ### Project Structure
 
