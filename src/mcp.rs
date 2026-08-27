@@ -29,7 +29,7 @@ const MAX_MOUNTED_NAME: usize = 64;
 /// with a stable hash suffix on overflow.
 #[must_use]
 pub fn mounted_name(server: &str, tool: &str) -> String {
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest as _, Sha256};
 
     let sanitize = |raw: &str| -> String {
         raw.chars()
@@ -42,15 +42,43 @@ pub fn mounted_name(server: &str, tool: &str) -> String {
             })
             .collect()
     };
-    let full = format!("mcp__{}__{}", sanitize(server), sanitize(tool));
-    if full.chars().count() <= MAX_MOUNTED_NAME {
+    let sanitized_server = sanitize(server);
+    let sanitized_tool = sanitize(tool);
+    let full = format!("mcp__{sanitized_server}__{sanitized_tool}");
+    let lossy = sanitized_server != server || sanitized_tool != tool;
+    let reserved_hash_suffix = full
+        .as_bytes()
+        .get(full.len().saturating_sub(25)..)
+        .is_some_and(|suffix| {
+            suffix.len() == 25
+                && suffix[0] == b'_'
+                && suffix[1..].iter().all(u8::is_ascii_hexdigit)
+        });
+    // `__` is the component delimiter. Hash any raw component containing it,
+    // and reserve the generated suffix shape, so a literal tool name cannot
+    // deliberately impersonate the mounted name of a lossy/long input.
+    let ambiguous = server.contains("__") || tool.contains("__") || reserved_hash_suffix;
+    if !lossy && !ambiguous && full.len() <= MAX_MOUNTED_NAME {
         return full;
     }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    full.hash(&mut hasher);
-    let suffix = format!("{:08x}", u32::try_from(hasher.finish()).unwrap_or(u32::MAX));
+
+    // Sanitization is many-to-one (`do.thing` and `do_thing` would otherwise
+    // collide), and `DefaultHasher` is not a cross-version persistence
+    // contract. Bind the original length-framed names with a stable digest.
+    let mut hasher = Sha256::new();
+    hasher.update(b"pi_agent_rust:mcp-mounted-tool:v1\0");
+    for part in [server, tool] {
+        hasher.update(
+            u64::try_from(part.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hasher.update(part.as_bytes());
+    }
+    let digest = crate::package_manager::hex_encode(&hasher.finalize());
+    let suffix = &digest[..24];
     let keep = MAX_MOUNTED_NAME - suffix.len() - 1;
-    let truncated: String = full.chars().take(keep).collect();
+    let truncated = &full[..full.len().min(keep)];
     format!("{truncated}_{suffix}")
 }
 
@@ -188,9 +216,23 @@ mod tests {
     #[test]
     fn mounted_name_sanitizes_and_preserves() {
         assert_eq!(mounted_name("docs", "search"), "mcp__docs__search");
-        assert_eq!(
-            mounted_name("my-server", "do.thing"),
-            "mcp__my-server__do_thing"
+        let sanitized = mounted_name("my-server", "do.thing");
+        assert!(sanitized.starts_with("mcp__my-server__do_thing_"));
+        assert_ne!(sanitized, mounted_name("my-server", "do_thing"));
+        assert_eq!(sanitized, mounted_name("my-server", "do.thing"));
+
+        assert_ne!(
+            mounted_name("a__b", "c"),
+            mounted_name("a", "b__c"),
+            "length-framed hashing must disambiguate raw component boundaries"
+        );
+        let impersonating_tool = sanitized
+            .strip_prefix("mcp__my-server__")
+            .expect("mounted prefix");
+        assert_ne!(
+            sanitized,
+            mounted_name("my-server", impersonating_tool),
+            "the generated hash suffix namespace must be reserved"
         );
     }
 

@@ -107,6 +107,17 @@ fn write_project_mcp_config(root: &Path, name: &str, command: &str, env: &[(&str
     .expect("write mcp.json");
 }
 
+fn write_project_mcp_value(root: &Path, value: &Value) {
+    let dir = root.join(".pi");
+    std::fs::create_dir_all(&dir).expect("create .pi");
+    std::fs::write(dir.join("mcp.json"), value.to_string()).expect("write mcp.json");
+}
+
+#[cfg(unix)]
+fn shell_single_quote(value: &Path) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
 // ---------------------------------------------------------------------------
 // Config + trust lanes (no fixture binary)
 // ---------------------------------------------------------------------------
@@ -136,12 +147,107 @@ fn mcp_discovery_flows_into_manager_list() {
     let docs = rows.iter().find(|r| r.name == "docs").expect("docs row");
     assert_eq!(docs.provenance, ".pi");
     assert_eq!(docs.trust, "pending");
-    assert!(docs.target.contains("docs-mcp"));
+    assert_eq!(docs.target, "<stdio>");
     let foreign = rows
         .iter()
         .find(|r| r.name == "foreign-srv")
         .expect("foreign");
     assert_eq!(foreign.provenance, "foreign");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_pending_and_list_surfaces_do_not_expose_target_credentials() {
+    let case = "mcp_pending_and_list_surfaces_do_not_expose_target_credentials";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let global = harness.temp_path("global");
+    write_project_mcp_value(
+        &root,
+        &json!({
+            "mcpServers": {
+                "stdio-secret": {
+                    "command": "/tmp/literal-command-secret",
+                    "args": ["--token", "literal-argv-secret"]
+                },
+                "http-secret": {
+                    "url": "https://user:password@example.test/mcp?token=query-secret"
+                }
+            }
+        }),
+    );
+    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap");
+    let rows = manager.list();
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.name == "stdio-secret")
+            .expect("stdio row")
+            .target,
+        "<stdio>"
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.name == "http-secret")
+            .expect("http row")
+            .target,
+        "<http>"
+    );
+
+    let error = block_on_local(manager.call_tool("stdio-secret", "anything", json!({})))
+        .expect_err("pending server must refuse before exposing its target")
+        .to_string();
+    for secret in [
+        "literal-command-secret",
+        "literal-argv-secret",
+        "password",
+        "query-secret",
+    ] {
+        assert!(!error.contains(secret), "pending error leaked {secret:?}: {error}");
+    }
+    assert!(error.contains("/mcp trust stdio-secret"), "{error}");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_extension_server_names_reject_terminal_controls() {
+    let case = "mcp_extension_server_names_reject_terminal_controls";
+    let harness = TestHarness::new(case);
+    let manager = McpManager::bootstrap(&harness.temp_path("."), &harness.temp_path("global"), &[])
+        .expect("bootstrap");
+    manager.register_extension_server(
+        "hostile\u{202e}name",
+        &json!({"command": "/nonexistent/server", "extension_id": "fixture"}),
+    );
+    assert!(manager.list().is_empty());
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_extension_server_specs_reject_non_string_execution_fields() {
+    let case = "mcp_extension_server_specs_reject_non_string_execution_fields";
+    let harness = TestHarness::new(case);
+    let manager = McpManager::bootstrap(&harness.temp_path("."), &harness.temp_path("global"), &[])
+        .expect("bootstrap");
+    for (name, spec) in [
+        (
+            "bad-arg",
+            json!({"command": "/nonexistent/server", "args": ["ok", 7]}),
+        ),
+        (
+            "bad-env",
+            json!({"command": "/nonexistent/server", "env": {"TOKEN": 7}}),
+        ),
+        (
+            "bad-header",
+            json!({"url": "https://example.test/mcp", "headers": {"Authorization": 7}}),
+        ),
+    ] {
+        manager.register_extension_server(name, &spec);
+    }
+    assert!(
+        manager.list().is_empty(),
+        "malformed execution fields must reject the whole extension server"
+    );
     finish_case(&harness, case);
 }
 
@@ -183,6 +289,166 @@ fn mcp_unknown_server_is_named_error() {
     let err = block_on_local(manager.call_tool("nope", "x", json!({})))
         .expect_err("unknown server must fail");
     assert!(err.to_string().contains("MCP_UNKNOWN_SERVER"), "{err}");
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_env_command_change_re_pends_before_resolution() {
+    let case = "mcp_env_command_change_re_pends_before_resolution";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path("project");
+    let global = harness.temp_path("global");
+    let marker = harness.temp_path("env-command-ran");
+    write_project_mcp_config(
+        &root,
+        "guarded",
+        "/nonexistent/guarded-server",
+        &[("TOKEN", "safe")],
+    );
+    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap initial config");
+    block_on_local(manager.trust("guarded")).expect_err("spawn should fail after persisting trust");
+
+    let injected = format!("$CMD:touch {}", shell_single_quote(&marker));
+    write_project_mcp_value(
+        &root,
+        &json!({
+            "mcpServers": {
+                "guarded": {
+                    "command": "/nonexistent/guarded-server",
+                    "env": {"TOKEN": injected}
+                }
+            }
+        }),
+    );
+    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap changed config");
+    let err = block_on_local(manager.call_tool("guarded", "anything", json!({})))
+        .expect_err("changed env definition must re-pend");
+    assert!(err.to_string().contains("MCP_TRUST_PENDING"), "{err}");
+    assert!(!marker.exists(), "pending trust must win before $CMD resolution");
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_header_command_change_re_pends_before_resolution() {
+    let case = "mcp_header_command_change_re_pends_before_resolution";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path("project");
+    let global = harness.temp_path("global");
+    let marker = harness.temp_path("header-command-ran");
+    write_project_mcp_value(
+        &root,
+        &json!({
+            "mcpServers": {
+                "remote": {
+                    "url": "not a valid URL",
+                    "headers": {"Authorization": "safe"}
+                }
+            }
+        }),
+    );
+    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap initial config");
+    block_on_local(manager.trust("remote")).expect_err("invalid URL must fail after trust write");
+
+    let injected = format!("$CMD:touch {}", shell_single_quote(&marker));
+    write_project_mcp_value(
+        &root,
+        &json!({
+            "mcpServers": {
+                "remote": {
+                    "url": "not a valid URL",
+                    "headers": {"Authorization": injected}
+                }
+            }
+        }),
+    );
+    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap changed config");
+    let err = block_on_local(manager.call_tool("remote", "anything", json!({})))
+        .expect_err("changed header definition must re-pend");
+    assert!(err.to_string().contains("MCP_TRUST_PENDING"), "{err}");
+    assert!(!marker.exists(), "pending trust must win before $CMD resolution");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_relative_stdio_trust_is_scoped_to_project_cwd() {
+    let case = "mcp_relative_stdio_trust_is_scoped_to_project_cwd";
+    let harness = TestHarness::new(case);
+    let project_a = harness.temp_path("project-a");
+    let project_b = harness.temp_path("project-b");
+    let global = harness.temp_path("global");
+    std::fs::create_dir_all(&project_a).expect("project A directory");
+    std::fs::create_dir_all(&project_b).expect("project B directory");
+    std::fs::create_dir_all(&global).expect("global directory");
+    std::fs::write(
+        global.join("mcp.json"),
+        json!({
+            "mcpServers": {
+                "local": {"command": "./server"}
+            }
+        })
+        .to_string(),
+    )
+    .expect("write shared global config");
+
+    let manager_a =
+        McpManager::bootstrap(&project_a, &global, &[]).expect("bootstrap project A");
+    block_on_local(manager_a.trust("local")).expect_err("missing project A server");
+
+    let manager_b =
+        McpManager::bootstrap(&project_b, &global, &[]).expect("bootstrap project B");
+    let row = manager_b
+        .list()
+        .into_iter()
+        .find(|row| row.name == "local")
+        .expect("project B row");
+    assert_eq!(row.trust, "pending");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_command_reference_trust_is_scoped_to_project_cwd() {
+    let case = "mcp_http_command_reference_trust_is_scoped_to_project_cwd";
+    let harness = TestHarness::new(case);
+    let project_a = harness.temp_path("http-project-a");
+    let project_b = harness.temp_path("http-project-b");
+    let global = harness.temp_path("http-global");
+    std::fs::create_dir_all(&project_a).expect("project A directory");
+    std::fs::create_dir_all(&project_b).expect("project B directory");
+    std::fs::create_dir_all(&global).expect("global directory");
+    std::fs::write(
+        global.join("mcp.json"),
+        json!({
+            "mcpServers": {
+                "remote": {
+                    "url": "not a valid URL",
+                    "headers": {"Authorization": "$CMD:./token-helper"}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write shared global config");
+
+    let manager_a =
+        McpManager::bootstrap(&project_a, &global, &[]).expect("bootstrap project A");
+    let row_a = manager_a
+        .list()
+        .into_iter()
+        .find(|row| row.name == "remote")
+        .expect("project A row");
+    assert_eq!(row_a.trust, "pending");
+    block_on_local(manager_a.deny("remote")).expect("persist project A decision");
+
+    let manager_b =
+        McpManager::bootstrap(&project_b, &global, &[]).expect("bootstrap project B");
+    let row_b = manager_b
+        .list()
+        .into_iter()
+        .find(|row| row.name == "remote")
+        .expect("project B row");
+    assert_eq!(row_b.trust, "pending");
     finish_case(&harness, case);
 }
 
@@ -337,6 +603,33 @@ mod fixture_lanes {
     }
 
     #[test]
+    fn mcp_live_transport_rechecks_shared_denial() {
+        let case = "mcp_live_transport_rechecks_shared_denial";
+        let harness = TestHarness::new(case);
+        let manager_a = fixture_manager(&harness, &[]);
+        block_on_local(manager_a.trust("fixture")).expect("manager A trust + connect");
+
+        let manager_b = fixture_manager(&harness, &[]);
+        block_on_local(manager_b.deny("fixture")).expect("manager B denial");
+        assert!(
+            manager_a.mounted_tool_metas().is_empty(),
+            "a shared denial must hide previously cached tools immediately"
+        );
+
+        let err = block_on_local(manager_a.call_tool("fixture", "echo", json!({"text": "no"})))
+            .expect_err("manager A must re-read shared denial before using live transport");
+        assert!(err.to_string().contains("MCP_TRUST_DENIED"), "{err}");
+        let row = manager_a
+            .list()
+            .into_iter()
+            .find(|row| row.name == "fixture")
+            .expect("manager A row");
+        assert_eq!(row.trust, "denied");
+        assert_eq!(row.health, "not started");
+        finish_case(&harness, case);
+    }
+
+    #[test]
     fn mcp_stdio_env_allowlist_proven() {
         let case = "mcp_stdio_env_allowlist_proven";
         let harness = TestHarness::new(case);
@@ -442,6 +735,15 @@ mod fixture_lanes {
             .find(|r| r.name == "fixture")
             .expect("row");
         assert!(row.health.contains("failed"), "{}", row.health);
+
+        // `/mcp test` is the documented manual recovery path. It must clear
+        // the exhausted budget and make one real connection attempt; this
+        // fixture still crashes, so the attempt fails for the transport reason
+        // rather than being rejected by the old budget.
+        let err = block_on_local(manager.test("fixture"))
+            .expect_err("manual retry reaches the still-crashing fixture");
+        assert!(!err.to_string().contains("MCP_RESTART_EXHAUSTED"), "{err}");
+        assert!(!err.to_string().contains("MCP_BACKOFF"), "{err}");
         finish_case(&harness, case);
     }
 

@@ -19,6 +19,79 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+const TRUST_FINGERPRINT_DOMAIN: &[u8] = b"pi_agent_rust:mcp-trust-surface:v2";
+
+/// `HttpTransport` always installs Content-Type + Accept and may add an MCP
+/// session header after initialize. Leave room for all three inside the HTTP
+/// client's hard 100-header ceiling so no trusted custom definition is ever
+/// silently dropped.
+const MAX_MCP_CUSTOM_HTTP_HEADERS: usize = 97;
+const MAX_MCP_HEADER_NAME_BYTES: usize = 128;
+const MAX_MCP_HEADER_VALUE_BYTES: usize = 16 * 1024;
+const MAX_MCP_ENV_ENTRIES: usize = 256;
+const MAX_MCP_ENV_NAME_BYTES: usize = 128;
+const MAX_MCP_ENV_VALUE_BYTES: usize = 64 * 1024;
+
+fn is_terminal_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+pub(super) fn validate_http_header_value(value: &str) -> std::result::Result<(), String> {
+    if value.len() > MAX_MCP_HEADER_VALUE_BYTES {
+        return Err(format!(
+            "HTTP header value exceeds {MAX_MCP_HEADER_VALUE_BYTES} bytes"
+        ));
+    }
+    if value.chars().any(is_terminal_control) {
+        return Err("HTTP header value contains terminal or protocol control characters".to_string());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_env_value(value: &str) -> std::result::Result<(), String> {
+    if value.len() > MAX_MCP_ENV_VALUE_BYTES {
+        return Err(format!(
+            "environment value exceeds {MAX_MCP_ENV_VALUE_BYTES} bytes"
+        ));
+    }
+    if value.chars().any(is_terminal_control) {
+        return Err("environment value contains terminal or process control characters".to_string());
+    }
+    Ok(())
+}
 
 /// Where a server definition came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -83,17 +156,53 @@ pub struct ConfiguredServer {
 }
 
 impl ConfiguredServer {
-    /// Stable fingerprint of the spawn target: a trust decision binds to
-    /// this, so any config change re-prompts.
+    /// Versioned cryptographic fingerprint of the complete execution surface.
+    ///
+    /// Trust is global on disk, so the digest binds not only the target but
+    /// also its name, raw secret definitions, provenance/source identity, and
+    /// the effective working directory for local process resolution. Secret
+    /// references are intentionally hashed before resolution: environment
+    /// rotation does not re-prompt, while changing `$ENV:`/`$CMD:` definitions
+    /// does.
     #[must_use]
-    pub fn fingerprint(&self) -> String {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.command.hash(&mut hasher);
-        self.args.hash(&mut hasher);
-        self.url.hash(&mut hasher);
-        self.transport_hint.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+    pub fn fingerprint(&self, effective_cwd: &Path) -> String {
+        let mut hasher = Sha256::new();
+        hash_part(&mut hasher, "domain", TRUST_FINGERPRINT_DOMAIN);
+        hash_part(&mut hasher, "name", self.name.as_bytes());
+        hash_optional(&mut hasher, "command", self.command.as_deref());
+        hash_strings(&mut hasher, "args", &self.args);
+        hash_definitions(&mut hasher, "env", &self.env, false);
+        hash_optional(&mut hasher, "url", self.url.as_deref());
+        hash_definitions(&mut hasher, "headers", &self.headers, true);
+        hash_optional(
+            &mut hasher,
+            "transport_hint",
+            self.transport_hint.as_deref(),
+        );
+        hash_part(
+            &mut hasher,
+            "provenance",
+            self.provenance.label().as_bytes(),
+        );
+
+        let source = canonical_identity(&self.source_file, effective_cwd);
+        hash_part(
+            &mut hasher,
+            "source_file",
+            source.as_os_str().as_encoded_bytes(),
+        );
+        // HTTP headers can contain `$CMD:` references too, and their helper
+        // processes inherit the Pi process working directory. Bind cwd for all
+        // transports so global/CLI trust cannot authorize a different local
+        // helper merely because Pi was launched from another project.
+        let cwd = canonical_cwd(effective_cwd);
+        hash_part(
+            &mut hasher,
+            "effective_cwd",
+            cwd.as_os_str().as_encoded_bytes(),
+        );
+
+        crate::package_manager::hex_encode(&hasher.finalize())
     }
 
     /// Whether this is an HTTP(-family) server.
@@ -107,6 +216,256 @@ impl ConfiguredServer {
     }
 }
 
+pub(super) fn validate_transport_shape(
+    config: &ConfiguredServer,
+) -> std::result::Result<(), String> {
+    let hint = config.transport_hint.as_deref().map(str::trim);
+    if hint.is_some_and(str::is_empty) {
+        return Err("transport type must not be empty".to_string());
+    }
+    match (config.command.as_deref(), config.url.as_deref()) {
+        (Some(_), Some(_)) => Err(
+            "defines both command and url; exactly one transport target is required".to_string(),
+        ),
+        (None, None) => Err("must define exactly one of command or url".to_string()),
+        (Some(command), None) => {
+            if command.trim().is_empty() {
+                return Err("stdio command must not be empty".to_string());
+            }
+            if !matches!(hint, None | Some("stdio")) {
+                return Err(format!(
+                    "stdio command is incompatible with transport type {:?}",
+                    config.transport_hint.as_deref().unwrap_or_default()
+                ));
+            }
+            if !config.headers.is_empty() {
+                return Err("stdio transport must not define HTTP headers".to_string());
+            }
+            Ok(())
+        }
+        (None, Some(url)) => {
+            if url.trim().is_empty() {
+                return Err("HTTP url must not be empty".to_string());
+            }
+            if !matches!(hint, None | Some("http" | "sse" | "streamable-http")) {
+                return Err(format!(
+                    "HTTP url is incompatible with transport type {:?}",
+                    config.transport_hint.as_deref().unwrap_or_default()
+                ));
+            }
+            if !config.args.is_empty() || !config.env.is_empty() {
+                return Err("HTTP transport must not define stdio args or env".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn canonical_identity(path: &Path, base: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            canonical_cwd(base).join(path)
+        }
+    })
+}
+
+fn canonical_cwd(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|current| current.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+pub(super) fn normalize_http_headers(
+    mut headers: Vec<(String, String)>,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    if headers.len() > MAX_MCP_CUSTOM_HTTP_HEADERS {
+        return Err(format!(
+            "defines {} custom HTTP headers; at most {MAX_MCP_CUSTOM_HTTP_HEADERS} are allowed",
+            headers.len()
+        ));
+    }
+    for (name, value) in &headers {
+        if name.is_empty()
+            || name.len() > MAX_MCP_HEADER_NAME_BYTES
+            || !name.bytes().all(is_http_token_byte)
+        {
+            return Err(format!(
+                "defines invalid HTTP header name {name:?}; names must be 1 to {MAX_MCP_HEADER_NAME_BYTES} ASCII token bytes"
+            ));
+        }
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "accept" | "content-type" | "mcp-session-id"
+        ) {
+            return Err(format!(
+                "defines transport-owned HTTP header {name:?}; Accept, Content-Type, and Mcp-Session-Id are managed by the MCP transport"
+            ));
+        }
+        validate_http_header_value(value)
+            .map_err(|reason| format!("header {name:?}: {reason}"))?;
+    }
+    headers.sort_by(|left, right| {
+        left.0
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_ascii_lowercase())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for duplicate in headers.windows(2) {
+        if duplicate[0].0.eq_ignore_ascii_case(&duplicate[1].0) {
+            return Err(format!(
+                "defines duplicate HTTP header names {:?} and {:?} (header names are case-insensitive)",
+                duplicate[0].0, duplicate[1].0
+            ));
+        }
+    }
+    Ok(headers)
+}
+
+pub(super) fn normalize_env(
+    mut env: Vec<(String, String)>,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    if env.len() > MAX_MCP_ENV_ENTRIES {
+        return Err(format!(
+            "defines {} environment entries; at most {MAX_MCP_ENV_ENTRIES} are allowed",
+            env.len()
+        ));
+    }
+    for (name, value) in &env {
+        let mut bytes = name.bytes();
+        let valid_start = bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+        if !valid_start
+            || name.len() > MAX_MCP_ENV_NAME_BYTES
+            || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(format!(
+                "defines invalid environment name {name:?}; names must be 1 to {MAX_MCP_ENV_NAME_BYTES} ASCII identifier bytes"
+            ));
+        }
+        validate_env_value(value).map_err(|reason| format!("environment {name:?}: {reason}"))?;
+    }
+    env.sort_by(|left, right| {
+        left.0
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_ascii_lowercase())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for duplicate in env.windows(2) {
+        if duplicate[0].0.eq_ignore_ascii_case(&duplicate[1].0) {
+            return Err(format!(
+                "defines duplicate environment names {:?} and {:?} (environment names alias case-insensitively on Windows)",
+                duplicate[0].0, duplicate[1].0
+            ));
+        }
+    }
+    Ok(env)
+}
+
+pub(super) fn validate_server_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() || name.len() > 128 {
+        return Err("server name must contain 1 to 128 ASCII characters".to_string());
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(
+            "server name may contain only ASCII letters, digits, '.', '-', and '_'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn hash_part(hasher: &mut Sha256, label: &str, value: &[u8]) {
+    hasher.update(
+        u64::try_from(label.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(label.as_bytes());
+    hasher.update(
+        u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(value);
+}
+
+fn hash_optional(hasher: &mut Sha256, label: &str, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_part(hasher, &format!("{label}.state"), b"present");
+            hash_part(hasher, label, value.as_bytes());
+        }
+        None => hash_part(hasher, &format!("{label}.state"), b"absent"),
+    }
+}
+
+fn hash_strings(hasher: &mut Sha256, label: &str, values: &[String]) {
+    hash_part(
+        hasher,
+        &format!("{label}.count"),
+        &u64::try_from(values.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for value in values {
+        hash_part(hasher, &format!("{label}.item"), value.as_bytes());
+    }
+}
+
+fn hash_definitions(
+    hasher: &mut Sha256,
+    label: &str,
+    entries: &[(String, String)],
+    normalize_names: bool,
+) {
+    let mut sorted: Vec<_> = entries
+        .iter()
+        .map(|(name, value)| {
+            let name = if normalize_names {
+                name.to_ascii_lowercase()
+            } else {
+                name.clone()
+            };
+            (name, value.as_str())
+        })
+        .collect();
+    sorted.sort_unstable();
+    hash_part(
+        hasher,
+        &format!("{label}.count"),
+        &u64::try_from(sorted.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for (name, raw) in sorted {
+        let (kind, definition) = if let Some(name) = raw.strip_prefix("$ENV:") {
+            ("env_ref", name)
+        } else if let Some(command) = raw.strip_prefix("$CMD:") {
+            ("command_ref", command)
+        } else {
+            ("literal", raw)
+        };
+        hash_part(hasher, &format!("{label}.name"), name.as_bytes());
+        hash_part(hasher, &format!("{label}.value_kind"), kind.as_bytes());
+        hash_part(
+            hasher,
+            &format!("{label}.value_definition"),
+            definition.as_bytes(),
+        );
+    }
+}
+
 /// A skipped entry, surfaced in `/mcp` and logs instead of aborting.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,14 +473,6 @@ pub struct ConfigWarning {
     pub source_file: PathBuf,
     pub entry: String,
     pub reason: String,
-}
-
-/// The raw file shape: `{"mcpServers": {...}}` or a bare server map.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct McpFile {
-    #[serde(default)]
-    mcp_servers: HashMap<String, Value>,
 }
 
 /// One raw server entry (tolerant: unknown fields ignored).
@@ -153,6 +504,7 @@ fn load_file(
     provenance: Provenance,
     out: &mut Vec<(String, RawServer, Provenance, PathBuf)>,
     warnings: &mut Vec<ConfigWarning>,
+    claimed_names: &mut std::collections::HashSet<String>,
 ) {
     let Ok(content) = std::fs::read_to_string(path) else {
         return; // absent files are normal
@@ -177,24 +529,41 @@ fn load_file(
         }
     };
     // Accept both `{"mcpServers": {...}}` and a bare `{name: {...}}` map.
-    let servers: HashMap<String, Value> = serde_json::from_value::<McpFile>(value.clone())
-        .map(|file| file.mcp_servers)
-        .unwrap_or_default();
-    let servers = if servers.is_empty() {
-        // Bare-map form: values that look like server objects.
-        value
-            .as_object()
-            .map(|map| {
-                map.iter()
-                    .filter(|(_, v)| v.get("command").is_some() || v.get("url").is_some())
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+    // Presence of the wrapper is authoritative even when it is empty; never
+    // reinterpret unrelated top-level settings as a fallback server map.
+    let Some(root) = value.as_object() else {
+        warnings.push(ConfigWarning {
+            source_file: path.to_path_buf(),
+            entry: "<file>".to_string(),
+            reason: "MCP config root must be an object".to_string(),
+        });
+        return;
+    };
+    let servers: HashMap<String, Value> = if let Some(wrapped) = root.get("mcpServers") {
+        let Some(wrapped) = wrapped.as_object() else {
+            warnings.push(ConfigWarning {
+                source_file: path.to_path_buf(),
+                entry: "<file>".to_string(),
+                reason: "mcpServers must be an object".to_string(),
+            });
+            return;
+        };
+        wrapped.clone().into_iter().collect()
     } else {
-        servers
+        // Foreign settings files share their root with unrelated settings, so
+        // only object values carrying an MCP execution field are candidates.
+        root.iter()
+            .filter(|(_, value)| value.get("command").is_some() || value.get("url").is_some())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
     };
     for (name, raw) in servers {
+        // A higher-precedence definition owns its name even when malformed.
+        // Falling through to an older, already-trusted lower definition would
+        // turn a configuration error into unexpected code execution.
+        if !claimed_names.insert(name.clone()) {
+            continue;
+        }
         match parse_server(&name, &raw) {
             Ok(server) => out.push((name, server, provenance, path.to_path_buf())),
             Err(reason) => warnings.push(ConfigWarning {
@@ -286,28 +655,38 @@ pub struct McpDiscovery {
 pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDiscovery {
     let mut layered: Vec<(String, RawServer, Provenance, PathBuf)> = Vec::new();
     let mut warnings = Vec::new();
+    let mut claimed_names = std::collections::HashSet::new();
 
     // Precedence high → low. Later layers only fill names not already set.
     for path in cli_paths {
-        load_file(path, Provenance::Cli, &mut layered, &mut warnings);
+        load_file(
+            path,
+            Provenance::Cli,
+            &mut layered,
+            &mut warnings,
+            &mut claimed_names,
+        );
     }
     load_file(
         &cwd.join(".pi/mcp.json"),
         Provenance::ProjectPi,
         &mut layered,
         &mut warnings,
+        &mut claimed_names,
     );
     load_file(
         &cwd.join(".agents/mcp.json"),
         Provenance::ProjectAgents,
         &mut layered,
         &mut warnings,
+        &mut claimed_names,
     );
     load_file(
         &global_dir.join("mcp.json"),
         Provenance::GlobalPi,
         &mut layered,
         &mut warnings,
+        &mut claimed_names,
     );
     for foreign in FOREIGN_PROJECT_FILES {
         load_file(
@@ -315,33 +694,67 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
             Provenance::Foreign,
             &mut layered,
             &mut warnings,
+            &mut claimed_names,
         );
     }
 
-    // First occurrence wins (layers were loaded high → low precedence).
-    let mut seen = std::collections::HashSet::new();
     let mut servers = Vec::new();
     for (name, raw, provenance, source_file) in layered {
-        if !seen.insert(name.clone()) {
+        if let Err(reason) = validate_server_name(&name) {
+            warnings.push(ConfigWarning {
+                source_file,
+                entry: name,
+                reason,
+            });
             continue;
         }
-        servers.push(ConfiguredServer {
+        let headers = match normalize_http_headers(
+            raw.headers
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        ) {
+            Ok(headers) => headers,
+            Err(reason) => {
+                warnings.push(ConfigWarning {
+                    source_file,
+                    entry: name,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let env = match normalize_env(raw.env.unwrap_or_default().into_iter().collect()) {
+            Ok(env) => env,
+            Err(reason) => {
+                warnings.push(ConfigWarning {
+                    source_file,
+                    entry: name,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let config = ConfiguredServer {
             name,
             command: raw.command,
             args: raw.args.unwrap_or_default(),
-            env: raw
-                .env
-                .map(|env| env.into_iter().collect())
-                .unwrap_or_default(),
+            env,
             url: raw.url,
-            headers: raw
-                .headers
-                .map(|headers| headers.into_iter().collect())
-                .unwrap_or_default(),
+            headers,
             transport_hint: raw.transport,
             provenance,
             source_file,
-        });
+        };
+        if let Err(reason) = validate_transport_shape(&config) {
+            warnings.push(ConfigWarning {
+                source_file: config.source_file.clone(),
+                entry: config.name.clone(),
+                reason,
+            });
+            continue;
+        }
+        servers.push(config);
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));
     McpDiscovery { servers, warnings }
@@ -479,6 +892,72 @@ mod tests {
     }
 
     #[test]
+    fn malformed_higher_precedence_entries_shadow_lower_servers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        let global = temp.path().join("global");
+        write(
+            &cwd.join(".pi/mcp.json"),
+            r#"{"mcpServers":{
+                "bad-shape":{"command":7},
+                "bad-header":{"url":"https://project.invalid","headers":{"Bad Header":"x"}},
+                "bad-env":{"command":"project","env":{"BAD-NAME":"x"}}
+            }}"#,
+        );
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{
+                "bad-shape":{"command":"global"},
+                "bad-header":{"command":"global"},
+                "bad-env":{"command":"global"}
+            }}"#,
+        );
+
+        let discovery = discover(&cwd, &global, &[]);
+        assert!(
+            discovery.servers.is_empty(),
+            "a lower-precedence trusted target must not replace a malformed override"
+        );
+        assert_eq!(discovery.warnings.len(), 3);
+    }
+
+    #[test]
+    fn ambiguous_transport_shapes_are_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        write(
+            &cwd.join(".pi/mcp.json"),
+            r#"{"mcpServers":{
+                "both":{"command":"server","url":"https://example.invalid"},
+                "url-stdio":{"url":"https://example.invalid","type":"stdio"},
+                "command-http":{"command":"server","type":"http"},
+                "unknown":{"command":"server","type":"other"},
+                "http-args":{"url":"https://example.invalid","args":["ignored"]},
+                "stdio-headers":{"command":"server","headers":{"X-Test":"ignored"}}
+            }}"#,
+        );
+
+        let discovery = discover(&cwd, &temp.path().join("global"), &[]);
+        assert!(discovery.servers.is_empty());
+        assert_eq!(discovery.warnings.len(), 6);
+    }
+
+    #[test]
+    fn malformed_mcp_servers_wrapper_warns_instead_of_becoming_a_bare_map() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        write(
+            &cwd.join(".pi/mcp.json"),
+            r#"{"mcpServers":[],"unrelated":{"command":"must-not-run"}}"#,
+        );
+
+        let discovery = discover(&cwd, &temp.path().join("global"), &[]);
+        assert!(discovery.servers.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+        assert!(discovery.warnings[0].reason.contains("mcpServers"));
+    }
+
+    #[test]
     fn malformed_file_warns_without_losing_other_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("proj");
@@ -537,20 +1016,173 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_changes_with_target() {
+    fn duplicate_case_insensitive_http_headers_are_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("proj");
         write(
             &cwd.join(".pi/mcp.json"),
-            r#"{"mcpServers": {"s": {"command": "a"}}}"#,
+            r#"{"mcpServers":{"remote":{"url":"https://mcp.example.test","headers":{"Authorization":"first","authorization":"second"}}}}"#,
         );
-        let first = discover(&cwd, &temp.path().join("g"), &[]).servers[0].fingerprint();
+
+        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        assert!(discovery.servers.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+        assert!(
+            discovery.warnings[0]
+                .reason
+                .contains("case-insensitive")
+        );
+    }
+
+    #[test]
+    fn terminal_control_server_names_are_rejected_during_discovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
         write(
             &cwd.join(".pi/mcp.json"),
-            r#"{"mcpServers": {"s": {"command": "b"}}}"#,
+            &serde_json::json!({
+                "mcpServers": {
+                    "hostile\u{202e}name": {"command": "server"}
+                }
+            })
+            .to_string(),
         );
-        let second = discover(&cwd, &temp.path().join("g"), &[]).servers[0].fingerprint();
-        assert_ne!(first, second, "trust fingerprint must track the target");
+
+        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        assert!(discovery.servers.is_empty());
+        assert!(discovery.warnings[0].reason.contains("ASCII"));
+    }
+
+    #[test]
+    fn over_limit_http_headers_are_rejected_before_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        let headers: serde_json::Map<String, Value> = (0..=MAX_MCP_CUSTOM_HTTP_HEADERS)
+            .map(|index| (format!("X-MCP-{index}"), Value::String("value".to_string())))
+            .collect();
+        write(
+            &cwd.join(".pi/mcp.json"),
+            &serde_json::json!({
+                "mcpServers": {
+                    "remote": {
+                        "url": "https://mcp.example.test",
+                        "headers": headers
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        assert!(discovery.servers.is_empty());
+        assert!(discovery.warnings[0].reason.contains("at most 97"));
+    }
+
+    #[test]
+    fn invalid_reserved_or_control_bearing_definitions_are_rejected() {
+        for headers in [
+            serde_json::json!({"Bad\nName": "value"}),
+            serde_json::json!({"Accept": "application/json"}),
+            serde_json::json!({"X-Test": "line\nforge"}),
+        ] {
+            let values = headers
+                .as_object()
+                .expect("header object")
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value.as_str().expect("header string").to_string(),
+                    )
+                })
+                .collect();
+            assert!(normalize_http_headers(values).is_err());
+        }
+
+        for env in [
+            vec![("BAD\nNAME".to_string(), "value".to_string())],
+            vec![("9INVALID".to_string(), "value".to_string())],
+            vec![("VALID".to_string(), "line\nforge".to_string())],
+            vec![
+                ("PATH".to_string(), "first".to_string()),
+                ("Path".to_string(), "second".to_string()),
+            ],
+        ] {
+            assert!(normalize_env(env).is_err());
+        }
+    }
+
+    #[test]
+    fn fingerprint_binds_complete_execution_surface_and_is_order_stable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        write(
+            &cwd.join(".pi/mcp.json"),
+            r#"{"mcpServers": {"s": {"command": "a", "args": ["one"], "env": {"B": "$ENV:TOKEN", "A": "literal"}, "headers": {"X-Token": "$CMD:token-helper", "X-Accept-Mode": "application/json"}}}}"#,
+        );
+        let server = discover(&cwd, &temp.path().join("g"), &[])
+            .servers
+            .remove(0);
+        let fingerprint = server.fingerprint(&cwd);
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let mut reordered = server.clone();
+        reordered.env.reverse();
+        reordered.headers.reverse();
+        assert_eq!(fingerprint, reordered.fingerprint(&cwd));
+
+        let mut changed_env = server.clone();
+        changed_env
+            .env
+            .iter_mut()
+            .find(|(name, _)| name == "B")
+            .expect("B env definition")
+            .1 = "$CMD:new-helper".to_string();
+        assert_ne!(fingerprint, changed_env.fingerprint(&cwd));
+
+        let mut changed_name = server.clone();
+        changed_name.name = "other-name".to_string();
+        assert_ne!(fingerprint, changed_name.fingerprint(&cwd));
+
+        let mut changed_command = server.clone();
+        changed_command.command = Some("other-command".to_string());
+        assert_ne!(fingerprint, changed_command.fingerprint(&cwd));
+
+        let mut changed_args = server.clone();
+        changed_args.args.push("two".to_string());
+        assert_ne!(fingerprint, changed_args.fingerprint(&cwd));
+
+        let mut changed_header = server.clone();
+        changed_header
+            .headers
+            .first_mut()
+            .expect("header definition")
+            .1 = "$ENV:OTHER_TOKEN".to_string();
+        assert_ne!(fingerprint, changed_header.fingerprint(&cwd));
+
+        let mut changed_url = server.clone();
+        changed_url.url = Some("https://mcp.example.test".to_string());
+        assert_ne!(fingerprint, changed_url.fingerprint(&cwd));
+
+        let mut changed_transport = server.clone();
+        changed_transport.transport_hint = Some("stdio".to_string());
+        assert_ne!(fingerprint, changed_transport.fingerprint(&cwd));
+
+        let mut changed_provenance = server.clone();
+        changed_provenance.provenance = Provenance::Foreign;
+        assert_ne!(fingerprint, changed_provenance.fingerprint(&cwd));
+
+        let other_source = cwd.join("other-mcp.json");
+        write(&other_source, "{}");
+        let mut changed_source = server.clone();
+        changed_source.source_file = other_source;
+        assert_ne!(fingerprint, changed_source.fingerprint(&cwd));
+
+        let other_cwd = temp.path().join("other-project");
+        std::fs::create_dir_all(&other_cwd).expect("other cwd");
+        assert_ne!(fingerprint, server.fingerprint(&other_cwd));
     }
 
     #[test]
