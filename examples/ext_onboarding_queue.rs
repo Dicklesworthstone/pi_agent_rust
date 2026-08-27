@@ -356,7 +356,10 @@ fn recompute_debiased_scores(drafts: &mut [QueueDraft]) {
 
         let raw = draft.score_key.raw_impact;
         let debiased = raw * multiplicity_penalty * rank_penalty;
-        let impact = debiased * relevance_multiplier + f64::from(draft.entry.pi_relevance_score);
+        let impact = debiased.mul_add(
+            relevance_multiplier,
+            f64::from(draft.entry.pi_relevance_score),
+        );
 
         draft.entry.debiased_impact_score = round3(debiased);
         draft.entry.impact_score = round3(impact);

@@ -266,7 +266,7 @@ fn start_extension_oauth_builds_correct_url() {
 
     let info = start_extension_oauth("my-provider", &config).expect("start");
     assert_eq!(info.provider, "my-provider");
-    assert!(!info.verifier.is_empty());
+    assert_ne!(info.verifier, "");
     assert!(
         info.url
             .starts_with("https://login.provider.test/authorize?")

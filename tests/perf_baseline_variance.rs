@@ -193,8 +193,8 @@ fn compute_variance_stats(samples: &[f64]) -> Option<VarianceStats> {
 
     // 95% CI
     let t95 = t_critical_95(df);
-    let ci95_lower = mean - t95 * se;
-    let ci95_upper = mean + t95 * se;
+    let ci95_lower = t95.mul_add(-se, mean);
+    let ci95_upper = t95.mul_add(se, mean);
     let ci95_width = ci95_upper - ci95_lower;
     let ci95_width_pct = if mean.abs() > f64::EPSILON {
         (ci95_width / mean.abs()) * 100.0
@@ -204,8 +204,8 @@ fn compute_variance_stats(samples: &[f64]) -> Option<VarianceStats> {
 
     // 99% CI
     let t99 = t_critical_99(df);
-    let ci99_lower = mean - t99 * se;
-    let ci99_upper = mean + t99 * se;
+    let ci99_lower = t99.mul_add(-se, mean);
+    let ci99_upper = t99.mul_add(se, mean);
     let ci99_width = ci99_upper - ci99_lower;
     let ci99_width_pct = if mean.abs() > f64::EPSILON {
         (ci99_width / mean.abs()) * 100.0

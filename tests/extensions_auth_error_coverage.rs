@@ -611,7 +611,7 @@ fn error_hints_config_cassette() {
 fn error_hints_auth() {
     let err = Error::auth("authentication failed");
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 /// Provider error produces provider-related hints.
@@ -619,7 +619,7 @@ fn error_hints_auth() {
 fn error_hints_provider() {
     let err = Error::provider("anthropic", "invalid API key (401)");
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 /// Tool error produces tool-related hints.
@@ -627,7 +627,7 @@ fn error_hints_provider() {
 fn error_hints_tool() {
     let err = Error::tool("bash", "command not found");
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 /// Validation error produces validation hints.
@@ -635,7 +635,7 @@ fn error_hints_tool() {
 fn error_hints_validation() {
     let err = Error::validation("missing required field");
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 /// Extension error produces extension hints.
@@ -643,7 +643,7 @@ fn error_hints_validation() {
 fn error_hints_extension() {
     let err = Error::extension("extension failed to load");
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 /// Aborted error produces abort hints.
@@ -651,7 +651,7 @@ fn error_hints_extension() {
 fn error_hints_aborted() {
     let err = Error::Aborted;
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 /// API error produces API hints.
@@ -659,7 +659,7 @@ fn error_hints_aborted() {
 fn error_hints_api() {
     let err = Error::api("rate limit exceeded");
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 /// Session not-found error produces session hints.
@@ -669,7 +669,7 @@ fn error_hints_session_not_found() {
         path: "test-session-id".to_string(),
     };
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 /// Session generic error produces session hints.
@@ -677,7 +677,7 @@ fn error_hints_session_not_found() {
 fn error_hints_session_generic() {
     let err = Error::session("corrupted session file");
     let hint = hints_for_error(&err);
-    assert!(!hint.summary.is_empty());
+    assert_ne!(hint.summary, "");
 }
 
 // ===========================================================================
@@ -700,7 +700,7 @@ fn format_error_with_hints_includes_message() {
 fn format_error_with_hints_config_vcr() {
     let err = Error::config("cassette not found: test_basic");
     let formatted = format_error_with_hints(&err);
-    assert!(!formatted.is_empty());
+    assert_ne!(formatted, "");
 }
 
 /// Formatted tool error.

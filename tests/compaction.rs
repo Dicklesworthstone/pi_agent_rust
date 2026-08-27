@@ -630,8 +630,14 @@ fn semantic_compaction_quality_happy_path_preserves_markers()
     assert_eq!(report.coverage.expected, 10);
     assert_eq!(report.coverage.preserved, 10);
     assert_eq!(report.coverage.coverage_bps, 10_000);
-    assert!(report.losses.is_empty());
-    assert!(report.false_positive_controls.is_empty());
+    assert_eq!(
+        report.losses,
+        [] as [pi::compaction::SemanticCompactionMarkerLoss; 0]
+    );
+    assert_eq!(
+        report.false_positive_controls,
+        [] as [pi::compaction::SemanticCompactionFalsePositiveControl; 0]
+    );
     assert_eq!(
         report
             .coverage_by_kind
@@ -1187,7 +1193,10 @@ fn compact_does_not_seed_file_ops_when_previous_compaction_from_hook() {
     log_result(&harness, &result);
 
     assert_eq!(result.details.read_files, vec!["r2.txt".to_string()]);
-    assert!(result.details.modified_files.is_empty());
+    assert_eq!(
+        result.details.modified_files,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -1709,7 +1718,10 @@ fn prepare_compaction_ignores_malformed_previous_compaction_details() {
         result.details.read_files,
         vec!["r1.txt".to_string(), "r2.txt".to_string()]
     );
-    assert!(result.details.modified_files.is_empty());
+    assert_eq!(
+        result.details.modified_files,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -1809,7 +1821,7 @@ fn prepare_compaction_turn_prefix_tool_calls_contribute_to_file_ops() {
         .expect("compact");
     log_result(&harness, &result);
 
-    assert!(result.details.read_files.is_empty());
+    assert_eq!(result.details.read_files, [] as [std::string::String; 0]);
     assert_eq!(result.details.modified_files, vec!["turn.txt".to_string()]);
 }
 

@@ -421,7 +421,7 @@ fn kill_switch_alert_schema_and_fields() {
     assert_eq!(alert.action, SecurityAlertAction::Terminate);
 
     // WHY.
-    assert!(!alert.summary.is_empty());
+    assert_ne!(alert.summary, "");
 
     // CONTEXT.
     assert!(alert.risk_score > 0.9);

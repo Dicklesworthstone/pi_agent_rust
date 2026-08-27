@@ -412,7 +412,7 @@ fn selector_empty_pool() {
     let selector = ExtensionSelector::from_entries(entries, &["a"]);
     assert_eq!(selector.pool_size(), 0);
     let selected = selector.select(42, 10, &SelectionFilter::default());
-    assert!(selected.is_empty());
+    assert_eq!(selected, [] as [std::string::String; 0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +431,7 @@ fn selector_no_match_filter() {
         ..Default::default()
     };
     let selected = selector.select(42, 10, &filter);
-    assert!(selected.is_empty());
+    assert_eq!(selected, [] as [std::string::String; 0]);
 }
 
 // ---------------------------------------------------------------------------

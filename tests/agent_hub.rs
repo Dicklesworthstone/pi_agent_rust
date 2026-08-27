@@ -107,7 +107,10 @@ fn steer_round_trips_through_queue_file() {
     assert!(drained[0].contains("focus on src/auth.rs"));
     assert!(drained[1].contains("I found the bug"));
     // Consumed exactly once.
-    assert!(agent_hub::drain_steer_file(&entry.steer_path).is_empty());
+    assert_eq!(
+        agent_hub::drain_steer_file(&entry.steer_path),
+        [] as [std::string::String; 0]
+    );
     // Inbox ordering matches delivery order.
     let inbox = reg.inbox(&entry.id);
     assert_eq!(inbox.len(), 2);

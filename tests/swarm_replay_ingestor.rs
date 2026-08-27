@@ -1250,7 +1250,7 @@ fn fault_injection_corpus_replays_coordination_failures() -> TestResult {
             "duplicate scenario {}",
             scenario.scenario_id
         );
-        assert!(!scenario.title.trim().is_empty());
+        assert_ne!(scenario.title.trim(), "");
         assert!(
             scenario.artifact_manifest.iter().any(|artifact| {
                 artifact.path == scenario.event_log_path
@@ -1262,8 +1262,8 @@ fn fault_injection_corpus_replays_coordination_failures() -> TestResult {
         );
 
         for artifact in &scenario.artifact_manifest {
-            assert!(!artifact.artifact_schema.trim().is_empty());
-            assert!(!artifact.evidence_kind.trim().is_empty());
+            assert_ne!(artifact.artifact_schema.trim(), "");
+            assert_ne!(artifact.evidence_kind.trim(), "");
             let artifact_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(&artifact.path);
             assert!(
                 artifact_path.exists(),

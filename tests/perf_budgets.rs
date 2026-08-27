@@ -4027,7 +4027,7 @@ fn clean_source_commit_rejects_hidden_index_flags_and_untracked_files() {
 
 #[test]
 fn claim_readiness_requires_complete_strict_same_run_evidence() {
-    assert!(
+    assert_eq!(
         claim_readiness_blockers(
             true,
             Some("0123456789abcdef0123456789abcdef01234567"),
@@ -4040,8 +4040,8 @@ fn claim_readiness_requires_complete_strict_same_run_evidence() {
             0,
             0,
             0,
-        )
-        .is_empty()
+        ),
+        [] as [&str; 0]
     );
 
     assert_eq!(

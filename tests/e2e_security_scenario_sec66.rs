@@ -1149,7 +1149,10 @@ fn scenario_rollback_recovery_after_incident() {
     // Forensic replay should be available (no redaction).
     // Note: replay availability depends on ledger chain integrity.
     if let Some(replay) = &bundle.risk_replay {
-        assert!(!replay.steps.is_empty());
+        assert_ne!(
+            replay.steps,
+            [] as [pi::extensions::RuntimeRiskReplayStep; 0]
+        );
     }
 
     emit_scenario_event(

@@ -639,7 +639,10 @@ fn e2e_recovery_flow_score_trajectory() {
     });
 
     let artifact = manager.runtime_risk_ledger_artifact();
-    assert!(!artifact.entries.is_empty());
+    assert_ne!(
+        artifact.entries,
+        [] as [pi::extensions::RuntimeRiskLedgerArtifactEntry; 0]
+    );
 
     // Verify the score trajectory and ledger integrity
     let danger_entries: Vec<_> = artifact

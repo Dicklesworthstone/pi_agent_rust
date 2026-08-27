@@ -996,7 +996,7 @@ mod tests {
             if result.success {
                 assert_eq!(result.rust_response, result.pi_mono_response);
                 assert_ne!(result.rust_response["status"], "blocked");
-                assert!(result.differences.is_empty());
+                assert_eq!(result.differences, [] as [std::string::String; 0]);
             } else {
                 assert!(
                     !result.differences.is_empty(),

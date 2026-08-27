@@ -61,7 +61,7 @@ fn test_package_manager_refusal_commands() {
 fn test_platform_candidates_contain_dsr_and_triple() {
     if let Some(platform) = PlatformInfo::current() {
         let candidates = platform.candidate_asset_names("0.3.0");
-        assert!(!candidates.is_empty());
+        assert_ne!(candidates, [] as [std::string::String; 0]);
         let joined = candidates.join(" ");
         assert!(
             joined.contains("pi_") || joined.contains("pi-"),

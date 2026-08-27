@@ -362,7 +362,7 @@ fn default_fixture_parses_to_mock_spec() {
     let current = model.current.as_ref().expect("current model");
     assert_eq!(current.provider.as_deref(), Some("anthropic"));
     assert_eq!(model.thinking_level, "off");
-    assert!(!model.available_models.is_empty());
+    assert_ne!(model.available_models, [] as [serde_json::Value; 0]);
 }
 
 #[test]

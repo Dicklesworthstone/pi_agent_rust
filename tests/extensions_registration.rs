@@ -154,7 +154,7 @@ fn command_with_empty_name_is_ignored_in_list() {
 
     // Commands without a name should be filtered out
     let commands = mgr.list_commands();
-    assert!(commands.is_empty());
+    assert_eq!(commands, [] as [serde_json::Value; 0]);
 }
 
 // ─── pi.registerShortcut() Tests ────────────────────────────────────────────
@@ -491,10 +491,10 @@ fn provider_model_entries_use_provider_base_url() {
 fn fresh_manager_has_no_registrations() {
     let mgr = ExtensionManager::new();
 
-    assert!(mgr.list_commands().is_empty());
-    assert!(mgr.list_shortcuts().is_empty());
-    assert!(mgr.list_flags().is_empty());
-    assert!(mgr.extension_providers().is_empty());
+    assert_eq!(mgr.list_commands(), [] as [serde_json::Value; 0]);
+    assert_eq!(mgr.list_shortcuts(), [] as [serde_json::Value; 0]);
+    assert_eq!(mgr.list_flags(), [] as [serde_json::Value; 0]);
+    assert_eq!(mgr.extension_providers(), [] as [serde_json::Value; 0]);
     assert!(mgr.extension_model_entries().is_empty());
 }
 

@@ -134,7 +134,7 @@ fn profile_standard_matches_default() {
 fn profile_permissive_allows_everything() {
     let policy = PolicyProfile::Permissive.to_policy();
     assert_eq!(policy.mode, ExtensionPolicyMode::Permissive);
-    assert!(policy.deny_caps.is_empty());
+    assert_eq!(policy.deny_caps, [] as [std::string::String; 0]);
     for cap in ALL_CAPABILITIES {
         let check = policy.evaluate(cap.as_str());
         assert_eq!(

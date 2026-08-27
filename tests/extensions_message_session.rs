@@ -146,7 +146,7 @@ fn extension_tool_defs_collected_from_payload() {
 #[test]
 fn extension_tool_defs_empty_when_no_extensions() {
     let mgr = ExtensionManager::new();
-    assert!(mgr.extension_tool_defs().is_empty());
+    assert_eq!(mgr.extension_tool_defs(), [] as [serde_json::Value; 0]);
 }
 
 // ─── Session Attachment Tests ───────────────────────────────────────────────

@@ -288,8 +288,8 @@ fn exec_mediation_policy_defaults_from_empty_json() {
     let policy: ExecMediationPolicy = serde_json::from_str("{}").expect("deserialize");
     assert!(policy.enabled);
     assert_eq!(policy.deny_threshold, ExecRiskTier::Critical);
-    assert!(policy.deny_patterns.is_empty());
-    assert!(policy.allow_patterns.is_empty());
+    assert_eq!(policy.deny_patterns, [] as [std::string::String; 0]);
+    assert_eq!(policy.allow_patterns, [] as [std::string::String; 0]);
     assert!(policy.audit_all_classified);
 }
 
@@ -451,8 +451,8 @@ fn secret_broker_policy_roundtrip() {
 fn secret_broker_policy_defaults_from_empty_json() {
     let broker: SecretBrokerPolicy = serde_json::from_str("{}").expect("deserialize");
     assert!(broker.enabled);
-    assert!(!broker.secret_suffixes.is_empty());
-    assert!(!broker.secret_exact.is_empty());
+    assert_ne!(broker.secret_suffixes, [] as [std::string::String; 0]);
+    assert_ne!(broker.secret_exact, [] as [std::string::String; 0]);
     assert_eq!(broker.redaction_placeholder, "[REDACTED]");
 }
 
@@ -466,7 +466,10 @@ fn extension_policy_default_includes_sec43() {
     assert!(policy.exec_mediation.enabled);
     assert!(policy.secret_broker.enabled);
     assert_eq!(policy.exec_mediation.deny_threshold, ExecRiskTier::Critical);
-    assert!(!policy.secret_broker.secret_suffixes.is_empty());
+    assert_ne!(
+        policy.secret_broker.secret_suffixes,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -673,7 +676,10 @@ fn empty_exec_mediation_artifact() {
     let manager = ExtensionManager::new();
     let artifact = manager.exec_mediation_artifact();
     assert_eq!(artifact.entry_count, 0);
-    assert!(artifact.entries.is_empty());
+    assert_eq!(
+        artifact.entries,
+        [] as [pi::extensions::ExecMediationLedgerEntry; 0]
+    );
     // generated_at_ms may be 0 outside an async runtime context.
     assert!(artifact.generated_at_ms >= 0);
 }
@@ -683,7 +689,10 @@ fn empty_secret_broker_artifact() {
     let manager = ExtensionManager::new();
     let artifact = manager.secret_broker_artifact();
     assert_eq!(artifact.entry_count, 0);
-    assert!(artifact.entries.is_empty());
+    assert_eq!(
+        artifact.entries,
+        [] as [pi::extensions::SecretBrokerLedgerEntry; 0]
+    );
 }
 
 // ==========================================================================
@@ -860,7 +869,7 @@ fn manager_ledger_entries_isolated_between_types() {
 #[test]
 fn classify_empty_command() {
     let classes = classify_dangerous_command("", &[]);
-    assert!(classes.is_empty());
+    assert_eq!(classes, [] as [pi::extensions::DangerousCommandClass; 0]);
 }
 
 #[test]

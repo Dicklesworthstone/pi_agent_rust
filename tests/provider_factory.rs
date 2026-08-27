@@ -1101,7 +1101,7 @@ fn create_provider_azure_openai_routes_natively() {
     });
     assert_eq!(provider.name(), "azure-openai");
     assert_eq!(provider.api(), "azure-openai");
-    assert!(!provider.model_id().is_empty());
+    assert_ne!(provider.model_id(), "");
 }
 
 #[test]
@@ -1123,7 +1123,7 @@ fn create_provider_azure_cognitive_services_alias_routes_natively() {
         });
     assert_eq!(provider.name(), "azure-cognitive-services");
     assert_eq!(provider.api(), "azure-openai");
-    assert!(!provider.model_id().is_empty());
+    assert_ne!(provider.model_id(), "");
 }
 
 #[test]

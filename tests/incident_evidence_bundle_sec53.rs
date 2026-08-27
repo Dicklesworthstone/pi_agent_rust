@@ -1408,7 +1408,7 @@ fn manager_export_incident_bundle_delegates_correctly() {
     );
 
     // Bundle hash is non-empty.
-    assert!(!bundle.bundle_hash.is_empty());
+    assert_ne!(bundle.bundle_hash, "");
 
     harness.log().info_ctx(
         "manager_export",

@@ -56,7 +56,7 @@ fn standard_profile_denies_dangerous_via_deny_caps() {
 fn permissive_profile_allows_everything() {
     let policy = PolicyProfile::Permissive.to_policy();
     assert_eq!(policy.mode, ExtensionPolicyMode::Permissive);
-    assert!(policy.deny_caps.is_empty());
+    assert_eq!(policy.deny_caps, [] as [std::string::String; 0]);
 
     let exec_check = policy.evaluate("exec");
     assert_eq!(exec_check.decision, PolicyDecision::Allow);
@@ -182,7 +182,10 @@ fn explain_safe_profile_shows_dangerous_denied() {
     assert!(explanation.secret_broker_enabled);
     assert!(explanation.dangerous_denied.contains(&"exec".to_string()));
     assert!(explanation.dangerous_denied.contains(&"env".to_string()));
-    assert!(explanation.dangerous_allowed.is_empty());
+    assert_eq!(
+        explanation.dangerous_allowed,
+        [] as [std::string::String; 0]
+    );
     assert!(explanation.extension_id.is_none());
 }
 
@@ -194,7 +197,7 @@ fn explain_permissive_profile_shows_dangerous_allowed() {
     assert_eq!(explanation.mode, ExtensionPolicyMode::Permissive);
     assert!(explanation.dangerous_allowed.contains(&"exec".to_string()));
     assert!(explanation.dangerous_allowed.contains(&"env".to_string()));
-    assert!(explanation.dangerous_denied.is_empty());
+    assert_eq!(explanation.dangerous_denied, [] as [std::string::String; 0]);
 }
 
 #[test]

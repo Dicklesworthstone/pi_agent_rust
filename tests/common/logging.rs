@@ -2836,7 +2836,10 @@ mod tests {
         let entries = logger.entries();
         let ctx_entry = entries.iter().find(|e| e.message == "ctx msg").unwrap();
         assert_eq!(ctx_entry.span_id.as_deref(), Some("span-1"));
-        assert_ne!(ctx_entry.context, [] as [(std::string::String, std::string::String); 0]);
+        assert_ne!(
+            ctx_entry.context,
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]

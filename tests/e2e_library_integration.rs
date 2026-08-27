@@ -316,7 +316,7 @@ fn glamour_renders_code_blocks() {
             ctx.push(("output_len".to_string(), rendered.len().to_string()));
         });
 
-    assert!(!rendered.is_empty());
+    assert_ne!(rendered, "");
 }
 
 #[test]

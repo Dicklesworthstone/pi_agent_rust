@@ -482,7 +482,7 @@ fn test_content_block_image() {
     let parsed: ContentBlock = serde_json::from_str(&json).unwrap();
     if let ContentBlock::Image(image) = parsed {
         assert_eq!(image.mime_type, "image/png");
-        assert!(!image.data.is_empty());
+        assert_ne!(image.data, "");
     } else {
         unreachable!("Expected Image block");
     }

@@ -147,7 +147,7 @@ fn empty_capability_denied_in_all_modes() {
                 "empty capability {empty:?} should be denied in {mode:?}"
             );
             assert_eq!(check.reason, "empty_capability");
-            assert!(check.capability.is_empty());
+            assert_eq!(check.capability, "");
         }
     }
 }

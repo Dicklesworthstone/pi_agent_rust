@@ -6337,7 +6337,7 @@ fn final_qa_certification() {
     );
 
     // Repro commands present
-    assert!(!cert.reproduce_commands.is_empty());
+    assert_ne!(cert.reproduce_commands, [] as [std::string::String; 0]);
 
     let requested = final_certification_generation_requested(
         std::env::var(GENERATE_FINAL_CERTIFICATION_ENV)

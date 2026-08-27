@@ -904,7 +904,7 @@ fn franken_node_fake_runtime_success_executes_fixture() -> Result<(), Box<dyn st
     assert_eq!(verdict.exit_code, Some(0));
     assert_eq!(verdict.pass_count, 1);
     assert_eq!(verdict.check_count, 1);
-    assert!(verdict.node_divergences.is_empty());
+    assert_eq!(verdict.node_divergences, [] as [std::string::String; 0]);
     Ok(())
 }
 

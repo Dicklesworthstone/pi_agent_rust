@@ -495,7 +495,10 @@ fn safe_profile_explanation_accurate() {
     assert!(explanation.secret_broker_enabled);
     assert!(explanation.dangerous_denied.contains(&"exec".to_string()));
     assert!(explanation.dangerous_denied.contains(&"env".to_string()));
-    assert!(explanation.dangerous_allowed.is_empty());
+    assert_eq!(
+        explanation.dangerous_allowed,
+        [] as [std::string::String; 0]
+    );
 
     // Verify all capabilities have decisions
     let cap_names: Vec<&str> = explanation

@@ -155,8 +155,8 @@ fn alert_has_why_fields() {
         SecurityAlertSeverity::Error,
         SecurityAlertAction::Deny,
     );
-    assert!(!alert.reason_codes.is_empty());
-    assert!(!alert.summary.is_empty());
+    assert_ne!(alert.reason_codes, [] as [std::string::String; 0]);
+    assert_ne!(alert.summary, "");
     assert_eq!(alert.policy_source, "exec_mediation");
 }
 
@@ -433,7 +433,7 @@ fn empty_manager_exports_empty_artifact() {
     let mgr = ExtensionManager::new();
     let artifact = mgr.security_alert_artifact();
     assert_eq!(artifact.alert_count, 0);
-    assert!(artifact.alerts.is_empty());
+    assert_eq!(artifact.alerts, [] as [pi::extensions::SecurityAlert; 0]);
     assert_eq!(artifact.category_counts.policy_denial, 0);
     assert_eq!(artifact.severity_counts.info, 0);
 }
@@ -525,7 +525,7 @@ fn alert_with_empty_reason_codes() {
     };
     let json = serde_json::to_string(&alert).expect("serialize");
     let restored: SecurityAlert = serde_json::from_str(&json).expect("deserialize");
-    assert!(restored.reason_codes.is_empty());
+    assert_eq!(restored.reason_codes, [] as [std::string::String; 0]);
     assert_eq!(restored.action, SecurityAlertAction::Redact);
 }
 

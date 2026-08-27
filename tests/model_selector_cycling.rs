@@ -253,13 +253,13 @@ fn parse_patterns_mixed_delimiters() {
 #[test]
 fn parse_patterns_empty_string() {
     let result = parse_scoped_model_patterns("");
-    assert!(result.is_empty());
+    assert_eq!(result, [] as [std::string::String; 0]);
 }
 
 #[test]
 fn parse_patterns_whitespace_only() {
     let result = parse_scoped_model_patterns("   ,  , ,   ");
-    assert!(result.is_empty());
+    assert_eq!(result, [] as [std::string::String; 0]);
 }
 
 #[test]

@@ -1328,7 +1328,7 @@ fn session_options_default_values() {
     assert!(opts.no_session, "default should be no_session=true");
     assert!(opts.session_path.is_none());
     assert!(opts.session_dir.is_none());
-    assert!(opts.extension_paths.is_empty());
+    assert_eq!(opts.extension_paths, [] as [std::path::PathBuf; 0]);
     assert!(opts.extension_policy.is_none());
     assert!(opts.repair_policy.is_none());
     assert!(opts.include_cwd_in_prompt);
@@ -1381,7 +1381,7 @@ fn session_options_with_no_tools() {
 
     let handle = run_async(create_agent_session(options)).expect("create session");
     // Session should be created even with no tools.
-    assert!(!handle.session().agent.provider().model_id().is_empty());
+    assert_ne!(handle.session().agent.provider().model_id(), "");
 
     harness.log().info_ctx("sdk", "no tools session ok", |ctx| {
         ctx.push(("created".to_string(), "true".to_string()));
@@ -1398,7 +1398,7 @@ fn session_options_with_selected_tools() {
     };
 
     let handle = run_async(create_agent_session(options)).expect("create session");
-    assert!(!handle.session().agent.provider().model_id().is_empty());
+    assert_ne!(handle.session().agent.provider().model_id(), "");
 
     harness
         .log()

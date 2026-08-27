@@ -1596,7 +1596,7 @@ fn e2e_cli_fetch_models_rejects_unsafe_static_fallback_ids() {
 
     let result = harness.run(&["--fetch-models", "openai"]);
     assert_exit_code(&harness.harness, &result, 1);
-    assert!(result.stdout.is_empty());
+    assert_eq!(result.stdout, "");
     assert_contains(&harness.harness, &result.stderr, "not printable ASCII");
 }
 

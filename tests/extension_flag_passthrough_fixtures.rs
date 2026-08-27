@@ -210,7 +210,7 @@ fn test_extension_flag_application_integration() {
 
     // Verify the manager can be created (basic integration test)
     // A new manager should have no flags initially
-    assert!(manager.list_flags().is_empty());
+    assert_eq!(manager.list_flags(), [] as [serde_json::value::Value; 0]);
 }
 
 /// Test edge cases in two-pass parsing

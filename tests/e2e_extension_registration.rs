@@ -665,10 +665,10 @@ fn e2e_empty_extension_loads_cleanly() {
     let source = r"export default function init(pi) { /* no registrations */ }";
     let manager = load_extension(&harness, source);
 
-    assert!(manager.list_commands().is_empty());
-    assert!(manager.list_shortcuts().is_empty());
-    assert!(manager.list_flags().is_empty());
-    assert!(manager.extension_providers().is_empty());
+    assert_eq!(manager.list_commands(), [] as [serde_json::Value; 0]);
+    assert_eq!(manager.list_shortcuts(), [] as [serde_json::Value; 0]);
+    assert_eq!(manager.list_flags(), [] as [serde_json::Value; 0]);
+    assert_eq!(manager.extension_providers(), [] as [serde_json::Value; 0]);
 
     capture_registration_artifacts(&harness, &manager);
     write_jsonl_artifacts(&harness);
@@ -689,9 +689,9 @@ export default function init(pi) {
 
     assert_eq!(manager.list_commands().len(), 1);
     assert!(manager.has_command("greet"));
-    assert!(manager.list_shortcuts().is_empty());
-    assert!(manager.list_flags().is_empty());
-    assert!(manager.extension_providers().is_empty());
+    assert_eq!(manager.list_shortcuts(), [] as [serde_json::Value; 0]);
+    assert_eq!(manager.list_flags(), [] as [serde_json::Value; 0]);
+    assert_eq!(manager.extension_providers(), [] as [serde_json::Value; 0]);
 
     capture_registration_artifacts(&harness, &manager);
     write_jsonl_artifacts(&harness);

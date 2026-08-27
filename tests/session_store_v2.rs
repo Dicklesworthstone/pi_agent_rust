@@ -1633,8 +1633,8 @@ fn manifest_write_and_read_round_trip() -> PiResult<()> {
     assert_eq!(manifest.counters.entries_total, 5);
     assert_eq!(manifest.head.entry_seq, 5);
     assert_eq!(manifest.head.entry_id, "entry_00000005");
-    assert!(!manifest.integrity.chain_hash.is_empty());
-    assert!(!manifest.integrity.manifest_hash.is_empty());
+    assert_ne!(manifest.integrity.chain_hash, "");
+    assert_ne!(manifest.integrity.manifest_hash, "");
 
     let read_back = store.read_manifest()?.expect("manifest should exist");
     assert_eq!(read_back.session_id, manifest.session_id);
@@ -3875,8 +3875,8 @@ fn e2e_full_migration_rollback_round_trip_with_forensic_log() -> PiResult<()> {
     assert!(fwd_event.verification.hash_chain_match);
     assert!(fwd_event.verification.index_consistent);
     assert!(fwd_event.error_class.is_none());
-    assert!(!fwd_event.migration_id.is_empty());
-    assert!(!fwd_event.at.is_empty());
+    assert_ne!(fwd_event.migration_id, "");
+    assert_ne!(fwd_event.at, "");
 
     // Verify migrated state.
     assert_eq!(

@@ -295,7 +295,7 @@ fn screen_empty_input() {
     assert_eq!(report.stats.total_screened, 0);
     assert_eq!(report.stats.pass, 0);
     assert_eq!(report.stats.needs_review, 0);
-    assert!(!report.generated_at.is_empty());
+    assert_ne!(report.generated_at, "");
     assert_eq!(report.task, "test-task");
 }
 

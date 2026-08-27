@@ -1687,7 +1687,7 @@ fn certification_dossier() {
     // ── Assertions ──
     let reloaded = dossier_value;
     assert_eq!(reloaded["schema"], "pi.qa.certification_dossier.v1");
-    assert!(!reloaded["generated_at"].as_str().unwrap_or("").is_empty());
+    assert_ne!(reloaded["generated_at"].as_str().unwrap_or(""), "");
 
     // Both closure questions must have an answer
     assert!(

@@ -136,7 +136,7 @@ fn scoped_rules_activate_on_matching_paths() {
         sources_for("server/api/users.rs"),
         vec![".github/instructions/api.instructions.md".to_string()]
     );
-    assert!(sources_for("README.md").is_empty());
+    assert_eq!(sources_for("README.md"), [] as [std::string::String; 0]);
     let absolute = root.join("app/lib.ts");
     assert_eq!(
         matcher

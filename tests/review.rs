@@ -46,7 +46,7 @@ fn test_rule_engine_findings_and_deduplication() {
 "#;
 
     let hunks = DiffParser::parse_unified_diff(diff_text).unwrap_or_default();
-    assert!(!hunks.is_empty());
+    assert_ne!(hunks, [] as [pi::commit_split::DiffHunk; 0]);
 
     let findings = ReviewRuleEngine::analyze_hunks(&hunks);
     assert!(findings.len() >= 4);
@@ -70,7 +70,7 @@ fn test_rule_engine_findings_and_deduplication() {
 
     // Verify deduplication and ranking puts P0 first
     let ranked = ReviewDeduplicator::dedupe_and_rank(findings, 20);
-    assert!(!ranked.is_empty());
+    assert_ne!(ranked, [] as [pi::review::ReviewFinding; 0]);
     assert_eq!(ranked[0].severity, ReviewSeverity::P0);
 }
 
@@ -184,6 +184,6 @@ fn query_user(id: &str) {
 
     let report_bad = CodeReviewer::review(repo_dir, &options).expect("review bad");
     assert_eq!(report_bad.verdict, ReviewVerdict::Block);
-    assert!(!report_bad.findings.is_empty());
+    assert_ne!(report_bad.findings, [] as [pi::review::ReviewFinding; 0]);
     assert_eq!(report_bad.findings[0].severity, ReviewSeverity::P0);
 }

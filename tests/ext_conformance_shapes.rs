@@ -614,7 +614,7 @@ fn shape_harness_nonexistent_fixture_reports_load_error() {
 
     let failure = ShapeFailure::new(FailureClass::LoadError, &err);
     assert_eq!(failure.class, FailureClass::LoadError);
-    assert!(!failure.message.is_empty());
+    assert_ne!(failure.message, "");
 
     // The display format should include the class
     let display = failure.to_string();

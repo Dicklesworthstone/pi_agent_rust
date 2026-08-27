@@ -454,7 +454,7 @@ fn session_create_with_dir() {
     asupersync::test_utils::run_test(|| async {
         let h = TestHarness::new("session_with_dir");
         let session = Session::create_with_dir(Some(h.temp_dir().to_path_buf()));
-        assert!(!session.header.id.is_empty());
+        assert_ne!(session.header.id, "");
     });
 }
 
@@ -486,7 +486,7 @@ fn session_model_change_entry() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
         let id = session.append_model_change("openai".to_string(), "gpt-4".to_string());
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         assert_eq!(session.entries.len(), 1);
         // Verify it's a ModelChange entry
         match &session.entries[0] {
@@ -505,7 +505,7 @@ fn session_thinking_level_change() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
         let id = session.append_thinking_level_change("high".to_string());
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
     });
 }
 
@@ -543,7 +543,7 @@ fn session_custom_entry() {
             "test-custom-type".to_string(),
             Some(json!({"key": "value", "count": 42})),
         );
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         assert_eq!(session.entries.len(), 1);
     });
 }
@@ -867,7 +867,7 @@ fn create_provider_unknown_provider_and_api_errors() {
         match result {
             Ok(p) => {
                 // If it succeeds, it should still return a valid provider
-                assert!(!p.name().is_empty());
+                assert_ne!(p.name(), "");
             }
             Err(e) => {
                 let err_str = format!("{e}");
@@ -953,7 +953,7 @@ fn encode_cwd_root() {
 #[test]
 fn encode_cwd_special_chars() {
     let encoded = pi::session::encode_cwd(std::path::Path::new("/home/user/my project (v2.0)/src"));
-    assert!(!encoded.is_empty());
+    assert_ne!(encoded, "");
     assert!(!encoded.contains('/'));
 }
 

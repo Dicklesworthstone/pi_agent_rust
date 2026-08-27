@@ -501,7 +501,7 @@ fn prepare_initial_message_wraps_files_and_appends_first_message() {
         ctx.push(("images".into(), initial.images.len().to_string()));
     });
 
-    assert!(messages.is_empty());
+    assert_eq!(messages, [] as [std::string::String; 0]);
     assert!(initial.text.contains("<file name=\""));
     assert!(initial.text.contains("hello"));
     assert!(initial.text.contains("world"));
@@ -644,7 +644,7 @@ fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
     );
     assert_eq!(initial.images.len(), 1);
     assert_eq!(initial.images[0].mime_type, "image/png");
-    assert!(!initial.images[0].data.is_empty());
+    assert_ne!(initial.images[0].data, "");
 
     let blocks = build_initial_content(&initial);
     assert_eq!(blocks.len(), 2);
@@ -815,7 +815,7 @@ fn prepare_initial_message_files_only_no_messages() {
 
     assert!(initial.text.contains("payload"));
     assert!(initial.text.contains("<file name=\""));
-    assert!(messages.is_empty());
+    assert_eq!(messages, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -949,7 +949,7 @@ fn cli_file_args_and_message_args_separation() {
 #[test]
 fn cli_file_args_empty_when_no_at_prefix() {
     let cli = cli::Cli::parse_from(["pi", "hello", "world"]);
-    assert!(cli.file_args().is_empty());
+    assert_eq!(cli.file_args(), [] as [&str; 0]);
     assert_eq!(cli.message_args(), vec!["hello", "world"]);
 }
 
@@ -957,7 +957,7 @@ fn cli_file_args_empty_when_no_at_prefix() {
 fn cli_message_args_empty_when_only_files() {
     let cli = cli::Cli::parse_from(["pi", "@a.txt", "@b.txt"]);
     assert_eq!(cli.file_args(), vec!["a.txt", "b.txt"]);
-    assert!(cli.message_args().is_empty());
+    assert_eq!(cli.message_args(), [] as [&str; 0]);
 }
 
 #[test]
@@ -1053,7 +1053,7 @@ fn cli_enabled_tools_default() {
 #[test]
 fn cli_no_tools_returns_empty() {
     let cli = cli::Cli::parse_from(["pi", "--no-tools"]);
-    assert!(cli.enabled_tools().is_empty());
+    assert_eq!(cli.enabled_tools(), [] as [&str; 0]);
 }
 
 fn cli_flag_parity_result(flag_args: &[&str]) -> Result<(), String> {

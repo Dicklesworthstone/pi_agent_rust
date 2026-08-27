@@ -169,7 +169,7 @@ fn install_digest_mismatch_fails_closed() {
     assert_eq!(err.code, "digest_mismatch");
     assert!(err.reason.contains("tampered_digest"));
     assert!(err.reason.contains("original_digest"));
-    assert!(!err.remediation.is_empty());
+    assert_ne!(err.remediation, "");
 }
 
 #[test]
@@ -370,7 +370,10 @@ fn read_nonexistent_lockfile_returns_empty_default() {
     let path = dir.path().join("does-not-exist.lock.json");
     let lockfile = read_package_lockfile(&path).unwrap();
     assert_eq!(lockfile.schema, PACKAGE_LOCK_SCHEMA);
-    assert!(lockfile.entries.is_empty());
+    assert_eq!(
+        lockfile.entries,
+        [] as [pi::package_manager::PackageLockEntry; 0]
+    );
 }
 
 #[test]
@@ -477,7 +480,7 @@ fn provenance_mismatch_identifies_change() {
     let err = evaluate_lock_transition(Some(&existing), &candidate, PackageLockAction::Install)
         .unwrap_err();
     assert_eq!(err.code, "provenance_mismatch");
-    assert!(!err.remediation.is_empty());
+    assert_ne!(err.remediation, "");
 }
 
 // ============================================================================

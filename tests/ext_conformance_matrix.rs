@@ -501,7 +501,7 @@ fn conformance_plan_schema_and_task() {
     let (plan, _, _) = load_test_plan();
     assert_eq!(plan.schema, "pi.ext.conformance-matrix.v1");
     assert_eq!(plan.task, "bd-2kyq");
-    assert!(!plan.generated_at.is_empty());
+    assert_ne!(plan.generated_at, "");
 }
 
 #[test]

@@ -372,8 +372,8 @@ fn replay_bundle_schema_validation() {
 
     assert_eq!(parsed.schema, "pi.e2e.replay_bundle.v1");
     assert_eq!(parsed.correlation_id, "test-correlation-001");
-    assert!(!parsed.one_command_replay.is_empty());
-    assert!(!parsed.environment.profile.is_empty());
+    assert_ne!(parsed.one_command_replay, "");
+    assert_ne!(parsed.environment.profile, "");
     assert_eq!(parsed.failed_suites.len(), 1);
     assert_eq!(parsed.failed_unit_targets.len(), 1);
     assert_eq!(parsed.failed_gates.len(), 1);
@@ -389,9 +389,9 @@ fn replay_bundle_schema_validation() {
     // Verify suite replay entry fields
     let suite = &parsed.failed_suites[0];
     assert_eq!(suite.suite, "e2e_tui");
-    assert!(!suite.runner_replay.is_empty());
-    assert!(!suite.cargo_replay.is_empty());
-    assert!(!suite.digest_path.is_empty());
+    assert_ne!(suite.runner_replay, "");
+    assert_ne!(suite.cargo_replay, "");
+    assert_ne!(suite.digest_path, "");
 
     eprintln!("  Schema round-trip: OK");
     eprintln!("  Required fields: OK");
@@ -690,10 +690,10 @@ fn generate_and_validate_replay_bundle() {
     let reloaded: ReplayBundle =
         serde_json::from_str(&json).expect("written bundle must be valid JSON");
     assert_eq!(reloaded.schema, "pi.e2e.replay_bundle.v1");
-    assert!(!reloaded.generated_at.is_empty());
-    assert!(!reloaded.correlation_id.is_empty());
-    assert!(!reloaded.environment.rustc_version.is_empty());
-    assert!(!reloaded.environment.os.is_empty());
+    assert_ne!(reloaded.generated_at, "");
+    assert_ne!(reloaded.correlation_id, "");
+    assert_ne!(reloaded.environment.rustc_version, "");
+    assert_ne!(reloaded.environment.os, "");
 
     // Every failed gate must have a non-empty reproduce command
     for gate in &reloaded.failed_gates {

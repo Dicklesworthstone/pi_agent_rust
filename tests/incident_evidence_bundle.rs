@@ -271,7 +271,7 @@ fn empty_bundle_has_correct_schema() {
     );
     assert_eq!(bundle.schema, INCIDENT_EVIDENCE_BUNDLE_SCHEMA_VERSION);
     assert_eq!(bundle.generated_at_ms, 100_000);
-    assert!(!bundle.bundle_hash.is_empty());
+    assert_ne!(bundle.bundle_hash, "");
 }
 
 #[test]
@@ -1091,12 +1091,15 @@ fn zero_match_extension_filter_yields_empty_replay_and_valid_bundle() {
         .as_ref()
         .expect("empty filtered ledgers should still yield a valid empty replay");
     assert_eq!(replay.entry_count, 0);
-    assert!(replay.steps.is_empty());
+    assert_eq!(
+        replay.steps,
+        [] as [pi::extensions::RuntimeRiskReplayStep; 0]
+    );
     assert!(replay.tail_ledger_hash.is_none());
 
     let report = verify_incident_evidence_bundle(&bundle);
     assert!(report.valid);
-    assert!(report.errors.is_empty());
+    assert_eq!(report.errors, [] as [std::string::String; 0]);
 }
 
 fn build_composed_filter_bundle(

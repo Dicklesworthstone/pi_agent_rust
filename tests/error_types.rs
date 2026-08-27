@@ -944,7 +944,7 @@ fn hints_sqlite_locked() {
     let err = Error::config("database is locked");
     // Config hint with "database is locked" falls through to config fallback
     let h = err.hints();
-    assert!(!h.summary.is_empty());
+    assert_ne!(h.summary, "");
 }
 
 // =============================================================================

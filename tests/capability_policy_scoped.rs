@@ -124,7 +124,7 @@ mod config_resolution {
         let config = Config::default();
         let policy = config.resolve_extension_policy(Some("permissive"));
         assert_eq!(policy.mode, ExtensionPolicyMode::Permissive);
-        assert!(policy.deny_caps.is_empty());
+        assert_eq!(policy.deny_caps, [] as [std::string::String; 0]);
     }
 
     #[test]

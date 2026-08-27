@@ -1052,7 +1052,10 @@ fn drift_not_detected_for_normal_observations() {
         !report.drift_detected,
         "baseline-matching data should not trigger drift"
     );
-    assert!(report.anomalies.is_empty());
+    assert_eq!(
+        report.anomalies,
+        [] as [pi::extensions::BaselineDriftAnomaly; 0]
+    );
 }
 
 #[test]
@@ -1127,7 +1130,10 @@ fn drift_detected_for_risk_score_outlier() {
         report.drift_detected,
         "extreme risk score should trigger drift"
     );
-    assert!(!report.anomalies.is_empty());
+    assert_ne!(
+        report.anomalies,
+        [] as [pi::extensions::BaselineDriftAnomaly; 0]
+    );
 
     let risk_anomaly = report
         .anomalies

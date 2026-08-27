@@ -875,7 +875,10 @@ fn action_progression_through_phases() {
         .iter()
         .filter(|e| e.call_id.starts_with("adversarial-"))
         .collect();
-    assert!(!adversarial.is_empty());
+    assert_ne!(
+        adversarial,
+        [] as [&pi::extensions::RuntimeRiskLedgerArtifactEntry; 0]
+    );
     let adversarial_len = f64::from(
         u32::try_from(adversarial.len()).expect("adversarial vector length must fit u32"),
     );

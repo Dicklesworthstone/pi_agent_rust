@@ -744,8 +744,14 @@ fn compat_scan_benign_source_has_no_forbidden() {
 
     // Under all profiles, a benign extension with no forbidden patterns
     // should produce no compatibility issues
-    assert!(ledger.forbidden.is_empty());
-    assert!(ledger.flagged.is_empty());
+    assert_eq!(
+        ledger.forbidden,
+        [] as [pi::extensions::CompatIssueEvidence; 0]
+    );
+    assert_eq!(
+        ledger.flagged,
+        [] as [pi::extensions::CompatIssueEvidence; 0]
+    );
 }
 
 #[test]

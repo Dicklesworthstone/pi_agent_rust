@@ -145,7 +145,7 @@ fn outbound_payload_carries_placeholders_only() {
             payloads.join(" | ").chars().take(400).collect::<String>()
         ),
     );
-    assert!(!payloads.is_empty());
+    assert_ne!(payloads, [] as [std::string::String; 0]);
     let joined = payloads.join("\n");
     assert!(
         joined.contains("<pi-secret:"),

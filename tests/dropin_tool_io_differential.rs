@@ -475,7 +475,10 @@ async fn run_scenario(scenario: &Scenario) -> pi::PiResult<()> {
         }
         "sse_split_event" => {
             let mut parser = SseParser::new();
-            assert!(parser.feed("event: message\n").is_empty());
+            assert_eq!(
+                parser.feed("event: message\n"),
+                [] as [pi::http::sse::SseEvent; 0]
+            );
             let events = parser.feed("data: split\n\n");
             assert_eq!(events.len(), 1, "{}: split event must emit", scenario.id);
             assert_eq!(events[0].data, "split");

@@ -158,7 +158,7 @@ fn policy_evaluate_covers_modes_and_deny_list() {
     let empty = policy.evaluate("   ");
     assert_eq!(empty.decision, PolicyDecision::Deny);
     assert_eq!(empty.reason, "empty_capability");
-    assert!(empty.capability.is_empty());
+    assert_eq!(empty.capability, "");
 
     let http = policy.evaluate("HTTP");
     assert_eq!(http.decision, PolicyDecision::Allow);
@@ -306,7 +306,9 @@ fn parse_slash_command_with_empty_args() {
     .to_string();
     let parsed = ExtensionMessage::parse_and_validate(&json).expect("parse");
     match parsed.body {
-        pi::extensions::ExtensionBody::SlashCommand(payload) => assert!(payload.args.is_empty()),
+        pi::extensions::ExtensionBody::SlashCommand(payload) => {
+            assert_eq!(payload.args, [] as [std::string::String; 0])
+        }
         _ => unreachable!("expected SlashCommand"),
     }
 }

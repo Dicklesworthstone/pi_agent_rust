@@ -304,13 +304,13 @@ fn parse_scoped_model_patterns_mixed_separators() {
 #[test]
 fn parse_scoped_model_patterns_empty_string() {
     let patterns = parse_scoped_model_patterns("");
-    assert!(patterns.is_empty());
+    assert_eq!(patterns, [] as [std::string::String; 0]);
 }
 
 #[test]
 fn parse_scoped_model_patterns_only_whitespace() {
     let patterns = parse_scoped_model_patterns("   ,  , ");
-    assert!(patterns.is_empty());
+    assert_eq!(patterns, [] as [std::string::String; 0]);
 }
 
 #[test]
