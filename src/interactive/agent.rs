@@ -1389,63 +1389,45 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// Invalidate every live or queued input card bound to the finished turn
     /// BEFORE idle handling hands control back (bd-1qol9): asks respond as
     /// dismissed and extension prompts receive cancelled responses so their
-    /// senders fail fast instead of leaking past the turn.
+    /// senders fail fast instead of leaking past the turn. QUEUED items are
+    /// drained first so resolution side effects cannot resurrect card
+    /// activations behind this sweep's back.
     fn invalidate_input_cards_for_turn_end(&mut self) {
-        // Snapshot first so slot/order bookkeeping stays consistent while we
-        // drain.
-        let order = std::mem::take(&mut self.input_card_order);
-        let mut saw_kind = |slot: &mut Option<InputCardKind>, kind| {
-            if *slot == Some(kind) {
-                *slot = None;
+        let _ = std::mem::take(&mut self.input_card_order);
+
+        while let Some(request) = self.ask_ui_queue.pop_front() {
+            if let Some(tool) = &self.ask_tool {
+                let _ = tool.respond_ui(
+                    &request.id,
+                    crate::ask::AskResponse {
+                        answers: Vec::new(),
+                        dismissed: true,
+                    },
+                );
             }
-        };
+        }
+
+        while let Some(request) = self.extension_ui_queue.pop_front() {
+            self.send_extension_ui_response_quiet(ExtensionUiResponse {
+                id: request.id,
+                value: None,
+                cancelled: true,
+            });
+        }
+
         if let Some(card) = self.active_ask_ui.take() {
-            let _ = &mut saw_kind;
-            self.active_input_card_kind = if self.active_input_card_kind == Some(InputCardKind::Ask)
-            {
-                None
-            } else {
-                self.active_input_card_kind
-            };
             self.finish_ask_ui(&card, true);
-            let _ = order_front_skip(&order, InputCardKind::Ask);
         }
         if let Some(active) = self.active_extension_ui.take() {
-            self.active_input_card_kind =
-                (self.active_input_card_kind != Some(InputCardKind::Extension))
-                    .then_some(self.active_input_card_kind)
-                    .flatten();
             self.send_extension_ui_response_quiet(ExtensionUiResponse {
                 id: active.id,
                 value: None,
                 cancelled: true,
             });
-            let _ = order_front_skip(&order, InputCardKind::Extension);
         }
-        for kind in order {
-            match kind {
-                InputCardKind::Ask => {
-                    if let Some(request) = self.ask_ui_queue.pop_front() {
-                        let _ = request;
-                    }
-                }
-                InputCardKind::Extension => {
-                    if let Some(request) = self.extension_ui_queue.pop_front() {
-                        self.send_extension_ui_response_quiet(ExtensionUiResponse {
-                            id: request.id,
-                            value: None,
-                            cancelled: true,
-                        });
-                    }
-                }
-            }
-        }
+
         self.active_input_card_kind = None;
         self.restore_card_draft_after_cards_settle();
-    }
-            self.apply_extension_ui_effect(&request);
-        }
-        None
     }
 
     /// FIFO capacity for queued capability prompts (bd-yllbn).
