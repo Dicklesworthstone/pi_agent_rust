@@ -65,6 +65,41 @@ pub struct RpcOptions {
     pub ask_tool: Option<crate::ask::AskTool>,
 }
 
+/// Closes the Ask picker on every RPC exit path, including early errors and
+/// cancellation where the normal stdin-EOF cleanup is never reached.
+struct AskUiCloseGuard(crate::ask::AskTool);
+
+impl Drop for AskUiCloseGuard {
+    fn drop(&mut self) {
+        self.0.close_channel_ui();
+    }
+}
+
+/// Closes the extension UI channel and releases every waiting request on all
+/// RPC exit paths. The forwarder owns a manager clone while the manager owns
+/// the matching channel sender, so relying on normal EOF cleanup alone would
+/// retain both sides when `run` returns early or is cancelled.
+struct ExtensionUiCloseGuard {
+    manager: ExtensionManager,
+    ui_state: Arc<std::sync::Mutex<RpcUiBridgeState>>,
+}
+
+impl ExtensionUiCloseGuard {
+    fn close(&self) {
+        self.ui_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close_and_cancel_timers();
+        self.manager.close_ui_sender_and_cancel_pending();
+    }
+}
+
+impl Drop for ExtensionUiCloseGuard {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RpcScopedModel {
     pub model: ModelEntry,
@@ -694,9 +729,17 @@ struct RpcSharedState {
     /// Cross-turn failover state (bd-cv653.3.2): cooldown tracker and the
     /// currently active non-primary model `(provider, model_id)`, if any.
     failover_cooldown: Option<crate::failover::CooldownTracker>,
+    /// The provider/model active before the first failover in the current
+    /// chain. This identity is explicit because the Session header and newest
+    /// ModelChange both advance to the fallback during a committed failover.
+    failover_primary_model: Option<(String, String)>,
     active_failover_model: Option<(String, String)>,
     /// Position of the last used entry in the active chain (per-chain walk).
     failover_chain_position: Option<usize>,
+    /// Terminal safety latch for a failover persistence outcome that could not
+    /// be made durable after an idempotent retry. Further provider entry is
+    /// prohibited because disk and live Session state may disagree.
+    provider_reentry_blocked: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -783,8 +826,10 @@ impl RpcSharedState {
                 .as_ref()
                 .and_then(|r| r.fallback_chains.as_ref())
                 .map(|_| crate::failover::CooldownTracker::new(config.failover_cooldown_secs())),
+            failover_primary_model: None,
             active_failover_model: None,
             failover_chain_position: None,
+            provider_reentry_blocked: None,
         }
     }
 
@@ -1002,10 +1047,143 @@ async fn rpc_session_transition_blocker(
         .then_some("A background bash command is still running; wait before changing sessions"))
 }
 
+#[derive(Debug, Clone)]
+struct RpcUiBridgeTimer {
+    cancel_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl RpcUiBridgeTimer {
+    fn new() -> (Self, oneshot::Receiver<()>) {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        (
+            Self {
+                cancel_tx: Arc::new(std::sync::Mutex::new(Some(cancel_tx))),
+            },
+            cancel_rx,
+        )
+    }
+
+    fn cancel(&self) {
+        let cancel_tx = self
+            .cancel_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(cancel_tx) = cancel_tx {
+            let _ = cancel_tx.send_blocking(());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RpcUiBridgeRequest {
+    request: ExtensionUiRequest,
+    generation: u64,
+    timer: Option<RpcUiBridgeTimer>,
+}
+
+impl RpcUiBridgeRequest {
+    fn cancel_timer(&self) {
+        if let Some(timer) = &self.timer {
+            timer.cancel();
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct RpcUiBridgeState {
-    active: Option<ExtensionUiRequest>,
-    queue: VecDeque<ExtensionUiRequest>,
+    active: Option<RpcUiBridgeRequest>,
+    queue: VecDeque<RpcUiBridgeRequest>,
+    next_generation: u64,
+    closed: bool,
+}
+
+struct RpcUiBridgeExpiration {
+    response: ExtensionUiResponse,
+    next: Option<RpcUiBridgeRequest>,
+}
+
+impl RpcUiBridgeState {
+    fn active_matches(&self, request_id: &str, generation: u64) -> bool {
+        !self.closed
+            && self.active.as_ref().is_some_and(|active| {
+                active.request.id == request_id && active.generation == generation
+            })
+    }
+
+    fn admit(
+        &mut self,
+        request: ExtensionUiRequest,
+    ) -> Option<(
+        RpcUiBridgeRequest,
+        bool,
+        Option<oneshot::Receiver<()>>,
+    )> {
+        if self.closed {
+            return None;
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let (timer, cancel_rx) = if request.deadline().is_some() {
+            let (timer, cancel_rx) = RpcUiBridgeTimer::new();
+            (Some(timer), Some(cancel_rx))
+        } else {
+            (None, None)
+        };
+        let admitted = RpcUiBridgeRequest {
+            request,
+            generation: self.next_generation,
+            timer,
+        };
+        let emit_now = self.active.is_none();
+        if emit_now {
+            self.active = Some(admitted.clone());
+        } else {
+            self.queue.push_back(admitted.clone());
+        }
+        Some((admitted, emit_now, cancel_rx))
+    }
+
+    fn finish_active(&mut self) -> Option<RpcUiBridgeRequest> {
+        if let Some(active) = self.active.take() {
+            active.cancel_timer();
+        }
+        let next = self.queue.pop_front();
+        self.active.clone_from(&next);
+        next
+    }
+
+    fn close_and_cancel_timers(&mut self) {
+        self.closed = true;
+        if let Some(active) = self.active.take() {
+            active.cancel_timer();
+        }
+        for queued in self.queue.drain(..) {
+            queued.cancel_timer();
+        }
+    }
+
+    fn expire(&mut self, request_id: &str, generation: u64) -> Option<RpcUiBridgeExpiration> {
+        if self.active_matches(request_id, generation) {
+            let expired = self.active.take()?;
+            expired.cancel_timer();
+            let next = self.queue.pop_front();
+            self.active.clone_from(&next);
+            return Some(RpcUiBridgeExpiration {
+                response: rpc_extension_ui_timeout_response(&expired.request),
+                next,
+            });
+        }
+
+        let queue_index = self.queue.iter().position(|queued| {
+            queued.request.id == request_id && queued.generation == generation
+        })?;
+        let expired = self.queue.remove(queue_index)?;
+        expired.cancel_timer();
+        Some(RpcUiBridgeExpiration {
+            response: rpc_extension_ui_timeout_response(&expired.request),
+            next: None,
+        })
+    }
 }
 
 pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result<()> {
@@ -1172,9 +1350,15 @@ pub async fn run(
             .cloned()
     };
 
-    let rpc_ui_state: Option<Arc<Mutex<RpcUiBridgeState>>> = rpc_extension_manager
+    let rpc_ui_state: Option<Arc<std::sync::Mutex<RpcUiBridgeState>>> = rpc_extension_manager
         .as_ref()
-        .map(|_| Arc::new(Mutex::new(RpcUiBridgeState::default())));
+        .map(|_| Arc::new(std::sync::Mutex::new(RpcUiBridgeState::default())));
+    let extension_ui_close_guard = rpc_extension_manager.as_ref().zip(rpc_ui_state.as_ref()).map(
+        |(manager, ui_state)| ExtensionUiCloseGuard {
+            manager: manager.clone(),
+            ui_state: Arc::clone(ui_state),
+        },
+    );
 
     // Ask-tool frames (bd-cv653.3.8): each picker request is emitted as an
     // `ask_request` event keyed by its request id; the client answers with
@@ -1185,16 +1369,28 @@ pub async fn run(
         let (ask_ui_tx, mut ask_ui_rx) =
             asupersync::channel::mpsc::channel::<crate::ask::AskUiRequest>(4);
         ask.install_channel_ui(ask_ui_tx);
+        let ask_forwarder = ask.clone();
         let out_tx_ask = out_tx.clone();
         options.runtime_handle.spawn(async move {
             let cx = AgentCx::for_request();
             while let Ok(request) = ask_ui_rx.recv(&cx).await {
-                let _ = out_tx_ask.send(event(&ask_request_rpc_event(&request)));
+                let frame = event(&ask_request_rpc_event(&request));
+                ask_forwarder.try_forward_channel_ui_request(&request.id, || {
+                    out_tx_ask.try_send(frame).is_ok()
+                });
             }
         });
     }
+    // The spawned forwarder owns both a receiver and an AskTool clone whose
+    // installed handler owns the matching sender. This guard breaks that
+    // ownership cycle even if a later `?` or task cancellation exits `run`
+    // before the explicit stdin-EOF close below.
+    let _ask_ui_close_guard = options
+        .ask_tool
+        .as_ref()
+        .map(|ask| AskUiCloseGuard(ask.clone()));
 
-    if let Some(ref manager) = rpc_extension_manager {
+    let extension_ui_forwarder = if let Some(ref manager) = rpc_extension_manager {
         let (extension_ui_tx, mut extension_ui_rx) =
             asupersync::channel::mpsc::channel::<ExtensionUiRequest>(64);
         manager.set_ui_sender(extension_ui_tx);
@@ -1206,21 +1402,21 @@ pub async fn run(
             .expect("rpc ui state should exist when extension manager exists");
         let manager_ui = (*manager).clone();
         let runtime_handle_ui = options.runtime_handle.clone();
-        options.runtime_handle.spawn(async move {
+        Some(options.runtime_handle.spawn(async move {
             const MAX_UI_PENDING_REQUESTS: usize = 64;
             let cx = AgentCx::for_request();
             while let Ok(request) = extension_ui_rx.recv(&cx).await {
                 if request.expects_response() {
-                    let emit_now = {
-                        let Ok(mut guard) = ui_state.lock(&cx).await else {
-                            return;
-                        };
-                        if guard.active.is_none() {
-                            guard.active = Some(request.clone());
-                            true
-                        } else if guard.queue.len() < MAX_UI_PENDING_REQUESTS {
-                            guard.queue.push_back(request.clone());
-                            false
+                    let admitted = {
+                        let mut guard = ui_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if !manager_ui.ui_request_is_pending(&request.id) {
+                            None
+                        } else if guard.active.is_none()
+                            || guard.queue.len() < MAX_UI_PENDING_REQUESTS
+                        {
+                            guard.admit(request.clone())
                         } else {
                             drop(guard);
                             let _ = manager_ui.respond_ui(ExtensionUiResponse {
@@ -1228,27 +1424,45 @@ pub async fn run(
                                 value: None,
                                 cancelled: true,
                             });
-                            false
+                            None
                         }
                     };
 
-                    if emit_now {
-                        rpc_emit_extension_ui_request(
-                            &runtime_handle_ui,
-                            Arc::clone(&ui_state),
-                            manager_ui.clone(),
-                            out_tx_ui.clone(),
-                            request,
-                        );
+                    if let Some((admitted, emit_now, cancel_rx)) = admitted {
+                        if let Some(cancel_rx) = cancel_rx {
+                            rpc_schedule_extension_ui_timeout(
+                                &runtime_handle_ui,
+                                Arc::clone(&ui_state),
+                                manager_ui.clone(),
+                                out_tx_ui.clone(),
+                                &admitted,
+                                cancel_rx,
+                            );
+                        }
+                        if emit_now {
+                            rpc_publish_extension_ui_request(
+                                Arc::clone(&ui_state),
+                                manager_ui.clone(),
+                                out_tx_ui.clone(),
+                                admitted,
+                            );
+                        }
                     }
                 } else {
                     // Fire-and-forget UI updates should not be queued.
                     let rpc_event = request.to_rpc_event();
-                    let _ = out_tx_ui.send(event(&rpc_event));
+                    let guard = ui_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !guard.closed {
+                        let _ = rpc_try_send_extension_ui_event(&out_tx_ui, &rpc_event);
+                    }
                 }
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     while let Ok(line) = in_rx.recv(&cx).await {
         if line.trim().is_empty() {
@@ -3402,16 +3616,21 @@ pub async fn run(
                         ));
                         continue;
                     };
+                    let Some(request_generation) =
+                        rpc_parse_extension_ui_response_generation(&parsed)
+                    else {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            "extension_ui_response",
+                            "Missing requestGeneration field",
+                        ));
+                        continue;
+                    };
 
                     let (response, next_request) = {
-                        let Ok(mut guard) = ui_state.lock(&cx).await else {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                "Extension UI bridge unavailable",
-                            ));
-                            continue;
-                        };
+                        let mut guard = ui_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
                         let Some(active) = guard.active.clone() else {
                             let _ = out_tx.send(response_error(
@@ -3422,35 +3641,43 @@ pub async fn run(
                             continue;
                         };
 
-                        if active.id != request_id {
+                        if active.request.id != request_id {
                             let _ = out_tx.send(response_error(
                                 id,
                                 "extension_ui_response",
                                 format!(
                                     "Unexpected requestId: {request_id} (active: {})",
-                                    active.id
+                                    active.request.id
+                                ),
+                            ));
+                            continue;
+                        }
+                        if active.generation != request_generation {
+                            let _ = out_tx.send(response_error(
+                                id,
+                                "extension_ui_response",
+                                format!(
+                                    "Unexpected requestGeneration: {request_generation} (active: {})",
+                                    active.generation
                                 ),
                             ));
                             continue;
                         }
 
-                        let response = match rpc_parse_extension_ui_response(&parsed, &active) {
-                            Ok(response) => response,
-                            Err(message) => {
-                                let _ = out_tx.send(response_error(
-                                    id,
-                                    "extension_ui_response",
-                                    message,
-                                ));
-                                continue;
-                            }
-                        };
+                        let response =
+                            match rpc_parse_extension_ui_response(&parsed, &active.request) {
+                                Ok(response) => response,
+                                Err(message) => {
+                                    let _ = out_tx.send(response_error(
+                                        id,
+                                        "extension_ui_response",
+                                        message,
+                                    ));
+                                    continue;
+                                }
+                            };
 
-                        guard.active = None;
-                        let next = guard.queue.pop_front();
-                        if let Some(ref next) = next {
-                            guard.active = Some(next.clone());
-                        }
+                        let next = guard.finish_active();
                         (response, next)
                     };
 
@@ -3462,8 +3689,7 @@ pub async fn run(
                     ));
 
                     if let Some(next) = next_request {
-                        rpc_emit_extension_ui_request(
-                            &options.runtime_handle,
+                        rpc_publish_extension_ui_request(
                             Arc::clone(ui_state),
                             (*manager).clone(),
                             out_tx.clone(),
@@ -3485,7 +3711,27 @@ pub async fn run(
         }
     }
 
-    // stdin has closed. Drain any in-flight work (streaming turn, extension
+    // stdin has closed. No future ask_response frame can arrive, so dismiss
+    // every pending picker before waiting for the in-flight turn to drain.
+    // Otherwise a turn blocked in `ask` and this drain loop wait on each
+    // other until the five-minute picker timeout expires.
+    if let Some(ask) = options.ask_tool.as_ref() {
+        ask.close_channel_ui();
+    }
+
+    // No future extension_ui_response frame can arrive either. Atomically
+    // close the bridge before cancelling manager requests, then wait until the
+    // forwarding task has observed the disconnected channel. This ordering
+    // suppresses post-close publication, cancels every bridge timer, and also
+    // covers an idle RPC session before the work-drain loop's early-exit check.
+    if let Some(guard) = extension_ui_close_guard.as_ref() {
+        guard.close();
+    }
+    if let Some(forwarder) = extension_ui_forwarder {
+        forwarder.await;
+    }
+
+    // Drain any in-flight work (streaming turn, extension
     // command, auto-compaction, background bash) before tearing down so a
     // client that pipes a single command and closes stdin
     // (`printf '{"type":"prompt",...}' | pi --mode rpc`) still receives the
@@ -3504,27 +3750,6 @@ pub async fn run(
             && !bash_running
         {
             break;
-        }
-        // Extension UI requests can never be answered once stdin is closed;
-        // cancel them (including any that arrive mid-drain) so an extension
-        // command blocked on UI input finishes instead of pinning the drain.
-        if let (Some(ui_state), Some(manager)) = (&rpc_ui_state, &rpc_extension_manager) {
-            let pending = ui_state.lock(&cx).await.map_or_else(
-                |_| Vec::new(),
-                |mut guard| {
-                    let mut pending: Vec<ExtensionUiRequest> =
-                        guard.active.take().into_iter().collect();
-                    pending.extend(std::mem::take(&mut guard.queue));
-                    pending
-                },
-            );
-            for request in pending {
-                let _ = manager.respond_ui(ExtensionUiResponse {
-                    id: request.id,
-                    value: None,
-                    cancelled: true,
-                });
-            }
         }
         let now = cx
             .cx()
@@ -4007,6 +4232,50 @@ fn finish_rpc_turn_durability<T>(
     }
 }
 
+async fn restore_rpc_retry_tail(
+    session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    cx: &AgentCx,
+    require_incomplete_tail: bool,
+) -> Result<()> {
+    let mut guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("retry restoration session lock failed: {err}")))?;
+    let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("retry restoration state lock failed: {err}")))?;
+    let session_store = Arc::clone(&guard.session);
+    let mut inner = OwnedMutexGuard::lock(session_store, cx)
+        .await
+        .map_err(|err| Error::session(format!("retry restoration inner lock failed: {err}")))?;
+    let mut candidate = inner.clone();
+    let reverted = candidate.revert_incomplete_response();
+    if require_incomplete_tail && !reverted {
+        return Err(Error::session(
+            "retry restoration invariant failed: the completed error response had no incomplete assistant tail",
+        ));
+    }
+    if !reverted {
+        return Ok(());
+    }
+
+    let restored_messages = candidate.to_messages_for_current_path();
+    if guard.save_enabled()
+        && let Err(first_err) = candidate.save().await
+        && let Err(retry_err) = candidate.save().await
+    {
+        let reason = format!(
+            "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+        );
+        state.provider_reentry_blocked = Some(reason.clone());
+        return Err(Error::session_persistence(reason));
+    }
+
+    *inner = candidate;
+    guard.agent.replace_messages(restored_messages);
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_prompt_with_retry(
     session: Arc<Mutex<AgentSession>>,
@@ -4028,16 +4297,53 @@ async fn run_prompt_with_retry(
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
     let _compacting_handoff_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
 
+    let provider_reentry_blocked = match OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await
+    {
+        Ok(state) => state.provider_reentry_blocked.clone(),
+        Err(err) => {
+            let error = Error::session(format!("retry state lock failed: {err}"));
+            let mut payload = json!({
+                "type": "agent_end",
+                "messages": [],
+                "error": error.to_string(),
+            });
+            payload["errorHints"] = error_hints_value(&error);
+            let _ = out_tx.send(event(&payload));
+            return;
+        }
+    };
+    if let Some(reason) = provider_reentry_blocked {
+        let error = Error::session_persistence(reason);
+        let mut payload = json!({
+            "type": "agent_end",
+            "messages": [],
+            "error": error.to_string(),
+        });
+        payload["errorHints"] = error_hints_value(&error);
+        let _ = out_tx.send(event(&payload));
+        return;
+    }
+
     // Cooldown restore (bd-cv653.3.2): if a previous turn failed over and the
     // cooldown has elapsed, swap back to the primary before running.
-    maybe_restore_primary(
+    if let Err(error) = maybe_restore_primary(
         Arc::clone(&session),
         Arc::clone(&shared_state),
         out_tx.clone(),
         &options,
         &cx,
     )
-    .await;
+    .await
+    {
+        let mut payload = json!({
+            "type": "agent_end",
+            "messages": [],
+            "error": error.to_string(),
+        });
+        payload["errorHints"] = error_hints_value(&error);
+        let _ = out_tx.send(event(&payload));
+        return;
+    }
 
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
@@ -4176,6 +4482,12 @@ async fn run_prompt_with_retry(
             *guard = None;
         }
 
+        let require_incomplete_tail = matches!(
+            &result,
+            Ok(message) if message.stop_reason == StopReason::Error
+        );
+        let mut quota_credential: Option<(String, String)> = None;
+
         match result {
             Ok(message) => {
                 if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -4284,16 +4596,24 @@ async fn run_prompt_with_retry(
                 }
                 final_error = Some(err_str.clone());
                 final_error_hints = Some(error_hints_value(&err));
-                // Rotation bookkeeping (bd-cv653.3.2): a 429 backs the current
-                // key off so the next resolve rotates to a healthy sibling.
                 if crate::failover::classify_failover(&err_str)
                     == Some(crate::failover::FailoverClass::Quota)
-                    && let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
                 {
+                    let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                        Ok(guard) => guard,
+                        Err(lock_err) => {
+                            let restore_err = Error::session(format!(
+                                "retry credential snapshot session lock failed: {lock_err}"
+                            ));
+                            final_error = Some(restore_err.to_string());
+                            final_error_hints = Some(error_hints_value(&restore_err));
+                            break;
+                        }
+                    };
                     let provider = guard.agent.provider();
                     let provider_name = provider.name().to_string();
                     if let Some(key) = guard.agent.stream_options().api_key.clone() {
-                        crate::auth::report_provider_rate_limit(&provider_name, &key);
+                        quota_credential = Some((provider_name, key));
                     }
                 }
             }
@@ -4307,27 +4627,43 @@ async fn run_prompt_with_retry(
             // If the error class is failover-eligible and a chain entry
             // remains, swap providers and continue the turn there. The
             // per-turn cap bounds total failover cost.
-            let failed_over = failovers_this_turn < options.config.max_failovers_per_turn()
-                && try_failover_to_next_chain_entry(
+            let failover_result = if failovers_this_turn
+                < options.config.max_failovers_per_turn()
+            {
+                try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
                     out_tx.clone(),
                     &options,
                     final_error.as_deref(),
+                    require_incomplete_tail,
+                    (retry_count > 0).then_some(retry_count),
                     &cx,
                 )
-                .await;
-            if failed_over {
-                retry_count = 0;
-                failovers_this_turn += 1;
-                final_error = None;
-                final_error_hints = None;
-                // Same strip as the retry path: drop the failed request's
-                // incomplete output before the new model resumes (#125).
-                if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                    let _ = guard.revert_incomplete_response().await;
+                .await
+            } else {
+                Ok(false)
+            };
+            match failover_result {
+                Ok(true) => {
+                    if let Some((provider_name, key)) = quota_credential.as_ref() {
+                        crate::auth::report_provider_rate_limit(provider_name, key);
+                    }
+                    retry_count = 0;
+                    failovers_this_turn += 1;
+                    final_error = None;
+                    final_error_hints = None;
+                    continue;
                 }
-                continue;
+                Ok(false) => {
+                    if let Some((provider_name, key)) = quota_credential.as_ref() {
+                        crate::auth::report_provider_rate_limit(provider_name, key);
+                    }
+                }
+                Err(restore_err) => {
+                    final_error = Some(restore_err.to_string());
+                    final_error_hints = Some(error_hints_value(&restore_err));
+                }
             }
             break;
         }
@@ -4372,16 +4708,41 @@ async fn run_prompt_with_retry(
         // the user prompt and every completed tool cycle stay on the session
         // path so the retry re-issues only the failed provider request rather
         // than replaying the whole turn (pi_agent_rust#125).
-        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-            let _ = guard.revert_incomplete_response().await;
-            // Credential rotation (bd-cv653.3.2): re-resolve the key so a
-            // backed-off credential rotates on the retry. CLI-pinned keys
-            // never rotate.
-            if options.cli_api_key.is_none() {
-                let provider_name = guard.agent.provider().name().to_string();
-                if let Some(fresh) = options.auth.resolve_api_key(&provider_name, None) {
-                    guard.agent.stream_options_mut().api_key = Some(fresh);
-                }
+        if let Err(restore_err) = restore_rpc_retry_tail(
+            &session,
+            &shared_state,
+            &cx,
+            require_incomplete_tail,
+        )
+        .await
+        {
+            final_error = Some(restore_err.to_string());
+            final_error_hints = Some(error_hints_value(&restore_err));
+            break;
+        }
+        // Rotation bookkeeping and key replacement are mutations, so tail
+        // restoration must succeed before either can occur.
+        if let Some((provider_name, key)) = quota_credential.as_ref() {
+            crate::auth::report_provider_rate_limit(provider_name, key);
+        }
+        let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+            Ok(guard) => guard,
+            Err(lock_err) => {
+                let restore_err = Error::session(format!(
+                    "retry credential rotation session lock failed: {lock_err}"
+                ));
+                final_error = Some(restore_err.to_string());
+                final_error_hints = Some(error_hints_value(&restore_err));
+                break;
+            }
+        };
+        // Credential rotation (bd-cv653.3.2): re-resolve the key so a
+        // backed-off credential rotates on the retry. CLI-pinned keys
+        // never rotate.
+        if options.cli_api_key.is_none() {
+            let provider_name = guard.agent.provider().name().to_string();
+            if let Some(fresh) = options.auth.resolve_api_key(&provider_name, None) {
+                guard.agent.stream_options_mut().api_key = Some(fresh);
             }
         }
     }
@@ -4474,64 +4835,53 @@ async fn run_prompt_with_retry(
 }
 
 /// Cooldown restore (bd-cv653.3.2): when a previous turn failed over and the
-/// cooldown elapsed, swap the agent back to the primary model recorded in the
-/// session header before the failover... i.e. the model the session used
-/// before `active_failover_model` was set. Emits FailoverEnd(restoredPrimary).
+/// cooldown elapsed, durably restore the explicitly recorded primary before
+/// changing the live provider or shared failover state.
 async fn maybe_restore_primary(
     session: Arc<Mutex<AgentSession>>,
     shared_state: Arc<Mutex<RpcSharedState>>,
     out_tx: std::sync::mpsc::SyncSender<String>,
     options: &RpcOptions,
     cx: &AgentCx,
-) {
-    let Some((failed_provider, failed_model)) = ({
-        let Ok(state) = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx).await else {
-            return;
-        };
-        let Some((provider, model)) = state.active_failover_model.clone() else {
-            return;
-        };
-        let tracker_ok = state
-            .failover_cooldown
-            .as_ref()
-            .is_some_and(|tracker| tracker.should_use_primary(std::time::Instant::now()));
-        if tracker_ok {
-            Some((provider, model))
-        } else {
-            None
-        }
-    }) else {
-        return;
+) -> Result<()> {
+    // Transition lock order is AgentSession -> shared state -> inner Session.
+    // Keep all three through the synchronous install so direct Session readers
+    // cannot observe a new header before the Agent/shared state changes.
+    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx)
+        .await
+        .map_err(|err| Error::session(format!("primary restore session lock failed: {err}")))?;
+    let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("primary restore state lock failed: {err}")))?;
+    let Some((active_provider, active_model)) = state.active_failover_model.clone() else {
+        return Ok(());
     };
-    let _ = (failed_provider, failed_model); // recorded for the audit entry below
+    if !state
+        .failover_cooldown
+        .as_ref()
+        .is_some_and(|tracker| tracker.should_use_primary(std::time::Instant::now()))
+    {
+        return Ok(());
+    }
+    let Some((provider, model_id)) = state.failover_primary_model.clone() else {
+        let reason = "primary restore invariant failed: active fallback has no recorded primary"
+            .to_string();
+        state.provider_reentry_blocked = Some(reason.clone());
+        return Err(Error::session_persistence(reason));
+    };
 
-    // The primary identity is the session header's stored provider/model —
-    // apply_model_change updated it on failover, so the pre-failover primary
-    // must be re-derived from the ModelChange history instead.
-    let primary = {
-        let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx).await else {
-            return;
-        };
-        let inner = guard.session.lock(cx.cx()).await.ok();
-        inner.and_then(|inner_session| {
-            inner_session
-                .entries_for_current_path()
-                .iter()
-                .rev()
-                .filter_map(|entry| match entry {
-                    crate::session::SessionEntry::ModelChange(mc) => {
-                        Some((mc.provider.clone(), mc.model_id.clone(), mc.role.clone()))
-                    }
-                    _ => None,
-                })
-                // First ModelChange WITHOUT a failover role tag is the primary.
-                .find(|(_p, _m, role)| role.is_none())
-                .map(|(p, m, _)| (p, m))
-        })
-    };
-    let Some((provider, model_id)) = primary else {
-        return;
-    };
+    let runtime_provider = guard.agent.provider();
+    if !crate::provider_metadata::provider_ids_match(runtime_provider.name(), &active_provider)
+        || !runtime_provider.model_id().eq_ignore_ascii_case(&active_model)
+    {
+        let reason = format!(
+            "primary restore invariant failed: runtime {}/{} does not match recorded fallback {active_provider}/{active_model}",
+            runtime_provider.name(),
+            runtime_provider.model_id()
+        );
+        state.provider_reentry_blocked = Some(reason.clone());
+        return Err(Error::session_persistence(reason));
+    }
 
     let Some(entry) = options
         .available_models
@@ -4543,47 +4893,74 @@ async fn maybe_restore_primary(
         .cloned()
         .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model_id))
     else {
-        return;
+        return Err(Error::validation(format!(
+            "Unable to restore primary provider/model {provider}/{model_id}"
+        )));
     };
 
-    let restored = async {
-        let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx).await?;
-        let provider_impl = providers::create_provider(
-            &entry,
-            guard
-                .extensions
-                .as_ref()
-                .map(crate::extensions::ExtensionRegion::manager),
-        )?;
-        guard.agent.set_provider(provider_impl);
-        guard.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
-        let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
-        guard.agent.stream_options_mut().api_key.clone_from(&key);
+    let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
+    if model_requires_configured_credential(&entry) && key.is_none() {
+        return Err(Error::auth(format!(
+            "Missing credentials for primary provider/model {provider}/{model_id}"
+        )));
+    }
+    let provider_impl = providers::create_provider(
+        &entry,
         guard
-            .agent
-            .stream_options_mut()
-            .headers
-            .clone_from(&entry.headers);
-        apply_model_change(&mut guard, &entry).await
+            .extensions
+            .as_ref()
+            .map(crate::extensions::ExtensionRegion::manager),
+    )?;
+
+    let session_store = Arc::clone(&guard.session);
+    let mut inner = OwnedMutexGuard::lock(session_store, cx)
+        .await
+        .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))?;
+    let mut candidate = inner.clone();
+    candidate.set_model_header(Some(provider.clone()), Some(model_id.clone()), None);
+    candidate.append_model_change_with_role(
+        provider.clone(),
+        model_id.clone(),
+        Some("primary_restore".to_string()),
+    );
+    if guard.save_enabled()
+        && let Err(first_err) = candidate.save().await
+        && let Err(retry_err) = candidate.save().await
+    {
+        let reason = format!(
+            "primary restore persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+        );
+        state.provider_reentry_blocked = Some(reason.clone());
+        return Err(Error::session_persistence(reason));
     }
-    .await;
-    if restored.is_ok() {
-        let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
-            success: true,
-            provider: provider.clone(),
-            model: model_id.clone(),
-            restored_primary: true,
-        }));
-        if let Ok(mut state) = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx).await {
-            state.active_failover_model = None;
-            state.failover_chain_position = None;
-            if let Some(tracker) = state.failover_cooldown.as_mut() {
-                tracker.reset();
-            }
-        }
+
+    *inner = candidate;
+    guard.agent.set_provider(provider_impl);
+    guard.agent.set_keyword_max_thinking_level(
+        entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+    );
+    guard.agent.set_tool_call_dialect(entry.tool_call_dialect());
+    let stream_options = guard.agent.stream_options_mut();
+    stream_options.api_key.clone_from(&key);
+    stream_options.headers.clone_from(&entry.headers);
+    stream_options.max_tokens = Some(entry.model.max_tokens);
+    state.active_failover_model = None;
+    state.failover_primary_model = None;
+    state.failover_chain_position = None;
+    if let Some(tracker) = state.failover_cooldown.as_mut() {
+        tracker.reset();
     }
+
+    drop(inner);
+    drop(state);
+    drop(guard);
+    let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
+        success: true,
+        provider,
+        model: model_id,
+        restored_primary: true,
+    }));
+    Ok(())
 }
 
 /// Failover walk (bd-cv653.3.2): classify the terminal error; if it is
@@ -4596,13 +4973,15 @@ async fn try_failover_to_next_chain_entry(
     out_tx: std::sync::mpsc::SyncSender<String>,
     options: &RpcOptions,
     error_text: Option<&str>,
+    require_incomplete_tail: bool,
+    retry_attempt_to_end: Option<u32>,
     cx: &AgentCx,
-) -> bool {
+) -> Result<bool> {
     let Some(error_text) = error_text else {
-        return false;
+        return Ok(false);
     };
     let Some(class) = crate::failover::classify_failover(error_text) else {
-        return false; // auth/loud errors never fail over
+        return Ok(false); // auth/loud errors never fail over
     };
     let Some(chains) = options
         .config
@@ -4610,29 +4989,28 @@ async fn try_failover_to_next_chain_entry(
         .as_ref()
         .and_then(|r| r.fallback_chains.as_ref())
     else {
-        return false;
+        return Ok(false);
     };
 
-    // Current provider/model from the agent.
-    let (current_provider, current_model) = {
-        let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx).await else {
-            return false;
-        };
-        let provider = guard.agent.provider();
-        (provider.name().to_string(), provider.model_id().to_string())
-    };
+    // Hold both transition authorities until the staged Session candidate is
+    // durable and the infallible in-memory install is complete. The lock order
+    // matches the other RPC session->shared-state paths.
+    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx)
+        .await
+        .map_err(|err| Error::session(format!("failover session lock failed: {err}")))?;
+    let provider = guard.agent.provider();
+    let (current_provider, current_model) =
+        (provider.name().to_string(), provider.model_id().to_string());
     let Some(chain) =
         crate::failover::chain_for(chains, "default", &current_provider, &current_model)
     else {
-        return false;
+        return Ok(false);
     };
 
-    let mut position = {
-        let Ok(state) = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx).await else {
-            return false;
-        };
-        state.failover_chain_position.unwrap_or(0)
-    };
+    let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("failover state lock failed: {err}")))?;
+    let mut position = state.failover_chain_position.unwrap_or(0);
     let cap = options.config.max_failovers_per_turn() as usize;
 
     while position < chain.entries.len() && position < cap {
@@ -4660,68 +5038,99 @@ async fn try_failover_to_next_chain_entry(
             continue;
         }
 
-        let swapped = async {
-            let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx).await?;
-            let provider_impl = providers::create_provider(
-                &entry,
-                guard
-                    .extensions
-                    .as_ref()
-                    .map(crate::extensions::ExtensionRegion::manager),
-            )?;
-            guard.agent.set_provider(provider_impl);
-            guard.agent.set_keyword_max_thinking_level(
-                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-            );
-            guard.agent.stream_options_mut().api_key.clone_from(&key);
+        let Ok(provider_impl) = providers::create_provider(
+            &entry,
             guard
-                .agent
-                .stream_options_mut()
-                .headers
-                .clone_from(&entry.headers);
-            apply_model_change(&mut guard, &entry).await
-        }
-        .await;
-        if swapped.is_err() {
+                .extensions
+                .as_ref()
+                .map(crate::extensions::ExtensionRegion::manager),
+        ) else {
             continue;
-        }
+        };
 
         let to_provider = entry.model.provider.clone();
         let to_model = entry.model.id.clone();
-        let _ = out_tx.send(agent_event(AgentEvent::FailoverStart {
+
+        // Mutate and persist a private Session candidate. The live transcript,
+        // provider/options, shared cooldown, and event stream remain untouched
+        // if restoration, the inner lock, or persistence fails.
+        let session_store = Arc::clone(&guard.session);
+        let mut inner = session_store
+            .lock(cx.cx())
+            .await
+            .map_err(|err| Error::session(format!("failover inner session lock failed: {err}")))?;
+        let mut candidate = inner.clone();
+        let reverted = candidate.revert_incomplete_response();
+        if require_incomplete_tail && !reverted {
+            return Err(Error::session(
+                "failover restoration invariant failed: the completed error response had no incomplete assistant tail",
+            ));
+        }
+        let restored_messages = candidate.to_messages_for_current_path();
+        candidate.set_model_header(Some(to_provider.clone()), Some(to_model.clone()), None);
+        candidate.append_custom_entry(
+            "failover".to_string(),
+            Some(serde_json::json!({
+                "from": format!("{current_provider}/{current_model}"),
+                "to": format!("{to_provider}/{to_model}"),
+                "class": format!("{class:?}").to_ascii_lowercase(),
+                "attempt": position,
+            })),
+        );
+        candidate.append_model_change(to_provider.clone(), to_model.clone());
+        if guard.save_enabled()
+            && let Err(first_err) = candidate.save().await
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            state.provider_reentry_blocked = Some(reason.clone());
+            return Err(Error::session_persistence(reason));
+        }
+
+        // No fallible operation remains in the transition after installation.
+        *inner = candidate;
+        drop(inner);
+        guard.agent.replace_messages(restored_messages);
+        guard.agent.set_provider(provider_impl);
+        guard.agent.set_keyword_max_thinking_level(
+            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
+        guard.agent.stream_options_mut().api_key.clone_from(&key);
+        guard
+            .agent
+            .stream_options_mut()
+            .headers
+            .clone_from(&entry.headers);
+
+        state.active_failover_model = Some((to_provider.clone(), to_model.clone()));
+        state.failover_chain_position = Some(position);
+        if let Some(tracker) = state.failover_cooldown.as_mut() {
+            tracker.record_primary_failure(std::time::Instant::now());
+        }
+
+        let event = agent_event(AgentEvent::FailoverStart {
             from_provider: current_provider.clone(),
             from_model: current_model.clone(),
             to_provider: to_provider.clone(),
             to_model: to_model.clone(),
             class: format!("{class:?}").to_ascii_lowercase(),
             attempt: position as u32,
-        }));
-
-        if let Ok(mut state) = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx).await {
-            state.active_failover_model = Some((to_provider.clone(), to_model.clone()));
-            state.failover_chain_position = Some(position);
-            if let Some(tracker) = state.failover_cooldown.as_mut() {
-                tracker.record_primary_failure(std::time::Instant::now());
-            }
+        });
+        drop(state);
+        drop(guard);
+        if let Some(attempt) = retry_attempt_to_end {
+            let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(error_text.to_string()),
+            }));
         }
-
-        // Session audit entry (bd-cv653.3.2 requirement).
-        if let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx).await
-            && let Ok(mut inner) = guard.session.lock(cx.cx()).await
-        {
-            inner.append_custom_entry(
-                "failover".to_string(),
-                Some(serde_json::json!({
-                    "from": format!("{current_provider}/{current_model}"),
-                    "to": format!("{to_provider}/{to_model}"),
-                    "class": format!("{class:?}").to_ascii_lowercase(),
-                    "attempt": position,
-                })),
-            );
-        }
-        return true;
+        let _ = out_tx.send(event);
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 async fn run_extension_command(
@@ -4926,78 +5335,165 @@ fn rpc_parse_ask_response(
     ))
 }
 
-fn rpc_emit_extension_ui_request(
-    runtime_handle: &RuntimeHandle,
-    ui_state: Arc<Mutex<RpcUiBridgeState>>,
+fn rpc_publish_extension_ui_request(
+    ui_state: Arc<std::sync::Mutex<RpcUiBridgeState>>,
     manager: ExtensionManager,
     out_tx_ui: std::sync::mpsc::SyncSender<String>,
-    request: ExtensionUiRequest,
+    active: RpcUiBridgeRequest,
 ) {
-    // Emit the UI request as a JSON notification to the client.
-    let rpc_event = request.to_rpc_event();
-    let _ = out_tx_ui.send(event(&rpc_event));
+    rpc_publish_extension_ui_request_at_seam(ui_state, manager, active, |frame| {
+        rpc_try_send_extension_ui_frame(&out_tx_ui, frame)
+    });
+}
 
-    if !request.expects_response() {
-        return;
+fn rpc_publish_extension_ui_request_at_seam(
+    ui_state: Arc<std::sync::Mutex<RpcUiBridgeState>>,
+    manager: ExtensionManager,
+    mut active: RpcUiBridgeRequest,
+    mut publish: impl FnMut(String) -> bool,
+) {
+    loop {
+        let request_id = active.request.id.clone();
+        let generation = active.generation;
+        let mut rpc_event = active.request.to_rpc_event();
+        if let Some(event) = rpc_event.as_object_mut() {
+            event.insert("requestGeneration".to_string(), Value::from(generation));
+        }
+
+        let expiration = {
+            let mut guard = ui_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !guard.active_matches(&request_id, generation) {
+                return;
+            }
+
+            let remaining = active
+                .request
+                .remaining_timeout(std::time::Instant::now());
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                guard.expire(&request_id, generation)
+            } else {
+                if let Some(remaining) = remaining {
+                    let remaining_ms =
+                        u64::try_from(remaining.as_nanos().div_ceil(1_000_000))
+                            .unwrap_or(u64::MAX);
+                    if let Some(event) = rpc_event.as_object_mut() {
+                        event.insert("timeout_ms".to_string(), Value::from(remaining_ms));
+                    }
+                }
+
+                // Serialization happens while expiry holds the same state
+                // lock. Recheck the absolute deadline after that potentially
+                // extension-controlled work and immediately before the
+                // nonblocking publication linearization point.
+                let frame = event(&rpc_event);
+                let expired_during_serialization = active
+                    .request
+                    .deadline()
+                    .is_some_and(|deadline| deadline <= std::time::Instant::now());
+                if expired_during_serialization || !publish(frame) {
+                    guard.expire(&request_id, generation)
+                } else {
+                    return;
+                }
+            }
+        };
+
+        let Some(expiration) = expiration else {
+            return;
+        };
+        let _ = manager.respond_ui(expiration.response);
+        let Some(next) = expiration.next else {
+            return;
+        };
+        active = next;
     }
+}
 
-    // For dialog methods, enforce deterministic ordering (one active request at a time) by
-    // auto-resolving timeouts as cancellation defaults (per bd-2hz.1).
-    let Some(timeout_ms) = request.effective_timeout_ms() else {
+fn rpc_try_send_extension_ui_event(
+    out_tx_ui: &std::sync::mpsc::SyncSender<String>,
+    rpc_event: &Value,
+) -> bool {
+    rpc_try_send_extension_ui_frame(out_tx_ui, event(rpc_event))
+}
+
+fn rpc_try_send_extension_ui_frame(
+    out_tx_ui: &std::sync::mpsc::SyncSender<String>,
+    frame: String,
+) -> bool {
+    out_tx_ui.try_send(frame).is_ok()
+}
+
+fn rpc_schedule_extension_ui_timeout(
+    runtime_handle: &RuntimeHandle,
+    ui_state: Arc<std::sync::Mutex<RpcUiBridgeState>>,
+    manager: ExtensionManager,
+    out_tx_ui: std::sync::mpsc::SyncSender<String>,
+    admitted: &RpcUiBridgeRequest,
+    cancel_rx: oneshot::Receiver<()>,
+) {
+    let Some(deadline) = admitted.request.deadline() else {
+        return;
+    };
+    let request_id = admitted.request.id.clone();
+    let generation = admitted.generation;
+    runtime_handle.spawn(async move {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let cancelled = Box::pin(cancel_rx);
+        let deadline = Box::pin(sleep(wall_now(), remaining));
+        if matches!(
+            futures::future::select(cancelled, deadline).await,
+            futures::future::Either::Left(_)
+        ) {
+            return;
+        }
+        rpc_resolve_extension_ui_default(
+            ui_state,
+            manager,
+            out_tx_ui,
+            request_id,
+            generation,
+        );
+    });
+}
+
+fn rpc_resolve_extension_ui_default(
+    ui_state: Arc<std::sync::Mutex<RpcUiBridgeState>>,
+    manager: ExtensionManager,
+    out_tx_ui: std::sync::mpsc::SyncSender<String>,
+    request_id: String,
+    generation: u64,
+) {
+    let expiration = {
+        let mut guard = ui_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.expire(&request_id, generation)
+    };
+    let Some(expiration) = expiration else {
         return;
     };
 
-    // Fire a little early so ExtensionManager::request_ui doesn't hit its own timeout first.
-    let fire_ms = timeout_ms.saturating_sub(10).max(1);
-    let request_id = request.id;
-    let ui_state_timeout = Arc::clone(&ui_state);
-    let manager_timeout = manager;
-    let out_tx_timeout = out_tx_ui;
-    let runtime_handle_inner = runtime_handle.clone();
+    // The private admission generation prevents a stale sleeper for request
+    // A from resolving a later request B that reuses A's public id. It also
+    // lets a queued request expire without disturbing the active slot.
+    let _ = manager.respond_ui(expiration.response);
+    if let Some(next) = expiration.next {
+        rpc_publish_extension_ui_request(ui_state, manager, out_tx_ui, next);
+    }
+}
 
-    runtime_handle.spawn(async move {
-        sleep(wall_now(), Duration::from_millis(fire_ms)).await;
-        let cx = AgentCx::for_request();
-
-        let next = {
-            let Ok(mut guard) = ui_state_timeout.lock(cx.cx()).await else {
-                return;
-            };
-
-            let Some(active) = guard.active.as_ref() else {
-                return;
-            };
-
-            // No-op if the active request has already advanced.
-            if active.id != request_id {
-                return;
-            }
-
-            // Resolve with cancellation defaults (downstream maps method -> default return value).
-            let _ = manager_timeout.respond_ui(ExtensionUiResponse {
-                id: request_id,
-                value: None,
-                cancelled: true,
-            });
-
-            guard.active = None;
-            let next = guard.queue.pop_front();
-            if let Some(ref next) = next {
-                guard.active = Some(next.clone());
-            }
-            next
-        };
-
-        if let Some(next) = next {
-            rpc_emit_extension_ui_request(
-                &runtime_handle_inner,
-                ui_state_timeout,
-                manager_timeout,
-                out_tx_timeout,
-                next,
-            );
+fn rpc_extension_ui_timeout_response(request: &ExtensionUiRequest) -> ExtensionUiResponse {
+    if request.is_capability_prompt() {
+        request.auto_deny_response()
+    } else {
+        ExtensionUiResponse {
+            id: request.id.clone(),
+            value: None,
+            cancelled: true,
         }
-    });
+    }
 }
 
 fn rpc_parse_extension_ui_response_id(parsed: &Value) -> Option<String> {
@@ -5016,6 +5512,10 @@ fn rpc_parse_extension_ui_response_id(parsed: &Value) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(String::from)
     })
+}
+
+fn rpc_parse_extension_ui_response_generation(parsed: &Value) -> Option<u64> {
+    parsed.get("requestGeneration").and_then(Value::as_u64)
 }
 
 fn rpc_parse_extension_ui_response(
@@ -5037,6 +5537,43 @@ fn rpc_parse_extension_ui_response(
 
     match active.method.as_str() {
         "confirm" => {
+            if active.is_capability_prompt() {
+                let scope = parsed
+                    .get("value")
+                    .and_then(Value::as_object)
+                    .or_else(|| parsed.as_object())
+                    .ok_or_else(|| {
+                        "capability confirm requires scoped `allow` and `persist` booleans"
+                            .to_string()
+                    })?;
+                let allow = scope
+                    .get("allow")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| "capability confirm requires boolean `allow`".to_string())?;
+                let persist = scope
+                    .get("persist")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| "capability confirm requires boolean `persist`".to_string())?;
+                let remember = scope
+                    .get("remember")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| "capability confirm requires boolean `remember`".to_string())?;
+                if persist && !remember {
+                    return Err(
+                        "capability confirm cannot persist a decision without remembering it"
+                            .to_string(),
+                    );
+                }
+                return Ok(ExtensionUiResponse {
+                    id: active.id.clone(),
+                    value: Some(json!({
+                        "allow": allow,
+                        "persist": persist,
+                        "remember": remember,
+                    })),
+                    cancelled: false,
+                });
+            }
             let value = parsed
                 .get("confirmed")
                 .and_then(Value::as_bool)
@@ -5102,6 +5639,18 @@ fn rpc_parse_extension_ui_response(
             Ok(ExtensionUiResponse {
                 id: active.id.clone(),
                 value: Some(value.clone()),
+                cancelled: false,
+            })
+        }
+        "getEditorText" | "get_editor_text" | "getAllThemes" | "get_all_themes"
+        | "getTheme" | "get_theme" | "setTheme" | "set_theme" => {
+            let value = parsed
+                .get("value")
+                .cloned()
+                .ok_or_else(|| format!("{} response requires `value` field", active.method))?;
+            Ok(ExtensionUiResponse {
+                id: active.id.clone(),
+                value: Some(value),
                 cancelled: false,
             })
         }
@@ -5187,6 +5736,116 @@ mod ui_bridge_tests {
     }
 
     #[test]
+    fn parse_capability_confirm_requires_explicit_scope() {
+        let active = ExtensionUiRequest::new_capability_prompt(
+            "req-cap",
+            "trusted-extension",
+            "exec",
+            json!({"title": "Capability"}),
+        );
+        let scoped = json!({
+            "type": "extension_ui_response",
+            "requestId": "req-cap",
+            "value": {"allow": true, "persist": false, "remember": false}
+        });
+        let response =
+            rpc_parse_extension_ui_response(&scoped, &active).expect("parse scoped capability");
+        assert_eq!(
+            response.value,
+            Some(json!({"allow": true, "persist": false, "remember": false}))
+        );
+
+        for unscoped in [
+            json!({"requestId": "req-cap", "confirmed": true}),
+            json!({"requestId": "req-cap", "value": true}),
+            json!({"requestId": "req-cap", "value": {"allow": true}}),
+            json!({"requestId": "req-cap", "value": {"allow": true, "persist": false}}),
+        ] {
+            assert!(
+                rpc_parse_extension_ui_response(&unscoped, &active).is_err(),
+                "unscoped capability decision must fail: {unscoped}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_capability_confirm_accepts_top_level_scope() {
+        let active = ExtensionUiRequest::new_capability_prompt(
+            "req-cap",
+            "trusted-extension",
+            "exec",
+            json!({"title": "Capability"}),
+        );
+        let top_level = json!({
+            "type": "extension_ui_response",
+            "requestId": "req-cap",
+            "allow": false,
+            "persist": true,
+            "remember": true,
+        });
+
+        let response = rpc_parse_extension_ui_response(&top_level, &active)
+            .expect("parse top-level capability scope");
+        assert_eq!(
+            response.value,
+            Some(json!({"allow": false, "persist": true, "remember": true}))
+        );
+    }
+
+    #[test]
+    fn parse_capability_confirm_rejects_persist_without_remember() {
+        let active = ExtensionUiRequest::new_capability_prompt(
+            "req-cap",
+            "trusted-extension",
+            "exec",
+            json!({"title": "Capability"}),
+        );
+        let contradictory = json!({
+            "type": "extension_ui_response",
+            "requestId": "req-cap",
+            "value": {"allow": true, "persist": true, "remember": false},
+        });
+
+        let err = rpc_parse_extension_ui_response(&contradictory, &active)
+            .expect_err("persistence without session remembering must fail");
+        assert_eq!(
+            err,
+            "capability confirm cannot persist a decision without remembering it"
+        );
+    }
+
+    #[test]
+    fn capability_rpc_timeout_is_typed_auto_deny_not_user_cancel() {
+        let request = ExtensionUiRequest::new_capability_prompt(
+            "req-cap-timeout",
+            "trusted-extension",
+            "exec",
+            json!({"title": "Capability"}),
+        );
+
+        let response = rpc_extension_ui_timeout_response(&request);
+        assert_eq!(response.id, "req-cap-timeout");
+        assert_eq!(
+            response.value,
+            Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+                "reason": "auto_deny",
+            }))
+        );
+        assert!(!response.cancelled);
+
+        let ordinary = rpc_extension_ui_timeout_response(&ExtensionUiRequest::new(
+            "req-confirm-timeout",
+            "confirm",
+            json!({"title": "Ordinary"}),
+        ));
+        assert_eq!(ordinary.value, None);
+        assert!(ordinary.cancelled);
+    }
+
+    #[test]
     fn parse_cancelled_response_wins_over_value() {
         let active = ExtensionUiRequest::new("req-1", "confirm", json!({"title":"t"}));
         let value = json!({"type":"extension_ui_response","requestId":"req-1","cancelled":true,"value":true});
@@ -5225,6 +5884,27 @@ mod ui_bridge_tests {
             rpc_parse_extension_ui_response(&bad_value, &active).is_err(),
             "non-string input should error"
         );
+    }
+
+    #[test]
+    fn parser_supports_every_query_method_that_expects_a_response() {
+        for method in [
+            "getEditorText",
+            "get_editor_text",
+            "getAllThemes",
+            "get_all_themes",
+            "getTheme",
+            "get_theme",
+            "setTheme",
+            "set_theme",
+        ] {
+            let active = ExtensionUiRequest::new("req-query", method, json!({}));
+            assert!(active.expects_response(), "fixture method must be response-bearing");
+            let parsed = json!({"requestId": "req-query", "value": {"ok": true}});
+            let response = rpc_parse_extension_ui_response(&parsed, &active)
+                .unwrap_or_else(|error| panic!("{method}: {error}"));
+            assert_eq!(response.value, Some(json!({"ok": true})), "{method}");
+        }
     }
 
     #[test]
@@ -5336,10 +6016,470 @@ mod ui_bridge_tests {
     }
 
     #[test]
+    fn parse_response_generation_requires_an_unsigned_integer() {
+        assert_eq!(
+            rpc_parse_extension_ui_response_generation(&json!({"requestGeneration": 7})),
+            Some(7)
+        );
+        for invalid in [
+            json!({}),
+            json!({"requestGeneration": "7"}),
+            json!({"requestGeneration": -1}),
+        ] {
+            assert!(rpc_parse_extension_ui_response_generation(&invalid).is_none());
+        }
+    }
+
+    #[test]
     fn bridge_state_default_is_empty() {
         let state = RpcUiBridgeState::default();
         assert!(state.active.is_none());
         assert!(state.queue.is_empty());
+        assert!(!state.closed);
+    }
+
+    #[test]
+    fn stale_timeout_cannot_resolve_later_activation_that_reuses_public_id() {
+        let mut state = RpcUiBridgeState::default();
+        let (first, first_emits, first_cancel_rx) = state
+            .admit(ExtensionUiRequest::new(
+                "reused-id",
+                "confirm",
+                json!({"title": "first"}),
+            ))
+            .expect("bridge is open");
+        assert!(first_emits);
+        assert!(first_cancel_rx.is_none());
+        let first_expiration = state
+            .expire("reused-id", first.generation)
+            .expect("the first activation is live");
+        assert_eq!(first_expiration.response.id, "reused-id");
+        assert!(first_expiration.next.is_none());
+
+        let (second, second_emits, second_cancel_rx) = state
+            .admit(ExtensionUiRequest::new(
+                "reused-id",
+                "confirm",
+                json!({"title": "second"}),
+            ))
+            .expect("bridge is open");
+        assert!(second_emits);
+        assert!(second_cancel_rx.is_none());
+
+        assert_ne!(first.generation, second.generation);
+        assert!(
+            state.expire("reused-id", first.generation).is_none(),
+            "the first activation's late sleeper must be inert"
+        );
+        let late_client_generation = rpc_parse_extension_ui_response_generation(&json!({
+            "requestGeneration": first.generation,
+        }))
+        .expect("late response carries A's generation");
+        assert!(
+            !state.active_matches("reused-id", late_client_generation),
+            "a late client response to A must not correlate with B"
+        );
+        assert!(state.active_matches("reused-id", second.generation));
+        assert_eq!(
+            state.active.as_ref().and_then(|active| {
+                active.request.payload.get("title").and_then(Value::as_str)
+            }),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn queued_deadline_expires_without_disturbing_unbounded_active_request() {
+        let mut state = RpcUiBridgeState::default();
+        let (active, active_emits, active_cancel_rx) = state
+            .admit(ExtensionUiRequest::new(
+                "unbounded-active",
+                "confirm",
+                json!({"title": "active"}),
+            ))
+            .expect("bridge is open");
+        assert!(active_emits);
+        assert!(active_cancel_rx.is_none());
+        let mut bounded = ExtensionUiRequest::new_capability_prompt(
+            "bounded-queued",
+            "trusted-extension",
+            "exec",
+            json!({"title": "queued"}),
+        )
+        .with_timeout_ms(30_000);
+        bounded.bind_deadline(std::time::Instant::now());
+        assert!(bounded.deadline().is_some(), "fixture must be bounded");
+        let (queued, queued_emits, queued_cancel_rx) =
+            state.admit(bounded).expect("bridge is open");
+        assert!(!queued_emits);
+        let mut queued_cancel_rx = queued_cancel_rx.expect("bounded request owns a waiter");
+
+        let expiration = state
+            .expire("bounded-queued", queued.generation)
+            .expect("queued request owns an independent deadline identity");
+
+        assert_eq!(expiration.response.id, "bounded-queued");
+        assert_eq!(
+            expiration.response.value,
+            Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+                "reason": "auto_deny",
+            }))
+        );
+        assert!(!expiration.response.cancelled);
+        assert!(expiration.next.is_none());
+        assert_eq!(
+            state.active.as_ref().map(|active| active.generation),
+            Some(active.generation)
+        );
+        assert!(state.queue.is_empty());
+        assert_eq!(
+            queued_cancel_rx.try_recv(),
+            Ok(()),
+            "terminal queue expiry cancels its outstanding sleeper"
+        );
+    }
+
+    #[test]
+    fn extension_ui_publication_is_nonblocking_under_backpressure() {
+        let (out_tx, _out_rx) = std::sync::mpsc::sync_channel(1);
+        out_tx
+            .send("already full".to_string())
+            .expect("fixture fills the output channel");
+
+        assert!(
+            !rpc_try_send_extension_ui_event(
+                &out_tx,
+                &json!({"type": "extension_ui_request", "id": "blocked"}),
+            ),
+            "a full client channel must fail closed without consuming prompt budget"
+        );
+    }
+
+    #[test]
+    fn full_channel_publication_fails_closed_and_advances_entire_fifo() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let mut bridge = RpcUiBridgeState::default();
+            let (first, first_emits, _) = bridge
+                .admit(ExtensionUiRequest::new(
+                    "first",
+                    "confirm",
+                    json!({"title": "first"}),
+                ))
+                .expect("bridge is open");
+            let (_, second_emits, _) = bridge
+                .admit(ExtensionUiRequest::new(
+                    "second",
+                    "confirm",
+                    json!({"title": "second"}),
+                ))
+                .expect("bridge is open");
+            assert!(first_emits);
+            assert!(!second_emits);
+
+            let state = Arc::new(std::sync::Mutex::new(bridge));
+            let (out_tx, _out_rx) = std::sync::mpsc::sync_channel(1);
+            out_tx
+                .send("already full".to_string())
+                .expect("fixture fills the output channel");
+
+            rpc_publish_extension_ui_request(
+                Arc::clone(&state),
+                ExtensionManager::new(),
+                out_tx,
+                first,
+            );
+
+            let guard = state.lock().expect("bridge lock");
+            assert!(guard.active.is_none());
+            assert!(guard.queue.is_empty());
+        });
+    }
+
+    #[test]
+    fn expired_active_request_is_never_published() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let mut request = ExtensionUiRequest::new(
+                "already-expired",
+                "confirm",
+                json!({"title": "too late"}),
+            )
+            .with_timeout_ms(0);
+            request.bind_deadline(std::time::Instant::now());
+
+            let mut bridge = RpcUiBridgeState::default();
+            let (active, emits, _) = bridge.admit(request).expect("bridge is open");
+            assert!(emits);
+            let state = Arc::new(std::sync::Mutex::new(bridge));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(4);
+
+            rpc_publish_extension_ui_request(
+                Arc::clone(&state),
+                ExtensionManager::new(),
+                out_tx,
+                active,
+            );
+
+            assert!(
+                out_rx.try_recv().is_err(),
+                "an expired frame must not cross the publication boundary"
+            );
+            let guard = state.lock().expect("bridge lock");
+            assert!(guard.active.is_none());
+        });
+    }
+
+    #[test]
+    fn queued_scheduler_expires_bounded_successor_behind_unbounded_active() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let mut bridge = RpcUiBridgeState::default();
+            let (active, active_emits, _) = bridge
+                .admit(ExtensionUiRequest::new(
+                    "unbounded-active",
+                    "confirm",
+                    json!({"title": "active"}),
+                ))
+                .expect("bridge is open");
+            assert!(active_emits);
+
+            let mut bounded = ExtensionUiRequest::new_capability_prompt(
+                "bounded-queued",
+                "trusted-extension",
+                "exec",
+                json!({"title": "queued"}),
+            )
+            .with_timeout_ms(10);
+            bounded.bind_deadline(std::time::Instant::now());
+            let (queued, queued_emits, cancel_rx) =
+                bridge.admit(bounded).expect("bridge is open");
+            assert!(!queued_emits);
+            let cancel_rx = cancel_rx.expect("bounded request owns a waiter");
+
+            let state = Arc::new(std::sync::Mutex::new(bridge));
+            let (out_tx, _out_rx) = std::sync::mpsc::sync_channel(4);
+            rpc_schedule_extension_ui_timeout(
+                &runtime_handle,
+                Arc::clone(&state),
+                ExtensionManager::new(),
+                out_tx,
+                &queued,
+                cancel_rx,
+            );
+            sleep(wall_now(), Duration::from_millis(50)).await;
+
+            let guard = state.lock().expect("bridge lock");
+            assert_eq!(
+                guard.active.as_ref().map(|active| active.generation),
+                Some(active.generation)
+            );
+            assert!(guard.queue.is_empty());
+        });
+    }
+
+    #[test]
+    fn normal_resolution_cancels_and_releases_long_deadline_sleeper() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let mut request = ExtensionUiRequest::new(
+                "promptly-answered",
+                "confirm",
+                json!({"title": "answer now"}),
+            )
+            .with_timeout_ms(30_000);
+            request.bind_deadline(std::time::Instant::now());
+
+            let mut bridge = RpcUiBridgeState::default();
+            let (active, emits, cancel_rx) =
+                bridge.admit(request).expect("bridge is open");
+            assert!(emits);
+            let cancel_rx = cancel_rx.expect("bounded request owns a waiter");
+            let state = Arc::new(std::sync::Mutex::new(bridge));
+            let (out_tx, _out_rx) = std::sync::mpsc::sync_channel(4);
+            rpc_schedule_extension_ui_timeout(
+                &runtime_handle,
+                Arc::clone(&state),
+                ExtensionManager::new(),
+                out_tx,
+                &active,
+                cancel_rx,
+            );
+
+            {
+                let mut guard = state.lock().expect("bridge lock");
+                assert!(guard.finish_active().is_none());
+            }
+            sleep(wall_now(), Duration::from_millis(20)).await;
+            assert_eq!(
+                Arc::strong_count(&state),
+                1,
+                "cancellation must release the task's captured bridge state promptly"
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_close_guard_cancels_long_timer_and_suppresses_post_close_publication() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let mut active_request = ExtensionUiRequest::new(
+                "terminal-close",
+                "confirm",
+                json!({"title": "must not outlive RPC"}),
+            )
+            .with_timeout_ms(30_000);
+            active_request.bind_deadline(std::time::Instant::now());
+            let mut queued_request = ExtensionUiRequest::new(
+                "terminal-close-queued",
+                "input",
+                json!({"title": "also must not outlive RPC"}),
+            )
+            .with_timeout_ms(30_000);
+            queued_request.bind_deadline(std::time::Instant::now());
+
+            let mut bridge = RpcUiBridgeState::default();
+            let (active, active_emits, active_cancel_rx) =
+                bridge.admit(active_request).expect("bridge is open");
+            let (queued, queued_emits, queued_cancel_rx) =
+                bridge.admit(queued_request).expect("bridge is open");
+            assert!(active_emits);
+            assert!(!queued_emits);
+            let active_cancel_rx = active_cancel_rx.expect("active request owns a waiter");
+            let queued_cancel_rx = queued_cancel_rx.expect("queued request owns a waiter");
+            let state = Arc::new(std::sync::Mutex::new(bridge));
+            let manager = ExtensionManager::new();
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(4);
+            rpc_schedule_extension_ui_timeout(
+                &runtime_handle,
+                Arc::clone(&state),
+                manager.clone(),
+                out_tx.clone(),
+                &active,
+                active_cancel_rx,
+            );
+            rpc_schedule_extension_ui_timeout(
+                &runtime_handle,
+                Arc::clone(&state),
+                manager.clone(),
+                out_tx.clone(),
+                &queued,
+                queued_cancel_rx,
+            );
+
+            let close_guard = ExtensionUiCloseGuard {
+                manager: manager.clone(),
+                ui_state: Arc::clone(&state),
+            };
+
+            let (seam_entered_tx, seam_entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_seam_tx, release_seam_rx) = std::sync::mpsc::sync_channel(1);
+            let publisher_state = Arc::clone(&state);
+            let publisher_manager = manager.clone();
+            let publisher_out_tx = out_tx.clone();
+            let post_close_active = active.clone();
+            let publisher = std::thread::spawn(move || {
+                rpc_publish_extension_ui_request_at_seam(
+                    publisher_state,
+                    publisher_manager,
+                    active,
+                    |frame| {
+                        seam_entered_tx.send(()).expect("announce publication seam");
+                        release_seam_rx.recv().expect("release publication seam");
+                        rpc_try_send_extension_ui_frame(&publisher_out_tx, frame)
+                    },
+                );
+            });
+            seam_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("publisher should reach the locked publication seam");
+            assert!(
+                matches!(
+                    state.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "the actual try_send seam must retain the bridge linearizer"
+            );
+
+            let (close_started_tx, close_started_rx) = std::sync::mpsc::sync_channel(1);
+            let (close_done_tx, close_done_rx) = std::sync::mpsc::sync_channel(1);
+            let closer = std::thread::spawn(move || {
+                close_started_tx.send(()).expect("start terminal close");
+                drop(close_guard);
+                close_done_tx.send(()).expect("report terminal close");
+            });
+            close_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("terminal close thread should start");
+            assert!(
+                matches!(
+                    close_done_rx.recv_timeout(Duration::from_millis(20)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "terminal close must wait while publication owns the linearizer"
+            );
+
+            release_seam_tx.send(()).expect("release publisher");
+            publisher.join().expect("publisher thread");
+            close_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("terminal close should finish after publication releases the lock");
+            closer.join().expect("terminal close thread");
+
+            let published_before_close = out_rx
+                .try_recv()
+                .expect("the frame linearized before close should be published");
+            assert!(published_before_close.contains("terminal-close"));
+
+            rpc_publish_extension_ui_request(
+                Arc::clone(&state),
+                manager,
+                out_tx,
+                post_close_active,
+            );
+
+            sleep(wall_now(), Duration::from_millis(20)).await;
+            assert_eq!(
+                Arc::strong_count(&state),
+                1,
+                "RAII close must wake and release every long-deadline timer task"
+            );
+            let mut guard = state.lock().expect("bridge lock");
+            assert!(guard.closed);
+            assert!(guard.active.is_none());
+            assert!(guard.queue.is_empty());
+            assert!(
+                guard
+                    .admit(ExtensionUiRequest::new(
+                        "too-late",
+                        "confirm",
+                        json!({"title": "must be rejected"}),
+                    ))
+                    .is_none(),
+                "terminal close must reject every later bridge admission"
+            );
+            drop(guard);
+            assert!(
+                out_rx.try_recv().is_err(),
+                "no second extension UI frame may cross the terminal close boundary"
+            );
+        });
     }
 }
 
@@ -5406,12 +6546,13 @@ mod retry_tests {
     use super::*;
     use crate::agent::{Agent, AgentConfig, AgentSession};
     use crate::model::{AssistantMessage, Usage};
-    use crate::provider::Provider;
+    use crate::provider::{InputType, Model, ModelCost, Provider};
     use crate::resources::ResourceLoader;
     use crate::session::Session;
     use crate::tools::ToolRegistry;
     use async_trait::async_trait;
     use futures::stream;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5569,6 +6710,7 @@ mod retry_tests {
 
         runtime.block_on(async move {
             let provider = Arc::new(FlakyProvider::new());
+            let provider_probe = Arc::clone(&provider);
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let inner_session = Arc::new(Mutex::new(Session::in_memory()));
@@ -5669,6 +6811,283 @@ mod retry_tests {
                 retry_end_value.get("finalError").is_none(),
                 "successful auto_retry_end must omit absent finalError: {retry_end_value}"
             );
+            assert_eq!(
+                provider_probe.calls.load(Ordering::SeqCst),
+                2,
+                "the production retry loop must make exactly one resumed provider call"
+            );
+
+            let verify_cx = AgentCx::for_request();
+            let guard = session.lock(&verify_cx).await.expect("agent session lock");
+            let inner = guard
+                .session
+                .lock(verify_cx.cx())
+                .await
+                .expect("inner session lock");
+            let path = inner.entries_for_current_path();
+            assert_eq!(
+                path.iter()
+                    .filter(|entry| matches!(entry, SessionEntry::Message(message) if matches!(&message.message, SessionMessage::User { .. })))
+                    .count(),
+                1,
+                "retry must preserve the original user message exactly once"
+            );
+            assert_eq!(
+                path.iter()
+                    .filter(|entry| matches!(
+                        entry,
+                        SessionEntry::Message(message)
+                            if matches!(
+                                &message.message,
+                                SessionMessage::Assistant { message }
+                                    if message.stop_reason == StopReason::Stop
+                            )
+                    ))
+                    .count(),
+                1,
+                "retry must leave exactly one successful assistant tail"
+            );
+            assert!(
+                path.iter().all(|entry| !matches!(
+                    entry,
+                    SessionEntry::Message(message)
+                        if matches!(
+                            &message.message,
+                            SessionMessage::Assistant { message }
+                                if message.stop_reason == StopReason::Error
+                        )
+                )),
+                "the failed assistant tail must be absent from the active path"
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_failover_requires_tail_then_commits_restored_candidate() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(Arc::new(AlwaysErrorProvider), tools, AgentConfig::default());
+            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let agent_session = AgentSession::new(
+                agent,
+                inner_session,
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let fallback = crate::models::ModelEntry {
+                model: Model {
+                    id: "fallback-model".to_string(),
+                    name: "fallback-model".to_string(),
+                    api: "anthropic".to_string(),
+                    provider: "anthropic".to_string(),
+                    base_url: "https://api.anthropic.com".to_string(),
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: HashMap::new(),
+                },
+                api_key: Some("fallback-key".to_string()),
+                headers: HashMap::from([("x-fallback".to_string(), "true".to_string())]),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                fallback_chains: Some(HashMap::from([(
+                    "default".to_string(),
+                    vec!["anthropic/fallback-model".to_string()],
+                )])),
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+            let auth_path = tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .join("auth.json");
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: vec![fallback],
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth: AuthStorage::load(auth_path).expect("auth load"),
+                runtime_handle,
+                ask_tool: None,
+            };
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+            let cx = AgentCx::for_request();
+
+            let err = try_failover_to_next_chain_entry(
+                Arc::clone(&session),
+                Arc::clone(&shared_state),
+                out_tx.clone(),
+                &options,
+                Some("server error"),
+                true,
+                None,
+                &cx,
+            )
+            .await
+            .expect_err("known assistant errors require a restorable tail");
+            assert!(
+                err.to_string().contains("no incomplete assistant tail"),
+                "unexpected failover invariant error: {err}"
+            );
+
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            assert_eq!(guard.agent.provider().name(), "test-provider");
+            assert_eq!(guard.agent.provider().model_id(), "test-model");
+            assert!(guard.agent.stream_options().api_key.is_none());
+            assert!(guard.agent.stream_options().headers.is_empty());
+            let inner = guard
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("inner session lock");
+            assert!(inner.entries.is_empty(), "failed transition appended metadata");
+            assert!(inner.header.provider.is_none());
+            assert!(inner.header.model_id.is_none());
+            drop(inner);
+            drop(guard);
+
+            let state = shared_state.lock(&cx).await.expect("shared state lock");
+            assert!(state.active_failover_model.is_none());
+            assert!(state.failover_chain_position.is_none());
+            assert!(state.provider_reentry_blocked.is_none());
+            assert!(
+                state
+                    .failover_cooldown
+                    .as_ref()
+                    .is_none_or(|tracker| tracker.failed_at().is_none()),
+                "failed transition mutated cooldown state"
+            );
+            assert!(
+                out_rx.try_iter().next().is_none(),
+                "failed transition emitted a failover lifecycle event"
+            );
+            drop(state);
+
+            let mut guard = session.lock(&cx).await.expect("agent session lock");
+            let session_store = Arc::clone(&guard.session);
+            let mut inner = session_store
+                .lock(cx.cx())
+                .await
+                .expect("inner session lock");
+            inner.append_message(SessionMessage::User {
+                content: UserContent::Text("hello".to_string()),
+                timestamp: Some(0),
+            });
+            inner.append_message(SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: Vec::new(),
+                    api: "test-api".to_string(),
+                    provider: "test-provider".to_string(),
+                    model: "test-model".to_string(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Error,
+                    stop_details: None,
+                    error_message: Some("server error".to_string()),
+                    timestamp: 0,
+                },
+            });
+            guard
+                .agent
+                .replace_messages(inner.to_messages_for_current_path());
+            drop(inner);
+            drop(guard);
+
+            assert!(
+                try_failover_to_next_chain_entry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    out_tx,
+                    &options,
+                    Some("server error"),
+                    true,
+                    None,
+                    &cx,
+                )
+                .await
+                .expect("restored failover candidate should commit"),
+                "eligible fallback was not installed"
+            );
+
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            assert_eq!(guard.agent.provider().name(), "anthropic");
+            assert_eq!(guard.agent.provider().model_id(), "fallback-model");
+            assert_eq!(
+                guard.agent.stream_options().api_key.as_deref(),
+                Some("fallback-key")
+            );
+            assert_eq!(
+                guard
+                    .agent
+                    .stream_options()
+                    .headers
+                    .get("x-fallback")
+                    .map(String::as_str),
+                Some("true")
+            );
+            let inner = guard
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("inner session lock");
+            let path = inner.entries_for_current_path();
+            assert!(path.iter().all(|entry| !matches!(
+                entry,
+                SessionEntry::Message(message)
+                    if matches!(
+                        &message.message,
+                        SessionMessage::Assistant { message }
+                            if message.stop_reason == StopReason::Error
+                    )
+            )));
+            assert!(path.iter().any(|entry| matches!(
+                entry,
+                SessionEntry::Custom(custom) if custom.custom_type == "failover"
+            )));
+            assert!(path.iter().any(|entry| matches!(
+                entry,
+                SessionEntry::ModelChange(change)
+                    if change.provider == "anthropic" && change.model_id == "fallback-model"
+            )));
+            drop(inner);
+            drop(guard);
+
+            let state = shared_state.lock(&cx).await.expect("shared state lock");
+            assert_eq!(
+                state
+                    .active_failover_model
+                    .as_ref()
+                    .map(|(provider, model)| (provider.as_str(), model.as_str())),
+                Some(("anthropic", "fallback-model"))
+            );
+            assert_eq!(state.failover_chain_position, Some(1));
+            assert!(state.provider_reentry_blocked.is_none());
+            drop(state);
+
+            let event = out_rx.try_recv().expect("failover_start event");
+            let event: Value = serde_json::from_str(&event).expect("failover event JSON");
+            assert_eq!(event.get("type").and_then(Value::as_str), Some("failover_start"));
+            assert!(out_rx.try_recv().is_err(), "unexpected extra failover event");
         });
     }
 
@@ -8967,6 +10386,38 @@ mod tests {
         }
     }
 
+    async fn recv_ask_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
+        let start = Instant::now();
+        loop {
+            let recv_result = {
+                let rx = out_rx.lock().expect("lock rpc output receiver");
+                rx.try_recv()
+            };
+
+            match recv_result {
+                Ok(line) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&line)
+                        && value.get("type").and_then(Value::as_str) == Some("ask_request")
+                    {
+                        return value;
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    unreachable!(
+                        "{label}: output channel disconnected while waiting for ask_request"
+                    );
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "{label}: timed out waiting for ask_request"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+        }
+    }
+
     async fn wait_for_custom_message(
         in_tx: &asupersync::channel::mpsc::Sender<String>,
         out_rx: &Arc<Mutex<Receiver<String>>>,
@@ -9719,6 +11170,9 @@ export default function init(pi) {
                 .as_str()
                 .expect("ui request id should be a string")
                 .to_string();
+            let request_generation = ui_event["requestGeneration"]
+                .as_u64()
+                .expect("ui request generation should be an integer");
 
             let second = send_recv(
                 &in_tx,
@@ -9737,6 +11191,7 @@ export default function init(pi) {
                 "id": "3",
                 "type": "extension_ui_response",
                 "requestId": request_id,
+                "requestGeneration": request_generation,
                 "confirmed": true,
             })
             .to_string();
@@ -9830,6 +11285,233 @@ export default function init(pi) {
                 saw_completion,
                 "extension command completion report should be committed before shutdown"
             );
+        });
+    }
+
+    #[test]
+    fn rpc_stdin_eof_cancels_idle_unbounded_extension_ui_request() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let ext_entry_path = cwd.join("idle-ui-ext.mjs");
+            std::fs::write(&ext_entry_path, RPC_BUSY_EXTENSION_COMMAND_EXT)
+                .expect("write extension source");
+
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            agent_session
+                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
+                .await
+                .expect("enable extensions");
+            let manager = agent_session
+                .extensions
+                .as_ref()
+                .expect("extension region")
+                .manager()
+                .clone();
+
+            let options = build_test_rpc_options(&handle, cwd.join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let ready = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"ready","type":"get_state"}"#,
+                "get_state before idle extension UI",
+            )
+            .await;
+            assert_ok(&ready, "get_state");
+
+            let request_manager = manager.clone();
+            let pending_ui = handle.spawn(async move {
+                request_manager
+                    .request_ui(ExtensionUiRequest::new(
+                        "idle-unbounded",
+                        "confirm",
+                        json!({"title": "No command is running"}),
+                    ))
+                    .await
+            });
+            let ui_event = recv_ui_request(&out_rx, "idle unbounded UI before eof").await;
+            assert_eq!(ui_event["id"], "idle-unbounded");
+            assert!(ui_event.get("timeout_ms").is_none());
+
+            drop(in_tx);
+
+            let ui_response = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(1),
+                pending_ui,
+            )
+            .await
+            .expect("idle UI request must be cancelled immediately at stdin EOF")
+            .expect("terminal close should resolve the UI request")
+            .expect("response-bearing UI request should receive a response");
+            assert_eq!(ui_response.id, "idle-unbounded");
+            assert!(ui_response.cancelled);
+
+            let server_result = server.await;
+            assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
+        });
+    }
+
+    #[test]
+    fn ask_ui_close_guard_disconnects_forwarder_channel_on_drop() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+            let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+            let (ask_ui_tx, mut ask_ui_rx) =
+                asupersync::channel::mpsc::channel::<crate::ask::AskUiRequest>(1);
+            ask.install_channel_ui(ask_ui_tx);
+            let forwarder_ask = ask.clone();
+
+            drop(AskUiCloseGuard(ask));
+
+            let cx = AgentCx::for_request();
+            let disconnected = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(1),
+                ask_ui_rx.recv(&cx),
+            )
+            .await
+            .expect("dropping the RPC guard must release the installed channel sender");
+            assert!(
+                disconnected.is_err(),
+                "the Ask forwarder receiver must disconnect on every guarded RPC exit"
+            );
+            drop(forwarder_ask);
+        });
+    }
+
+    #[test]
+    fn extension_ui_close_guard_disconnects_channel_and_cancels_pending_request() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            let manager = ExtensionManager::new();
+            let (ui_tx, mut ui_rx) =
+                asupersync::channel::mpsc::channel::<ExtensionUiRequest>(1);
+            manager.set_ui_sender(ui_tx);
+
+            let request_manager = manager.clone();
+            let pending = handle.spawn(async move {
+                request_manager
+                    .request_ui(ExtensionUiRequest::new(
+                        "guarded-request",
+                        "confirm",
+                        json!({"title": "Wait forever"}),
+                    ))
+                    .await
+            });
+            let cx = AgentCx::for_request();
+            let request = ui_rx
+                .recv(&cx)
+                .await
+                .expect("pending request should reach the RPC forwarder");
+            assert_eq!(request.id, "guarded-request");
+
+            drop(ExtensionUiCloseGuard {
+                manager,
+                ui_state: Arc::new(std::sync::Mutex::new(RpcUiBridgeState::default())),
+            });
+
+            let response = pending
+                .await
+                .expect("terminal close should resolve the pending request")
+                .expect("response-bearing request should receive a response");
+            assert_eq!(response.id, "guarded-request");
+            assert!(response.cancelled);
+
+            let disconnected = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(1),
+                ui_rx.recv(&cx),
+            )
+            .await
+            .expect("dropping the RPC guard must release the extension UI sender");
+            assert!(
+                disconnected.is_err(),
+                "the extension UI forwarder receiver must disconnect on guarded RPC exit"
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_stdin_eof_dismisses_pending_ask_tool_request() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+            let agent_session = build_test_agent_session(Session::in_memory());
+            let mut options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+            options.ask_tool = Some(ask.clone());
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+            let ready = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"ready","type":"get_state"}"#,
+                "get_state before ask",
+            )
+            .await;
+            assert_ok(&ready, "get_state");
+
+            let ask_task = handle.spawn(async move {
+                crate::tools::Tool::execute(
+                    &ask,
+                    "rpc-eof-ask",
+                    json!({
+                        "questions": [{
+                            "question": "Pick?",
+                            "options": [{"label": "A"}, {"label": "B"}]
+                        }]
+                    }),
+                    None,
+                )
+                .await
+            });
+            let ask_event = recv_ask_request(&out_rx, "pending ask before eof").await;
+            assert_eq!(ask_event["type"], "ask_request");
+
+            drop(in_tx);
+            let server_result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(1),
+                server,
+            )
+            .await
+            .expect("RPC EOF must not wait for the ask tool's five-minute timeout");
+            assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
+
+            let ask_result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(1),
+                ask_task,
+            )
+            .await
+            .expect("pending ask must be dismissed promptly after RPC EOF")
+            .expect_err("EOF must dismiss rather than answer the picker");
+            assert!(ask_result.to_string().contains("dismissed"), "{ask_result}");
         });
     }
 

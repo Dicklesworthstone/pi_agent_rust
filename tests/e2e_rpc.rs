@@ -3857,6 +3857,68 @@ async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> 
     }
 }
 
+fn ui_request_generation(event: &Value) -> u64 {
+    event
+        .get("requestGeneration")
+        .and_then(Value::as_u64)
+        .expect("extension UI request must carry its correlation generation")
+}
+
+fn extension_ui_response_command(
+    command_id: &str,
+    request_id: &str,
+    request_generation: u64,
+    response_fields: Value,
+) -> String {
+    let mut command = json!({
+        "id": command_id,
+        "type": "extension_ui_response",
+        "requestId": request_id,
+        "requestGeneration": request_generation,
+    });
+    let command = command
+        .as_object_mut()
+        .expect("extension UI response command is an object");
+    let response_fields = response_fields
+        .as_object()
+        .expect("extension UI response fields are an object");
+    command.extend(response_fields.clone());
+    Value::Object(command.clone()).to_string()
+}
+
+async fn assert_no_ui_request_with_id(
+    out_rx: &Arc<Mutex<Receiver<String>>>,
+    request_id: &str,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let recv_result = {
+            let rx = out_rx.lock().expect("lock rpc output receiver");
+            rx.try_recv()
+        };
+        match recv_result {
+            Ok(line) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&line)
+                    && value.get("type").and_then(Value::as_str)
+                        == Some("extension_ui_request")
+                    && value.get("id").and_then(Value::as_str) == Some(request_id)
+                {
+                    panic!("unexpected stale extension UI request: {value}");
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                panic!("RPC output disconnected while checking for stale UI request")
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+    }
+}
+
 async fn wait_for_custom_message(
     in_tx: &asupersync::channel::mpsc::Sender<String>,
     out_rx: &Arc<Mutex<Receiver<String>>>,
@@ -4160,17 +4222,17 @@ fn rpc_extension_ui_confirm_roundtrip() {
         // Spawn a request_ui call from the extension side.
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-confirm-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-confirm-1",
+                "confirm",
+                json!({
                     "title": "Delete file?",
                     "message": "This cannot be undone.",
                     "timeout": 5000
                 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("test-ext".to_string()),
-            };
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("test-ext".to_string()));
             mgr.request_ui(request).await
         });
 
@@ -4180,12 +4242,23 @@ fn rpc_extension_ui_confirm_roundtrip() {
         assert_eq!(ui_event["id"], "req-confirm-1");
         assert_eq!(ui_event["method"], "confirm");
         assert_eq!(ui_event["title"], "Delete file?");
+        let request_generation = ui_event["requestGeneration"]
+            .as_u64()
+            .expect("extension UI event carries its correlation generation");
 
         // Respond with confirmed = true.
+        let response = json!({
+            "id": "cmd-1",
+            "type": "extension_ui_response",
+            "requestId": "req-confirm-1",
+            "requestGeneration": request_generation,
+            "confirmed": true,
+        })
+        .to_string();
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-1","type":"extension_ui_response","requestId":"req-confirm-1","confirmed":true}"#,
+            &response,
             "confirm_response",
         )
         .await;
@@ -4232,13 +4305,12 @@ fn rpc_extension_ui_confirm_denied() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-deny-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "Do risky thing?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            let request = ExtensionUiRequest::new(
+                "req-deny-1",
+                "confirm",
+                json!({ "title": "Do risky thing?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
@@ -4246,10 +4318,16 @@ fn rpc_extension_ui_confirm_denied() {
         assert_eq!(ui_event["id"], "req-deny-1");
 
         // Respond with confirmed = false.
+        let response = extension_ui_response_command(
+            "cmd-2",
+            "req-deny-1",
+            ui_request_generation(&ui_event),
+            json!({"value": false}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-2","type":"extension_ui_response","requestId":"req-deny-1","value":false}"#,
+            &response,
             "confirm_denied_response",
         )
         .await;
@@ -4297,17 +4375,17 @@ fn rpc_extension_ui_select_roundtrip() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-select-1".to_string(),
-                method: "select".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-select-1",
+                "select",
+                json!({
                     "title": "Pick a model",
                     "options": ["claude-sonnet", "gpt-4o", "gemini-pro"],
                     "timeout": 5000
                 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("model-picker-ext".to_string()),
-            };
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("model-picker-ext".to_string()));
             mgr.request_ui(request).await
         });
 
@@ -4318,10 +4396,16 @@ fn rpc_extension_ui_select_roundtrip() {
         assert!(ui_event["options"].is_array());
 
         // Select the second option.
+        let response = extension_ui_response_command(
+            "cmd-3",
+            "req-select-1",
+            ui_request_generation(&ui_event),
+            json!({"value": "gpt-4o"}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-3","type":"extension_ui_response","requestId":"req-select-1","value":"gpt-4o"}"#,
+            &response,
             "select_response",
         )
         .await;
@@ -4369,17 +4453,17 @@ fn rpc_extension_ui_input_roundtrip() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-input-1".to_string(),
-                method: "input".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-input-1",
+                "input",
+                json!({
                     "title": "Enter API key",
                     "message": "Paste your key below",
                     "timeout": 5000
                 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("api-key-ext".to_string()),
-            };
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("api-key-ext".to_string()));
             mgr.request_ui(request).await
         });
 
@@ -4388,10 +4472,16 @@ fn rpc_extension_ui_input_roundtrip() {
         assert_eq!(ui_event["method"], "input");
 
         // Respond with typed text.
+        let response = extension_ui_response_command(
+            "cmd-4",
+            "req-input-1",
+            ui_request_generation(&ui_event),
+            json!({"value": "sk-test-12345"}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-4","type":"extension_ui_response","requestId":"req-input-1","value":"sk-test-12345"}"#,
+            &response,
             "input_response",
         )
         .await;
@@ -4439,17 +4529,16 @@ fn rpc_extension_ui_editor_roundtrip() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-editor-1".to_string(),
-                method: "editor".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-editor-1",
+                "editor",
+                json!({
                     "title": "Edit config",
                     "message": "Modify the YAML below",
                     "timeout": 5000
                 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
@@ -4458,10 +4547,16 @@ fn rpc_extension_ui_editor_roundtrip() {
         assert_eq!(ui_event["method"], "editor");
 
         // Respond with edited text.
+        let response = extension_ui_response_command(
+            "cmd-5",
+            "req-editor-1",
+            ui_request_generation(&ui_event),
+            json!({"value": "key: new_value"}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-5","type":"extension_ui_response","requestId":"req-editor-1","value":"key: new_value"}"#,
+            &response,
             "editor_response",
         )
         .await;
@@ -4509,13 +4604,12 @@ fn rpc_extension_ui_cancel_response() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-cancel-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "Proceed?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            let request = ExtensionUiRequest::new(
+                "req-cancel-1",
+                "confirm",
+                json!({ "title": "Proceed?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
@@ -4523,10 +4617,16 @@ fn rpc_extension_ui_cancel_response() {
         assert_eq!(ui_event["id"], "req-cancel-1");
 
         // Respond with cancelled: true.
+        let response = extension_ui_response_command(
+            "cmd-6",
+            "req-cancel-1",
+            ui_request_generation(&ui_event),
+            json!({"cancelled": true}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-6","type":"extension_ui_response","requestId":"req-cancel-1","cancelled":true}"#,
+            &response,
             "cancel_response",
         )
         .await;
@@ -4575,7 +4675,7 @@ fn rpc_extension_ui_response_without_extensions() {
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-7","type":"extension_ui_response","requestId":"req-x","confirmed":true}"#,
+            r#"{"id":"cmd-7","type":"extension_ui_response","requestId":"req-x","requestGeneration":0,"confirmed":true}"#,
             "no_extensions",
         )
         .await;
@@ -4618,24 +4718,30 @@ fn rpc_extension_ui_mismatched_request_id() {
 
         let mgr = manager.clone();
         let _ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-real-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "Do it?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            let request = ExtensionUiRequest::new(
+                "req-real-1",
+                "confirm",
+                json!({ "title": "Do it?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
         let ui_event = recv_ui_request(&out_rx, "mismatch").await;
         assert_eq!(ui_event["id"], "req-real-1");
+        let request_generation = ui_request_generation(&ui_event);
 
         // Send response with WRONG request ID.
+        let wrong_response = extension_ui_response_command(
+            "cmd-8",
+            "req-WRONG",
+            request_generation,
+            json!({"confirmed": true}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-8","type":"extension_ui_response","requestId":"req-WRONG","confirmed":true}"#,
+            &wrong_response,
             "wrong_id_response",
         )
         .await;
@@ -4647,10 +4753,16 @@ fn rpc_extension_ui_mismatched_request_id() {
         );
 
         // Now send the correct one to clean up.
+        let correct_response = extension_ui_response_command(
+            "cmd-9",
+            "req-real-1",
+            request_generation,
+            json!({"confirmed": true}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-9","type":"extension_ui_response","requestId":"req-real-1","confirmed":true}"#,
+            &correct_response,
             "correct_id_response",
         )
         .await;
@@ -4742,26 +4854,33 @@ fn rpc_extension_ui_id_alias_roundtrip() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-legacy-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "Legacy id alias?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            let request = ExtensionUiRequest::new(
+                "req-legacy-1",
+                "confirm",
+                json!({ "title": "Legacy id alias?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
         let ui_event = recv_ui_request(&out_rx, "id_alias").await;
         assert_eq!(ui_event["id"], "req-legacy-1");
         assert_eq!(ui_event["method"], "confirm");
+        let request_generation = ui_request_generation(&ui_event);
 
         // Upstream accepts top-level "id" as a requestId alias for
         // extension_ui_response.
+        let response = json!({
+            "id": "req-legacy-1",
+            "type": "extension_ui_response",
+            "requestGeneration": request_generation,
+            "confirmed": true,
+        })
+        .to_string();
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"req-legacy-1","type":"extension_ui_response","confirmed":true}"#,
+            &response,
             "id_alias_response",
         )
         .await;
@@ -4774,6 +4893,199 @@ fn rpc_extension_ui_id_alias_roundtrip() {
         let response = response.expect("should have a response");
         assert_eq!(response.value, Some(json!(true)));
         assert!(!response.cancelled);
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+#[test]
+fn rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse() {
+    let _harness = TestHarness::new("rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (agent_session, manager) =
+            build_agent_session_with_extensions(Session::in_memory(), &cassette_dir);
+        let options = build_options(
+            &handle,
+            PathBuf::from("/tmp/auth_ui_generation_aba.json"),
+            vec![],
+            vec![],
+        );
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+
+        let first_manager = manager.clone();
+        let first_task = handle.spawn(async move {
+            first_manager
+                .request_ui(
+                    ExtensionUiRequest::new(
+                        "reused-id",
+                        "confirm",
+                        json!({"title": "first"}),
+                    )
+                    .with_timeout_ms(40),
+                )
+                .await
+        });
+        let first_event = recv_ui_request(&out_rx, "same-id first").await;
+        let first_generation = ui_request_generation(&first_event);
+        let _ = first_task.await;
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(20)).await;
+
+        let second_manager = manager.clone();
+        let second_task = handle.spawn(async move {
+            second_manager
+                .request_ui(
+                    ExtensionUiRequest::new(
+                        "reused-id",
+                        "confirm",
+                        json!({"title": "second"}),
+                    )
+                    .with_timeout_ms(5_000),
+                )
+                .await
+        });
+        let second_event = recv_ui_request(&out_rx, "same-id second").await;
+        let second_generation = ui_request_generation(&second_event);
+        assert_ne!(first_generation, second_generation);
+
+        let late_response = extension_ui_response_command(
+            "late-a",
+            "reused-id",
+            first_generation,
+            json!({"confirmed": false}),
+        );
+        let rejected = send_recv(&in_tx, &out_rx, &late_response, "late same-id response").await;
+        assert_err(&rejected, "extension_ui_response");
+        assert!(
+            rejected["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Unexpected requestGeneration"))
+        );
+        assert!(manager.ui_request_is_pending("reused-id"));
+
+        let current_response = extension_ui_response_command(
+            "current-b",
+            "reused-id",
+            second_generation,
+            json!({"confirmed": true}),
+        );
+        let accepted = send_recv(
+            &in_tx,
+            &out_rx,
+            &current_response,
+            "current same-id response",
+        )
+        .await;
+        assert_ok(&accepted, "extension_ui_response");
+        let second = second_task
+            .await
+            .expect("second request succeeds")
+            .expect("second request has response");
+        assert_eq!(second.value, Some(json!(true)));
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+#[test]
+fn rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves() {
+    let _harness = TestHarness::new("rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (agent_session, manager) =
+            build_agent_session_with_extensions(Session::in_memory(), &cassette_dir);
+        let options = build_options(
+            &handle,
+            PathBuf::from("/tmp/auth_ui_queued_deadline.json"),
+            vec![],
+            vec![],
+        );
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+
+        let active_manager = manager.clone();
+        let active_task = handle.spawn(async move {
+            active_manager
+                .request_ui(ExtensionUiRequest::new(
+                    "unbounded-active",
+                    "confirm",
+                    json!({"title": "active"}),
+                ))
+                .await
+        });
+        let active_event = recv_ui_request(&out_rx, "unbounded active").await;
+        let active_generation = ui_request_generation(&active_event);
+
+        let queued_manager = manager.clone();
+        let queued_task = handle.spawn(async move {
+            queued_manager
+                .request_ui(
+                    ExtensionUiRequest::new_capability_prompt(
+                        "bounded-queued",
+                        "trusted-extension",
+                        "exec",
+                        json!({"title": "queued"}),
+                    )
+                    .with_timeout_ms(40),
+                )
+                .await
+        });
+        let queued_response = queued_task
+            .await
+            .expect("queued capability timeout is a typed response")
+            .expect("capability prompt expects a response");
+        assert_eq!(queued_response.id, "bounded-queued");
+        assert_eq!(
+            queued_response.value,
+            Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+                "reason": "auto_deny",
+            }))
+        );
+
+        let active_response = extension_ui_response_command(
+            "resolve-active",
+            "unbounded-active",
+            active_generation,
+            json!({"confirmed": true}),
+        );
+        let accepted = send_recv(
+            &in_tx,
+            &out_rx,
+            &active_response,
+            "resolve unbounded active",
+        )
+        .await;
+        assert_ok(&accepted, "extension_ui_response");
+        let _ = active_task.await;
+
+        assert_no_ui_request_with_id(
+            &out_rx,
+            "bounded-queued",
+            Duration::from_millis(100),
+        )
+        .await;
 
         drop(in_tx);
         let _ = server.await;
@@ -4812,29 +5124,30 @@ fn rpc_extension_ui_sequential_ordering() {
         // Fire two requests concurrently.
         let mgr1 = manager.clone();
         let ui_task_1 = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-seq-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "First?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("ext-a".to_string()),
-            };
+            let request = ExtensionUiRequest::new(
+                "req-seq-1",
+                "confirm",
+                json!({ "title": "First?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("ext-a".to_string()));
             mgr1.request_ui(request).await
         });
 
         // Wait for the first to be emitted before sending the second.
         let first_event = recv_ui_request(&out_rx, "seq_first").await;
         assert_eq!(first_event["id"], "req-seq-1");
+        let first_generation = ui_request_generation(&first_event);
 
         let mgr2 = manager.clone();
         let ui_task_2 = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-seq-2".to_string(),
-                method: "input".to_string(),
-                payload: json!({ "title": "Second?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("ext-b".to_string()),
-            };
+            let request = ExtensionUiRequest::new(
+                "req-seq-2",
+                "input",
+                json!({ "title": "Second?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("ext-b".to_string()));
             mgr2.request_ui(request).await
         });
 
@@ -4842,10 +5155,16 @@ fn rpc_extension_ui_sequential_ordering() {
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(100)).await;
 
         // Respond to the first — this should dequeue the second.
+        let first_response = extension_ui_response_command(
+            "cmd-11",
+            "req-seq-1",
+            first_generation,
+            json!({"confirmed": true}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-11","type":"extension_ui_response","requestId":"req-seq-1","confirmed":true}"#,
+            &first_response,
             "seq_first_response",
         )
         .await;
@@ -4861,12 +5180,19 @@ fn rpc_extension_ui_sequential_ordering() {
         let second_event = recv_ui_request(&out_rx, "seq_second").await;
         assert_eq!(second_event["id"], "req-seq-2");
         assert_eq!(second_event["method"], "input");
+        let second_generation = ui_request_generation(&second_event);
 
         // Respond to the second.
+        let second_response = extension_ui_response_command(
+            "cmd-12",
+            "req-seq-2",
+            second_generation,
+            json!({"value": "hello"}),
+        );
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-12","type":"extension_ui_response","requestId":"req-seq-2","value":"hello"}"#,
+            &second_response,
             "seq_second_response",
         )
         .await;
@@ -4915,7 +5241,7 @@ fn rpc_extension_ui_no_active_request() {
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-13","type":"extension_ui_response","requestId":"req-ghost","confirmed":true}"#,
+            r#"{"id":"cmd-13","type":"extension_ui_response","requestId":"req-ghost","requestGeneration":0,"confirmed":true}"#,
             "no_active",
         )
         .await;
@@ -4963,16 +5289,15 @@ fn rpc_extension_ui_notify_fire_and_forget() {
         // Send a "notify" request — fire-and-forget, no response expected.
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-notify-1".to_string(),
-                method: "notify".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-notify-1",
+                "notify",
+                json!({
                     "title": "Heads up!",
                     "message": "Something happened"
                 }),
-                timeout_ms: None,
-                extension_id: Some("notifier-ext".to_string()),
-            };
+            )
+            .with_extension_id(Some("notifier-ext".to_string()));
             mgr.request_ui(request).await
         });
 

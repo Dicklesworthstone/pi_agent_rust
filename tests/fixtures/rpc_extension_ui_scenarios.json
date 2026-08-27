@@ -6,6 +6,7 @@
     "request_event_type": "extension_ui_request",
     "response_command_type": "extension_ui_response",
     "request_id_field": "requestId",
+    "request_generation_field": "requestGeneration",
     "legacy_request_id_alias": "id"
   },
   "scenarios": [
@@ -26,6 +27,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-confirm-accepted",
+        "requestGeneration": 1,
         "confirmed": true
       },
       "expect": {
@@ -50,6 +52,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-confirm-denied",
+        "requestGeneration": 1,
         "value": false
       },
       "expect": {
@@ -75,6 +78,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-select-string",
+        "requestGeneration": 1,
         "value": "gpt-4o"
       },
       "expect": {
@@ -109,6 +113,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-select-object",
+        "requestGeneration": 1,
         "value": "stage"
       },
       "expect": {
@@ -134,6 +139,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-input-text",
+        "requestGeneration": 1,
         "value": "sk-test-12345"
       },
       "expect": {
@@ -159,6 +165,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-editor-text",
+        "requestGeneration": 1,
         "value": "key: new_value"
       },
       "expect": {
@@ -183,6 +190,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-cancelled",
+        "requestGeneration": 1,
         "cancelled": true
       },
       "expect": {
@@ -227,6 +235,7 @@
       "response": {
         "type": "extension_ui_response",
         "id": "req-id-alias",
+        "requestGeneration": 1,
         "confirmed": true
       },
       "expect": {
@@ -251,6 +260,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-seq-1",
+        "requestGeneration": 1,
         "confirmed": true
       },
       "expect": {
@@ -276,6 +286,7 @@
       "response": {
         "type": "extension_ui_response",
         "requestId": "req-seq-2",
+        "requestGeneration": 1,
         "value": "hello"
       },
       "expect": {

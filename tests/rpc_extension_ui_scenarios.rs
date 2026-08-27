@@ -19,6 +19,10 @@ fn rpc_extension_ui_fixture_has_required_parity_scenarios() {
         fixture["wire"]["response_command_type"],
         "extension_ui_response"
     );
+    assert_eq!(
+        fixture["wire"]["request_generation_field"],
+        "requestGeneration"
+    );
 
     let scenarios = fixture["scenarios"]
         .as_array()
@@ -57,6 +61,13 @@ fn rpc_extension_ui_fixture_has_required_parity_scenarios() {
             assert!(
                 response.get("requestId").is_some() || response.get("id").is_some(),
                 "response must carry requestId or legacy id alias for {id}"
+            );
+            assert!(
+                response
+                    .get("requestGeneration")
+                    .and_then(Value::as_u64)
+                    .is_some(),
+                "response must carry an unsigned requestGeneration for {id}"
             );
         }
     }
