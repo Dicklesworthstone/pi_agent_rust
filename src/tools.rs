@@ -193,6 +193,10 @@ pub trait Tool: Send + Sync {
     fn effects(&self) -> ToolEffects {
         ToolEffects::write()
     }
+
+    /// Attach the owning registry's live background-job session scope.
+    /// Non-job tools intentionally ignore it.
+    fn bind_job_session_scope(&mut self, _scope: crate::jobs::JobSessionScope) {}
 }
 
 /// Tool execution output.
@@ -5225,6 +5229,9 @@ pub(crate) fn resize_image_if_needed(
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    /// Shared by bash/jobs/hub and rebound by [`crate::agent::AgentSession`]
+    /// to the live session handle.
+    job_session_scope: crate::jobs::JobSessionScope,
     /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
     /// schema until promoted via `xdev promote`. Everything not in this set
     /// is in the schema (essential tier).
@@ -5260,6 +5267,7 @@ impl ToolRegistry {
         let legacy_workspace = WorkspaceHandle::default();
         let workspace = workspace.unwrap_or(&legacy_workspace);
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        let job_session_scope = crate::jobs::JobSessionScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
         let image_auto_resize = config.is_none_or(Config::image_auto_resize);
@@ -5307,7 +5315,7 @@ impl ToolRegistry {
                         .with_mutation_recorder(mutation_recorder.clone())
                         .with_workspace(workspace.clone()),
                 )),
-                "jobs" => tools.push(Box::new(JobsTool)),
+                "jobs" => tools.push(Box::new(JobsTool::new())),
                 "hub" => tools.push(Box::new(HubTool::new(cwd))),
                 "security_scan" => {
                     tools.push(Box::new(crate::security_scan::SecurityScanTool::new(cwd)));
@@ -5496,17 +5504,27 @@ impl ToolRegistry {
             }
         }
 
+        for tool in &mut tools {
+            tool.bind_job_session_scope(job_session_scope.clone());
+        }
+
         Self {
             tools,
+            job_session_scope,
             discoverable: discoverable_names,
             mutation_recorder,
         }
     }
 
     /// Construct a registry from a pre-built tool list.
-    pub fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+    pub fn from_tools(mut tools: Vec<Box<dyn Tool>>) -> Self {
+        let job_session_scope = crate::jobs::JobSessionScope::default();
+        for tool in &mut tools {
+            tool.bind_job_session_scope(job_session_scope.clone());
+        }
         Self {
             tools,
+            job_session_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
         }
@@ -5546,7 +5564,8 @@ impl ToolRegistry {
     }
 
     /// Append a tool.
-    pub fn push(&mut self, tool: Box<dyn Tool>) {
+    pub fn push(&mut self, mut tool: Box<dyn Tool>) {
+        tool.bind_job_session_scope(self.job_session_scope.clone());
         self.tools.push(tool);
     }
 
@@ -5555,7 +5574,21 @@ impl ToolRegistry {
     where
         I: IntoIterator<Item = Box<dyn Tool>>,
     {
-        self.tools.extend(tools);
+        for mut tool in tools {
+            tool.bind_job_session_scope(self.job_session_scope.clone());
+            self.tools.push(tool);
+        }
+    }
+
+    /// The shared scope captured by the job completion fetcher.
+    #[must_use]
+    pub fn job_session_scope(&self) -> crate::jobs::JobSessionScope {
+        self.job_session_scope.clone()
+    }
+
+    /// Rebind every job-aware tool and fetcher to a live session resolver.
+    pub fn bind_job_session_resolver(&self, resolver: crate::jobs::JobSessionIdResolver) {
+        self.job_session_scope.bind(resolver);
     }
 
     /// Get all tools.
@@ -6398,6 +6431,7 @@ pub struct BashTool {
     shell_path: Option<String>,
     command_prefix: Option<String>,
     artifact_root: Option<PathBuf>,
+    job_session_scope: crate::jobs::JobSessionScope,
     /// Mediation settings (`bash.mediation*`, bd-cv653.1.7).
     mediation: Option<crate::config::BashSettings>,
 }
@@ -7056,6 +7090,7 @@ impl BashTool {
             shell_path: None,
             command_prefix: None,
             artifact_root: None,
+            job_session_scope: crate::jobs::JobSessionScope::default(),
             mediation: None,
         }
     }
@@ -7070,6 +7105,7 @@ impl BashTool {
             shell_path,
             command_prefix,
             artifact_root: None,
+            job_session_scope: crate::jobs::JobSessionScope::default(),
             mediation: None,
         }
     }
@@ -7088,6 +7124,7 @@ impl BashTool {
             shell_path: None,
             command_prefix: None,
             artifact_root: Some(artifact_root.to_path_buf()),
+            job_session_scope: crate::jobs::JobSessionScope::default(),
             mediation: None,
         }
     }
@@ -7131,6 +7168,10 @@ impl Tool for BashTool {
         ToolEffects::process().union(ToolEffects::write())
     }
 
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
@@ -7140,6 +7181,11 @@ impl Tool for BashTool {
     ) -> Result<ToolOutput> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let background_session_id = if input.background.unwrap_or(false) {
+            Some(self.job_session_scope.session_id().await?)
+        } else {
+            None
+        };
 
         // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
         // real pseudo-terminal when `bash.pty` is auto/always; the tool
@@ -7209,6 +7255,15 @@ impl Tool for BashTool {
                                 // result instead of blocking on foreground
                                 // output.
                                 let job = crate::jobs::spawn_background(
+                                    background_session_id
+                                        .as_deref()
+                                        .ok_or_else(|| {
+                                            Error::tool(
+                                                "bash",
+                                                "background job session scope was not resolved"
+                                                    .to_string(),
+                                            )
+                                        })?,
                                     &self.cwd,
                                     self.shell_path.as_deref(),
                                     self.command_prefix.as_deref(),
@@ -7296,6 +7351,14 @@ impl Tool for BashTool {
         // timeout/tree-kill discipline via the jobs registry.
         if input.background.unwrap_or(false) {
             let job = match crate::jobs::spawn_background(
+                background_session_id
+                    .as_deref()
+                    .ok_or_else(|| {
+                        Error::tool(
+                            "bash",
+                            "background job session scope was not resolved".to_string(),
+                        )
+                    })?,
                 &self.cwd,
                 self.shell_path.as_deref(),
                 self.command_prefix.as_deref(),
@@ -7408,7 +7471,24 @@ struct JobsInput {
 /// Manage background bash jobs spawned with `bash {background: true}`
 /// (bd-cv653.3.10). The future hub tool's jobs action group wraps the same
 /// registry (bd-cv653.5.4).
-pub struct JobsTool;
+pub struct JobsTool {
+    job_session_scope: crate::jobs::JobSessionScope,
+}
+
+impl JobsTool {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            job_session_scope: crate::jobs::JobSessionScope::default(),
+        }
+    }
+}
+
+impl Default for JobsTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
@@ -7455,6 +7535,10 @@ impl Tool for JobsTool {
         ToolEffects::process()
     }
 
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -7463,10 +7547,11 @@ impl Tool for JobsTool {
     ) -> Result<ToolOutput> {
         let input: JobsInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let owner_session_id = self.job_session_scope.session_id().await?;
         let action = input.action.trim().to_ascii_lowercase();
         let payload = match action.as_str() {
             "list" => {
-                let jobs = crate::jobs::list()?;
+                let jobs = crate::jobs::list(&owner_session_id)?;
                 serde_json::json!({ "schema": crate::jobs::JOB_SCHEMA, "jobs": jobs })
             }
             "wait" => {
@@ -7475,9 +7560,12 @@ impl Tool for JobsTool {
                     .as_deref()
                     .ok_or_else(|| Error::validation("jobs wait requires jobId".to_string()))?;
                 let budget_ms = input.timeout_ms.unwrap_or(30_000).min(600_000);
-                let snapshot =
-                    crate::jobs::wait_async(job_id, std::time::Duration::from_millis(budget_ms))
-                        .await?;
+                let snapshot = crate::jobs::wait_async(
+                    &owner_session_id,
+                    job_id,
+                    std::time::Duration::from_millis(budget_ms),
+                )
+                .await?;
                 serde_json::to_value(&snapshot)?
             }
             "cancel" => {
@@ -7485,7 +7573,7 @@ impl Tool for JobsTool {
                     .job_id
                     .as_deref()
                     .ok_or_else(|| Error::validation("jobs cancel requires jobId".to_string()))?;
-                let snapshot = crate::jobs::cancel_async(job_id).await?;
+                let snapshot = crate::jobs::cancel_async(&owner_session_id, job_id).await?;
                 serde_json::to_value(&snapshot)?
             }
             other => {
@@ -7921,12 +8009,14 @@ struct HubReadyInput {
 /// lands with the agent-hub registry (bd-cv653.5.3).
 pub struct HubTool {
     cwd: PathBuf,
+    job_session_scope: crate::jobs::JobSessionScope,
 }
 
 impl HubTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            job_session_scope: crate::jobs::JobSessionScope::default(),
         }
     }
 }
@@ -8001,6 +8091,10 @@ impl Tool for HubTool {
         ToolEffects::process()
     }
 
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
@@ -8011,7 +8105,7 @@ impl Tool for HubTool {
         let input: HubInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let op = input.op.trim().to_ascii_lowercase();
-        let dispatched = self.dispatch(&op, &input);
+        let dispatched = self.dispatch(&op, &input).await;
         let (text, details, is_error) = match dispatched {
             Ok((text, details)) => (text, details, false),
             Err(err) => {
@@ -8034,7 +8128,7 @@ impl Tool for HubTool {
 
 impl HubTool {
     #[allow(clippy::too_many_lines)]
-    fn dispatch(&self, op: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
+    async fn dispatch(&self, op: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
         let name_required = |op: &str| -> Result<String> {
             input
                 .name
@@ -8194,6 +8288,7 @@ impl HubTool {
                 (format!("To '{name}': {}", actions.join("; ")), details)
             }
             "jobs" => {
+                let owner_session_id = self.job_session_scope.session_id().await?;
                 let action = input
                     .action
                     .clone()
@@ -8201,7 +8296,7 @@ impl HubTool {
                     .to_ascii_lowercase();
                 match action.as_str() {
                     "list" => {
-                        let jobs = crate::jobs::list()?;
+                        let jobs = crate::jobs::list(&owner_session_id)?;
                         let details = serde_json::json!({
                             "schema": crate::jobs::JOB_SCHEMA,
                             "jobs": jobs,
@@ -8233,6 +8328,7 @@ impl HubTool {
                         })?;
                         let budget = input.timeout_ms.unwrap_or(30_000).min(600_000);
                         let snapshot = crate::jobs::wait_async(
+                            &owner_session_id,
                             &job_id,
                             std::time::Duration::from_millis(budget),
                         )
@@ -8254,7 +8350,8 @@ impl HubTool {
                         let job_id = input.job_id.clone().ok_or_else(|| {
                             Error::validation("hub jobs cancel requires jobId".to_string())
                         })?;
-                        let snapshot = crate::jobs::cancel_async(&job_id).await?;
+                        let snapshot =
+                            crate::jobs::cancel_async(&owner_session_id, &job_id).await?;
                         let details = serde_json::to_value(&snapshot)?;
                         (format!("job {}: {}", snapshot.id, snapshot.status), details)
                     }
@@ -12984,6 +13081,23 @@ pub(crate) fn attach_child_job_discipline(child: &std::process::Child) -> bool {
         let _ = child;
         true
     }
+}
+
+/// Terminate descendants still covered by an already-reaped root's platform
+/// discipline without walking a potentially recycled root PID.
+pub(crate) fn terminate_reaped_child_discipline(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = win_job::terminate(pid);
+    }
+    #[cfg(unix)]
+    if let Ok(raw_pid) = i32::try_from(pid)
+        && let Some(process_group) = rustix::process::Pid::from_raw(raw_pid)
+    {
+        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
 }
 
 #[cfg(windows)]

@@ -209,6 +209,40 @@ pub fn mount_tools(manager: &std::sync::Arc<McpManager>) -> Vec<Box<dyn Tool>> {
     out
 }
 
+/// Mount cached wrappers for one server only.
+///
+/// Runtime trust/test flows use this targeted form so a newly available
+/// server does not re-append wrappers for every server that was already
+/// mounted during startup (bd-vjfol).
+#[must_use]
+pub fn mount_server_tools(
+    manager: &std::sync::Arc<McpManager>,
+    server_name: &str,
+) -> Vec<Box<dyn Tool>> {
+    let Some((server, metas)) = manager
+        .mounted_tool_metas()
+        .into_iter()
+        .find(|(server, _)| server == server_name)
+    else {
+        return Vec::new();
+    };
+    metas
+        .into_iter()
+        .map(|meta| Box::new(McpTool::new(&server, &meta, manager.clone())) as Box<dyn Tool>)
+        .collect()
+}
+
+/// Connect every acknowledged server, then snapshot its cached tools as
+/// first-class wrappers. Call this once after native, foreign, CLI, and
+/// extension-provided server definitions have all been registered.
+#[must_use]
+pub async fn connect_trusted_and_mount_tools(
+    manager: &std::sync::Arc<McpManager>,
+) -> Vec<Box<dyn Tool>> {
+    manager.connect_trusted().await;
+    mount_tools(manager)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

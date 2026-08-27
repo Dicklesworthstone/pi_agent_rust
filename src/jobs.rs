@@ -11,11 +11,12 @@
 //! tool's jobs action group (bd-cv653.5.4) wraps this same registry, so
 //! the consolidation costs zero rework.
 //!
-//! Session scoping: the registry lives for the process; `kill_all` runs at
-//! the main shutdown chokepoint so no job outlives the session (no orphan
-//! daemons across restarts).
+//! Session scoping: the registry lives for the process, but every descriptor,
+//! management operation, and completion notice carries its originating
+//! session id. Cross-session ids fail exactly like unknown ids. `kill_all`
+//! remains the final process-shutdown chokepoint so no child survives exit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +30,72 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::model::{Message, UserContent, UserMessage};
+
+/// Future returned by the live session-identity resolver shared by the jobs
+/// tools and their completion-notice fetcher.
+pub type JobSessionIdFuture = futures::future::BoxFuture<'static, Option<String>>;
+
+/// Resolves the session that owns a job operation at the instant it runs.
+/// Reading the live session rather than caching its startup id keeps RPC and
+/// interactive new/switch/fork transitions scoped without special-case
+/// rebinding at every transition site.
+pub type JobSessionIdResolver = Arc<dyn Fn() -> JobSessionIdFuture + Send + Sync>;
+
+/// Shared, dynamically resolved job ownership scope for one tool registry.
+#[derive(Clone)]
+pub struct JobSessionScope {
+    resolver: Arc<Mutex<JobSessionIdResolver>>,
+}
+
+impl JobSessionScope {
+    /// Create a fixed scope, primarily for standalone tool embeddings and
+    /// focused tests that do not have a live [`crate::session::Session`].
+    #[must_use]
+    pub fn fixed(session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        let resolver: JobSessionIdResolver = Arc::new(move || {
+            let session_id = session_id.clone();
+            Box::pin(async move { Some(session_id) })
+        });
+        Self {
+            resolver: Arc::new(Mutex::new(resolver)),
+        }
+    }
+
+    /// Rebind this shared scope to a live session resolver.
+    pub fn bind(&self, resolver: JobSessionIdResolver) {
+        *self
+            .resolver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = resolver;
+    }
+
+    /// Resolve a non-empty owner id, failing closed when the live session is
+    /// unavailable instead of falling back to a process-global namespace.
+    pub async fn session_id(&self) -> Result<String> {
+        let resolver = self
+            .resolver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        resolver()
+            .await
+            .filter(|session_id| !session_id.trim().is_empty())
+            .ok_or_else(|| {
+                Error::tool(
+                    "jobs",
+                    "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable"
+                        .to_string(),
+                )
+            })
+    }
+}
+
+impl Default for JobSessionScope {
+    fn default() -> Self {
+        Self::fixed(format!("standalone-{}", uuid::Uuid::new_v4().simple()))
+    }
+}
 
 /// Tool-result schema tag for job descriptors (stable audit contract).
 pub const JOB_SCHEMA: &str = "pi.bash_job.v1";
@@ -73,6 +140,18 @@ const MAX_ASYNC_WAIT_SLICE: Duration = Duration::from_secs(60 * 60);
 /// reaches another delivery boundary.
 const MAX_COMPLETION_NOTICES: usize = 64;
 
+/// Process-wide backstop across many session identities in a long-lived RPC
+/// host. The per-session cap above preserves fairness; this bound prevents a
+/// client that continually creates sessions from retaining notices forever.
+const MAX_TOTAL_COMPLETION_NOTICES: usize = 512;
+
+/// Bound retained model-visible command metadata independently from the
+/// command passed to the shell. The suffix makes truncation explicit.
+const MAX_RETAINED_COMMAND_BYTES: usize = 64 * 1024;
+
+/// Bound arbitrary host-produced notice text, including `/tan` task text.
+const MAX_COMPLETION_NOTICE_BYTES: usize = 32 * 1024;
+
 /// Settled descriptors remain queryable for recent history, but the process
 /// must not retain every command/tail forever during a long-lived RPC session.
 const MAX_RETAINED_SETTLED_JOBS: usize = 128;
@@ -106,6 +185,7 @@ impl JobStatus {
 
 /// Live registry entry. The output tail is shared with the pump threads.
 struct JobEntry {
+    owner_session_id: String,
     id: String,
     command: String,
     started_at_ms: i64,
@@ -218,6 +298,7 @@ impl JobSnapshotSource {
 
 #[derive(Clone)]
 struct JobWaitHandle {
+    owner_session_id: String,
     id: String,
     settled_snapshot: Arc<Mutex<Option<JobSnapshot>>>,
     settled_notify: Arc<Notify>,
@@ -401,7 +482,12 @@ struct JobRegistry {
     starting_jobs: usize,
     next_job_sequence: u64,
     next_settled_sequence: u64,
-    notices: Vec<String>,
+    notices: VecDeque<CompletionNotice>,
+}
+
+struct CompletionNotice {
+    owner_session_id: String,
+    text: String,
 }
 
 fn registry() -> &'static Mutex<JobRegistry> {
@@ -598,10 +684,12 @@ impl Drop for BackgroundChild {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        let pid = child.id();
         if matches!(child.try_wait(), Ok(Some(_))) {
+            crate::tools::terminate_reaped_child_discipline(pid);
             return;
         }
-        crate::tools::kill_process_group_tree(Some(child.id()));
+        crate::tools::kill_process_group_tree(Some(pid));
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -615,6 +703,7 @@ impl Drop for BackgroundChild {
 /// for spawn/artifact failures.
 #[allow(clippy::too_many_lines)]
 pub fn spawn_background(
+    owner_session_id: &str,
     cwd: &Path,
     shell_path: Option<&str>,
     command_prefix: Option<&str>,
@@ -628,6 +717,13 @@ pub fn spawn_background(
     let _lifecycle = lifecycle_lock()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned".to_string()))?;
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable"
+                .to_string(),
+        ));
+    }
     if !cwd.exists() {
         return Err(Error::tool(
             "bash",
@@ -644,11 +740,12 @@ pub fn spawn_background(
         Some(value) => Some(value),
     };
 
-    let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+    let retained_command = truncate_utf8_bytes(command, MAX_RETAINED_COMMAND_BYTES);
+    let shell_command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
         || command.to_string(),
         |prefix| format!("{prefix}\n{command}"),
     );
-    let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
+    let shell_command = format!("trap 'code=$?; wait; exit $code' EXIT\n{shell_command}");
 
     let shell = shell_path.unwrap_or_else(|| {
         for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
@@ -662,7 +759,7 @@ pub fn spawn_background(
     let mut cmd = crate::tools::command_with_default_sigpipe_in_dir(shell, cwd)
         .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
     cmd.arg("-c")
-        .arg(&command)
+        .arg(&shell_command)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -699,10 +796,18 @@ pub fn spawn_background(
 
     let started_at = Instant::now();
     let started_at_ms = now_ms();
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
-    crate::tools::attach_child_job_discipline(&child);
+    if !crate::tools::attach_child_job_discipline(&child) {
+        crate::tools::kill_process_group_tree(Some(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(Error::tool(
+            "bash",
+            "Failed to attach background shell to platform process-tree discipline".to_string(),
+        ));
+    }
     let pid = child.id();
     let mut child = BackgroundChild::new(child);
     let stdout = child
@@ -770,8 +875,9 @@ pub fn spawn_background(
         reg.jobs.insert(
             id.clone(),
             JobEntry {
+                owner_session_id: owner_session_id.to_string(),
                 id: id.clone(),
-                command,
+                command: retained_command,
                 started_at_ms,
                 sequence,
                 settled_sequence: None,
@@ -884,6 +990,23 @@ fn last_chars(text: &str, cap: usize) -> String {
         .collect()
 }
 
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    const SUFFIX: &str = "\n...[truncated]";
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let suffix = &SUFFIX[..SUFFIX.len().min(max_bytes)];
+    let content_cap = max_bytes - suffix.len();
+    let mut end = content_cap.min(text.len());
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut truncated = String::with_capacity(max_bytes);
+    truncated.push_str(&text[..end]);
+    truncated.push_str(suffix);
+    truncated
+}
+
 fn monitor_job(
     id: &str,
     mut child: BackgroundChild,
@@ -898,6 +1021,7 @@ fn monitor_job(
     let timeout = timeout_secs.map(Duration::from_secs);
     let mut terminate_at: Option<Instant> = None;
     let mut termination_status: Option<JobStatus> = None;
+    let root_pid = child.id();
 
     let exit_code = loop {
         // Keep the nonblocking reap observation and `process_live` transition
@@ -919,6 +1043,13 @@ fn monitor_job(
         };
         match wait_result {
             Ok(Some(status)) => {
+                // The root has been reaped, but descendants may still own its
+                // process-group/job handles and inherited output pipes. Close
+                // that discipline before settlement so no child or pump
+                // thread survives a natural root exit.
+                if let Some(root_pid) = root_pid {
+                    crate::tools::terminate_reaped_child_discipline(root_pid);
+                }
                 child.disarm();
                 break status.code();
             }
@@ -1035,22 +1166,22 @@ fn settle_job_and_enqueue_notice(
     let snapshot = JobSnapshot::from_source_best_effort(&source);
     let tail_excerpt = last_chars(&snapshot.output_tail, 4096);
     let notice = format!(
-            "[background job {} settled: {} (exit {}; outputComplete={}; artifactTruncated={})]\ncommand: {}\nartifact: {}\noutput tail:\n{}",
-            snapshot.id,
-            snapshot.status,
-            snapshot
-                .exit_code
-                .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
-            snapshot.output_complete,
-            snapshot.artifact_truncated,
-            snapshot.command.lines().nth(1).unwrap_or(&snapshot.command),
-            snapshot.artifact_path,
-            if tail_excerpt.is_empty() {
-                "(no output)"
-            } else {
-                &tail_excerpt
-            }
-        );
+        "[background job {} settled: {} (exit {}; outputComplete={}; artifactTruncated={})]\ncommand: {}\nartifact: {}\noutput tail:\n{}",
+        snapshot.id,
+        snapshot.status,
+        snapshot
+            .exit_code
+            .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
+        snapshot.output_complete,
+        snapshot.artifact_truncated,
+        snapshot.command.lines().next().unwrap_or(&snapshot.command),
+        snapshot.artifact_path,
+        if tail_excerpt.is_empty() {
+            "(no output)"
+        } else {
+            &tail_excerpt
+        }
+    );
 
     let notify = {
         let mut reg = registry()
@@ -1072,11 +1203,9 @@ fn settle_job_and_enqueue_notice(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
         let notify = Arc::clone(&job.settled_notify);
+        let owner_session_id = job.owner_session_id.clone();
         job.cancel_deadline.finish();
-        if reg.notices.len() >= MAX_COMPLETION_NOTICES {
-            reg.notices.remove(0);
-        }
-        reg.notices.push(notice);
+        enqueue_completion_notice(&mut reg, &owner_session_id, notice);
         prune_settled_jobs(&mut reg);
         notify
     };
@@ -1103,17 +1232,18 @@ fn prune_settled_jobs(reg: &mut JobRegistry) {
     }
 }
 
-/// List snapshots of every job this session, newest last.
+/// List snapshots owned by one session, newest last.
 ///
 /// # Errors
 /// Tool error when the registry is poisoned.
-pub fn list() -> Result<Vec<JobSnapshot>> {
+pub fn list(owner_session_id: &str) -> Result<Vec<JobSnapshot>> {
     let reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
     let mut sources: Vec<_> = reg
         .jobs
         .values()
+        .filter(|job| job.owner_session_id == owner_session_id)
         .map(|job| {
             let settled = job
                 .settled_snapshot
@@ -1139,17 +1269,24 @@ pub fn list() -> Result<Vec<JobSnapshot>> {
         .collect())
 }
 
-fn wait_handle(id: &str) -> Result<JobWaitHandle> {
+fn unknown_job_error(id: &str) -> Error {
+    Error::tool(
+        "jobs",
+        format!("PI_JOBS_UNKNOWN_ID: no background job named '{id}'"),
+    )
+}
+
+fn wait_handle(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
     let reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-    let job = reg.jobs.get(id).ok_or_else(|| {
-        Error::tool(
-            "jobs",
-            format!("PI_JOBS_UNKNOWN_ID: no background job named '{id}'"),
-        )
-    })?;
+    let job = reg
+        .jobs
+        .get(id)
+        .filter(|job| job.owner_session_id == owner_session_id)
+        .ok_or_else(|| unknown_job_error(id))?;
     Ok(JobWaitHandle {
+        owner_session_id: owner_session_id.to_string(),
         id: id.to_string(),
         settled_snapshot: Arc::clone(&job.settled_snapshot),
         settled_notify: Arc::clone(&job.settled_notify),
@@ -1172,7 +1309,11 @@ fn snapshot_now_best_effort(handle: &JobWaitHandle) -> Result<JobSnapshot> {
     let reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-    if let Some(job) = reg.jobs.get(&handle.id) {
+    if let Some(job) = reg
+        .jobs
+        .get(&handle.id)
+        .filter(|job| job.owner_session_id == handle.owner_session_id)
+    {
         let source = JobSnapshotSource::from_entry(job);
         drop(reg);
         return Ok(JobSnapshot::from_source_best_effort(&source));
@@ -1181,10 +1322,7 @@ fn snapshot_now_best_effort(handle: &JobWaitHandle) -> Result<JobSnapshot> {
     if let Some(snapshot) = settled_snapshot(handle) {
         return Ok(snapshot);
     }
-    Err(Error::tool(
-        "jobs",
-        format!("PI_JOBS_UNKNOWN_ID: no background job named '{}'", handle.id),
-    ))
+    Err(unknown_job_error(&handle.id))
 }
 
 fn wait_with_handle(handle: &JobWaitHandle, timeout: Duration) -> Result<JobSnapshot> {
@@ -1215,10 +1353,10 @@ fn remaining_wait_slice(now: Instant, deadline: Option<Instant>) -> Option<Durat
 /// Wait for a job to settle (bounded), returning its snapshot either way.
 ///
 /// # Errors
-/// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids.
+/// Named `PI_JOBS_UNKNOWN_ID` for unknown or foreign-session job ids.
 #[allow(clippy::significant_drop_tightening)]
-pub fn wait(id: &str, timeout: Duration) -> Result<JobSnapshot> {
-    let handle = wait_handle(id)?;
+pub fn wait(owner_session_id: &str, id: &str, timeout: Duration) -> Result<JobSnapshot> {
+    let handle = wait_handle(owner_session_id, id)?;
     wait_with_handle(&handle, timeout)
 }
 
@@ -1226,17 +1364,22 @@ pub fn wait(id: &str, timeout: Duration) -> Result<JobSnapshot> {
 /// abort/steering and unrelated sessions.
 ///
 /// # Errors
-/// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids.
-pub async fn wait_async(id: &str, timeout: Duration) -> Result<JobSnapshot> {
-    wait_async_with_slice(id, timeout, MAX_ASYNC_WAIT_SLICE).await
+/// Named `PI_JOBS_UNKNOWN_ID` for unknown or foreign-session job ids.
+pub async fn wait_async(
+    owner_session_id: &str,
+    id: &str,
+    timeout: Duration,
+) -> Result<JobSnapshot> {
+    wait_async_with_slice(owner_session_id, id, timeout, MAX_ASYNC_WAIT_SLICE).await
 }
 
 async fn wait_async_with_slice(
+    owner_session_id: &str,
     id: &str,
     timeout: Duration,
     max_wait_slice: Duration,
 ) -> Result<JobSnapshot> {
-    let handle = wait_handle(id)?;
+    let handle = wait_handle(owner_session_id, id)?;
     let cx = crate::agent_cx::AgentCx::for_current_or_request();
     let now = cx
         .cx()
@@ -1298,15 +1441,16 @@ async fn wait_for_settlement_wall(
     }
 }
 
-fn request_cancel(id: &str) -> Result<JobWaitHandle> {
+fn request_cancel(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
     let mut reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-    let Some(job) = reg.jobs.get_mut(id) else {
-        return Err(Error::tool(
-            "jobs",
-            format!("PI_JOBS_UNKNOWN_ID: no background job named '{id}'"),
-        ));
+    let Some(job) = reg
+        .jobs
+        .get_mut(id)
+        .filter(|job| job.owner_session_id == owner_session_id)
+    else {
+        return Err(unknown_job_error(id));
     };
     if job.status.settled() || !job.process_live {
         return Err(Error::tool(
@@ -1319,6 +1463,7 @@ fn request_cancel(id: &str) -> Result<JobWaitHandle> {
     }
     job.cancel_requested = true;
     Ok(JobWaitHandle {
+        owner_session_id: owner_session_id.to_string(),
         id: id.to_string(),
         settled_snapshot: Arc::clone(&job.settled_snapshot),
         settled_notify: Arc::clone(&job.settled_notify),
@@ -1333,8 +1478,8 @@ fn request_cancel(id: &str) -> Result<JobWaitHandle> {
 /// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids; `PI_JOBS_NOT_RUNNING`
 /// when the job already settled.
 #[allow(clippy::significant_drop_tightening)]
-pub fn cancel(id: &str) -> Result<JobSnapshot> {
-    let handle = request_cancel(id)?;
+pub fn cancel(owner_session_id: &str, id: &str) -> Result<JobSnapshot> {
+    let handle = request_cancel(owner_session_id, id)?;
     // The monitor thread applies the KILL escalation and records the final
     // status; wait briefly so the snapshot reflects the settle.
     let snapshot = wait_with_handle(&handle, Duration::from_secs(10))?;
@@ -1354,8 +1499,8 @@ pub fn cancel(id: &str) -> Result<JobSnapshot> {
 /// # Errors
 /// Same named errors as [`cancel`], plus `PI_JOBS_CANCEL_TIMEOUT` if the monitor
 /// cannot publish a terminal state within the bounded cleanup window.
-pub async fn cancel_async(id: &str) -> Result<JobSnapshot> {
-    let handle = request_cancel(id)?;
+pub async fn cancel_async(owner_session_id: &str, id: &str) -> Result<JobSnapshot> {
+    let handle = request_cancel(owner_session_id, id)?;
     let snapshot = wait_for_settlement_wall(&handle, Duration::from_secs(10)).await?;
     if snapshot.status == JobStatus::Running.as_str() {
         return Err(Error::tool(
@@ -1369,14 +1514,21 @@ pub async fn cancel_async(id: &str) -> Result<JobSnapshot> {
 /// Drain pending completion notices as follow-up messages for the agent.
 /// The fetcher registered with the agent calls this on every poll.
 #[must_use]
-pub fn take_completion_notices() -> Vec<Message> {
+pub fn take_completion_notices(owner_session_id: &str) -> Vec<Message> {
     let mut reg = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.notices
-        .drain(..)
-        .map(completion_notice_message)
-        .collect()
+    let mut matched = Vec::new();
+    let mut retained = VecDeque::with_capacity(reg.notices.len());
+    while let Some(notice) = reg.notices.pop_front() {
+        if notice.owner_session_id == owner_session_id {
+            matched.push(completion_notice_message(notice.text));
+        } else {
+            retained.push_back(notice);
+        }
+    }
+    reg.notices = retained;
+    matched
 }
 
 fn completion_notice_message(text: String) -> Message {
@@ -1391,23 +1543,49 @@ fn completion_notice_message(text: String) -> Message {
 /// `/tan` shares this seam with background bash jobs so queue
 /// modes, persistence, RPC behavior, and turn-boundary semantics stay
 /// identical.
-pub fn push_completion_notice(text: impl Into<String>) {
+pub fn push_completion_notice(owner_session_id: &str, text: impl Into<String>) {
+    let text = text.into();
+    let text = truncate_utf8_bytes(&text, MAX_COMPLETION_NOTICE_BYTES);
     let mut reg = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if reg.notices.len() >= MAX_COMPLETION_NOTICES {
-        reg.notices.remove(0);
+    enqueue_completion_notice(&mut reg, owner_session_id, text);
+}
+
+fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text: String) {
+    let owner_notice_count = reg
+        .notices
+        .iter()
+        .filter(|notice| notice.owner_session_id == owner_session_id)
+        .count();
+    if owner_notice_count >= MAX_COMPLETION_NOTICES
+        && let Some(oldest) = reg
+            .notices
+            .iter()
+            .position(|notice| notice.owner_session_id == owner_session_id)
+    {
+        let _ = reg.notices.remove(oldest);
     }
-    reg.notices.push(text.into());
+    reg.notices.push_back(CompletionNotice {
+        owner_session_id: owner_session_id.to_string(),
+        text: truncate_utf8_bytes(&text, MAX_COMPLETION_NOTICE_BYTES),
+    });
+    while reg.notices.len() > MAX_TOTAL_COMPLETION_NOTICES {
+        let _ = reg.notices.pop_front();
+    }
 }
 
 /// Build the follow-up fetcher that delivers job completion notices into
 /// the agent's message queue.
 #[must_use]
-pub fn follow_up_fetcher() -> crate::agent::MessageFetcher {
-    std::sync::Arc::new(|| {
+pub fn follow_up_fetcher(scope: JobSessionScope) -> crate::agent::MessageFetcher {
+    std::sync::Arc::new(move || {
+        let scope = scope.clone();
         Box::pin(async move {
-            take_completion_notices()
+            let Ok(owner_session_id) = scope.session_id().await else {
+                return Vec::new();
+            };
+            take_completion_notices(&owner_session_id)
                 .into_iter()
                 .map(crate::agent::QueuedAgentMessage::generated)
                 .collect()
@@ -1421,7 +1599,7 @@ pub fn kill_all() {
     let _lifecycle = lifecycle_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let jobs: Vec<String> = {
+    let jobs: Vec<(String, String)> = {
         let mut reg = registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1433,11 +1611,12 @@ pub fn kill_all() {
         reg.jobs
             .values()
             .filter(|job| !job.status.settled())
-            .map(|job| job.id.clone())
+            .map(|job| (job.owner_session_id.clone(), job.id.clone()))
             .collect()
     };
-    for id in jobs {
+    for (owner_session_id, id) in jobs {
         let _ = wait(
+            &owner_session_id,
             &id,
             TERMINATE_GRACE + OUTPUT_DRAIN_GRACE + Duration::from_secs(1),
         );
@@ -1447,6 +1626,8 @@ pub fn kill_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_SESSION_ID: &str = "jobs-test-session";
 
     fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
         static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1475,6 +1656,7 @@ mod tests {
     ) -> JobEntry {
         let file = std::fs::File::create(&artifact_path).expect("synthetic artifact");
         JobEntry {
+            owner_session_id: TEST_SESSION_ID.to_string(),
             id: id.to_string(),
             command: "true".to_string(),
             started_at_ms: 1,
@@ -1506,7 +1688,7 @@ mod tests {
     fn wait_for_output(id: &str, marker: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
-            let snapshot = wait(id, Duration::ZERO).expect("job snapshot");
+            let snapshot = wait(TEST_SESSION_ID, id, Duration::ZERO).expect("job snapshot");
             if snapshot.output_tail.contains(marker) {
                 return;
             }
@@ -1768,6 +1950,7 @@ mod tests {
         let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
         let artifact = Arc::clone(&entry.artifact);
         let handle = JobWaitHandle {
+            owner_session_id: TEST_SESSION_ID.to_string(),
             id: id.clone(),
             settled_snapshot: Arc::clone(&entry.settled_snapshot),
             settled_notify: Arc::clone(&entry.settled_notify),
@@ -1798,7 +1981,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .jobs
             .remove(&id);
-        let _ = take_completion_notices();
+        let _ = take_completion_notices(TEST_SESSION_ID);
     }
 
     #[test]
@@ -1817,7 +2000,9 @@ mod tests {
         let artifact_guard = artifact.lock().expect("artifact lock");
         let (listed_tx, listed_rx) = std::sync::mpsc::channel();
         let listing = std::thread::spawn(move || {
-            listed_tx.send(list()).expect("return list result");
+            listed_tx
+                .send(list(TEST_SESSION_ID))
+                .expect("return list result");
         });
         let prompt_result = listed_rx.recv_timeout(Duration::from_secs(2));
         drop(artifact_guard);
@@ -1851,7 +2036,8 @@ mod tests {
             .jobs
             .insert(id.clone(), entry);
 
-        let error = request_cancel(&id).expect_err("reaped process must not be signalled");
+        let error = request_cancel(TEST_SESSION_ID, &id)
+            .expect_err("reaped process must not be signalled");
         assert!(error.to_string().contains("PI_JOBS_NOT_RUNNING"));
         registry()
             .lock()
@@ -1873,6 +2059,7 @@ mod tests {
             reg.jobs.insert(
                 id.clone(),
                 JobEntry {
+                    owner_session_id: TEST_SESSION_ID.to_string(),
                     id,
                     command: "true".to_string(),
                     started_at_ms: i64::try_from(index).expect("index fits"),
@@ -1917,10 +2104,93 @@ mod tests {
     }
 
     #[test]
+    fn completion_notices_are_drained_only_by_their_owner_session() {
+        let owner_a = format!("owner-a-{}", uuid::Uuid::new_v4().simple());
+        let owner_b = format!("owner-b-{}", uuid::Uuid::new_v4().simple());
+        push_completion_notice(&owner_a, "notice-a");
+        push_completion_notice(&owner_b, "notice-b");
+
+        let first = take_completion_notices(&owner_a);
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            &first[0],
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "notice-a"
+        ));
+        assert!(
+            take_completion_notices(&owner_a).is_empty(),
+            "draining one owner must not duplicate its notice"
+        );
+
+        let second = take_completion_notices(&owner_b);
+        assert_eq!(second.len(), 1);
+        assert!(matches!(
+            &second[0],
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "notice-b"
+        ));
+    }
+
+    #[test]
+    fn retained_text_limits_are_utf8_safe_and_explicit() {
+        let oversized = "界".repeat(MAX_COMPLETION_NOTICE_BYTES);
+        let truncated = truncate_utf8_bytes(&oversized, MAX_COMPLETION_NOTICE_BYTES);
+        assert!(truncated.len() <= MAX_COMPLETION_NOTICE_BYTES);
+        assert!(truncated.ends_with("\n...[truncated]"));
+
+        let mut reg = JobRegistry::default();
+        enqueue_completion_notice(&mut reg, TEST_SESSION_ID, oversized);
+        let retained = reg.notices.pop_front().expect("bounded notice");
+        assert!(retained.text.len() <= MAX_COMPLETION_NOTICE_BYTES);
+        assert!(retained.text.ends_with("\n...[truncated]"));
+    }
+
+    #[test]
+    fn cross_session_job_ids_fail_closed_without_metadata() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("owner-{}", uuid::Uuid::new_v4().simple());
+        let foreign_owner = format!("foreign-{}", uuid::Uuid::new_v4().simple());
+        let id = format!("job-private-{}", uuid::Uuid::new_v4().simple());
+        let artifact_path = root.join("private-artifact.log");
+        let mut entry = synthetic_entry(&id, artifact_path.clone(), 0, false);
+        entry.owner_session_id.clone_from(&owner);
+        entry.command = "printf private-command".to_string();
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        assert_eq!(list(&owner).expect("owner list").len(), 1);
+        assert!(list(&foreign_owner).expect("foreign list").is_empty());
+        for error in [
+            wait(&foreign_owner, &id, Duration::ZERO).expect_err("foreign wait"),
+            request_cancel(&foreign_owner, &id).expect_err("foreign cancel"),
+        ] {
+            let rendered = error.to_string();
+            assert!(rendered.contains("PI_JOBS_UNKNOWN_ID"));
+            assert!(!rendered.contains("private-command"));
+            assert!(!rendered.contains(&artifact_path.display().to_string()));
+        }
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
     fn spawn_list_wait_cycle() {
         let _guard = process_test_guard();
         let root = temp_root();
         let snapshot = spawn_background(
+            TEST_SESSION_ID,
             &root,
             None,
             None,
@@ -1930,7 +2200,8 @@ mod tests {
         )
         .expect("spawn");
         assert_eq!(snapshot.status, "running");
-        let settled = wait(&snapshot.id, Duration::from_secs(10)).expect("wait");
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
+            .expect("wait");
         assert_eq!(settled.status, "exited");
         assert_eq!(settled.exit_code, Some(0));
         assert!(settled.output_tail.contains("job-output-marker"));
@@ -1938,9 +2209,9 @@ mod tests {
         assert!(!settled.artifact_truncated);
         assert!(settled.artifact_error.is_none());
         assert!(std::path::Path::new(&settled.artifact_path).exists());
-        let listed = list().expect("list");
+        let listed = list(TEST_SESSION_ID).expect("list");
         assert!(listed.iter().any(|job| job.id == settled.id));
-        let notices = take_completion_notices();
+        let notices = take_completion_notices(TEST_SESSION_ID);
         assert!(
             notices.iter().any(|message| matches!(
                 message,
@@ -1951,6 +2222,75 @@ mod tests {
             )),
             "settled publication and its completion notice must be atomic"
         );
+    }
+
+    #[test]
+    fn background_metadata_excludes_configured_shell_prefix() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let prefix_secret = "PI_PRIVATE_PREFIX_MARKER=must-not-leak";
+        let user_command = "printf prefix-metadata-ok";
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            Some(prefix_secret),
+            user_command,
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn with configured prefix");
+        assert_eq!(snapshot.command, user_command);
+        assert!(!snapshot.command.contains(prefix_secret));
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
+            .expect("prefixed job settles");
+        assert_eq!(settled.command, user_command);
+        assert!(!settled.command.contains(prefix_secret));
+
+        let notices = take_completion_notices(TEST_SESSION_ID);
+        let rendered = notices
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(user_command));
+        assert!(!rendered.contains(prefix_secret));
+    }
+
+    #[test]
+    fn background_metadata_bounds_retained_user_command() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let user_command = format!(
+            "printf retained-command-ok\n# {}",
+            "界".repeat(MAX_RETAINED_COMMAND_BYTES / 3 + 100)
+        );
+        assert!(user_command.len() > MAX_RETAINED_COMMAND_BYTES);
+
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            &user_command,
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn with oversized user command");
+        assert!(snapshot.command.len() <= MAX_RETAINED_COMMAND_BYTES);
+        assert!(snapshot.command.ends_with("\n...[truncated]"));
+
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
+            .expect("oversized-command job settles");
+        assert_eq!(settled.command, snapshot.command);
+        assert!(settled.output_tail.contains("retained-command-ok"));
+        let _ = take_completion_notices(TEST_SESSION_ID);
     }
 
     #[test]
@@ -1977,10 +2317,11 @@ mod tests {
             .build()
             .expect("runtime");
         let async_snapshot = runtime
-            .block_on(wait_async(&id, Duration::MAX))
+            .block_on(wait_async(TEST_SESSION_ID, &id, Duration::MAX))
             .expect("async settled wait");
         assert_eq!(async_snapshot.status, "exited");
-        let sync_snapshot = wait(&id, Duration::MAX).expect("sync settled wait");
+        let sync_snapshot =
+            wait(TEST_SESSION_ID, &id, Duration::MAX).expect("sync settled wait");
         assert_eq!(sync_snapshot.status, "exited");
 
         registry()
@@ -2039,6 +2380,7 @@ mod tests {
                 .timer_driver()
                 .map_or_else(asupersync::time::wall_now, |timer| timer.now());
             let waiting = wait_async_with_slice(
+                TEST_SESSION_ID,
                 &id,
                 Duration::from_secs(1),
                 Duration::from_millis(5),
@@ -2069,6 +2411,7 @@ mod tests {
         let _guard = process_test_guard();
         let root = temp_root();
         let snapshot = spawn_background(
+            TEST_SESSION_ID,
             &root,
             None,
             None,
@@ -2079,7 +2422,7 @@ mod tests {
         .expect("spawn");
         wait_for_output(&snapshot.id, "cancel-ready", Duration::from_secs(2));
         let started = Instant::now();
-        let cancelled = cancel(&snapshot.id).expect("cancel");
+        let cancelled = cancel(TEST_SESSION_ID, &snapshot.id).expect("cancel");
         assert_eq!(cancelled.status, "killed");
         assert!(
             started.elapsed() >= TERMINATE_GRACE,
@@ -2092,7 +2435,7 @@ mod tests {
         // thread) so it cannot leak into concurrently running agent-loop
         // tests through the process-global follow-up queue.
         for _ in 0..200 {
-            let drained = take_completion_notices();
+            let drained = take_completion_notices(TEST_SESSION_ID);
             if drained.iter().any(|message| {
                 matches!(
                     message,
@@ -2110,7 +2453,12 @@ mod tests {
 
     #[test]
     fn wait_rejects_unknown_id() {
-        let err = wait("job-does-not-exist", Duration::from_millis(10)).unwrap_err();
+        let err = wait(
+            TEST_SESSION_ID,
+            "job-does-not-exist",
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("PI_JOBS_UNKNOWN_ID"));
     }
 
@@ -2123,8 +2471,16 @@ mod tests {
         let marker = root.join("spawned-marker");
         let command = format!("printf ran > '{}'", marker.display());
 
-        let err = spawn_background(&root, None, None, &command, Some(30), Some(&root))
-            .expect_err("artifact creation must fail");
+        let err = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            &command,
+            Some(30),
+            Some(&root),
+        )
+        .expect_err("artifact creation must fail");
         assert!(err.to_string().contains("Failed to create jobs artifact dir"));
         std::thread::sleep(Duration::from_millis(100));
         assert!(!marker.exists(), "process must not spawn before artifact setup");
@@ -2136,6 +2492,7 @@ mod tests {
         let _guard = process_test_guard();
         let root = temp_root();
         let snapshot = spawn_background(
+            TEST_SESSION_ID,
             &root,
             None,
             None,
@@ -2146,14 +2503,61 @@ mod tests {
         .expect("spawn");
         wait_for_output(&snapshot.id, "timeout-ready", Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(1200));
-        let during_grace = wait(&snapshot.id, Duration::ZERO).expect("snapshot during grace");
+        let during_grace = wait(TEST_SESSION_ID, &snapshot.id, Duration::ZERO)
+            .expect("snapshot during grace");
         assert_eq!(during_grace.status, "running");
 
-        let settled = wait(&snapshot.id, Duration::from_secs(8)).expect("timed out job settles");
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(8))
+            .expect("timed out job settles");
         assert_eq!(settled.status, "timedOut");
         assert!(settled.output_complete);
         #[cfg(unix)]
         assert!(!process_exists(snapshot.pid.expect("pid")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn natural_root_exit_reaps_a_descendant_holding_output_pipes() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let descendant_pid_path = root.join("descendant.pid");
+        let command = format!(
+            "(sleep 300 & printf '%s' \"$!\" > '{}') &",
+            descendant_pid_path.display()
+        );
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            &command,
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn descendant fixture");
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
+            .expect("root and descendant settle");
+        assert_eq!(settled.status, "exited");
+        assert!(
+            settled.output_complete,
+            "descendant pipe holders must be reaped before settlement"
+        );
+
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+            .expect("descendant pid fixture")
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        for _ in 0..100 {
+            if !process_exists(descendant_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_exists(descendant_pid),
+            "descendant {descendant_pid} survived natural root exit"
+        );
+        let _ = take_completion_notices(TEST_SESSION_ID);
     }
 
     #[test]
@@ -2168,6 +2572,7 @@ mod tests {
             callers.push(std::thread::spawn(move || {
                 caller_barrier.wait();
                 spawn_background(
+                    TEST_SESSION_ID,
                     &caller_root,
                     None,
                     None,
@@ -2189,7 +2594,7 @@ mod tests {
         assert!(rejected[0].to_string().contains("PI_JOBS_AT_CAPACITY"));
 
         for snapshot in succeeded {
-            cancel(&snapshot.id).expect("cleanup capacity test job");
+            cancel(TEST_SESSION_ID, &snapshot.id).expect("cleanup capacity test job");
         }
     }
 }

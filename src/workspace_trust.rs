@@ -11,8 +11,9 @@
 //! current workspace is trusted:
 //!
 //! - The decision is keyed to the canonical workspace path **and** a content
-//!   digest over the project-controlled surfaces (`.pi/settings.json` plus
-//!   every file under `.pi/extensions/`). Any content change re-prompts.
+//!   digest over the project-controlled surfaces (`.pi/settings.json`, every
+//!   file under `.pi/extensions/`, and project-local MCP configuration). Any
+//!   content change re-prompts.
 //! - Interactive launches prompt once and persist the answer (trusted or
 //!   untrusted) in `<global_dir>/workspace-trust.json`.
 //! - Non-interactive launches (RPC, `--print`, piped stdin) fail closed:
@@ -58,6 +59,10 @@ pub struct WorkspaceTrustSurface {
     pub package_count: usize,
     /// Files under `.pi/extensions/`, relative to the workspace root, sorted.
     pub extension_entries: Vec<String>,
+    /// Project-local MCP configuration files, relative to the workspace root,
+    /// sorted. Explicit CLI and global MCP files are deliberate operator
+    /// inputs and are not workspace trust surfaces.
+    pub mcp_config_entries: Vec<String>,
     /// Hex sha256 over the canonical surface manifest.
     pub digest: String,
 }
@@ -66,8 +71,19 @@ impl WorkspaceTrustSurface {
     /// Scan `cwd` for project-controlled executable surfaces.
     ///
     /// Returns `Ok(None)` when the workspace declares nothing to trust
-    /// (no `.pi/settings.json` and no `.pi/extensions/` entries).
+    /// (no `.pi/settings.json`, no `.pi/extensions/` entries, and no
+    /// project-local MCP configuration).
     pub fn scan(cwd: &Path) -> Result<Option<Self>> {
+        const PROJECT_MCP_CONFIGS: &[&str] = &[
+            ".agents/mcp.json",
+            ".claude/mcp.json",
+            ".codex/config.toml",
+            ".cursor/mcp.json",
+            ".gemini/settings.json",
+            ".pi/mcp.json",
+            ".windsurf/mcp.json",
+        ];
+
         let project_dir = cwd.join(Config::project_dir());
         let settings_path = project_dir.join("settings.json");
         let extensions_dir = project_dir.join("extensions");
@@ -87,7 +103,22 @@ impl WorkspaceTrustSurface {
         collect_files_recursive(&extensions_dir, &extensions_dir, &mut extension_files)?;
         extension_files.sort_by(|a, b| a.relative.cmp(&b.relative));
 
-        if settings_bytes.is_none() && extension_files.is_empty() {
+        let mut mcp_config_files = Vec::new();
+        for relative in PROJECT_MCP_CONFIGS {
+            let absolute = cwd.join(relative);
+            match std::fs::read(&absolute) {
+                Ok(bytes) => mcp_config_files.push(((*relative).to_string(), bytes)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(Error::config(format!(
+                        "Failed to read {}: {err}",
+                        absolute.display()
+                    )));
+                }
+            }
+        }
+
+        if settings_bytes.is_none() && extension_files.is_empty() && mcp_config_files.is_empty() {
             return Ok(None);
         }
 
@@ -124,11 +155,20 @@ impl WorkspaceTrustSurface {
             manifest.push('\n');
             extension_entries.push(display);
         }
+        let mut mcp_config_entries = Vec::with_capacity(mcp_config_files.len());
+        for (relative, bytes) in mcp_config_files {
+            manifest.push_str(&relative);
+            manifest.push('\t');
+            manifest.push_str(&crate::package_manager::hex_encode(&Sha256::digest(bytes)));
+            manifest.push('\n');
+            mcp_config_entries.push(relative);
+        }
 
         Ok(Some(Self {
             has_project_settings: settings_bytes.is_some(),
             package_count,
             extension_entries,
+            mcp_config_entries,
             digest: crate::package_manager::hex_encode(&Sha256::digest(manifest.as_bytes())),
         }))
     }
@@ -467,6 +507,7 @@ mod tests {
                 ".pi/extensions/nested/util.ts".to_string(),
             ]
         );
+        assert!(first.mcp_config_entries.is_empty());
 
         // Settings edit changes the digest.
         write(
@@ -495,6 +536,48 @@ mod tests {
             .expect("scan")
             .expect("surface");
         assert_ne!(extension_changed.digest, extension_added.digest);
+    }
+
+    #[test]
+    fn scan_tracks_project_mcp_configuration_as_executable_surface() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_mcp = dir.path().join(".pi/mcp.json");
+        write(
+            &project_mcp,
+            r#"{"mcpServers":{"local":{"command":"first"}}}"#,
+        );
+
+        let first = WorkspaceTrustSurface::scan(dir.path())
+            .expect("scan")
+            .expect("MCP-only workspace must have a trust surface");
+        assert!(!first.has_project_settings);
+        assert!(first.extension_entries.is_empty());
+        assert_eq!(first.mcp_config_entries, vec![".pi/mcp.json"]);
+
+        write(
+            &project_mcp,
+            r#"{"mcpServers":{"local":{"command":"second"}}}"#,
+        );
+        let changed = WorkspaceTrustSurface::scan(dir.path())
+            .expect("scan")
+            .expect("surface");
+        assert_ne!(
+            first.digest, changed.digest,
+            "changing an MCP execution target must invalidate workspace trust"
+        );
+
+        write(
+            &dir.path().join(".codex/config.toml"),
+            "[mcp_servers.foreign]\ncommand = \"foreign\"\n",
+        );
+        let foreign_added = WorkspaceTrustSurface::scan(dir.path())
+            .expect("scan")
+            .expect("surface");
+        assert_eq!(
+            foreign_added.mcp_config_entries,
+            vec![".codex/config.toml", ".pi/mcp.json"]
+        );
+        assert_ne!(changed.digest, foreign_added.digest);
     }
 
     #[test]
@@ -545,6 +628,29 @@ mod tests {
         assert!(state.trusted);
         assert_eq!(state.source, TrustSource::NoSurface);
         assert!(!store_path.exists(), "no-surface runs must not persist");
+    }
+
+    #[test]
+    fn establish_non_interactive_mcp_only_workspace_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir.path().join(".agents/mcp.json"),
+            r#"{"mcpServers":{"project":{"command":"project-server"}}}"#,
+        );
+        let store_path = dir.path().join("store.json");
+
+        let state = establish(dir.path(), &store_path, &inputs(), no_prompt).expect("establish");
+        assert!(!state.trusted);
+        assert_eq!(state.source, TrustSource::NonInteractive);
+        assert_eq!(
+            state
+                .surface
+                .as_ref()
+                .expect("surface")
+                .mcp_config_entries,
+            vec![".agents/mcp.json"]
+        );
+        assert!(!store_path.exists());
     }
 
     #[test]
