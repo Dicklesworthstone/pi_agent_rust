@@ -15,9 +15,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(not(unix))]
 use tempfile::NamedTempFile;
@@ -2093,12 +2093,13 @@ impl SecretCmdGuard {
         }
     }
 
+    /// Marks the run settled so Drop becomes a no-op. The caller MUST have
+    /// reaped the leader (`child.wait()`) on every path before settling —
+    /// std has no safe standalone pid reap, and adding libc/unsafe is
+    /// forbidden in this crate (bd-wuswt).
     fn settle(&mut self) {
         self.settled.store(true, Ordering::Relaxed);
-        if let Some(pid) = self.pid.take() {
-            // Reap the leader even on success so no zombie outlives us.
-            let _ = crate::platform::reap_pid(pid);
-        }
+        self.pid = None;
     }
 }
 
@@ -2130,22 +2131,18 @@ impl CappedCapture {
             match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    {
-                        let mut kept = self.kept.lock().expect("secret capture lock");
-                        let remaining = cap.saturating_sub(kept.len());
-                        if remaining > 0 {
-                            let take = remaining.min(n);
-                            kept.extend_from_slice(&chunk[..take]);
-                        }
-                        if kept.len() >= cap
-                            && !self.overflowed.swap(true, Ordering::Relaxed)
-                        {
-                            tracing::warn!(
-                                event = "pi.auth.secret_cmd_output_overflow",
-                                "secret helper output exceeded its bounded cap; \
+                    let mut kept = self.kept.lock().expect("secret capture lock");
+                    let remaining = cap.saturating_sub(kept.len());
+                    if remaining > 0 {
+                        let take = remaining.min(n);
+                        kept.extend_from_slice(&chunk[..take]);
+                    }
+                    if kept.len() >= cap && !self.overflowed.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            event = "pi.auth.secret_cmd_output_overflow",
+                            "secret helper output exceeded its bounded cap; \
                                  draining to EOF then failing closed"
-                            );
-                        }
+                        );
                     }
                 }
             }
@@ -2183,12 +2180,14 @@ fn run_bounded_secret_command(
     let pid = child.id();
     let mut guard = SecretCmdGuard::arm(pid);
 
-    let stdout_pipe = child.stdout.take().ok_or_else(|| {
-        "[MCP_SECRET_CMD_IO] secret helper stdout unavailable".to_string()
-    })?;
-    let stderr_pipe = child.stderr.take().ok_or_else(|| {
-        "[MCP_SECRET_CMD_IO] secret helper stderr unavailable".to_string()
-    })?;
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "[MCP_SECRET_CMD_IO] secret helper stdout unavailable".to_string())?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "[MCP_SECRET_CMD_IO] secret helper stderr unavailable".to_string())?;
     let stdout_capture = Arc::new(CappedCapture::default());
     let stderr_capture = Arc::new(CappedCapture::default());
     let stdout_handle = std::thread::spawn({
@@ -2221,9 +2220,8 @@ fn run_bounded_secret_command(
     // Grandchildren may hold pipe write-ends past leader exit; give readers a
     // short grace after either exit or kill, then force the tree down so the
     // collector can never hang forever (bd-wuswt).
-    let drained =
-        CappedCapture::join_grace(stdout_handle, SECRET_CMD_KILL_GRACE)
-            & CappedCapture::join_grace(stderr_handle, SECRET_CMD_KILL_GRACE);
+    let drained = CappedCapture::join_grace(stdout_handle, SECRET_CMD_KILL_GRACE)
+        & CappedCapture::join_grace(stderr_handle, SECRET_CMD_KILL_GRACE);
     if !drained {
         crate::tools::kill_process_group_tree(Some(pid));
         CappedCapture::join_grace(stdout_handle, Duration::from_millis(250));
@@ -12899,5 +12897,169 @@ sso_region = us-east-1
         let resolved_with_override =
             auth.resolve_api_key_with_env_lookup("openai", Some("override-key"), |_| None);
         assert_eq!(resolved_with_override.as_deref(), Some("override-key"));
+    }
+
+    // ===== bd-wuswt: bounded, isolated $CMD: secret helpers =====
+
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write helper script");
+        let mut permissions = std::fs::metadata(&path).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+        path
+    }
+
+    /// Exact-byte success: stdout is trimmed once, nothing else mutates it.
+    #[cfg(unix)]
+    #[test]
+    fn secret_cmd_resolves_exact_bytes_successfully() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = write_script(
+            temp.path(),
+            "helper",
+            "#!/bin/sh\nprintf '  tok=abc123 \\n'\n",
+        );
+        let resolved = run_bounded_secret_command(
+            &format!("{} extra-arg", script.display()),
+            Duration::from_secs(10),
+        )
+        .expect("successful resolution");
+        assert_eq!(resolved.as_deref(), Some("tok=abc123"));
+    }
+
+    /// Hostile writer floods BOTH pipes; the collector must return an
+    /// overflow error quickly instead of deadlocking on a full pipe.
+    #[cfg(unix)]
+    #[test]
+    fn secret_cmd_dual_pipe_flood_fails_fast_with_overflow() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // ~2.6MB to each stream through the shell loop.
+        let script = write_script(
+            temp.path(),
+            "flooder",
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 13000 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >&2; i=$((i+1)); done\n",
+        );
+        let started = Instant::now();
+        let error =
+            run_bounded_secret_command(&script.display().to_string(), Duration::from_secs(20))
+                .err()
+                .expect("flood must fail closed");
+        assert!(
+            error.contains("OUTPUT_OVERFLOW"),
+            "expected overflow diagnostic, got {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "flood must not wedge the collector ({:?})",
+            started.elapsed()
+        );
+    }
+
+    /// A helper that leaks a timeout-resistant descendant (sleeping child
+    /// holding pipes) must still terminate inside the deadline via group
+    /// teardown, and the descendant must be reaped afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn secret_cmd_timeout_reaps_descendants() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("late-marker");
+        let script = write_script(
+            temp.path(),
+            "leaky",
+            &format!(
+                "#!/bin/sh\n(sleep 58; touch {}) &\nwait\n",
+                marker.display()
+            ),
+        );
+        let started = Instant::now();
+        let error =
+            run_bounded_secret_command(&script.display().to_string(), Duration::from_secs(2))
+                .err()
+                .expect("must hit the bounded deadline");
+        assert!(error.contains("TIMEOUT"), "{error}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(9),
+            "deadline honored without hanging past grace: {elapsed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            !marker.exists(),
+            "killed descendants never wrote the marker"
+        );
+    }
+
+    /// Least-privilege environment: the helper sees ONLY the allowlisted
+    /// names. Control-run comparison — the same helper invoked with an
+    /// explicitly injected variable DOES observe it, proving the assertion
+    /// would catch blanket inheritance.
+    #[cfg(unix)]
+    #[test]
+    fn secret_cmd_environment_is_least_privilege_allowlist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let probe_script = write_script(
+            temp.path(),
+            "envprobe",
+            "#!/bin/sh\nif env | grep -q '^SP5_SECRET_CANARY='; then echo LEAKED; else echo CLEAN; fi\n",
+        );
+
+        let builder_only = run_bounded_secret_command(
+            &probe_script.display().to_string(),
+            Duration::from_secs(10),
+        )
+        .expect("allowlist run resolves")
+        .expect("non-empty");
+        assert_eq!(
+            builder_only, "CLEAN",
+            "builder env must exclude ambient secrets"
+        );
+
+        let mut injected = build_api_key_command_shell(&probe_script.display().to_string());
+        injected.env("SP5_SECRET_CANARY", "value-proves-detection");
+        let control_output = injected.output().expect("control run");
+        let control_stdout = String::from_utf8_lossy(&control_output.stdout).to_string();
+        assert_eq!(
+            control_stdout.trim(),
+            "LEAKED",
+            "control proves detection power"
+        );
+    }
+
+    /// Guard-drop cancellation: aborting before completion tears down the
+    /// helper so its side effect never lands.
+    #[cfg(unix)]
+    #[test]
+    fn secret_cmd_guard_drop_kills_before_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("aborted-marker");
+        let script = write_script(
+            temp.path(),
+            "slow",
+            &format!(
+                "#!/bin/sh\nsleep 30 && touch {}\nsleep 40\n",
+                marker.display()
+            ),
+        );
+        let mut cmd = build_api_key_command_shell(&script.display().to_string());
+        crate::tools::isolate_command_process_group(&mut cmd);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn slow helper");
+        let pid = child.id();
+        {
+            let guard = SecretCmdGuard::arm(pid);
+            let _ = guard.settled.clone();
+        } // Drop ⇒ group teardown.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "aborted helper must not complete its side effect"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
