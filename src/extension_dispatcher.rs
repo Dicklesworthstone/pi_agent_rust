@@ -3730,13 +3730,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             };
         }
 
-        let request = ExtensionUiRequest {
-            id: call_id.to_string(),
-            method: op.to_string(),
-            payload,
-            timeout_ms: None,
-            extension_id: extension_id.map(ToString::to_string),
-        };
+        let request = ExtensionUiRequest::new(call_id, op, payload)
+            .with_extension_id(extension_id.map(ToString::to_string));
 
         match self.ui_handler.request_ui(request).await {
             Ok(Some(response)) => HostcallOutcome::Success(ui_response_value_for_op(op, &response)),

@@ -20821,6 +20821,25 @@ function __pi_register_provider(provider_id, spec) {
         models: models,
         hasStreamSimple: effectiveHasStreamSimple,
     };
+    if (spec.oauth && typeof spec.oauth === 'object') {
+        const oauth = {};
+        if (spec.oauth.authUrl !== undefined && spec.oauth.authUrl !== null) {
+            oauth.authUrl = String(spec.oauth.authUrl);
+        }
+        if (spec.oauth.tokenUrl !== undefined && spec.oauth.tokenUrl !== null) {
+            oauth.tokenUrl = String(spec.oauth.tokenUrl);
+        }
+        if (spec.oauth.clientId !== undefined && spec.oauth.clientId !== null) {
+            oauth.clientId = String(spec.oauth.clientId);
+        }
+        if (Array.isArray(spec.oauth.scopes)) {
+            oauth.scopes = spec.oauth.scopes.map((scope) => String(scope));
+        }
+        if (spec.oauth.redirectUri !== undefined && spec.oauth.redirectUri !== null) {
+            oauth.redirectUri = String(spec.oauth.redirectUri);
+        }
+        providerSpec.oauth = oauth;
+    }
 
     if (effectiveHasStreamSimple && !providerSpec.api) {
         throw new Error('registerProvider: api is required when registering streamSimple');

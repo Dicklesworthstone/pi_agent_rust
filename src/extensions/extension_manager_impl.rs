@@ -5,6 +5,29 @@
 // implementation and therefore needs the manager's complete private state
 // graph; narrower leaf modules use explicit imports instead.
 use super::*;
+
+struct PendingExtensionUiLease {
+    inner: Arc<Mutex<ExtensionManagerInner>>,
+    id: String,
+    token: Uuid,
+}
+
+impl Drop for PendingExtensionUiLease {
+    fn drop(&mut self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owns_entry = guard
+            .pending_ui
+            .get(&self.id)
+            .is_some_and(|pending| pending.token == self.token);
+        if owns_entry {
+            guard.pending_ui.remove(&self.id);
+        }
+    }
+}
+
 impl ExtensionManager {
     fn validate_extension_identity_table(
         registrations: &[RegisterPayload],
@@ -2770,13 +2793,34 @@ impl ExtensionManager {
         self.refresh_snapshot_with_guard_release(guard);
     }
 
-    pub fn clear_ui_sender(&self) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.ui_sender = None;
-        self.refresh_snapshot_with_guard_release(guard);
+    /// Terminally detach the channel UI and cancel every response-bearing
+    /// request admitted through it. Admission and detachment share the manager
+    /// mutex, so a request is either published with a reachable pending sender
+    /// or rejected after closure; it cannot insert behind this drain.
+    pub fn close_ui_sender_and_cancel_pending(&self) -> usize {
+        let pending = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.ui_sender = None;
+            let pending = std::mem::take(&mut guard.pending_ui);
+            self.refresh_snapshot_with_guard_release(guard);
+            pending
+        };
+        let count = pending.len();
+        let cx = Cx::for_request();
+        for (id, pending) in pending {
+            let _ = pending.sender.send(
+                &cx,
+                ExtensionUiResponse {
+                    id,
+                    value: None,
+                    cancelled: true,
+                },
+            );
+        }
+        count
     }
 
     /// Install a direct UI handler bridge (SDK embedders).
@@ -2942,8 +2986,17 @@ impl ExtensionManager {
         Some(dec.allow)
     }
 
-    pub fn cache_policy_prompt_decision(&self, extension_id: &str, capability: &str, allow: bool) {
-        self.cache_policy_prompt_decision_scoped(extension_id, capability, allow, None);
+    /// Cache using the manager's default persistence scope.
+    ///
+    /// The in-memory fallback is installed before a durable write is attempted;
+    /// an error means the requested persistent scope was not achieved.
+    pub fn cache_policy_prompt_decision(
+        &self,
+        extension_id: &str,
+        capability: &str,
+        allow: bool,
+    ) -> Result<()> {
+        self.cache_policy_prompt_decision_scoped(extension_id, capability, allow, None)
     }
 
     /// Cache a policy prompt decision with explicit persistence scope.
@@ -2953,14 +3006,15 @@ impl ExtensionManager {
     /// `None` defers to the manager-level default (see
     /// [`Self::set_policy_prompt_persistence`], persistent unless changed),
     /// `Some(true)` forces a durable record, and `Some(false)` keeps the
-    /// decision session-scoped.
+    /// decision session-scoped. If a requested durable write fails, the
+    /// session cache remains installed and the error reports that downgrade.
     pub fn cache_policy_prompt_decision_scoped(
         &self,
         extension_id: &str,
         capability: &str,
         allow: bool,
         persist: Option<bool>,
-    ) {
+    ) -> Result<()> {
         let mut guard = self
             .inner
             .lock()
@@ -2989,18 +3043,21 @@ impl ExtensionManager {
         // the decision (or the manager) is scoped to this session only.
         let persist_effective = persist.unwrap_or(!guard.session_scoped_prompt_decisions);
         if !persist_effective {
-            return;
+            return Ok(());
         }
-        if let Some(ref mut store) = guard.permission_store {
-            let res = if let Some(range) = version_range {
-                store.record_with_version(extension_id, capability, allow, &range)
-            } else {
-                store.record(extension_id, capability, allow)
-            };
-            if let Err(e) = res {
-                tracing::warn!("Failed to persist permission decision: {e}");
-            }
-        }
+        let store = guard.permission_store.as_mut().ok_or_else(|| {
+            Error::extension("Permission store unavailable for persistent capability decision")
+        })?;
+        let result = if let Some(range) = version_range {
+            store.record_with_version(extension_id, capability, allow, &range)
+        } else {
+            store.record(extension_id, capability, allow)
+        };
+        result.map_err(|error| {
+            Error::extension(format!(
+                "Failed to persist permission decision for {extension_id}/{capability}: {error}"
+            ))
+        })
     }
 
     /// Revoke all persisted permission decisions for an extension.
@@ -3375,7 +3432,12 @@ impl ExtensionManager {
             let extension_id = spec.manifest.extension_id.clone();
             let extension = host.load_from_path(&spec.entry_path)?;
             let mut instance = host
-                .instantiate_with(&extension, Arc::clone(&tools), Some(self.handle()))
+                .instantiate_with(
+                    &extension,
+                    Arc::clone(&tools),
+                    Some(self.handle()),
+                    &extension_id,
+                )
                 .await?;
 
             let registration_json = instance.init(&spec.manifest_json).await?;
@@ -4122,17 +4184,14 @@ impl ExtensionManager {
         if request.id.trim().is_empty() {
             request.id = Uuid::new_v4().to_string();
         }
+        request.bind_deadline(Instant::now());
 
-        let (ui_sender, ui_handler, expects_response) = {
+        let (ui_handler, expects_response) = {
             let guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                guard.ui_sender.clone(),
-                guard.ui_handler.clone(),
-                request.expects_response(),
-            )
+            (guard.ui_handler.clone(), request.expects_response())
         };
 
         // Direct handler bridge (SDK embedders) takes precedence over the
@@ -4141,60 +4200,104 @@ impl ExtensionManager {
         // same timeout error instead of hanging on a stalled handler) and
         // never surface a response for notification-style requests.
         if let Some(handler) = ui_handler {
-            let timeout_ms = request.effective_timeout_ms();
-            let response = if let Some(timeout_ms) = timeout_ms {
-                timeout(
+            let remaining = request.remaining_timeout(Instant::now());
+            let request_id = request.id.clone();
+            let timeout_response = request
+                .is_capability_prompt()
+                .then(|| request.auto_deny_response());
+            let response = if let Some(remaining) = remaining {
+                match timeout(
                     wall_now(),
-                    Duration::from_millis(timeout_ms),
+                    remaining,
                     handler.request_ui(request),
                 )
                 .await
-                .unwrap_or_else(|_| Err(Error::extension("Extension UI request timed out")))
+                {
+                    Ok(response) => response,
+                    Err(_) => timeout_response.map_or_else(
+                        || Err(Error::extension("Extension UI request timed out")),
+                        |response| Ok(Some(response)),
+                    ),
+                }
             } else {
                 handler.request_ui(request).await
             };
-            return if expects_response {
-                response
-            } else {
-                response.map(|_| None)
+            if !expects_response {
+                return response.map(|_| None);
+            }
+            return match response? {
+                Some(response) if response.id == request_id => Ok(Some(response)),
+                Some(response) => Err(Error::extension(format!(
+                    "Extension UI handler response ID mismatch: expected {request_id}, got {}",
+                    response.id
+                ))),
+                None => Err(Error::extension(
+                    "Extension UI handler dropped a response-bearing request",
+                )),
             };
         }
 
-        let Some(ui_sender) = ui_sender else {
-            return Err(Error::extension("Extension UI sender not configured"));
-        };
-
         if !expects_response {
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ui_sender = guard
+                .ui_sender
+                .as_ref()
+                .ok_or_else(|| Error::extension("Extension UI sender not configured"))?;
             ui_sender
-                .send(&cx, request)
-                .await
-                .map_err(|_| Error::extension("Extension UI channel closed"))?;
+                .try_send(request)
+                .map_err(|_| Error::extension("Extension UI channel unavailable"))?;
             return Ok(None);
         }
 
         let (tx, mut rx) = oneshot::channel();
+        let token = Uuid::new_v4();
         {
             let mut guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.pending_ui.insert(request.id.clone(), tx);
+            let ui_sender = guard
+                .ui_sender
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Error::extension("Extension UI sender not configured"))?;
+            match guard.pending_ui.entry(request.id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingExtensionUi { token, sender: tx });
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(Error::extension(format!(
+                        "Duplicate pending Extension UI request ID: {}",
+                        request.id
+                    )));
+                }
+            }
+            if ui_sender.try_send(request.clone()).is_err() {
+                guard.pending_ui.remove(&request.id);
+                return Err(Error::extension("Extension UI channel unavailable"));
+            }
         }
+        // An outer timeout or task cancellation can drop this future before
+        // its explicit response branches run. Bind map membership to the
+        // future's lifetime so every exit releases the pending ID.
+        let _pending_reply = PendingExtensionUiLease {
+            inner: Arc::clone(&self.inner),
+            id: request.id.clone(),
+            token,
+        };
 
-        if ui_sender.send(&cx, request.clone()).await.is_err() {
-            self.inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_ui
-                .remove(&request.id);
-            return Err(Error::extension("Extension UI channel closed"));
-        }
-
-        let response = if let Some(timeout_ms) = request.effective_timeout_ms() {
-            match timeout(wall_now(), Duration::from_millis(timeout_ms), rx.recv(&cx)).await {
+        let timeout_response = request
+            .is_capability_prompt()
+            .then(|| request.auto_deny_response());
+        let response = if let Some(remaining) = request.remaining_timeout(Instant::now()) {
+            match timeout(wall_now(), remaining, rx.recv(&cx)).await {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(_)) => Err(Error::extension("Extension UI response dropped")),
-                Err(_) => Err(Error::extension("Extension UI request timed out")),
+                Err(_) => timeout_response
+                    .ok_or_else(|| Error::extension("Extension UI request timed out")),
             }
         } else {
             rx.recv(&cx)
@@ -4202,17 +4305,7 @@ impl ExtensionManager {
                 .map_err(|_| Error::extension("Extension UI response dropped"))
         };
 
-        match response {
-            Ok(resp) => Ok(Some(resp)),
-            Err(err) => {
-                self.inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pending_ui
-                    .remove(&request.id);
-                Err(err)
-            }
-        }
+        response.map(Some)
     }
 
     pub fn respond_ui(&self, response: ExtensionUiResponse) -> bool {
@@ -4224,7 +4317,27 @@ impl ExtensionManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.pending_ui.remove(&response.id)
         };
-        tx.is_some_and(|sender| sender.send(&cx, response).is_ok())
+        tx.is_some_and(|pending| pending.sender.send(&cx, response).is_ok())
+    }
+
+    /// Whether a response-bearing delivery is still live. Classic UI checks
+    /// this at consumption time so a request cancelled by terminal close is
+    /// not resurrected from its buffered event queue.
+    pub fn ui_request_is_pending(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_ui
+            .contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_ui_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_ui
+            .len()
     }
 
     /// Build the context payload from an RCU registry snapshot.

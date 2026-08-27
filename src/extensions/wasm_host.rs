@@ -38,7 +38,7 @@ impl HostState {
             &cwd,
             None,
         ));
-        Self::new_with_tools(policy, cwd, tools, None)
+        Self::new_with_tools(policy, cwd, tools, None, None)
     }
 
     pub(super) fn new_with_tools(
@@ -46,6 +46,7 @@ impl HostState {
         cwd: PathBuf,
         tools: Arc<crate::tools::ToolRegistry>,
         manager: Option<ExtensionManagerHandle>,
+        extension_id: Option<String>,
     ) -> Result<Self> {
         let scopes = FsScopes::least_privilege_for_cwd(&cwd)?;
         let fs = FsConnector::new(&cwd, policy.clone(), scopes)?;
@@ -62,7 +63,7 @@ impl HostState {
             env_allowlist: BTreeSet::new(),
             manifest_schema: None,
             manifest_requirements: Vec::new(),
-            extension_id: None,
+            extension_id,
         })
     }
 
@@ -119,7 +120,12 @@ impl HostState {
     }
 
     pub fn apply_registration(&mut self, registration: &RegisterPayload) -> Result<()> {
-        if !registration.name.trim().is_empty() {
+        // Manager-loaded components arrive with an authoritative manifest
+        // principal before guest initialization. The guest's registration
+        // name is presentation metadata and must never replace that identity.
+        // Standalone host instances have no manifest context, so they retain
+        // the registration name as a best-effort fallback.
+        if self.extension_id.is_none() && !registration.name.trim().is_empty() {
             self.extension_id = Some(registration.name.trim().to_string());
         }
 
@@ -365,7 +371,9 @@ impl HostState {
             decision,
             capability,
             reason,
-        } = self.policy.evaluate(required);
+        } = self
+            .policy
+            .evaluate_for(required, self.extension_id.as_deref());
 
         if decision != PolicyDecision::Prompt {
             return (decision, reason, capability);
@@ -396,22 +404,40 @@ impl HostState {
         }
 
         let prompt_extension_id = self.extension_id.as_deref().unwrap_or(UNKNOWN_EXTENSION_ID);
-        let (allow, persist) =
-            prompt_capability_once(&manager, prompt_extension_id, &capability).await;
-        if let Some(extension_id) = self.extension_id.as_deref() {
-            manager.cache_policy_prompt_decision_scoped(extension_id, &capability, allow, persist);
-        }
-        let decision = if allow {
-            PolicyDecision::Allow
-        } else {
-            PolicyDecision::Deny
+        let outcome = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
+        let (decision, reason) = match outcome {
+            CapabilityPromptOutcome::UserDecision {
+                allow,
+                persist,
+                remember,
+            } => {
+                let persistence_failed = remember_capability_prompt_decision(
+                    &manager,
+                    self.extension_id.as_deref(),
+                    &capability,
+                    allow,
+                    persist,
+                    remember,
+                );
+                let decision = if allow {
+                    PolicyDecision::Allow
+                } else {
+                    PolicyDecision::Deny
+                };
+                (
+                    decision,
+                    prompt_user_decision_reason(allow, persistence_failed),
+                )
+            }
+            CapabilityPromptOutcome::Cancelled => (PolicyDecision::Deny, "prompt_cancelled"),
+            CapabilityPromptOutcome::InvalidResponse => {
+                (PolicyDecision::Deny, "prompt_invalid_response")
+            }
+            CapabilityPromptOutcome::Unavailable => {
+                (PolicyDecision::Deny, "prompt_unavailable")
+            }
         };
-        let reason = if allow {
-            "prompt_user_allow".to_string()
-        } else {
-            "prompt_user_deny".to_string()
-        };
-        (decision, reason, capability)
+        (decision, reason.to_string(), capability)
     }
 
     async fn dispatch_tool(&self, call: &HostCallPayload) -> std::result::Result<String, String> {
@@ -1157,6 +1183,26 @@ mod tests {
         }
     }
 
+    struct RememberingAllowHandler;
+
+    #[async_trait]
+    impl crate::extension_dispatcher::ExtensionUiHandler for RememberingAllowHandler {
+        async fn request_ui(
+            &self,
+            request: ExtensionUiRequest,
+        ) -> Result<Option<ExtensionUiResponse>> {
+            Ok(Some(ExtensionUiResponse {
+                id: request.id,
+                value: Some(json!({
+                    "allow": true,
+                    "persist": false,
+                    "remember": true,
+                })),
+                cancelled: false,
+            }))
+        }
+    }
+
     fn registration_payload() -> RegisterPayload {
         RegisterPayload {
             name: "ext.test".to_string(),
@@ -1855,6 +1901,116 @@ mod tests {
         let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
         assert_eq!(err.code, HostCallErrorCode::Denied);
         assert_policy_decision_logged(&events, &call.call_id, "env", "Deny");
+    }
+
+    #[test]
+    fn wasm_policy_uses_authoritative_manifest_principal_for_overrides() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let mut policy = permissive_policy();
+        policy.per_extension.insert(
+            "manifest.denied".to_string(),
+            ExtensionOverride {
+                deny: vec!["exec".to_string()],
+                ..ExtensionOverride::default()
+            },
+        );
+        let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+        let mut state = HostState::new_with_tools(
+            policy,
+            cwd,
+            tools,
+            None,
+            Some("manifest.denied".to_string()),
+        )
+        .expect("host state");
+        let mut registration = registration_payload();
+        registration.name = "guest-display-name".to_string();
+        state
+            .apply_registration(&registration)
+            .expect("apply registration");
+
+        let decision = run_async(async { state.resolve_policy_decision("exec").await });
+        assert_eq!(
+            decision,
+            (
+                PolicyDecision::Deny,
+                "extension_deny".to_string(),
+                "exec".to_string(),
+            )
+        );
+        assert_eq!(state.extension_id.as_deref(), Some("manifest.denied"));
+    }
+
+    #[test]
+    fn wasm_prompt_cache_isolated_by_manifest_principal_not_guest_name() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+        let policy = ExtensionPolicy {
+            mode: ExtensionPolicyMode::Prompt,
+            max_memory_mb: 256,
+            default_caps: Vec::new(),
+            deny_caps: Vec::new(),
+            ..Default::default()
+        };
+        let manager = ExtensionManager::new();
+        {
+            let mut guard = manager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.permission_store = None;
+            guard.policy_prompt_cache.clear();
+        }
+        manager.set_ui_handler(Arc::new(RememberingAllowHandler));
+
+        let mut first = HostState::new_with_tools(
+            policy.clone(),
+            cwd.clone(),
+            Arc::clone(&tools),
+            Some(manager.handle()),
+            Some("manifest.one".to_string()),
+        )
+        .expect("first host state");
+        let mut registration = registration_payload();
+        registration.name = "shared-guest-name".to_string();
+        first
+            .apply_registration(&registration)
+            .expect("first registration");
+        let first_decision = run_async(async { first.resolve_policy_decision("exec").await });
+        assert_eq!(first_decision.0, PolicyDecision::Allow);
+        assert_eq!(
+            manager.cached_policy_prompt_decision("manifest.one", "exec"),
+            Some(true)
+        );
+        assert_eq!(
+            manager.cached_policy_prompt_decision("shared-guest-name", "exec"),
+            None
+        );
+
+        manager.clear_ui_handler();
+        let mut second = HostState::new_with_tools(
+            policy,
+            cwd,
+            tools,
+            Some(manager.handle()),
+            Some("manifest.two".to_string()),
+        )
+        .expect("second host state");
+        second
+            .apply_registration(&registration)
+            .expect("second registration");
+        let second_decision = run_async(async { second.resolve_policy_decision("exec").await });
+        assert_eq!(
+            second_decision,
+            (
+                PolicyDecision::Deny,
+                "prompt_unavailable".to_string(),
+                "exec".to_string(),
+            ),
+            "a second manifest principal must not inherit the first principal's remembered choice"
+        );
     }
 
     #[test]

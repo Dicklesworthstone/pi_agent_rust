@@ -1841,7 +1841,7 @@ fn js_hostcall_prompt_mode_asks_once_per_capability() {
                 prompt_count_clone.fetch_add(1, Ordering::SeqCst);
                 responder.respond_ui(ExtensionUiResponse {
                     id: req.id,
-                    value: Some(json!(true)),
+                    value: Some(json!({"allow": true, "persist": false})),
                     cancelled: false,
                 });
             }
@@ -4066,6 +4066,7 @@ fn cached_policy_prompt_decision_uses_runtime_extension_id_for_named_extension()
 #[test]
 fn cache_policy_prompt_decision_uses_runtime_extension_id_for_named_extension() {
     let manager = extension_manager_no_persisted_permissions();
+    manager.set_policy_prompt_persistence(false);
     {
         let mut guard = manager
             .inner
@@ -4088,7 +4089,9 @@ fn cache_policy_prompt_decision_uses_runtime_extension_id_for_named_extension() 
             .insert("ext.named".to_string(), "2.5.1".to_string());
     }
 
-    manager.cache_policy_prompt_decision("ext.named", "exec", true);
+    manager
+        .cache_policy_prompt_decision("ext.named", "exec", true)
+        .expect("session-scoped cache decision");
 
     let decision = manager
         .inner
@@ -4134,7 +4137,9 @@ fn invalid_permissions_file_still_allows_future_decisions_to_persist() {
             .insert("ext.persist".to_string(), "1.2.3".to_string());
     }
 
-    manager.cache_policy_prompt_decision("ext.persist", "exec", true);
+    manager
+        .cache_policy_prompt_decision("ext.persist", "exec", true)
+        .expect("persist repaired permission decision");
 
     let store = PermissionStore::open(&path).expect("reload permissions file");
     assert_eq!(store.lookup("ext.persist", "exec"), Some(true));
@@ -4161,7 +4166,9 @@ fn session_scoped_prompt_decision_skips_permission_store() {
     assert!(has_permission_store);
 
     // Session-scoped decision: cached in memory, never written to disk.
-    manager.cache_policy_prompt_decision_scoped("ext.session", "exec", true, Some(false));
+    manager
+        .cache_policy_prompt_decision_scoped("ext.session", "exec", true, Some(false))
+        .expect("cache session-scoped decision");
     assert_eq!(
         manager.cached_policy_prompt_decision("ext.session", "exec"),
         Some(true),
@@ -4175,8 +4182,12 @@ fn session_scoped_prompt_decision_skips_permission_store() {
     );
 
     // Explicit persist and default (None) decisions still reach the store.
-    manager.cache_policy_prompt_decision_scoped("ext.session", "http", false, Some(true));
-    manager.cache_policy_prompt_decision_scoped("ext.session", "read", true, None);
+    manager
+        .cache_policy_prompt_decision_scoped("ext.session", "http", false, Some(true))
+        .expect("persist explicit decision");
+    manager
+        .cache_policy_prompt_decision_scoped("ext.session", "read", true, None)
+        .expect("persist default-scoped decision");
     let store = PermissionStore::open(&path).expect("reload permissions file");
     assert_eq!(store.lookup("ext.session", "http"), Some(false));
     assert_eq!(store.lookup("ext.session", "read"), Some(true));
@@ -4201,7 +4212,9 @@ fn manager_session_scope_disables_default_persistence() {
     assert!(!manager.policy_prompt_persistence());
 
     // Legacy entry point now defers to the manager-level scope.
-    manager.cache_policy_prompt_decision("ext.mgr", "exec", true);
+    manager
+        .cache_policy_prompt_decision("ext.mgr", "exec", true)
+        .expect("cache manager-scoped decision");
     assert_eq!(
         manager.cached_policy_prompt_decision("ext.mgr", "exec"),
         Some(true)
@@ -4210,7 +4223,9 @@ fn manager_session_scope_disables_default_persistence() {
     assert_eq!(store.lookup("ext.mgr", "exec"), None);
 
     // A per-decision override still wins over the manager default.
-    manager.cache_policy_prompt_decision_scoped("ext.mgr", "http", true, Some(true));
+    manager
+        .cache_policy_prompt_decision_scoped("ext.mgr", "http", true, Some(true))
+        .expect("persist per-decision override");
     let store = PermissionStore::open(&path).expect("reload permissions file");
     assert_eq!(store.lookup("ext.mgr", "http"), Some(true));
 }
@@ -4332,6 +4347,43 @@ fn ui_handler_notification_response_is_suppressed() {
     assert_eq!(prompts.len(), 1, "handler still observes the notification");
 }
 
+struct MismatchedUiHandler;
+
+#[async_trait]
+impl crate::extension_dispatcher::ExtensionUiHandler for MismatchedUiHandler {
+    async fn request_ui(
+        &self,
+        _request: ExtensionUiRequest,
+    ) -> Result<Option<ExtensionUiResponse>> {
+        Ok(Some(ExtensionUiResponse {
+            id: "stale-request-id".to_string(),
+            value: Some(Value::Bool(true)),
+            cancelled: false,
+        }))
+    }
+}
+
+#[test]
+fn ui_handler_rejects_response_for_a_different_request_id() {
+    let manager = extension_manager_no_persisted_permissions();
+    manager.set_ui_handler(Arc::new(MismatchedUiHandler));
+
+    let error = run_async(async {
+        manager
+            .request_ui(ExtensionUiRequest::new(
+                "current-request-id",
+                "confirm",
+                json!({"title": "Current"}),
+            ))
+            .await
+    })
+    .expect_err("a direct handler must not answer a different request generation");
+    let message = error.to_string();
+    assert!(message.contains("response ID mismatch"), "{message}");
+    assert!(message.contains("current-request-id"), "{message}");
+    assert!(message.contains("stale-request-id"), "{message}");
+}
+
 #[test]
 fn prompt_capability_once_parses_scoped_object_response() {
     let manager = extension_manager_no_persisted_permissions();
@@ -4341,14 +4393,44 @@ fn prompt_capability_once_parses_scoped_object_response() {
     });
     manager.set_ui_handler(handler);
 
-    let (allow, persist) =
+    let outcome =
         run_async(async { super::prompt_capability_once(&manager, "ext.scoped", "exec").await });
-    assert!(allow);
-    assert_eq!(persist, Some(false));
+    assert_eq!(
+        outcome,
+        CapabilityPromptOutcome::UserDecision {
+            allow: true,
+            persist: false,
+            remember: true,
+        }
+    );
 }
 
 #[test]
-fn prompt_capability_once_bool_response_keeps_default_persistence() {
+fn prompt_capability_once_attributes_auto_deny_without_forging_user_choice() {
+    let manager = extension_manager_no_persisted_permissions();
+    let handler = Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: json!({
+            "allow": false,
+            "persist": false,
+            "remember": false,
+            "reason": "auto_deny",
+        }),
+    });
+    manager.set_ui_handler(handler);
+
+    let outcome =
+        run_async(async { super::prompt_capability_once(&manager, "ext.expired", "exec").await });
+    assert_eq!(outcome, CapabilityPromptOutcome::AutoDenied);
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.expired", "exec"),
+        None,
+        "automatic expiry is not a reusable user decision"
+    );
+}
+
+#[test]
+fn prompt_capability_once_rejects_unscoped_boolean_response() {
     let manager = extension_manager_no_persisted_permissions();
     let handler = Arc::new(RecordingUiHandler {
         prompts: std::sync::Mutex::new(Vec::new()),
@@ -4356,10 +4438,34 @@ fn prompt_capability_once_bool_response_keeps_default_persistence() {
     });
     manager.set_ui_handler(handler);
 
-    let (allow, persist) =
+    let outcome =
         run_async(async { super::prompt_capability_once(&manager, "ext.bool", "exec").await });
-    assert!(allow);
-    assert_eq!(persist, None);
+    assert_eq!(outcome, CapabilityPromptOutcome::InvalidResponse);
+}
+
+#[test]
+fn prompt_capability_once_rejects_malformed_or_contradictory_scope() {
+    for (extension_id, value) in [
+        (
+            "ext.bad-remember",
+            json!({"allow": true, "persist": false, "remember": "yes"}),
+        ),
+        (
+            "ext.bad-persistence",
+            json!({"allow": true, "persist": true, "remember": false}),
+        ),
+    ] {
+        let manager = extension_manager_no_persisted_permissions();
+        manager.set_ui_handler(Arc::new(RecordingUiHandler {
+            prompts: std::sync::Mutex::new(Vec::new()),
+            value,
+        }));
+
+        let outcome = run_async(async {
+            super::prompt_capability_once(&manager, extension_id, "exec").await
+        });
+        assert_eq!(outcome, CapabilityPromptOutcome::InvalidResponse);
+    }
 }
 
 #[test]
@@ -4377,10 +4483,233 @@ fn prompt_capability_once_without_ui_surface_fails_closed() {
             .contains("Extension UI sender not configured")
     );
 
-    let (allow, persist) =
+    let outcome =
         run_async(async { super::prompt_capability_once(&manager, "ext.closed", "exec").await });
-    assert!(!allow, "missing UI surface must deny");
-    assert_eq!(persist, None);
+    assert_eq!(outcome, CapabilityPromptOutcome::Unavailable);
+}
+
+#[test]
+fn unavailable_prompt_denies_current_call_without_caching_a_user_decision() {
+    let manager = extension_manager_no_persisted_permissions();
+    let dir = tempdir().expect("tempdir");
+    let tools = ToolRegistry::new(&[], dir.path(), None);
+    let http = HttpConnector::with_defaults();
+    let policy = ExtensionPolicy {
+        mode: ExtensionPolicyMode::Prompt,
+        max_memory_mb: 256,
+        default_caps: Vec::new(),
+        deny_caps: Vec::new(),
+        ..Default::default()
+    };
+    let ctx = HostCallContext {
+        runtime_name: "test",
+        extension_id: Some("ext.recover"),
+        tools: &tools,
+        http: &http,
+        manager: Some(manager.clone()),
+        policy: &policy,
+        js_runtime: None,
+        interceptor: None,
+    };
+
+    let first = run_async(async { resolve_shared_policy_prompt(&ctx, "exec").await });
+    assert_eq!(first, (PolicyDecision::Deny, "prompt_unavailable".to_string()));
+    assert_eq!(manager.cached_policy_prompt_decision("ext.recover", "exec"), None);
+
+    manager.set_ui_handler(Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: json!({"allow": true, "persist": false}),
+    }));
+    let recovered = run_async(async { resolve_shared_policy_prompt(&ctx, "exec").await });
+    assert_eq!(
+        recovered,
+        (PolicyDecision::Allow, "prompt_user_allow".to_string())
+    );
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.recover", "exec"),
+        Some(true)
+    );
+}
+
+#[test]
+fn one_shot_prompt_decision_is_not_reused_by_the_next_hostcall() {
+    let manager = extension_manager_no_persisted_permissions();
+    let handler = Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: json!({
+            "allow": true,
+            "persist": false,
+            "remember": false,
+        }),
+    });
+    manager.set_ui_handler(handler.clone());
+    let dir = tempdir().expect("tempdir");
+    let tools = ToolRegistry::new(&[], dir.path(), None);
+    let http = HttpConnector::with_defaults();
+    let policy = ExtensionPolicy {
+        mode: ExtensionPolicyMode::Prompt,
+        max_memory_mb: 256,
+        default_caps: Vec::new(),
+        deny_caps: Vec::new(),
+        ..Default::default()
+    };
+    let ctx = HostCallContext {
+        runtime_name: "test",
+        extension_id: Some("ext.once"),
+        tools: &tools,
+        http: &http,
+        manager: Some(manager.clone()),
+        policy: &policy,
+        js_runtime: None,
+        interceptor: None,
+    };
+
+    for _ in 0..2 {
+        let decision = run_async(async { resolve_shared_policy_prompt(&ctx, "exec").await });
+        assert_eq!(
+            decision,
+            (PolicyDecision::Allow, "prompt_user_allow".to_string())
+        );
+    }
+    assert_eq!(manager.cached_policy_prompt_decision("ext.once", "exec"), None);
+    assert_eq!(
+        handler
+            .prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        2,
+        "an Allow Once decision must prompt again on the next hostcall"
+    );
+}
+
+#[test]
+fn only_remembered_persistent_prompt_decisions_survive_store_reopen() {
+    let dir = tempdir().expect("tempdir");
+    let permissions_path = dir.path().join("permissions.json");
+    let manager = extension_manager_no_persisted_permissions();
+    {
+        let mut guard = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ExtensionManager::load_persisted_permissions_from(&mut guard, &permissions_path);
+    }
+    let tools = ToolRegistry::new(&[], dir.path(), None);
+    let http = HttpConnector::with_defaults();
+    let policy = ExtensionPolicy {
+        mode: ExtensionPolicyMode::Prompt,
+        max_memory_mb: 256,
+        default_caps: Vec::new(),
+        deny_caps: Vec::new(),
+        ..Default::default()
+    };
+    let ctx = HostCallContext {
+        runtime_name: "test",
+        extension_id: Some("ext.scope"),
+        tools: &tools,
+        http: &http,
+        manager: Some(manager.clone()),
+        policy: &policy,
+        js_runtime: None,
+        interceptor: None,
+    };
+
+    manager.set_ui_handler(Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: json!({
+            "allow": true,
+            "persist": false,
+            "remember": false,
+        }),
+    }));
+    let once = run_async(async { resolve_shared_policy_prompt(&ctx, "exec").await });
+    assert_eq!(once.0, PolicyDecision::Allow);
+    assert_eq!(manager.cached_policy_prompt_decision("ext.scope", "exec"), None);
+    assert_eq!(
+        PermissionStore::open(&permissions_path)
+            .expect("reopen after once")
+            .lookup("ext.scope", "exec"),
+        None
+    );
+
+    manager.set_ui_handler(Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: json!({
+            "allow": false,
+            "persist": true,
+            "remember": true,
+        }),
+    }));
+    let always = run_async(async { resolve_shared_policy_prompt(&ctx, "exec").await });
+    assert_eq!(always.0, PolicyDecision::Deny);
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.scope", "exec"),
+        Some(false)
+    );
+    assert_eq!(
+        PermissionStore::open(&permissions_path)
+            .expect("reopen after always")
+            .lookup("ext.scope", "exec"),
+        Some(false)
+    );
+}
+
+#[test]
+fn persistent_prompt_storage_failure_is_reported_without_losing_session_fallback() {
+    let dir = tempdir().expect("tempdir");
+    let invalid_store_path = dir.path().join("permission-store-is-a-directory");
+    std::fs::create_dir(&invalid_store_path).expect("create invalid store target");
+    let manager = extension_manager_no_persisted_permissions();
+    {
+        let mut guard = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ExtensionManager::load_persisted_permissions_from(&mut guard, &invalid_store_path);
+    }
+    manager.set_ui_handler(Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: json!({
+            "allow": false,
+            "persist": true,
+            "remember": true,
+        }),
+    }));
+    let tools = ToolRegistry::new(&[], dir.path(), None);
+    let http = HttpConnector::with_defaults();
+    let policy = ExtensionPolicy {
+        mode: ExtensionPolicyMode::Prompt,
+        max_memory_mb: 256,
+        default_caps: Vec::new(),
+        deny_caps: Vec::new(),
+        ..Default::default()
+    };
+    let ctx = HostCallContext {
+        runtime_name: "test",
+        extension_id: Some("ext.persist-failure"),
+        tools: &tools,
+        http: &http,
+        manager: Some(manager.clone()),
+        policy: &policy,
+        js_runtime: None,
+        interceptor: None,
+    };
+
+    let decision = run_async(async { resolve_shared_policy_prompt(&ctx, "exec").await });
+    assert_eq!(
+        decision,
+        (
+            PolicyDecision::Deny,
+            "prompt_user_deny_persistence_failed".to_string(),
+        )
+    );
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.persist-failure", "exec"),
+        Some(false),
+        "the failed durable write should retain a truthful session fallback"
+    );
+    assert!(invalid_store_path.is_dir());
 }
 
 #[test]
@@ -4574,7 +4903,10 @@ fn js_hostcall_prompt_policy_caches_user_allow_and_never_logs_raw_params() {
                 assert!(
                     manager.respond_ui(ExtensionUiResponse {
                         id: ui_request.id,
-                        value: Some(serde_json::Value::Bool(true)),
+                        value: Some(serde_json::json!({
+                            "allow": true,
+                            "persist": false,
+                        })),
                         cancelled: false,
                     }),
                     "respond_ui"
@@ -5082,7 +5414,10 @@ fn js_hostcall_capability_denial_matrix_emits_deterministic_errors_and_logs() {
                     assert!(
                         manager_prompt.respond_ui(ExtensionUiResponse {
                             id: ui_request.id,
-                            value: Some(serde_json::Value::Bool(false)),
+                            value: Some(serde_json::json!({
+                                "allow": false,
+                                "persist": false,
+                            })),
                             cancelled: false,
                         }),
                         "respond_ui"

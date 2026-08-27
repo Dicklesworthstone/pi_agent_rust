@@ -939,6 +939,13 @@ pub struct ErrorPayload {
     pub details: Option<Value>,
 }
 
+/// Host-authenticated identity for a privileged capability prompt.
+#[derive(Debug, Clone)]
+struct CapabilityPromptMetadata {
+    extension_id: String,
+    capability: String,
+}
+
 /// Extension UI request payload (host -> UI surface).
 #[derive(Debug, Clone)]
 pub struct ExtensionUiRequest {
@@ -946,8 +953,16 @@ pub struct ExtensionUiRequest {
     pub method: String,
     pub payload: Value,
     pub timeout_ms: Option<u64>,
+    /// Monotonic absolute deadline bound once before publication.
+    ///
+    /// Keeping this private prevents extension-controlled payloads from
+    /// resetting the manager/TUI budget when a request crosses a queue.
+    deadline: Option<Instant>,
     /// Extension that initiated this UI request (for provenance display).
     pub extension_id: Option<String>,
+    /// Private trust marker: extension-controlled payload keys cannot opt an
+    /// ordinary `ui.confirm` request into privileged permission UI.
+    capability_prompt: Option<CapabilityPromptMetadata>,
 }
 
 /// Extension UI response payload (UI surface -> host).
@@ -9725,6 +9740,7 @@ impl WasmExtensionHost {
         extension: &WasmExtension,
         tools: Arc<ToolRegistry>,
         manager: Option<ExtensionManagerHandle>,
+        extension_id: &str,
     ) -> Result<wasm_host::Instance> {
         wasm_host::Instance::instantiate(
             &self.engine,
@@ -9734,6 +9750,7 @@ impl WasmExtensionHost {
                 self.cwd.clone(),
                 tools,
                 manager,
+                Some(extension_id.to_string()),
             )?,
         )
         .await
@@ -15020,19 +15037,76 @@ fn js_hostcall_timeout_ms(request: &HostcallRequest) -> Option<u64> {
 /// and the TUI derives its visible auto-deny countdown from the same value.
 pub(crate) const CAPABILITY_PROMPT_TIMEOUT_MS: u64 = 30_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityPromptOutcome {
+    UserDecision {
+        allow: bool,
+        persist: bool,
+        remember: bool,
+    },
+    AutoDenied,
+    Cancelled,
+    InvalidResponse,
+    Unavailable,
+}
+
+fn remember_capability_prompt_decision(
+    manager: &ExtensionManager,
+    extension_id: Option<&str>,
+    capability: &str,
+    allow: bool,
+    persist: bool,
+    remember: bool,
+) -> bool {
+    if !remember {
+        return false;
+    }
+    let Some(extension_id) = extension_id else {
+        return persist;
+    };
+    match manager.cache_policy_prompt_decision_scoped(
+        extension_id,
+        capability,
+        allow,
+        Some(persist),
+    ) {
+        Ok(()) => false,
+        Err(error) => {
+            tracing::warn!(
+                extension_id = %extension_id,
+                capability = %capability,
+                allow,
+                persist,
+                error = %error,
+                "Capability decision could not be persisted; retaining only the in-memory fallback"
+            );
+            true
+        }
+    }
+}
+
+const fn prompt_user_decision_reason(allow: bool, persistence_failed: bool) -> &'static str {
+    match (allow, persistence_failed) {
+        (true, false) => "prompt_user_allow",
+        (false, false) => "prompt_user_deny",
+        (true, true) => "prompt_user_allow_persistence_failed",
+        (false, true) => "prompt_user_deny_persistence_failed",
+    }
+}
+
 /// Prompt the UI surface once for a capability decision.
 ///
-/// Returns `(allow, persist_override)`. The response `value` may be either a
-/// plain boolean (the TUI flow; `persist_override` stays `None`, keeping the
-/// caller's default persistence behavior) or an object of the form
-/// `{"allow": bool, "persist": bool}` so embedder-provided UI handlers can
-/// scope a decision to the current session (`persist: false`) or persist it
-/// (`persist: true`). Missing responses and errors fail closed to deny.
+/// Only an explicit scoped object is a user decision. `persist` controls disk
+/// storage; `remember` controls whether the decision enters the manager cache
+/// at all. The latter distinguishes a true one-shot choice from a session
+/// decision. Trusted embedders that omit `remember` retain session-cache
+/// semantics. Cancellation, malformed responses, missing UI, and transport
+/// errors fail closed for the current call without forging a user denial.
 async fn prompt_capability_once(
     manager: &ExtensionManager,
     extension_id: &str,
     capability: &str,
-) -> (bool, Option<bool>) {
+) -> CapabilityPromptOutcome {
     let title = format!("Allow extension capability: {capability}");
     let message = format!("Extension {extension_id} requests capability '{capability}'. Allow?");
     let payload = json!({
@@ -15044,26 +15118,53 @@ async fn prompt_capability_once(
         // consumers and RPC surfaces observe the identical deadline budget.
         "timeout_ms": CAPABILITY_PROMPT_TIMEOUT_MS,
     });
-    let request = ExtensionUiRequest::new("", "confirm", payload)
-        .with_extension_id(Some(extension_id.to_string()))
+    let request =
+        ExtensionUiRequest::new_capability_prompt("", extension_id, capability, payload)
         .with_timeout_ms(CAPABILITY_PROMPT_TIMEOUT_MS);
 
     match manager.request_ui(request).await {
         Ok(Some(response)) => {
             if response.cancelled {
-                return (false, None);
+                return CapabilityPromptOutcome::Cancelled;
             }
             match response.value.as_ref() {
-                Some(Value::Bool(allow)) => (*allow, None),
                 Some(Value::Object(map)) => {
-                    let allow = map.get("allow").and_then(Value::as_bool).unwrap_or(false);
-                    let persist = map.get("persist").and_then(Value::as_bool);
-                    (allow, persist)
+                    match (
+                        map.get("allow").and_then(Value::as_bool),
+                        map.get("persist").and_then(Value::as_bool),
+                    ) {
+                        (Some(allow), Some(persist)) => {
+                            let remember = match map.get("remember") {
+                                None => None,
+                                Some(value) => match value.as_bool() {
+                                    Some(remember) => Some(remember),
+                                    None => return CapabilityPromptOutcome::InvalidResponse,
+                                },
+                            };
+                            if map.get("reason").and_then(Value::as_str) == Some("auto_deny") {
+                                if !allow && !persist && remember == Some(false) {
+                                    CapabilityPromptOutcome::AutoDenied
+                                } else {
+                                    CapabilityPromptOutcome::InvalidResponse
+                                }
+                            } else if persist && remember == Some(false) {
+                                CapabilityPromptOutcome::InvalidResponse
+                            } else {
+                                CapabilityPromptOutcome::UserDecision {
+                                    allow,
+                                    persist,
+                                    remember: remember.unwrap_or(true),
+                                }
+                            }
+                        }
+                        _ => CapabilityPromptOutcome::InvalidResponse,
+                    }
                 }
-                _ => (false, None),
+                _ => CapabilityPromptOutcome::InvalidResponse,
             }
         }
-        Ok(None) | Err(_) => (false, None),
+        Ok(None) => CapabilityPromptOutcome::InvalidResponse,
+        Err(_) => CapabilityPromptOutcome::Unavailable,
     }
 }
 
@@ -15107,19 +15208,44 @@ async fn resolve_js_hostcall_policy_decision(
     let Some(manager) = host.manager() else {
         return (PolicyDecision::Deny, "shutdown".to_string(), capability);
     };
-    let (allow, persist) = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
-    if let Some(extension_id) = extension_id {
-        manager.cache_policy_prompt_decision_scoped(extension_id, &capability, allow, persist);
-    }
-    decision = if allow {
-        PolicyDecision::Allow
-    } else {
-        PolicyDecision::Deny
-    };
-    reason = if allow {
-        "prompt_user_allow".to_string()
-    } else {
-        "prompt_user_deny".to_string()
+    let outcome = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
+    (decision, reason) = match outcome {
+        CapabilityPromptOutcome::UserDecision {
+            allow,
+            persist,
+            remember,
+        } => {
+            let persistence_failed = remember_capability_prompt_decision(
+                &manager,
+                extension_id,
+                &capability,
+                allow,
+                persist,
+                remember,
+            );
+            let decision = if allow {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
+            };
+            (
+                decision,
+                prompt_user_decision_reason(allow, persistence_failed).to_string(),
+            )
+        }
+        CapabilityPromptOutcome::Cancelled => {
+            (PolicyDecision::Deny, "prompt_cancelled".to_string())
+        }
+        CapabilityPromptOutcome::AutoDenied => {
+            (PolicyDecision::Deny, "prompt_auto_deny".to_string())
+        }
+        CapabilityPromptOutcome::InvalidResponse => (
+            PolicyDecision::Deny,
+            "prompt_invalid_response".to_string(),
+        ),
+        CapabilityPromptOutcome::Unavailable => {
+            (PolicyDecision::Deny, "prompt_unavailable".to_string())
+        }
     };
     (decision, reason, capability)
 }
@@ -16175,21 +16301,37 @@ async fn resolve_shared_policy_prompt(
     };
 
     let prompt_ext_id = ctx.extension_id.unwrap_or("<unknown>");
-    let (allow, persist) = prompt_capability_once(manager, prompt_ext_id, capability).await;
-
-    if let Some(ext_id) = ctx.extension_id {
-        manager.cache_policy_prompt_decision_scoped(ext_id, capability, allow, persist);
-    }
-
-    let decision = if allow {
-        PolicyDecision::Allow
-    } else {
-        PolicyDecision::Deny
-    };
-    let reason = if allow {
-        "prompt_user_allow"
-    } else {
-        "prompt_user_deny"
+    let outcome = prompt_capability_once(manager, prompt_ext_id, capability).await;
+    let (decision, reason) = match outcome {
+        CapabilityPromptOutcome::UserDecision {
+            allow,
+            persist,
+            remember,
+        } => {
+            let persistence_failed = remember_capability_prompt_decision(
+                manager,
+                ctx.extension_id,
+                capability,
+                allow,
+                persist,
+                remember,
+            );
+            let decision = if allow {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
+            };
+            (
+                decision,
+                prompt_user_decision_reason(allow, persistence_failed),
+            )
+        }
+        CapabilityPromptOutcome::Cancelled => (PolicyDecision::Deny, "prompt_cancelled"),
+        CapabilityPromptOutcome::AutoDenied => (PolicyDecision::Deny, "prompt_auto_deny"),
+        CapabilityPromptOutcome::InvalidResponse => {
+            (PolicyDecision::Deny, "prompt_invalid_response")
+        }
+        CapabilityPromptOutcome::Unavailable => (PolicyDecision::Deny, "prompt_unavailable"),
     };
     (decision, reason.to_string())
 }
@@ -18126,13 +18268,8 @@ async fn dispatch_hostcall_ui_ref(
         };
     }
 
-    let request = ExtensionUiRequest {
-        id: call_id.to_string(),
-        method: op.to_string(),
-        payload: params_without_key(payload, "op"),
-        timeout_ms: None,
-        extension_id: extension_id.map(ToString::to_string),
-    };
+    let request = ExtensionUiRequest::new(call_id, op, params_without_key(payload, "op"))
+        .with_extension_id(extension_id.map(ToString::to_string));
 
     match manager.request_ui(request).await {
         Ok(Some(response)) => HostcallOutcome::Success(ui_response_value_for_op(op, &response)),
@@ -19293,7 +19430,7 @@ struct ExtensionManagerInner {
     /// session only and never written to the persistent permission store
     /// (unless a per-decision override requests persistence).
     session_scoped_prompt_decisions: bool,
-    pending_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
+    pending_ui: HashMap<String, PendingExtensionUi>,
     session: Option<Arc<dyn ExtensionSession>>,
     active_tools: Option<Vec<String>>,
     providers: Vec<Value>,
@@ -19367,6 +19504,11 @@ struct ExtensionManagerInner {
     replay_config: Option<crate::extension_replay::ReplayLaneConfig>,
     /// Completed replay trace bundles from recent dispatch cycles.
     replay_bundles: VecDeque<crate::extension_replay::ReplayTraceBundle>,
+}
+
+struct PendingExtensionUi {
+    token: Uuid,
+    sender: oneshot::Sender<ExtensionUiResponse>,
 }
 
 impl std::fmt::Debug for ExtensionManager {

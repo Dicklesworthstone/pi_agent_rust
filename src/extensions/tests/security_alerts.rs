@@ -1277,7 +1277,7 @@ fn rcu_has_ui_field_propagates_to_snapshot() {
     assert!(manager.read_snapshot().has_ui);
 
     // Clear it.
-    manager.clear_ui_sender();
+    manager.close_ui_sender_and_cancel_pending();
     assert!(!manager.read_snapshot().has_ui);
 }
 

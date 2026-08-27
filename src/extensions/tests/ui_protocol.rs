@@ -1756,6 +1756,38 @@ fn all_opcodes_have_consistent_round_trip_code_parse() {
 // ========================================================================
 
 #[test]
+fn extension_ui_deadline_is_bound_once_and_never_restarted() {
+    let base = std::time::Instant::now();
+    let mut request = ExtensionUiRequest::new("deadline-1", "confirm", json!({}));
+    request.timeout_ms = Some(5_000);
+
+    request.bind_deadline(base);
+    let bound = request.deadline().expect("relative timeout binds a deadline");
+    assert_eq!(bound, base + std::time::Duration::from_secs(5));
+
+    request.bind_deadline(base + std::time::Duration::from_secs(2));
+    assert_eq!(
+        request.deadline(),
+        Some(bound),
+        "a later queue/consumer must not restart the request budget"
+    );
+    assert_eq!(
+        request.remaining_timeout(base + std::time::Duration::from_secs(2)),
+        Some(std::time::Duration::from_secs(3))
+    );
+
+    let first = ExtensionUiRequest::new("deadline-2", "confirm", json!({}))
+        .with_timeout_ms(5_000);
+    let first_deadline = first.deadline().expect("builder binds its timeout");
+    let replaced = first.with_timeout_ms(1_000);
+    assert_eq!(replaced.timeout_ms, Some(1_000));
+    assert!(
+        replaced.deadline().expect("replacement deadline") < first_deadline,
+        "a later consuming timeout setter must replace the earlier deadline"
+    );
+}
+
+#[test]
 fn capability_prompt_once_binds_authoritative_deadline_budget() {
     use asupersync::channel::mpsc;
 
@@ -1771,6 +1803,11 @@ fn capability_prompt_once_binds_authoritative_deadline_budget() {
             // The typed field is the authoritative budget; the payload mirror
             // and provenance field must agree with it exactly.
             assert_eq!(req.method, "confirm");
+            assert!(req.is_capability_prompt());
+            assert_eq!(
+                req.capability_prompt_identity(),
+                Some(("ext.budget", "exec"))
+            );
             assert_eq!(req.timeout_ms, Some(CAPABILITY_PROMPT_TIMEOUT_MS));
             assert_eq!(
                 req.payload.get("timeout_ms").and_then(Value::as_u64),
@@ -1789,8 +1826,15 @@ fn capability_prompt_once_binds_authoritative_deadline_budget() {
         };
         let decision = async { prompt_capability_once(&manager, "ext.budget", "exec").await };
 
-        let (_, (allow, persist)) = futures::join!(surface, decision);
-        assert_eq!((allow, persist), (true, Some(false)));
+        let (_, outcome) = futures::join!(surface, decision);
+        assert_eq!(
+            outcome,
+            CapabilityPromptOutcome::UserDecision {
+                allow: true,
+                persist: false,
+                remember: true,
+            }
+        );
     });
 }
 
@@ -1820,19 +1864,12 @@ fn request_ui_timeout_fails_closed_and_clears_pending_entry() {
         .with_timeout_ms(TINY_BUDGET_MS);
         let late_id = request.id.clone();
 
-        let attempt = async { manager.request_ui(request).await };
-        let stalled_surface = async {
-            // Receive but deliberately never answer inside the budget.
-            let _received = ui_rx.recv(&cx).await.expect("request reaches surface");
-            asupersync::time::sleep(
-                asupersync::time::wall_now(),
-                std::time::Duration::from_millis(TINY_BUDGET_MS * 6),
-            )
-            .await;
-        };
-
         let started = std::time::Instant::now();
-        let (outcome, ()) = futures::join!(attempt, stalled_surface);
+        let mut attempt = Box::pin(manager.request_ui(request));
+        assert!(futures::poll!(attempt.as_mut()).is_pending());
+        let _received = ui_rx.recv(&cx).await.expect("request reaches surface");
+        // Keep the delivered request alive but deliberately never respond.
+        let outcome = attempt.await;
         let elapsed = started.elapsed();
 
         match outcome {
@@ -1850,6 +1887,11 @@ fn request_ui_timeout_fails_closed_and_clears_pending_entry() {
             elapsed < std::time::Duration::from_secs(5),
             "timeout sweep must stay tight, took {elapsed:?}"
         );
+        assert_eq!(
+            manager.pending_ui_count(),
+            0,
+            "timed-out request must release its pending map entry"
+        );
 
         // The pending entry is gone: even a late, matching response is a noop.
         let late = manager.respond_ui(ExtensionUiResponse {
@@ -1858,5 +1900,262 @@ fn request_ui_timeout_fails_closed_and_clears_pending_entry() {
             cancelled: false,
         });
         assert!(!late, "expired request must drop its pending entry");
+    });
+}
+
+#[test]
+fn capability_request_ui_timeout_returns_typed_auto_deny_and_clears_pending() {
+    use asupersync::channel::mpsc;
+
+    let manager = extension_manager_no_persisted_permissions();
+    let (ui_tx, mut ui_rx) = mpsc::channel(4);
+    manager.set_ui_sender(ui_tx);
+
+    run_async(async {
+        const TINY_BUDGET_MS: u64 = 20;
+        let request = ExtensionUiRequest::new_capability_prompt(
+            "cap-auto-timeout",
+            "ext.timeout",
+            "exec",
+            json!({"message": "bounded capability probe"}),
+        )
+        .with_timeout_ms(TINY_BUDGET_MS);
+        let mut attempt = Box::pin(manager.request_ui(request));
+        assert!(futures::poll!(attempt.as_mut()).is_pending());
+        let cx = asupersync::Cx::for_request();
+        let _received = ui_rx.recv(&cx).await.expect("request reaches surface");
+
+        let response = attempt
+            .await
+            .expect("capability timeout resolves fail-closed")
+            .expect("capability confirm expects a response");
+        assert_eq!(response.id, "cap-auto-timeout");
+        assert_eq!(
+            response.value,
+            Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+                "reason": "auto_deny",
+            }))
+        );
+        assert!(!response.cancelled);
+        assert_eq!(manager.pending_ui_count(), 0);
+        assert!(!manager.respond_ui(ExtensionUiResponse {
+            id: "cap-auto-timeout".to_string(),
+            value: Some(json!({"allow": true, "persist": true, "remember": true})),
+            cancelled: false,
+        }));
+    });
+}
+
+#[test]
+fn dropping_request_ui_future_releases_pending_entry() {
+    use asupersync::channel::mpsc;
+
+    let manager = extension_manager_no_persisted_permissions();
+    let (ui_tx, mut ui_rx) = mpsc::channel(4);
+    manager.set_ui_sender(ui_tx);
+
+    run_async(async {
+        let request = ExtensionUiRequest::new(
+            "cancelled-ui-request",
+            "confirm",
+            json!({"title": "Cancel me"}),
+        );
+        let mut attempt = Box::pin(manager.request_ui(request));
+        assert!(futures::poll!(attempt.as_mut()).is_pending());
+
+        let cx = asupersync::Cx::for_request();
+        ui_rx.recv(&cx).await.expect("request reaches UI surface");
+        assert_eq!(manager.pending_ui_count(), 1);
+
+        drop(attempt);
+
+        assert_eq!(
+            manager.pending_ui_count(),
+            0,
+            "cancelling the outer request future must release its pending lease"
+        );
+    });
+}
+
+#[test]
+fn full_ui_channel_fails_before_pending_entry_can_wait() {
+    use asupersync::channel::mpsc;
+
+    let manager = extension_manager_no_persisted_permissions();
+    let (ui_tx, _ui_rx) = mpsc::channel(1);
+    ui_tx
+        .try_send(ExtensionUiRequest::new(
+            "occupied-slot",
+            "notify",
+            json!({"message": "occupy capacity"}),
+        ))
+        .expect("occupy the only UI channel slot");
+    manager.set_ui_sender(ui_tx);
+
+    run_async(async {
+        let request = ExtensionUiRequest::new(
+            "blocked-ui-request",
+            "confirm",
+            json!({"title": "Blocked send"}),
+        );
+        let attempt = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_millis(20),
+            manager.request_ui(request),
+        )
+        .await
+        .expect("a full UI queue must fail before the outer guard expires")
+        .expect_err("a full UI queue is unavailable");
+        assert!(attempt.to_string().contains("channel unavailable"));
+        assert_eq!(
+            manager.pending_ui_count(),
+            0,
+            "failed nonblocking publication must remove its pending entry"
+        );
+    });
+}
+
+#[test]
+fn closing_ui_sender_cancels_pending_and_rejects_late_requests() {
+    use asupersync::channel::mpsc;
+
+    let manager = extension_manager_no_persisted_permissions();
+    let (ui_tx, mut ui_rx) = mpsc::channel(4);
+    manager.set_ui_sender(ui_tx);
+
+    run_async(async {
+        let mut attempt = Box::pin(manager.request_ui(ExtensionUiRequest::new(
+            "close-pending-request",
+            "confirm",
+            json!({"title": "Close me"}),
+        )));
+        assert!(futures::poll!(attempt.as_mut()).is_pending());
+        let cx = asupersync::Cx::for_request();
+        ui_rx.recv(&cx).await.expect("request reaches UI");
+        assert!(manager.ui_request_is_pending("close-pending-request"));
+
+        assert_eq!(manager.close_ui_sender_and_cancel_pending(), 1);
+        assert_eq!(manager.pending_ui_count(), 0);
+        assert!(!manager.ui_request_is_pending("close-pending-request"));
+        let cancelled = attempt
+            .await
+            .expect("close returns a typed cancellation")
+            .expect("response-bearing request has a response");
+        assert_eq!(cancelled.id, "close-pending-request");
+        assert!(cancelled.cancelled);
+
+        let late = manager
+            .request_ui(
+                ExtensionUiRequest::new(
+                    "after-close",
+                    "confirm",
+                    json!({"title": "Too late"}),
+                )
+                .with_timeout_ms(20),
+            )
+            .await
+            .expect_err("closed UI rejects later requests");
+        assert!(late.to_string().contains("sender not configured"));
+    });
+}
+
+#[test]
+fn completed_request_lease_cannot_remove_reused_id_generation() {
+    use asupersync::channel::mpsc;
+
+    let manager = extension_manager_no_persisted_permissions();
+    let (ui_tx, mut ui_rx) = mpsc::channel(4);
+    manager.set_ui_sender(ui_tx);
+
+    run_async(async {
+        let mut first = Box::pin(manager.request_ui(ExtensionUiRequest::new(
+            "reused-request-id",
+            "confirm",
+            json!({"title": "First"}),
+        )));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let cx = asupersync::Cx::for_request();
+        ui_rx.recv(&cx).await.expect("first request reaches UI");
+        assert!(manager.respond_ui(ExtensionUiResponse {
+            id: String::from("reused-request-id"),
+            value: Some(Value::Bool(true)),
+            cancelled: false,
+        }));
+
+        let mut second = Box::pin(manager.request_ui(ExtensionUiRequest::new(
+            "reused-request-id",
+            "confirm",
+            json!({"title": "Second"}),
+        )));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        ui_rx.recv(&cx).await.expect("second request reaches UI");
+        assert_eq!(manager.pending_ui_count(), 1);
+
+        let first_response = first.await.expect("first request succeeds");
+        assert!(first_response.is_some());
+        assert_eq!(
+            manager.pending_ui_count(),
+            1,
+            "the first lease must not remove a newer generation with the same public ID"
+        );
+
+        assert!(manager.respond_ui(ExtensionUiResponse {
+            id: String::from("reused-request-id"),
+            value: Some(Value::Bool(false)),
+            cancelled: false,
+        }));
+        let second_response = second.await.expect("second request succeeds");
+        assert!(second_response.is_some());
+        assert_eq!(manager.pending_ui_count(), 0);
+    });
+}
+
+#[test]
+fn simultaneous_duplicate_request_id_is_rejected_without_overwrite() {
+    use asupersync::channel::mpsc;
+
+    let manager = extension_manager_no_persisted_permissions();
+    let (ui_tx, mut ui_rx) = mpsc::channel(4);
+    manager.set_ui_sender(ui_tx);
+
+    run_async(async {
+        let mut first = Box::pin(manager.request_ui(ExtensionUiRequest::new(
+            "duplicate-request-id",
+            "confirm",
+            json!({"title": "First"}),
+        )));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let cx = asupersync::Cx::for_request();
+        ui_rx.recv(&cx).await.expect("first request reaches UI");
+
+        let duplicate = manager
+            .request_ui(
+                ExtensionUiRequest::new(
+                    "duplicate-request-id",
+                    "confirm",
+                    json!({"title": "Duplicate"}),
+                )
+                .with_timeout_ms(20),
+            )
+            .await
+            .expect_err("an in-flight public ID must not be overwritten");
+        assert!(duplicate.to_string().contains("Duplicate pending"));
+        assert_eq!(manager.pending_ui_count(), 1);
+        assert!(
+            ui_rx.try_recv().is_err(),
+            "duplicate request must not publish a second UI frame"
+        );
+
+        assert!(manager.respond_ui(ExtensionUiResponse {
+            id: String::from("duplicate-request-id"),
+            value: Some(Value::Bool(true)),
+            cancelled: false,
+        }));
+        let response = first.await.expect("original request succeeds");
+        assert!(response.is_some());
+        assert_eq!(manager.pending_ui_count(), 0);
     });
 }

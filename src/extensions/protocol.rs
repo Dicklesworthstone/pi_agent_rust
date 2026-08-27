@@ -1797,8 +1797,48 @@ impl ExtensionUiRequest {
             method: method.into(),
             payload,
             timeout_ms: None,
+            deadline: None,
             extension_id: None,
+            capability_prompt: None,
         }
+    }
+
+    /// Construct a host-authenticated capability permission prompt.
+    ///
+    /// The typed identity, not similarly named payload fields, is the trust
+    /// boundary consumed by interactive surfaces. Ordinary extension UI
+    /// hostcalls always enter through [`Self::new`] and remain unprivileged.
+    pub fn new_capability_prompt(
+        id: impl Into<String>,
+        extension_id: impl Into<String>,
+        capability: impl Into<String>,
+        payload: Value,
+    ) -> Self {
+        let extension_id = extension_id.into();
+        let capability = capability.into();
+        Self {
+            id: id.into(),
+            method: "confirm".to_string(),
+            payload,
+            timeout_ms: None,
+            deadline: None,
+            extension_id: Some(extension_id.clone()),
+            capability_prompt: Some(CapabilityPromptMetadata {
+                extension_id,
+                capability,
+            }),
+        }
+    }
+
+    /// Whether this request carries host-authenticated capability metadata.
+    pub fn is_capability_prompt(&self) -> bool {
+        self.capability_prompt.is_some()
+    }
+
+    pub(crate) fn capability_prompt_identity(&self) -> Option<(&str, &str)> {
+        self.capability_prompt
+            .as_ref()
+            .map(|metadata| (metadata.extension_id.as_str(), metadata.capability.as_str()))
     }
 
     /// Set the extension ID for provenance tracking.
@@ -1814,9 +1854,64 @@ impl ExtensionUiRequest {
     /// timeout elapses fails closed with a timeout error and its pending
     /// entry is removed, so callers cannot strand on an unanswered surface.
     #[must_use]
-    pub const fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = Some(timeout_ms);
+        // This consuming builder is still pre-publication, so a later setter
+        // deliberately replaces both the relative value and its deadline.
+        // Once request_ui admits the request, bind_deadline is idempotent and
+        // no queue or consumer can restart the final budget.
+        self.deadline = None;
+        self.bind_deadline(Instant::now());
         self
+    }
+
+    /// Bind the effective relative timeout to one monotonic deadline.
+    ///
+    /// This is idempotent: cloning, queueing, and later consumers can never
+    /// restart the request's budget. An `Instant` overflow fails closed by
+    /// binding the deadline to `now` instead of silently making it unbounded.
+    pub(crate) fn bind_deadline(&mut self, now: Instant) {
+        if self.deadline.is_some() {
+            return;
+        }
+        let Some(timeout_ms) = self.effective_timeout_ms() else {
+            return;
+        };
+        self.deadline = Some(
+            now.checked_add(Duration::from_millis(timeout_ms))
+                .unwrap_or(now),
+        );
+    }
+
+    /// The monotonic deadline shared by manager and local UI consumers.
+    pub(crate) const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Remaining time in the already-bound budget.
+    ///
+    /// Requests that have not crossed the manager yet retain their relative
+    /// timeout as a fallback; `request_ui` binds it before publication.
+    pub(crate) fn remaining_timeout(&self, now: Instant) -> Option<Duration> {
+        self.deadline.map_or_else(
+            || self.effective_timeout_ms().map(Duration::from_millis),
+            |deadline| Some(deadline.saturating_duration_since(now)),
+        )
+    }
+
+    /// Canonical non-cacheable denial emitted when the authoritative
+    /// capability-prompt deadline elapses without a user choice.
+    pub(crate) fn auto_deny_response(&self) -> ExtensionUiResponse {
+        ExtensionUiResponse {
+            id: self.id.clone(),
+            value: Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+                "reason": "auto_deny",
+            })),
+            cancelled: false,
+        }
     }
 
     pub fn expects_response(&self) -> bool {
@@ -1848,13 +1943,6 @@ impl ExtensionUiRequest {
 
     pub fn to_rpc_event(&self) -> Value {
         let mut map = serde_json::Map::new();
-        map.insert(
-            "type".to_string(),
-            Value::String("extension_ui_request".to_string()),
-        );
-        map.insert("id".to_string(), Value::String(self.id.clone()));
-        map.insert("method".to_string(), Value::String(self.method.clone()));
-
         match &self.payload {
             Value::Object(obj) => {
                 for (key, value) in obj {
@@ -1864,6 +1952,38 @@ impl ExtensionUiRequest {
             other => {
                 map.insert("payload".to_string(), other.clone());
             }
+        }
+
+        // Typed envelope fields are authoritative and are inserted after the
+        // flattened, extension-controlled payload. Payload collisions must
+        // never spoof the RPC event type or response correlation identity.
+        map.insert(
+            "type".to_string(),
+            Value::String("extension_ui_request".to_string()),
+        );
+        map.insert("id".to_string(), Value::String(self.id.clone()));
+        map.insert("method".to_string(), Value::String(self.method.clone()));
+        map.insert(
+            "capability_prompt".to_string(),
+            Value::Bool(self.is_capability_prompt()),
+        );
+        if let Some((extension_id, capability)) = self.capability_prompt_identity() {
+            map.insert(
+                "extension_id".to_string(),
+                Value::String(extension_id.to_string()),
+            );
+            map.insert(
+                "capability".to_string(),
+                Value::String(capability.to_string()),
+            );
+        } else if let Some(extension_id) = &self.extension_id {
+            map.insert(
+                "extension_id".to_string(),
+                Value::String(extension_id.clone()),
+            );
+        }
+        if let Some(timeout_ms) = self.timeout_ms {
+            map.insert("timeout_ms".to_string(), Value::from(timeout_ms));
         }
 
         Value::Object(map)
