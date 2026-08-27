@@ -4526,6 +4526,35 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn set_editor_text_event_is_bound_to_its_originating_session() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let current_session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+        app.input.set_value("current draft");
+
+        let _ = app.handle_pi_message(PiMsg::SetEditorText {
+            owner_session_id: "replaced-session".to_string(),
+            text: "stale branch prompt".to_string(),
+        });
+        assert_eq!(
+            app.input.value(),
+            "current draft",
+            "an old session's branch prompt must not overwrite the replacement editor"
+        );
+
+        let _ = app.handle_pi_message(PiMsg::SetEditorText {
+            owner_session_id: current_session_id,
+            text: "current branch prompt".to_string(),
+        });
+        assert_eq!(app.input.value(), "current branch prompt");
+    }
+
+    #[test]
     fn continue_pending_input_runs_agent_without_new_user_message() {
         let state = Arc::new(ContinueProbeState::default());
         let provider: Arc<dyn Provider> = Arc::new(ContinueProbeProvider {

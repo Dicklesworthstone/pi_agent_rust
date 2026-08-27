@@ -5112,12 +5112,22 @@ mod tests {
         let original_session_id = current_session_id(&app);
         app.title_requested = true;
         app.todo_summary = Some("1/2 todos complete".to_string());
+        app.role_model_overrides.insert(
+            crate::models::ModelRole::Smol,
+            ("fixture-provider".to_string(), "fixture-model".to_string()),
+        );
 
         let _ = app.handle_slash_command(SlashCommand::New, "");
 
-        assert_ne!(current_session_id(&app), original_session_id);
+        let new_session_id = current_session_id(&app);
+        assert_ne!(new_session_id, original_session_id);
         assert!(!app.title_requested);
         assert!(app.todo_summary.is_none());
+        assert!(app.role_model_overrides.is_empty());
+        assert_eq!(
+            app.displayed_session_id.as_deref(),
+            Some(new_session_id.as_str())
+        );
     }
 
     #[test]
