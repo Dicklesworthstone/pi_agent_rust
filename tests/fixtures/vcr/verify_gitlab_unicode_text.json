@@ -20,7 +20,18 @@
             "Accept",
             "application/json"
           ]
-        ]
+        ],
+        "body": {
+          "content": "Respond with exactly: '日本語テスト — émojis: 🦀🔥'",
+          "with_clean_history": true,
+          "additional_context": [
+            {
+              "category": "file",
+              "id": "system-prompt",
+              "content": "[System]: You are a test harness model. Follow instructions precisely and deterministically."
+            }
+          ]
+        }
       },
       "response": {
         "status": 200,
@@ -31,7 +42,7 @@
           ]
         ],
         "body_chunks": [
-          "{\"response\":\"日本語テスト — émojis: 🦀🔥\"}"
+          "\"日本語テスト — émojis: 🦀🔥\""
         ]
       }
     }

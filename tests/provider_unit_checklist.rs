@@ -234,7 +234,7 @@ fn checklist_bedrock_request_mapping() {
 #[test]
 fn checklist_gitlab_request_mapping() {
     let context = minimal_context();
-    let req = GitLabProvider::build_request(&context);
+    let req = GitLabProvider::build_request(&context).expect("gitlab request mapping");
     let v = serde_json::to_value(&req).expect("gitlab: build_request must serialize to JSON");
     assert!(v.is_object(), "gitlab: request must be a JSON object");
     assert!(

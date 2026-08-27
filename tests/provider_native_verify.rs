@@ -149,6 +149,11 @@ struct StreamSummary {
     stream_error: Option<String>,
 }
 
+enum ScenarioResult {
+    Stream(StreamSummary),
+    Error,
+}
+
 fn summarize_events(outcome: &StreamOutcome) -> StreamSummary {
     let mut summary = StreamSummary {
         timeline: Vec::new(),
@@ -1176,12 +1181,11 @@ const SYSTEM_PROMPT: &str =
 
 /// Run a single canonical scenario against a pre-built provider.
 ///
-/// Returns `true` if the scenario ran (cassette present), `false` if skipped.
 async fn run_canonical_scenario(
     provider: &dyn Provider,
     scenario: &CanonicalScenario,
     harness: &TestHarness,
-) -> bool {
+) -> ScenarioResult {
     let context = Context {
         system_prompt: Some(SYSTEM_PROMPT.to_string().into()),
         messages: scenario.messages.clone().into(),
@@ -1241,6 +1245,7 @@ async fn run_canonical_scenario(
             let report =
                 build_verification_report(provider_name, tag, scenario.description, &summary);
             write_report(harness, provider_name, tag, &report);
+            ScenarioResult::Stream(summary)
         }
         CanonicalExpectation::Error(expectation) => {
             let result = provider.stream(&context, &options).await;
@@ -1251,10 +1256,9 @@ async fn run_canonical_scenario(
             assert_error_ok(&format!("{provider_name}/{tag}"), &message, expectation);
 
             harness.log().info("error", &message);
+            ScenarioResult::Error
         }
     }
-
-    true
 }
 
 // ============================================================================
@@ -1861,6 +1865,16 @@ mod gitlab_smoke {
         format!("verify_gitlab_{tag}")
     }
 
+    fn expected_request_body(scenario: &CanonicalScenario) -> Value {
+        let context = Context {
+            system_prompt: Some(SYSTEM_PROMPT.to_string().into()),
+            messages: scenario.messages.clone().into(),
+            tools: scenario.tools.clone().into(),
+        };
+        let request = GitLabProvider::build_request(&context).expect("valid GitLab request");
+        serde_json::to_value(request).expect("serialize GitLab request")
+    }
+
     fn ensure_fixture(tag: &str, scenario: &CanonicalScenario) -> PathBuf {
         let dir = cassette_root();
         let name = cassette_name(tag);
@@ -1888,12 +1902,14 @@ mod gitlab_smoke {
                     RecordedResponse {
                         status: 200,
                         headers: vec![("Content-Type".to_string(), "application/json".to_string())],
-                        body_chunks: vec![
-                            serde_json::to_string(&json!({"response": text})).unwrap_or_default(),
-                        ],
+                        body_chunks: vec![serde_json::to_string(text).unwrap_or_default()],
                         body_chunks_base64: None,
                     }
                 }
+            };
+            let request_body = match &scenario.expectation {
+                CanonicalExpectation::Stream(_) => Some(expected_request_body(scenario)),
+                CanonicalExpectation::Error(_) => None,
             };
 
             let cassette = Cassette {
@@ -1910,7 +1926,7 @@ mod gitlab_smoke {
                             ("Content-Type".to_string(), "application/json".to_string()),
                             ("Accept".to_string(), "application/json".to_string()),
                         ],
-                        body: None,
+                        body: request_body,
                         body_text: None,
                     },
                     response,
@@ -1944,7 +1960,12 @@ mod gitlab_smoke {
             .expect("runtime")
             .block_on(async {
                 let harness = TestHarness::new("verify_gitlab_simple_text");
-                run_canonical_scenario(&provider, scenario, &harness).await;
+                let ScenarioResult::Stream(summary) =
+                    run_canonical_scenario(&provider, scenario, &harness).await
+                else {
+                    panic!("GitLab simple text must stream");
+                };
+                assert_eq!(summary.text, "Hello from the verification harness.");
             });
     }
 
@@ -1960,7 +1981,12 @@ mod gitlab_smoke {
             .expect("runtime")
             .block_on(async {
                 let harness = TestHarness::new("verify_gitlab_unicode_text");
-                run_canonical_scenario(&provider, scenario, &harness).await;
+                let ScenarioResult::Stream(summary) =
+                    run_canonical_scenario(&provider, scenario, &harness).await
+                else {
+                    panic!("GitLab unicode text must stream");
+                };
+                assert_eq!(summary.text, "日本語テスト — émojis: 🦀🔥");
             });
     }
 
