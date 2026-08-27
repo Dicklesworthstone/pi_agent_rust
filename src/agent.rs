@@ -1736,6 +1736,17 @@ impl Agent {
         self.plan_state.clone()
     }
 
+    /// Reset memory-only state that belongs to the active Session identity.
+    ///
+    /// Secret placeholders are intentionally predictable within one Session,
+    /// so carrying their raw-value map into another Session would let a stale
+    /// placeholder recover data that the new Session never observed. Plan
+    /// state is shared with the submit-plan tool and must be reset in place.
+    pub fn reset_session_scoped_state(&mut self, plan_mode: crate::plan::PlanMode) {
+        self.secrets_vault = crate::secrets::SecretVault::default();
+        self.plan_state.reset_for_session(plan_mode);
+    }
+
     /// The shared tool approval state (bd-cv653.3.19).
     #[must_use]
     pub fn approval_state(&self) -> Option<crate::approval::ApprovalState> {
@@ -5454,6 +5465,7 @@ impl AgentSessionHostActions {
 #[async_trait]
 impl ExtensionHostActions for AgentSessionHostActions {
     async fn send_message(&self, message: ExtensionSendMessage) -> Result<()> {
+        let _session_action_permit = self.acquire_provider_admission().await?;
         let custom_message = Message::Custom(CustomMessage {
             content: message.content,
             custom_type: message.custom_type,
@@ -5484,6 +5496,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
     }
 
     async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()> {
+        let _session_action_permit = self.acquire_provider_admission().await?;
         let text = message.text;
         let user_message = Message::User(UserMessage {
             content: UserContent::Text(text.clone()),
@@ -7536,6 +7549,74 @@ mod extensions_integration_tests {
                 guard.to_messages_for_current_path().is_empty(),
                 "cancelled send_message should not append a message"
             );
+        });
+    }
+
+    #[test]
+    fn agent_host_actions_send_message_waits_for_session_transition_admission() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let provider_admission = ProviderAdmissionGate::default();
+            let actions = AgentSessionHostActions {
+                session: Arc::clone(&session),
+                injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_turn_active: Arc::new(AtomicBool::new(false)),
+                pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
+                ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
+                    provider: Arc::new(NoopProvider),
+                    stream_options: StreamOptions::default(),
+                    models: Vec::new(),
+                })),
+                provider_admission: provider_admission.clone(),
+            };
+            let transition_cx = crate::agent_cx::AgentCx::for_request();
+            let transition_permit = provider_admission
+                .acquire(transition_cx.cx())
+                .await
+                .expect("transition admission");
+
+            let hostcall = runtime_handle.spawn(async move {
+                actions
+                    .send_message(ExtensionSendMessage {
+                        extension_id: Some("ext".to_string()),
+                        custom_type: "note".to_string(),
+                        content: "must wait for transition".to_string(),
+                        display: false,
+                        details: None,
+                        deliver_as: Some(ExtensionDeliverAs::NextTurn),
+                        trigger_turn: false,
+                    })
+                    .await
+            });
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(25)).await;
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let guard = session.lock(cx.cx()).await.expect("session lock");
+                assert!(
+                    guard.to_messages_for_current_path().is_empty(),
+                    "host action must not mutate the Session while transition admission is held"
+                );
+            }
+
+            drop(transition_permit);
+            hostcall
+                .await
+                .expect("host action after transition release");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let guard = session.lock(cx.cx()).await.expect("session lock");
+            assert!(guard.to_messages_for_current_path().iter().any(|message| {
+                matches!(
+                    message,
+                    Message::Custom(CustomMessage { content, .. })
+                        if content == "must wait for transition"
+                )
+            }));
         });
     }
 
@@ -11699,6 +11780,12 @@ impl AgentSession {
     ) -> Result<Value> {
         self.execute_extension_command_with_abort(command_name, args, timeout_ms, None, on_event)
             .await
+    }
+
+    pub(crate) fn has_pending_extension_idle_actions(&self) -> bool {
+        self.extensions_pending_idle_actions
+            .lock()
+            .map_or(true, |actions| !actions.is_empty())
     }
 
     pub async fn execute_extension_command_with_abort(
@@ -19049,6 +19136,39 @@ mod tests {
                 .and_then(Value::as_str),
             Some("approved")
         );
+    }
+
+    #[test]
+    fn session_state_reset_drops_secret_placeholders_and_plan_gate() {
+        let provider = Arc::new(SilentProvider);
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+        let raw_secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        let placeholder = agent
+            .secrets_transform_outbound_text(raw_secret)
+            .expect("obfuscate secret");
+        assert_ne!(placeholder, raw_secret);
+        agent.plan_state().enter_planning();
+
+        let before_reset = agent.restore_secrets_inbound(ToolCall {
+            id: "before".to_string(),
+            name: "read".to_string(),
+            arguments: json!({"token": placeholder}),
+            thought_signature: None,
+        });
+        assert_eq!(before_reset.arguments["token"], raw_secret);
+
+        agent.reset_session_scoped_state(crate::plan::PlanMode::Off);
+
+        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
+        let after_reset = agent.restore_secrets_inbound(ToolCall {
+            id: "after".to_string(),
+            name: "read".to_string(),
+            arguments: json!({"token": placeholder}),
+            thought_signature: None,
+        });
+        assert_eq!(after_reset.arguments["token"], placeholder);
+        assert_eq!(agent.mask_secrets_text(raw_secret), raw_secret);
     }
 
     // === Dialect repair turn (bd-cv653.7.8) ===

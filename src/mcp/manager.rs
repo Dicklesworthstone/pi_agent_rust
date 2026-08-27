@@ -1039,6 +1039,23 @@ impl McpManager {
             Self::lock(&entry.tools_cache).take();
             return Err(err);
         }
+        if let Err(err) = Arc::clone(&transport).activate() {
+            transport.close().await;
+            Self::record_failure(entry, &err);
+            return Err(err);
+        }
+        if !transport.is_alive() {
+            let err = tool_err(
+                "MCP_TRANSPORT_CLOSED",
+                format!(
+                    "server {:?} failed while activating its receive channel",
+                    entry.config.name
+                ),
+            );
+            transport.close().await;
+            Self::record_failure(entry, &err);
+            return Err(err);
+        }
         let published = {
             let mut current = Self::lock(&entry.transport);
             if self.inner.shutting_down.load(Ordering::Acquire) {

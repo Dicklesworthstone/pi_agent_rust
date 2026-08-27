@@ -1066,6 +1066,32 @@ impl RunningBash {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RpcSessionTransitionSnapshot {
+    session_id: String,
+    leaf_id: Option<String>,
+    entry_count: usize,
+}
+
+async fn rpc_session_transition_snapshot(
+    session: &Arc<Mutex<AgentSession>>,
+    cx: &AgentCx,
+) -> Result<RpcSessionTransitionSnapshot> {
+    let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let inner = guard
+        .session
+        .lock(cx.cx())
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+    Ok(RpcSessionTransitionSnapshot {
+        session_id: inner.header.id.clone(),
+        leaf_id: inner.leaf_id().map(str::to_string),
+        entry_count: inner.entries.len(),
+    })
+}
+
 async fn rpc_session_transition_blocker(
     is_streaming: &AtomicBool,
     is_compacting: &AtomicBool,
@@ -1099,10 +1125,16 @@ async fn rpc_session_transition_blocker(
     guard.ensure_provider_reentry_allowed()?;
     let provider_admission = guard.provider_admission_gate();
     let staged_follow_up = guard.agent.has_staged_follow_up();
+    let pending_extension_action = guard.has_pending_extension_idle_actions();
     drop(guard);
     if staged_follow_up {
         return Ok(Some(
             "An accepted follow-up is still pending; resume it before changing sessions",
+        ));
+    }
+    if pending_extension_action {
+        return Ok(Some(
+            "An extension-triggered action is still pending; resume it before changing sessions",
         ));
     }
 
@@ -1125,6 +1157,49 @@ async fn rpc_session_transition_blocker(
         .is_some();
     Ok(bash_running
         .then_some("A background bash command is still running; wait before changing sessions"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acquire_rpc_session_transition_after_hook(
+    baseline: &RpcSessionTransitionSnapshot,
+    is_streaming: &AtomicBool,
+    is_compacting: &AtomicBool,
+    turn_phase_linearizer: &std::sync::Mutex<()>,
+    session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    bash_state: &Arc<Mutex<Option<RunningBash>>>,
+    cx: &AgentCx,
+) -> Result<OwnedMutexGuard<()>> {
+    let provider_admission = {
+        let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+            .await
+            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        guard.provider_admission_gate()
+    };
+    let permit = provider_admission.acquire(cx.cx()).await?;
+    provider_admission.ensure_allowed()?;
+
+    if let Some(reason) = rpc_session_transition_blocker(
+        is_streaming,
+        is_compacting,
+        turn_phase_linearizer,
+        session,
+        shared_state,
+        bash_state,
+        cx,
+    )
+    .await?
+    {
+        return Err(Error::session(reason));
+    }
+
+    let current = rpc_session_transition_snapshot(session, cx).await?;
+    if current != *baseline {
+        return Err(Error::session(
+            "session_before_switch modified the source Session; the transition was rejected so the accepted action remains owned by that Session",
+        ));
+    }
+    Ok(permit)
 }
 
 #[derive(Debug, Clone)]
@@ -1365,6 +1440,15 @@ pub async fn run(
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
             .await
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        let initial_plan_mode = {
+            let inner = guard
+                .session
+                .lock(&cx)
+                .await
+                .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+            replayed_plan_mode(&inner)
+        };
+        guard.agent.reset_session_scoped_state(initial_plan_mode);
         guard.set_queue_modes(
             options.config.steering_queue_mode(),
             options.config.follow_up_queue_mode(),
@@ -3465,6 +3549,7 @@ pub async fn run(
                     }
                     *inner = candidate;
                     guard.agent.stream_options_mut().session_id = Some(new_id.clone());
+                    guard.refresh_extension_completion_host_state();
                     state.provider_admission.clear();
                     Ok(json!({ "schema": "pi.fresh.v1", "newSessionId": new_id }))
                 }
@@ -3604,6 +3689,7 @@ pub async fn run(
                     let _ = out_tx.send(response_error(id, "new_session", reason.to_string()));
                     continue;
                 }
+                let transition_baseline = rpc_session_transition_snapshot(&session, &cx).await?;
                 if rpc_dispatch_session_before_switch(rpc_extension_manager.clone(), "new", None)
                     .await
                 {
@@ -3614,12 +3700,30 @@ pub async fn run(
                     ));
                     continue;
                 }
+                let session_transition_permit = match acquire_rpc_session_transition_after_hook(
+                    &transition_baseline,
+                    &is_streaming,
+                    &is_compacting,
+                    &turn_phase_linearizer,
+                    &session,
+                    &shared_state,
+                    &bash_state,
+                    &cx,
+                )
+                .await
+                {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "new_session", &err));
+                        continue;
+                    }
+                };
 
                 let parent = parsed
                     .get("parentSession")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let (session_id, previous_session_file) = {
+                let result: Result<(String, Option<String>)> = async {
                     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
@@ -3655,6 +3759,8 @@ pub async fn run(
                         .clone_from(&thinking_level);
 
                     let session_id = new_session.header.id.clone();
+                    guard.invalidate_background_compaction();
+                    state.provider_admission.ensure_allowed()?;
                     {
                         let session_store = Arc::clone(&guard.session);
                         let mut inner_session = OwnedMutexGuard::lock(session_store, &cx)
@@ -3662,32 +3768,42 @@ pub async fn run(
                             .map_err(|err| {
                                 Error::session(format!("inner session lock failed: {err}"))
                             })?;
-                        guard.invalidate_background_compaction();
-                        let _provider_transition = state.provider_admission.acquire(&cx).await?;
-                        state.provider_admission.ensure_allowed()?;
                         *inner_session = new_session;
                     }
                     guard.agent.clear_messages();
                     guard.agent.stream_options_mut().session_id = Some(session_id.clone());
+                    guard
+                        .agent
+                        .reset_session_scoped_state(crate::plan::PlanMode::Off);
+                    guard.refresh_extension_completion_host_state();
                     state.clear_all_pending();
                     state.clear_failover_lifecycle();
 
-                    (session_id, previous_session_file)
-                };
-                rpc_dispatch_session_switch_event(
-                    rpc_extension_manager.clone(),
-                    json!({
-                        "reason": "new",
-                        "previousSessionFile": previous_session_file,
-                        "sessionId": session_id,
-                    }),
-                )
+                    Ok((session_id, previous_session_file))
+                }
                 .await;
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "new_session",
-                    Some(json!({ "cancelled": false })),
-                ));
+                drop(session_transition_permit);
+                match result {
+                    Ok((session_id, previous_session_file)) => {
+                        rpc_dispatch_session_switch_event(
+                            rpc_extension_manager.clone(),
+                            json!({
+                                "reason": "new",
+                                "previousSessionFile": previous_session_file,
+                                "sessionId": session_id,
+                            }),
+                        )
+                        .await;
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "new_session",
+                            Some(json!({ "cancelled": false })),
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "new_session", &err));
+                    }
+                }
             }
 
             "switch_session" => {
@@ -3713,6 +3829,7 @@ pub async fn run(
                     ));
                     continue;
                 };
+                let transition_baseline = rpc_session_transition_snapshot(&session, &cx).await?;
 
                 if rpc_dispatch_session_before_switch(
                     rpc_extension_manager.clone(),
@@ -3728,6 +3845,24 @@ pub async fn run(
                     ));
                     continue;
                 }
+                let session_transition_permit = match acquire_rpc_session_transition_after_hook(
+                    &transition_baseline,
+                    &is_streaming,
+                    &is_compacting,
+                    &turn_phase_linearizer,
+                    &session,
+                    &shared_state,
+                    &bash_state,
+                    &cx,
+                )
+                .await
+                {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
+                        continue;
+                    }
+                };
 
                 // Validate relative paths against the sessions directory to prevent traversal.
                 let session_path_buf = std::path::PathBuf::from(session_path);
@@ -3835,9 +3970,12 @@ pub async fn run(
                                 }
                             }
 
+                            let target_plan_mode = replayed_plan_mode(&new_session);
                             let messages = new_session.to_messages_for_current_path();
                             let session_id = new_session.header.id.clone();
 
+                            guard.invalidate_background_compaction();
+                            state.provider_admission.ensure_allowed()?;
                             let session_store = Arc::clone(&guard.session);
                             let mut inner_session = OwnedMutexGuard::lock(session_store, &cx)
                                 .await
@@ -3846,13 +3984,10 @@ pub async fn run(
                                 })?;
                             let previous_session_file =
                                 inner_session.path.as_ref().map(|p| p.display().to_string());
-                            guard.invalidate_background_compaction();
-                            let _provider_transition =
-                                state.provider_admission.acquire(&cx).await?;
-                            state.provider_admission.ensure_allowed()?;
                             *inner_session = new_session;
                             guard.agent.replace_messages(messages);
                             guard.agent.stream_options_mut().session_id = Some(session_id.clone());
+                            guard.agent.reset_session_scoped_state(target_plan_mode);
 
                             guard.agent.set_provider(provider_impl);
                             guard.agent.set_keyword_max_thinking_level(
@@ -3886,6 +4021,7 @@ pub async fn run(
                             Ok((previous_session_file, session_id))
                         }
                         .await;
+                        drop(session_transition_permit);
 
                         match result {
                             Ok((previous_session_file, session_id)) => {
@@ -3916,6 +4052,7 @@ pub async fn run(
                         }
                     }
                     Err(err) => {
+                        drop(session_transition_permit);
                         let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
                     }
                 }
@@ -4051,8 +4188,12 @@ pub async fn run(
                             }
                         }
 
+                        let target_plan_mode = replayed_plan_mode(&new_session);
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
+                        guard.invalidate_background_compaction();
+                        let _provider_transition = state.provider_admission.acquire(&cx).await?;
+                        state.provider_admission.ensure_allowed()?;
                         let session_store = Arc::clone(&guard.session);
                         let mut inner = OwnedMutexGuard::lock(session_store, &cx)
                             .await
@@ -4064,13 +4205,11 @@ pub async fn run(
                                 "active Session changed while the fork target was being prepared",
                             ));
                         }
-                        guard.invalidate_background_compaction();
-                        let _provider_transition = state.provider_admission.acquire(&cx).await?;
-                        state.provider_admission.ensure_allowed()?;
                         *inner = new_session;
                         drop(inner);
                         guard.agent.replace_messages(messages);
                         guard.agent.stream_options_mut().session_id = Some(session_id);
+                        guard.agent.reset_session_scoped_state(target_plan_mode);
                         guard.agent.set_provider(provider_impl);
                         guard.agent.set_keyword_max_thinking_level(
                             entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
@@ -5298,11 +5437,6 @@ async fn run_prompt_with_retry(
             final_error_hints = Some(error_hints_value(&restore_err));
             break;
         }
-        // Rotation bookkeeping and key replacement are mutations, so tail
-        // restoration must succeed before either can occur.
-        if let Some((provider_name, key)) = quota_credential.as_ref() {
-            crate::auth::report_provider_rate_limit(provider_name, key);
-        }
         let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
             Ok(guard) => guard,
             Err(lock_err) => {
@@ -5314,6 +5448,26 @@ async fn run_prompt_with_retry(
                 break;
             }
         };
+        let provider_admission = guard.provider_admission_gate();
+        let _credential_rotation_permit = match provider_admission.acquire(&cx).await {
+            Ok(permit) => permit,
+            Err(admission_err) => {
+                final_error = Some(admission_err.to_string());
+                final_error_hints = Some(error_hints_value(&admission_err));
+                break;
+            }
+        };
+        if let Err(admission_err) = provider_admission.ensure_allowed() {
+            final_error = Some(admission_err.to_string());
+            final_error_hints = Some(error_hints_value(&admission_err));
+            break;
+        }
+        // Rotation bookkeeping and key replacement are one admission-bound
+        // mutation. Tail restoration must succeed before either can occur,
+        // and no provider call may observe the backed-off key in between.
+        if let Some((provider_name, key)) = quota_credential.as_ref() {
+            crate::auth::report_provider_rate_limit(provider_name, key);
+        }
         // Credential rotation (bd-cv653.3.2): re-resolve the key so a
         // backed-off credential rotates on the retry. CLI-pinned keys
         // never rotate.
@@ -5472,12 +5626,14 @@ async fn maybe_restore_primary(
     let Some((active_provider, active_model)) = state.active_failover_model.clone() else {
         return Ok(());
     };
-    let Some((provider, model_id)) = state.failover_primary_model.clone() else {
+    let Some(primary) = state.failover_primary.clone() else {
         let reason =
             "primary restore invariant failed: active fallback has no recorded primary".to_string();
         state.provider_admission.block(reason.clone());
         return Err(Error::session_persistence(reason));
     };
+    let provider = primary.provider;
+    let model_id = primary.model_id;
 
     let runtime_provider = guard.agent.provider();
     if !crate::provider_metadata::provider_ids_match(runtime_provider.name(), &active_provider)
@@ -5548,13 +5704,7 @@ async fn maybe_restore_primary(
             .map(crate::extensions::ExtensionRegion::manager),
     )?;
 
-    let target_thinking = entry.clamp_thinking_level(
-        guard
-            .agent
-            .stream_options()
-            .thinking_level
-            .unwrap_or_default(),
-    );
+    let target_thinking = entry.clamp_thinking_level(primary.requested_thinking_level);
     let target_thinking_text = target_thinking.to_string();
     let mut candidate = inner.clone();
     let thinking_changed = candidate
@@ -5680,9 +5830,17 @@ async fn try_failover_to_next_chain_entry(
     state.ensure_session_advancement_allowed()?;
     let primary_model = match (
         state.active_failover_model.as_ref(),
-        state.failover_primary_model.as_ref(),
+        state.failover_primary.as_ref(),
     ) {
-        (None, None) => (current_provider.clone(), current_model.clone()),
+        (None, None) => RpcFailoverPrimary {
+            provider: current_provider.clone(),
+            model_id: current_model.clone(),
+            requested_thinking_level: guard
+                .agent
+                .stream_options()
+                .thinking_level
+                .unwrap_or_default(),
+        },
         (Some((active_provider, active_model)), Some(primary))
             if crate::provider_metadata::provider_ids_match(&current_provider, active_provider)
                 && current_model.eq_ignore_ascii_case(active_model) =>
@@ -5709,9 +5867,12 @@ async fn try_failover_to_next_chain_entry(
     // A fallback chain belongs to the original primary identity. Once the
     // first entry is active, resolving from the live fallback would make an
     // exact primary chain disappear and prevent later entries from running.
-    let Some(chain) =
-        crate::failover::chain_for(chains, "default", &primary_model.0, &primary_model.1)
-    else {
+    let Some(chain) = crate::failover::chain_for(
+        chains,
+        "default",
+        &primary_model.provider,
+        &primary_model.model_id,
+    ) else {
         return Ok(false);
     };
     let mut position = state.failover_chain_position.unwrap_or(0);
@@ -5772,13 +5933,7 @@ async fn try_failover_to_next_chain_entry(
             ));
         }
         let restored_messages = candidate.to_messages_for_current_path();
-        let target_thinking = entry.clamp_thinking_level(
-            guard
-                .agent
-                .stream_options()
-                .thinking_level
-                .unwrap_or_default(),
-        );
+        let target_thinking = entry.clamp_thinking_level(primary_model.requested_thinking_level);
         let target_thinking_text = target_thinking.to_string();
         let thinking_changed = candidate
             .effective_thinking_level_for_current_path()
@@ -5854,7 +6009,7 @@ async fn try_failover_to_next_chain_entry(
                 .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
         }
 
-        state.failover_primary_model = Some(primary_model.clone());
+        state.failover_primary = Some(primary_model.clone());
         state.active_failover_model = Some((to_provider.clone(), to_model.clone()));
         state.failover_chain_position = Some(position);
         if let Some(tracker) = state.failover_cooldown.as_mut() {
@@ -7714,7 +7869,7 @@ mod retry_tests {
             drop(guard);
 
             let state = shared_state.lock(&cx).await.expect("shared state lock");
-            assert!(state.failover_primary_model.is_none());
+            assert!(state.failover_primary.is_none());
             assert!(state.active_failover_model.is_none());
             assert!(state.failover_chain_position.is_none());
             assert!(state.provider_admission.reason().is_none());
@@ -7851,11 +8006,12 @@ mod retry_tests {
 
             let state = shared_state.lock(&cx).await.expect("shared state lock");
             assert_eq!(
-                state
-                    .failover_primary_model
-                    .as_ref()
-                    .map(|(provider, model)| (provider.as_str(), model.as_str())),
-                Some(("test-provider", "test-model"))
+                state.failover_primary.as_ref().map(|primary| (
+                    primary.provider.as_str(),
+                    primary.model_id.as_str(),
+                    primary.requested_thinking_level,
+                )),
+                Some(("test-provider", "test-model", ThinkingLevel::Off))
             );
             assert_eq!(
                 state
@@ -7966,6 +8122,7 @@ mod retry_tests {
             );
             second_fallback.model.context_window = 2_048;
             second_fallback.model.max_tokens = 3_072;
+            second_fallback.model.reasoning = true;
             let provider = providers::create_provider(&primary, None).expect("primary provider");
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let mut agent = Agent::new(provider, tools, AgentConfig::default());
@@ -8131,6 +8288,11 @@ mod retry_tests {
                     .expect("second fallback AgentSession lock");
                 assert_eq!(guard.agent.provider().name(), "cohere");
                 assert_eq!(guard.agent.provider().model_id(), "second-fallback-model");
+                assert_eq!(
+                    guard.agent.stream_options().thinking_level,
+                    Some(ThinkingLevel::High),
+                    "a later reasoning-capable fallback must recover the primary request"
+                );
                 assert_eq!(guard.agent.stream_options().max_tokens, Some(3_072));
                 assert_eq!(guard.compaction_settings().context_window_tokens, 2_048);
             }
@@ -8149,7 +8311,7 @@ mod retry_tests {
             assert_eq!(guard.agent.provider().model_id(), "primary-model");
             assert_eq!(
                 guard.agent.stream_options().thinking_level,
-                Some(ThinkingLevel::Off)
+                Some(ThinkingLevel::High)
             );
             assert_eq!(guard.agent.stream_options().max_tokens, Some(1_536));
             assert!(guard.agent.model_accepts_images());
@@ -8177,7 +8339,7 @@ mod retry_tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(roles, vec!["failover", "failover", "primary_restore"]);
-            assert_eq!(inner.header.thinking_level.as_deref(), Some("off"));
+            assert_eq!(inner.header.thinking_level.as_deref(), Some("high"));
             let persisted_path = inner
                 .path
                 .clone()
@@ -8212,11 +8374,11 @@ mod retry_tests {
                 reopened
                     .effective_thinking_level_for_current_path()
                     .as_deref(),
-                Some("off")
+                Some("high")
             );
 
             let state = shared_state.lock(&cx).await.expect("shared state lock");
-            assert!(state.failover_primary_model.is_none());
+            assert!(state.failover_primary.is_none());
             assert!(state.active_failover_model.is_none());
             assert!(state.failover_chain_position.is_none());
             assert!(state.provider_admission.reason().is_none());
@@ -9111,6 +9273,106 @@ mod retry_tests {
                 "failed persistence must not install the fresh marker"
             );
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn rpc_new_session_rejects_real_js_hook_message_without_losing_source_action() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let extension_path = temp.path().join("switch-owner.mjs");
+            std::fs::write(
+                &extension_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("session_before_switch", async () => {
+                    await pi.sendMessage({
+                      customType: "hook-note",
+                      content: "belongs to source session",
+                      display: true
+                    }, {});
+                  });
+                }
+                "#,
+            )
+            .expect("write transition extension");
+
+            let provider = Arc::new(FlakyProvider::new());
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+            let original_session_id = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("initial session lock")
+                .header
+                .id
+                .clone();
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            agent_session
+                .enable_extensions(&[], temp.path(), None, &[extension_path])
+                .await
+                .expect("enable transition extension");
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+            let send_cx = asupersync::Cx::for_testing();
+            in_tx
+                .send(
+                    &send_cx,
+                    r#"{"id":"1","type":"new_session"}"#.to_string(),
+                )
+                .await
+                .expect("send new_session");
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+
+            run(agent_session, options, in_rx, out_tx)
+                .await
+                .expect("rpc server loop");
+
+            let response = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+                .find(|value| value["type"] == "response" && value["command"] == "new_session")
+                .expect("new_session response");
+            assert_eq!(response["success"], false, "unexpected response: {response}");
+            assert!(
+                response["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("modified the source Session")),
+                "unexpected transition error: {response}"
+            );
+
+            let cx = AgentCx::for_request();
+            let inner = inner_session.lock(&cx).await.expect("source session lock");
+            assert_eq!(inner.header.id, original_session_id);
+            assert!(inner.entries_for_current_path().iter().any(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Message(message)
+                        if matches!(
+                            &message.message,
+                            SessionMessage::Custom {
+                                custom_type,
+                                content,
+                                ..
+                            } if custom_type == "hook-note" && content == "belongs to source session"
+                        )
+                )
+            }));
         });
     }
 
@@ -10565,6 +10827,34 @@ fn session_thinking_level(
                 },
                 Some,
             )
+        })
+}
+
+fn replayed_plan_mode(session: &crate::session::Session) -> crate::plan::PlanMode {
+    session
+        .entries_for_current_path()
+        .iter()
+        .filter_map(|entry| {
+            let SessionEntry::Custom(custom) = entry else {
+                return None;
+            };
+            if custom.custom_type != "plan_mode" {
+                return None;
+            }
+            custom
+                .data
+                .as_ref()
+                .and_then(|data| data.get("mode"))
+                .and_then(Value::as_str)
+        })
+        .fold(crate::plan::PlanMode::Off, |current, mode| match mode {
+            "off" => crate::plan::PlanMode::Off,
+            "planning" | "rejected" => crate::plan::PlanMode::Planning,
+            // Submitted plan text is memory-only. Resetting the Agent maps
+            // this unreconstructable state back to read-only Planning.
+            "pending_approval" => crate::plan::PlanMode::PendingApproval,
+            "approved" => crate::plan::PlanMode::Approved,
+            _ => current,
         })
 }
 
@@ -14629,6 +14919,64 @@ export default function init(pi) {
     }
 
     #[test]
+    fn post_hook_transition_recheck_rejects_source_session_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let bash_state = Arc::new(asupersync::sync::Mutex::new(None));
+            let cx = AgentCx::for_request();
+            let baseline = rpc_session_transition_snapshot(&session, &cx)
+                .await
+                .expect("transition baseline");
+            {
+                let guard = session.lock(&cx).await.expect("agent session lock");
+                let mut inner = guard.session.lock(&cx).await.expect("inner session lock");
+                inner.append_custom_entry(
+                    "hook-action".to_string(),
+                    Some(json!({"owner": "source-session"})),
+                );
+            }
+
+            let err = match acquire_rpc_session_transition_after_hook(
+                &baseline,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                &std::sync::Mutex::new(()),
+                &session,
+                &shared_state,
+                &bash_state,
+                &cx,
+            )
+            .await
+            {
+                Ok(_) => panic!("source mutation must reject the transition"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("modified the source Session"),
+                "unexpected transition error: {err}"
+            );
+
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            let inner = guard.session.lock(&cx).await.expect("inner session lock");
+            assert!(inner.entries_for_current_path().iter().any(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Custom(custom) if custom.custom_type == "hook-action"
+                )
+            }));
+        });
+    }
+
+    #[test]
     fn bash_abort_keeps_running_state_until_worker_finalization() {
         let cx = asupersync::Cx::for_testing();
         let (abort_tx, mut abort_rx) = oneshot::channel();
@@ -16626,6 +16974,29 @@ export default function init(pi) {
     }
 
     #[test]
+    fn replayed_plan_mode_uses_latest_session_transition_and_preserves_fail_closed_state() {
+        let mut session = Session::in_memory();
+        session.append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "planning"})));
+        session.append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "approved"})));
+        assert_eq!(
+            replayed_plan_mode(&session),
+            crate::plan::PlanMode::Approved
+        );
+
+        session.append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "off"})));
+        assert_eq!(replayed_plan_mode(&session), crate::plan::PlanMode::Off);
+
+        session.append_custom_entry(
+            "plan_mode".to_string(),
+            Some(json!({"mode": "pending_approval"})),
+        );
+        assert_eq!(
+            replayed_plan_mode(&session),
+            crate::plan::PlanMode::PendingApproval
+        );
+    }
+
+    #[test]
     fn current_or_runtime_model_entry_falls_back_when_header_is_unresolved() {
         let mut runtime = dummy_entry("test-model", false);
         runtime.model.provider = "test-provider".to_string();
@@ -16854,8 +17225,11 @@ export default function init(pi) {
 
             let mut agent_session = build_test_agent_session(Session::in_memory());
             let mut shared_state = RpcSharedState::new(&options.config);
-            shared_state.failover_primary_model =
-                Some(("test-provider".to_string(), "test-model".to_string()));
+            shared_state.failover_primary = Some(RpcFailoverPrimary {
+                provider: "test-provider".to_string(),
+                model_id: "test-model".to_string(),
+                requested_thinking_level: ThinkingLevel::High,
+            });
             shared_state.active_failover_model =
                 Some(("anthropic".to_string(), "stale-fallback".to_string()));
             shared_state.failover_chain_position = Some(2);
@@ -16868,7 +17242,7 @@ export default function init(pi) {
             assert_eq!(result.0.model.id, next.model.id);
             assert_eq!(agent_session.agent.provider().name(), next.model.provider);
             assert_eq!(agent_session.agent.provider().model_id(), next.model.id);
-            assert!(shared_state.failover_primary_model.is_none());
+            assert!(shared_state.failover_primary.is_none());
             assert!(shared_state.active_failover_model.is_none());
             assert!(shared_state.failover_chain_position.is_none());
 

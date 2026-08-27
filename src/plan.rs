@@ -234,6 +234,23 @@ impl PlanState {
         inner.previous_model = None;
     }
 
+    /// Install plan-mode state reconstructed for a newly active Session.
+    ///
+    /// Submitted plan text and the pre-plan model are memory-only state and
+    /// must never cross a Session boundary. `PendingApproval` cannot be
+    /// reconstructed safely without that submitted plan, so it fails closed
+    /// to read-only `Planning` until the user submits or exits again.
+    pub fn reset_for_session(&self, mode: PlanMode) {
+        let mut inner = self.inner.write().expect("plan state lock");
+        inner.mode = if mode == PlanMode::PendingApproval {
+            PlanMode::Planning
+        } else {
+            mode
+        };
+        inner.plan = None;
+        inner.previous_model = None;
+    }
+
     /// The submitted plan text, if any.
     #[must_use]
     pub fn plan(&self) -> Option<String> {
@@ -303,6 +320,20 @@ mod tests {
         state.exit();
         assert_eq!(state.mode(), PlanMode::Off);
         assert!(state.plan().is_none());
+    }
+
+    #[test]
+    fn session_reset_drops_memory_only_plan_state_and_fails_closed() {
+        let state = PlanState::new();
+        state.enter_planning();
+        assert!(state.submit_plan("a complete plan that must not cross sessions".to_string()));
+        state.stash_previous_model("provider-a", "model-a");
+
+        state.reset_for_session(PlanMode::PendingApproval);
+
+        assert_eq!(state.mode(), PlanMode::Planning);
+        assert!(state.plan().is_none());
+        assert!(state.take_previous_model().is_none());
     }
 
     #[test]

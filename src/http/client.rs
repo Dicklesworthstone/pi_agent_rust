@@ -275,6 +275,10 @@ impl Client {
         RequestBuilder::new(self, Method::Get, url)
     }
 
+    pub fn delete(&self, url: &str) -> RequestBuilder<'_> {
+        RequestBuilder::new(self, Method::Delete, url)
+    }
+
     #[must_use]
     pub fn with_vcr(mut self, recorder: VcrRecorder) -> Self {
         self.vcr = Some(recorder);
@@ -294,6 +298,7 @@ impl Default for Client {
 
 #[derive(Debug, Clone, Copy)]
 enum Method {
+    Delete,
     Get,
     Post,
 }
@@ -301,6 +306,7 @@ enum Method {
 impl Method {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Delete => "DELETE",
             Self::Get => "GET",
             Self::Post => "POST",
         }
@@ -1515,6 +1521,11 @@ mod tests {
     use std::collections::VecDeque;
 
     // ── Method ──────────────────────────────────────────────────────────
+    #[test]
+    fn method_as_str_delete() {
+        assert_eq!(Method::Delete.as_str(), "DELETE");
+    }
+
     #[test]
     fn method_as_str_get() {
         assert_eq!(Method::Get.as_str(), "GET");

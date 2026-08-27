@@ -1196,6 +1196,211 @@ struct HttpSessionState {
     initialize_params: Option<Value>,
 }
 
+#[derive(Clone)]
+struct HttpWireState {
+    session_id: Option<String>,
+    protocol_version: Option<String>,
+}
+
+struct HttpCancellationDispatch {
+    client: crate::http::client::Client,
+    url: String,
+    headers: Vec<(String, String)>,
+    wire_state: HttpWireState,
+    request_id: u64,
+}
+
+impl HttpCancellationDispatch {
+    async fn send(self) -> Result<()> {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {
+                "requestId": self.request_id,
+                "reason": "request timed out or was cancelled",
+            },
+        });
+        let mut request = self
+            .client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        for (name, value) in self.headers {
+            request = request.header(name, value);
+        }
+        if let Some(session_id) = self.wire_state.session_id {
+            request = request.header("Mcp-Session-Id", session_id);
+        }
+        if let Some(protocol_version) = self.wire_state.protocol_version {
+            request = request.header("Mcp-Protocol-Version", protocol_version);
+        }
+        let response = request
+            .json(&frame)
+            .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("encode cancellation: {err}")))?
+            .timeout(HTTP_CANCEL_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("send cancellation: {err}")))?;
+        let status = response.status();
+        if status != 202 {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                format!("cancellation notification expected HTTP 202, received {status}"),
+            ));
+        }
+        let body = response.bytes_limited(1).await.map_err(|err| {
+            tool_err(
+                "MCP_PROTOCOL",
+                format!("cancellation response body was not empty: {err}"),
+            )
+        })?;
+        if body.is_empty() {
+            Ok(())
+        } else {
+            Err(tool_err(
+                "MCP_PROTOCOL",
+                "HTTP 202 cancellation response must have no body",
+            ))
+        }
+    }
+}
+
+struct PendingHttpRequest<'a> {
+    transport: &'a HttpTransport,
+    cancellation: Option<HttpCancellationDispatch>,
+    runtime: Option<asupersync::runtime::RuntimeHandle>,
+}
+
+impl PendingHttpRequest<'_> {
+    fn disarm(&mut self) {
+        self.cancellation = None;
+    }
+
+    async fn cancel_and_abort(&mut self) {
+        let cancellation = self.cancellation.take();
+        self.transport.abort();
+        if let Some(cancellation) = cancellation {
+            let _ = cancellation.send().await;
+        }
+    }
+}
+
+impl Drop for PendingHttpRequest<'_> {
+    fn drop(&mut self) {
+        let Some(cancellation) = self.cancellation.take() else {
+            return;
+        };
+        self.transport.abort();
+        if let Some(runtime) = self.runtime.take() {
+            let _ = runtime.try_spawn(async move {
+                let _ = cancellation.send().await;
+            });
+        }
+    }
+}
+
+#[derive(Default)]
+struct HttpSseCursor {
+    seen_ids: HashSet<String>,
+    last_event_id: Option<String>,
+}
+
+impl HttpSseCursor {
+    fn accept(&mut self, event: &crate::sse::SseEvent) -> Result<bool> {
+        let Some(event_id) = event.id.as_deref() else {
+            return Ok(true);
+        };
+        if event_id.is_empty() {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "MCP SSE event id must not be empty",
+            ));
+        }
+        super::config::validate_http_header_value(event_id)
+            .map_err(|err| tool_err("MCP_PROTOCOL", format!("invalid MCP SSE event id: {err}")))?;
+        if self.seen_ids.contains(event_id) {
+            return Ok(false);
+        }
+        if self.seen_ids.len() >= MAX_HTTP_SSE_EVENT_IDS {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                format!(
+                    "MCP SSE stream exceeded the {MAX_HTTP_SSE_EVENT_IDS}-event id safety bound"
+                ),
+            ));
+        }
+        self.seen_ids.insert(event_id.to_string());
+        self.last_event_id = Some(event_id.to_string());
+        Ok(true)
+    }
+}
+
+struct BoundedHttpSseDecoder {
+    parser: crate::sse::SseParser,
+    pending_utf8: Vec<u8>,
+    received_bytes: usize,
+}
+
+impl BoundedHttpSseDecoder {
+    fn new() -> Self {
+        Self {
+            parser: crate::sse::SseParser::new(),
+            pending_utf8: Vec::new(),
+            received_bytes: 0,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<crate::sse::SseEvent>> {
+        self.received_bytes = self
+            .received_bytes
+            .checked_add(chunk.len())
+            .ok_or_else(|| tool_err("MCP_PROTOCOL", "SSE response byte count overflowed"))?;
+        if self.received_bytes > MAX_HTTP_BODY {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                format!("SSE response exceeded {MAX_HTTP_BODY} bytes"),
+            ));
+        }
+        self.pending_utf8.extend_from_slice(chunk);
+        let valid_bytes = match std::str::from_utf8(&self.pending_utf8) {
+            Ok(_) => self.pending_utf8.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => {
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    format!("SSE response is not valid UTF-8: {error}"),
+                ));
+            }
+        };
+        if valid_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let tail = self.pending_utf8.split_off(valid_bytes);
+        let text = std::str::from_utf8(&self.pending_utf8)
+            .map_err(|err| tool_err("MCP_PROTOCOL", format!("invalid SSE UTF-8: {err}")))?;
+        let events = self.parser.feed(text);
+        self.pending_utf8 = tail;
+        Ok(events)
+    }
+
+    fn finish(mut self) -> Result<Vec<crate::sse::SseEvent>> {
+        let mut events = Vec::new();
+        if !self.pending_utf8.is_empty() {
+            let text = std::str::from_utf8(&self.pending_utf8).map_err(|err| {
+                tool_err(
+                    "MCP_PROTOCOL",
+                    format!("SSE response ended with invalid UTF-8: {err}"),
+                )
+            })?;
+            events.extend(self.parser.feed(text));
+        }
+        if let Some(event) = self.parser.flush() {
+            events.push(event);
+        }
+        Ok(events)
+    }
+}
+
 struct ProvisionalHttpSession<'a> {
     transport: &'a HttpTransport,
     active: bool,
@@ -1225,6 +1430,12 @@ enum HttpRoundTripKind<'a> {
 enum HttpResponseMediaType {
     Json,
     EventStream,
+}
+
+enum HttpEventStreamOpen {
+    Unsupported,
+    SessionExpired,
+    Stream(crate::http::client::Response),
 }
 
 impl HttpTransport {
@@ -1262,6 +1473,24 @@ impl HttpTransport {
         self.next_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| tool_err("MCP_PROTOCOL", "HTTP request id space exhausted"))
+    }
+
+    fn wire_state(&self) -> HttpWireState {
+        let session = Self::lock(&self.session);
+        HttpWireState {
+            session_id: session.session_id.clone(),
+            protocol_version: session.protocol_version.clone(),
+        }
+    }
+
+    fn cancellation_dispatch(&self, request_id: u64) -> HttpCancellationDispatch {
+        HttpCancellationDispatch {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            headers: self.headers.clone(),
+            wire_state: self.wire_state(),
+            request_id,
+        }
     }
 
     fn clear_negotiated_state(&self) {
@@ -1434,7 +1663,8 @@ impl HttpTransport {
             };
         let result = match media_type {
             HttpResponseMediaType::EventStream => {
-                self.receive_sse_response(response, expected_id).await?
+                self.receive_sse_response(response, expected_id, timeout)
+                    .await?
             }
             HttpResponseMediaType::Json => {
                 let body = response
@@ -1539,15 +1769,39 @@ impl HttpTransport {
         if !params.is_null() {
             frame["params"] = params.clone();
         }
-        self.round_trip(
-            &frame,
-            timeout,
-            HttpRoundTripKind::Request {
-                expected_id: id,
-                method,
-            },
-        )
-        .await
+        let cancellation = (method != "initialize").then(|| self.cancellation_dispatch(id));
+        let mut pending_request = PendingHttpRequest {
+            transport: self,
+            cancellation,
+            runtime: asupersync::runtime::Runtime::current_handle(),
+        };
+        let result = self
+            .round_trip(
+                &frame,
+                timeout,
+                HttpRoundTripKind::Request {
+                    expected_id: id,
+                    method,
+                },
+            )
+            .await;
+        match &result {
+            Ok(_) => pending_request.disarm(),
+            Err(error) if is_session_expired(error) || is_server_error(error) => {
+                pending_request.disarm();
+            }
+            Err(error) if is_transport_io(error) || is_delivery_indeterminate(error) => {
+                pending_request.cancel_and_abort().await;
+            }
+            Err(_) => {
+                // A malformed or mismatched response proves the request was
+                // accepted but leaves its outcome unknowable. Never reuse
+                // that logical HTTP session for another side effect.
+                self.abort();
+                pending_request.disarm();
+            }
+        }
+        result
     }
 
     async fn notify_once(&self, method: &str, params: &Value) -> Result<()> {
@@ -1587,6 +1841,117 @@ impl HttpTransport {
                 "server rejected the client response inside an already-accepted SSE request; refusing to replay the originating request",
             )),
             result => result.map(|_| ()),
+        }
+    }
+
+    async fn open_event_stream(
+        &self,
+        last_event_id: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<HttpEventStreamOpen> {
+        let wire_state = self.wire_state();
+        let had_session = wire_state.session_id.is_some();
+        let mut request = self
+            .client
+            .get(&self.url)
+            .header("Accept", "text/event-stream");
+        for (name, value) in &self.headers {
+            request = request.header(name.clone(), value.clone());
+        }
+        if let Some(session_id) = wire_state.session_id {
+            request = request.header("Mcp-Session-Id", session_id);
+        }
+        if let Some(protocol_version) = wire_state.protocol_version {
+            request = request.header("Mcp-Protocol-Version", protocol_version);
+        }
+        if let Some(last_event_id) = last_event_id {
+            super::config::validate_http_header_value(last_event_id).map_err(|err| {
+                tool_err(
+                    "MCP_PROTOCOL",
+                    format!("invalid Last-Event-ID resume cursor: {err}"),
+                )
+            })?;
+            request = request.header("Last-Event-ID", last_event_id.to_string());
+        }
+        request = if let Some(timeout) = timeout {
+            request.timeout(timeout)
+        } else {
+            request.no_timeout()
+        };
+        let response = request.send().await.map_err(|err| {
+            tool_err(
+                "MCP_TRANSPORT_IO",
+                format!("open server event stream: {err}"),
+            )
+        })?;
+        let status = response.status();
+        if status == 405 {
+            let _ = response.bytes_limited(4096).await;
+            return Ok(HttpEventStreamOpen::Unsupported);
+        }
+        if status == 404 && had_session {
+            let _ = response.bytes_limited(4096).await;
+            return Ok(HttpEventStreamOpen::SessionExpired);
+        }
+        if status != 200 {
+            let body = response.text_limited(4096).await.unwrap_or_default();
+            return Err(tool_err(
+                "MCP_HTTP_STATUS",
+                format!("HTTP {status} opening server event stream: {}", body.trim()),
+            ));
+        }
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or_default();
+        if !content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("text/event-stream")
+        {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                format!(
+                    "HTTP GET server stream requires Content-Type text/event-stream, received {content_type:?}"
+                ),
+            ));
+        }
+        Ok(HttpEventStreamOpen::Stream(response))
+    }
+
+    async fn send_session_delete(&self, wire_state: HttpWireState) -> Result<()> {
+        let Some(session_id) = wire_state.session_id else {
+            return Ok(());
+        };
+        let mut request = self.client.delete(&self.url);
+        for (name, value) in &self.headers {
+            request = request.header(name.clone(), value.clone());
+        }
+        request = request.header("Mcp-Session-Id", session_id);
+        if let Some(protocol_version) = wire_state.protocol_version {
+            request = request.header("Mcp-Protocol-Version", protocol_version);
+        }
+        let response = request
+            .timeout(HTTP_CLOSE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| {
+                tool_err("MCP_TRANSPORT_IO", format!("terminate HTTP session: {err}"))
+            })?;
+        let status = response.status();
+        if (200..300).contains(&status) || status == 405 {
+            let _ = response.bytes_limited(4096).await;
+            Ok(())
+        } else {
+            let body = response.text_limited(4096).await.unwrap_or_default();
+            Err(tool_err(
+                "MCP_HTTP_STATUS",
+                format!("HTTP {status} terminating session: {}", body.trim()),
+            ))
         }
     }
 
@@ -1667,73 +2032,161 @@ impl HttpTransport {
         self.handle_sse_message(value, expected_id).await
     }
 
+    async fn handle_server_stream_event(&self, event: crate::sse::SseEvent) -> Result<()> {
+        let data = event.data.trim();
+        if data.is_empty() {
+            return Ok(());
+        }
+        let value: Value = serde_json::from_str(data).map_err(|err| {
+            tool_err(
+                "MCP_PROTOCOL",
+                format!("server-stream SSE data is not a JSON-RPC message: {err}"),
+            )
+        })?;
+        if value.get("method").is_none() {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "unsolicited HTTP GET stream must not contain a JSON-RPC response",
+            ));
+        }
+        let unexpected_response = self.handle_sse_message(value, 0).await?;
+        debug_assert!(unexpected_response.is_none());
+        Ok(())
+    }
+
+    async fn receive_request_sse_stream(
+        &self,
+        response: crate::http::client::Response,
+        expected_id: u64,
+        cursor: &mut HttpSseCursor,
+    ) -> Result<Option<Value>> {
+        let mut stream = response.bytes_stream();
+        let mut decoder = BoundedHttpSseDecoder::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read SSE body: {err}")))?;
+            for event in decoder.feed(&chunk)? {
+                if !cursor.accept(&event)? {
+                    continue;
+                }
+                if let Some(result) = self.handle_sse_event(event, expected_id).await? {
+                    return Ok(Some(result));
+                }
+            }
+        }
+        for event in decoder.finish()? {
+            if !cursor.accept(&event)? {
+                continue;
+            }
+            if let Some(result) = self.handle_sse_event(event, expected_id).await? {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
+    }
+
     async fn receive_sse_response(
         &self,
         response: crate::http::client::Response,
         expected_id: u64,
+        timeout: Duration,
     ) -> Result<Value> {
-        let mut stream = response.bytes_stream();
-        let mut parser = crate::sse::SseParser::new();
-        let mut pending_utf8 = Vec::new();
-        let mut received_bytes = 0usize;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read SSE body: {err}")))?;
-            received_bytes = received_bytes.checked_add(chunk.len()).ok_or_else(|| {
-                tool_err("MCP_PROTOCOL", "SSE response body byte count overflowed")
-            })?;
-            if received_bytes > MAX_HTTP_BODY {
+        let mut cursor = HttpSseCursor::default();
+        match self
+            .receive_request_sse_stream(response, expected_id, &mut cursor)
+            .await
+        {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) => {}
+            Err(error) if is_transport_io(&error) && cursor.last_event_id.is_some() => {}
+            Err(error) => return Err(error),
+        }
+        let Some(last_event_id) = cursor.last_event_id.clone() else {
+            return Err(tool_err(
+                "MCP_DELIVERY_INDETERMINATE",
+                "SSE request stream ended before its JSON-RPC response and supplied no resumable event id",
+            ));
+        };
+        let resumed = match self
+            .open_event_stream(Some(&last_event_id), Some(timeout))
+            .await?
+        {
+            HttpEventStreamOpen::Stream(response) => response,
+            HttpEventStreamOpen::Unsupported => {
                 return Err(tool_err(
-                    "MCP_PROTOCOL",
-                    format!("SSE response exceeded {MAX_HTTP_BODY} bytes"),
+                    "MCP_DELIVERY_INDETERMINATE",
+                    "SSE request stream ended before its response and the server rejected one-shot resumption with HTTP 405",
                 ));
             }
-            pending_utf8.extend_from_slice(&chunk);
-            let valid_bytes = match std::str::from_utf8(&pending_utf8) {
-                Ok(_) => pending_utf8.len(),
-                Err(error) if error.error_len().is_none() => error.valid_up_to(),
-                Err(error) => {
-                    return Err(tool_err(
-                        "MCP_PROTOCOL",
-                        format!("SSE response is not valid UTF-8: {error}"),
-                    ));
-                }
-            };
-            if valid_bytes == 0 {
-                continue;
+            HttpEventStreamOpen::SessionExpired => {
+                return Err(tool_err(
+                    "MCP_DELIVERY_INDETERMINATE",
+                    "HTTP session expired after the server accepted a request; refusing to replay it in a new session",
+                ));
             }
-            let tail = pending_utf8.split_off(valid_bytes);
-            let text = std::str::from_utf8(&pending_utf8)
-                .map_err(|err| tool_err("MCP_PROTOCOL", format!("invalid SSE UTF-8: {err}")))?;
-            for event in parser.feed(text) {
-                if let Some(result) = self.handle_sse_event(event, expected_id).await? {
-                    return Ok(result);
-                }
-            }
-            pending_utf8 = tail;
+        };
+        match self
+            .receive_request_sse_stream(resumed, expected_id, &mut cursor)
+            .await?
+        {
+            Some(result) => Ok(result),
+            None => Err(tool_err(
+                "MCP_DELIVERY_INDETERMINATE",
+                "one-shot SSE resumption ended before the pending JSON-RPC response",
+            )),
         }
-        if !pending_utf8.is_empty() {
-            let text = std::str::from_utf8(&pending_utf8).map_err(|err| {
+    }
+
+    async fn receive_server_event_stream(
+        &self,
+        response: crate::http::client::Response,
+        cursor: &mut HttpSseCursor,
+    ) -> Result<()> {
+        let mut stream = response.bytes_stream();
+        let mut decoder = BoundedHttpSseDecoder::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| {
                 tool_err(
-                    "MCP_PROTOCOL",
-                    format!("SSE response ended with invalid UTF-8: {err}"),
+                    "MCP_TRANSPORT_IO",
+                    format!("read server event stream: {err}"),
                 )
             })?;
-            for event in parser.feed(text) {
-                if let Some(result) = self.handle_sse_event(event, expected_id).await? {
-                    return Ok(result);
+            for event in decoder.feed(&chunk)? {
+                if cursor.accept(&event)? {
+                    self.handle_server_stream_event(event).await?;
                 }
             }
         }
-        if let Some(event) = parser.flush()
-            && let Some(result) = self.handle_sse_event(event, expected_id).await?
-        {
-            return Ok(result);
+        for event in decoder.finish()? {
+            if cursor.accept(&event)? {
+                self.handle_server_stream_event(event).await?;
+            }
         }
-        Err(tool_err(
-            "MCP_PROTOCOL",
-            "SSE response contained no matching JSON-RPC response",
-        ))
+        Ok(())
+    }
+
+    async fn run_server_event_listener(&self) -> Result<()> {
+        let mut cursor = HttpSseCursor::default();
+        let first = match self.open_event_stream(None, None).await? {
+            HttpEventStreamOpen::Unsupported | HttpEventStreamOpen::SessionExpired => return Ok(()),
+            HttpEventStreamOpen::Stream(response) => response,
+        };
+        let first_result = self.receive_server_event_stream(first, &mut cursor).await;
+        if let Err(error) = first_result {
+            if !is_transport_io(&error) || cursor.last_event_id.is_none() {
+                return Err(error);
+            }
+        }
+        let Some(last_event_id) = cursor.last_event_id.clone() else {
+            return Ok(());
+        };
+        let resumed = match self.open_event_stream(Some(&last_event_id), None).await? {
+            HttpEventStreamOpen::Unsupported | HttpEventStreamOpen::SessionExpired => return Ok(()),
+            HttpEventStreamOpen::Stream(response) => response,
+        };
+        // Exactly one resume attempt per logical GET stream. A second
+        // disconnect ends this optional receive channel instead of looping.
+        self.receive_server_event_stream(resumed, &mut cursor).await
     }
 
     async fn renew_session(&self) -> Result<()> {
@@ -1793,6 +2246,22 @@ fn is_delivery_indeterminate(error: &Error) -> bool {
         error,
         Error::Tool { tool, message }
             if tool == "mcp" && message.starts_with("[MCP_DELIVERY_INDETERMINATE]")
+    )
+}
+
+fn is_transport_io(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Tool { tool, message }
+            if tool == "mcp" && message.starts_with("[MCP_TRANSPORT_IO]")
+    )
+}
+
+fn is_server_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Tool { tool, message }
+            if tool == "mcp" && message.starts_with("[MCP_SERVER_ERROR]")
     )
 }
 
@@ -1967,11 +2436,55 @@ impl McpTransport for HttpTransport {
         self.abort_notify.notify_waiters();
     }
 
+    fn activate(self: std::sync::Arc<Self>) -> Result<()> {
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(tool_err(
+                "MCP_TRANSPORT_UNAVAILABLE",
+                "cannot activate an aborted HTTP transport",
+            ));
+        }
+        if self
+            .listener_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let Some(runtime) = asupersync::runtime::Runtime::current_handle() else {
+            self.listener_started.store(false, Ordering::Release);
+            return Err(tool_err(
+                "MCP_RUNTIME_UNAVAILABLE",
+                "cannot start the HTTP server-event listener outside an active runtime",
+            ));
+        };
+        let listener_transport = std::sync::Arc::clone(&self);
+        if let Err(error) = runtime.try_spawn(async move {
+            let result = listener_transport
+                .run_until_abort(listener_transport.run_server_event_listener())
+                .await;
+            if let Err(error) = result
+                && listener_transport.is_alive()
+            {
+                tracing::warn!(error = %error, "MCP HTTP server-event listener failed");
+                listener_transport.abort();
+            }
+        }) {
+            self.listener_started.store(false, Ordering::Release);
+            return Err(tool_err(
+                "MCP_RUNTIME_UNAVAILABLE",
+                format!("failed to start HTTP server-event listener: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
     async fn close(&self) {
-        // Local teardown only: no session DELETE in v1 (server support for
-        // it is spotty and the session expires server-side regardless).
+        let wire_state = self.wire_state();
+        // Cancel the optional GET stream and reject new request dispatch
+        // before telling the server to discard the captured session.
         self.abort();
         self.reset_session_state();
+        let _ = self.send_session_delete(wire_state).await;
     }
 
     fn diagnostics_tail(&self) -> String {
@@ -2428,6 +2941,7 @@ mod tests {
     struct ScriptedHttpServer {
         addr: std::net::SocketAddr,
         captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>>,
+        request_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -2439,6 +2953,8 @@ mod tests {
             let captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let captured_for_thread = std::sync::Arc::clone(&captured);
+            let request_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let request_lines_for_thread = std::sync::Arc::clone(&request_lines);
             let handle = std::thread::spawn(move || {
                 for response in responses {
                     let (stream, _) = match listener.accept() {
@@ -2452,6 +2968,10 @@ mod tests {
                     if std::io::BufRead::read_line(&mut reader, &mut request_line).is_err() {
                         break;
                     }
+                    request_lines_for_thread
+                        .lock()
+                        .expect("request-line capture lock")
+                        .push(request_line.trim_end().to_string());
                     let mut headers: Vec<(String, String)> = Vec::new();
                     let mut content_length = 0usize;
                     let mut request_body_id: Option<u64> = None;
@@ -2504,12 +3024,20 @@ mod tests {
             Self {
                 addr,
                 captured,
+                request_lines,
                 handle: Some(handle),
             }
         }
 
         fn captured(&self) -> Vec<(Vec<(String, String)>, String)> {
             self.captured.lock().expect("capture lock").clone()
+        }
+
+        fn request_lines(&self) -> Vec<String> {
+            self.request_lines
+                .lock()
+                .expect("request-line capture lock")
+                .clone()
         }
 
         fn url(&self) -> String {
@@ -2525,17 +3053,165 @@ mod tests {
         }
     }
 
+    struct CancellationHttpServer {
+        addr: std::net::SocketAddr,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>>,
+        slow_started: std::sync::Arc<AtomicBool>,
+        cancellation_received: std::sync::Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CancellationHttpServer {
+        fn start() -> Self {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind cancellation server");
+            let addr = listener.local_addr().expect("listener addr");
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured_for_thread = std::sync::Arc::clone(&captured);
+            let slow_started = std::sync::Arc::new(AtomicBool::new(false));
+            let slow_started_for_thread = std::sync::Arc::clone(&slow_started);
+            let cancellation_received = std::sync::Arc::new(AtomicBool::new(false));
+            let cancellation_for_thread = std::sync::Arc::clone(&cancellation_received);
+            let handle = std::thread::spawn(move || {
+                let capture = |stream: &mut std::net::TcpStream| {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut reader =
+                        std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                    let mut request_line = String::new();
+                    std::io::BufRead::read_line(&mut reader, &mut request_line)
+                        .expect("read request line");
+                    let mut headers = Vec::new();
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        std::io::BufRead::read_line(&mut reader, &mut line)
+                            .expect("read request header");
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = trimmed.split_once(':') {
+                            let name = name.trim().to_string();
+                            let value = value.trim().to_string();
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.parse().unwrap_or(0);
+                            }
+                            headers.push((name, value));
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        std::io::Read::read_exact(&mut reader, &mut body).expect("read body");
+                    }
+                    (headers, String::from_utf8_lossy(&body).to_string())
+                };
+
+                let (mut initialize, _) = listener.accept().expect("accept initialize");
+                let initialize_request = capture(&mut initialize);
+                let initialize_id = serde_json::from_str::<Value>(&initialize_request.1)
+                    .ok()
+                    .and_then(|frame| frame.get("id").and_then(Value::as_u64))
+                    .unwrap_or(1);
+                captured_for_thread
+                    .lock()
+                    .expect("capture initialize")
+                    .push(initialize_request);
+                let response = http_ok_with_session(
+                    &initialize_id.to_string(),
+                    initialize_success_body(),
+                    "sid-cancel",
+                );
+                initialize
+                    .write_all(response.as_bytes())
+                    .expect("write initialize response");
+                initialize.flush().expect("flush initialize response");
+                drop(initialize);
+
+                let (mut slow, _) = listener.accept().expect("accept slow request");
+                let slow_request = capture(&mut slow);
+                captured_for_thread
+                    .lock()
+                    .expect("capture slow request")
+                    .push(slow_request);
+                slow.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: 1\r\n\r\n",
+                )
+                .expect("write slow response head");
+                slow.flush().expect("flush slow response head");
+                slow_started_for_thread.store(true, Ordering::Release);
+                let cancellation_for_holder = std::sync::Arc::clone(&cancellation_for_thread);
+                let holder = std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        if cancellation_for_holder.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    drop(slow);
+                });
+
+                listener
+                    .set_nonblocking(true)
+                    .expect("set cancellation accept nonblocking");
+                let mut cancellation = None;
+                for _ in 0..500 {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            cancellation = Some(stream);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Some(mut cancellation) = cancellation {
+                    let cancellation_request = capture(&mut cancellation);
+                    captured_for_thread
+                        .lock()
+                        .expect("capture cancellation")
+                        .push(cancellation_request);
+                    cancellation
+                        .write_all(http_empty(202, "Accepted").as_bytes())
+                        .expect("write cancellation response");
+                    cancellation.flush().expect("flush cancellation response");
+                    cancellation_for_thread.store(true, Ordering::Release);
+                }
+                let _ = holder.join();
+            });
+            Self {
+                addr,
+                captured,
+                slow_started,
+                cancellation_received,
+                handle: Some(handle),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/mcp", self.addr)
+        }
+
+        fn captured(&self) -> Vec<(Vec<(String, String)>, String)> {
+            self.captured.lock().expect("capture lock").clone()
+        }
+    }
+
+    impl Drop for CancellationHttpServer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
     fn http_ok_with_session(
         id_placeholder: &str,
         body: serde_json::Value,
         session: &str,
     ) -> String {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id_placeholder,
-            "result": body,
-        })
-        .to_string();
+        let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id_placeholder},\"result\":{body}}}");
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nmcp-session-id: {session}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
@@ -2543,16 +3219,45 @@ mod tests {
     }
 
     fn http_ok_plain(id_placeholder: &str, body: serde_json::Value) -> String {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id_placeholder,
-            "result": body,
-        })
-        .to_string();
+        let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id_placeholder},\"result\":{body}}}");
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    fn http_empty(status: u16, reason: &str) -> String {
+        format!("HTTP/1.1 {status} {reason}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+    }
+
+    fn http_event_stream(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn wait_for_requests(server: &ScriptedHttpServer, expected: usize) {
+        for _ in 0..200 {
+            if server.captured().len() >= expected {
+                return;
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for {expected} requests; captured {:?}",
+            server.request_lines()
+        );
+    }
+
+    async fn wait_for_flag(flag: &AtomicBool, description: &str) {
+        for _ in 0..300 {
+            if flag.load(Ordering::Acquire) {
+                return;
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {description}");
     }
 
     fn initialize_success_body() -> serde_json::Value {
@@ -2738,30 +3443,6 @@ mod tests {
             ))
             .expect("expired session renews exactly once and retries successfully");
 
-        let captured = server.captured();
-        assert_eq!(
-            captured.len(),
-            7,
-            "first expiry: init, list-404, renewal-init, list-ok; \
-             second expiry: list-404, renewal-init, list-404; got {captured:#?}"
-        );
-        let initialize_count = captured
-            .iter()
-            .filter(|(_, body)| body.contains("\"initialize\"") || body.contains("protocolVersion"))
-            .count();
-        let initialize_requests = captured
-            .iter()
-            .filter(|(headers, body)| {
-                body.contains("\"method\":\"initialize\"")
-                    || headers.iter().any(|(k, v)| {
-                        k.eq_ignore_ascii_case("mcp-session-id") == false
-                            && body.contains("\"method\":\"initialize\"")
-                    })
-            })
-            .count();
-        let _ = initialize_count;
-        let _ = initialize_requests;
-
         // A second consecutive expiry surfaces to the caller (no loop).
         let error = runtime
             .block_on(transport.request(
@@ -2771,5 +3452,247 @@ mod tests {
             ))
             .expect_err("second expiry must surface instead of looping forever");
         assert!(error.to_string().contains("404"), "{error}");
+
+        let captured = server.captured();
+        assert_eq!(
+            captured.len(),
+            7,
+            "first expiry: init, list-404, renewal-init, list-ok; \
+             second expiry: list-404, renewal-init, list-404; got {captured:#?}"
+        );
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|(_, body)| body.contains("\"method\":\"initialize\""))
+                .count(),
+            3,
+            "initialization must happen once initially and once per expired call"
+        );
+    }
+
+    /// The optional GET channel is activated after the handshake, answers
+    /// server pings, resumes exactly once with its own cursor, and suppresses
+    /// a replayed event id rather than duplicating the response side effect.
+    #[test]
+    fn streamable_http_get_resumes_once_without_duplicate_delivery() {
+        let first_stream = concat!(
+            "id: stream-1:1\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-1\",\"method\":\"ping\"}\n\n",
+        );
+        let resumed_stream = concat!(
+            "id: stream-1:1\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-1\",\"method\":\"ping\"}\n\n",
+            "id: stream-1:2\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-2\",\"method\":\"ping\"}\n\n",
+        );
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-get"),
+            http_empty(202, "Accepted"),
+            http_event_stream(first_stream),
+            http_empty(202, "Accepted"),
+            http_event_stream(resumed_stream),
+            http_empty(202, "Accepted"),
+        ]);
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        let runtime = runtime_for_tests();
+        runtime.block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized notification");
+            std::sync::Arc::clone(&transport)
+                .activate()
+                .expect("activate GET listener");
+            wait_for_requests(&server, 6).await;
+            transport.abort();
+        });
+
+        let lines = server.request_lines();
+        assert_eq!(
+            lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "POST /mcp HTTP/1.1",
+                "POST /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "POST /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "POST /mcp HTTP/1.1",
+            ]
+        );
+        let captured = server.captured();
+        let header = |index: usize, name: &str| {
+            captured[index]
+                .0
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header(2, "Accept"), Some("text/event-stream"));
+        assert_eq!(header(2, "Last-Event-ID"), None);
+        assert_eq!(header(4, "Last-Event-ID"), Some("stream-1:1"));
+        assert_eq!(header(4, "Mcp-Session-Id"), Some("sid-get"));
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|(_, body)| body.contains("\"id\":\"server-1\""))
+                .count(),
+            1,
+            "replayed event id must not send the server-1 response twice"
+        );
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|(_, body)| body.contains("\"id\":\"server-2\""))
+                .count(),
+            1
+        );
+    }
+
+    /// HTTP 405 disables only the optional GET channel. Orderly close still
+    /// sends a bounded DELETE, and both 2xx and 405 DELETE responses are
+    /// accepted by the best-effort teardown path.
+    #[test]
+    fn streamable_http_get_405_and_session_delete_lifecycle() {
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-close"),
+            http_empty(202, "Accepted"),
+            http_empty(405, "Method Not Allowed"),
+            http_empty(204, "No Content"),
+        ]);
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        let runtime = runtime_for_tests();
+        runtime.block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized notification");
+            std::sync::Arc::clone(&transport)
+                .activate()
+                .expect("activate GET listener");
+            wait_for_requests(&server, 3).await;
+            transport.close().await;
+            wait_for_requests(&server, 4).await;
+        });
+        let lines = server.request_lines();
+        assert_eq!(lines[2], "GET /mcp HTTP/1.1");
+        assert_eq!(lines[3], "DELETE /mcp HTTP/1.1");
+        let captured = server.captured();
+        assert!(captured[3].0.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("Mcp-Session-Id") && value == "sid-close"
+        }));
+        assert!(!transport.is_alive());
+
+        let rejects_delete = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-no-delete"),
+            http_empty(405, "Method Not Allowed"),
+        ]);
+        let transport = HttpTransport::new(&rejects_delete.url(), Vec::new()).expect("transport");
+        runtime.block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            transport.close().await;
+        });
+        assert_eq!(
+            rejects_delete.request_lines(),
+            vec!["POST /mcp HTTP/1.1", "DELETE /mcp HTTP/1.1"]
+        );
+    }
+
+    /// Once an HTTP request has reached a response stream, an idle timeout
+    /// sends notifications/cancelled with the exact request id and retires
+    /// the indeterminate session instead of allowing another call.
+    #[test]
+    fn streamable_http_timeout_cancels_and_retires_session() {
+        let server = CancellationHttpServer::start();
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport");
+        let runtime = runtime_for_tests();
+        runtime.block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            let error = transport
+                .request(
+                    "tools/call",
+                    serde_json::json!({"name": "slow", "arguments": {}}),
+                    Duration::from_millis(50),
+                )
+                .await
+                .expect_err("body-idle timeout must fail the request");
+            assert!(error.to_string().contains("MCP_TRANSPORT_IO"), "{error}");
+            wait_for_flag(&server.cancellation_received, "timeout cancellation").await;
+        });
+        assert!(!transport.is_alive());
+        let captured = server.captured();
+        assert_eq!(captured.len(), 3, "initialize, request, cancellation");
+        let request_id = serde_json::from_str::<Value>(&captured[1].1)
+            .expect("request JSON")
+            .get("id")
+            .cloned()
+            .expect("request id");
+        let cancellation: Value = serde_json::from_str(&captured[2].1).expect("cancellation JSON");
+        assert_eq!(cancellation["method"], "notifications/cancelled");
+        assert_eq!(cancellation["params"]["requestId"], request_id);
+        assert!(captured[2].0.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("Mcp-Session-Id") && value == "sid-cancel"
+        }));
+    }
+
+    /// Dropping the in-flight request future follows the same safety rule as
+    /// an explicit timeout: cancellation is dispatched from owned state and
+    /// the original transport becomes permanently unusable.
+    #[test]
+    fn streamable_http_future_drop_cancels_and_retires_session() {
+        let server = CancellationHttpServer::start();
+        let transport = std::sync::Arc::new(
+            HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport"),
+        );
+        let runtime = runtime_for_tests();
+        runtime.block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+
+            let request = Box::pin(transport.request(
+                "tools/call",
+                serde_json::json!({"name": "slow", "arguments": {}}),
+                Duration::from_secs(5),
+            ));
+            let request_started = Box::pin(async {
+                wait_for_flag(&server.slow_started, "slow request dispatch").await;
+            });
+            match futures::future::select(request, request_started).await {
+                futures::future::Either::Left((result, _)) => {
+                    panic!("slow request unexpectedly completed: {result:?}");
+                }
+                futures::future::Either::Right(((), pending_request)) => {
+                    drop(pending_request);
+                }
+            }
+            wait_for_flag(&server.cancellation_received, "drop cancellation").await;
+        });
+        assert!(!transport.is_alive());
+        let captured = server.captured();
+        assert_eq!(captured.len(), 3, "initialize, request, cancellation");
+        let request_id = serde_json::from_str::<Value>(&captured[1].1)
+            .expect("request JSON")
+            .get("id")
+            .cloned()
+            .expect("request id");
+        let cancellation: Value = serde_json::from_str(&captured[2].1).expect("cancellation JSON");
+        assert_eq!(cancellation["params"]["requestId"], request_id);
     }
 }
