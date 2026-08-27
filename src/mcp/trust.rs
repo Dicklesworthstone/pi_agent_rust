@@ -67,6 +67,11 @@ pub struct TrustRecord {
     pub fingerprint: String,
     pub by: String,
     pub at: String,
+    /// bd-sp5o3: canonical identity of the resolved executable bound when
+    /// the operator acknowledged. Legacy records carry None and are treated
+    /// as fail-closed "missing binding" at the pre-spawn seam.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<super::config::StoredExecutionIdentity>,
     #[serde(default)]
     pub audit: Vec<TrustAuditEntry>,
 }
@@ -205,20 +210,13 @@ fn open_trust_directory_nofollow(path: &Path, create: bool) -> std::io::Result<F
 
     let mut symlink_budget: u8 = 8;
     while let Some(name) = pending.pop_front() {
-        let child = match rustix::fs::openat(
-            &directory,
-            &name,
-            flags,
-            rustix::fs::Mode::empty(),
-        ) {
+        let child = match rustix::fs::openat(&directory, &name, flags, rustix::fs::Mode::empty()) {
             Ok(child) => child,
             Err(rustix::io::Errno::NOENT) if create => {
                 match rustix::fs::mkdirat(
                     &directory,
                     &name,
-                    rustix::fs::Mode::RUSR
-                        | rustix::fs::Mode::WUSR
-                        | rustix::fs::Mode::XUSR,
+                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR | rustix::fs::Mode::XUSR,
                 ) {
                     Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(error) => return Err(std::io::Error::from(error)),
@@ -274,9 +272,7 @@ fn read_trust_file_at(
     let descriptor = match rustix::fs::openat(
         directory,
         target_name,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     ) {
         Ok(descriptor) => descriptor,
@@ -331,10 +327,7 @@ fn read_trust_file_at(
 fn create_trust_temp_file(directory: &File) -> std::io::Result<TrustTempFile> {
     let owned_directory = directory.try_clone()?;
     for _ in 0..16 {
-        let name = OsString::from(format!(
-            ".mcp-trust.tmp-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let name = OsString::from(format!(".mcp-trust.tmp-{}", uuid::Uuid::new_v4().simple()));
         match rustix::fs::openat(
             directory,
             &name,
@@ -419,9 +412,7 @@ pub(crate) fn acquire_global_trust_lock_for(
     use std::os::unix::fs::MetadataExt as _;
 
     let euid = rustix::process::geteuid().as_raw();
-    let lock_root = PathBuf::from(format!(
-        "/tmp/pi-agent-rust-mcp-trust-locks-{euid}"
-    ));
+    let lock_root = PathBuf::from(format!("/tmp/pi-agent-rust-mcp-trust-locks-{euid}"));
     let directory = open_trust_directory_nofollow(&lock_root, true)?;
     let metadata = directory.metadata()?;
     if !metadata.is_dir() || metadata.uid() != euid || metadata.mode() & 0o077 != 0 {
@@ -670,7 +661,10 @@ impl TrustStore {
         let (parent, target_name) = trust_target_parts(path).map_err(|err| {
             Error::tool(
                 "mcp",
-                format!("[MCP_TRUST_IO] invalid trust path {}: {err}", path.display()),
+                format!(
+                    "[MCP_TRUST_IO] invalid trust path {}: {err}",
+                    path.display()
+                ),
             )
         })?;
         let directory = match open_trust_directory_nofollow(parent, false) {
@@ -713,20 +707,20 @@ impl TrustStore {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let (operation_path, parent_guards) =
-            match open_or_create_windows_trust_parent(path, false) {
-                Ok(result) => result,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(err) => {
-                    return Err(Error::tool(
-                        "mcp",
-                        format!(
-                            "[MCP_TRUST_IO] cannot pin trust parent for {}: {err}",
-                            path.display()
-                        ),
-                    ));
-                }
-            };
+        let (operation_path, parent_guards) = match open_or_create_windows_trust_parent(path, false)
+        {
+            Ok(result) => result,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(Error::tool(
+                    "mcp",
+                    format!(
+                        "[MCP_TRUST_IO] cannot pin trust parent for {}: {err}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
         let path = operation_path.as_path();
         reject_windows_reparse_components(path).map_err(|err| {
             Error::tool(
@@ -893,7 +887,10 @@ impl TrustStore {
         if !opened_metadata.is_file() || opened_metadata.len() > MAX_TRUST_FILE_BYTES {
             return Err(Error::tool(
                 "mcp",
-                format!("[MCP_TRUST_IO] trust file became unsafe: {}", path.display()),
+                format!(
+                    "[MCP_TRUST_IO] trust file became unsafe: {}",
+                    path.display()
+                ),
             ));
         }
         let mut content = String::new();
@@ -990,6 +987,9 @@ impl TrustStore {
             record.state = TrustState::Pending;
             record.by = by.to_string();
             record.at = at;
+            // Reset also drops any stale execution binding: a re-ack must
+            // re-derive it against the CURRENT PATH/contents (bd-sp5o3).
+            record.execution = None;
         }
         self.save(&file_guard)
     }
@@ -1001,6 +1001,24 @@ impl TrustStore {
         state: TrustState,
         by: &str,
         action: &str,
+    ) -> Result<()> {
+        self.transition_execution(name, fingerprint, state, by, action, None)
+    }
+
+    /// Shared state machine with an optional execution-identity binding
+    /// (bd-sp5o3): only acknowledgements carry one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be written.
+    fn transition_execution(
+        &mut self,
+        name: &str,
+        fingerprint: &str,
+        state: TrustState,
+        by: &str,
+        action: &str,
+        execution: Option<super::config::StoredExecutionIdentity>,
     ) -> Result<()> {
         let file_guard = self.lock_and_reload()?;
         self.migrate_schema_if_needed();
@@ -1019,14 +1037,69 @@ impl TrustStore {
                 fingerprint: fingerprint.to_string(),
                 by: by.to_string(),
                 at: at.clone(),
+                execution: None,
                 audit: Vec::new(),
             });
         record.state = state;
         record.fingerprint = fingerprint.to_string();
         record.by = by.to_string();
         record.at = at;
+        if execution.is_some() {
+            record.execution = execution;
+        } else if !matches!(state, TrustState::Acknowledged) {
+            // Denials keep whatever binding existed (they block regardless);
+            // pending transitions drop stale bindings.
+            if matches!(state, TrustState::Pending) {
+                record.execution = None;
+            }
+        }
         record.audit.push(audit);
         self.save(&file_guard)
+    }
+
+    /// Record an acknowledgement together with the canonical execution
+    /// identity that was shown to and approved by the operator (bd-sp5o3).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be written.
+    pub fn acknowledge_execution(
+        &mut self,
+        name: &str,
+        fingerprint: &str,
+        by: &str,
+        execution: super::config::StoredExecutionIdentity,
+    ) -> Result<()> {
+        self.transition_execution(
+            name,
+            fingerprint,
+            TrustState::Acknowledged,
+            by,
+            "acknowledged",
+            Some(execution),
+        )
+    }
+
+    /// The stored binding for an ACKNOWLEDGED record matching this exact
+    /// fingerprint; anything else yields `None` (fail-closed upstream).
+    #[must_use]
+    pub fn acknowledged_execution(
+        &self,
+        name: &str,
+        fingerprint: &str,
+    ) -> Option<super::config::StoredExecutionIdentity> {
+        if self.schema_version != TRUST_SCHEMA_VERSION {
+            return None;
+        }
+        match self.servers.get(name) {
+            Some(record)
+                if record.fingerprint == fingerprint
+                    && record.state == TrustState::Acknowledged =>
+            {
+                record.execution.clone()
+            }
+            _ => None,
+        }
     }
 
     #[cfg(unix)]
@@ -1063,17 +1136,14 @@ impl TrustStore {
                 ),
             )
         })?;
-        let lock = crate::file_lock::DirLockAt::acquire_for(
-            &directory,
-            &target_name,
-            TRUST_LOCK_TIMEOUT,
-        )
-        .map_err(|err| {
-            Error::tool(
-                "mcp",
-                format!("[MCP_TRUST_IO] cannot lock {}: {err}", self.path.display()),
-            )
-        })?;
+        let lock =
+            crate::file_lock::DirLockAt::acquire_for(&directory, &target_name, TRUST_LOCK_TIMEOUT)
+                .map_err(|err| {
+                    Error::tool(
+                        "mcp",
+                        format!("[MCP_TRUST_IO] cannot lock {}: {err}", self.path.display()),
+                    )
+                })?;
         self.ensure_parent_unchanged(&directory, "after acquiring the trust lock")?;
         let content = read_trust_file_at(&directory, &target_name, &self.path).map_err(|err| {
             Error::tool(
@@ -1096,16 +1166,16 @@ impl TrustStore {
 
     #[cfg(windows)]
     fn lock_and_reload(&mut self) -> Result<TrustWriteGuard> {
-        let (operation_path, directories) =
-            open_or_create_windows_trust_parent(&self.path, true).map_err(|err| {
-                Error::tool(
-                    "mcp",
-                    format!(
-                        "[MCP_TRUST_IO] cannot pin trust parent for {}: {err}",
-                        self.path.display()
-                    ),
-                )
-            })?;
+        let (operation_path, directories) = open_or_create_windows_trust_parent(&self.path, true)
+            .map_err(|err| {
+            Error::tool(
+                "mcp",
+                format!(
+                    "[MCP_TRUST_IO] cannot pin trust parent for {}: {err}",
+                    self.path.display()
+                ),
+            )
+        })?;
         let lock = crate::file_lock::DirLock::acquire_for(&operation_path, TRUST_LOCK_TIMEOUT)
             .map_err(|err| {
                 Error::tool(
@@ -1483,10 +1553,7 @@ mod tests {
             reloaded.decision("legacy", &"a".repeat(64)),
             TrustDecision::Pending
         );
-        assert_eq!(
-            reloaded.records()["legacy"].state,
-            TrustState::Pending
-        );
+        assert_eq!(reloaded.records()["legacy"].state, TrustState::Pending);
         assert!(
             reloaded.records()["legacy"]
                 .audit
@@ -1515,10 +1582,7 @@ mod tests {
             .expect("ack server B from stale snapshot");
 
         let reloaded = TrustStore::load(&path).expect("reload final store");
-        assert_eq!(
-            reloaded.decision("server-a", "fp-a"),
-            TrustDecision::Denied
-        );
+        assert_eq!(reloaded.decision("server-a", "fp-a"), TrustDecision::Denied);
         assert_eq!(
             reloaded.decision("server-b", "fp-b"),
             TrustDecision::Acknowledged
@@ -1559,10 +1623,7 @@ mod tests {
         acknowledging.join().expect("acknowledging writer");
 
         let reloaded = TrustStore::load(&path).expect("reload final store");
-        assert_eq!(
-            reloaded.decision("server-a", "fp-a"),
-            TrustDecision::Denied
-        );
+        assert_eq!(reloaded.decision("server-a", "fp-a"), TrustDecision::Denied);
         assert_eq!(
             reloaded.decision("server-b", "fp-b"),
             TrustDecision::Acknowledged
@@ -1666,7 +1727,10 @@ mod tests {
         symlink(&real_path, &link_path).expect("create trust symlink");
 
         let error = TrustStore::load(&link_path).expect_err("trust symlink must fail closed");
-        assert!(error.to_string().contains("regular non-link file"), "{error}");
+        assert!(
+            error.to_string().contains("regular non-link file"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -1686,6 +1750,7 @@ mod tests {
                 fingerprint: "fp".to_string(),
                 by: "operator".to_string(),
                 at: at.clone(),
+                execution: None,
                 audit: vec![TrustAuditEntry {
                     at,
                     action: "denied".to_string(),
@@ -1702,7 +1767,10 @@ mod tests {
             })
             .expect_err("ancestor replacement must abort persistence");
 
-        assert!(error.to_string().contains("trust directory changed"), "{error}");
+        assert!(
+            error.to_string().contains("trust directory changed"),
+            "{error}"
+        );
         assert!(
             !path.exists(),
             "replacement directory must not receive the trust decision"
@@ -1710,6 +1778,83 @@ mod tests {
         assert!(
             !displaced.join("trust.json").exists(),
             "aborted write must not publish into the displaced directory"
+        );
+    }
+    /// bd-sp5o3: the acknowledged record persists its bound canonical
+    /// identity across reloads, and any non-acknowledged state stops
+    /// exposing it (fail-closed for the pre-spawn seam).
+    #[test]
+    fn acknowledge_execution_binds_identity_until_state_leaves_acknowledged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("trust.json");
+        let fingerprint = "c".repeat(64);
+        let identity = crate::mcp::config::StoredExecutionIdentity {
+            resolved_path: "/usr/local/bin/agent-fixture".to_string(),
+            content_sha256: "d".repeat(64),
+        };
+
+        let mut store = TrustStore::load(&path).expect("load fresh store");
+        store
+            .acknowledge_execution("srv", &fingerprint, "operator", identity.clone())
+            .expect("bind execution on ack");
+        assert_eq!(
+            store.decision("srv", &fingerprint),
+            TrustDecision::Acknowledged
+        );
+
+        let reloaded = TrustStore::load(&path).expect("reload");
+        assert_eq!(
+            reloaded.acknowledged_execution("srv", &fingerprint),
+            Some(identity)
+        );
+
+        // Denial immediately revokes exposure of the binding.
+        let mut reloaded = TrustStore::load(&path).expect("reload after first load");
+        reloaded
+            .deny("srv", &fingerprint, "operator")
+            .expect("persist denial");
+        let reloaded = TrustStore::load(&path).expect("reload after deny");
+        assert_eq!(
+            reloaded.acknowledged_execution("srv", &fingerprint),
+            None,
+            "non-acknowledged states must not expose bindings"
+        );
+    }
+
+    /// bd-sp5o3: a v2 acknowledgement WITHOUT an execution field is exactly
+    /// the pre-hardening shape; it must read back as no binding so the spawn
+    /// seam forces a fresh `/mcp trust` instead of trusting raw strings.
+    #[test]
+    fn legacy_v2_record_without_execution_reads_as_unbound() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("trust.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 2,
+                "servers": {
+                    "srv": {
+                        "state": "acknowledged",
+                        "fingerprint": "e".repeat(64),
+                        "by": "operator",
+                        "at": "2026-08-27T00:00:00Z",
+                        "audit": []
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write v2 record without execution");
+
+        let store = TrustStore::load(&path).expect("load legacy-shaped store");
+        assert_eq!(
+            store.decision("srv", &"e".repeat(64)),
+            TrustDecision::Acknowledged
+        );
+        assert!(
+            store
+                .acknowledged_execution("srv", &"e".repeat(64))
+                .is_none()
         );
     }
 }

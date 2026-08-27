@@ -90,7 +90,12 @@ fn parse_tool_list(result: &Value) -> Result<Vec<McpToolMeta>> {
     let tools = result
         .get("tools")
         .and_then(Value::as_array)
-        .ok_or_else(|| tool_err("MCP_PROTOCOL", "tools/list result must contain a tools array"))?;
+        .ok_or_else(|| {
+            tool_err(
+                "MCP_PROTOCOL",
+                "tools/list result must contain a tools array",
+            )
+        })?;
     if tools.len() > MAX_SERVER_TOOLS {
         return Err(tool_err(
             "MCP_PROTOCOL",
@@ -437,8 +442,37 @@ impl McpManager {
         let fingerprint = self.trust_fingerprint(&entry.config);
         {
             let _guard = Self::lock(&self.inner.trust_lock);
-            let mut store = TrustStore::load(&self.inner.trust_path)?;
-            store.acknowledge(name, &fingerprint, "operator")?;
+            // bd-sp5o3: resolve and bind the CANONICAL executable identity
+            // the operator is approving — never ack on the raw string alone.
+            let identity = entry
+                .config
+                .execution_identity(&self.inner.cwd)
+                .map_err(|err| {
+                    tool_err(
+                        "MCP_TRUST_UNRESOLVED",
+                        format!(
+                            "cannot bind an executable for {:?}: {err}; \
+                             fix the command, then /mcp trust {name} again",
+                            entry.config.name
+                        ),
+                    )
+                })?;
+            match &identity {
+                Some(execution) => {
+                    let mut store = TrustStore::load(&self.inner.trust_path)?;
+                    store.acknowledge_execution(
+                        name,
+                        &fingerprint,
+                        "operator",
+                        execution.clone(),
+                    )?;
+                }
+                None => {
+                    // HTTP transport: nothing local executes.
+                    let mut store = TrustStore::load(&self.inner.trust_path)?;
+                    store.acknowledge(name, &fingerprint, "operator")?;
+                }
+            }
         }
         self.connect_and_list(&entry).await
     }
@@ -459,12 +493,10 @@ impl McpManager {
     pub async fn deny(&self, name: &str) -> Result<()> {
         let entry = self.entry(name)?;
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let _connect_guard = asupersync::sync::OwnedMutexGuard::lock(
-            Arc::clone(&entry.connect_lane),
-            cx.cx(),
-        )
-        .await
-        .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while denying server"))?;
+        let _connect_guard =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while denying server"))?;
         let fingerprint = self.trust_fingerprint(&entry.config);
         {
             let _guard = Self::lock(&self.inner.trust_lock);
@@ -488,12 +520,10 @@ impl McpManager {
     pub async fn test(&self, name: &str) -> Result<Vec<McpToolMeta>> {
         let entry = self.entry(name)?;
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let connect_guard = asupersync::sync::OwnedMutexGuard::lock(
-            Arc::clone(&entry.connect_lane),
-            cx.cx(),
-        )
-        .await
-        .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while testing server"))?;
+        let connect_guard =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while testing server"))?;
         *Self::lock(&entry.restarts) = RestartState::default();
         *Self::lock(&entry.health) = ServerHealth::NotStarted;
         self.ensure_ready_in_lane(&entry).await?;
@@ -517,12 +547,10 @@ impl McpManager {
     /// Connect (trust-gated, restart-budgeted) and return the tool list.
     async fn connect_and_list(&self, entry: &Arc<ServerEntry>) -> Result<Vec<McpToolMeta>> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let connect_guard = asupersync::sync::OwnedMutexGuard::lock(
-            Arc::clone(&entry.connect_lane),
-            cx.cx(),
-        )
-        .await
-        .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while connecting server"))?;
+        let connect_guard =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while connecting server"))?;
         self.ensure_ready_in_lane(entry).await?;
         let result = self.list_and_cache_tools_in_lane(entry).await;
         drop(connect_guard);
@@ -532,12 +560,10 @@ impl McpManager {
     #[cfg(test)]
     async fn list_and_cache_tools(&self, entry: &Arc<ServerEntry>) -> Result<Vec<McpToolMeta>> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let connect_guard = asupersync::sync::OwnedMutexGuard::lock(
-            Arc::clone(&entry.connect_lane),
-            cx.cx(),
-        )
-        .await
-        .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while listing server tools"))?;
+        let connect_guard =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while listing server tools"))?;
         let result = self.list_and_cache_tools_in_lane(entry).await;
         drop(connect_guard);
         result
@@ -661,10 +687,7 @@ impl McpManager {
     fn check_trust(&self, entry: &Arc<ServerEntry>) -> Result<()> {
         let decision = self
             .trust_store()?
-            .decision(
-                &entry.config.name,
-                &self.trust_fingerprint(&entry.config),
-            );
+            .decision(&entry.config.name, &self.trust_fingerprint(&entry.config));
         match decision {
             TrustDecision::Acknowledged => Ok(()),
             TrustDecision::Pending => Err(tool_err(
@@ -692,6 +715,63 @@ impl McpManager {
         let fingerprint = config.fingerprint(cwd);
         let mut store = TrustStore::load(trust_path)?;
         let (decision, guard) = store.locked_decision(&config.name, &fingerprint)?;
+
+        // bd-sp5o3: the acknowledged decision covers the RESOLVED executable,
+        // not the raw command string. At this final pre-spawn seam, under the
+        // cross-process trust lock and BEFORE any process is created, re-
+        // derive the identity and compare. PATH swaps, symlink retargets, or
+        // in-place content replacement all fail closed here instead of
+        // executing substituted code.
+        if matches!(decision, TrustDecision::Acknowledged) && config.command.is_some() {
+            let current = config.execution_identity(cwd).map_err(|err| {
+                tool_err(
+                    "MCP_TRUST_IDENTITY_UNRESOLVED",
+                    format!(
+                        "server {:?} can no longer be resolved to its trusted \
+                         executable before spawn: {err}",
+                        config.name
+                    ),
+                )
+            })?;
+            let stored = store.acknowledged_execution(&config.name, &fingerprint);
+            // stdio under an Acknowledged decision always yields Some here;
+            // anything else is a vanished surface, not a bypass.
+            let Some(current) = current else {
+                return Err(tool_err(
+                    "MCP_TRUST_IDENTITY_UNRESOLVED",
+                    format!(
+                        "server {:?} resolved to no executable right before spawn",
+                        config.name
+                    ),
+                ));
+            };
+            match stored {
+                Some(bound) if bound == current => {}
+                Some(bound) => {
+                    return Err(tool_err(
+                        "MCP_TRUST_IDENTITY_MISMATCH",
+                        format!(
+                            "server {:?} now resolves to a different executable \
+                             than the operator approved; refusing to spawn.\n  \
+                             approved: {bound}\n  current:  {current}",
+                            config.name
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(tool_err(
+                        "MCP_TRUST_IDENTITY_MISSING",
+                        format!(
+                            "server {:?} has an acknowledgement that predates \
+                             execution binding (or lost it); run /mcp trust {} \
+                             again after inspecting its source config",
+                            config.name, config.name
+                        ),
+                    ));
+                }
+            }
+        }
+
         match decision {
             TrustDecision::Acknowledged => Ok(guard),
             TrustDecision::Pending => Err(tool_err(
@@ -752,12 +832,10 @@ impl McpManager {
 
     async fn ensure_ready(&self, entry: &Arc<ServerEntry>) -> Result<()> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let _connect_guard = asupersync::sync::OwnedMutexGuard::lock(
-            Arc::clone(&entry.connect_lane),
-            cx.cx(),
-        )
-        .await
-        .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while connecting server"))?;
+        let _connect_guard =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while connecting server"))?;
 
         self.ensure_ready_in_lane(entry).await
     }
@@ -802,8 +880,7 @@ impl McpManager {
                 return Err(err);
             }
         };
-        let mut private_transport =
-            PrivateHandshakeTransport::new(Arc::clone(&transport));
+        let mut private_transport = PrivateHandshakeTransport::new(Arc::clone(&transport));
         if let Err(err) = self.check_trust(entry) {
             transport.close().await;
             *Self::lock(&entry.health) = ServerHealth::NotStarted;
@@ -932,14 +1009,13 @@ impl McpManager {
                         format!("server {:?} is http-shaped but has no url", config.name),
                     )
                 })?;
-                let headers = resolve_secrets(
-                    &config.headers,
-                    super::config::validate_http_header_value,
-                )?;
+                let headers =
+                    resolve_secrets(&config.headers, super::config::validate_http_header_value)?;
                 ensure_active()?;
-                return Ok(Box::new(super::transport::HttpTransport::new(
-                    &url, headers,
-                )?) as Box<dyn McpTransport>);
+                return Ok(
+                    Box::new(super::transport::HttpTransport::new(&url, headers)?)
+                        as Box<dyn McpTransport>,
+                );
             }
             let command = config.command.clone().ok_or_else(|| {
                 tool_err(
@@ -949,12 +1025,8 @@ impl McpManager {
             })?;
             let env = resolve_secrets(&config.env, super::config::validate_env_value)?;
             ensure_active()?;
-            let transport = super::transport::StdioTransport::spawn(
-                &command,
-                &config.args,
-                &env,
-                &cwd,
-            )?;
+            let transport =
+                super::transport::StdioTransport::spawn(&command, &config.args, &env, &cwd)?;
             if let Err(error) = ensure_active() {
                 transport.abort();
                 return Err(error);
@@ -1039,11 +1111,8 @@ impl McpManager {
         failure: &Error,
     ) -> String {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let connect_guard = asupersync::sync::OwnedMutexGuard::lock(
-            Arc::clone(&entry.connect_lane),
-            cx.cx(),
-        )
-        .await;
+        let connect_guard =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx()).await;
         let Ok(connect_guard) = connect_guard else {
             failed_transport.abort();
             return "recovery was cancelled before the connection lane became available"
@@ -1053,18 +1122,15 @@ impl McpManager {
         Self::detach_failed_call_transport(entry, failed_transport, failure);
 
         let recovery = match self.ensure_ready_in_lane(entry).await {
-            Ok(()) => self
-                .list_and_cache_tools_in_lane(entry)
-                .await
-                .map(|_| ()),
+            Ok(()) => self.list_and_cache_tools_in_lane(entry).await.map(|_| ()),
             Err(err) => Err(err),
         };
         drop(connect_guard);
         match recovery {
             Ok(()) => "the server was reconnected for subsequent calls".to_string(),
-            Err(recovery) => format!(
-                "the server could not be reconnected for subsequent calls: {recovery}"
-            ),
+            Err(recovery) => {
+                format!("the server could not be reconnected for subsequent calls: {recovery}")
+            }
         }
     }
 
@@ -1094,10 +1160,7 @@ impl McpManager {
         removed_failed_transport.is_some()
     }
 
-    async fn close_revoked_transport(
-        entry: &Arc<ServerEntry>,
-        transport: &Arc<dyn McpTransport>,
-    ) {
+    async fn close_revoked_transport(entry: &Arc<ServerEntry>, transport: &Arc<dyn McpTransport>) {
         let removed = {
             let mut current = Self::lock(&entry.transport);
             if current
@@ -1177,10 +1240,8 @@ impl McpManager {
         servers
             .values()
             .filter_map(|entry| {
-                if store.decision(
-                    &entry.config.name,
-                    &self.trust_fingerprint(&entry.config),
-                ) != TrustDecision::Acknowledged
+                if store.decision(&entry.config.name, &self.trust_fingerprint(&entry.config))
+                    != TrustDecision::Acknowledged
                 {
                     return None;
                 }
@@ -1214,7 +1275,8 @@ impl McpManager {
     /// bounded by a global budget; stragglers/failures land Unhealthy and
     /// never block startup.
     pub async fn connect_trusted(&self) {
-        self.connect_trusted_with_budget(STARTUP_CONNECT_BUDGET).await;
+        self.connect_trusted_with_budget(STARTUP_CONNECT_BUDGET)
+            .await;
     }
 
     fn fail_timed_out_startup_attempt(
@@ -1269,10 +1331,8 @@ impl McpManager {
         let mut tracked = Vec::new();
         let mut pending = Vec::new();
         for entry in servers.values().filter(|entry| {
-            store.decision(
-                &entry.config.name,
-                &self.trust_fingerprint(&entry.config),
-            ) == TrustDecision::Acknowledged
+            store.decision(&entry.config.name, &self.trust_fingerprint(&entry.config))
+                == TrustDecision::Acknowledged
         }) {
             let entry = Arc::clone(entry);
             let completed = Arc::new(AtomicBool::new(false));
@@ -1294,8 +1354,7 @@ impl McpManager {
                         // Capture and list one exact generation while retaining
                         // the same lane. Timeout cleanup can then safely compare
                         // this snapshot with the transport whose request hung.
-                        *Self::lock(&observed_transport) =
-                            Self::lock(&entry.transport).clone();
+                        *Self::lock(&observed_transport) = Self::lock(&entry.transport).clone();
                         #[cfg(test)]
                         if let Some(hook) =
                             Self::lock(&self.inner.startup_after_generation_hook).clone()
@@ -1330,9 +1389,7 @@ impl McpManager {
                     continue;
                 }
                 let observed_transport = Self::lock(&observed_transport).clone();
-                let Ok(_connect_guard) =
-                    Arc::clone(&entry.connect_lane).try_lock_owned()
-                else {
+                let Ok(_connect_guard) = Arc::clone(&entry.connect_lane).try_lock_owned() else {
                     if let Some(transport) = observed_transport {
                         transport.abort();
                     }
@@ -1573,8 +1630,8 @@ mod tests {
                 ]
             }),
         ] {
-            let error = parse_tool_list(&malformed)
-                .expect_err("malformed tools/list must fail as a whole");
+            let error =
+                parse_tool_list(&malformed).expect_err("malformed tools/list must fail as a whole");
             assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
         }
     }
@@ -1679,12 +1736,7 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for HangingToolsTransport {
-        async fn request(
-            &self,
-            method: &str,
-            _params: Value,
-            _timeout: Duration,
-        ) -> Result<Value> {
+        async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             if method == "tools/list" {
                 if let Some(started) = McpManager::lock(&self.started).take() {
                     let _ = started.send(());
@@ -1717,12 +1769,7 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for HangingInitializeTransport {
-        async fn request(
-            &self,
-            method: &str,
-            _params: Value,
-            _timeout: Duration,
-        ) -> Result<Value> {
+        async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             if method == "initialize" {
                 if let Some(started) = McpManager::lock(&self.state.started).take() {
                     let _ = started.send(());
@@ -1755,12 +1802,7 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for FlappingCallTransport {
-        async fn request(
-            &self,
-            method: &str,
-            _params: Value,
-            _timeout: Duration,
-        ) -> Result<Value> {
+        async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             match method {
                 "initialize" => Ok(serde_json::json!({})),
                 "tools/list" => Ok(serde_json::json!({
@@ -1807,17 +1849,9 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for FailingInitializeTransport {
-        async fn request(
-            &self,
-            method: &str,
-            _params: Value,
-            _timeout: Duration,
-        ) -> Result<Value> {
+        async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             if method == "initialize" {
-                return Err(tool_err(
-                    "MCP_TRANSPORT_IO",
-                    "fixture initialize failure",
-                ));
+                return Err(tool_err("MCP_TRANSPORT_IO", "fixture initialize failure"));
             }
             Err(tool_err(
                 "MCP_PROTOCOL",
@@ -1848,12 +1882,7 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for SuccessfulTransport {
-        async fn request(
-            &self,
-            method: &str,
-            _params: Value,
-            _timeout: Duration,
-        ) -> Result<Value> {
+        async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             match method {
                 "initialize" => Ok(serde_json::json!({})),
                 "tools/list" => Ok(serde_json::json!({"tools": []})),
@@ -2203,12 +2232,7 @@ mod tests {
             .build()
             .expect("runtime");
         runtime
-            .block_on(manager.call_on_transport(
-                &entry,
-                &current,
-                "echo",
-                &serde_json::json!({}),
-            ))
+            .block_on(manager.call_on_transport(&entry, &current, "echo", &serde_json::json!({})))
             .expect("current-generation tool call");
         assert_eq!(McpManager::lock(&entry.restarts).count, 0);
         assert!(McpManager::lock(&entry.restarts).next_retry_at.is_none());
@@ -2225,12 +2249,7 @@ mod tests {
             next_retry_at: Some(Instant::now() + Duration::from_secs(10)),
         };
         runtime
-            .block_on(manager.call_on_transport(
-                &entry,
-                &stale,
-                "echo",
-                &serde_json::json!({}),
-            ))
+            .block_on(manager.call_on_transport(&entry, &stale, "echo", &serde_json::json!({})))
             .expect("stale transport response is still a completed call");
         assert_eq!(
             McpManager::lock(&entry.restarts).count,
@@ -2288,9 +2307,7 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
-        runtime.block_on(
-            manager.connect_trusted_with_budget(Duration::from_millis(20)),
-        );
+        runtime.block_on(manager.connect_trusted_with_budget(Duration::from_millis(20)));
 
         started_rx
             .recv_timeout(Duration::from_millis(50))
@@ -2615,10 +2632,7 @@ mod tests {
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
 
         assert!(
-            !McpManager::fail_timed_out_startup_attempt(
-                &entry,
-                Some(timed_out_erased),
-            ),
+            !McpManager::fail_timed_out_startup_attempt(&entry, Some(timed_out_erased),),
             "generation mismatch must leave replacement state untouched"
         );
         assert!(timed_out.closed.load(Ordering::Acquire));
@@ -2641,10 +2655,7 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
-        runtime.block_on(McpManager::close_revoked_transport(
-            &entry,
-            &revoked_erased,
-        ));
+        runtime.block_on(McpManager::close_revoked_transport(&entry, &revoked_erased));
         assert!(
             revoked.closed.load(Ordering::Acquire),
             "the obsolete revoked generation must be aborted"
@@ -2663,11 +2674,7 @@ mod tests {
         let failed_call_erased: Arc<dyn McpTransport> = failed_call.clone();
         let failure = tool_err("MCP_TRANSPORT_IO", "lost old connection");
         assert!(
-            !McpManager::detach_failed_call_transport(
-                &entry,
-                &failed_call_erased,
-                &failure,
-            ),
+            !McpManager::detach_failed_call_transport(&entry, &failed_call_erased, &failure,),
             "a stale call failure must not detach or poison its replacement"
         );
         assert!(failed_call.closed.load(Ordering::Acquire));
@@ -2801,10 +2808,7 @@ mod tests {
         }
     }
 
-    fn assert_stale_tools_list_preserves_replacement(
-        response: Value,
-        expected_error_code: &str,
-    ) {
+    fn assert_stale_tools_list_preserves_replacement(response: Value, expected_error_code: &str) {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("project");
         let global = temp.path().join("global");

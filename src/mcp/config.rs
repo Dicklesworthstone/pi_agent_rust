@@ -81,7 +81,9 @@ pub(super) fn validate_http_header_value(value: &str) -> std::result::Result<(),
         ));
     }
     if value.chars().any(is_terminal_control) {
-        return Err("HTTP header value contains terminal or protocol control characters".to_string());
+        return Err(
+            "HTTP header value contains terminal or protocol control characters".to_string(),
+        );
     }
     Ok(())
 }
@@ -93,7 +95,9 @@ pub(super) fn validate_env_value(value: &str) -> std::result::Result<(), String>
         ));
     }
     if value.chars().any(is_terminal_control) {
-        return Err("environment value contains terminal or process control characters".to_string());
+        return Err(
+            "environment value contains terminal or process control characters".to_string(),
+        );
     }
     Ok(())
 }
@@ -221,6 +225,153 @@ impl ConfiguredServer {
     }
 }
 
+/// Canonical identity of the executable a stdio MCP server will actually
+/// run (bd-sp5o3).
+///
+/// `resolved_path` is the symlink-collapsed absolute path selected for the
+/// raw command (PATH search for bare names, cwd-anchored resolution for
+/// relative paths), and `content_sha256` binds the bytes that path pointed
+/// at when the operator acknowledged trust.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredExecutionIdentity {
+    pub resolved_path: String,
+    pub content_sha256: String,
+}
+
+impl std::fmt::Display for StoredExecutionIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (sha256:{})",
+            self.resolved_path,
+            &self.content_sha256[..16.min(self.content_sha256.len())]
+        )
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|err| format!("cannot open {:?} for hashing: {err}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("cannot read {:?}: {err}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(crate::package_manager::hex_encode(&hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+}
+
+/// Pure resolver for one raw command against explicit PATH contents.
+///
+/// Semantics mirror ambient spawn behavior: bare names are searched in every
+/// non-empty `path_env` directory in order (the current directory is NOT
+/// implicitly searched), relative paths containing a separator anchor to
+/// `cwd`, absolute paths pass through. The result collapses symlinks so a
+/// retargeted link changes identity, and hashes the executable's content so
+/// an in-place replacement is detected even when size/mtime lie.
+pub fn resolve_command_identity(
+    raw_command: &str,
+    cwd: &Path,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<StoredExecutionIdentity, String> {
+    let trimmed = raw_command.trim();
+    if trimmed.is_empty() {
+        return Err("command is empty".to_string());
+    }
+    let raw_path = Path::new(trimmed);
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else if trimmed.contains('/') || trimmed.contains('\\') {
+        cwd.join(raw_path)
+    } else {
+        let dirs = match path_env {
+            Some(os_str) => std::env::split_paths(os_str).collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        dirs.iter()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join(raw_path))
+            .find(|candidate| is_executable_file(candidate))
+            .ok_or_else(|| format!("executable {trimmed:?} was not found on the current PATH"))?
+    };
+
+    let candidate: PathBuf = candidate
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|err| format!("cannot resolve command target {candidate:?}: {err}"))?;
+    let meta = std::fs::metadata(&resolved)
+        .map_err(|err| format!("cannot inspect resolved command {resolved:?}: {err}"))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "resolved command {resolved:?} is not a regular file"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&resolved)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0);
+        if mode & 0o111 == 0 {
+            return Err(format!(
+                "resolved command {resolved:?} exists but is not executable"
+            ));
+        }
+    }
+
+    Ok(StoredExecutionIdentity {
+        resolved_path: resolved.display().to_string(),
+        content_sha256: sha256_file(&resolved)?,
+    })
+}
+
+impl ConfiguredServer {
+    /// Derive the execution identity this configuration will run RIGHT NOW.
+    ///
+    /// Returns `Ok(None)` for HTTP servers (nothing local executes), and an
+    /// error when a stdio command cannot be resolved to exactly one regular
+    /// executable (bd-sp5o3).
+    ///
+    /// # Errors
+    ///
+    /// Fails when a stdio command resolves to nothing executable or its
+    /// canonical target/content cannot be hashed.
+    pub fn execution_identity(
+        &self,
+        effective_cwd: &Path,
+    ) -> Result<Option<StoredExecutionIdentity>, String> {
+        let Some(command) = self.command.as_deref() else {
+            return Ok(None);
+        };
+        resolve_command_identity(command, effective_cwd, std::env::var_os("PATH").as_deref())
+            .map(Some)
+    }
+}
+
 pub(super) fn validate_transport_shape(
     config: &ConfiguredServer,
 ) -> std::result::Result<(), String> {
@@ -314,8 +465,7 @@ pub(super) fn normalize_http_headers(
                 "defines transport-owned HTTP header {name:?}; Accept, Content-Type, and Mcp-Session-Id are managed by the MCP transport"
             ));
         }
-        validate_http_header_value(value)
-            .map_err(|reason| format!("header {name:?}: {reason}"))?;
+        validate_http_header_value(value).map_err(|reason| format!("header {name:?}: {reason}"))?;
     }
     headers.sort_by(|left, right| {
         left.0
@@ -391,17 +541,9 @@ pub(super) fn validate_server_name(name: &str) -> std::result::Result<(), String
 }
 
 fn hash_part(hasher: &mut Sha256, label: &str, value: &[u8]) {
-    hasher.update(
-        u64::try_from(label.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
+    hasher.update(u64::try_from(label.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(label.as_bytes());
-    hasher.update(
-        u64::try_from(value.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(value);
 }
 
@@ -543,10 +685,7 @@ fn load_file(
 ) -> bool {
     let content = match read_bounded_config(path) {
         Ok(content) => content,
-        Err(err)
-            if err.kind() == std::io::ErrorKind::NotFound
-                && provenance != Provenance::Cli =>
-        {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && provenance != Provenance::Cli => {
             return false; // absent default files are normal
         }
         Err(err) => {
@@ -778,22 +917,18 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
             });
             continue;
         }
-        let headers = match normalize_http_headers(
-            raw.headers
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-        ) {
-            Ok(headers) => headers,
-            Err(reason) => {
-                warnings.push(ConfigWarning {
-                    source_file,
-                    entry: name,
-                    reason,
-                });
-                continue;
-            }
-        };
+        let headers =
+            match normalize_http_headers(raw.headers.unwrap_or_default().into_iter().collect()) {
+                Ok(headers) => headers,
+                Err(reason) => {
+                    warnings.push(ConfigWarning {
+                        source_file,
+                        entry: name,
+                        reason,
+                    });
+                    continue;
+                }
+            };
         let env = match normalize_env(raw.env.unwrap_or_default().into_iter().collect()) {
             Ok(env) => env,
             Err(reason) => {
@@ -1081,8 +1216,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("proj");
         let global = temp.path().join("global");
-        std::fs::create_dir_all(cwd.join(".pi/mcp.json"))
-            .expect("non-regular config fixture");
+        std::fs::create_dir_all(cwd.join(".pi/mcp.json")).expect("non-regular config fixture");
         write(
             &global.join("mcp.json"),
             r#"{"mcpServers":{"fallback":{"command":"ok"}}}"#,
@@ -1091,10 +1225,7 @@ mod tests {
         let discovery = discover(&cwd, &global, &[]);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
-        assert_eq!(
-            discovery.warnings[0].source_file,
-            cwd.join(".pi/mcp.json")
-        );
+        assert_eq!(discovery.warnings[0].source_file, cwd.join(".pi/mcp.json"));
         assert!(
             discovery.warnings[0]
                 .reason
@@ -1204,11 +1335,7 @@ mod tests {
         let discovery = discover(&cwd, &temp.path().join("g"), &[]);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
-        assert!(
-            discovery.warnings[0]
-                .reason
-                .contains("case-insensitive")
-        );
+        assert!(discovery.warnings[0].reason.contains("case-insensitive"));
     }
 
     #[test]
@@ -1362,6 +1489,209 @@ mod tests {
         assert_ne!(fingerprint, server.fingerprint(&other_cwd));
     }
 
+    /// bd-sp5o3 fixtures: an executable script with the unix exec bit set.
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).expect("write fixture");
+        let mut permissions = std::fs::metadata(path)
+            .expect("fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod fixture");
+    }
+
+    #[cfg(unix)]
+    fn stdio_fixture(name: &str, command: &str) -> ConfiguredServer {
+        ConfiguredServer {
+            name: name.to_string(),
+            command: Some(command.to_string()),
+            args: vec!["--serve".to_string()],
+            env: Vec::new(),
+            url: None,
+            headers: Vec::new(),
+            transport_hint: None,
+            provenance: Provenance::GlobalPi,
+            source_file: PathBuf::from("/tmp/whatever.json"),
+        }
+    }
+
+    /// Bare commands resolve through explicit PATH contents in order; the
+    /// current directory is never implicitly searched.
+    #[cfg(unix)]
+    #[test]
+    fn bare_command_resolution_follows_path_order_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_dir = temp.path().join("first");
+        let second_dir = temp.path().join("second");
+        let project_cwd = temp.path().join("project");
+        for directory in [&first_dir, &second_dir, &project_cwd] {
+            std::fs::create_dir_all(directory).expect("mkdir");
+        }
+        write_executable(&first_dir.join("svc"), "#!/bin/sh\necho first\n");
+        write_executable(&second_dir.join("svc"), "#!/bin/sh\necho second\n");
+        // Same name in the cwd must be ignored for bare lookups.
+        write_executable(&project_cwd.join("svc"), "#!/bin/sh\necho cwd\n");
+
+        let path_env = std::env::join_paths([&first_dir, &second_dir]).expect("join PATH");
+        let identity = resolve_command_identity("svc", &project_cwd, Some(path_env.as_os_str()))
+            .expect("bare resolution");
+        assert_eq!(
+            identity.resolved_path,
+            first_dir.join("svc").display().to_string(),
+            "earlier PATH entry wins"
+        );
+
+        // Reordering the PATH selects different code under identical config.
+        let flipped = std::env::join_paths([&second_dir, &first_dir]).expect("join PATH");
+        let identity = resolve_command_identity("svc", &project_cwd, Some(flipped.as_os_str()))
+            .expect("reordered resolution");
+        assert_eq!(
+            identity.resolved_path,
+            second_dir.join("svc").display().to_string()
+        );
+    }
+
+    /// Relative commands anchor to the effective cwd and FAIL when nothing
+    /// executable is there.
+    #[cfg(unix)]
+    #[test]
+    fn relative_command_resolution_anchors_to_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("proj");
+        std::fs::create_dir_all(project.join("bin")).expect("mkdir bin");
+        write_executable(&project.join("bin").join("tool"), "#!/bin/sh\nexit 0\n");
+
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir elsewhere");
+
+        let resolved_here =
+            resolve_command_identity("./bin/tool", &project, Some(std::ffi::OsStr::new("")))
+                .expect("relative resolution anchored to project cwd")
+                .resolved_path;
+        assert_eq!(
+            resolved_here,
+            std::fs::canonicalize(project.join("bin/tool"))
+                .expect("canonical")
+                .display()
+                .to_string()
+        );
+
+        let error = resolve_command_identity("./bin/tool", &elsewhere, None)
+            .err()
+            .expect("must not resolve outside the effective cwd");
+        assert!(
+            error.contains("cannot resolve") || error.contains("not a regular"),
+            "{error}"
+        );
+    }
+
+    /// In-place content replacement (same filename, similar size) MUST
+    /// change the identity digest — the exact substitution the bead exists
+    /// to catch between acknowledgement and spawn.
+    #[cfg(unix)]
+    #[test]
+    fn content_mutation_changes_identity_even_in_place() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let target = dir.join("tool");
+        write_executable(&target, "#!/bin/sh\necho ORIGINAL_SAME_LENGTH_AAAA\n");
+
+        let path_env = std::env::join_paths([&dir]).expect("join PATH");
+        let before = resolve_command_identity("tool", temp.path(), Some(path_env.as_os_str()))
+            .expect("initial");
+
+        write_executable(&target, "#!/bin/sh\necho REPLACED_SAME_LENGTH_BBBB\n");
+        let after = resolve_command_identity("tool", temp.path(), Some(path_env.as_os_str()))
+            .expect("after rewrite");
+
+        assert_eq!(before.resolved_path, after.resolved_path);
+        assert_ne!(
+            before.content_sha256, after.content_sha256,
+            "content binding must expose in-place swaps"
+        );
+    }
+
+    /// A symlink retarget changes the canonical path (and therefore the
+    /// bound identity), independent of content hashing.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_retarget_changes_resolved_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let real_a = bin.join("real-a");
+        let real_b = bin.join("real-b");
+        write_executable(&real_a, "#!/bin/sh\necho A\n");
+        write_executable(&real_b, "#!/bin/sh\necho B\n");
+        std::os::unix::fs::symlink(&real_a, bin.join("link")).expect("symlink a");
+
+        let path_env = std::env::join_paths([&bin]).expect("join PATH");
+        let before = resolve_command_identity("link", temp.path(), Some(path_env.as_os_str()))
+            .expect("via link->a");
+
+        std::fs::remove_file(bin.join("link")).expect("remove link");
+        std::os::unix::fs::symlink(&real_b, bin.join("link")).expect("symlink b");
+        let after = resolve_command_identity("link", temp.path(), Some(path_env.as_os_str()))
+            .expect("via link->b");
+
+        assert_ne!(
+            before.resolved_path, after.resolved_path,
+            "canonicalization exposes retargeted symlinks"
+        );
+    }
+
+    /// Non-executable and missing targets fail closed with actionable text;
+    /// HTTP servers carry no execution identity at all.
+    #[cfg(unix)]
+    #[test]
+    fn unresolvable_commands_fail_closed_and_http_is_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("d");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("lazy"), "#!/bin/sh\nexit 0\n").expect("no exec bit");
+
+        let path_env = std::env::join_paths([&dir]).expect("join PATH");
+        let error = resolve_command_identity("lazy", temp.path(), Some(path_env.as_os_str()))
+            .err()
+            .expect("missing exec bit fails closed");
+        assert!(
+            error.contains("not executable") || error.contains("not found"),
+            "{error}"
+        );
+
+        let missing = resolve_command_identity("never-installed-binary", temp.path(), None)
+            .err()
+            .expect("absent from PATH fails closed");
+        assert!(
+            missing.contains("not found on the current PATH"),
+            "{missing}"
+        );
+
+        let mut http = ConfiguredServer {
+            name: "remote".to_string(),
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            url: Some("https://example.invalid/mcp".to_string()),
+            headers: Vec::new(),
+            transport_hint: None,
+            provenance: Provenance::GlobalPi,
+            source_file: PathBuf::from("/tmp/remote.json"),
+        };
+        assert!(
+            http.execution_identity(temp.path())
+                .expect("http has no local surface")
+                .is_none()
+        );
+        http.command = Some("./nowhere/tool".to_string());
+        assert!(
+            http.execution_identity(temp.path()).is_err(),
+            "stdio-with-missing-target still fails closed"
+        );
+    }
+
     #[test]
     fn write_then_read_project_config_roundtrip() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1380,16 +1710,12 @@ mod tests {
     fn project_config_read_rejects_oversized_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join(".pi/mcp.json");
-        std::fs::create_dir_all(path.parent().expect("config parent"))
-            .expect("config directory");
+        std::fs::create_dir_all(path.parent().expect("config parent")).expect("config directory");
         std::fs::write(&path, vec![b' '; MAX_MCP_CONFIG_BYTES + 1])
             .expect("oversized config fixture");
 
         let error = read_project_config(&path).expect_err("oversized config must fail closed");
-        assert!(
-            error.to_string().contains("MCP_CONFIG_INVALID"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("MCP_CONFIG_INVALID"), "{error}");
         assert!(
             error.to_string().contains("exceeds 1048576 bytes"),
             "{error}"
@@ -1408,10 +1734,10 @@ mod tests {
 
         let error = write_project_config(&path, &value)
             .expect_err("writer must not create a config the bounded reader rejects");
+        assert!(error.to_string().contains("MCP_CONFIG_INVALID"), "{error}");
         assert!(
-            error.to_string().contains("MCP_CONFIG_INVALID"),
-            "{error}"
+            !path.exists(),
+            "rejected output must not create the config file"
         );
-        assert!(!path.exists(), "rejected output must not create the config file");
     }
 }
