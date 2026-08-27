@@ -98,6 +98,10 @@ write_cp_fail_stub() {
 #!/usr/bin/env bash
 set -euo pipefail
 for arg in "$@"; do
+  if [ -n "${STUB_CP_FAIL_SOURCE:-}" ] && [ "$arg" = "$STUB_CP_FAIL_SOURCE" ]; then
+    echo "cp fixture: forced source failure" >&2
+    exit 1
+  fi
   if [[ "$arg" == *"/skills/"* ]]; then
     echo "cp fixture: forced failure" >&2
     exit 1
@@ -182,6 +186,7 @@ fi
 
 output=""
 is_head=0
+write_out=0
 args=("$@")
 idx=0
 while [ "$idx" -lt "${#args[@]}" ]; do
@@ -194,6 +199,10 @@ while [ "$idx" -lt "${#args[@]}" ]; do
       idx=$((idx + 1))
       output="${args[$idx]}"
       ;;
+    -w|--write-out)
+      write_out=1
+      idx=$((idx + 1))
+      ;;
   esac
   idx=$((idx + 1))
 done
@@ -204,6 +213,44 @@ fi
 
 url="${args[${#args[@]}-1]}"
 if [[ "$url" == *.sigstore.json ]]; then
+  exit 22
+fi
+if [[ "$url" == */SHA256SUMS ]]; then
+  if [ -n "${STUB_SHA256SUMS_SOURCE:-}" ]; then
+    cp "${STUB_SHA256SUMS_SOURCE}" "$output"
+    if [ "$write_out" -eq 1 ]; then
+      printf '200'
+    fi
+    exit 0
+  fi
+  if [ "$write_out" -eq 1 ]; then
+    printf '%s' "${STUB_SHA256SUMS_HTTP_STATUS:-404}"
+  fi
+  exit "${STUB_SHA256SUMS_CURL_RC:-22}"
+fi
+if [[ "$url" == *.sha256 ]]; then
+  if [ -n "${STUB_SHA256_SIDECAR_SOURCE:-}" ]; then
+    cp "${STUB_SHA256_SIDECAR_SOURCE}" "$output"
+    if [ "$write_out" -eq 1 ]; then
+      printf '200'
+    fi
+    exit 0
+  fi
+  if [ "$write_out" -eq 1 ]; then
+    printf '%s' "${STUB_SHA256_SIDECAR_HTTP_STATUS:-404}"
+  fi
+  exit "${STUB_SHA256_SIDECAR_CURL_RC:-22}"
+fi
+if [ -n "${STUB_ARTIFACT_FAIL_SUFFIX:-}" ] && [[ "$url" == *"${STUB_ARTIFACT_FAIL_SUFFIX}" ]]; then
+  if [ "$write_out" -eq 1 ]; then
+    printf '%s' "${STUB_ARTIFACT_HTTP_STATUS:-503}"
+  fi
+  exit "${STUB_ARTIFACT_CURL_RC:-22}"
+fi
+if [ -n "${STUB_ARTIFACT_URL_SUFFIX:-}" ] && [[ "$url" != *"${STUB_ARTIFACT_URL_SUFFIX}" ]]; then
+  if [ "$write_out" -eq 1 ]; then
+    printf '404'
+  fi
   exit 22
 fi
 if [ -n "$output" ] && [ -n "${STUB_ARTIFACT_SOURCE:-}" ]; then
@@ -1754,6 +1801,417 @@ MANIFEST
   assert_output_contains "$dir" "Release checksum verification failed; aborting install"
 }
 
+test_local_checksum_copy_failure_fails_closed() {
+  local dir artifact artifact_url checksum_file installed
+  dir="$(case_dir "checksum-local-copy-failure")"
+  write_existing_pi_stub "$dir"
+  write_cp_fail_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum_file="${dir}/fixtures/pi-fixture.sha256"
+  printf '%s  %s\n' "$(sha256_file "$artifact")" "pi-fixture" > "$checksum_file"
+  installed="${dir}/dest/pi"
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  STUB_CP_FAIL_SOURCE="$checksum_file" \
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "$artifact_url" \
+    --checksum-url "file://${checksum_file}" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Failed to download checksum file"
+  assert_output_contains "$dir" "Release checksum verification failed; aborting install"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "local checksum copy failure replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_release_install_uses_dsr_asset_sidecar_when_manifest_absent() {
+  local dir artifact archive sidecar checksum curl_log installed
+  dir="$(case_dir "checksum-dsr-sidecar")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  sidecar="${archive}.sha256"
+  curl_log="${dir}/curl.log"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  checksum="$(sha256_file "$archive" | tr '[:lower:]' '[:upper:]')"
+  printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$sidecar"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_SHA256_SIDECAR_SOURCE="$sidecar" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Checksum:  verified (artifact .sha256)"
+  grep -Fq -- "/pi-linux-amd64.tar.xz.sha256" "$curl_log"
+  if grep -Fq -- "/SHA256SUMS" "$curl_log"; then
+    echo "canonical DSR sidecar success unnecessarily probed legacy SHA256SUMS" >&2
+    return 1
+  fi
+  installed="${dir}/dest/pi"
+  [ -x "$installed" ] || { echo "expected installed binary at ${installed}" >&2; return 1; }
+}
+
+test_release_install_falls_back_to_legacy_manifest_when_sidecar_absent() {
+  local dir artifact archive manifest checksum curl_log installed
+  dir="$(case_dir "checksum-legacy-manifest-fallback")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  manifest="${dir}/fixtures/SHA256SUMS"
+  curl_log="${dir}/curl.log"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  checksum="$(sha256_file "$archive")"
+  printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$manifest"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_SHA256SUMS_SOURCE="$manifest" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Checksum:  verified (SHA256SUMS)"
+  grep -Fq -- "/pi-linux-amd64.tar.xz.sha256" "$curl_log"
+  grep -Fq -- "/SHA256SUMS" "$curl_log"
+  installed="${dir}/dest/pi"
+  [ -x "$installed" ] || { echo "expected installed binary at ${installed}" >&2; return 1; }
+}
+
+test_release_install_without_any_checksum_fails_closed() {
+  local dir artifact archive curl_log installed
+  dir="$(case_dir "checksum-release-unavailable")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  curl_log="${dir}/curl.log"
+  installed="${dir}/dest/pi"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Release provides neither pi-linux-amd64.tar.xz.sha256 nor SHA256SUMS"
+  assert_output_contains "$dir" "Release checksum verification failed; aborting install"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "checksum-less release replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_release_install_rejects_wrong_dsr_asset_sidecar() {
+  local dir artifact archive sidecar curl_log installed
+  dir="$(case_dir "checksum-dsr-sidecar-mismatch")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  sidecar="${archive}.sha256"
+  curl_log="${dir}/curl.log"
+  installed="${dir}/dest/pi"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  printf '%064d  %s\n' 0 "pi-linux-amd64.tar.xz" > "$sidecar"
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_SHA256_SIDECAR_SOURCE="$sidecar" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Checksum mismatch for pi-linux-amd64.tar.xz"
+  assert_output_contains "$dir" "Release checksum verification failed; aborting install"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "wrong DSR sidecar replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_release_install_rejects_misbound_dsr_sidecar_without_legacy_fallback() {
+  local dir artifact archive sidecar checksum curl_log installed
+  dir="$(case_dir "checksum-dsr-sidecar-misbound")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  sidecar="${archive}.sha256"
+  curl_log="${dir}/curl.log"
+  installed="${dir}/dest/pi"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  checksum="$(sha256_file "$archive")"
+  printf '%s  %s\n' "$checksum" "pi-linux-arm64.tar.xz" > "$sidecar"
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_SHA256_SIDECAR_SOURCE="$sidecar" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Checksum sidecar for pi-linux-amd64.tar.xz does not contain one usable SHA-256 digest"
+  assert_output_contains "$dir" "Release checksum verification failed; aborting install"
+  for forbidden in "/pi_linux_amd64" "/pi-linux-amd64.tar.gz" "/pi-x86_64-unknown-linux-gnu"; do
+    if grep -Fq -- "$forbidden" "$curl_log"; then
+      echo "misbound canonical DSR sidecar triggered historical artifact fallback: ${forbidden}" >&2
+      return 1
+    fi
+  done
+  if grep -Eq '/pi(-linux-amd64)?([[:space:]]|$)' "$curl_log"; then
+    echo "misbound canonical DSR sidecar triggered a bare-binary fallback" >&2
+    return 1
+  fi
+  assert_output_not_contains "$dir" "falling back to source build"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "misbound DSR sidecar replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_release_install_does_not_downgrade_on_sidecar_transport_failure() {
+  local dir artifact archive sidecar manifest checksum curl_log installed
+  dir="$(case_dir "checksum-sidecar-transport-failure")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  sidecar="${archive}.sha256"
+  manifest="${dir}/fixtures/SHA256SUMS"
+  curl_log="${dir}/curl.log"
+  installed="${dir}/dest/pi"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  checksum="$(sha256_file "$archive")"
+  printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$sidecar"
+  cp "$sidecar" "$manifest"
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_SHA256SUMS_SOURCE="$manifest" \
+  STUB_SHA256_SIDECAR_HTTP_STATUS="000" \
+  STUB_SHA256_SIDECAR_CURL_RC="28" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Failed to fetch canonical checksum sidecar"
+  assert_output_contains "$dir" "Release checksum verification failed; aborting install"
+  if grep -Fq -- "/SHA256SUMS" "$curl_log"; then
+    echo "checksum sidecar transport failure downgraded to the aggregate manifest" >&2
+    return 1
+  fi
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "sidecar transport failure replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_release_install_does_not_downgrade_on_artifact_transport_failure() {
+  local dir artifact archive curl_log installed
+  dir="$(case_dir "artifact-transport-failure")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  curl_log="${dir}/curl.log"
+  installed="${dir}/dest/pi"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_FAIL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_ARTIFACT_HTTP_STATUS="503" \
+  STUB_ARTIFACT_CURL_RC="22" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Failed to fetch release artifact because of a transport or server error"
+  assert_output_contains "$dir" "Release artifact transport failed; aborting install"
+  for forbidden in "/pi_linux_amd64" "/pi-linux-amd64.tar.gz" "/pi-x86_64-unknown-linux-gnu"; do
+    if grep -Fq -- "$forbidden" "$curl_log"; then
+      echo "canonical artifact transport failure triggered historical fallback: ${forbidden}" >&2
+      return 1
+    fi
+  done
+  if grep -Eq '/pi(-linux-amd64)?([[:space:]]|$)' "$curl_log"; then
+    echo "canonical artifact transport failure triggered a bare-binary fallback" >&2
+    return 1
+  fi
+  assert_output_not_contains "$dir" "falling back to source build"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "artifact transport failure replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_release_install_distinguishes_manifest_transport_failure_from_absence() {
+  local dir artifact archive curl_log installed
+  dir="$(case_dir "checksum-manifest-transport-failure")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  curl_log="${dir}/curl.log"
+  installed="${dir}/dest/pi"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_SHA256SUMS_HTTP_STATUS="503" \
+  STUB_SHA256SUMS_CURL_RC="22" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Failed to fetch aggregate release checksum manifest"
+  assert_output_contains "$dir" "Release checksum verification failed; aborting install"
+  assert_output_not_contains "$dir" "provides neither"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "checksum manifest transport failure replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_release_install_rejects_checksum_verified_broken_canonical_archive() {
+  local dir archive sidecar checksum curl_log installed
+  dir="$(case_dir "checksum-broken-canonical-archive")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  sidecar="${archive}.sha256"
+  curl_log="${dir}/curl.log"
+  installed="${dir}/dest/pi"
+  printf 'not-an-xz-archive\n' > "$archive"
+  checksum="$(sha256_file "$archive")"
+  printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$sidecar"
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_SHA256_SIDECAR_SOURCE="$sidecar" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Checksum-verified release artifact could not be extracted"
+  assert_output_contains "$dir" "Release packaging validation failed; aborting install"
+  for forbidden in "/pi_linux_amd64" "/pi-linux-amd64.tar.gz" "/pi-x86_64-unknown-linux-gnu"; do
+    if grep -Fq -- "$forbidden" "$curl_log"; then
+      echo "broken canonical archive triggered historical artifact fallback: ${forbidden}" >&2
+      return 1
+    fi
+  done
+  if grep -Eq '/pi(-linux-amd64)?([[:space:]]|$)' "$curl_log"; then
+    echo "broken canonical archive triggered a bare-binary fallback" >&2
+    return 1
+  fi
+  assert_output_not_contains "$dir" "falling back to source build"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "broken canonical archive replaced the existing installation" >&2
+    return 1
+  fi
+}
+
 test_sigstore_bundle_unavailable_soft_skip() {
   local dir artifact artifact_url checksum
   dir="$(case_dir "sigstore-bundle-unavailable")"
@@ -1778,6 +2236,102 @@ test_sigstore_bundle_unavailable_soft_skip() {
   assert_output_contains "$dir" "Signature: skipped (offline; bundle not provided)"
 }
 
+test_explicit_sigstore_bundle_without_cosign_fails_closed() {
+  local dir artifact artifact_url bundle checksum installed
+  dir="$(case_dir "sigstore-explicit-bundle-cosign-missing")"
+  write_existing_pi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+  bundle="${dir}/fixtures/pi-fixture.sigstore.json"
+  printf '{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n' > "$bundle"
+  installed="${dir}/dest/pi"
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  PI_INSTALLER_COSIGN_BIN="${dir}/fixtures/definitely-missing-cosign" \
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --sigstore-bundle-url "file://${bundle}" \
+    --no-completions
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Sigstore bundle was explicitly requested, but cosign is not installed"
+  assert_output_contains "$dir" "Release signature verification failed; aborting install"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "missing cosign replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_explicit_sigstore_bundle_fetch_failure_fails_closed() {
+  local dir artifact artifact_url missing_bundle checksum installed
+  dir="$(case_dir "sigstore-explicit-bundle-fetch-failure")"
+  write_existing_pi_stub "$dir"
+  write_cosign_stub "$dir" "pass"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+  missing_bundle="${dir}/fixtures/missing.sigstore.json"
+  installed="${dir}/dest/pi"
+  printf 'existing-destination-sentinel\n' > "$installed"
+  chmod +x "$installed"
+
+  COSIGN_IDENTITY_RE='^https://issuer.example/dsr/pi-agent-rust$' \
+  COSIGN_OIDC_ISSUER='https://issuer.example' \
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --sigstore-bundle-url "file://${missing_bundle}" \
+    --no-completions
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Failed to fetch explicitly requested Sigstore bundle"
+  assert_output_contains "$dir" "Release signature verification failed; aborting install"
+  if [ ! -f "$installed" ] || [ "$(cat "$installed")" != "existing-destination-sentinel" ]; then
+    echo "explicit Sigstore bundle fetch failure replaced the existing installation" >&2
+    return 1
+  fi
+}
+
+test_sigstore_bundle_without_identity_policy_fails_closed() {
+  local dir artifact artifact_url bundle checksum
+  dir="$(case_dir "sigstore-identity-policy-missing")"
+  write_existing_pi_stub "$dir"
+  write_cosign_stub "$dir" "pass"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+  bundle="${dir}/fixtures/pi-fixture.sigstore.json"
+  printf '{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n' > "$bundle"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --sigstore-bundle-url "file://${bundle}" \
+    --no-completions
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "no trusted cosign identity policy is configured"
+  assert_output_contains "$dir" "Release signature verification failed; aborting install"
+}
+
 test_sigstore_cosign_failure_fails_hard() {
   local dir artifact artifact_url bundle checksum
   dir="$(case_dir "sigstore-cosign-fail")"
@@ -1791,6 +2345,8 @@ test_sigstore_cosign_failure_fails_hard() {
   bundle="${dir}/fixtures/pi-fixture.sigstore.json"
   printf '{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n' > "$bundle"
 
+  COSIGN_IDENTITY_RE='^https://issuer.example/dsr/pi-agent-rust$' \
+  COSIGN_OIDC_ISSUER='https://issuer.example' \
   run_installer "$dir" \
     --yes --no-gum --offline \
     --version v9.9.9 \
@@ -1819,6 +2375,8 @@ test_sigstore_cosign_success() {
   cosign_log="${dir}/cosign.log"
   printf '{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n' > "$bundle"
 
+  COSIGN_IDENTITY_RE='^https://issuer.example/dsr/pi-agent-rust$' \
+  COSIGN_OIDC_ISSUER='https://issuer.example' \
   COSIGN_LOG_PATH="$cosign_log" run_installer "$dir" \
     --yes --no-gum --offline \
     --version v9.9.9 \
@@ -2354,7 +2912,20 @@ main() {
   run_test test_checksum_inline_success
   run_test test_checksum_mismatch_fails_hard
   run_test test_checksum_missing_manifest_entry_fails_hard
+  run_test test_local_checksum_copy_failure_fails_closed
+  run_test test_release_install_uses_dsr_asset_sidecar_when_manifest_absent
+  run_test test_release_install_falls_back_to_legacy_manifest_when_sidecar_absent
+  run_test test_release_install_without_any_checksum_fails_closed
+  run_test test_release_install_rejects_wrong_dsr_asset_sidecar
+  run_test test_release_install_rejects_misbound_dsr_sidecar_without_legacy_fallback
+  run_test test_release_install_does_not_downgrade_on_sidecar_transport_failure
+  run_test test_release_install_does_not_downgrade_on_artifact_transport_failure
+  run_test test_release_install_distinguishes_manifest_transport_failure_from_absence
+  run_test test_release_install_rejects_checksum_verified_broken_canonical_archive
   run_test test_sigstore_bundle_unavailable_soft_skip
+  run_test test_explicit_sigstore_bundle_without_cosign_fails_closed
+  run_test test_explicit_sigstore_bundle_fetch_failure_fails_closed
+  run_test test_sigstore_bundle_without_identity_policy_fails_closed
   run_test test_sigstore_cosign_failure_fails_hard
   run_test test_sigstore_cosign_success
   run_test test_completions_unsupported_build_soft_skip

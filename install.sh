@@ -7,7 +7,7 @@
 #
 # Highlights:
 # - Installs latest (or requested) GitHub release binary for your platform
-# - Verifies artifact checksum via SHA256SUMS
+# - Verifies each release artifact via its exact `.sha256` sidecar
 # - Detects existing TypeScript pi and can migrate to Rust canonical `pi`
 # - Creates `legacy-pi` alias for the preserved TypeScript CLI when migrated
 # - Writes installer state for idempotent re-runs and clean uninstall
@@ -43,8 +43,9 @@ CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 SOURCE_DIR="${SOURCE_DIR:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
-COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/release.yml@refs/tags/.*$}"
-COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-}"
+COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-}"
+COSIGN_BIN="${PI_INSTALLER_COSIGN_BIN:-cosign}"
 COMPLETIONS_MODE="${COMPLETIONS_MODE:-auto}"
 
 PROXY_ARGS=()
@@ -545,7 +546,7 @@ fetch_url_to_file() {
       max_time="${PI_INSTALLER_ARTIFACT_MAX_TIME:-240}"
       retries="${PI_INSTALLER_ARTIFACT_RETRIES:-2}"
       ;;
-    "release checksum manifest"|"checksum file"|"derived checksum file"|"sigstore bundle")
+    "release checksum manifest"|"checksum file"|"derived checksum file"|"artifact checksum sidecar"|"sigstore bundle")
       connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
       max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
       retries="${PI_INSTALLER_META_RETRIES:-2}"
@@ -559,7 +560,7 @@ fetch_url_to_file() {
       err "Local ${context} not found: $local_path"
       return 1
     fi
-    cp "$local_path" "$output_path"
+    cp "$local_path" "$output_path" || return 1
     return 0
   fi
 
@@ -570,6 +571,58 @@ fetch_url_to_file() {
     --retry-delay "$retry_delay" \
     --retry-connrefused \
     "$url" -o "$output_path"
+}
+
+# Fetch optional release metadata while distinguishing a real HTTP absence from
+# transport/auth/server failure. Return 10 only for a local miss or final
+# HTTP 404/410; every other failure is authoritative and must not trigger a
+# checksum-policy downgrade.
+fetch_optional_url_to_file() {
+  local url="$1"
+  local output_path="$2"
+  local context="$3"
+  local connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
+  local max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
+  local retries="${PI_INSTALLER_META_RETRIES:-2}"
+  local retry_delay="${PI_INSTALLER_RETRY_DELAY:-1}"
+
+  if [ "$context" = "release artifact" ]; then
+    connect_timeout="${PI_INSTALLER_ARTIFACT_CONNECT_TIMEOUT:-10}"
+    max_time="${PI_INSTALLER_ARTIFACT_MAX_TIME:-240}"
+    retries="${PI_INSTALLER_ARTIFACT_RETRIES:-2}"
+  fi
+
+  if ! ensure_network_allowed "$url" "$context"; then
+    return 1
+  fi
+
+  if is_local_resource_ref "$url"; then
+    local local_path
+    local_path="$(resource_to_local_path "$url")"
+    if [ ! -e "$local_path" ]; then
+      return 10
+    fi
+    cp "$local_path" "$output_path" || return 1
+    return 0
+  fi
+
+  local http_status="" curl_rc=0
+  http_status="$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    --retry "$retries" \
+    --retry-delay "$retry_delay" \
+    --retry-connrefused \
+    --write-out '%{http_code}' \
+    -o "$output_path" \
+    "$url")" || curl_rc=$?
+  if [ "$curl_rc" -eq 0 ]; then
+    return 0
+  fi
+  case "$http_status" in
+    404|410) return 10 ;;
+    *) return 1 ;;
+  esac
 }
 
 fetch_url_to_stdout() {
@@ -1725,10 +1778,33 @@ verify_download_checksum() {
     fi
     checksum_source_kind="artifact-derived"
   else
-    if ! fetch_url_to_file "$SHA_URL" "$checksum_file" "release checksum manifest"; then
-      warn "No SHA256SUMS found in release; skipping checksum verification"
-      CHECKSUM_STATUS="skipped (no SHA256SUMS in release)"
-      return 0
+    local artifact_base="${artifact_url%%\?*}"
+    artifact_base="${artifact_base%%#*}"
+    local derived_checksum_url="${artifact_base}.sha256"
+    local sidecar_rc=0
+    if fetch_optional_url_to_file "$derived_checksum_url" "$checksum_file" "artifact checksum sidecar"; then
+      checksum_source_kind="artifact-derived"
+    else
+      sidecar_rc=$?
+      if [ "$sidecar_rc" -ne 10 ]; then
+        err "Failed to fetch canonical checksum sidecar: $derived_checksum_url"
+        CHECKSUM_STATUS="failed (checksum sidecar transport error)"
+        return 4
+      fi
+      local manifest_rc=0
+      if fetch_optional_url_to_file "$SHA_URL" "$checksum_file" "release checksum manifest"; then
+        checksum_source_kind="release-manifest"
+      else
+        manifest_rc=$?
+        if [ "$manifest_rc" -eq 10 ]; then
+          err "Release provides neither ${asset_name}.sha256 nor SHA256SUMS"
+          CHECKSUM_STATUS="failed (checksum unavailable)"
+        else
+          err "Failed to fetch aggregate release checksum manifest: $SHA_URL"
+          CHECKSUM_STATUS="failed (checksum manifest transport error)"
+        fi
+        return 4
+      fi
     fi
   fi
 
@@ -1747,19 +1823,34 @@ verify_download_checksum() {
 
     if [ -z "$expected" ]; then
       if [ "$checksum_source_kind" != "release-manifest" ]; then
-        local checksum_count
+        local checksum_count checksum_entry_name
         checksum_count=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { c += 1 } END { print c + 0 }' "$checksum_file")
         if [ "$checksum_count" -eq 1 ]; then
-          expected=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$checksum_file")
+          checksum_entry_name=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ {
+            file=$2
+            sub(/^\*/, "", file)
+            sub(/^\.\//, "", file)
+            print file
+            exit
+          }' "$checksum_file")
+          if [ -z "$checksum_entry_name" ]; then
+            expected=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$checksum_file")
+          fi
         fi
       fi
     fi
 
     if [ -z "$expected" ]; then
       CHECKSUM_STATUS="failed (missing checksum entry)"
+      if [ "$checksum_source_kind" = "artifact-derived" ]; then
+        err "Checksum sidecar for $asset_name does not contain one usable SHA-256 digest"
+        return 6
+      fi
       return 2
     fi
   fi
+
+  expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
 
   local actual
   actual=$(compute_sha256 "$artifact_file")
@@ -1772,13 +1863,11 @@ verify_download_checksum() {
   fi
 
   local source_desc="SHA256SUMS"
-  if [ -n "$CHECKSUM" ]; then
-    source_desc="--checksum"
-  elif [ -n "$CHECKSUM_URL" ]; then
-    source_desc="--checksum-url"
-  elif [ -n "$ARTIFACT_URL" ]; then
-    source_desc="artifact .sha256"
-  fi
+  case "$checksum_source_kind" in
+    inline) source_desc="--checksum" ;;
+    custom-url) source_desc="--checksum-url" ;;
+    artifact-derived) source_desc="artifact .sha256" ;;
+  esac
 
   CHECKSUM_STATUS="verified (${source_desc})"
   ok "Checksum verified for ${asset_name}"
@@ -1796,7 +1885,12 @@ verify_sigstore_bundle() {
     return 0
   fi
 
-  if ! command -v cosign >/dev/null 2>&1; then
+  if ! command -v "$COSIGN_BIN" >/dev/null 2>&1; then
+    if [ -n "$SIGSTORE_BUNDLE_URL" ]; then
+      SIGSTORE_STATUS="failed (cosign not found)"
+      err "A Sigstore bundle was explicitly requested, but cosign is not installed"
+      return 1
+    fi
     SIGSTORE_STATUS="skipped (cosign not found)"
     warn "cosign not found; skipping signature verification"
     return 0
@@ -1817,12 +1911,24 @@ verify_sigstore_bundle() {
   local bundle_file
   bundle_file="$TMP/$(basename "${bundle_url%%\?*}")"
   if ! fetch_url_to_file "$bundle_url" "$bundle_file" "sigstore bundle"; then
+    if [ -n "$SIGSTORE_BUNDLE_URL" ]; then
+      SIGSTORE_STATUS="failed (explicit bundle unavailable)"
+      err "Failed to fetch explicitly requested Sigstore bundle: $bundle_url"
+      return 1
+    fi
     SIGSTORE_STATUS="skipped (bundle unavailable)"
     warn "Sigstore bundle not found; skipping signature verification"
     return 0
   fi
 
-  if ! cosign verify-blob \
+  if [ -z "$COSIGN_IDENTITY_RE" ] || [ -z "$COSIGN_OIDC_ISSUER" ]; then
+    SIGSTORE_STATUS="failed (identity policy unavailable)"
+    err "Sigstore bundle found, but no trusted cosign identity policy is configured"
+    err "Set both COSIGN_IDENTITY_RE and COSIGN_OIDC_ISSUER for this bundle's signer"
+    return 1
+  fi
+
+  if ! "$COSIGN_BIN" verify-blob \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
@@ -1919,22 +2025,26 @@ download_release_binary() {
   if [ -n "$ARTIFACT_URL" ]; then
     candidates+=("$ASSET_NAME|$ARTIFACT_URL")
   else
-    # Try candidates in priority order. dsr bare-binary names first (most common
-    # for local releases), then archive formats, then Rust target-triple names.
+    # Try the canonical DSR release-contract archive first. Historical names
+    # remain as read-only install fallbacks for already-published artifacts.
     local base_v="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}"
-    # dsr-style naming: pi_<os>_<arch> with underscores (e.g. pi_darwin_arm64)
-    if [ -n "$ASSET_PLATFORM" ]; then
-      local dsr_name="pi_${ASSET_PLATFORM//-/_}${EXE_EXT}"
-      candidates+=("${dsr_name}|${base_v}/${dsr_name}")
-    fi
-    # Bare binary name (dsr uploads Linux as just "pi")
-    candidates+=("pi${EXE_EXT}|${base_v}/pi${EXE_EXT}")
-    # Archive formats (GH Actions output)
     if [ -n "$ASSET_PLATFORM" ]; then
       if [ -n "$EXE_EXT" ]; then
         candidates+=("pi-${ASSET_PLATFORM}.zip|${base_v}/pi-${ASSET_PLATFORM}.zip")
       else
         candidates+=("pi-${ASSET_PLATFORM}.tar.xz|${base_v}/pi-${ASSET_PLATFORM}.tar.xz")
+      fi
+    fi
+    # Historical underscore-separated bare-binary naming.
+    if [ -n "$ASSET_PLATFORM" ]; then
+      local dsr_name="pi_${ASSET_PLATFORM//-/_}${EXE_EXT}"
+      candidates+=("${dsr_name}|${base_v}/${dsr_name}")
+    fi
+    # Historical bare binary name.
+    candidates+=("pi${EXE_EXT}|${base_v}/pi${EXE_EXT}")
+    # Historical archive alternatives.
+    if [ -n "$ASSET_PLATFORM" ]; then
+      if [ -z "$EXE_EXT" ]; then
         candidates+=("pi-${ASSET_PLATFORM}.tar.gz|${base_v}/pi-${ASSET_PLATFORM}.tar.gz")
       fi
     fi
@@ -1950,11 +2060,19 @@ download_release_binary() {
     local artifact_file="$TMP/$candidate"
     # Suppress stderr for candidate probing — 404s are expected as we try
     # multiple naming conventions. Only show errors for explicit --artifact-url.
-    if ! fetch_url_to_file "$candidate_url" "$artifact_file" "release artifact" 2>/dev/null; then
-      if [ -n "$ARTIFACT_URL" ]; then
-        err "Failed to download artifact: $candidate_url"
+    local artifact_fetch_rc=0
+    if fetch_optional_url_to_file "$candidate_url" "$artifact_file" "release artifact" 2>/dev/null; then
+      :
+    else
+      artifact_fetch_rc=$?
+      if [ "$artifact_fetch_rc" -eq 10 ]; then
+        if [ -n "$ARTIFACT_URL" ]; then
+          err "Requested artifact was not found: $candidate_url"
+        fi
+        continue
       fi
-      continue
+      err "Failed to fetch release artifact because of a transport or server error: $candidate_url"
+      return 8
     fi
 
     ASSET_NAME="$candidate"
@@ -1979,12 +2097,14 @@ download_release_binary() {
       return 5
     fi
 
-    local extracted=""
-    extracted="$(extract_release_artifact "$candidate" "$artifact_file" || true)"
-    if [ -n "$extracted" ] && [ -e "$extracted" ]; then
-      printf '%s\n' "$extracted"
-      return 0
+    local extracted="" extract_rc=0
+    extracted="$(extract_release_artifact "$candidate" "$artifact_file")" || extract_rc=$?
+    if [ "$extract_rc" -ne 0 ] || [ -z "$extracted" ] || [ ! -e "$extracted" ]; then
+      err "Checksum-verified release artifact could not be extracted: $candidate"
+      return 7
     fi
+    printf '%s\n' "$extracted"
+    return 0
   done
 
   err "No downloadable release artifact found for version ${VERSION} and target ${TARGET}"
@@ -3709,8 +3829,16 @@ main() {
       fi
     else
       download_rc=$?
-      if [ "$download_rc" -eq 2 ] || [ "$download_rc" -eq 3 ] || [ "$download_rc" -eq 4 ]; then
+      if [ "$download_rc" -eq 2 ] || [ "$download_rc" -eq 3 ] || [ "$download_rc" -eq 4 ] || [ "$download_rc" -eq 6 ]; then
         err "Release checksum verification failed; aborting install"
+        exit 1
+      fi
+      if [ "$download_rc" -eq 7 ]; then
+        err "Release packaging validation failed; aborting install"
+        exit 1
+      fi
+      if [ "$download_rc" -eq 8 ]; then
+        err "Release artifact transport failed; aborting install"
         exit 1
       fi
       if [ "$download_rc" -eq 5 ]; then
