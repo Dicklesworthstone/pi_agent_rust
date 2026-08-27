@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::{Mutex, OwnedMutexGuard};
@@ -42,7 +42,10 @@ use pi::extensions::{
 };
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
-use pi::models::{ModelEntry, ModelRegistry, default_models_path, fetched_models_path};
+use pi::models::{
+    ExtensionProviderBinding, ModelEntry, ModelRegistry, default_models_path,
+    extension_provider_bindings, fetched_models_path,
+};
 use pi::package_manager::{
     PackageEntry, PackageManager, PackageScope, ResolvedPaths, ResolvedResource, ResourceOrigin,
 };
@@ -93,6 +96,52 @@ const USAGE_ERROR_PATTERNS: &[&str] = &[
     "theme file not found",
     "theme spec is empty",
 ];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ResourceDiagnosticCursor {
+    skills: usize,
+    prompts: usize,
+    themes: usize,
+}
+
+impl ResourceDiagnosticCursor {
+    fn at_end(resources: &ResourceLoader) -> Self {
+        Self {
+            skills: resources.skill_diagnostics().len(),
+            prompts: resources.prompt_diagnostics().len(),
+            themes: resources.theme_diagnostics().len(),
+        }
+    }
+}
+
+fn write_resource_diagnostics_since(
+    output: &mut impl Write,
+    resources: &ResourceLoader,
+    cursor: ResourceDiagnosticCursor,
+) -> io::Result<usize> {
+    let groups = [
+        ("skill", resources.skill_diagnostics(), cursor.skills),
+        (
+            "prompt template",
+            resources.prompt_diagnostics(),
+            cursor.prompts,
+        ),
+        ("theme", resources.theme_diagnostics(), cursor.themes),
+    ];
+    let mut written = 0usize;
+    for (label, diagnostics, start) in groups {
+        for diagnostic in diagnostics.iter().skip(start.min(diagnostics.len())) {
+            writeln!(
+                output,
+                "Warning: {label} resource diagnostic for '{}': {}",
+                diagnostic.path.display(),
+                diagnostic.message
+            )?;
+            written = written.saturating_add(1);
+        }
+    }
+    Ok(written)
+}
 
 fn main() {
     // `/share` uses a gated copy of Pi on Windows so the real `gh` child cannot
@@ -296,16 +345,17 @@ fn validate_fetch_models_is_standalone(
 fn reload_model_registry_with_extra_entries(
     auth: &AuthStorage,
     models_path: &Path,
+    extension_bindings: &[ExtensionProviderBinding],
     extra_entries: &[ModelEntry],
-) -> ModelRegistry {
+) -> Result<ModelRegistry> {
     let mut registry = ModelRegistry::load(auth, Some(models_path.to_path_buf()));
     if let Some(error) = registry.error() {
         eprintln!("Warning: models.json error: {error}");
     }
-    if !extra_entries.is_empty() {
-        registry.merge_entries(extra_entries.to_vec());
+    if !extension_bindings.is_empty() || !extra_entries.is_empty() {
+        registry.merge_extension_registry(extension_bindings, extra_entries.to_vec())?;
     }
-    registry
+    Ok(registry)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -318,6 +368,7 @@ async fn resolve_selection_with_auth(
     auth: &mut AuthStorage,
     models_path: &Path,
     allow_setup_prompt: bool,
+    extension_bindings: &[ExtensionProviderBinding],
     extra_entries: &[ModelEntry],
 ) -> Result<Option<(pi::app::ModelSelection, Option<String>)>> {
     loop {
@@ -348,8 +399,9 @@ async fn resolve_selection_with_auth(
                         *model_registry = reload_model_registry_with_extra_entries(
                             auth,
                             models_path,
+                            extension_bindings,
                             extra_entries,
-                        );
+                        )?;
                         continue;
                     }
                     return Ok(None);
@@ -372,8 +424,9 @@ async fn resolve_selection_with_auth(
                         *model_registry = reload_model_registry_with_extra_entries(
                             auth,
                             models_path,
+                            extension_bindings,
                             extra_entries,
-                        );
+                        )?;
                         continue;
                     }
                     return Ok(None);
@@ -1269,6 +1322,11 @@ async fn run(
             ResourceLoader::empty(config.enable_skill_commands())
         }
     };
+    let _ = write_resource_diagnostics_since(
+        &mut io::stderr().lock(),
+        &resources,
+        ResourceDiagnosticCursor::default(),
+    );
 
     // Fail early when extension flags were extracted from the CLI but no extensions
     // are available.  Without this check the binary proceeds to model selection which
@@ -1575,6 +1633,7 @@ async fn run(
         &models_path,
         allow_setup_prompt,
         &[],
+        &[],
     )
     .await
     {
@@ -1826,6 +1885,7 @@ async fn run(
             workspace_trusted,
         )?))
     };
+    let mut extension_bindings = Vec::new();
     let mut extension_model_entries = Vec::new();
 
     if !resources.extensions().is_empty() {
@@ -1887,22 +1947,14 @@ async fn run(
                 Some(resolved_ext_policy.policy),
                 Some(effective_repair_policy),
                 pre_warmed,
+                pi::agent::ExtensionHostConfiguration {
+                    ui_handler: None,
+                    persist_permission_decisions: true,
+                    cli_flags: extension_flags.clone(),
+                },
             )
             .await
             .map_err(anyhow::Error::new)?;
-
-        if !extension_flags.is_empty() {
-            if let Some(region) = &agent_session.extensions {
-                pi::extensions::apply_cli_flags(region.manager(), &extension_flags)
-                    .await
-                    .map_err(anyhow::Error::new)?;
-            } else {
-                return Err(pi::error::Error::validation(
-                    "Extension flags were provided, but extensions are not active in this session.",
-                )
-                .into());
-            }
-        }
 
         // Merge extension-registered providers into the model registry.
         if let Some(region) = &agent_session.extensions {
@@ -1921,21 +1973,27 @@ async fn run(
                     }
                 }
             }
+            extension_bindings =
+                extension_provider_bindings(&region.manager().extension_providers())?;
             extension_model_entries = region.manager().extension_model_entries();
-            if !extension_model_entries.is_empty() {
-                // Build OAuth configs map from model entries before merging.
+            if !extension_bindings.is_empty() || !extension_model_entries.is_empty() {
+                // Build the refresh map from provider bindings so OAuth-only
+                // providers remain reachable without declared model rows.
                 let ext_oauth_configs: std::collections::HashMap<String, pi::models::OAuthConfig> =
-                    extension_model_entries
+                    extension_bindings
                         .iter()
-                        .filter_map(|entry| {
-                            entry
+                        .filter_map(|binding| {
+                            binding
                                 .oauth_config
                                 .as_ref()
-                                .map(|cfg| (entry.model.provider.clone(), cfg.clone()))
+                                .map(|cfg| (binding.provider.clone(), cfg.clone()))
                         })
                         .collect();
 
-                model_registry.merge_entries(extension_model_entries.clone());
+                model_registry.merge_extension_registry(
+                    &extension_bindings,
+                    extension_model_entries.clone(),
+                )?;
 
                 // Refresh expired OAuth tokens for extension-registered providers.
                 if !ext_oauth_configs.is_empty() {
@@ -1955,13 +2013,17 @@ async fn run(
 
             let discovered = region.manager().discover_resources(&cwd, "startup").await;
             if !discovered.is_empty() {
+                let diagnostic_cursor = ResourceDiagnosticCursor::at_end(&resources);
                 if let Err(err) = resources.extend_with_paths(&cwd, &discovered) {
-                    tracing::warn!(
-                        event = "pi.resources.startup.extension_paths_failed",
-                        error = %err,
-                        "Failed to apply extension-discovered resource paths"
+                    eprintln!(
+                        "Warning: Failed to apply extension-discovered resource paths: {err}"
                     );
                 } else {
+                    let _ = write_resource_diagnostics_since(
+                        &mut io::stderr().lock(),
+                        &resources,
+                        diagnostic_cursor,
+                    );
                     let skills_prompt = if enabled_tools.contains(&"read") {
                         resources.format_skills_for_prompt()
                     } else {
@@ -2030,6 +2092,7 @@ async fn run(
             &mut auth,
             &models_path,
             allow_setup_prompt,
+            &extension_bindings,
             &extension_model_entries,
         )
         .await?;
@@ -2168,8 +2231,16 @@ async fn run(
                 // behavior as the default stack.
                 system_prompt: cli.system_prompt.clone(),
                 append_system_prompt: cli.append_system_prompt.clone(),
-                enabled_tools: if cli.no_tools { Some(Vec::new()) } else { None },
+                enabled_tools: Some(
+                    enabled_tools
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect(),
+                ),
                 thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
+                include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
+                max_tool_iterations,
+                package_dir: Some(package_dir.clone()),
                 mcp: Some(pi::sdk::McpSessionOptions {
                     config_paths: cli.mcp_config.clone(),
                     global_dir: Some(pi::config::Config::global_dir()),
@@ -2233,6 +2304,7 @@ async fn run(
             !cli.no_session,
             resources,
             resource_cli,
+            package_manager,
             cwd.clone(),
             runtime_handle.clone(),
             workspace.clone(),
@@ -2300,8 +2372,10 @@ async fn run(
 
     // Best-effort autosave flush on shutdown. OwnedMutexGuard: the guard is
     // held across the flush await, and the borrowed MutexGuard is !Send
-    // (clippy::future_not_send).
-    if !cli.no_session {
+    // (clippy::future_not_send). FTUI owns and flushes a different SDK
+    // session; flushing this throwaway bootstrap session afterward could make
+    // stale state the last writer to the same session path.
+    if !cli.no_session && !ftui_requested {
         let cx = pi::agent_cx::AgentCx::for_request();
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx).await
             && let Err(e) = guard.flush_autosave_on_shutdown().await
@@ -8589,6 +8663,52 @@ fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
     pi::error::is_retryable_error(err_msg, Some(msg.usage.input), None)
 }
 
+async fn restore_print_retry_tail(
+    session: &mut AgentSession,
+    require_incomplete_tail: bool,
+) -> Result<()> {
+    let cx = pi::agent_cx::AgentCx::for_request();
+    let mut inner = OwnedMutexGuard::lock(Arc::clone(&session.session), &cx)
+        .await
+        .map_err(|err| anyhow::anyhow!("retry restoration session lock failed: {err}"))?;
+    let mut candidate = inner.clone();
+    let reverted = candidate.revert_incomplete_response();
+    if require_incomplete_tail && !reverted {
+        bail!(
+            "retry restoration invariant failed: the completed error response had no incomplete assistant tail"
+        );
+    }
+    if !reverted {
+        return Ok(());
+    }
+
+    let restored_messages = candidate.to_messages_for_current_path();
+    if session.save_enabled()
+        && let Err(first_err) = candidate.save().await
+        && let Err(retry_err) = candidate.save().await
+    {
+        return Err(anyhow::Error::new(
+            pi::error::Error::session_persistence(format!(
+                "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            )),
+        ));
+    }
+
+    *inner = candidate;
+    session.agent.replace_messages(restored_messages);
+    Ok(())
+}
+
+fn emit_print_restore_failure(is_json: bool, retry_count: u32, error: &anyhow::Error) {
+    if is_json && retry_count > 0 {
+        emit_json_event(&AgentEvent::AutoRetryEnd {
+            success: false,
+            attempt: retry_count,
+            final_error: Some(error.to_string()),
+        });
+    }
+}
+
 /// Print-mode failover swap (bd-cv653.3.2): classify the terminal error; if
 /// eligible, resolve the next chain entry, swap the agent's provider, emit
 /// `FailoverStart` (json mode), and record the session audit + `ModelChange`.
@@ -8601,18 +8721,30 @@ async fn try_print_failover(
     position: &mut usize,
     error_text: Option<&str>,
     is_json: bool,
-) -> Option<(String, String)> {
-    let ctx = failover_ctx?;
-    let error_text = error_text?;
-    let class = pi::failover::classify_failover(error_text)?;
-    let chains = config.retry.as_ref()?.fallback_chains.as_ref()?;
+    require_incomplete_tail: bool,
+    retry_attempt_to_end: Option<u32>,
+) -> Result<Option<(String, String)>> {
+    let Some(ctx) = failover_ctx else {
+        return Ok(None);
+    };
+    let Some(error_text) = error_text else {
+        return Ok(None);
+    };
+    let Some(class) = pi::failover::classify_failover(error_text) else {
+        return Ok(None);
+    };
+    let Some(chains) = config.retry.as_ref().and_then(|retry| retry.fallback_chains.as_ref()) else {
+        return Ok(None);
+    };
 
     let current_provider = session.agent.provider();
     let (from_provider, from_model) = (
         current_provider.name().to_string(),
         current_provider.model_id().to_string(),
     );
-    let chain = pi::failover::chain_for(chains, "default", &from_provider, &from_model)?;
+    let Some(chain) = pi::failover::chain_for(chains, "default", &from_provider, &from_model) else {
+        return Ok(None);
+    };
     let cap = config.max_failovers_per_turn() as usize;
 
     while *position < chain.entries.len() && *position < cap {
@@ -8641,6 +8773,50 @@ async fn try_print_failover(
         ) else {
             continue;
         };
+
+        // Build and persist the complete transition on a private Session
+        // candidate. The live transcript and provider/options stay untouched
+        // if restoration, the inner lock, or persistence fails.
+        let session_store = Arc::clone(&session.session);
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut inner = OwnedMutexGuard::lock(session_store, &cx)
+            .await
+            .map_err(|err| anyhow::anyhow!("failover session lock failed: {err}"))?;
+        let mut candidate = inner.clone();
+        let reverted = candidate.revert_incomplete_response();
+        if require_incomplete_tail && !reverted {
+            bail!(
+                "failover restoration invariant failed: the completed error response had no incomplete assistant tail"
+            );
+        }
+        let restored_messages = candidate.to_messages_for_current_path();
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        candidate.set_model_header(Some(to_provider.clone()), Some(to_model.clone()), None);
+        candidate.append_custom_entry(
+            "failover".to_string(),
+            Some(serde_json::json!({
+                "from": format!("{from_provider}/{from_model}"),
+                "to": format!("{to_provider}/{to_model}"),
+                "class": format!("{class:?}").to_ascii_lowercase(),
+                "attempt": *position,
+            })),
+        );
+        candidate.append_model_change(to_provider.clone(), to_model.clone());
+        if session.save_enabled()
+            && let Err(first_err) = candidate.save().await
+            && let Err(retry_err) = candidate.save().await
+        {
+            return Err(anyhow::Error::new(
+                pi::error::Error::session_persistence(format!(
+                    "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                )),
+            ));
+        }
+
+        // No fallible operation remains after installing the candidate.
+        *inner = candidate;
+        session.agent.replace_messages(restored_messages);
         session.agent.set_provider(provider_impl);
         session.agent.set_keyword_max_thinking_level(
             entry.clamp_thinking_level(pi::model::ThinkingLevel::Max),
@@ -8651,10 +8827,16 @@ async fn try_print_failover(
             .stream_options_mut()
             .headers
             .clone_from(&entry.headers);
+        drop(inner);
 
-        let to_provider = entry.model.provider.clone();
-        let to_model = entry.model.id.clone();
         if is_json {
+            if let Some(attempt) = retry_attempt_to_end {
+                emit_json_event(&AgentEvent::AutoRetryEnd {
+                    success: false,
+                    attempt,
+                    final_error: Some(error_text.to_string()),
+                });
+            }
             emit_json_event(&AgentEvent::FailoverStart {
                 from_provider: from_provider.clone(),
                 from_model: from_model.clone(),
@@ -8665,28 +8847,9 @@ async fn try_print_failover(
             });
         }
 
-        // Session audit + model-change entries (persisted sessions only).
-        {
-            let cx = pi::agent_cx::AgentCx::for_request();
-            if let Ok(mut inner) = session.session.lock(cx.cx()).await {
-                inner.append_custom_entry(
-                    "failover".to_string(),
-                    Some(serde_json::json!({
-                        "from": format!("{from_provider}/{from_model}"),
-                        "to": format!("{to_provider}/{to_model}"),
-                        "class": format!("{class:?}").to_ascii_lowercase(),
-                        "attempt": *position,
-                    })),
-                );
-                inner.header.provider = Some(to_provider.clone());
-                inner.header.model_id = Some(to_model.clone());
-                inner.append_model_change(to_provider.clone(), to_model.clone());
-            }
-        }
-
-        return Some((to_provider, to_model));
+        return Ok(Some((to_provider, to_model)));
     }
-    None
+    Ok(None)
 }
 
 /// Execute a single prompt with automatic retry and `AutoRetryStart`/`AutoRetryEnd`
@@ -8793,7 +8956,10 @@ where
                 // only the failed provider request — already-executed tool calls
                 // are not re-run and prior work is not re-billed
                 // (pi_agent_rust#125). Matches RPC retry behaviour.
-                let _ = session.revert_incomplete_response().await;
+                if let Err(restore_err) = restore_print_retry_tail(session, true).await {
+                    emit_print_restore_failure(is_json, retry_count, &restore_err);
+                    return Err(restore_err);
+                }
                 current_result = session
                     .run_continue_with_abort(Some(abort_signal.clone()), make_event_handler())
                     .await;
@@ -8820,18 +8986,26 @@ where
                     }
                     // Failover (bd-cv653.3.2): a classified transient failure
                     // on the final retry walks the fallback chain.
-                    if let Some(_swapped) = try_print_failover(
+                    let failover_result = try_print_failover(
                         session,
                         config,
                         failover_ctx,
                         &mut failover_position,
                         msg.error_message.as_deref(),
                         is_json,
+                        true,
+                        (retry_count > 0).then_some(retry_count),
                     )
-                    .await
-                    {
+                    .await;
+                    let swapped = match failover_result {
+                        Ok(swapped) => swapped,
+                        Err(restore_err) => {
+                            emit_print_restore_failure(is_json, retry_count, &restore_err);
+                            return Err(restore_err);
+                        }
+                    };
+                    if swapped.is_some() {
                         retry_count = 0;
-                        let _ = session.revert_incomplete_response().await;
                         current_result = session
                             .run_continue_with_abort(
                                 Some(abort_signal.clone()),
@@ -8870,16 +9044,15 @@ where
                     return Err(anyhow::Error::new(err));
                 }
                 let err_str = err.to_string();
-                // Rotation bookkeeping (bd-cv653.3.2): a 429 backs the current
-                // key off so the next resolve rotates to a healthy sibling.
-                if pi::failover::classify_failover(&err_str)
-                    == Some(pi::failover::FailoverClass::Quota)
-                {
-                    let provider_name = session.agent.provider().name().to_string();
-                    if let Some(key) = session.agent.stream_options().api_key.clone() {
-                        pi::auth::report_provider_rate_limit(&provider_name, &key);
-                    }
-                }
+                let quota_credential =
+                    (pi::failover::classify_failover(&err_str)
+                        == Some(pi::failover::FailoverClass::Quota))
+                    .then(|| {
+                        (
+                            session.agent.provider().name().to_string(),
+                            session.agent.stream_options().api_key.clone(),
+                        )
+                    });
                 // Classify from the TYPED error first (transient io::ErrorKind
                 // via the source chain), then fall back to message-text matching
                 // for prose-only errors (pi_agent_rust#118).
@@ -8907,7 +9080,18 @@ where
                     // to strip and the resume simply re-issues the request — but
                     // any already-completed tool cycles from earlier in the turn
                     // are preserved rather than re-executed.
-                    let _ = session.revert_incomplete_response().await;
+                    if let Err(restore_err) = restore_print_retry_tail(session, false).await {
+                        let terminal_err = anyhow::Error::new(err).context(format!(
+                            "retry restoration failed before provider re-entry: {restore_err}"
+                        ));
+                        emit_print_restore_failure(is_json, retry_count, &terminal_err);
+                        return Err(terminal_err);
+                    }
+                    // Rotation bookkeeping (bd-cv653.3.2): restoration is the
+                    // precondition for mutating credential cooldown state.
+                    if let Some((provider_name, Some(key))) = quota_credential.as_ref() {
+                        pi::auth::report_provider_rate_limit(provider_name, key);
+                    }
                     // Credential rotation (bd-cv653.3.2): re-resolve the key so
                     // a backed-off credential rotates to its healthy sibling on
                     // the retry. Explicit --api-key stays pinned by design.
@@ -8926,18 +9110,32 @@ where
                     // Failover (bd-cv653.3.2): HTTP/transport errors surface on
                     // the Err path, so the chain walk must live here too —
                     // not only on the Ok-with-error-result path.
-                    if let Some(_swapped) = try_print_failover(
+                    let failover_result = try_print_failover(
                         session,
                         config,
                         failover_ctx,
                         &mut failover_position,
                         Some(err_str.as_str()),
                         is_json,
+                        false,
+                        (retry_count > 0).then_some(retry_count),
                     )
-                    .await
-                    {
+                    .await;
+                    let swapped = match failover_result {
+                        Ok(swapped) => swapped,
+                        Err(restore_err) => {
+                            let terminal_err = anyhow::Error::new(err).context(format!(
+                                "failover transition failed before provider re-entry: {restore_err}"
+                            ));
+                            emit_print_restore_failure(is_json, retry_count, &terminal_err);
+                            return Err(terminal_err);
+                        }
+                    };
+                    if swapped.is_some() {
+                        if let Some((provider_name, Some(key))) = quota_credential.as_ref() {
+                            pi::auth::report_provider_rate_limit(provider_name, key);
+                        }
                         retry_count = 0;
-                        let _ = session.revert_incomplete_response().await;
                         current_result = session
                             .run_continue_with_abort(
                                 Some(abort_signal.clone()),
@@ -8945,6 +9143,9 @@ where
                             )
                             .await;
                         continue;
+                    }
+                    if let Some((provider_name, Some(key))) = quota_credential.as_ref() {
+                        pi::auth::report_provider_rate_limit(provider_name, key);
                     }
                     if retry_count > 0 && is_json {
                         emit_json_event(&AgentEvent::AutoRetryEnd {
@@ -8973,6 +9174,7 @@ async fn run_interactive_mode(
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
+    package_manager: PackageManager,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
     workspace: pi::workspace::WorkspaceHandle,
@@ -9019,6 +9221,7 @@ async fn run_interactive_mode(
         save_enabled,
         resources,
         resource_cli,
+        package_manager,
         extensions,
         cwd,
         runtime_handle,
@@ -9187,6 +9390,63 @@ mod tests {
         let mut buf = Vec::new();
         write_model_table(&mut buf, rows).expect("render model table");
         String::from_utf8(buf).expect("table output should be utf-8")
+    }
+
+    #[test]
+    fn startup_resource_diagnostics_are_visible_and_cursor_bounded() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = root.path().join("oversized-first.md");
+        let second = root.path().join("oversized-second.md");
+        for path in [&first, &second] {
+            let file = fs::File::create(path).expect("create oversized prompt");
+            file.set_len(2 * 1024 * 1024)
+                .expect("extend oversized prompt");
+        }
+
+        let mut resources = ResourceLoader::empty(true);
+        resources
+            .extend_with_paths(
+                root.path(),
+                &pi::resources::ExtensionResourcePaths {
+                    prompt_paths: vec![first.clone()],
+                    ..pi::resources::ExtensionResourcePaths::default()
+                },
+            )
+            .expect("configured prompt failures remain non-fatal");
+
+        let mut initial_output = Vec::new();
+        assert_eq!(
+            write_resource_diagnostics_since(
+                &mut initial_output,
+                &resources,
+                ResourceDiagnosticCursor::default(),
+            )
+            .expect("render initial resource diagnostics"),
+            1
+        );
+        let initial_output = String::from_utf8(initial_output).expect("UTF-8 diagnostics");
+        assert!(initial_output.contains(&first.display().to_string()));
+        assert!(initial_output.contains("resource limit"));
+
+        let cursor = ResourceDiagnosticCursor::at_end(&resources);
+        resources
+            .extend_with_paths(
+                root.path(),
+                &pi::resources::ExtensionResourcePaths {
+                    prompt_paths: vec![second.clone()],
+                    ..pi::resources::ExtensionResourcePaths::default()
+                },
+            )
+            .expect("extension-discovered prompt failures remain non-fatal");
+        let mut extension_output = Vec::new();
+        assert_eq!(
+            write_resource_diagnostics_since(&mut extension_output, &resources, cursor)
+                .expect("render extension resource diagnostics"),
+            1
+        );
+        let extension_output = String::from_utf8(extension_output).expect("UTF-8 diagnostics");
+        assert!(extension_output.contains(&second.display().to_string()));
+        assert!(!extension_output.contains(&first.display().to_string()));
     }
 
     #[test]
@@ -9732,6 +9992,59 @@ mod tests {
                 !(entry.model.provider.eq("openai") && entry.model.id.eq("gpt-4o"))
             }),
             "Blank CLI API-key values should not expose remote models"
+        );
+    }
+
+    #[test]
+    fn registry_reload_grafts_zero_model_extension_binding_without_inserting_rows() {
+        let temp = TempDir::new().expect("tempdir");
+        let auth = AuthStorage::load(temp.path().join("auth.json")).expect("auth load");
+        let models_path = temp.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{
+                "providers": {
+                    "acme": {
+                        "api": "openai-completions",
+                        "baseUrl": "https://manual.example.test/v1",
+                        "models": [{"id": "manual-only", "name": "Manual Only"}]
+                    }
+                }
+            }"#,
+        )
+        .expect("write models.json");
+        let binding = ExtensionProviderBinding {
+            provider: "Acme".to_string(),
+            oauth_config: Some(pi::models::OAuthConfig {
+                auth_url: "https://auth.example.test/authorize".to_string(),
+                token_url: "https://auth.example.test/token".to_string(),
+                client_id: "acme-client".to_string(),
+                scopes: vec!["models:use".to_string()],
+                redirect_uri: Some("http://127.0.0.1/callback".to_string()),
+            }),
+        };
+
+        let registry = reload_model_registry_with_extra_entries(
+            &auth,
+            &models_path,
+            &[binding],
+            &[],
+        )
+        .expect("reload with zero-model extension binding");
+        let acme_rows = registry
+            .models()
+            .iter()
+            .filter(|entry| entry.model.provider.eq_ignore_ascii_case("acme"))
+            .collect::<Vec<_>>();
+        assert_eq!(acme_rows.len(), 1, "zero-model binding must not add rows");
+        let entry = acme_rows.first().expect("single manual Acme row");
+        assert_eq!(entry.model.provider, "Acme");
+        assert_eq!(entry.model.id, "manual-only");
+        assert_eq!(entry.model.name, "Manual Only");
+        assert_eq!(entry.model.base_url, "https://manual.example.test/v1");
+        assert_eq!(
+            entry.oauth_config.as_ref().map(|oauth| oauth.client_id.as_str()),
+            Some("acme-client")
         );
     }
 

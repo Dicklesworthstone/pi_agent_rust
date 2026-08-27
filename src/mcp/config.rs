@@ -29,10 +29,11 @@ const TRUST_FINGERPRINT_DOMAIN: &[u8] = b"pi_agent_rust:mcp-trust-surface:v2";
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
 
 /// `HttpTransport` always installs Content-Type + Accept and may add an MCP
-/// session header after initialize. Leave room for all three inside the HTTP
+/// session and protocol-version headers after initialize. Leave room for all
+/// four transport-owned headers inside the HTTP
 /// client's hard 100-header ceiling so no trusted custom definition is ever
 /// silently dropped.
-const MAX_MCP_CUSTOM_HTTP_HEADERS: usize = 97;
+const MAX_MCP_CUSTOM_HTTP_HEADERS: usize = 96;
 const MAX_MCP_HEADER_NAME_BYTES: usize = 128;
 const MAX_MCP_HEADER_VALUE_BYTES: usize = 16 * 1024;
 const MAX_MCP_ENV_ENTRIES: usize = 256;
@@ -459,10 +460,10 @@ pub(super) fn normalize_http_headers(
         }
         if matches!(
             name.to_ascii_lowercase().as_str(),
-            "accept" | "content-type" | "mcp-session-id"
+            "accept" | "content-type" | "mcp-protocol-version" | "mcp-session-id"
         ) {
             return Err(format!(
-                "defines transport-owned HTTP header {name:?}; Accept, Content-Type, and Mcp-Session-Id are managed by the MCP transport"
+                "defines transport-owned HTTP header {name:?}; Accept, Content-Type, Mcp-Protocol-Version, and Mcp-Session-Id are managed by the MCP transport"
             ));
         }
         validate_http_header_value(value).map_err(|reason| format!("header {name:?}: {reason}"))?;
@@ -1378,6 +1379,15 @@ mod tests {
     fn over_limit_http_headers_are_rejected_before_trust() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("proj");
+        let at_limit: Vec<(String, String)> = (0..MAX_MCP_CUSTOM_HTTP_HEADERS)
+            .map(|index| (format!("X-Limit-{index}"), "value".to_string()))
+            .collect();
+        assert_eq!(
+            normalize_http_headers(at_limit)
+                .expect("the exact custom-header limit must be accepted")
+                .len(),
+            MAX_MCP_CUSTOM_HTTP_HEADERS
+        );
         let headers: serde_json::Map<String, Value> = (0..=MAX_MCP_CUSTOM_HTTP_HEADERS)
             .map(|index| (format!("X-MCP-{index}"), Value::String("value".to_string())))
             .collect();
@@ -1396,7 +1406,7 @@ mod tests {
 
         let discovery = discover(&cwd, &temp.path().join("g"), &[]);
         assert!(discovery.servers.is_empty());
-        assert!(discovery.warnings[0].reason.contains("at most 97"));
+        assert!(discovery.warnings[0].reason.contains("at most 96"));
     }
 
     #[test]
@@ -1404,6 +1414,7 @@ mod tests {
         for headers in [
             serde_json::json!({"Bad\nName": "value"}),
             serde_json::json!({"Accept": "application/json"}),
+            serde_json::json!({"Mcp-Protocol-Version": "2025-06-18"}),
             serde_json::json!({"X-Test": "line\nforge"}),
         ] {
             let values = headers

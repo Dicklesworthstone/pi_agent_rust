@@ -1,7 +1,8 @@
 use super::*;
 
 use crate::models::{
-    ModelEntry, ModelRole, model_requires_configured_credential, normalize_api_key_opt,
+    ExtensionProviderBinding, ModelEntry, ModelRole, extension_provider_bindings,
+    model_requires_configured_credential, normalize_api_key_opt,
 };
 use crate::provider_metadata::{
     ProviderMetadata, ProviderOnboardingMode, provider_ids_match, provider_metadata,
@@ -571,17 +572,31 @@ fn format_provider_status(auth: &crate::auth::AuthStorage, provider: &str) -> St
     format_credential_status(&status)
 }
 
-fn collect_extension_oauth_providers(available_models: &[ModelEntry]) -> Vec<String> {
-    let mut providers: Vec<String> = available_models
+fn collect_extension_oauth_providers(
+    available_models: &[ModelEntry],
+    registered_extension_bindings: &[ExtensionProviderBinding],
+) -> Vec<String> {
+    let mut providers = registered_extension_bindings
         .iter()
-        .filter(|entry| entry.oauth_config.is_some())
-        .map(|entry| {
-            let provider = entry.model.provider.as_str();
+        .filter(|binding| binding.oauth_config.is_some())
+        .map(|binding| {
+            let provider = binding.provider.as_str();
             crate::provider_metadata::canonical_provider_id(provider)
                 .unwrap_or(provider)
                 .to_string()
         })
-        .collect();
+        .collect::<Vec<_>>();
+    providers.extend(
+        available_models
+            .iter()
+            .filter(|entry| entry.oauth_config.is_some())
+            .map(|entry| {
+                let provider = entry.model.provider.as_str();
+                crate::provider_metadata::canonical_provider_id(provider)
+                    .unwrap_or(provider)
+                    .to_string()
+            }),
+    );
 
     providers.retain(|provider| {
         !BUILTIN_LOGIN_PROVIDERS
@@ -595,18 +610,42 @@ fn collect_extension_oauth_providers(available_models: &[ModelEntry]) -> Vec<Str
 
 fn extension_oauth_config_for_provider(
     available_models: &[ModelEntry],
+    registered_extension_bindings: &[ExtensionProviderBinding],
     provider: &str,
 ) -> Option<crate::models::OAuthConfig> {
-    available_models.iter().find_map(|entry| {
-        let model_provider = entry.model.provider.as_str();
-        let canonical = crate::provider_metadata::canonical_provider_id(model_provider)
-            .unwrap_or(model_provider);
-        if canonical.eq_ignore_ascii_case(provider) {
-            entry.oauth_config.clone()
-        } else {
-            None
-        }
-    })
+    registered_extension_bindings
+        .iter()
+        .find_map(|binding| {
+            let registered_provider = binding.provider.as_str();
+            let canonical = crate::provider_metadata::canonical_provider_id(registered_provider)
+                .unwrap_or(registered_provider);
+            if canonical.eq_ignore_ascii_case(provider) {
+                binding.oauth_config.clone()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            available_models.iter().find_map(|entry| {
+                let model_provider = entry.model.provider.as_str();
+                let canonical = crate::provider_metadata::canonical_provider_id(model_provider)
+                    .unwrap_or(model_provider);
+                if canonical.eq_ignore_ascii_case(provider) {
+                    entry.oauth_config.clone()
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn registered_extension_provider_bindings(
+    extensions: Option<&ExtensionManager>,
+) -> crate::error::Result<Vec<ExtensionProviderBinding>> {
+    extensions.map_or_else(
+        || Ok(Vec::new()),
+        |manager| extension_provider_bindings(&manager.extension_providers()),
+    )
 }
 
 fn append_provider_rows(output: &mut String, heading: &str, rows: &[(String, String, String)]) {
@@ -640,6 +679,7 @@ fn append_provider_rows(output: &mut String, heading: &str, rows: &[(String, Str
 pub(super) fn format_login_provider_listing(
     auth: &crate::auth::AuthStorage,
     available_models: &[ModelEntry],
+    registered_extension_bindings: &[ExtensionProviderBinding],
 ) -> String {
     let mut output = String::from("Available login providers:\n\n");
 
@@ -670,7 +710,8 @@ pub(super) fn format_login_provider_listing(
     built_in_rows.extend(api_key_rows);
     append_provider_rows(&mut output, "Built-in", &built_in_rows);
 
-    let extension_providers = collect_extension_oauth_providers(available_models);
+    let extension_providers =
+        collect_extension_oauth_providers(available_models, registered_extension_bindings);
     if !extension_providers.is_empty() {
         let extension_rows: Vec<(String, String, String)> = extension_providers
             .iter()
@@ -2525,8 +2566,17 @@ impl PiApp {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_login(&mut self, args: &str) -> Option<Cmd> {
+        let auth_path = crate::config::Config::auth_path();
+        self.handle_slash_login_with_auth_path(args, &auth_path)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_slash_login_with_auth_path(
+        &mut self,
+        args: &str,
+        auth_path: &std::path::Path,
+    ) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot login while processing".to_string());
             return None;
@@ -2534,10 +2584,23 @@ impl PiApp {
 
         let args = args.trim();
         if args.is_empty() {
-            let auth_path = crate::config::Config::auth_path();
-            match crate::auth::AuthStorage::load(auth_path) {
+            match crate::auth::AuthStorage::load(auth_path.to_path_buf()) {
                 Ok(auth) => {
-                    let listing = format_login_provider_listing(&auth, &self.available_models);
+                    let registered_extension_bindings =
+                        match registered_extension_provider_bindings(self.extensions.as_ref()) {
+                            Ok(bindings) => bindings,
+                            Err(err) => {
+                                self.status_message = Some(format!(
+                                    "Unable to load extension login providers: {err}"
+                                ));
+                                return None;
+                            }
+                        };
+                    let listing = format_login_provider_listing(
+                        &auth,
+                        &self.available_models,
+                        &registered_extension_bindings,
+                    );
                     self.messages.push(ConversationMessage {
                         role: MessageRole::System,
                         content: listing,
@@ -2689,7 +2752,21 @@ impl PiApp {
             crate::auth::start_gitlab_oauth(&gitlab_config).map(|info| (info, None))
         } else {
             // Check extension providers for OAuth config.
-            let ext_oauth = extension_oauth_config_for_provider(&self.available_models, &provider);
+            let registered_extension_bindings =
+                match registered_extension_provider_bindings(self.extensions.as_ref()) {
+                    Ok(bindings) => bindings,
+                    Err(err) => {
+                        self.status_message = Some(format!(
+                            "Unable to load extension login providers: {err}"
+                        ));
+                        return None;
+                    }
+                };
+            let ext_oauth = extension_oauth_config_for_provider(
+                &self.available_models,
+                &registered_extension_bindings,
+                &provider,
+            );
             if let Some(config) = ext_oauth {
                 crate::auth::start_extension_oauth(&provider, &config)
                     .map(|info| (info, Some(config)))
@@ -3485,6 +3562,24 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    fn completed_tan_event(
+        owner_session_id: String,
+        completion: pi::subagents::TanCompletion,
+    ) -> PiMsg {
+        let card = pi::jobs::push_completion_notice(
+            &owner_session_id,
+            completion.follow_up_text(),
+        )
+        .map_or_else(
+            |err| format!("(/tan failed to queue follow-up)\n{err}"),
+            |()| completion.card_text(),
+        );
+        PiMsg::SessionSystemNote {
+            owner_session_id,
+            message: card,
+        }
+    }
+
     /// `/tan <work>` — run tangential work in a background task-role child
     /// (bd-cv653.3.16). The command returns immediately; the child joins the
     /// hub roster as `kind=tan`, renders a display-only completion card, and
@@ -3544,28 +3639,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         let display_work = work.clone();
         runtime.spawn(async move {
-            let card = match tool.run_background_tan(&work).await {
-                Ok(completion) => {
-                    let follow_up_result = pi::jobs::push_completion_notice(
-                        &owner_session_id,
-                        completion.follow_up_text(),
-                    );
-                    follow_up_result.map_or_else(
-                        |err| format!("(/tan failed to queue follow-up)\n{err}"),
-                        |()| completion.card_text(),
-                    )
-                }
-                Err(err) => format!("(/tan failed)\n{err}"),
-            };
-            let _ = crate::interactive::enqueue_pi_event(
-                &event_tx,
-                &task_cx,
-                PiMsg::SessionSystemNote {
+            let event = match tool.run_background_tan(&work).await {
+                Ok(completion) => PiApp::completed_tan_event(owner_session_id, completion),
+                Err(err) => PiMsg::SessionSystemNote {
                     owner_session_id,
-                    message: card,
+                    message: format!("(/tan failed)\n{err}"),
                 },
-            )
-            .await;
+            };
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &task_cx, event).await;
         });
 
         self.messages.push(ConversationMessage {
@@ -4142,6 +4223,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let config = self.config.clone();
         let cli = self.resource_cli.clone();
+        let package_manager = self.package_manager.clone();
         let cwd = self.cwd.clone();
         let event_tx = self.event_tx.clone();
         let extensions = self.extensions.clone();
@@ -4149,8 +4231,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
 
         runtime_handle.spawn(async move {
-            let manager = PackageManager::new(cwd.clone());
-            match ResourceLoader::load(&manager, &cwd, &config, &cli).await {
+            match ResourceLoader::load(&package_manager, &cwd, &config, &cli).await {
                 Ok(mut resources) => {
                     if let Some(manager) = extensions {
                         let discovered = manager.discover_resources(&cwd, "reload").await;
@@ -4588,15 +4669,17 @@ mod tests {
         ExcludedBashPersistenceOutcome, PiMsg, parse_bash_command, parse_extension_command,
         persist_excluded_bash_execution, should_show_startup_oauth_hint, spawn_bash_completion,
     };
-    use super::{AgentState, PendingInput, PiApp, SlashCommand};
+    use super::{AgentState, PendingInput, PendingLoginKind, PiApp, SlashCommand};
     use crate::agent::{Agent, AgentConfig, QueuedAgentMessage};
     use crate::auth::{AuthCredential, AuthStorage};
     use crate::config::Config;
+    use crate::extensions::ExtensionManager;
     use crate::keybindings::KeyBindings;
     use crate::model::{
         Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage,
     };
-    use crate::models::ModelEntry;
+    use crate::models::{ExtensionProviderBinding, ModelEntry};
+    use crate::package_manager::PackageManager;
     use crate::provider::{InputType, Model, ModelCost};
     use crate::provider::{Context, Provider, StreamOptions};
     use crate::resources::{ResourceCliOptions, ResourceLoader};
@@ -4980,6 +5063,92 @@ mod tests {
         (app, event_rx)
     }
 
+    #[test]
+    fn reload_reuses_startup_package_trust_and_keeps_explicit_resources() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        let project_skill = cwd.join(".pi/skills/project-only/SKILL.md");
+        let explicit_skill = cwd.join("explicit/explicit-only/SKILL.md");
+        std::fs::create_dir_all(project_skill.parent().expect("project skill parent"))
+            .expect("create project skill directory");
+        std::fs::create_dir_all(explicit_skill.parent().expect("explicit skill parent"))
+            .expect("create explicit skill directory");
+        std::fs::write(
+            &project_skill,
+            "---\nname: project-only\ndescription: Project trust sentinel\n---\nProject body.\n",
+        )
+        .expect("write project skill");
+        std::fs::write(cwd.join(".pi/settings.json"), "{}\n")
+            .expect("write project trust sentinel");
+        std::fs::write(
+            &explicit_skill,
+            "---\nname: explicit-only\ndescription: Explicit path sentinel\n---\nExplicit body.\n",
+        )
+        .expect("write explicit skill");
+
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, cwd);
+        app.resource_cli.no_prompt_templates = true;
+        app.resource_cli.no_extensions = true;
+        app.resource_cli.no_themes = true;
+        app.resource_cli.skill_paths = vec![explicit_skill.to_string_lossy().to_string()];
+
+        assert!(app.handle_slash_reload().is_none());
+        let untrusted = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("untrusted reload event before timeout")
+            .expect("untrusted reload event")
+        });
+        let PiMsg::ResourcesReloaded { resources, .. } = untrusted else {
+            panic!("unexpected untrusted reload event: {untrusted:?}");
+        };
+        assert!(
+            resources
+                .skills()
+                .iter()
+                .any(|skill| skill.name == "explicit-only"),
+            "explicit CLI resources remain authorized in an untrusted workspace"
+        );
+        assert!(
+            resources
+                .skills()
+                .iter()
+                .all(|skill| skill.name != "project-only"),
+            "untrusted reload must not rediscover project resources"
+        );
+
+        app.set_reload_package_manager(
+            PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+        );
+        assert!(app.handle_slash_reload().is_none());
+        let trusted = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("trusted reload event before timeout")
+            .expect("trusted reload event")
+        });
+        let PiMsg::ResourcesReloaded { resources, .. } = trusted else {
+            panic!("unexpected trusted reload event: {trusted:?}");
+        };
+        for expected in ["explicit-only", "project-only"] {
+            assert!(
+                resources.skills().iter().any(|skill| skill.name == expected),
+                "trusted reload should include {expected}"
+            );
+        }
+    }
+
     fn stage_private_follow_up(app: &PiApp) {
         let mut agent = app.agent.try_lock().expect("test agent lock");
         agent.queue_follow_up(ModelMessage::User(UserMessage {
@@ -4995,6 +5164,89 @@ mod tests {
             .header
             .id
             .clone()
+    }
+
+    #[test]
+    fn completed_tan_event_keeps_card_and_follow_up_bound_to_the_origin_session() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, temp.path());
+        let origin_session_id = current_session_id(&app);
+        let task_marker = "origin-only-tan-task";
+        let output_marker = "origin-only-tan-output";
+        let completion = pi::subagents::TanCompletion {
+            schema: "pi.background-tan.result.v1",
+            hub_id: Some("tan-origin-proof".to_string()),
+            task: task_marker.to_string(),
+            status: "completed".to_string(),
+            output: output_marker.to_string(),
+            error: None,
+            is_error: false,
+        };
+        let expected_card = completion.card_text();
+        let expected_follow_up = completion.follow_up_text();
+        let event = PiApp::completed_tan_event(
+            origin_session_id.clone(),
+            completion,
+        );
+        assert!(matches!(
+            &event,
+            PiMsg::SessionSystemNote {
+                owner_session_id,
+                message,
+            } if owner_session_id == &origin_session_id
+                && message == &expected_card
+        ));
+        assert!(runtime().block_on(async {
+            let cx = Cx::for_testing();
+            crate::interactive::enqueue_pi_event(&app.event_tx, &cx, event).await
+        }));
+
+        let replacement_session = Session::in_memory();
+        let replacement_session_id = replacement_session.header.id.clone();
+        assert_ne!(replacement_session_id, origin_session_id);
+        *app.session.try_lock().expect("replace live session") = replacement_session;
+        let messages_before_delivery = app.messages.len();
+
+        let queued_event = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("/tan completion event before timeout")
+            .expect("/tan completion event")
+        });
+        let _ = app.handle_pi_message(queued_event);
+        assert_eq!(
+            app.messages.len(),
+            messages_before_delivery,
+            "the replacement transcript must discard the origin-bound /tan card"
+        );
+        assert!(app.messages.iter().all(|message| {
+            !message.content.contains(task_marker) && !message.content.contains(output_marker)
+        }));
+
+        let origin_notices = pi::jobs::take_completion_notices(&origin_session_id);
+        assert_eq!(
+            origin_notices.len(),
+            1,
+            "the production completion helper must queue exactly one origin follow-up"
+        );
+        let ModelMessage::User(UserMessage {
+            content: UserContent::Text(follow_up),
+            ..
+        }) = &origin_notices[0]
+        else {
+            panic!("/tan follow-up must be a user message");
+        };
+        assert_eq!(follow_up, &expected_follow_up);
+        assert!(
+            pi::jobs::take_completion_notices(&replacement_session_id).is_empty(),
+            "the replacement session must not inherit the origin model follow-up"
+        );
     }
 
     fn assert_staged_transition_rejected(app: &PiApp, original_session_id: &str) {
@@ -5540,7 +5792,7 @@ mod tests {
     #[test]
     fn login_provider_listing_includes_metadata_backed_api_key_providers() {
         let auth = empty_auth_storage();
-        let listing = super::format_login_provider_listing(&auth, &[]);
+        let listing = super::format_login_provider_listing(&auth, &[], &[]);
         assert!(listing.contains("openrouter"));
         assert!(listing.contains("cohere"));
         assert!(listing.contains("API key"));
@@ -5665,8 +5917,15 @@ mod tests {
             redirect_uri: Some("http://localhost/callback".to_string()),
         });
 
-        let selected =
-            super::extension_oauth_config_for_provider(&[no_oauth, with_oauth], "ext-provider");
+        let registered_extension_bindings = [ExtensionProviderBinding {
+            provider: with_oauth.model.provider.clone(),
+            oauth_config: with_oauth.oauth_config.clone(),
+        }];
+        let selected = super::extension_oauth_config_for_provider(
+            &[no_oauth],
+            &registered_extension_bindings,
+            "ext-provider",
+        );
         let selected = selected.expect("expected oauth config");
         assert_eq!(selected.auth_url, "https://example.test/oauth/authorize");
         assert_eq!(selected.token_url, "https://example.test/oauth/token");
@@ -5676,5 +5935,75 @@ mod tests {
             selected.redirect_uri.as_deref(),
             Some("http://localhost/callback")
         );
+
+        let auth = empty_auth_storage();
+        let listing =
+            super::format_login_provider_listing(&auth, &[], &registered_extension_bindings);
+        assert!(listing.contains("Extension providers"));
+        assert!(listing.contains("ext-provider"));
+        assert!(listing.contains("OAuth"));
+    }
+
+    #[test]
+    fn zero_model_extension_oauth_is_reachable_through_actual_login_command() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let manager = ExtensionManager::new();
+        manager.register_provider(serde_json::json!({
+            "id": "Acme",
+            "models": [],
+            "hasStreamSimple": false,
+            "oauth": {
+                "authUrl": "https://auth.example.test/authorize",
+                "tokenUrl": "https://auth.example.test/token",
+                "clientId": "zero-model-client",
+                "scopes": ["models:use"]
+            }
+        }));
+        app.extensions = Some(manager);
+        app.available_models.clear();
+
+        let invalid_auth_path = temp.path().join("auth-as-directory");
+        std::fs::create_dir_all(&invalid_auth_path).expect("create invalid auth-path directory");
+        let messages_before_invalid_path = app.messages.len();
+        assert!(
+            app.handle_slash_login_with_auth_path("", &invalid_auth_path)
+                .is_none()
+        );
+        assert_eq!(app.messages.len(), messages_before_invalid_path);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Unable to load auth status:"))
+        );
+
+        app.status_message = None;
+        let auth_path = temp.path().join("auth.json");
+        assert!(
+            app.handle_slash_login_with_auth_path("", &auth_path)
+                .is_none()
+        );
+        let listing = &app.messages.last().expect("login listing message").content;
+        assert!(listing.contains("Extension providers"));
+        assert!(listing.contains("Acme"));
+        assert!(listing.contains("OAuth"));
+
+        assert!(
+            app.handle_slash_login_with_auth_path("acme", &auth_path)
+                .is_none()
+        );
+        let pending = app
+            .pending_oauth
+            .as_ref()
+            .expect("extension OAuth flow should be pending");
+        assert_eq!(pending.provider, "acme");
+        assert!(matches!(pending.kind, PendingLoginKind::OAuth));
+        let oauth = pending
+            .oauth_config
+            .as_ref()
+            .expect("extension OAuth metadata should reach the command");
+        assert_eq!(oauth.client_id, "zero-model-client");
+        assert_eq!(oauth.token_url, "https://auth.example.test/token");
     }
 }

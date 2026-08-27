@@ -899,6 +899,10 @@ pub struct PiFtuiModel {
     /// queue behind it, mirroring the bubbletea active/queue pair.
     active_ext: Option<ExtensionUiRequest>,
     ext_queue: VecDeque<ExtensionUiRequest>,
+    /// User draft captured when the first response-bearing card takes over the
+    /// editor. Successor cards share the snapshot; the last terminal path
+    /// restores it only after clearing card-owned input.
+    card_draft_snapshot: Option<String>,
     /// Where completed extension UI replies go (driver pairs them back to the
     /// pending request via `FtuiExtensionUiHandler::resolve`).
     ext_reply_tx: Option<Sender<ExtensionUiResponse>>,
@@ -1003,6 +1007,7 @@ impl PiFtuiModel {
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
+            card_draft_snapshot: None,
             ext_reply_tx: None,
             ask_reply_tx: None,
             term: (80, 24),
@@ -1315,6 +1320,7 @@ impl PiFtuiModel {
                 error_message,
                 ..
             } => {
+                self.dismiss_pending_interactions();
                 if !self.streaming.is_empty() {
                     let text = std::mem::take(&mut self.streaming);
                     self.push_entry(EntryRole::Assistant, text);
@@ -1335,6 +1341,7 @@ impl PiFtuiModel {
                 self.settle_pending_cards();
             }
             PiMsg::AgentError(err) => {
+                self.dismiss_pending_interactions();
                 // Pinned above the editor (bd-cv653.9.2), dismiss-on-send —
                 // not duplicated into the transcript. Partial streamed text
                 // is still flushed so it isn't merged into the next turn.
@@ -1367,6 +1374,7 @@ impl PiFtuiModel {
                 status,
                 ..
             } => {
+                self.dismiss_pending_interactions();
                 self.displayed_session_id = Some(session_id);
                 self.apply_conversation_reset(messages, status);
             }
@@ -1383,7 +1391,13 @@ impl PiFtuiModel {
                     // Defensive: an empty card resolves immediately as
                     // dismissed rather than deadlocking the pending tool.
                     self.send_ask_reply(request.id, Vec::new(), true);
+                } else if self.active_ask.is_some() || self.active_ext.is_some() {
+                    // The model-side scheduling barrier should serialize Ask,
+                    // but reject overlap defensively rather than overwriting an
+                    // already reachable modal and stranding its waiter.
+                    self.send_ask_reply(request.id, Vec::new(), true);
                 } else {
+                    self.capture_preexisting_card_draft();
                     self.push_ask_card(&request, 0);
                     self.active_ask = Some(ActiveAsk {
                         request,
@@ -1393,7 +1407,11 @@ impl PiFtuiModel {
                 }
             }
             PiMsg::ExtensionUiRequest(request) => {
-                if self.active_ext.is_none() && self.active_ask.is_none() {
+                if !request.expects_response() {
+                    let text =
+                        sanitize(format_extension_ui_prompt(&request).trim_end()).into_owned();
+                    self.push_entry(EntryRole::System, text);
+                } else if self.active_ext.is_none() && self.active_ask.is_none() {
                     self.activate_ext_request(request);
                 } else {
                     self.ext_queue.push_back(request);
@@ -1958,6 +1976,7 @@ impl PiFtuiModel {
                             self.push_entry(EntryRole::Ask, String::from("  (dismissed)"));
                             self.scroll_from_tail = 0;
                             self.send_ask_reply(ask.request.id, Vec::new(), true);
+                            self.input.set_text("");
                             self.maybe_activate_queued_ext();
                         }
                         return Cmd::none();
@@ -2028,6 +2047,65 @@ impl PiFtuiModel {
         self.state == AgentUiState::Ready || self.active_ask.is_some() || self.active_ext.is_some()
     }
 
+    /// Fail closed every modal owned by the completed/replaced turn. Replies
+    /// are emitted before state is cleared so no Ask or extension waiter can
+    /// survive invisibly and consume ordinary editor input later.
+    fn dismiss_pending_interactions(&mut self) -> bool {
+        let mut dismissed = false;
+        if let Some(ask) = self.active_ask.take() {
+            self.send_ask_reply(ask.request.id, Vec::new(), true);
+            dismissed = true;
+        }
+        if let Some(request) = self.active_ext.take() {
+            self.send_ext_reply(ExtensionUiResponse {
+                id: request.id,
+                value: None,
+                cancelled: true,
+            });
+            dismissed = true;
+        }
+        let queued = std::mem::take(&mut self.ext_queue);
+        if !queued.is_empty() {
+            dismissed = true;
+        }
+        for request in queued {
+            self.send_ext_reply(ExtensionUiResponse {
+                id: request.id,
+                value: None,
+                cancelled: true,
+            });
+        }
+        if dismissed {
+            self.input.set_text("");
+        }
+        self.restore_card_draft_after_cards_settle();
+        dismissed
+    }
+
+    /// Snapshot the pre-card editor exactly once per contiguous card burst.
+    /// Card answers own the editor until the burst settles, so the draft is
+    /// cleared before the first card becomes reachable.
+    fn capture_preexisting_card_draft(&mut self) {
+        let draft = self.input.text();
+        if self.card_draft_snapshot.is_none() && !draft.is_empty() {
+            self.card_draft_snapshot = Some(draft);
+            self.input.set_text("");
+        }
+    }
+
+    /// Explicit merge policy: after the last response-bearing card settles,
+    /// restore the original draft only into an empty editor.
+    fn restore_card_draft_after_cards_settle(&mut self) {
+        if self.active_ask.is_some() || self.active_ext.is_some() || !self.ext_queue.is_empty() {
+            return;
+        }
+        if self.input.text().is_empty()
+            && let Some(draft) = self.card_draft_snapshot.take()
+        {
+            self.input.set_text(&draft);
+        }
+    }
+
     /// Rebuild the transcript from a resumed/forked/compacted session.
     fn apply_conversation_reset(
         &mut self,
@@ -2057,6 +2135,7 @@ impl PiFtuiModel {
     /// Render an extension UI prompt into the transcript and make it the
     /// active reply target.
     fn activate_ext_request(&mut self, request: ExtensionUiRequest) {
+        self.capture_preexisting_card_draft();
         let card = format_extension_ui_prompt(&request);
         let text = sanitize(card.trim_end()).into_owned();
         self.push_entry(EntryRole::Ask, text);
@@ -2094,9 +2173,7 @@ impl PiFtuiModel {
                 self.push_entry(EntryRole::Ask, echo);
                 self.scroll_from_tail = 0;
                 self.send_ext_reply(response);
-                if let Some(next) = self.ext_queue.pop_front() {
-                    self.activate_ext_request(next);
-                }
+                self.maybe_activate_queued_ext();
             }
         }
     }
@@ -2104,11 +2181,13 @@ impl PiFtuiModel {
     /// Activate a queued extension prompt once no ask card or prompt is
     /// holding the input line.
     fn maybe_activate_queued_ext(&mut self) {
-        if self.active_ask.is_none()
-            && self.active_ext.is_none()
-            && let Some(next) = self.ext_queue.pop_front()
-        {
+        if self.active_ask.is_some() || self.active_ext.is_some() {
+            return;
+        }
+        if let Some(next) = self.ext_queue.pop_front() {
             self.activate_ext_request(next);
+        } else {
+            self.restore_card_draft_after_cards_settle();
         }
     }
 
@@ -2122,9 +2201,8 @@ impl PiFtuiModel {
                 value: None,
                 cancelled: true,
             });
-            if let Some(next) = self.ext_queue.pop_front() {
-                self.activate_ext_request(next);
-            }
+            self.input.set_text("");
+            self.maybe_activate_queued_ext();
         }
     }
 
@@ -2525,6 +2603,7 @@ const EXT_UI_TIMEOUT_MS: u64 = 300_000;
 /// `AskTool::install_channel_ui`.
 struct FtuiExtensionUiHandler {
     agent_tx: Sender<PiMsg>,
+    reply_channel_open: std::sync::atomic::AtomicBool,
     pending: Mutex<
         std::collections::HashMap<
             String,
@@ -2537,7 +2616,16 @@ impl FtuiExtensionUiHandler {
     fn new(agent_tx: Sender<PiMsg>) -> Self {
         Self {
             agent_tx,
+            reply_channel_open: std::sync::atomic::AtomicBool::new(true),
             pending: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn cancelled_response(id: String) -> ExtensionUiResponse {
+        ExtensionUiResponse {
+            id,
+            value: None,
+            cancelled: true,
         }
     }
 
@@ -2559,6 +2647,35 @@ impl FtuiExtensionUiHandler {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(id);
     }
+
+    fn cancel_all_pending(&self) -> usize {
+        let pending = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.reply_channel_open
+                .store(false, std::sync::atomic::Ordering::Release);
+            std::mem::take(&mut *pending)
+        };
+        let count = pending.len();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        for (id, sender) in pending {
+            let _ = sender.send(cx.cx(), Self::cancelled_response(id));
+        }
+        count
+    }
+}
+
+struct FtuiPendingUiLease<'a> {
+    handler: &'a FtuiExtensionUiHandler,
+    id: String,
+}
+
+impl Drop for FtuiPendingUiLease<'_> {
+    fn drop(&mut self) {
+        self.handler.drop_pending(&self.id);
+    }
 }
 
 #[async_trait::async_trait]
@@ -2569,20 +2686,43 @@ impl crate::sdk::ExtensionUiHandler for FtuiExtensionUiHandler {
     ) -> crate::error::Result<Option<ExtensionUiResponse>> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let id = request.id.clone();
-        let timeout_ms = request.timeout_ms.unwrap_or(EXT_UI_TIMEOUT_MS);
-        let (reply_tx, mut reply_rx) = asupersync::channel::oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.clone(), reply_tx);
-        if self
-            .agent_tx
-            .send(PiMsg::ExtensionUiRequest(request))
-            .is_err()
+        if !self
+            .reply_channel_open
+            .load(std::sync::atomic::Ordering::Acquire)
         {
-            self.drop_pending(&id);
+            return Ok(Some(Self::cancelled_response(id)));
+        }
+        if !request.expects_response() {
+            let _ = self.agent_tx.send(PiMsg::ExtensionUiRequest(request));
             return Ok(None);
         }
+        let timeout_ms = request.timeout_ms.unwrap_or(EXT_UI_TIMEOUT_MS);
+        let (reply_tx, mut reply_rx) = asupersync::channel::oneshot::channel();
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self
+                .reply_channel_open
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(Some(Self::cancelled_response(id)));
+            }
+            pending.insert(id.clone(), reply_tx);
+            if self
+                .agent_tx
+                .send(PiMsg::ExtensionUiRequest(request))
+                .is_err()
+            {
+                pending.remove(&id);
+                return Ok(None);
+            }
+        }
+        let _pending_reply = FtuiPendingUiLease {
+            handler: self,
+            id: id.clone(),
+        };
         let waited = asupersync::time::timeout(
             asupersync::time::wall_now(),
             std::time::Duration::from_millis(timeout_ms),
@@ -2595,11 +2735,30 @@ impl crate::sdk::ExtensionUiHandler for FtuiExtensionUiHandler {
             // UI gone or user never answered: report a cancel so the
             // extension gets a definitive answer instead of hanging.
             self.drop_pending(&id);
-            Ok(Some(ExtensionUiResponse {
-                id,
-                value: None,
-                cancelled: true,
-            }))
+            Ok(Some(Self::cancelled_response(id)))
+        }
+    }
+}
+
+enum ExtReplyPoll {
+    Resolved,
+    Empty,
+    Disconnected,
+}
+
+fn poll_ext_reply(
+    handler: &FtuiExtensionUiHandler,
+    ext_reply_rx: &Receiver<ExtensionUiResponse>,
+) -> ExtReplyPoll {
+    match ext_reply_rx.try_recv() {
+        Ok(response) => {
+            handler.resolve(response);
+            ExtReplyPoll::Resolved
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => ExtReplyPoll::Empty,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            handler.cancel_all_pending();
+            ExtReplyPoll::Disconnected
         }
     }
 }
@@ -2613,12 +2772,12 @@ fn spawn_ext_reply_pump(
 ) {
     runtime_handle.spawn(async move {
         loop {
-            match ext_reply_rx.try_recv() {
-                Ok(response) => handler.resolve(response),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
+            match poll_ext_reply(&handler, &ext_reply_rx) {
+                ExtReplyPoll::Resolved => {}
+                ExtReplyPoll::Empty => {
                     asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL).await;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                ExtReplyPoll::Disconnected => break,
             }
         }
     });
@@ -2635,7 +2794,7 @@ fn install_ask_bridges(
 ) -> CurrentAsk {
     let current_ask: CurrentAsk = Arc::new(Mutex::new(handle.ask_tool()));
     if let Some(ask) = handle.ask_tool() {
-        install_ask_forwarder(&ask, agent_tx, runtime_handle);
+        drop(install_ask_forwarder(&ask, agent_tx, runtime_handle));
     }
     spawn_ask_reply_pump(Arc::clone(&current_ask), ask_reply_rx, runtime_handle);
     current_ask
@@ -2655,20 +2814,62 @@ fn install_ask_forwarder(
     ask: &crate::ask::AskTool,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) {
+) -> asupersync::runtime::JoinHandle<()> {
     let (ask_ui_tx, mut ask_ui_rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(4);
     ask.install_channel_ui(ask_ui_tx);
+    let ask_forwarder = ask.clone();
     let ask_fwd_tx = agent_tx.clone();
     runtime_handle.spawn(async move {
         let cx = crate::agent_cx::AgentCx::for_request();
         while let Ok(request) = ask_ui_rx.recv(&cx).await {
-            let _ = ask_fwd_tx.send(PiMsg::AskUiRequest(request));
+            forward_ask_ui_request(&ask_forwarder, &ask_fwd_tx, request);
         }
-    });
+    })
+}
+
+fn forward_ask_ui_request(
+    ask: &crate::ask::AskTool,
+    agent_tx: &Sender<PiMsg>,
+    request: AskUiRequest,
+) -> bool {
+    let request_id = request.id.clone();
+    ask.try_forward_channel_ui_request(&request_id, || {
+        agent_tx.send(PiMsg::AskUiRequest(request)).is_ok()
+    })
 }
 
 /// Spawn the long-lived reply pump: answered cards pair back through the
 /// CURRENT ask tool's `respond_ui` (see [`CurrentAsk`]).
+enum AskReplyPoll {
+    Resolved,
+    Empty,
+    Disconnected,
+}
+
+fn poll_ask_reply(current_ask: &CurrentAsk, ask_reply_rx: &Receiver<AskUiReply>) -> AskReplyPoll {
+    match ask_reply_rx.try_recv() {
+        Ok(reply) => {
+            let guard = current_ask
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(ask) = guard.as_ref() {
+                let _ = ask.respond_ui(&reply.request_id, reply.response);
+            }
+            AskReplyPoll::Resolved
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => AskReplyPoll::Empty,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            let guard = current_ask
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(ask) = guard.as_ref() {
+                ask.close_channel_ui();
+            }
+            AskReplyPoll::Disconnected
+        }
+    }
+}
+
 fn spawn_ask_reply_pump(
     current_ask: CurrentAsk,
     ask_reply_rx: Receiver<AskUiReply>,
@@ -2676,19 +2877,12 @@ fn spawn_ask_reply_pump(
 ) {
     runtime_handle.spawn(async move {
         loop {
-            match ask_reply_rx.try_recv() {
-                Ok(reply) => {
-                    let guard = current_ask
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(ask) = guard.as_ref() {
-                        let _ = ask.respond_ui(&reply.request_id, reply.response);
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
+            match poll_ask_reply(&current_ask, &ask_reply_rx) {
+                AskReplyPoll::Resolved => {}
+                AskReplyPoll::Empty => {
                     asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL).await;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                AskReplyPoll::Disconnected => break,
             }
         }
     });
@@ -2926,10 +3120,41 @@ async fn run_compact_command(
     }
 }
 
+fn report_replacement_shutdown_failure(
+    shutdown: &crate::sdk::SessionResourceShutdown,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let summary = shutdown
+        .failures()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let _ = agent_tx.send(PiMsg::AgentError(format!(
+        "session replacement cancelled because previous-session shutdown preflight failed: {summary}"
+    )));
+}
+
+async fn complete_replacement_after_shutdown(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    shutdown: &crate::sdk::SessionResourceShutdown,
+) -> std::result::Result<(), String> {
+    if !shutdown.completed_cleanly() || !shutdown.permits_replacement_mcp_activation() {
+        handle.disable_mcp();
+        let issues = shutdown.messages().collect::<Vec<_>>().join("; ");
+        return Err(if issues.is_empty() {
+            String::from("previous-session cleanup did not prove complete MCP shutdown")
+        } else {
+            issues
+        });
+    }
+    handle.activate_mcp().await;
+    Ok(())
+}
+
 /// Handle `/new` in the driver: build a fresh session from the launch
 /// template with the CURRENT provider/model selection preserved and thinking
 /// reset to off (SlashCommand::New parity). MCP activation is deferred until
-/// after the old handle is dropped so singleton servers never overlap.
+/// after the old handle completes awaited shutdown so singleton servers never
+/// overlap and the previous session flushes before replacement.
 /// Construction failures surface as UI errors and keep the current session.
 async fn new_session_command(
     template: &crate::sdk::SessionOptions,
@@ -2938,7 +3163,7 @@ async fn new_session_command(
     ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) {
+) -> std::result::Result<(), String> {
     let (provider, model_id) = handle.model();
     let mut options = template.clone();
     options.provider = Some(provider.clone());
@@ -2950,15 +3175,39 @@ async fn new_session_command(
     options.no_session = false;
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
+            let prepared = match handle.preflight_replacement().await {
+                Ok(prepared) => prepared,
+                Err(shutdown) => {
+                    report_replacement_shutdown_failure(&shutdown, agent_tx);
+                    let cleanup = new_handle.discard_uncommitted_resources().await;
+                    for issue in cleanup.messages() {
+                        let _ = agent_tx.send(PiMsg::System(format!(
+                            "Uncommitted new session cleanup issue: {issue}"
+                        )));
+                    }
+                    return Ok(());
+                }
+            };
+            // Commit the candidate before teardown begins. Cancellation during
+            // any later await can no longer leave a partially decommissioned
+            // old handle installed as the current session.
             let old_handle = std::mem::replace(handle, new_handle);
-            drop(old_handle);
+            if let Some(ask) = old_handle.ask_tool() {
+                ask.close_channel_ui();
+            }
+            let shutdown = old_handle.commit_resource_shutdown(prepared).await;
+            if let Err(issues) = complete_replacement_after_shutdown(handle, &shutdown).await {
+                let _ = agent_tx.send(PiMsg::AgentError(format!(
+                    "Previous-session cleanup was incomplete; ending the FTUI session without activating replacement MCP: {issues}"
+                )));
+                return Err(issues);
+            }
             *current_ask
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = handle.ask_tool();
             if let Some(ask) = handle.ask_tool() {
-                install_ask_forwarder(&ask, agent_tx, runtime_handle);
+                drop(install_ask_forwarder(&ask, agent_tx, runtime_handle));
             }
-            handle.activate_mcp().await;
             send_conversation_reset(
                 handle,
                 agent_tx,
@@ -2972,6 +3221,7 @@ async fn new_session_command(
             let _ = agent_tx.send(PiMsg::AgentError(format!("new session: {err}")));
         }
     }
+    Ok(())
 }
 
 /// Handle `/session`: report the live session's file/id/name/model/thinking/
@@ -3212,9 +3462,10 @@ async fn run_usage_command(refresh: bool, agent_tx: &Sender<PiMsg>) {
 }
 
 /// Handle `/resume` in the driver: open the chosen session file with the
-/// launch selection preserved, drop the previous handle before starting the
-/// replacement's MCP servers, rewire the ask bridge, and replay the
-/// conversation into the UI. Construction failures keep the current session.
+/// launch selection preserved, await the previous handle's shutdown before
+/// starting the replacement's MCP servers, rewire the ask bridge, and replay
+/// the conversation into the UI. Construction failures keep the current
+/// session.
 async fn resume_session_command(
     path: &str,
     template: &crate::sdk::SessionOptions,
@@ -3223,7 +3474,7 @@ async fn resume_session_command(
     ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) {
+) -> std::result::Result<(), String> {
     let mut options = template.clone();
     options.session_path = Some(std::path::PathBuf::from(path));
     options.extension_ui_handler =
@@ -3231,21 +3482,43 @@ async fn resume_session_command(
     options.no_session = false;
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
+            let prepared = match handle.preflight_replacement().await {
+                Ok(prepared) => prepared,
+                Err(shutdown) => {
+                    report_replacement_shutdown_failure(&shutdown, agent_tx);
+                    let cleanup = new_handle.discard_uncommitted_resources().await;
+                    for issue in cleanup.messages() {
+                        let _ = agent_tx.send(PiMsg::System(format!(
+                            "Uncommitted resumed session cleanup issue: {issue}"
+                        )));
+                    }
+                    return Ok(());
+                }
+            };
             let old_handle = std::mem::replace(handle, new_handle);
-            drop(old_handle);
+            if let Some(ask) = old_handle.ask_tool() {
+                ask.close_channel_ui();
+            }
+            let shutdown = old_handle.commit_resource_shutdown(prepared).await;
+            if let Err(issues) = complete_replacement_after_shutdown(handle, &shutdown).await {
+                let _ = agent_tx.send(PiMsg::AgentError(format!(
+                    "Previous-session cleanup was incomplete; ending the FTUI session without activating replacement MCP: {issues}"
+                )));
+                return Err(issues);
+            }
             *current_ask
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = handle.ask_tool();
             if let Some(ask) = handle.ask_tool() {
-                install_ask_forwarder(&ask, agent_tx, runtime_handle);
+                drop(install_ask_forwarder(&ask, agent_tx, runtime_handle));
             }
-            handle.activate_mcp().await;
             send_conversation_reset(handle, agent_tx, "session resumed").await;
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("resume: {err}")));
         }
     }
+    Ok(())
 }
 
 /// Snapshot the handle's conversation and reset the UI transcript from it.
@@ -3379,6 +3652,37 @@ fn driver_bash_cwd(session_options: &crate::sdk::SessionOptions) -> std::path::P
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+fn finish_ftui_run(
+    app_result: std::io::Result<()>,
+    driver_result: std::thread::Result<std::io::Result<()>>,
+) -> std::io::Result<()> {
+    app_result?;
+    driver_result
+        .map_err(|_| std::io::Error::other("FTUI agent driver panicked during shutdown"))?
+}
+
+fn terminal_replacement_error(
+    agent_tx: &Sender<PiMsg>,
+    replacement_failure: String,
+    shutdown: &crate::sdk::SessionResourceShutdown,
+) -> std::io::Error {
+    // The diagnostic was enqueued before the driver broke its command loop.
+    // Follow it with an ordered quit event so the app stops waiting, joins the
+    // failed driver, and returns this terminal error without manual input.
+    let _ = agent_tx.send(PiMsg::UiShutdown);
+    let cleanup_issues = shutdown.failures().collect::<Vec<_>>().join("; ");
+    let detail = if cleanup_issues.is_empty() {
+        replacement_failure
+    } else {
+        format!(
+            "{replacement_failure}; replacement cleanup was also incomplete: {cleanup_issues}"
+        )
+    };
+    std::io::Error::other(format!(
+        "FTUI session replacement failed terminally: {detail}"
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn run(
     session_options: crate::sdk::SessionOptions,
@@ -3399,16 +3703,19 @@ pub fn run(
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
         .stack_size(DRIVER_STACK_BYTES)
-        .spawn(move || {
+        .spawn(move || -> std::io::Result<()> {
             let runtime = match asupersync::runtime::RuntimeBuilder::new().build() {
                 Ok(runtime) => runtime,
                 Err(err) => {
                     let _ = agent_tx.send(PiMsg::AgentError(format!("runtime build: {err}")));
-                    return;
+                    return Err(std::io::Error::other(format!(
+                        "FTUI runtime build failed: {err}"
+                    )));
                 }
             };
             let runtime_handle = runtime.handle();
-            runtime.block_on(async move {
+            let terminal_agent_tx = agent_tx.clone();
+            let shutdown = runtime.block_on(async move {
                 let Some((mut handle, ext_handler)) = create_driver_session(
                     session_options,
                     &agent_tx,
@@ -3417,7 +3724,7 @@ pub fn run(
                 )
                 .await
                 else {
-                    return;
+                    return None;
                 };
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
@@ -3427,6 +3734,7 @@ pub fn run(
                     "ftui preview stack — experimental (bd-cv653.9.1)",
                 )
                 .await;
+                let mut replacement_failure = None;
                 loop {
                     match submit_rx.try_recv() {
                         Ok(UiCommand::Prompt(prompt)) => {
@@ -3477,7 +3785,7 @@ pub fn run(
                                 .await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
-                            resume_session_command(
+                            if let Err(err) = resume_session_command(
                                 &path,
                                 &resume_template,
                                 &mut handle,
@@ -3486,10 +3794,14 @@ pub fn run(
                                 &agent_tx,
                                 &runtime_handle,
                             )
-                            .await;
+                            .await
+                            {
+                                replacement_failure = Some(err);
+                                break;
+                            }
                         }
                         Ok(UiCommand::NewSession) => {
-                            new_session_command(
+                            if let Err(err) = new_session_command(
                                 &resume_template,
                                 &mut handle,
                                 &current_ask,
@@ -3497,7 +3809,11 @@ pub fn run(
                                 &agent_tx,
                                 &runtime_handle,
                             )
-                            .await;
+                            .await
+                            {
+                                replacement_failure = Some(err);
+                                break;
+                            }
                         }
                         Ok(UiCommand::SessionInfo) => {
                             run_session_info_command(&handle, &agent_tx).await;
@@ -3518,7 +3834,37 @@ pub fn run(
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
                 }
+                let shutdown = if replacement_failure.is_some() {
+                    handle.discard_uncommitted_resources().await
+                } else {
+                    handle.shutdown_owned_resources().await
+                };
+                Some((shutdown, replacement_failure))
             });
+            let Some((shutdown, replacement_failure)) = shutdown else {
+                return Err(std::io::Error::other(
+                    "FTUI agent session failed to initialize",
+                ));
+            };
+            if let Some(replacement_failure) = replacement_failure {
+                return Err(terminal_replacement_error(
+                    &terminal_agent_tx,
+                    replacement_failure,
+                    &shutdown,
+                ));
+            }
+            if shutdown.completed_cleanly() {
+                return Ok(());
+            }
+            let issues = shutdown.failures().collect::<Vec<_>>().join("; ");
+            tracing::warn!(
+                event = "ftui.session.shutdown.incomplete",
+                issues,
+                "session-owned resources remained after exhaustive shutdown"
+            );
+            Err(std::io::Error::other(format!(
+                "FTUI session shutdown incomplete: {issues}"
+            )))
         })?;
 
     let model = PiFtuiModel::new(agent_rx)
@@ -3544,10 +3890,9 @@ pub fn run(
     drop(log_guard);
 
     // The UI (and with it the submit sender) is gone; the driver's next poll
-    // sees Disconnected and unwinds. Join briefly so session teardown (saves)
-    // completes before process exit paths run.
-    let _ = driver.join();
-    result
+    // sees Disconnected and unwinds. Await the teardown result so final save
+    // or resource-shutdown failures cannot be reported as a successful exit.
+    finish_ftui_run(result, driver.join())
 }
 
 #[cfg(test)]
@@ -3605,6 +3950,62 @@ mod tests {
         assert_eq!(
             mcp.global_dir,
             Some(std::path::PathBuf::from("isolated-global"))
+        );
+    }
+
+    #[test]
+    fn ftui_exit_surfaces_driver_shutdown_failures_and_panics() {
+        let shutdown_error = finish_ftui_run(
+            Ok(()),
+            Ok(Err(std::io::Error::other("autosave was not flushed"))),
+        )
+        .expect_err("driver shutdown failure must make FTUI exit fail");
+        assert!(shutdown_error.to_string().contains("autosave was not flushed"));
+
+        let panic_error = finish_ftui_run(Ok(()), Err(Box::new("driver panic")))
+            .expect_err("driver panic must make FTUI exit fail");
+        assert!(panic_error.to_string().contains("driver panicked"));
+
+        let app_error = finish_ftui_run(
+            Err(std::io::Error::other("terminal restore failed")),
+            Ok(Err(std::io::Error::other("driver shutdown failed"))),
+        )
+        .expect_err("primary app failure must be preserved");
+        assert!(app_error.to_string().contains("terminal restore failed"));
+
+        let app_error_before_panic = finish_ftui_run(
+            Err(std::io::Error::other("terminal restore failed first")),
+            Err(Box::new("driver panic")),
+        )
+        .expect_err("app failure must remain primary even when the driver also panics");
+        assert!(
+            app_error_before_panic
+                .to_string()
+                .contains("terminal restore failed first")
+        );
+    }
+
+    #[test]
+    fn terminal_replacement_failure_requests_ui_shutdown_and_aggregates_cleanup() {
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let mut shutdown = crate::sdk::SessionResourceShutdown::default();
+        shutdown.fail(String::from("candidate extension shutdown timed out"));
+
+        let error = terminal_replacement_error(
+            &agent_tx,
+            String::from("old MCP shutdown timed out"),
+            &shutdown,
+        );
+
+        assert!(matches!(
+            agent_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(PiMsg::UiShutdown)
+        ));
+        let message = error.to_string();
+        assert!(message.contains("old MCP shutdown timed out"), "{message}");
+        assert!(
+            message.contains("candidate extension shutdown timed out"),
+            "{message}"
         );
     }
 
@@ -4215,6 +4616,68 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_ask_is_dismissed_without_replacing_active_card() {
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel::<AskUiReply>();
+        let model = PiFtuiModel::new(agent_rx).with_ask_reply_channel(reply_tx);
+        drop(agent_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-active",
+            vec![question("First?", &["a", "b"], false)],
+        ))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-overlap",
+            vec![question("Second?", &["c", "d"], false)],
+        ))));
+
+        assert_eq!(
+            sim.model()
+                .active_ask
+                .as_ref()
+                .map(|ask| ask.request.id.as_str()),
+            Some("ask-active"),
+            "overlap must not replace the reachable card"
+        );
+        let dismissed = reply_rx.try_recv().expect("overlap receives dismissal");
+        assert_eq!(dismissed.request_id, "ask-overlap");
+        assert!(dismissed.response.dismissed);
+        assert!(dismissed.response.answers.is_empty());
+    }
+
+    #[test]
+    fn ask_overlapping_active_extension_is_dismissed_without_replacement() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ask_tx, ask_rx) = mpsc::channel::<AskUiReply>();
+        let (ext_tx, _ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx)
+            .with_ask_reply_channel(ask_tx)
+            .with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-active",
+            "confirm",
+            serde_json::json!({"title": "First?"}),
+        ))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-overlap",
+            vec![question("Second?", &["a", "b"], false)],
+        ))));
+
+        assert_eq!(
+            sim.model().active_ext.as_ref().map(|request| request.id.as_str()),
+            Some("ext-active")
+        );
+        assert!(sim.model().active_ask.is_none());
+        let dismissed = ask_rx.try_recv().expect("overlap receives dismissal");
+        assert_eq!(dismissed.request_id, "ask-overlap");
+        assert!(dismissed.response.dismissed);
+    }
+
+    #[test]
     fn ask_free_text_becomes_other_answer() {
         let (agent_tx, agent_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel::<AskUiReply>();
@@ -4257,13 +4720,188 @@ mod tests {
     }
 
     fn ext_request(id: &str, method: &str, payload: serde_json::Value) -> ExtensionUiRequest {
-        ExtensionUiRequest {
-            id: id.to_string(),
-            method: method.to_string(),
-            payload,
-            timeout_ms: None,
-            extension_id: Some(String::from("demo-ext")),
-        }
+        ExtensionUiRequest::new(id, method, payload)
+            .with_extension_id(Some(String::from("demo-ext")))
+    }
+
+    #[test]
+    fn extension_reply_disconnect_cancels_pending_and_rejects_new_prompts() {
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let handler = FtuiExtensionUiHandler::new(agent_tx);
+        let (pending_tx, mut pending_rx) = asupersync::channel::oneshot::channel();
+        handler
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(String::from("startup-prompt"), pending_tx);
+        let (ext_reply_tx, ext_reply_rx) = mpsc::channel::<ExtensionUiResponse>();
+        drop(ext_reply_tx);
+
+        assert!(matches!(
+            poll_ext_reply(&handler, &ext_reply_rx),
+            ExtReplyPoll::Disconnected
+        ));
+        assert!(
+            handler
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "disconnect must drain every outstanding prompt"
+        );
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cancelled = runtime
+            .block_on(async {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                pending_rx.recv(cx.cx()).await
+            })
+            .expect("pending prompt receives cancellation");
+        assert_eq!(cancelled.id, "startup-prompt");
+        assert!(cancelled.cancelled);
+
+        let mut late_request = ext_request(
+            "late-prompt",
+            "confirm",
+            serde_json::json!({"title": "Too late?"}),
+        );
+        late_request.timeout_ms = Some(10);
+        let rejected = runtime
+            .block_on(crate::sdk::ExtensionUiHandler::request_ui(
+                &handler,
+                late_request,
+            ))
+            .expect("closed UI returns a typed response")
+            .expect("closed UI returns cancellation rather than absence");
+        assert_eq!(rejected.id, "late-prompt");
+        assert!(rejected.cancelled);
+        assert!(
+            agent_rx.try_recv().is_err(),
+            "closed reply channel must reject new prompts before UI dispatch"
+        );
+    }
+
+    #[test]
+    fn ftui_extension_handler_notification_never_waits_for_reply() {
+        asupersync::test_utils::run_test(|| async {
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let handler = FtuiExtensionUiHandler::new(agent_tx);
+            let notification = ext_request(
+                "notify-1",
+                "notify",
+                serde_json::json!({"title": "Complete", "message": "Build finished"}),
+            );
+
+            let outcome = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(20),
+                crate::sdk::ExtensionUiHandler::request_ui(&handler, notification),
+            )
+            .await
+            .expect("notification must not wait on the response timeout")
+            .expect("notification dispatch succeeds");
+
+            assert!(outcome.is_none(), "notification has no response contract");
+            assert!(
+                handler
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "notification must not allocate a pending waiter"
+            );
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::ExtensionUiRequest(request)) if request.id == "notify-1"
+            ));
+        });
+    }
+
+    #[test]
+    fn dropping_ftui_extension_request_releases_pending_entry() {
+        asupersync::test_utils::run_test(|| async {
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let handler = FtuiExtensionUiHandler::new(agent_tx);
+            let request = ext_request(
+                "cancelled-ftui-request",
+                "confirm",
+                serde_json::json!({"title": "Cancel me"}),
+            );
+            let mut attempt = Box::pin(crate::sdk::ExtensionUiHandler::request_ui(
+                &handler, request,
+            ));
+            assert!(futures::poll!(attempt.as_mut()).is_pending());
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::ExtensionUiRequest(request))
+                    if request.id == "cancelled-ftui-request"
+            ));
+            assert_eq!(
+                handler
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1
+            );
+
+            drop(attempt);
+
+            assert!(
+                handler
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "cancelling the outer future must release its pending lease"
+            );
+        });
+    }
+
+    #[test]
+    fn ask_reply_disconnect_closes_picker_surface() {
+        let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+        let (ui_tx, _ui_rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(4);
+        tool.install_channel_ui(ui_tx);
+        let current_ask = Arc::new(Mutex::new(Some(tool.clone())));
+        let (reply_tx, reply_rx) = mpsc::channel::<AskUiReply>();
+        drop(reply_tx);
+
+        assert!(matches!(
+            poll_ask_reply(&current_ask, &reply_rx),
+            AskReplyPoll::Disconnected
+        ));
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(async {
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(20),
+                crate::tools::Tool::execute(
+                    &tool,
+                    "ask-after-disconnect",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Too late?",
+                            "options": [{"label": "A"}, {"label": "B"}]
+                        }]
+                    }),
+                    None,
+                ),
+            )
+            .await
+        });
+        let error = result
+            .expect("closed picker must reject before the short mutation guard expires")
+            .expect_err("closed picker must reject later cards");
+        assert!(
+            error.to_string().contains("picker surface closed"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4325,6 +4963,33 @@ mod tests {
     }
 
     #[test]
+    fn extension_prompt_escape_discards_partial_answer_and_restores_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "saved extension draft");
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-escape",
+            "input",
+            serde_json::json!({"title": "Value?"}),
+        ))));
+        assert!(sim.model().input.text().is_empty());
+        type_str(&mut sim, "partial card answer");
+
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+
+        let reply = ext_rx.try_recv().expect("extension cancellation routed");
+        assert_eq!(reply.id, "ext-escape");
+        assert!(reply.cancelled);
+        assert!(sim.model().active_ext.is_none());
+        assert_eq!(sim.model().input.text(), "saved extension draft");
+        assert!(sim.model().card_draft_snapshot.is_none());
+    }
+
+    #[test]
     fn extension_prompt_queues_behind_active_ask() {
         let (_agent_tx, rx) = mpsc::channel();
         let (ask_tx, _ask_rx) = mpsc::channel::<AskUiReply>();
@@ -4356,6 +5021,235 @@ mod tests {
     }
 
     #[test]
+    fn mixed_card_burst_restores_only_the_preexisting_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ask_tx, _ask_rx) = mpsc::channel::<AskUiReply>();
+        let (ext_tx, _ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx)
+            .with_ask_reply_channel(ask_tx)
+            .with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "keep this draft");
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-first",
+            vec![question("Pick?", &["a", "b"], false)],
+        ))));
+        assert!(sim.model().input.text().is_empty());
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-second",
+            "confirm",
+            serde_json::json!({"title": "Continue?"}),
+        ))));
+
+        type_str(&mut sim, "1");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            sim.model().active_ext.as_ref().map(|request| request.id.as_str()),
+            Some("ext-second")
+        );
+        assert!(
+            sim.model().input.text().is_empty(),
+            "the Ask answer must not become the extension draft"
+        );
+        type_str(&mut sim, "yes");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        assert_eq!(sim.model().input.text(), "keep this draft");
+        assert!(sim.model().card_draft_snapshot.is_none());
+    }
+
+    #[test]
+    fn whitespace_only_draft_is_preserved_byte_for_byte_around_card() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ask_tx, _ask_rx) = mpsc::channel::<AskUiReply>();
+        let model = PiFtuiModel::new(rx).with_ask_reply_channel(ask_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.model_mut().input.set_text(" \n\t");
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-whitespace-draft",
+            vec![question("Pick?", &["a", "b"], false)],
+        ))));
+        assert!(
+            sim.model().input.text().is_empty(),
+            "card activation must clear even a whitespace-only draft"
+        );
+
+        type_str(&mut sim, "1");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        assert_eq!(sim.model().input.text(), " \n\t");
+        assert!(sim.model().card_draft_snapshot.is_none());
+    }
+
+    #[test]
+    fn extension_notification_is_nonmodal_during_active_ask() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ask_tx, _ask_rx) = mpsc::channel::<AskUiReply>();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx)
+            .with_ask_reply_channel(ask_tx)
+            .with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-hold",
+            vec![question("Pick?", &["a", "b"], false)],
+        ))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "notify-during-ask",
+            "notify",
+            serde_json::json!({"title": "Heads up", "message": "Build finished"}),
+        ))));
+
+        assert_eq!(
+            sim.model()
+                .active_ask
+                .as_ref()
+                .map(|ask| ask.request.id.as_str()),
+            Some("ask-hold")
+        );
+        assert!(sim.model().active_ext.is_none());
+        assert!(sim.model().ext_queue.is_empty());
+        assert!(ext_rx.try_recv().is_err(), "notification has no reply");
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains("Build finished")),
+            "notification must remain visible in the transcript"
+        );
+    }
+
+    fn assert_terminal_event_dismisses_ask_and_queued_extension(event: PiMsg) {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ask_tx, ask_rx) = mpsc::channel::<AskUiReply>();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx)
+            .with_ask_reply_channel(ask_tx)
+            .with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "saved draft");
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-stale",
+            vec![question("Pick?", &["a", "b"], false)],
+        ))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-stale",
+            "confirm",
+            serde_json::json!({"title": "Later?"}),
+        ))));
+        type_str(&mut sim, "draft");
+
+        sim.send(PiFtuiMsg::Agent(event));
+
+        assert!(sim.model().active_ask.is_none());
+        assert!(sim.model().active_ext.is_none());
+        assert!(sim.model().ext_queue.is_empty());
+        assert_eq!(sim.model().input.text(), "saved draft");
+        assert!(sim.model().card_draft_snapshot.is_none());
+        let ask_reply = ask_rx.try_recv().expect("active Ask receives dismissal");
+        assert_eq!(ask_reply.request_id, "ask-stale");
+        assert!(ask_reply.response.dismissed);
+        let ext_reply = ext_rx
+            .try_recv()
+            .expect("queued extension prompt receives cancellation");
+        assert_eq!(ext_reply.id, "ext-stale");
+        assert!(ext_reply.cancelled);
+    }
+
+    #[test]
+    fn terminal_agent_events_invalidate_turn_owned_interactions() {
+        assert_terminal_event_dismisses_ask_and_queued_extension(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        });
+        assert_terminal_event_dismisses_ask_and_queued_extension(PiMsg::AgentError(
+            String::from("turn failed"),
+        ));
+        assert_terminal_event_dismisses_ask_and_queued_extension(PiMsg::ConversationReset {
+            session_id: String::from("replacement"),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        });
+    }
+
+    #[test]
+    fn agent_done_cancels_active_and_queued_extension_prompts() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-active",
+            "confirm",
+            serde_json::json!({"title": "Now?"}),
+        ))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-queued",
+            "input",
+            serde_json::json!({"title": "Later?"}),
+        ))));
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+
+        assert!(sim.model().active_ext.is_none());
+        assert!(sim.model().ext_queue.is_empty());
+        let first = ext_rx.try_recv().expect("active prompt cancelled");
+        let second = ext_rx.try_recv().expect("queued prompt cancelled");
+        assert_eq!(first.id, "ext-active");
+        assert_eq!(second.id, "ext-queued");
+        assert!(first.cancelled && second.cancelled);
+    }
+
+    #[test]
+    fn installed_ftui_ask_forwarder_observes_close_before_dispatch() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let forwarder = install_ask_forwarder(&tool, &agent_tx, &runtime_handle);
+
+        runtime.block_on(async {
+            let mut execution = Box::pin(crate::tools::Tool::execute(
+                &tool,
+                "ask-close-before-ftui-forward",
+                serde_json::json!({
+                    "questions": [{
+                        "question": "Pick?",
+                        "options": [{"label": "A"}, {"label": "B"}]
+                    }]
+                }),
+                None,
+            ));
+            assert!(futures::poll!(execution.as_mut()).is_pending());
+            assert_eq!(tool.close_channel_ui(), 1);
+            drop(execution);
+            forwarder.await;
+            assert!(
+                agent_rx.try_recv().is_err(),
+                "closed Ask must not reach the FTUI model"
+            );
+        });
+    }
+
+    #[test]
     fn escape_dismisses_active_ask() {
         let (agent_tx, agent_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel::<AskUiReply>();
@@ -4363,15 +5257,19 @@ mod tests {
         drop(agent_tx);
         let mut sim = ProgramSimulator::new(model);
         sim.init();
+        type_str(&mut sim, "saved draft");
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
         sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
             "ask-esc",
             vec![question("Continue?", &["yes", "no"], false)],
         ))));
+        assert!(sim.model().input.text().is_empty());
+        type_str(&mut sim, "partial answer");
         sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
         let reply = reply_rx.try_recv().expect("dismissal sent");
         assert!(reply.response.dismissed);
         assert!(sim.model().active_ask.is_none());
+        assert_eq!(sim.model().input.text(), "saved draft");
     }
 
     #[test]

@@ -12,7 +12,47 @@ use glamour::{Style as GlamourStyle, StyleConfig as GlamourStyleConfig};
 use lipgloss::Style as LipglossStyle;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// Maximum UTF-8 source size accepted for any user-supplied resource file.
+///
+/// Theme loading shares this limit with skills and prompt templates so startup
+/// cannot allocate an arbitrarily large file while resource categories load in
+/// parallel. Readers consume at most one byte beyond the limit to distinguish
+/// an exact-limit file from an oversized one.
+pub(crate) const MAX_RESOURCE_FILE_BYTES: usize = 1024 * 1024;
+
+fn read_theme_file_bounded(path: &Path) -> Result<String> {
+    let file = fs::File::open(path).map_err(|err| {
+        Error::config(format!(
+            "Failed to open theme file '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_RESOURCE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            Error::config(format!(
+                "Failed to read theme file '{}': {err}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > MAX_RESOURCE_FILE_BYTES {
+        return Err(Error::config(format!(
+            "Theme file '{}' exceeds the {MAX_RESOURCE_FILE_BYTES}-byte resource limit",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|err| {
+        Error::config(format!(
+            "Theme file '{}' is not valid UTF-8: {}",
+            path.display(),
+            err.utf8_error()
+        ))
+    })
+}
 
 // `TuiStyles` and the `tui_styles`/`glamour_style_config` helpers below build
 // concrete lipgloss/glamour render styles and are only needed by the
@@ -331,7 +371,7 @@ impl Theme {
 
     /// Load a theme from a JSON file.
     pub fn load(path: &Path) -> Result<Self> {
-        let content = fs::read_to_string(path)?;
+        let content = read_theme_file_bounded(path)?;
         let theme: Self = serde_json::from_str(&content)?;
         theme.validate()?;
         Ok(theme)

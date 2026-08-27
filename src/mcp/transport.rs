@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -1172,18 +1172,6 @@ async fn wait_for_child_exit(client: &McpStdioClient, budget: Duration) -> bool 
 // Streamable HTTP transport
 // ============================================================================
 
-/// Reject CR/LF in a header name or value (header-injection guard). Config
-/// files and server-assigned session ids are both untrusted here.
-fn require_header_safe(what: &str, value: &str) -> Result<()> {
-    if value.contains(['\r', '\n']) {
-        return Err(tool_err(
-            "MCP_HEADER_UNSAFE",
-            format!("{what} contains CR/LF; refusing to send it as a header"),
-        ));
-    }
-    Ok(())
-}
-
 /// Streamable HTTP MCP transport.
 ///
 /// POST per message; the response may be a single JSON document or an SSE
@@ -1193,26 +1181,69 @@ pub struct HttpTransport {
     client: crate::http::client::Client,
     url: String,
     headers: Vec<(String, String)>,
-    session_id: Mutex<Option<String>>,
+    session: Mutex<HttpSessionState>,
+    next_id: AtomicU64,
     alive: std::sync::atomic::AtomicBool,
     abort_notify: asupersync::sync::Notify,
     lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
 }
 
+#[derive(Default)]
+struct HttpSessionState {
+    session_id: Option<String>,
+    protocol_version: Option<String>,
+    initialize_params: Option<Value>,
+}
+
+struct ProvisionalHttpSession<'a> {
+    transport: &'a HttpTransport,
+    active: bool,
+}
+
+impl ProvisionalHttpSession<'_> {
+    fn commit(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ProvisionalHttpSession<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.transport.reset_session_state();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HttpRoundTripKind<'a> {
+    Request { expected_id: u64, method: &'a str },
+    AcceptedMessage { description: &'static str },
+}
+
+#[derive(Clone, Copy)]
+enum HttpResponseMediaType {
+    Json,
+    EventStream,
+}
+
 impl HttpTransport {
     /// # Errors
     ///
-    /// Fails when any custom header name/value contains CR/LF.
+    /// Fails when custom headers are malformed, unsafe, duplicated, or claim
+    /// a protocol-owned header.
     pub fn new(url: &str, headers: Vec<(String, String)>) -> Result<Self> {
-        for (name, value) in &headers {
-            require_header_safe("header name", name)?;
-            require_header_safe(&format!("header {name:?} value"), value)?;
-        }
+        let headers = super::config::normalize_http_headers(headers).map_err(|reason| {
+            tool_err(
+                "MCP_CONFIG_INVALID",
+                format!("invalid custom HTTP headers: {reason}"),
+            )
+        })?;
         Ok(Self {
             client: crate::http::client::Client::new(),
             url: url.to_string(),
             headers,
-            session_id: Mutex::new(None),
+            session: Mutex::new(HttpSessionState::default()),
+            next_id: AtomicU64::new(1),
             alive: std::sync::atomic::AtomicBool::new(true),
             abort_notify: asupersync::sync::Notify::new(),
             lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
@@ -1223,6 +1254,37 @@ impl HttpTransport {
         mutex
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn next_request_id(&self) -> Result<u64> {
+        self.next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| tool_err("MCP_PROTOCOL", "HTTP request id space exhausted"))
+    }
+
+    fn clear_negotiated_state(&self) {
+        let mut session = Self::lock(&self.session);
+        session.session_id = None;
+        session.protocol_version = None;
+    }
+
+    fn reset_session_state(&self) {
+        *Self::lock(&self.session) = HttpSessionState::default();
+    }
+
+    fn begin_provisional_session(
+        &self,
+        candidate_session_id: Option<&str>,
+    ) -> Result<Option<ProvisionalHttpSession<'_>>> {
+        let Some(session_id) = candidate_session_id else {
+            return Ok(None);
+        };
+        validate_http_session_id(session_id)?;
+        Self::lock(&self.session).session_id = Some(session_id.to_string());
+        Ok(Some(ProvisionalHttpSession {
+            transport: self,
+            active: true,
+        }))
     }
 
     async fn run_until_abort<F, T>(&self, operation: F) -> Result<T>
@@ -1250,26 +1312,44 @@ impl HttpTransport {
         }
     }
 
-    /// One POST round-trip, returning the JSON-RPC response value.
-    async fn round_trip(&self, frame: &Value, timeout: Duration) -> Result<Value> {
-        self.run_until_abort(self.round_trip_inner(frame, timeout))
+    /// One POST round-trip, returning a validated JSON-RPC response value.
+    async fn round_trip(
+        &self,
+        frame: &Value,
+        timeout: Duration,
+        kind: HttpRoundTripKind<'_>,
+    ) -> Result<Value> {
+        self.run_until_abort(self.round_trip_inner(frame, timeout, kind))
             .await
     }
 
-    async fn round_trip_inner(&self, frame: &Value, timeout: Duration) -> Result<Value> {
+    async fn round_trip_inner(
+        &self,
+        frame: &Value,
+        timeout: Duration,
+        kind: HttpRoundTripKind<'_>,
+    ) -> Result<Value> {
         let mut request = self
             .client
             .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
         for (name, value) in &self.headers {
-            // ubs:ignore CR/LF-validated at HttpTransport::new (require_header_safe)
+            // ubs:ignore names and values validated at HttpTransport::new
             request = request.header(name.clone(), value.clone());
         }
-        let assigned_session = { Self::lock(&self.session_id).clone() };
+        let (assigned_session, protocol_version) = {
+            let session = Self::lock(&self.session);
+            (session.session_id.clone(), session.protocol_version.clone())
+        };
+        let had_assigned_session = assigned_session.is_some();
         if let Some(session) = assigned_session {
             // ubs:ignore CR/LF-filtered at capture (hostile-server guard above)
             request = request.header("Mcp-Session-Id", session);
+        }
+        if let Some(protocol_version) = protocol_version {
+            // ubs:ignore validated at initialize-state capture below
+            request = request.header("Mcp-Protocol-Version", protocol_version);
         }
         let response = request
             .json(frame)
@@ -1280,27 +1360,23 @@ impl HttpTransport {
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("send: {err}")))?;
 
         let status = response.status();
-        // Capture the session id the server assigned (initialize response).
-        // A CR/LF-laden id is a hostile-server header-injection attempt:
-        // fail closed by ignoring it.
-        if let Some(assigned) = response
+        let candidate_session_id = response
             .headers()
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
-            .map(|(_, value)| value.clone())
-            .filter(|value| !value.contains(['\r', '\n']))
-        {
-            *Self::lock(&self.session_id) = Some(assigned);
-        }
+            .map(|(_, value)| value.clone());
         let content_type = response
             .headers()
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             .map(|(_, value)| value.clone())
             .unwrap_or_default();
-        if status == 202 {
-            // Accepted: notification/response acknowledgment, no body.
-            return Ok(Value::Null);
+        if status == 404 && had_assigned_session {
+            self.clear_negotiated_state();
+            return Err(tool_err(
+                "MCP_SESSION_EXPIRED",
+                "server rejected the active Mcp-Session-Id with HTTP 404",
+            ));
         }
         if !(200..300).contains(&status) {
             let body = response.text_limited(4096).await.unwrap_or_default();
@@ -1309,61 +1385,515 @@ impl HttpTransport {
                 format!("HTTP {status} from {}: {}", self.url, body.trim()),
             ));
         }
-        if content_type.contains("text/event-stream") {
-            let body = response
-                .text_limited(MAX_HTTP_BODY)
-                .await
-                .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read SSE body: {err}")))?;
-            return parse_sse_responses(&body);
+        match kind {
+            HttpRoundTripKind::AcceptedMessage { .. } if status == 202 => {
+                let body = response.bytes_limited(1).await.map_err(|err| {
+                    tool_err(
+                        "MCP_PROTOCOL",
+                        format!("HTTP 202 response body was not empty: {err}"),
+                    )
+                })?;
+                if body.is_empty() {
+                    return Ok(Value::Null);
+                }
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    "HTTP 202 response to a JSON-RPC notification or response must have no body",
+                ));
+            }
+            HttpRoundTripKind::AcceptedMessage { description } => {
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    format!("HTTP {description} expected status 202, received {status}"),
+                ));
+            }
+            HttpRoundTripKind::Request { method, .. } if status == 202 => {
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    format!("HTTP 202 cannot acknowledge JSON-RPC request {method:?}"),
+                ));
+            }
+            HttpRoundTripKind::Request { .. } => {}
         }
-        let body = response
-            .text_limited(MAX_HTTP_BODY)
-            .await
-            .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read body: {err}")))?;
-        let value: Value = serde_json::from_str(&body).map_err(|err| {
+
+        let HttpRoundTripKind::Request {
+            expected_id,
+            method,
+        } = kind
+        else {
+            unreachable!("notification status handling returned above");
+        };
+        let media_type = classify_http_response_media_type(&content_type)?;
+        let mut provisional_session = if method == "initialize"
+            && matches!(media_type, HttpResponseMediaType::EventStream)
+        {
+            self.begin_provisional_session(candidate_session_id.as_deref())?
+        } else {
+            None
+        };
+        let result = match media_type {
+            HttpResponseMediaType::EventStream => {
+                self.receive_sse_response(response, expected_id).await?
+            }
+            HttpResponseMediaType::Json => {
+                let body = response
+                    .text_limited(MAX_HTTP_BODY)
+                    .await
+                    .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read body: {err}")))?;
+                let value: Value = serde_json::from_str(&body).map_err(|err| {
+                    tool_err(
+                        "MCP_PROTOCOL",
+                        format!("response is not JSON: {err} (body: {:.200})", body.trim()),
+                    )
+                })?;
+                validate_jsonrpc_response(&value, expected_id)?
+            }
+        };
+
+        if method == "initialize" {
+            self.capture_initialize_state(&result, candidate_session_id, frame)?;
+            if let Some(session) = provisional_session.as_mut() {
+                session.commit();
+            }
+        }
+        Ok(result)
+    }
+
+    fn capture_initialize_state(
+        &self,
+        result: &Value,
+        candidate_session_id: Option<String>,
+        initialize_frame: &Value,
+    ) -> Result<()> {
+        let result = result.as_object().ok_or_else(|| {
+            tool_err("MCP_PROTOCOL", "initialize result must be an object")
+        })?;
+        let protocol_version = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                tool_err(
+                    "MCP_PROTOCOL",
+                    "initialize result is missing protocolVersion",
+                )
+            })?;
+        super::config::validate_http_header_value(protocol_version)
+            .map_err(|err| tool_err("MCP_PROTOCOL", format!("invalid protocolVersion: {err}")))?;
+        if protocol_version != MCP_PROTOCOL_VERSION {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                format!(
+                    "server selected unsupported protocolVersion {protocol_version:?}; supported version is {MCP_PROTOCOL_VERSION}"
+                ),
+            ));
+        }
+        if !result.get("capabilities").is_some_and(Value::is_object) {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "initialize result requires an object-valued capabilities field",
+            ));
+        }
+        let server_info = result
+            .get("serverInfo")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                tool_err(
+                    "MCP_PROTOCOL",
+                    "initialize result requires an object-valued serverInfo field",
+                )
+            })?;
+        if server_info.get("name").and_then(Value::as_str).is_none()
+            || server_info.get("version").and_then(Value::as_str).is_none()
+        {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "initialize result serverInfo requires string name and version fields",
+            ));
+        }
+        if let Some(session_id) = candidate_session_id.as_deref() {
+            validate_http_session_id(session_id)?;
+        }
+        *Self::lock(&self.session) = HttpSessionState {
+            session_id: candidate_session_id,
+            protocol_version: Some(protocol_version.to_string()),
+            initialize_params: Some(
+                initialize_frame
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        };
+        Ok(())
+    }
+
+    async fn request_once(
+        &self,
+        method: &str,
+        params: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        validate_outgoing_params(method, params)?;
+        let id = self.next_request_id()?;
+        let mut frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+        });
+        if !params.is_null() {
+            frame["params"] = params.clone();
+        }
+        self.round_trip(
+            &frame,
+            timeout,
+            HttpRoundTripKind::Request {
+                expected_id: id,
+                method,
+            },
+        )
+        .await
+    }
+
+    async fn notify_once(&self, method: &str, params: &Value) -> Result<()> {
+        validate_outgoing_params(method, params)?;
+        let mut frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+        });
+        if !params.is_null() {
+            frame["params"] = params.clone();
+        }
+        self.round_trip(
+            &frame,
+            DEFAULT_MCP_TIMEOUT,
+            HttpRoundTripKind::AcceptedMessage {
+                description: "JSON-RPC notification",
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn send_server_response(&self, frame: &Value) -> Result<()> {
+        // Box the nested POST edge: an SSE response can contain a server
+        // request, whose client response is another HTTP round-trip.
+        let result = Box::pin(self.round_trip(
+            frame,
+            DEFAULT_MCP_TIMEOUT,
+            HttpRoundTripKind::AcceptedMessage {
+                description: "JSON-RPC response",
+            },
+        ))
+        .await;
+        match result {
+            Err(error) if is_session_expired(&error) => Err(tool_err(
+                "MCP_DELIVERY_INDETERMINATE",
+                "server rejected the client response inside an already-accepted SSE request; refusing to replay the originating request",
+            )),
+            result => result.map(|_| ()),
+        }
+    }
+
+    async fn handle_sse_message(&self, value: Value, expected_id: u64) -> Result<Option<Value>> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| tool_err("MCP_PROTOCOL", "SSE JSON-RPC message must be an object"))?;
+        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "SSE JSON-RPC message must declare jsonrpc \"2.0\"",
+            ));
+        }
+        if let Some(method) = object.get("method") {
+            if object.contains_key("result") || object.contains_key("error") {
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    "SSE JSON-RPC request or notification must not contain result or error",
+                ));
+            }
+            let method = method.as_str().ok_or_else(|| {
+                tool_err("MCP_PROTOCOL", "SSE JSON-RPC method must be a string")
+            })?;
+            if object.get("params").is_some_and(|params| !params.is_object()) {
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    "SSE JSON-RPC request or notification params must be an object",
+                ));
+            }
+            let Some(id) = object.get("id") else {
+                // Notifications do not require a response. Optional client
+                // features are not advertised by this transport today, so
+                // no notification dispatch is required at this layer.
+                return Ok(None);
+            };
+            if !matches!(id, Value::Number(_) | Value::String(_)) {
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    "SSE JSON-RPC request id must be a string or number",
+                ));
+            }
+            let response = if method == "ping" {
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("client method {method:?} is not supported")
+                    }
+                })
+            };
+            self.send_server_response(&response).await?;
+            return Ok(None);
+        }
+        validate_jsonrpc_response(&value, expected_id).map(Some)
+    }
+
+    async fn handle_sse_event(
+        &self,
+        event: crate::sse::SseEvent,
+        expected_id: u64,
+    ) -> Result<Option<Value>> {
+        let data = event.data.trim();
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let value: Value = serde_json::from_str(data).map_err(|err| {
             tool_err(
                 "MCP_PROTOCOL",
-                format!("response is not JSON: {err} (body: {:.200})", body.trim()),
+                format!("SSE event data is not a JSON-RPC message: {err}"),
             )
         })?;
-        // Unwrap the JSON-RPC envelope, same as the SSE path.
-        if let Some(error) = value.get("error") {
+        self.handle_sse_message(value, expected_id).await
+    }
+
+    async fn receive_sse_response(
+        &self,
+        response: crate::http::client::Response,
+        expected_id: u64,
+    ) -> Result<Value> {
+        let mut stream = response.bytes_stream();
+        let mut parser = crate::sse::SseParser::new();
+        let mut pending_utf8 = Vec::new();
+        let mut received_bytes = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read SSE body: {err}")))?;
+            received_bytes = received_bytes.checked_add(chunk.len()).ok_or_else(|| {
+                tool_err("MCP_PROTOCOL", "SSE response body byte count overflowed")
+            })?;
+            if received_bytes > MAX_HTTP_BODY {
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    format!("SSE response exceeded {MAX_HTTP_BODY} bytes"),
+                ));
+            }
+            pending_utf8.extend_from_slice(&chunk);
+            let valid_bytes = match std::str::from_utf8(&pending_utf8) {
+                Ok(_) => pending_utf8.len(),
+                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                Err(error) => {
+                    return Err(tool_err(
+                        "MCP_PROTOCOL",
+                        format!("SSE response is not valid UTF-8: {error}"),
+                    ));
+                }
+            };
+            if valid_bytes == 0 {
+                continue;
+            }
+            let tail = pending_utf8.split_off(valid_bytes);
+            let text = std::str::from_utf8(&pending_utf8)
+                .map_err(|err| tool_err("MCP_PROTOCOL", format!("invalid SSE UTF-8: {err}")))?;
+            for event in parser.feed(text) {
+                if let Some(result) = self.handle_sse_event(event, expected_id).await? {
+                    return Ok(result);
+                }
+            }
+            pending_utf8 = tail;
+        }
+        if !pending_utf8.is_empty() {
+            let text = std::str::from_utf8(&pending_utf8).map_err(|err| {
+                tool_err(
+                    "MCP_PROTOCOL",
+                    format!("SSE response ended with invalid UTF-8: {err}"),
+                )
+            })?;
+            for event in parser.feed(text) {
+                if let Some(result) = self.handle_sse_event(event, expected_id).await? {
+                    return Ok(result);
+                }
+            }
+        }
+        if let Some(event) = parser.flush()
+            && let Some(result) = self.handle_sse_event(event, expected_id).await?
+        {
+            return Ok(result);
+        }
+        Err(tool_err(
+            "MCP_PROTOCOL",
+            "SSE response contained no matching JSON-RPC response",
+        ))
+    }
+
+    async fn renew_session(&self) -> Result<()> {
+        let initialize_params = Self::lock(&self.session)
+            .initialize_params
+            .clone()
+            .ok_or_else(|| {
+                tool_err(
+                    "MCP_SESSION_EXPIRED",
+                    "cannot renew an HTTP session without a validated initialize request",
+                )
+            })?;
+        self.reset_session_state();
+        let result = match self
+            .request_once("initialize", &initialize_params, DEFAULT_MCP_TIMEOUT)
+            .await
+        {
+            Ok(_) => {
+                self.notify_once("notifications/initialized", &serde_json::json!({}))
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+}
+
+fn classify_http_response_media_type(content_type: &str) -> Result<HttpResponseMediaType> {
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if media_type.eq_ignore_ascii_case("application/json") {
+        Ok(HttpResponseMediaType::Json)
+    } else if media_type.eq_ignore_ascii_case("text/event-stream") {
+        Ok(HttpResponseMediaType::EventStream)
+    } else {
+        Err(tool_err(
+            "MCP_PROTOCOL",
+            format!(
+                "HTTP JSON-RPC request response requires Content-Type application/json or text/event-stream, received {content_type:?}"
+            ),
+        ))
+    }
+}
+
+fn is_session_expired(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Tool { tool, message }
+            if tool == "mcp" && message.starts_with("[MCP_SESSION_EXPIRED]")
+    )
+}
+
+fn is_delivery_indeterminate(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Tool { tool, message }
+            if tool == "mcp" && message.starts_with("[MCP_DELIVERY_INDETERMINATE]")
+    )
+}
+
+fn validate_outgoing_params(method: &str, params: &Value) -> Result<()> {
+    if params.is_null() || params.is_object() {
+        Ok(())
+    } else {
+        Err(tool_err(
+            "MCP_PROTOCOL",
+            format!("JSON-RPC method {method:?} requires object-valued params"),
+        ))
+    }
+}
+
+fn validate_http_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|byte| matches!(byte, 0x21..=0x7e))
+    {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            "initialize response Mcp-Session-Id must contain only visible ASCII bytes",
+        ));
+    }
+    super::config::validate_http_header_value(session_id)
+        .map_err(|err| tool_err("MCP_PROTOCOL", format!("invalid Mcp-Session-Id: {err}")))
+}
+
+fn validate_jsonrpc_response(value: &Value, expected_id: u64) -> Result<Value> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| tool_err("MCP_PROTOCOL", "JSON-RPC response must be an object"))?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            "JSON-RPC response must declare jsonrpc \"2.0\"",
+        ));
+    }
+    let expected = Value::from(expected_id);
+    if object.get("id") != Some(&expected) {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            format!(
+                "JSON-RPC response id did not match request: expected {expected_id}, received {}",
+                object.get("id").unwrap_or(&Value::Null)
+            ),
+        ));
+    }
+    if object.contains_key("method") {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            "JSON-RPC response must not contain method",
+        ));
+    }
+    match (object.get("result"), object.get("error")) {
+        (Some(result), None) => Ok(result.clone()),
+        (None, Some(error)) => {
+            let error = error.as_object().ok_or_else(|| {
+                tool_err("MCP_PROTOCOL", "JSON-RPC error must be an object")
+            })?;
+            if !matches!(
+                error.get("code"),
+                Some(Value::Number(code)) if code.is_i64() || code.is_u64()
+            )
+                || error.get("message").and_then(Value::as_str).is_none()
+            {
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    "JSON-RPC error requires integer code and string message",
+                ));
+            }
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown server error");
-            return Err(tool_err(
+            Err(tool_err(
                 "MCP_SERVER_ERROR",
                 format!("server error: {message}"),
-            ));
+            ))
         }
-        Ok(value.get("result").cloned().unwrap_or(Value::Null))
+        _ => Err(tool_err(
+            "MCP_PROTOCOL",
+            "JSON-RPC response requires exactly one of result or error",
+        )),
     }
 }
 
-/// Parse an SSE body into the first JSON-RPC message carrying a result or
-/// error (legacy SSE accept: events may nest `data:` JSON-RPC frames).
-fn parse_sse_responses(body: &str) -> Result<Value> {
+/// Synchronous SSE envelope helper for focused parser tests. Production reads
+/// and handles the response stream incrementally in `receive_sse_response`.
+#[cfg(test)]
+fn parse_sse_responses(body: &str, expected_id: u64) -> Result<Value> {
     let mut parser = crate::sse::SseParser::new();
     let events = parser.feed(body);
     for event in events {
-        for line in event.data.lines() {
-            let Ok(value) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if value.get("result").is_some() || value.get("error").is_some() {
-                if let Some(error) = value.get("error") {
-                    let message = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown server error");
-                    return Err(tool_err(
-                        "MCP_SERVER_ERROR",
-                        format!("server error: {message}"),
-                    ));
-                }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-            }
+        let Ok(value) = serde_json::from_str::<Value>(event.data.trim()) else {
+            continue;
+        };
+        if value.get("result").is_some() || value.get("error").is_some() {
+            return validate_jsonrpc_response(&value, expected_id);
         }
     }
     Err(tool_err(
@@ -1371,9 +1901,6 @@ fn parse_sse_responses(body: &str) -> Result<Value> {
         "SSE stream ended without a JSON-RPC response",
     ))
 }
-
-/// Request id counter for the HTTP transport (process-global).
-static NEXT_HTTP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[async_trait]
 impl McpTransport for HttpTransport {
@@ -1383,25 +1910,58 @@ impl McpTransport for HttpTransport {
             asupersync::sync::OwnedMutexGuard::lock(std::sync::Arc::clone(&self.lane), cx.cx())
                 .await
                 .map_err(|_| tool_err("MCP_CANCELLED", "cancelled by ambient context"))?;
-        let id = NEXT_HTTP_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let frame = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        self.round_trip(&frame, timeout).await
+        if method == "initialize" {
+            // An explicit initialize always starts a fresh protocol session
+            // and must not replay headers negotiated by an older one.
+            self.reset_session_state();
+        }
+        let result = match self.request_once(method, &params, timeout).await {
+            Err(error) if method != "initialize" && is_session_expired(&error) => {
+                // A session-specific 404 proves the server rejected delivery,
+                // so exactly one reinitialize and replay is safe. There is no
+                // loop: a second 404 is returned to the caller.
+                self.renew_session().await?;
+                let result = self.request_once(method, &params, timeout).await;
+                if let Err(error) = &result
+                    && is_session_expired(error)
+                {
+                    self.abort();
+                }
+                result
+            }
+            result => result,
+        };
+        if let Err(error) = &result
+            && is_delivery_indeterminate(error)
+        {
+            self.abort();
+        }
+        result
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        let frame = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
-        self.round_trip(&frame, DEFAULT_MCP_TIMEOUT)
-            .await
-            .map(|_| ())
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let _lane =
+            asupersync::sync::OwnedMutexGuard::lock(std::sync::Arc::clone(&self.lane), cx.cx())
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled by ambient context"))?;
+        match self.notify_once(method, &params).await {
+            Err(error) if is_session_expired(&error) => {
+                self.renew_session().await?;
+                if method == "notifications/initialized" {
+                    Ok(())
+                } else {
+                    let result = self.notify_once(method, &params).await;
+                    if let Err(error) = &result
+                        && is_session_expired(error)
+                    {
+                        self.abort();
+                    }
+                    result
+                }
+            }
+            result => result,
+        }
     }
 
     fn is_alive(&self) -> bool {
@@ -1418,7 +1978,7 @@ impl McpTransport for HttpTransport {
         // Local teardown only: no session DELETE in v1 (server support for
         // it is spotty and the session expires server-side regardless).
         self.abort();
-        Self::lock(&self.session_id).take();
+        self.reset_session_state();
     }
 
     fn diagnostics_tail(&self) -> String {
@@ -1757,28 +2317,57 @@ mod tests {
     fn sse_parse_extracts_result() {
         let body =
             "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
-        let value = parse_sse_responses(body).expect("result");
+        let value = parse_sse_responses(body, 1).expect("result");
         assert_eq!(value["tools"], serde_json::json!([]));
     }
 
     #[test]
     fn sse_parse_surfaces_error() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no method\"}}\n\n";
-        let err = parse_sse_responses(body).expect_err("error");
+        let err = parse_sse_responses(body, 1).expect_err("error");
         assert!(err.to_string().contains("no method"), "{err}");
     }
 
     #[test]
     fn sse_parse_skips_non_rpc_events() {
         let body = "event: ping\ndata: {}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":42}\n\n";
-        let value = parse_sse_responses(body).expect("result after skip");
+        let value = parse_sse_responses(body, 2).expect("result after skip");
         assert_eq!(value, serde_json::json!(42));
+    }
+
+    #[test]
+    fn sse_parse_rejects_wrong_response_version_and_id() {
+        for body in [
+            "event: message\ndata: {\"jsonrpc\":\"1.0\",\"id\":7,\"result\":42}\n\n",
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":8,\"result\":42}\n\n",
+        ] {
+            let error = parse_sse_responses(body, 7)
+                .expect_err("a mismatched SSE response envelope must fail");
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+        }
     }
 
     #[test]
     fn sse_parse_requires_response() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";
-        assert!(parse_sse_responses(body).is_err());
+        assert!(parse_sse_responses(body, 1).is_err());
+    }
+
+    #[test]
+    fn http_transport_rejects_protocol_owned_and_unsafe_custom_headers() {
+        for headers in [
+            vec![(
+                "Mcp-Protocol-Version".to_string(),
+                MCP_PROTOCOL_VERSION.to_string(),
+            )],
+            vec![("Mcp-Session-Id".to_string(), "caller-owned".to_string())],
+            vec![("X-Test".to_string(), "line\nforge".to_string())],
+        ] {
+            let error = HttpTransport::new("http://127.0.0.1:1/mcp", headers)
+                .err()
+                .expect("unsafe or protocol-owned custom header must fail closed");
+            assert!(error.to_string().contains("MCP_CONFIG_INVALID"), "{error}");
+        }
     }
 
     #[test]

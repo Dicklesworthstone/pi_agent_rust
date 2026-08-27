@@ -894,6 +894,10 @@ impl PiApp {
     ) -> Option<Cmd> {
         let retry = session_event_retry_cmd(event, attempts_remaining);
         if retry.is_none() {
+            // The Session lock is still contended, so ownership remains
+            // unknowable. Exhaustion must be observable but non-destructive:
+            // mutating even reset-specific state here would let a delayed
+            // reset for session A idle or clear a live session-B turn.
             self.status_message = Some(
                 "Session remained busy; a delayed session update was not applied".to_string(),
             );
@@ -1046,6 +1050,13 @@ impl PiApp {
                 self.todo_summary = summary;
             }
             PiMsg::AskUiRequest(request) => {
+                if self
+                    .ask_tool
+                    .as_ref()
+                    .is_some_and(|tool| !tool.channel_ui_request_is_pending(&request.id))
+                {
+                    return None;
+                }
                 self.input_card_order.push_back(InputCardKind::Ask);
                 self.ask_ui_queue.push_back(request);
                 self.advance_ask_ui_queue();
@@ -1361,6 +1372,15 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
                 let is_replacement =
                     self.displayed_session_id.as_deref() != Some(session_id.as_str());
+                if is_replacement {
+                    // A draft captured before an old-session card belongs to
+                    // that session. Prevent the generic card drain below from
+                    // restoring it into the replacement session's editor.
+                    self.card_draft_snapshot = None;
+                }
+                // Compaction, fork, and session replacement are all terminal
+                // boundaries for UI requests admitted by the previous turn.
+                self.invalidate_input_cards_for_turn_end();
                 self.displayed_session_id = Some(session_id);
                 self.messages = messages;
                 self.total_usage = usage;
@@ -1376,12 +1396,13 @@ After approving access in the browser, press Enter in Pi to complete login."
                     self.todo_summary = None;
                     self.pending_oauth = None;
                     self.role_model_overrides.clear();
+                    self.tree_ui = None;
+                    self.extension_custom_active = false;
+                    self.extension_custom_key_queue.clear();
+                    self.extension_custom_overlay = None;
                 }
                 self.status_message = status;
                 self.message_render_cache.clear();
-                // Session replacement invalidates outstanding prompts: drop
-                // them fail-closed (bd-yllbn).
-                self.drain_capability_prompts_for_session_reset();
                 if let Err(message) = self.sync_runtime_selection_from_session_header() {
                     self.status_message = Some(message);
                 }
@@ -1477,8 +1498,12 @@ After approving access in the browser, press Enter in Pi to complete login."
             PiMsg::ExtensionUiRequest(request) => {
                 return self.handle_extension_ui_request(request);
             }
-            PiMsg::CapabilityPromptExpired { id, generation } => {
-                return self.handle_capability_prompt_expiry(id, generation);
+            PiMsg::CapabilityPromptTick {
+                id,
+                generation,
+                timer_generation,
+            } => {
+                return self.handle_capability_prompt_tick(id, generation, timer_generation);
             }
             PiMsg::ExtensionCommandDone {
                 command: _,
@@ -1635,7 +1660,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// senders fail fast instead of leaking past the turn. QUEUED items are
     /// drained first so resolution side effects cannot resurrect card
     /// activations behind this sweep's back.
-    fn invalidate_input_cards_for_turn_end(&mut self) {
+    pub(super) fn invalidate_input_cards_for_turn_end(&mut self) {
         let _ = std::mem::take(&mut self.input_card_order);
 
         while let Some(request) = self.ask_ui_queue.pop_front() {
@@ -1672,6 +1697,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
         self.active_input_card_kind = None;
         self.restore_card_draft_after_cards_settle();
+        self.drain_capability_prompts_for_session_reset();
     }
 
     /// FIFO capacity for queued capability prompts (bd-yllbn).
@@ -1695,6 +1721,14 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// strand bounded successors past their deadlines indefinitely.
     fn enqueue_capability_prompt(&mut self, mut overlay: CapabilityPromptOverlay) -> Option<Cmd> {
         overlay.generation = self.next_capability_prompt_generation();
+        if overlay
+            .expires_at
+            .is_some_and(|deadline| deadline <= std::time::Instant::now())
+        {
+            overlay.cancel_timer();
+            self.send_extension_ui_response_quiet(overlay.request.auto_deny_response());
+            return None;
+        }
         if self.capability_prompt.is_none() {
             return self.activate_capability_prompt(overlay);
         }
@@ -1707,31 +1741,66 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.send_extension_ui_response_quiet(response);
             return None;
         }
-        let queue_wake = Self::capability_prompt_expiry_cmd(&overlay);
+        let queue_wake = Self::capability_prompt_queue_deadline_cmd(&overlay);
         self.capability_prompt_queue.push_back(overlay);
         queue_wake
     }
 
-    /// Promote an overlay to the active slot and schedule its expiry wake.
-    fn activate_capability_prompt(&mut self, overlay: CapabilityPromptOverlay) -> Option<Cmd> {
-        let expiry_cmd = Self::capability_prompt_expiry_cmd(&overlay);
+    /// Promote an overlay to the active slot and schedule its first redraw.
+    fn activate_capability_prompt(&mut self, mut overlay: CapabilityPromptOverlay) -> Option<Cmd> {
+        // Replace any queued deadline waiter. A queued wake already in the
+        // program mailbox carries the previous timer epoch and is ignored.
+        overlay.restart_timer();
+        let tick_cmd = Self::capability_prompt_tick_cmd(&overlay);
         self.capability_prompt = Some(overlay);
-        expiry_cmd
+        tick_cmd
     }
 
-    /// Thread-pool command waking exactly once when this prompt's
-    /// authoritative deadline elapses. The sleep targets the absolute
-    /// expiry captured at arrival, the same budget the manager enforces.
-    fn capability_prompt_expiry_cmd(overlay: &CapabilityPromptOverlay) -> Option<Cmd> {
+    /// Cancellable periodic wake for one exact prompt generation.
+    ///
+    /// Each wait is at most one second, causing an idle TUI repaint so the
+    /// displayed countdown visibly decreases. The overlay-owned cancellation
+    /// signal interrupts the wait immediately on resolution/reset/quit, while
+    /// `(id, generation, timer_generation)` makes already-enqueued stale
+    /// ticks harmless.
+    fn capability_prompt_tick_cmd(overlay: &CapabilityPromptOverlay) -> Option<Cmd> {
         let expires_at = overlay.expires_at?;
         let id = overlay.request.id.clone();
         let generation = overlay.generation;
-        Some(Cmd::new(move || {
-            let now = std::time::Instant::now();
-            if let Some(remaining) = expires_at.checked_duration_since(now) {
-                std::thread::sleep(remaining);
-            }
-            Message::new(PiMsg::CapabilityPromptExpired { id, generation })
+        let timer_generation = overlay.timer_generation();
+        let remaining = expires_at.saturating_duration_since(std::time::Instant::now());
+        let delay = remaining.min(std::time::Duration::from_secs(1));
+        let timer = overlay.timer();
+        Some(Cmd::new_optional(move || {
+            timer.wait(delay).then(|| {
+                Message::new(PiMsg::CapabilityPromptTick {
+                    id,
+                    generation,
+                    timer_generation,
+                })
+            })
+        }))
+    }
+
+    /// Queued prompts do not need repaint ticks. Wait directly for their own
+    /// absolute deadline; promotion cancels and replaces this command.
+    fn capability_prompt_queue_deadline_cmd(
+        overlay: &CapabilityPromptOverlay,
+    ) -> Option<Cmd> {
+        let expires_at = overlay.expires_at?;
+        let id = overlay.request.id.clone();
+        let generation = overlay.generation;
+        let timer_generation = overlay.timer_generation();
+        let remaining = expires_at.saturating_duration_since(std::time::Instant::now());
+        let timer = overlay.timer();
+        Some(Cmd::new_optional(move || {
+            timer.wait(remaining).then(|| {
+                Message::new(PiMsg::CapabilityPromptTick {
+                    id,
+                    generation,
+                    timer_generation,
+                })
+            })
         }))
     }
 
@@ -1746,9 +1815,9 @@ After approving access in the browser, press Enter in Pi to complete login."
 
     /// Auto-deny path for an elapsed capability-prompt deadline (bd-yllbn).
     ///
-    /// Two independent resolution targets carry the exact `(id, generation)`
-    /// identity so stale, late, or foreign wakes can never dismiss or answer
-    /// a different prompt:
+    /// Two independent resolution targets carry the exact request, prompt,
+    /// and timer generation so stale, late, or foreign wakes can never
+    /// dismiss, answer, or rearm a different prompt:
     ///
     /// 1. the ACTIVE overlay — denied, then the FIFO successor promotes;
     /// 2. any QUEUED prompt whose own deadline passed while it waits behind
@@ -1756,38 +1825,72 @@ After approving access in the browser, press Enter in Pi to complete login."
     ///    anything else. This keeps every bounded successor honest even when
     ///    the currently displayed prompt carries no timeout of its own
     ///    (bd-yllbn reopen audit).
-    fn handle_capability_prompt_expiry(&mut self, id: String, generation: u64) -> Option<Cmd> {
+    fn handle_capability_prompt_tick(
+        &mut self,
+        id: String,
+        generation: u64,
+        timer_generation: u64,
+    ) -> Option<Cmd> {
+        let now = std::time::Instant::now();
         let matches_active = self
             .capability_prompt
             .as_ref()
-            .is_some_and(|prompt| prompt.request.id == id && prompt.generation == generation);
+            .is_some_and(|prompt| {
+                prompt.request.id == id
+                    && prompt.generation == generation
+                    && prompt.timer_generation() == timer_generation
+            });
         if !matches_active {
             let queue_index = self
                 .capability_prompt_queue
                 .iter()
-                .position(|prompt| prompt.request.id == id && prompt.generation == generation);
+                .position(|prompt| {
+                    prompt.request.id == id
+                        && prompt.generation == generation
+                        && prompt.timer_generation() == timer_generation
+                });
             let Some(queue_index) = queue_index else {
                 return None;
             };
+            let Some(queued) = self.capability_prompt_queue.get(queue_index) else {
+                return None;
+            };
+            if queued.has_time_remaining(now) {
+                let Some(queued) = self.capability_prompt_queue.get_mut(queue_index) else {
+                    return None;
+                };
+                // Invalidate this delivered epoch before arming its
+                // replacement. A duplicate copy of the current tick can then
+                // never create a second live waiter chain.
+                queued.restart_timer();
+                return Self::capability_prompt_queue_deadline_cmd(queued);
+            }
             // Ids are unique per request and generations are monotonic, so at
             // most one queued item can carry this identity.
             if let Some(expired) = self.capability_prompt_queue.remove(queue_index) {
-                let _ = expired;
-                let response = ExtensionUiResponse {
-                    id,
-                    value: Some(Value::Bool(false)),
-                    cancelled: true,
-                };
+                expired.cancel_timer();
+                let response = expired.request.auto_deny_response();
                 self.send_extension_ui_response_quiet(response);
             }
             return None;
         }
-        let response = ExtensionUiResponse {
-            id,
-            value: Some(Value::Bool(false)),
-            cancelled: true,
+        if self
+            .capability_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.has_time_remaining(now))
+        {
+            let active = self.capability_prompt.as_mut()?;
+            // Every scheduled waiter owns a fresh epoch. Replaying the tick
+            // that led here is therefore inert instead of forking another
+            // periodic repaint chain.
+            active.restart_timer();
+            return Self::capability_prompt_tick_cmd(active);
+        }
+        let Some(expired) = self.capability_prompt.take() else {
+            return None;
         };
-        self.capability_prompt = None;
+        expired.cancel_timer();
+        let response = expired.request.auto_deny_response();
         self.send_extension_ui_response_quiet(response);
         self.activate_next_capability_prompt()
     }
@@ -1802,6 +1905,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             dropped.push_front(active);
         }
         for prompt in dropped {
+            prompt.cancel_timer();
             let response = ExtensionUiResponse {
                 id: prompt.request.id,
                 value: Some(Value::Bool(false)),
@@ -3682,7 +3786,7 @@ mod stream_delta_batcher_tests {
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
     use crate::resources::{ResourceCliOptions, ResourceLoader};
     use crate::session::Session;
-    use crate::tools::ToolRegistry;
+    use crate::tools::{Tool, ToolRegistry};
     use asupersync::runtime::RuntimeBuilder;
     use futures::stream;
     use serde_json::{Value, json};
@@ -5015,6 +5119,9 @@ mod stream_delta_batcher_tests {
         let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app.title_requested = true;
         app.todo_summary = Some("1 todo pending".to_string());
+        app.extension_custom_active = true;
+        app.extension_custom_key_queue.push_back("old-key".to_string());
+        app.extension_custom_overlay = Some(ExtensionCustomOverlay::default());
         app.role_model_overrides.insert(
             crate::models::ModelRole::Smol,
             ("fixture-provider".to_string(), "fixture-model".to_string()),
@@ -5027,6 +5134,46 @@ mod stream_delta_batcher_tests {
             expires_in: 300,
         });
         assert!(app.pending_oauth.is_some());
+        let current_session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+        let _ = app.handle_pi_message(PiMsg::OpenTree {
+            owner_session_id: current_session_id,
+            initial_selected_id: None,
+            label: Some("old session tree".to_string()),
+        });
+        assert!(app.tree_ui.is_some());
+
+        let ask_tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended);
+        let (ask_tx, mut ask_rx) = asupersync::channel::mpsc::channel(1);
+        ask_tool.install_channel_ui(ask_tx);
+        let mut ask_execution = Box::pin(ask_tool.execute(
+            "old-session-ask-call",
+            serde_json::json!({
+                "questions": [{"question": "Old prompt?", "options": [{"label": "Yes"}]}]
+            }),
+            None,
+        ));
+        let ask_request = runtime().block_on(async {
+            assert!(futures::poll!(ask_execution.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ask_rx.recv(&cx).await.expect("ask request reaches UI")
+        });
+        app.ask_tool = Some(ask_tool.clone());
+        app.input.set_value("old session draft");
+        let _ = app.handle_pi_message(PiMsg::AskUiRequest(ask_request));
+        assert!(app.active_ask_ui.is_some(), "fixture must activate a real Ask waiter");
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(ExtensionUiRequest::new(
+            "old-session-extension",
+            "confirm",
+            serde_json::json!({"title": "Old extension prompt"}),
+        )));
+        app.input.set_value("partial old-session answer");
+
         let replacement_session_id = "replacement-session".to_string();
         app.session
             .try_lock()
@@ -5058,6 +5205,24 @@ mod stream_delta_batcher_tests {
             app.role_model_overrides.is_empty(),
             "the previous session's role model overrides must not leak"
         );
+        assert!(app.tree_ui.is_none(), "the previous session's tree must close");
+        assert!(!app.extension_custom_active);
+        assert!(app.extension_custom_key_queue.is_empty());
+        assert!(app.extension_custom_overlay.is_none());
+        assert!(app.active_ask_ui.is_none());
+        assert!(app.ask_ui_queue.is_empty());
+        assert!(app.active_extension_ui.is_none());
+        assert!(app.extension_ui_queue.is_empty());
+        assert!(app.input_card_order.is_empty());
+        assert!(app.card_draft_snapshot.is_none());
+        assert!(
+            app.input.value().is_empty(),
+            "neither the old draft nor a partial old-card answer may enter the replacement"
+        );
+        let ask_error = runtime()
+            .block_on(ask_execution)
+            .expect_err("replacement reset must dismiss the old Ask waiter");
+        assert!(ask_error.to_string().contains("dismissed"), "{ask_error}");
     }
 
     #[test]
@@ -5129,29 +5294,34 @@ mod stream_delta_batcher_tests {
 
         let session = Arc::clone(&app.session);
         let session_guard = session.try_lock().expect("hold session lock");
-        let retry = app.handle_pi_message(PiMsg::ConversationReset {
-            session_id: session_id.clone(),
-            messages: Vec::new(),
-            usage: Usage::default(),
-            status: Some("Conversation compacted".to_string()),
-        });
+        let retry = app
+            .handle_pi_message(PiMsg::ConversationReset {
+                session_id: session_id.clone(),
+                messages: Vec::new(),
+                usage: Usage::default(),
+                status: Some("Conversation compacted".to_string()),
+            })
+            .expect("a current-session event must be retried when only the lock is busy");
+        let retry_message = retry
+            .execute()
+            .expect("session retry command must emit a message")
+            .downcast::<PiMsg>()
+            .expect("session retry command must emit PiMsg");
         assert!(
-            retry.is_some(),
+            matches!(
+                &retry_message,
+                PiMsg::SessionEventRetry {
+                    attempts_remaining,
+                    ..
+                } if *attempts_remaining == SESSION_EVENT_LOCK_RETRY_ATTEMPTS - 1
+            ),
             "a current-session event must be retried when only the lock is busy"
         );
         assert_eq!(app.agent_state, AgentState::Processing);
         assert_eq!(app.messages.len(), 1);
         drop(session_guard);
 
-        let completed = app.handle_pi_message(PiMsg::SessionEventRetry {
-            event: Box::new(PiMsg::ConversationReset {
-                session_id,
-                messages: Vec::new(),
-                usage: Usage::default(),
-                status: Some("Conversation compacted".to_string()),
-            }),
-            attempts_remaining: SESSION_EVENT_LOCK_RETRY_ATTEMPTS - 1,
-        });
+        let completed = app.handle_pi_message(retry_message);
         assert!(completed.is_none());
         assert_eq!(app.agent_state, AgentState::Idle);
         assert!(app.messages.is_empty());
@@ -5159,6 +5329,74 @@ mod stream_delta_batcher_tests {
             app.status_message.as_deref(),
             Some("Conversation compacted")
         );
+
+        let stale_session_id = format!("stale-{session_id}");
+        app.agent_state = AgentState::Processing;
+        app.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            content: "session B persisted transcript".to_string(),
+            thinking: None,
+            collapsed: false,
+        });
+        app.current_response.push_str("session B partial response");
+        app.current_thinking.push_str("session B partial thinking");
+        app.current_tool = Some("session-b-tool".to_string());
+        app.current_tool_id = Some("session-b-tool-id".to_string());
+        app.current_tool_summary.insert(
+            "session-b-tool-id".to_string(),
+            "session B invocation".to_string(),
+        );
+        let (abort_handle, _abort_signal) = AbortHandle::new();
+        app.abort_handle = Some(abort_handle);
+        app.total_usage.input = 41;
+        app.todo_summary = Some("session B todo".to_string());
+        app.title_requested = true;
+        app.extension_ui_queue.push_back(ExtensionUiRequest::new(
+            "session-b-card",
+            "confirm",
+            serde_json::json!({"title": "session B prompt"}),
+        ));
+        app.extension_streaming.store(true, Ordering::SeqCst);
+        app.extension_compacting.store(true, Ordering::SeqCst);
+        let session = Arc::clone(&app.session);
+        let session_guard = session.try_lock().expect("hold session lock");
+        let exhausted = app.handle_pi_message(PiMsg::SessionEventRetry {
+            event: Box::new(PiMsg::ConversationReset {
+                session_id: stale_session_id,
+                messages: Vec::new(),
+                usage: Usage::default(),
+                status: Some("stale session A reset".to_string()),
+            }),
+            attempts_remaining: 0,
+        });
+        assert!(exhausted.is_none());
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(
+            app.messages[0].content,
+            "session B persisted transcript"
+        );
+        assert_eq!(app.displayed_session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(app.current_response, "session B partial response");
+        assert_eq!(app.current_thinking, "session B partial thinking");
+        assert_eq!(app.current_tool.as_deref(), Some("session-b-tool"));
+        assert_eq!(app.current_tool_id.as_deref(), Some("session-b-tool-id"));
+        assert_eq!(
+            app.current_tool_summary.get("session-b-tool-id").map(String::as_str),
+            Some("session B invocation")
+        );
+        assert!(app.abort_handle.is_some());
+        assert_eq!(app.total_usage.input, 41);
+        assert_eq!(app.todo_summary.as_deref(), Some("session B todo"));
+        assert!(app.title_requested);
+        assert_eq!(app.extension_ui_queue.len(), 1);
+        assert!(app.extension_streaming.load(Ordering::SeqCst));
+        assert!(app.extension_compacting.load(Ordering::SeqCst));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Session remained busy; a delayed session update was not applied")
+        );
+        drop(session_guard);
     }
 
     #[test]
@@ -5589,16 +5827,16 @@ mod stream_delta_batcher_tests {
         .with_extension_id(Some("snake".to_string()));
         app.handle_custom_extension_ui_request(poll_request);
 
-        let capability_request = ExtensionUiRequest::new(
+        let capability_request = ExtensionUiRequest::new_capability_prompt(
             "req-cap",
-            "confirm",
+            "snake",
+            "exec",
             json!({
                 "extension_id": "snake",
                 "capability": "exec",
                 "message": "Needs shell access",
             }),
-        )
-        .with_extension_id(Some("snake".to_string()));
+        );
         app.capability_prompt = Some(CapabilityPromptOverlay::from_request(capability_request));
 
         let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Right)));
@@ -5620,9 +5858,10 @@ mod stream_delta_batcher_tests {
     // ===== bd-yllbn: capability prompt FIFO / generation / expiry semantics =====
 
     fn capability_request(id: &str, extension_id: &str, capability: &str) -> ExtensionUiRequest {
-        ExtensionUiRequest::new(
+        let mut request = ExtensionUiRequest::new_capability_prompt(
             id,
-            "confirm",
+            extension_id,
+            capability,
             json!({
                 "extension_id": extension_id,
                 "capability": capability,
@@ -5630,14 +5869,40 @@ mod stream_delta_batcher_tests {
                 "timeout_ms": 1_000_u64,
             }),
         )
-        .with_extension_id(Some(extension_id.to_string()))
-        .with_timeout_ms(1_000)
+        .with_timeout_ms(1_000);
+        // Production requests bind at manager admission. These state-machine
+        // fixtures inject PiMsg directly, so bind at the equivalent seam.
+        request.bind_deadline(std::time::Instant::now());
+        request
     }
 
-    fn active_capability(app: &PiApp) -> Option<(String, u64)> {
+    fn active_capability(app: &PiApp) -> Option<(String, u64, u64)> {
         app.capability_prompt
             .as_ref()
-            .map(|prompt| (prompt.request.id.clone(), prompt.generation))
+            .map(|prompt| {
+                (
+                    prompt.request.id.clone(),
+                    prompt.generation,
+                    prompt.timer_generation(),
+                )
+            })
+    }
+
+    fn force_capability_deadline_elapsed(app: &mut PiApp, id: &str) {
+        let elapsed = std::time::Instant::now();
+        if let Some(prompt) = app
+            .capability_prompt
+            .as_mut()
+            .filter(|prompt| prompt.request.id == id)
+        {
+            prompt.expires_at = Some(elapsed);
+            return;
+        }
+        app.capability_prompt_queue
+            .iter_mut()
+            .find(|prompt| prompt.request.id == id)
+            .expect("capability prompt fixture must exist")
+            .expires_at = Some(elapsed);
     }
 
     #[test]
@@ -5647,7 +5912,8 @@ mod stream_delta_batcher_tests {
         let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
             "r1", "ext-a", "exec",
         )));
-        let (first_id, first_gen) = active_capability(&app).expect("first request activates");
+        let (first_id, first_gen, first_timer_gen) =
+            active_capability(&app).expect("first request activates");
         assert_eq!(first_id, "r1");
         assert!(app.capability_prompt_queue.is_empty());
 
@@ -5657,7 +5923,7 @@ mod stream_delta_batcher_tests {
         let unchanged = active_capability(&app).expect("active survives arrival");
         assert_eq!(
             unchanged,
-            (first_id.clone(), first_gen),
+            (first_id.clone(), first_gen, first_timer_gen),
             "a second concurrent request must never overwrite the active overlay"
         );
         assert_eq!(app.capability_prompt_queue.len(), 1);
@@ -5672,45 +5938,128 @@ mod stream_delta_batcher_tests {
 
         // Only the exact (id, generation) identity resolves the live prompt;
         // resolution promotes the FIFO successor and schedules its wake.
-        let cmd = app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+        force_capability_deadline_elapsed(&mut app, &first_id);
+        let cmd = app.handle_pi_message(PiMsg::CapabilityPromptTick {
             id: first_id.clone(),
             generation: first_gen,
+            timer_generation: first_timer_gen,
         });
         assert!(
             cmd.is_some(),
             "successor activation must schedule its own expiry wake"
         );
-        let (second_id, second_gen) = active_capability(&app).expect("successor activates");
+        let (second_id, second_gen, second_timer_gen) =
+            active_capability(&app).expect("successor activates");
         assert_eq!(second_id, "r2");
         assert_ne!(second_gen, first_gen, "generations are unique per request");
         assert!(app.capability_prompt_queue.is_empty());
 
         // Stale replay of the resolved identity must be ignored outright...
         assert!(
-            app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+            app.handle_pi_message(PiMsg::CapabilityPromptTick {
                 id: first_id,
                 generation: first_gen,
+                timer_generation: first_timer_gen,
             })
             .is_none()
         );
         // ...as must a foreign id wearing a live generation.
         assert!(
-            app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+            app.handle_pi_message(PiMsg::CapabilityPromptTick {
                 id: "zzz-unknown".to_string(),
                 generation: second_gen,
+                timer_generation: second_timer_gen,
             })
             .is_none()
         );
         let survived = active_capability(&app).expect("live prompt untouched by stale wakes");
-        assert_eq!(survived, (second_id.clone(), second_gen));
+        assert_eq!(
+            survived,
+            (second_id.clone(), second_gen, second_timer_gen)
+        );
 
         // Correct final resolution empties everything; no successor exists.
-        let tail_cmd = app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+        force_capability_deadline_elapsed(&mut app, &second_id);
+        let tail_cmd = app.handle_pi_message(PiMsg::CapabilityPromptTick {
             id: second_id,
             generation: second_gen,
+            timer_generation: second_timer_gen,
         });
         assert!(tail_cmd.is_none());
         assert!(active_capability(&app).is_none());
+        assert!(app.capability_prompt_queue.is_empty());
+    }
+
+    #[test]
+    fn timed_out_first_manager_prompt_auto_denies_and_promotes_second() {
+        let mut app = build_test_app();
+        let manager = crate::extensions::ExtensionManager::new();
+        let (ui_tx, mut ui_rx) = asupersync::channel::mpsc::channel(4);
+        manager.set_ui_sender(ui_tx);
+        app.extensions = Some(manager.clone());
+
+        let mut first_attempt = Box::pin(manager.request_ui(capability_request(
+            "timeout-first",
+            "ext-timeout",
+            "exec",
+        )));
+        let first_request = runtime().block_on(async {
+            assert!(futures::poll!(first_attempt.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ui_rx.recv(&cx).await.expect("first prompt reaches TUI")
+        });
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(first_request));
+
+        let mut second_attempt = Box::pin(manager.request_ui(capability_request(
+            "timeout-second",
+            "ext-timeout",
+            "http",
+        )));
+        let second_request = runtime().block_on(async {
+            assert!(futures::poll!(second_attempt.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ui_rx.recv(&cx).await.expect("second prompt reaches TUI")
+        });
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(second_request));
+
+        force_capability_deadline_elapsed(&mut app, "timeout-first");
+        let (_, prompt_generation, timer_generation) =
+            active_capability(&app).expect("first prompt remains active");
+        let successor_wake = app.handle_pi_message(PiMsg::CapabilityPromptTick {
+            id: "timeout-first".to_string(),
+            generation: prompt_generation,
+            timer_generation,
+        });
+
+        let first_response = runtime()
+            .block_on(first_attempt)
+            .expect("auto-deny responds through manager")
+            .expect("capability prompt expects a response");
+        assert_eq!(
+            first_response.value,
+            Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+                "reason": "auto_deny",
+            }))
+        );
+        assert!(!first_response.cancelled);
+        assert!(!manager.ui_request_is_pending("timeout-first"));
+        assert!(successor_wake.is_some(), "second prompt owns the active tick");
+        assert_eq!(
+            active_capability(&app).map(|active| active.0),
+            Some("timeout-second".to_string())
+        );
+
+        let _ = app.handle_capability_prompt_key(&KeyMsg::from_type(KeyType::Esc));
+        let second_response = runtime()
+            .block_on(second_attempt)
+            .expect("Escape responds through manager")
+            .expect("capability prompt expects a response");
+        assert!(second_response.cancelled);
+        assert!(!manager.ui_request_is_pending("timeout-second"));
+        assert!(app.capability_prompt.is_none());
         assert!(app.capability_prompt_queue.is_empty());
     }
 
@@ -5762,19 +6111,32 @@ mod stream_delta_batcher_tests {
     #[test]
     fn conversation_reset_drains_prompts_fail_closed_without_permissions() {
         let mut app = build_test_app();
-        // Real manager attached: quiet deny responses flow through
-        // respond_ui (pending-less probes return false harmlessly).
-        app.extensions = Some(crate::extensions::ExtensionManager::new());
+        let manager = crate::extensions::ExtensionManager::new();
+        let (ui_tx, mut ui_rx) = asupersync::channel::mpsc::channel(4);
+        manager.set_ui_sender(ui_tx);
+        app.extensions = Some(manager.clone());
 
-        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
-            "d1", "ext-d", "http",
-        )));
-        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
-            "d2", "ext-d", "exec",
-        )));
-        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
-            "d3", "ext-e", "exec",
-        )));
+        let requests = [
+            capability_request("d1", "ext-d", "http"),
+            capability_request("d2", "ext-d", "exec"),
+            capability_request("d3", "ext-e", "exec"),
+        ];
+        let mut attempts = Vec::new();
+        let mut wakes = Vec::new();
+        for request in requests {
+            let mut attempt = Box::pin(manager.request_ui(request));
+            let delivered = runtime().block_on(async {
+                assert!(futures::poll!(attempt.as_mut()).is_pending());
+                let cx = Cx::for_request();
+                ui_rx.recv(&cx).await.expect("manager publishes capability prompt")
+            });
+            assert!(manager.ui_request_is_pending(&delivered.id));
+            wakes.push(
+                app.handle_pi_message(PiMsg::ExtensionUiRequest(delivered))
+                    .expect("bounded prompt schedules a cancellable wake"),
+            );
+            attempts.push(attempt);
+        }
         assert!(active_capability(&app).is_some());
         assert_eq!(app.capability_prompt_queue.len(), 2);
         let session_id = app
@@ -5800,6 +6162,71 @@ mod stream_delta_batcher_tests {
             app.capability_prompt_queue.is_empty(),
             "and the entire FIFO"
         );
+        for (id, attempt) in ["d1", "d2", "d3"].into_iter().zip(attempts) {
+            let response = runtime()
+                .block_on(attempt)
+                .expect("reset delivers a typed response")
+                .expect("capability prompts expect a response");
+            assert_eq!(response.id, id);
+            assert_eq!(response.value, Some(Value::Bool(false)));
+            assert!(response.cancelled);
+            assert!(!manager.ui_request_is_pending(id));
+        }
+        for wake in wakes {
+            assert!(
+                wake.execute().is_none(),
+                "session reset must interrupt every outstanding timer command"
+            );
+        }
+    }
+
+    #[test]
+    fn live_queued_tick_rearms_once_with_a_fresh_timer_epoch() {
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "active", "ext-a", "exec",
+        )));
+        let active_before = active_capability(&app).expect("first prompt activates");
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "queued", "ext-b", "http",
+        )));
+        let queued = app
+            .capability_prompt_queue
+            .front_mut()
+            .expect("second prompt queues");
+        queued.expires_at = Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        let prompt_generation = queued.generation;
+        let timer_generation = queued.timer_generation();
+
+        let next_waiter = app.handle_pi_message(PiMsg::CapabilityPromptTick {
+            id: "queued".to_string(),
+            generation: prompt_generation,
+            timer_generation,
+        });
+
+        assert!(
+            next_waiter.is_some(),
+            "a premature queued wake must retain the absolute-deadline waiter"
+        );
+        assert_eq!(active_capability(&app), Some(active_before));
+        let rearmed = app
+            .capability_prompt_queue
+            .front()
+            .expect("queued prompt remains queued");
+        assert_eq!(rearmed.generation, prompt_generation);
+        assert_ne!(rearmed.timer_generation(), timer_generation);
+        assert!(
+            app.handle_pi_message(PiMsg::CapabilityPromptTick {
+                id: "queued".to_string(),
+                generation: prompt_generation,
+                timer_generation,
+            })
+            .is_none(),
+            "a duplicate of the delivered queued tick cannot fork a waiter chain"
+        );
+        assert_eq!(app.capability_prompt_queue.len(), 1);
     }
 
     /// bd-yllbn reopen audit: a queued prompt's budget elapses on its own
@@ -5811,16 +6238,16 @@ mod stream_delta_batcher_tests {
         let mut app = build_test_app();
 
         // An embedder-sourced confirm carries NO timeout: unbudgeted active.
-        let unbudgeted = ExtensionUiRequest::new(
+        let unbudgeted = ExtensionUiRequest::new_capability_prompt(
             "r0",
-            "confirm",
+            "ext-embed",
+            "exec",
             json!({
                 "extension_id": "ext-embed",
                 "capability": "exec",
                 "message": "no deadline supplied"
             }),
-        )
-        .with_extension_id(Some("ext-embed".to_string()));
+        );
         let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(unbudgeted));
         let active_before = active_capability(&app).expect("unbudgeted r0 activates");
         assert!(
@@ -5843,13 +6270,17 @@ mod stream_delta_batcher_tests {
         );
 
         // Its deadline passes while r0 lingers: resolve r2 by identity only.
-        let expired_wake = app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+        force_capability_deadline_elapsed(&mut app, "r2");
+        let queued = app
+            .capability_prompt_queue
+            .front()
+            .expect("r2 still queued");
+        let queued_generation = queued.generation;
+        let queued_timer_generation = queued.timer_generation();
+        let expired_wake = app.handle_pi_message(PiMsg::CapabilityPromptTick {
             id: "r2".to_string(),
-            generation: app
-                .capability_prompt_queue
-                .front()
-                .expect("r2 still queued")
-                .generation,
+            generation: queued_generation,
+            timer_generation: queued_timer_generation,
         });
         assert!(
             expired_wake.is_none(),
@@ -5867,9 +6298,10 @@ mod stream_delta_batcher_tests {
 
         // A replay of the same identity after removal is inert (stale guard).
         assert!(
-            app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+            app.handle_pi_message(PiMsg::CapabilityPromptTick {
                 id: "r2".to_string(),
                 generation: u64::MAX,
+                timer_generation: u64::MAX,
             })
             .is_none()
         );
@@ -5880,16 +6312,16 @@ mod stream_delta_batcher_tests {
     #[test]
     fn unbudgeted_prompt_schedules_no_expiry_wake() {
         let mut app = build_test_app();
-        let unbudgeted = ExtensionUiRequest::new(
+        let unbudgeted = ExtensionUiRequest::new_capability_prompt(
             "u1",
-            "confirm",
+            "ext-e",
+            "http",
             json!({
                 "extension_id": "ext-e",
                 "capability": "http",
                 "message": "no deadline"
             }),
-        )
-        .with_extension_id(Some("ext-e".to_string()));
+        );
 
         let wake = app.handle_pi_message(PiMsg::ExtensionUiRequest(unbudgeted));
         assert!(wake.is_none(), "no timeout means no timer");
@@ -5898,6 +6330,135 @@ mod stream_delta_batcher_tests {
                 .as_ref()
                 .and_then(|prompt| prompt.expires_at)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn capability_prompt_tick_repaints_before_expiry_without_resolving() {
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "tick-1", "ext-tick", "exec",
+        )));
+        app.capability_prompt
+            .as_mut()
+            .expect("prompt activates")
+            .expires_at = Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            );
+        let (id, generation, timer_generation) =
+            active_capability(&app).expect("prompt activates");
+
+        let next_tick = app.handle_pi_message(PiMsg::CapabilityPromptTick {
+            id: id.clone(),
+            generation,
+            timer_generation,
+        });
+
+        assert!(next_tick.is_some(), "a live prompt schedules its next repaint");
+        let rearmed = active_capability(&app).expect("prompt remains active");
+        assert_eq!(rearmed.0, id);
+        assert_eq!(rearmed.1, generation);
+        assert_ne!(
+            rearmed.2, timer_generation,
+            "each periodic waiter must own a fresh timer epoch"
+        );
+        assert!(
+            app.handle_pi_message(PiMsg::CapabilityPromptTick {
+                id: rearmed.0.clone(),
+                generation,
+                timer_generation,
+            })
+            .is_none(),
+            "a duplicate of the delivered tick cannot fork a waiter chain"
+        );
+    }
+
+    #[test]
+    fn capability_prompt_render_countdown_visibly_decreases_without_input() {
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "render-tick",
+            "ext-tick",
+            "exec",
+        )));
+        let base = std::time::Instant::now();
+        let prompt = app.capability_prompt.as_mut().expect("prompt activates");
+        prompt.expires_at = Some(base + std::time::Duration::from_nanos(1));
+        assert_eq!(prompt.remaining_secs(base), Some(1));
+        prompt.expires_at = Some(base + std::time::Duration::from_secs(1));
+        assert_eq!(prompt.remaining_secs(base), Some(1));
+        prompt.expires_at = Some(
+            base + std::time::Duration::from_secs(1) + std::time::Duration::from_nanos(1),
+        );
+        assert_eq!(prompt.remaining_secs(base), Some(2));
+        prompt.expires_at = Some(base + std::time::Duration::from_secs(2));
+        let prompt = app.capability_prompt.as_ref().expect("prompt remains active");
+
+        let initial = app.render_capability_prompt_at(prompt, 0, base);
+        let next = app.render_capability_prompt_at(
+            prompt,
+            0,
+            base + std::time::Duration::from_secs(1),
+        );
+
+        assert!(initial.contains("Auto-deny in 2s"), "{initial}");
+        assert!(next.contains("Auto-deny in 1s"), "{next}");
+        assert_ne!(initial, next, "a timer tick must produce a changed frame");
+    }
+
+    #[test]
+    fn promoting_queued_prompt_cancels_and_invalidates_queued_timer() {
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "active", "ext-a", "exec",
+        )));
+        let queued_wake = app
+            .handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+                "queued", "ext-b", "http",
+            )))
+            .expect("queued bounded prompt owns a deadline waiter");
+        let queued = app
+            .capability_prompt_queue
+            .front()
+            .expect("queued prompt retained");
+        let stale_prompt_generation = queued.generation;
+        let stale_timer_generation = queued.timer_generation();
+
+        let _ = app.handle_capability_prompt_key(&KeyMsg::from_type(KeyType::Enter));
+        let promoted = active_capability(&app).expect("queued prompt promotes");
+        assert_eq!(promoted.0, "queued");
+        assert_ne!(promoted.2, stale_timer_generation);
+        assert!(
+            queued_wake.execute().is_none(),
+            "promotion must interrupt the queued deadline waiter"
+        );
+        assert!(
+            app.handle_pi_message(PiMsg::CapabilityPromptTick {
+                id: "queued".to_string(),
+                generation: stale_prompt_generation,
+                timer_generation: stale_timer_generation,
+            })
+            .is_none(),
+            "an already-enqueued queued-era wake cannot rearm the active timer"
+        );
+        assert_eq!(active_capability(&app), Some(promoted));
+    }
+
+    #[test]
+    fn resolving_capability_prompt_cancels_outstanding_tick_command() {
+        let mut app = build_test_app();
+        let wake = app
+            .handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+                "cancel-tick", "ext-tick", "exec",
+            )))
+            .expect("bounded prompt schedules a wake");
+
+        let _ = app.handle_capability_prompt_key(&KeyMsg::from_type(KeyType::Enter));
+
+        assert!(app.capability_prompt.is_none());
+        assert!(
+            wake.execute().is_none(),
+            "the cancelled command must exit without publishing a stale tick"
         );
     }
 }

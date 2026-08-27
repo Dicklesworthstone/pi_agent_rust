@@ -1665,6 +1665,15 @@ impl PiApp {
         prompt: &CapabilityPromptOverlay,
         queued_count: usize,
     ) -> String {
+        self.render_capability_prompt_at(prompt, queued_count, std::time::Instant::now())
+    }
+
+    pub(super) fn render_capability_prompt_at(
+        &self,
+        prompt: &CapabilityPromptOverlay,
+        queued_count: usize,
+        now: std::time::Instant,
+    ) -> String {
         let mut output = String::new();
 
         // Title line.
@@ -1709,7 +1718,7 @@ impl PiApp {
         // Auto-deny countdown derived LIVE from the authoritative deadline
         // captured on arrival (bd-yllbn); it decays in wall-clock time and
         // expiry resolves the overlay fail-closed.
-        if let Some(secs) = prompt.remaining_secs(std::time::Instant::now()) {
+        if let Some(secs) = prompt.remaining_secs(now) {
             let _ = writeln!(
                 output,
                 "  {}",

@@ -5132,6 +5132,28 @@ pub struct PreWarmedExtensionRuntime {
     pub tools: Arc<ToolRegistry>,
 }
 
+/// Host bridges that must exist while extensions register and run startup
+/// hooks, rather than being attached after initialization has completed.
+#[derive(Clone)]
+pub struct ExtensionHostConfiguration {
+    /// Direct host UI bridge used by `ctx.ui` and capability prompts.
+    pub ui_handler: Option<Arc<dyn crate::extension_dispatcher::ExtensionUiHandler>>,
+    /// Whether capability decisions may persist beyond this session.
+    pub persist_permission_decisions: bool,
+    /// Parsed extension flags, applied after registration and before startup.
+    pub cli_flags: Vec<crate::cli::ExtensionCliFlag>,
+}
+
+impl Default for ExtensionHostConfiguration {
+    fn default() -> Self {
+        Self {
+            ui_handler: None,
+            persist_permission_decisions: true,
+            cli_flags: Vec::new(),
+        }
+    }
+}
+
 /// RAII guard that resets an `AtomicBool` to `false` on drop, ensuring the
 /// flag is cleared even if the enclosing async task is cancelled.
 struct AtomicBoolGuard(Arc<AtomicBool>);
@@ -11912,6 +11934,7 @@ impl AgentSession {
             None,
             None,
             None,
+            ExtensionHostConfiguration::default(),
         )
         .await
     }
@@ -11926,6 +11949,7 @@ impl AgentSession {
         policy: Option<ExtensionPolicy>,
         repair_policy: Option<RepairPolicyMode>,
         pre_warmed: Option<PreWarmedExtensionRuntime>,
+        host: ExtensionHostConfiguration,
     ) -> Result<()> {
         let mut js_specs: Vec<JsExtensionLoadSpec> = Vec::new();
         let mut native_specs: Vec<NativeRustExtensionLoadSpec> = Vec::new();
@@ -12092,6 +12116,10 @@ impl AgentSession {
             manager.set_runtime(runtime);
             (manager, tools)
         };
+        if let Some(handler) = host.ui_handler {
+            manager.set_ui_handler(handler);
+        }
+        manager.set_policy_prompt_persistence(host.persist_permission_decisions);
         tools.bind_job_session_resolver(Self::job_session_id_resolver(&self.session));
 
         // Session, host actions, and message fetchers are always set here
@@ -12195,6 +12223,11 @@ impl AgentSession {
                 .load_wasm_extensions(&host, wasm_specs, Arc::clone(&tools))
                 .await?;
         }
+
+        // Extension flag definitions are registered by the load calls above,
+        // but startup hooks may read their resolved values. Apply the parsed
+        // host values in that narrow interval rather than after startup.
+        crate::extensions::apply_cli_flags(&manager, &host.cli_flags).await?;
 
         // Fire the `startup` lifecycle hook once extensions are loaded.
         // Fail-open: extension errors must not prevent the agent from running.

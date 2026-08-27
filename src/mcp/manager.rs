@@ -308,6 +308,7 @@ struct McpManagerInner {
     servers: Mutex<HashMap<String, Arc<ServerEntry>>>,
     trust_path: PathBuf,
     trust_lock: Mutex<()>,
+    shutting_down: AtomicBool,
     warnings: Vec<super::config::ConfigWarning>,
     #[cfg(test)]
     transport_factory: Mutex<Option<Arc<TestTransportFactory>>>,
@@ -340,6 +341,7 @@ impl McpManager {
                 servers: Mutex::new(servers),
                 trust_path: global_dir.join("mcp-trust.json"),
                 trust_lock: Mutex::new(()),
+                shutting_down: AtomicBool::new(false),
                 warnings: discovery.warnings,
                 #[cfg(test)]
                 transport_factory: Mutex::new(None),
@@ -373,6 +375,17 @@ impl McpManager {
 
     fn trust_fingerprint(&self, config: &ConfiguredServer) -> String {
         config.fingerprint(&self.inner.cwd)
+    }
+
+    fn check_running(&self) -> Result<()> {
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            Err(tool_err(
+                "MCP_MANAGER_SHUTDOWN",
+                "this MCP session is shutting down and cannot start or use transports",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Config warnings collected during discovery (for `/mcp`).
@@ -516,35 +529,65 @@ impl McpManager {
     ///
     /// FTUI `/new` and `/resume` must guarantee singleton shutdown before
     /// swapping manager handles: dropping the old manager only aborts
-    /// transports without awaiting stdio children. This detaches all live
-    /// handles under each entry's short lock, then awaits `close()` outside
-    /// those locks so one slow child cannot serialize unrelated entries.
+    /// transports without awaiting stdio children. This terminally seals the
+    /// manager, synchronously aborts every published transport, waits for each
+    /// private connection attempt to leave its connection lane, then awaits
+    /// all published `close()` futures together. One slow child therefore
+    /// cannot serialize unrelated close operations, and no private handshake
+    /// can outlive the returned future.
     ///
     /// Runtime-only teardown: persisted trust, definitions, provenance, and
     /// on-disk caches are untouched; per-entry slots reset to `NotStarted`
     /// exactly like [`Self::deny`] does for a single server. Returns the
-    /// names of transports that were actually closed (empty when idle).
+    /// names of transports that were actually closed (empty when idle). A
+    /// manager cannot be restarted after this call; construct a replacement
+    /// session manager instead.
     pub async fn shutdown_all(&self) -> Vec<String> {
+        self.inner.shutting_down.store(true, Ordering::Release);
         let servers = Self::lock(&self.inner.servers).clone();
-        let detached: Vec<(String, Arc<dyn McpTransport>)> = servers
-            .iter()
-            .filter_map(|(name, entry)| {
-                Self::lock(&entry.transport)
-                    .take()
-                    .map(|transport| (name.clone(), transport))
-            })
-            .collect();
-
-        let mut closed: Vec<String> = Vec::with_capacity(detached.len());
-        for (name, transport) in detached {
-            transport.close().await;
-            if let Some(entry) = servers.get(&name) {
-                *Self::lock(&entry.health) = ServerHealth::NotStarted;
-                Self::lock(&entry.tools_cache).take();
+        let mut detached: Vec<(String, Arc<dyn McpTransport>)> = Vec::new();
+        for (name, entry) in &servers {
+            if let Some(transport) = Self::lock(&entry.transport).take() {
+                // Abort immediately so in-flight stdio/HTTP requests observe
+                // shutdown while connection lanes drain below.
+                transport.abort();
+                detached.push((name.clone(), transport));
             }
-            closed.push(name);
+            *Self::lock(&entry.health) = ServerHealth::NotStarted;
+            Self::lock(&entry.tools_cache).take();
         }
-        closed
+
+        // A connection under construction stays private until its handshake
+        // succeeds, so it cannot be detached above. Every constructor holds
+        // this lane through publication; terminal state prevents publication,
+        // and this barrier waits until the private transport has closed.
+        let lane_guards = futures::future::join_all(servers.values().map(|entry| {
+            let lane = Arc::clone(&entry.connect_lane);
+            async move {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                asupersync::sync::OwnedMutexGuard::lock(lane, cx.cx()).await
+            }
+        }))
+        .await;
+
+        // Reset every entry, including an inconsistent cache-only state. The
+        // terminal publication check makes a transport here impossible in
+        // production, but taking it keeps teardown fail-closed under races.
+        for (name, entry) in &servers {
+            if let Some(transport) = Self::lock(&entry.transport).take() {
+                transport.abort();
+                detached.push((name.clone(), transport));
+            }
+            *Self::lock(&entry.health) = ServerHealth::NotStarted;
+            Self::lock(&entry.tools_cache).take();
+        }
+        drop(lane_guards);
+
+        futures::future::join_all(detached.into_iter().map(|(name, transport)| async move {
+            transport.close().await;
+            name
+        }))
+        .await
     }
 
     /// Ping + tool list (the `/mcp test` surface).
@@ -553,6 +596,7 @@ impl McpManager {
     ///
     /// Fails closed on trust denial/pending or any transport error.
     pub async fn test(&self, name: &str) -> Result<Vec<McpToolMeta>> {
+        self.check_running()?;
         let entry = self.entry(name)?;
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let connect_guard =
@@ -608,6 +652,7 @@ impl McpManager {
         &self,
         entry: &Arc<ServerEntry>,
     ) -> Result<Vec<McpToolMeta>> {
+        self.check_running()?;
         self.check_trust(entry)?;
         let transport = Self::lock(&entry.transport)
             .clone()
@@ -628,6 +673,7 @@ impl McpManager {
                 return Err(err);
             }
         };
+        self.check_running()?;
         if let Err(err) = self.check_trust(entry) {
             Self::close_revoked_transport(entry, &transport).await;
             return Err(err);
@@ -645,7 +691,7 @@ impl McpManager {
             Self::close_revoked_transport(entry, &transport).await;
             return Err(err);
         }
-        if !Self::publish_tools_if_current(entry, &transport, &tools) {
+        if !self.publish_tools_if_current(entry, &transport, &tools) {
             transport.abort();
             return Err(tool_err(
                 "MCP_TRANSPORT_SUPERSEDED",
@@ -671,12 +717,14 @@ impl McpManager {
     }
 
     fn publish_tools_if_current(
+        &self,
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
         tools: &[McpToolMeta],
     ) -> bool {
         let current = Self::lock(&entry.transport);
-        if !current
+        if self.inner.shutting_down.load(Ordering::Acquire)
+            || !current
             .as_ref()
             .is_some_and(|candidate| Arc::ptr_eq(candidate, transport))
         {
@@ -876,6 +924,7 @@ impl McpManager {
     }
 
     async fn ensure_ready_in_lane(&self, entry: &Arc<ServerEntry>) -> Result<()> {
+        self.check_running()?;
         if let Err(err) = self.check_trust(entry) {
             let transport = { Self::lock(&entry.transport).take() };
             if let Some(transport) = transport {
@@ -916,6 +965,10 @@ impl McpManager {
             }
         };
         let mut private_transport = PrivateHandshakeTransport::new(Arc::clone(&transport));
+        if let Err(err) = self.check_running() {
+            transport.close().await;
+            return Err(err);
+        }
         if let Err(err) = self.check_trust(entry) {
             transport.close().await;
             *Self::lock(&entry.health) = ServerHealth::NotStarted;
@@ -943,6 +996,10 @@ impl McpManager {
             Self::record_failure(entry, &err);
             return Err(err);
         }
+        if let Err(err) = self.check_running() {
+            transport.close().await;
+            return Err(err);
+        }
         if let Err(err) = transport
             .notify("notifications/initialized", serde_json::json!({}))
             .await
@@ -957,7 +1014,22 @@ impl McpManager {
             Self::lock(&entry.tools_cache).take();
             return Err(err);
         }
-        *Self::lock(&entry.transport) = Some(Arc::clone(&transport));
+        let published = {
+            let mut current = Self::lock(&entry.transport);
+            if self.inner.shutting_down.load(Ordering::Acquire) {
+                false
+            } else {
+                *current = Some(Arc::clone(&transport));
+                true
+            }
+        };
+        if !published {
+            transport.close().await;
+            return Err(tool_err(
+                "MCP_MANAGER_SHUTDOWN",
+                "MCP session shutdown won the transport publication race",
+            ));
+        }
         private_transport.disarm();
         // A denial can race the small check-to-publication interval above.
         // Recheck before returning the transport to any caller; on revocation,
@@ -966,11 +1038,26 @@ impl McpManager {
             Self::close_revoked_transport(entry, &transport).await;
             return Err(err);
         }
-        *Self::lock(&entry.health) = ServerHealth::Ready {
-            tools: Self::lock(&entry.tools_cache)
-                .as_ref()
-                .map_or(0, |(_, tools)| tools.len()),
-        };
+        {
+            let current = Self::lock(&entry.transport);
+            if self.inner.shutting_down.load(Ordering::Acquire)
+                || !current
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &transport))
+            {
+                drop(current);
+                transport.abort();
+                return Err(tool_err(
+                    "MCP_MANAGER_SHUTDOWN",
+                    "MCP session shut down before transport activation completed",
+                ));
+            }
+            *Self::lock(&entry.health) = ServerHealth::Ready {
+                tools: Self::lock(&entry.tools_cache)
+                    .as_ref()
+                    .map_or(0, |(_, tools)| tools.len()),
+            };
+        }
         Ok(())
     }
 
@@ -1123,6 +1210,7 @@ impl McpManager {
         // tool call. Re-authorize at the request boundary so a trust decision
         // changed by another manager cannot be bypassed by an already-live
         // transport.
+        self.check_running()?;
         self.check_trust(entry)?;
         let result = transport
             .request(
@@ -1130,7 +1218,9 @@ impl McpManager {
                 serde_json::json!({ "name": tool, "arguments": arguments }),
                 DEFAULT_MCP_TIMEOUT,
             )
-            .await?;
+            .await;
+        self.check_running()?;
+        let result = result?;
         if let Err(err) = self.check_trust(entry) {
             Self::close_revoked_transport(entry, transport).await;
             return Err(err);
@@ -1983,6 +2073,160 @@ mod tests {
         (manager, entry)
     }
 
+    #[test]
+    fn shutdown_all_awaits_and_resets_every_live_transport() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("project");
+        let global = temp.path().join("global");
+        std::fs::create_dir_all(&cwd).expect("project directory");
+        std::fs::create_dir_all(&global).expect("global directory");
+        let servers = ["first", "second"]
+            .into_iter()
+            .map(|name| ConfiguredServer {
+                name: name.to_string(),
+                command: Some(format!("unused-{name}")),
+                args: Vec::new(),
+                env: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                transport_hint: Some("stdio".to_string()),
+                provenance: Provenance::ProjectPi,
+                source_file: cwd.join(".pi/mcp.json"),
+            })
+            .collect();
+        let manager = McpManager::new(
+            &cwd,
+            &global,
+            McpDiscovery {
+                servers,
+                warnings: Vec::new(),
+            },
+        );
+
+        let mut observed = Vec::new();
+        for name in ["first", "second"] {
+            let entry = manager.entry(name).expect("fixture entry");
+            let closed = Arc::new(AtomicBool::new(false));
+            let transport: Arc<dyn McpTransport> = Arc::new(SuccessfulTransport {
+                closed: Arc::clone(&closed),
+            });
+            *McpManager::lock(&entry.transport) = Some(transport);
+            *McpManager::lock(&entry.tools_cache) = Some((
+                Instant::now(),
+                vec![McpToolMeta {
+                    name: format!("{name}-tool"),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                }],
+            ));
+            *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
+            observed.push((entry, closed));
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let mut closed_names = runtime.block_on(manager.shutdown_all());
+        closed_names.sort();
+        assert_eq!(closed_names, vec!["first", "second"]);
+        for (entry, closed) in observed {
+            assert!(
+                closed.load(Ordering::Acquire),
+                "shutdown must await transport close"
+            );
+            assert!(McpManager::lock(&entry.transport).is_none());
+            assert!(McpManager::lock(&entry.tools_cache).is_none());
+            assert!(matches!(
+                &*McpManager::lock(&entry.health),
+                ServerHealth::NotStarted
+            ));
+        }
+
+        let terminal_entry = manager.entry("first").expect("fixture entry");
+        let error = runtime
+            .block_on(manager.connect_and_list(&terminal_entry))
+            .expect_err("a shut-down manager must never reconnect");
+        assert!(error.to_string().contains("MCP_MANAGER_SHUTDOWN"), "{error}");
+        assert!(McpManager::lock(&terminal_entry.transport).is_none());
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_private_handshake_to_leave_its_connection_lane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry) = trusted_fixture_manager(&temp);
+        let manager = Arc::new(manager);
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let factory_release = Arc::clone(&release);
+        let private_closed = Arc::new(AtomicBool::new(false));
+        let factory_closed = Arc::clone(&private_closed);
+        *McpManager::lock(&manager.inner.transport_factory) =
+            Some(Arc::new(move || -> Box<dyn McpTransport> {
+                Box::new(HeldRequestTransport {
+                    started: Mutex::new(Some(started_tx.clone())),
+                    release: Arc::clone(&factory_release),
+                    response: serde_json::json!({}),
+                    closed: Arc::clone(&factory_closed),
+                })
+            }));
+
+        let connecting_manager = Arc::clone(&manager);
+        let connecting_entry = Arc::clone(&entry);
+        let connecting = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
+            runtime.block_on(connecting_manager.connect_and_list(&connecting_entry))
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initialize reached the controlled private handshake");
+
+        let shutdown_manager = Arc::clone(&manager);
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
+            let closed = runtime.block_on(shutdown_manager.shutdown_all());
+            shutdown_done_tx.send(()).expect("shutdown completion");
+            closed
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !manager.inner.shutting_down.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "shutdown never sealed the manager");
+            std::thread::yield_now();
+        }
+        let shutdown_returned_before_release = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+
+        // Always release and join both helpers before asserting the intended
+        // red condition so a broken barrier cannot strand a test process.
+        let (released, wake) = &*release;
+        *McpManager::lock(released) = true;
+        wake.notify_all();
+
+        let connect_result = connecting.join().expect("connect thread");
+        let closed_names = shutdown.join().expect("shutdown thread");
+        assert!(
+            !shutdown_returned_before_release,
+            "shutdown returned while a private handshake still held the connection lane"
+        );
+        let connect_error = connect_result
+            .expect_err("terminal shutdown must reject handshake publication");
+        assert!(
+            connect_error.to_string().contains("MCP_MANAGER_SHUTDOWN"),
+            "{connect_error}"
+        );
+        assert!(closed_names.is_empty());
+        assert!(
+            private_closed.load(Ordering::Acquire),
+            "shutdown must wait for the private transport to close"
+        );
+        assert!(McpManager::lock(&entry.transport).is_none());
+    }
+
     #[async_trait]
     impl McpTransport for MalformedToolsTransport {
         async fn request(
@@ -2798,7 +3042,7 @@ mod tests {
         started: Mutex<Option<mpsc::Sender<()>>>,
         release: Arc<(Mutex<bool>, Condvar)>,
         response: Value,
-        closed: AtomicBool,
+        closed: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -2881,7 +3125,7 @@ mod tests {
             started: Mutex::new(Some(started_tx)),
             release: Arc::clone(&release),
             response,
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
         });
         let stale_erased: Arc<dyn McpTransport> = stale.clone();
         *McpManager::lock(&entry.transport) = Some(stale_erased);
@@ -2998,7 +3242,7 @@ mod tests {
             started: Mutex::new(Some(started_tx)),
             release: Arc::clone(&release),
             response: serde_json::json!({"content": []}),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
         });
         let transport: Arc<dyn McpTransport> = fake.clone();
         *McpManager::lock(&entry.transport) = Some(Arc::clone(&transport));

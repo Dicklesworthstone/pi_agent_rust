@@ -1396,14 +1396,17 @@ fn rpc_handle_ui_request(
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return Ok(());
     };
+    let Some(request_generation) = value.get("requestGeneration").and_then(Value::as_u64) else {
+        return Ok(());
+    };
 
     match method {
         "select" => {
             let response = rpc_ui_response_value(scenario, "select")
                 .and_then(Value::as_str)
                 .map_or_else(
-                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
-                    |choice| json!({"type":"extension_ui_response","id": id, "value": choice}),
+                    || json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "cancelled": true}),
+                    |choice| json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "value": choice}),
                 );
             rpc_write_command(stdin, &response)?;
         }
@@ -1411,9 +1414,9 @@ fn rpc_handle_ui_request(
             let response = rpc_ui_response_value(scenario, "confirm")
                 .and_then(Value::as_bool)
                 .map_or_else(
-                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
+                    || json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "cancelled": true}),
                     |confirmed| {
-                        json!({"type":"extension_ui_response","id": id, "confirmed": confirmed})
+                        json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "confirmed": confirmed})
                     },
                 );
             rpc_write_command(stdin, &response)?;
@@ -1422,8 +1425,8 @@ fn rpc_handle_ui_request(
             let response = rpc_ui_response_value(scenario, "input")
                 .and_then(Value::as_str)
                 .map_or_else(
-                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
-                    |text| json!({"type":"extension_ui_response","id": id, "value": text}),
+                    || json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "cancelled": true}),
+                    |text| json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "value": text}),
                 );
             rpc_write_command(stdin, &response)?;
         }
@@ -1431,8 +1434,8 @@ fn rpc_handle_ui_request(
             let response = rpc_ui_response_value(scenario, "editor")
                 .and_then(Value::as_str)
                 .map_or_else(
-                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
-                    |text| json!({"type":"extension_ui_response","id": id, "value": text}),
+                    || json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "cancelled": true}),
+                    |text| json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "value": text}),
                 );
             rpc_write_command(stdin, &response)?;
         }

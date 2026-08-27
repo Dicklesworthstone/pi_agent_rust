@@ -14,7 +14,10 @@ use super::conversation::tool_content_blocks_to_text;
 pub(super) fn sanitize_terminal_text(input: &str) -> Cow<'_, str> {
     let needs_work = input
         .bytes()
-        .any(|b| b == 0x1b || b == 0x7f || (b < 0x20 && b != b'\n' && b != b'\t'));
+        .any(|b| b == 0x1b || b == 0x7f || (b < 0x20 && b != b'\n' && b != b'\t'))
+        || input
+            .chars()
+            .any(|ch| ('\u{0080}'..='\u{009f}').contains(&ch));
     if !needs_work {
         return Cow::Borrowed(input);
     }
@@ -45,6 +48,9 @@ pub(super) fn sanitize_terminal_text(input: &str) -> Cow<'_, str> {
                         if accepts_bel && c == '\u{07}' {
                             break;
                         }
+                        if c == '\u{009c}' {
+                            break;
+                        }
                         if c == '\u{1b}' {
                             if chars.peek() == Some(&'\\') {
                                 chars.next();
@@ -59,16 +65,59 @@ pub(super) fn sanitize_terminal_text(input: &str) -> Cow<'_, str> {
                 }
                 None => {}
             },
+            // Single-codepoint C1 CSI.
+            '\u{009b}' => {
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // Single-codepoint C1 string controls: DCS, SOS, OSC, PM, APC.
+            c @ ('\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}') => {
+                let accepts_bel = c == '\u{009d}';
+                while let Some(c) = chars.next() {
+                    if c == '\u{009c}' || (accepts_bel && c == '\u{07}') {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
             '\r' => {
                 if chars.peek() != Some(&'\n') {
                     out.push('\n');
                 }
             }
+            c if ('\u{0080}'..='\u{009f}').contains(&c) => {}
             c if c == '\u{7f}' || (c < '\u{20}' && c != '\n' && c != '\t') => {}
             c => out.push(c),
         }
     }
     Cow::Owned(out)
+}
+
+/// Sanitize a terminal-bound value that must remain on one visual line.
+///
+/// This applies the full escape/control filter above, then replaces the
+/// otherwise-preserved newline and tab characters with spaces. Use it for
+/// identities, titles, and option labels; use [`sanitize_terminal_text`] for
+/// deliberately multiline transcript content.
+pub(super) fn sanitize_terminal_line(input: &str) -> Cow<'_, str> {
+    let sanitized = sanitize_terminal_text(input);
+    if !sanitized.chars().any(|ch| matches!(ch, '\n' | '\t')) {
+        return sanitized;
+    }
+
+    Cow::Owned(
+        sanitized
+            .chars()
+            .map(|ch| if matches!(ch, '\n' | '\t') { ' ' } else { ch })
+            .collect(),
+    )
 }
 
 pub(super) fn format_tool_output(
@@ -477,6 +526,31 @@ mod tests {
         assert_eq!(sanitize_terminal_text("tail\u{1b}"), "tail");
         // Two-character escapes (ESC 7 / ESC c) are consumed entirely.
         assert_eq!(sanitize_terminal_text("x\u{1b}7y\u{1b}cz"), "xyz");
+    }
+
+    #[test]
+    fn sanitizes_single_codepoint_c1_sequences() {
+        assert_eq!(
+            sanitize_terminal_text("\u{009b}31mred\u{009b}0m"),
+            "red"
+        );
+        assert_eq!(
+            sanitize_terminal_text("a\u{009d}0;forged title\u{009c}b"),
+            "ab"
+        );
+        assert_eq!(
+            sanitize_terminal_text("a\u{0090}terminal payload\u{009c}b"),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn terminal_line_sanitizer_prevents_multiline_layout_spoofing() {
+        assert_eq!(
+            sanitize_terminal_line("trusted\n[Allow Always]\tlabel"),
+            "trusted [Allow Always] label"
+        );
+        assert_eq!(sanitize_terminal_line("safe\u{009b}2Jname"), "safename");
     }
 
     #[test]

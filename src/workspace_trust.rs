@@ -397,44 +397,47 @@ pub struct TrustInputs {
     pub interactive: bool,
 }
 
-/// Canonical store key for a workspace path.
-#[must_use]
-pub fn workspace_key(cwd: &Path) -> String {
-    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-
+#[cfg(unix)]
+fn encoded_workspace_key(canonical: &Path) -> String {
     // The tag is part of the persistence contract. Changing it deliberately
     // invalidates older decisions and causes a safe re-prompt instead of
     // interpreting path bytes with a different platform/toolchain encoding.
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
 
-        return format!(
-            "path-v3:unix:{}",
-            crate::package_manager::hex_encode(canonical.as_os_str().as_bytes())
-        );
-    }
+    format!(
+        "path-v3:unix:{}",
+        crate::package_manager::hex_encode(canonical.as_os_str().as_bytes())
+    )
+}
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt as _;
+#[cfg(windows)]
+fn encoded_workspace_key(canonical: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt as _;
 
-        let bytes = canonical
-            .as_os_str()
-            .encode_wide()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-        return format!(
-            "path-v3:windows-utf16le:{}",
-            crate::package_manager::hex_encode(&bytes)
-        );
-    }
+    let bytes = canonical
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    format!(
+        "path-v3:windows-utf16le:{}",
+        crate::package_manager::hex_encode(&bytes)
+    )
+}
 
-    #[cfg(not(any(unix, windows)))]
+#[cfg(not(any(unix, windows)))]
+fn encoded_workspace_key(canonical: &Path) -> String {
     format!(
         "path-v3:platform-encoded:{}",
         crate::package_manager::hex_encode(canonical.as_os_str().as_encoded_bytes())
     )
+}
+
+/// Canonical store key for a workspace path.
+#[must_use]
+pub fn workspace_key(cwd: &Path) -> String {
+    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    encoded_workspace_key(&canonical)
 }
 
 /// Decide whether the workspace at `cwd` is trusted, prompting via `prompt`

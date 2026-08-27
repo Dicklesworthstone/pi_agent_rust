@@ -1687,6 +1687,7 @@ pub async fn run_interactive(
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
+    package_manager: PackageManager,
     extensions: Option<ExtensionManager>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
@@ -1696,6 +1697,18 @@ pub async fn run_interactive(
     btw_factory: Option<pi::btw::BtwClientFactory>,
     mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
 ) -> anyhow::Result<()> {
+    // Resolve the initial transcript before taking ownership of the terminal
+    // or installing request/reply bridges. A lock failure can therefore
+    // return normally without leaving the cursor hidden or UI senders open.
+    let (messages, usage) = {
+        let cx = Cx::for_request();
+        let guard = session
+            .lock(&cx)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to lock session: {e}"))?;
+        conversation_from_session(&guard)
+    };
+
     let should_check_for_updates = config.should_check_for_updates();
     let show_hardware_cursor = config
         .show_hardware_cursor
@@ -1738,6 +1751,8 @@ pub async fn run_interactive(
     }
 
     let extensions = extensions;
+    let terminal_extensions = extensions.clone();
+    let terminal_ask_tool = ask_tool.clone();
 
     // Ask-tool picker bridge (bd-cv653.3.8): requests flow through a channel
     // into the UI loop; answers return via AskTool::respond_ui, mirroring the
@@ -1745,14 +1760,15 @@ pub async fn run_interactive(
     if let Some(ask) = &ask_tool {
         let (ask_ui_tx, mut ask_ui_rx) = mpsc::channel::<crate::ask::AskUiRequest>(4);
         ask.install_channel_ui(ask_ui_tx);
+        let ask_forwarder = ask.clone();
         let ask_event_tx = event_tx.clone();
         let ask_ui_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
             while let Ok(request) = ask_ui_rx.recv(&ask_ui_cx).await {
-                if !enqueue_pi_event(&ask_event_tx, &ask_ui_cx, PiMsg::AskUiRequest(request)).await
-                {
-                    break;
-                }
+                let request_id = request.id.clone();
+                ask_forwarder.try_forward_channel_ui_request(&request_id, || {
+                    ask_event_tx.try_send(PiMsg::AskUiRequest(request)).is_ok()
+                });
             }
         });
     }
@@ -1761,10 +1777,16 @@ pub async fn run_interactive(
         let (extension_ui_tx, mut extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
         manager.set_ui_sender(extension_ui_tx);
 
+        let extension_ui_manager = manager.clone();
         let extension_event_tx = event_tx.clone();
         let extension_ui_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
             while let Ok(request) = extension_ui_rx.recv(&extension_ui_cx).await {
+                if request.expects_response()
+                    && !extension_ui_manager.ui_request_is_pending(&request.id)
+                {
+                    continue;
+                }
                 if !enqueue_pi_event(
                     &extension_event_tx,
                     &extension_ui_cx,
@@ -1778,22 +1800,13 @@ pub async fn run_interactive(
         });
     }
 
-    let (messages, usage) = {
-        let cx = Cx::for_request();
-        let guard = session
-            .lock(&cx)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to lock session: {e}"))?;
-        conversation_from_session(&guard)
-    };
-
     // Build the bubbletea program. Mouse capture is conditional: ON by
     // default (so in-app mouse-wheel scrolling routes to the TUI), but
     // disabled when the user opts out via --no-mouse-capture / settings /
     // PI_NO_MOUSE_CAPTURE so terminal-native copy/paste keeps working
     // (Windows-specific UX win — see pi_agent_rust#78). When disabled,
     // users scroll with Page Up/Down or arrow keys instead.
-    {
+    let program_result = {
         let mut app = Box::new(PiApp::new(
             agent,
             session,
@@ -1816,6 +1829,10 @@ pub async fn run_interactive(
             usage,
             mcp_manager,
         ));
+        // `/reload` must reuse the exact startup trust decision. Rebuilding a
+        // default PackageManager here would silently re-enable project package
+        // resolution in an untrusted workspace.
+        app.set_reload_package_manager(package_manager);
         app.ask_tool = ask_tool;
         // The live multi-root handle must reach the app (bd-cv653.3.12) —
         // without it /add-dir, @-file scope, and autocomplete run on a
@@ -1837,7 +1854,17 @@ pub async fn run_interactive(
         // (bd-trkef): stderr writes would be painted into the alt-screen
         // frame and corrupt the transcript. Restored on drop, even on error.
         let _log_guard = crate::tui::TuiLogRedirectGuard::begin();
-        program.run()?;
+        program.run()
+    };
+
+    // Terminally close both request/reply surfaces before bridge teardown.
+    // This runs on normal exit and on `Program::run` errors, so outstanding
+    // tool/extension futures cannot wait for a UI that no longer exists.
+    if let Some(ask_tool) = &terminal_ask_tool {
+        ask_tool.close_channel_ui();
+    }
+    if let Some(manager) = &terminal_extensions {
+        manager.close_ui_sender_and_cancel_pending();
     }
 
     // Tell the async bridge to exit promptly even if some background task still
@@ -1848,6 +1875,7 @@ pub async fn run_interactive(
     enqueue_ui_shutdown(&shutdown_event_tx, &shutdown_cx).await;
 
     let _ = crossterm::execute!(std::io::stdout(), cursor::Show);
+    program_result?;
     println!("Goodbye!");
     Ok(())
 }
@@ -1999,11 +2027,15 @@ pub enum PiMsg {
     },
     /// Extension UI request (select/confirm/input/editor/custom/notify).
     ExtensionUiRequest(ExtensionUiRequest),
-    /// A queued capability prompt's bounded budget elapsed (bd-yllbn).
+    /// Periodic redraw or final deadline wake for one capability prompt.
     ///
-    /// Carries the exact request id plus its activation generation so late
-    /// or duplicated wake-ups cannot resolve a different overlay.
-    CapabilityPromptExpired { id: String, generation: u64 },
+    /// Carries request, prompt, and timer generations so late or duplicated
+    /// wakes cannot resolve or rearm a replacement timer/overlay.
+    CapabilityPromptTick {
+        id: String,
+        generation: u64,
+        timer_generation: u64,
+    },
     /// Extension command finished execution.
     ExtensionCommandDone {
         command: String,
@@ -2015,9 +2047,9 @@ pub enum PiMsg {
     OAuthCallbackReceived(String),
 }
 
-/// Retry a contended session-scoped UI event for at most two seconds. This is
-/// long enough to bridge normal transition critical sections while keeping a
-/// broken lock path bounded and observable to the handler at exhaustion.
+/// Retry a contended session-scoped UI event with at most 80 deliberate 25 ms
+/// sleeps. Scheduler and queue delays are outside this budget, so this bounds
+/// retry work rather than wall-clock age; exhaustion remains observable.
 pub(super) const SESSION_EVENT_LOCK_RETRY_ATTEMPTS: u8 = 80;
 const SESSION_EVENT_LOCK_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(25);
@@ -2496,6 +2528,10 @@ pub struct PiApp {
     markdown_style: GlamourStyleConfig,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
+    /// Startup-configured package resolver retained for `/reload`. Direct
+    /// `PiApp::new` construction starts fail-closed until its host installs an
+    /// explicitly trusted manager.
+    package_manager: PackageManager,
     cwd: PathBuf,
     model_entry: ModelEntry,
     model_entry_shared: Arc<StdMutex<ModelEntry>>,
@@ -2640,6 +2676,14 @@ impl BubbleteaModel for Box<PiApp> {
 }
 
 impl PiApp {
+    /// Install the startup-configured resolver used by `/reload`.
+    ///
+    /// Keeping this as one explicit seam prevents reload from reconstructing a
+    /// resolver whose default trust differs from the decision made at startup.
+    pub(crate) fn set_reload_package_manager(&mut self, package_manager: PackageManager) {
+        self.package_manager = package_manager;
+    }
+
     /// Attach the session workspace root handle (bd-cv653.3.12). Installed
     /// after construction by hosts that own the shared root set.
     pub fn set_workspace(&mut self, workspace: WorkspaceHandle) {
@@ -2904,6 +2948,7 @@ impl PiApp {
             markdown_style,
             resources,
             resource_cli,
+            package_manager: PackageManager::new(cwd.clone()).with_project_trust(false),
             cwd,
             model_entry,
             model_entry_shared: model_entry_shared.clone(),

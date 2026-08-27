@@ -523,16 +523,35 @@ pub fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    // Show provenance: which extension is making this request.
-    let provenance = request
-        .extension_id
-        .as_deref()
+    // Capability provenance is host-authenticated metadata. Generic requests
+    // retain the explicit/payload fallback used by the extension UI protocol.
+    let capability_identity = request.capability_prompt_identity();
+    let provenance = capability_identity
+        .map(|(extension_id, _)| extension_id)
+        .or(request.extension_id.as_deref())
         .or_else(|| request.payload.get("extension_id").and_then(Value::as_str))
         .unwrap_or("unknown");
 
+    // This prompt is written directly to a terminal in the line-oriented
+    // surface. Sanitize every extension-controlled display string before
+    // formatting so OSC/DCS/CSI sequences cannot escape the prompt.
+    let title = super::tool_render::sanitize_terminal_line(title);
+    let message = super::tool_render::sanitize_terminal_text(message);
+    let provenance = super::tool_render::sanitize_terminal_line(provenance);
+    let capability = capability_identity
+        .map(|(_, capability)| super::tool_render::sanitize_terminal_line(capability));
+
     match request.method.as_str() {
         "confirm" => {
-            format!("[{provenance}] confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'.")
+            if let Some(capability) = capability.as_deref() {
+                format!(
+                    "[{provenance}] capability request: {capability}\n{message}\n\nEnter yes/no, or 'cancel'."
+                )
+            } else {
+                format!(
+                    "[{provenance}] confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'."
+                )
+            }
         }
         "select" => {
             let options = request
@@ -554,6 +573,7 @@ pub fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
                     .or_else(|| opt.get("value").and_then(Value::as_str))
                     .or_else(|| opt.as_str())
                     .unwrap_or("");
+                let label = super::tool_render::sanitize_terminal_line(label);
                 let _ = writeln!(&mut out, "  {}) {label}", idx + 1);
             }
             out.push_str("\nEnter a number, label, or 'cancel'.");
@@ -590,7 +610,15 @@ pub fn parse_extension_ui_response(
             };
             Ok(ExtensionUiResponse {
                 id: request.id.clone(),
-                value: Some(Value::Bool(value)),
+                value: Some(if request.is_capability_prompt() {
+                    json!({
+                        "allow": value,
+                        "persist": false,
+                        "remember": false,
+                    })
+                } else {
+                    Value::Bool(value)
+                }),
                 cancelled: false,
             })
         }
@@ -782,6 +810,45 @@ mod tests {
             compat: None,
             oauth_config: None,
         }
+    }
+
+    #[test]
+    fn format_generic_confirm_sanitizes_hostile_title_on_one_line() {
+        let request = ExtensionUiRequest::new(
+            "req-confirm",
+            "confirm",
+            json!({
+                "title": "Approve\nforged\u{1b}]0;owned\u{7}\u{009b}31mred",
+                "message": "Continue?",
+            }),
+        )
+        .with_extension_id(Some("trusted-extension".to_string()));
+
+        assert_eq!(
+            format_extension_ui_prompt(&request),
+            "[trusted-extension] confirm: Approve forgedred\nContinue?\n\nEnter yes/no, or 'cancel'."
+        );
+    }
+
+    #[test]
+    fn format_generic_select_sanitizes_hostile_option_label_on_one_line() {
+        let request = ExtensionUiRequest::new(
+            "req-select",
+            "select",
+            json!({
+                "title": "Choose",
+                "options": [{
+                    "label": "First\nforged\u{009d}0;owned\u{009c}\tvisible",
+                    "value": "first",
+                }],
+            }),
+        )
+        .with_extension_id(Some("trusted-extension".to_string()));
+
+        assert_eq!(
+            format_extension_ui_prompt(&request),
+            "[trusted-extension] select: Choose\n  1) First forged visible\n\nEnter a number, label, or 'cancel'."
+        );
     }
 
     #[test]

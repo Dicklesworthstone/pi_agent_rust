@@ -16,6 +16,8 @@ use crate::session_picker::delete_session_file;
 use crate::theme::Theme;
 use serde_json::Value;
 
+use super::tool_render::{sanitize_terminal_line, sanitize_terminal_text};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PendingLoginKind {
     OAuth,
@@ -618,31 +620,81 @@ pub(super) struct CapabilityPromptOverlay {
     /// Authoritative absolute expiry shared with the manager-side timeout.
     /// `None` = request carried no bounded budget (no timer rendered/fired).
     pub(super) expires_at: Option<std::time::Instant>,
+    /// Cancellation signal for the single outstanding periodic wake owned by
+    /// this request generation. Resolution/reset/quit wakes the command
+    /// thread immediately instead of leaving a long sleeper behind.
+    timer: CapabilityPromptTimer,
+    /// Epoch for the timer command currently owned by this prompt.
+    /// Promotion replaces a queued deadline wake with an active 1 Hz wake;
+    /// already-enqueued messages from the old epoch are therefore inert.
+    timer_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CapabilityPromptTimer {
+    state: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl CapabilityPromptTimer {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )),
+        }
+    }
+
+    pub(super) fn cancel(&self) {
+        let (cancelled, wake) = &*self.state;
+        let mut cancelled = cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cancelled = true;
+        wake.notify_all();
+    }
+
+    /// Wait for one redraw interval. Returns false when lifecycle cleanup
+    /// cancelled this generation before the interval elapsed.
+    pub(super) fn wait(&self, delay: std::time::Duration) -> bool {
+        let (cancelled, wake) = &*self.state;
+        let cancelled = cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cancelled {
+            return false;
+        }
+        let (cancelled, timed_out) = wake
+            .wait_timeout_while(cancelled, delay, |cancelled| !*cancelled)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !*cancelled && timed_out.timed_out()
+    }
 }
 
 impl CapabilityPromptOverlay {
     pub(super) fn from_request(request: ExtensionUiRequest) -> Self {
-        let extension_id = request
-            .payload
-            .get("extension_id")
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>")
-            .to_string();
-        let capability = request
-            .payload
-            .get("capability")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
+        let (extension_id, capability) = request
+            .capability_prompt_identity()
+            .map_or(("<unknown>", "unknown"), |(extension_id, capability)| {
+                (extension_id, capability)
+            });
+        // Extension-provided labels and descriptions are rendered directly by
+        // the terminal UI. Strip escape/control sequences at the trust
+        // boundary so a capability prompt cannot move the cursor, rewrite the
+        // screen, or smuggle an OSC/DCS payload into the terminal.
+        let extension_id = sanitize_terminal_line(extension_id).into_owned();
+        let capability = sanitize_terminal_line(capability).into_owned();
         let description = request
             .payload
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        // Anchored at arrival so queueing time consumes the same bounded
-        // budget the manager enforces on its side of the same request.
-        let expires_at = Self::deadline_from_request(&request, std::time::Instant::now());
+            .map_or_else(String::new, |message| {
+                sanitize_terminal_text(message).into_owned()
+            });
+        // The manager binds this once before publication. Consuming the exact
+        // monotonic value here prevents channel/queue delay from restarting
+        // the visible countdown after the manager's budget has already run.
+        let expires_at = request.deadline();
         Self {
             request,
             extension_id,
@@ -651,34 +703,40 @@ impl CapabilityPromptOverlay {
             focused: 0,
             generation: 0,
             expires_at,
+            timer: CapabilityPromptTimer::new(),
+            timer_generation: 0,
         }
     }
 
-    /// Resolve the single authoritative deadline from an incoming request.
-    fn deadline_from_request(
-        request: &ExtensionUiRequest,
-        now: std::time::Instant,
-    ) -> Option<std::time::Instant> {
-        let ms = request
-            .timeout_ms
-            .or_else(|| request.payload.get("timeout_ms").and_then(Value::as_u64))
-            .or_else(|| request.payload.get("timeout").and_then(Value::as_u64))?;
-        (ms > 0).then(|| now + std::time::Duration::from_millis(ms))
+    pub(super) fn cancel_timer(&self) {
+        self.timer.cancel();
+    }
+
+    pub(super) fn timer(&self) -> CapabilityPromptTimer {
+        self.timer.clone()
+    }
+
+    pub(super) const fn timer_generation(&self) -> u64 {
+        self.timer_generation
+    }
+
+    pub(super) fn restart_timer(&mut self) {
+        self.timer.cancel();
+        self.timer = CapabilityPromptTimer::new();
+        self.timer_generation = self.timer_generation.wrapping_add(1);
+    }
+
+    pub(super) fn has_time_remaining(&self, now: std::time::Instant) -> bool {
+        self.expires_at.is_some_and(|deadline| deadline > now)
     }
 
     /// Whole seconds left on the countdown, clamped at zero.
     pub(super) fn remaining_secs(&self, now: std::time::Instant) -> Option<u32> {
-        let remaining = self.remaining_ms(now)?;
-        Some(u32::try_from(remaining.div_ceil(1000)).unwrap_or(u32::MAX))
-    }
-
-    /// Milliseconds remaining until expiry (`None` when unbudgeted).
-    pub(super) fn remaining_ms(&self, now: std::time::Instant) -> Option<u64> {
-        self.expires_at.map(|deadline| {
-            deadline
-                .checked_duration_since(now)
-                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        })
+        let remaining = self.expires_at?.saturating_duration_since(now);
+        let rounded_up = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+        Some(u32::try_from(rounded_up).unwrap_or(u32::MAX))
     }
 
     pub(super) const fn focus_next(&mut self) {
@@ -699,9 +757,7 @@ impl CapabilityPromptOverlay {
     /// Returns `true` if this is a capability-specific confirm prompt (not a
     /// generic extension confirm).
     pub(super) fn is_capability_prompt(request: &ExtensionUiRequest) -> bool {
-        request.method == "confirm"
-            && request.payload.get("capability").is_some()
-            && request.payload.get("extension_id").is_some()
+        request.is_capability_prompt()
     }
 }
 
