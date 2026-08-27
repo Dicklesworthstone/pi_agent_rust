@@ -2726,7 +2726,7 @@ mod tests {
             fn as_str_non_empty_dotted(idx in 0..13usize) {
                 let code = ALL_DIAGNOSTIC_CODES[idx];
                 let s = code.as_str();
-                assert_ne!(s, "");
+                assert!(!s.is_empty());
                 assert!(s.contains('.'), "diagnostic code should be dotted: {s}");
             }
 
@@ -2745,7 +2745,7 @@ mod tests {
             #[test]
             fn remediation_non_empty(idx in 0..13usize) {
                 let code = ALL_DIAGNOSTIC_CODES[idx];
-                assert_ne!(code.remediation(), "");
+                assert!(!code.remediation().is_empty());
             }
 
             /// `redaction_policy` is always `"redact-secrets"`.
@@ -2784,7 +2784,7 @@ mod tests {
                 ];
                 for e in &errors {
                     let code = e.category_code();
-                    assert_ne!(code, "");
+                    assert!(!code.is_empty());
                     assert!(code.chars().all(|c| c.is_ascii_lowercase()));
                 }
             }

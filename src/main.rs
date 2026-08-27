@@ -8957,7 +8957,7 @@ mod tests {
                 |_| None,
             ))
             .expect("missing ambient key remains an explicit empty result");
-        assert!(absent.is_empty());
+        assert_eq!(absent, "");
     }
 
     #[test]

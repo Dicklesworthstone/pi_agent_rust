@@ -580,7 +580,7 @@ mod tests {
         let error = Error::config("settings.json not found");
         let hint = hints_for_error(&error);
         assert!(hint.summary.contains("configuration"));
-        assert_ne!(hint.hints, []);
+        assert!(!hint.hints.is_empty());
     }
 
     #[test]
@@ -651,7 +651,7 @@ mod tests {
     fn test_aborted_has_no_hints() {
         let error = Error::Aborted;
         let hint = hints_for_error(&error);
-        assert_eq!(hint.hints, []);
+        assert!(hint.hints.is_empty());
     }
 
     #[test]
@@ -739,7 +739,7 @@ mod tests {
         let error = Error::session("database locked");
         let hint = hints_for_error(&error);
         // Falls back to generic session error since it's not actually a Sqlite variant
-        assert_ne!(hint.hints, []);
+        assert!(!hint.hints.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1161,7 +1161,7 @@ mod tests {
             fn hints_for_error_never_panics(variant in 0..9usize, msg in "[\\w\\s./]{0,80}") {
                 let error = make_error(variant, &msg);
                 let hint = hints_for_error(&error);
-                assert_ne!(hint.summary, "");
+                assert!(!hint.summary.is_empty());
                 assert!(hint.hints.len() <= 2);
                 assert!(hint.context_fields.len() <= 3);
             }
@@ -1179,7 +1179,7 @@ mod tests {
             fn summary_is_clean(variant in 0..9usize, msg in "[\\w\\s./]{0,80}") {
                 let error = make_error(variant, &msg);
                 let hint = hints_for_error(&error);
-                assert_ne!(hint.summary, "");
+                assert!(!hint.summary.is_empty());
                 assert!(!hint.summary.contains('\n'));
                 assert!(!hint.summary.contains('\r'));
             }
@@ -1190,7 +1190,7 @@ mod tests {
                 let error = make_error(variant, &msg);
                 let hint = hints_for_error(&error);
                 for &h in hint.hints {
-                    assert_ne!(h, "");
+                    assert!(!h.is_empty());
                 }
             }
 
@@ -1200,7 +1200,7 @@ mod tests {
                 let error = make_error(variant, &msg);
                 let hint = hints_for_error(&error);
                 for &field in hint.context_fields {
-                    assert_ne!(field, "");
+                    assert!(!field.is_empty());
                     assert!(field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
                 }
             }
@@ -1257,15 +1257,15 @@ mod tests {
                 let msg = format!("{prefix} timeout");
                 let error = Error::provider(provider, msg);
                 let hint = hints_for_error(&error);
-                assert_ne!(hint.summary, "");
+                assert!(!hint.summary.is_empty());
             }
 
             /// Aborted error always has empty hints.
             #[test]
             fn aborted_always_empty_hints(_dummy in 0..10u32) {
                 let hint = hints_for_error(&Error::Aborted);
-                assert_eq!(hint.hints, []);
-                assert_eq!(hint.context_fields, []);
+                assert!(hint.hints.is_empty());
+                assert!(hint.context_fields.is_empty());
                 assert_eq!(hint.summary, "Operation cancelled by user");
             }
 

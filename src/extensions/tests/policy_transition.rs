@@ -45,7 +45,7 @@ fn explain_effective_policy_permissive_profile() {
         explanation.dangerous_allowed.contains(&"env".to_string()),
         "env should be allowed in permissive profile"
     );
-    assert_eq!(explanation.dangerous_denied, [] as [std::string::String; 0]);
+    assert!(explanation.dangerous_denied.is_empty());
 }
 
 #[test]

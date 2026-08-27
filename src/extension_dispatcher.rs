@@ -14078,7 +14078,7 @@ mod tests {
         let observed_keys = details["schemaDiff"]["observedParamKeys"]
             .as_array()
             .expect("must be array");
-        assert_eq!(observed_keys.as_slice(), []);
+        assert!(observed_keys.is_empty());
         assert_eq!(
             details["dispatcherDecisionTrace"]["fallbackReason"],
             "handler_error"

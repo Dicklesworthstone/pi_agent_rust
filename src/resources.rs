@@ -2952,7 +2952,7 @@ mod tests {
             "description exceeds {MAX_SKILL_DESC_LEN} characters"
         ))));
 
-        assert_eq!(validate_description("ok"), [] as [std::string::String; 0]);
+        assert!(validate_description("ok").is_empty());
     }
 
     #[test]
@@ -3434,8 +3434,8 @@ still frontmatter",
 
     #[test]
     fn test_parse_command_args_empty() {
-        assert_eq!(parse_command_args(""), [] as [std::string::String; 0]);
-        assert_eq!(parse_command_args("   "), [] as [std::string::String; 0]);
+        assert!(parse_command_args("").is_empty());
+        assert!(parse_command_args("   ").is_empty());
     }
 
     #[test]
@@ -3578,7 +3578,7 @@ still frontmatter",
     fn test_parse_frontmatter_empty_input() {
         let parsed = parse_frontmatter("");
         assert!(parsed.frontmatter.is_empty());
-        assert_eq!(parsed.body, "");
+        assert!(parsed.body.is_empty());
     }
 
     #[test]
@@ -3600,13 +3600,13 @@ still frontmatter",
     #[test]
     fn test_validate_name_valid_name() {
         let errors = validate_name("good-name", "good-name");
-        assert_eq!(errors, [] as [std::string::String; 0]);
+        assert!(errors.is_empty());
     }
 
     #[test]
     fn test_validate_name_single_char() {
         let errors = validate_name("a", "a");
-        assert_eq!(errors, [] as [std::string::String; 0]);
+        assert!(errors.is_empty());
     }
 
     // ── CollisionInfo and DiagnosticKind ────────────────────────────────

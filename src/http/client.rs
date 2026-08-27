@@ -678,7 +678,6 @@ impl Response {
         &self.headers
     }
 
-    
     pub fn bytes_stream(self) -> Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>> {
         wrap_stream_with_idle_timeout(self.stream, self.timeout_info)
     }
@@ -1682,7 +1681,7 @@ mod tests {
         let head = b"HTTP/1.1 404 Not Found\r\n\r\n";
         let (status, headers) = parse_response_head(head).unwrap();
         assert_eq!(status, 404);
-        assert_eq!(headers, [] as [(std::string::String, std::string::String); 0]);
+        assert!(headers.is_empty());
     }
 
     #[test]
@@ -2217,7 +2216,7 @@ mod tests {
             .post("https://api.example.com")
             .json(&json!({"key": "value"}))
             .unwrap();
-        assert_ne!(builder.body, [] as [u8; 0]);
+        assert!(!builder.body.is_empty());
         // Should have auto-added Content-Type header
         assert!(
             builder
@@ -2359,7 +2358,7 @@ mod tests {
                 .expect_err("flush failure should not be swallowed");
             assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
             assert_eq!(err.to_string(), "flush failed");
-            assert_eq!(writer.written, [] as [u8; 0]);
+            assert!(writer.written.is_empty());
         });
     }
 

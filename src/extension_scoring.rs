@@ -2109,9 +2109,9 @@ mod tests {
         let report = evaluate_interference_matrix_completeness(&levers, &observed);
         assert_eq!(report.expected_pairs, 6);
         assert_eq!(report.observed_pairs, 6);
-        assert_eq!(report.missing_pairs, [] as [std::string::String; 0]);
-        assert_eq!(report.duplicate_pairs, [] as [std::string::String; 0]);
-        assert_eq!(report.unknown_pairs, [] as [std::string::String; 0]);
+        assert!(report.missing_pairs.is_empty());
+        assert!(report.duplicate_pairs.is_empty());
+        assert!(report.unknown_pairs.is_empty());
         assert!(report.complete);
     }
 
@@ -3086,7 +3086,7 @@ mod tests {
         let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let candidate = minimal_candidate("bare");
         let scored = score_candidate(&candidate, as_of);
-        assert_ne!(scored.missing_signals, [] as [std::string::String; 0]);
+        assert!(!scored.missing_signals.is_empty());
         assert!(
             scored
                 .missing_signals

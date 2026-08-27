@@ -2064,8 +2064,8 @@ mod tests {
 
         let handle = run_async(create_agent_session(options)).expect("create session");
         let provider = handle.session().agent.provider();
-        assert_ne!(provider.name(), "");
-        assert_ne!(provider.model_id(), "");
+        assert!(!provider.name().is_empty());
+        assert!(!provider.model_id().is_empty());
         assert_eq!(handle.model().0, provider.name());
         assert_eq!(handle.model().1, provider.model_id());
     }
@@ -2939,7 +2939,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let tool = super::create_read_tool(tmp.path());
         assert_eq!(tool.name(), "read");
-        assert_ne!(tool.description(), "");
+        assert!(!tool.description().is_empty());
         let params = tool.parameters();
         assert!(params.is_object(), "parameters should be a JSON object");
     }
@@ -2949,7 +2949,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let tool = super::create_bash_tool(tmp.path());
         assert_eq!(tool.name(), "bash");
-        assert_ne!(tool.description(), "");
+        assert!(!tool.description().is_empty());
     }
 
     #[test]
@@ -3005,7 +3005,7 @@ mod tests {
         let tool = super::create_read_tool(tmp.path());
         let def = super::tool_to_definition(tool.as_ref());
         assert_eq!(def.name, "read");
-        assert_ne!(def.description, "");
+        assert!(!def.description.is_empty());
         assert!(def.parameters.is_object());
         assert!(
             def.parameters.get("properties").is_some(),
@@ -3020,8 +3020,8 @@ mod tests {
         assert_eq!(defs.len(), 8);
 
         for def in &defs {
-            assert_ne!(def.name, "");
-            assert_ne!(def.description, "");
+            assert!(!def.name.is_empty());
+            assert!(!def.description.is_empty());
             assert!(def.parameters.is_object());
         }
     }

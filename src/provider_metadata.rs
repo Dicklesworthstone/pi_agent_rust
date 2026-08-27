@@ -2959,10 +2959,11 @@ mod tests {
             provider_metadata("lmstudio").unwrap().auth_env_keys,
             &["LMSTUDIO_API_KEY"]
         );
-        assert_eq!(
+        assert!(
             provider_metadata("ollama")
                 .unwrap()
-                .auth_env_keys, []
+                .auth_env_keys
+                .is_empty()
         );
         assert_eq!(
             provider_metadata("ollama-cloud").unwrap().auth_env_keys,
@@ -3386,7 +3387,7 @@ mod tests {
         );
         // A collision-free table yields no violations.
         let clean: Vec<(&str, &[&str])> = vec![("gmi", &["gmi-cloud"][..]), ("kilo", &[])];
-        assert_eq!(alias_collision_violations(&clean), [] as [std::string::String; 0]);
+        assert!(alias_collision_violations(&clean).is_empty());
     }
 
     #[test]
@@ -3528,7 +3529,7 @@ mod tests {
             fn provider_metadata_empty_returns_none(_dummy in 0..10u32) {
                 assert!(provider_metadata("").is_none());
                 assert!(canonical_provider_id("").is_none());
-                assert_eq!(provider_auth_env_keys(""), []);
+                assert!(provider_auth_env_keys("").is_empty());
                 assert!(provider_routing_defaults("").is_none());
             }
 
@@ -3581,7 +3582,7 @@ mod tests {
                 // 20+ char lowercase strings won't match any provider
                 assert!(provider_metadata(&s).is_none());
                 assert!(canonical_provider_id(&s).is_none());
-                assert_eq!(provider_auth_env_keys(&s), []);
+                assert!(provider_auth_env_keys(&s).is_empty());
                 assert!(provider_routing_defaults(&s).is_none());
             }
 
@@ -3592,7 +3593,7 @@ mod tests {
                 let keys = provider_auth_env_keys(meta.canonical_id);
                 // Some providers (e.g. ollama) have no auth keys — that's valid.
                 for &key in keys {
-                    assert_ne!(key, "");
+                    assert!(!key.is_empty());
                     assert!(
                         key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
                         "invalid env var name: {key}"

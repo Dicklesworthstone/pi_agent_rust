@@ -2532,7 +2532,7 @@ export default function init(pi) {
         let provider = create_provider(&entry, None).expect("azure provider");
         assert_eq!(provider.name(), "azure-openai");
         assert_eq!(provider.api(), "azure-openai");
-        assert_ne!(provider.model_id(), "");
+        assert!(!provider.model_id().is_empty());
     }
 
     #[test]
@@ -2546,7 +2546,7 @@ export default function init(pi) {
         let provider = create_provider(&entry, None).expect("azure cognitive provider");
         assert_eq!(provider.name(), "azure-cognitive-services");
         assert_eq!(provider.api(), "azure-openai");
-        assert_ne!(provider.model_id(), "");
+        assert!(!provider.model_id().is_empty());
     }
 
     #[test]

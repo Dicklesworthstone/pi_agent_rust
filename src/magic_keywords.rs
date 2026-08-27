@@ -287,23 +287,23 @@ mod tests {
 
     #[test]
     fn code_spans_and_fences_never_trigger() {
-        assert_eq!(words("`ultrathink` in backticks"), [] as [std::string::String; 0]);
-        assert_eq!(words("```\nultrathink\n```"), [] as [std::string::String; 0]);
-        assert_eq!(words("some `code ultrathink code` here"), [] as [std::string::String; 0]);
+        assert!(words("`ultrathink` in backticks").is_empty());
+        assert!(words("```\nultrathink\n```").is_empty());
+        assert!(words("some `code ultrathink code` here").is_empty());
     }
 
     #[test]
     fn xml_sections_never_trigger() {
-        assert_eq!(words("<system-reminder>ultrathink</system-reminder>"), [] as [std::string::String; 0]);
-        assert_eq!(words("<think>ultrathink</think>"), [] as [std::string::String; 0]);
+        assert!(words("<system-reminder>ultrathink</system-reminder>").is_empty());
+        assert!(words("<think>ultrathink</think>").is_empty());
     }
 
     #[test]
     fn identifiers_and_paths_never_trigger() {
-        assert_eq!(words("ultrathink_mode"), [] as [std::string::String; 0]);
-        assert_eq!(words("preultrathink"), [] as [std::string::String; 0]);
-        assert_eq!(words("/tmp/ultrathink"), [] as [std::string::String; 0]);
-        assert_eq!(words("see https://example.com/ultrathink docs"), [] as [std::string::String; 0]);
+        assert!(words("ultrathink_mode").is_empty());
+        assert!(words("preultrathink").is_empty());
+        assert!(words("/tmp/ultrathink").is_empty());
+        assert!(words("see https://example.com/ultrathink docs").is_empty());
     }
 
     #[test]

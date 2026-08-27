@@ -462,7 +462,7 @@ mod tests {
             vec!["[hub:a] first".to_string(), "[hub:b] second".to_string()]
         );
         // Drain is consume-once.
-        assert_eq!(drain_steer_file(&entry.steer_path), [] as [std::string::String; 0]);
+        assert!(drain_steer_file(&entry.steer_path).is_empty());
         let _ = fs::remove_dir_all(&temp);
     }
 

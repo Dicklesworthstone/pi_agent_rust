@@ -413,8 +413,8 @@ mod tests {
     fn flake_category_all_covered() {
         assert_eq!(FlakeCategory::all().len(), 6);
         for cat in FlakeCategory::all() {
-            assert_ne!(cat.label(), "");
-            assert_ne!(cat.to_string(), "");
+            assert!(!cat.label().is_empty());
+            assert!(!cat.to_string().is_empty());
         }
     }
 
@@ -619,8 +619,8 @@ mod tests {
             #[test]
             fn all_categories_have_nonempty_labels(idx in 0..6usize) {
                 let cat = FlakeCategory::all()[idx];
-                assert_ne!(cat.label(), "");
-                assert_ne!(cat.to_string(), "");
+                assert!(!cat.label().is_empty());
+                assert!(!cat.to_string().is_empty());
                 assert_eq!(cat.label(), cat.to_string());
             }
 

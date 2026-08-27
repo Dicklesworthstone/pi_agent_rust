@@ -1397,7 +1397,7 @@ mod tests {
             enable_skill_commands: false,
         });
         let resp = provider.suggest("/skill:ru", "/skill:ru".len());
-        assert_eq!(resp.items, [] as [autocomplete::AutocompleteItem; 0]);
+        assert!(resp.items.is_empty());
     }
 
     #[test]
@@ -2305,7 +2305,7 @@ mod tests {
         let mut provider =
             AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
         let resp = provider.suggest("hello world", 5);
-        assert_eq!(resp.items, [] as [autocomplete::AutocompleteItem; 0]);
+        assert!(resp.items.is_empty());
     }
 
     // ── suggest_slash with empty query ───────────────────────────────
@@ -2371,7 +2371,7 @@ mod tests {
     fn walk_project_files_empty_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let files = walk_project_files(tmp.path());
-        assert_eq!(files, [] as [std::string::String; 0]);
+        assert!(files.is_empty());
     }
 
     // ── resolve_file_ref ─────────────────────────────────────────────
@@ -2440,9 +2440,9 @@ mod tests {
     #[test]
     fn autocomplete_catalog_default_is_empty() {
         let catalog = AutocompleteCatalog::default();
-        assert_eq!(catalog.prompt_templates, [] as [autocomplete::NamedEntry; 0]);
-        assert_eq!(catalog.skills, [] as [autocomplete::NamedEntry; 0]);
-        assert_eq!(catalog.extension_commands, [] as [autocomplete::NamedEntry; 0]);
+        assert!(catalog.prompt_templates.is_empty());
+        assert!(catalog.skills.is_empty());
+        assert!(catalog.extension_commands.is_empty());
         assert!(!catalog.enable_skill_commands);
     }
 
@@ -2504,7 +2504,7 @@ mod tests {
         };
         let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
         let resp = provider.suggest("/skill:de", "/skill:de".len());
-        assert_eq!(resp.items, [] as [autocomplete::AutocompleteItem; 0]);
+        assert!(resp.items.is_empty());
     }
 
     // ── file ref suggest with @ ──────────────────────────────────────
@@ -2591,7 +2591,7 @@ mod tests {
         cache.updating = true;
 
         cache.invalidate();
-        assert_eq!(cache.files, [] as [std::string::String; 0]);
+        assert!(cache.files.is_empty());
         assert!(cache.last_update_request.is_none());
         assert!(cache.update_rx.is_none());
         assert!(!cache.updating);
@@ -2703,7 +2703,7 @@ mod tests {
             fn split_path_prefix_tilde(_dummy in 0..1u8) {
                 let (d, f) = split_path_prefix("~");
                 assert_eq!(d, "~");
-                assert_eq!(f, "");
+                assert!(f.is_empty());
             }
 
             /// `split_path_prefix` with trailing slash returns dir=path, file="".
@@ -2712,7 +2712,7 @@ mod tests {
                 let path = format!("{dir}/");
                 let (d, f) = split_path_prefix(&path);
                 assert_eq!(d, path);
-                assert_eq!(f, "");
+                assert!(f.is_empty());
             }
 
             /// `split_path_prefix` with no slash returns dir=".", file=path.

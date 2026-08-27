@@ -511,7 +511,7 @@ fn drift_detection_no_anomaly_for_baseline_data() {
         !report.drift_detected,
         "should not detect drift for baseline-matching data"
     );
-    assert_eq!(report.anomalies, [] as [extensions::BaselineDriftAnomaly; 0]);
+    assert!(report.anomalies.is_empty());
 }
 
 #[test]

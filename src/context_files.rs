@@ -635,7 +635,7 @@ mod tests {
             matches("src/api/users.ts"),
             vec![".cursor/rules/api.mdc", ".cursor/rules/ts.mdc"]
         );
-        assert_eq!(matches("README.md"), [] as [std::string::String; 0]);
+        assert!(matches("README.md").is_empty());
         // Absolute path inside the workspace resolves via its relative form.
         let absolute = root.join("lib.ts");
         assert_eq!(
@@ -764,6 +764,6 @@ mod tests {
         let rules = discover_foreign_rules(root);
         let rule = rules.rules.first().expect("copilot rule present");
         assert!(rule.always_apply);
-        assert_eq!(rule.globs, [] as [std::string::String; 0]);
+        assert!(rule.globs.is_empty());
     }
 }

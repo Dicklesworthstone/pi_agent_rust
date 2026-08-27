@@ -2138,7 +2138,7 @@ mod tests {
 
         let mut output = String::new();
         assert!(!cache.append_cached(&mut output, 0, &key));
-        assert_eq!(output, "");
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -2267,7 +2267,7 @@ mod tests {
         cache.prefix_set("prefix", 3);
         cache.clear();
         assert!(!cache.prefix_valid(3));
-        assert_eq!(cache.prefix_get(), "");
+        assert!(cache.prefix_get().is_empty());
     }
 
     #[test]
@@ -2303,7 +2303,7 @@ mod tests {
     fn render_buffers_take_returns_cleared_buffer() {
         let rb = RenderBuffers::new();
         let buf = rb.take_conversation_buffer();
-        assert_eq!(buf, "");
+        assert!(buf.is_empty());
         assert!(buf.capacity() >= INITIAL_VIEW_CAPACITY);
     }
 
@@ -2319,7 +2319,7 @@ mod tests {
 
         // Taking again should reuse the grown allocation (cleared but same cap).
         let buf2 = rb.take_conversation_buffer();
-        assert_eq!(buf2, "");
+        assert!(buf2.is_empty());
         assert_eq!(buf2.capacity(), grown_cap);
     }
 
@@ -2331,7 +2331,7 @@ mod tests {
         drop(buf1);
         // Next take gets a fresh (empty, zero-cap) String.
         let buf2 = rb.take_conversation_buffer();
-        assert_eq!(buf2, "");
+        assert!(buf2.is_empty());
     }
 
     #[test]

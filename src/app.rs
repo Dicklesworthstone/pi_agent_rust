@@ -1733,7 +1733,7 @@ mod tests {
             &selection.model_entry.model.provider,
             "open-router"
         ));
-        assert_ne!(selection.model_entry.model.id, "");
+        assert!(!selection.model_entry.model.id.is_empty());
     }
 
     // === Model roles (bd-cv653.3.1) ===

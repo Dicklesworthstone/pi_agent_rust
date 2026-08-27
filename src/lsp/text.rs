@@ -498,6 +498,6 @@ mod tests {
         assert_eq!(line1.len(), 1);
         assert_eq!(line1[0].0, 16);
         let missing = find_occurrences(content, "foo", Some(9));
-        assert_eq!(missing, [] as [(usize, usize); 0]);
+        assert!(missing.is_empty());
     }
 }

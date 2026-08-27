@@ -506,7 +506,7 @@ mod tests {
     fn test_gitlab_response_content_field() {
         let json = r#"{"content": "Alternative response format"}"#;
         let resp: GitLabChatResponse = serde_json::from_str(json).expect("parse");
-        assert_eq!(resp.response, "");
+        assert!(resp.response.is_empty());
         assert_eq!(resp.content, "Alternative response format");
     }
 

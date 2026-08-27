@@ -26258,7 +26258,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         );
 
         assert!(!result.ran_macrotask);
-        assert_eq!(fired, [] as [u64; 0]);
+        assert!(fired.is_empty());
     }
 
     #[test]
@@ -27080,12 +27080,12 @@ import { isIPv4 as netIsIpv4 } from "node:net";
 
             {
                 let state = runtime.module_state.borrow();
-                assert_eq!(state.extension_roots, [] as [std::path::PathBuf; 0]);
-                assert_eq!(state.canonical_extension_roots, [] as [std::path::PathBuf; 0]);
+                assert!(state.extension_roots.is_empty());
+                assert!(state.canonical_extension_roots.is_empty());
                 assert!(state.extension_root_tiers.is_empty());
                 assert!(state.extension_root_scopes.is_empty());
                 assert!(state.extension_roots_by_id.is_empty());
-                assert_eq!(state.extension_roots_without_id, [] as [std::path::PathBuf; 0]);
+                assert!(state.extension_roots_without_id.is_empty());
                 assert!(state.foreign_extension_root_boundaries_by_id.is_empty());
                 assert!(state.dynamic_virtual_modules.is_empty());
                 assert!(state.dynamic_virtual_named_exports.is_empty());
@@ -27180,10 +27180,10 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             );
 
             let state = runtime.module_state.borrow();
-            assert_eq!(state.extension_roots, [] as [std::path::PathBuf; 0]);
-            assert_eq!(state.canonical_extension_roots, [] as [std::path::PathBuf; 0]);
+            assert!(state.extension_roots.is_empty());
+            assert!(state.canonical_extension_roots.is_empty());
             assert!(state.extension_roots_by_id.is_empty());
-            assert_eq!(state.extension_roots_without_id, [] as [std::path::PathBuf; 0]);
+            assert!(state.extension_roots_without_id.is_empty());
         });
     }
 
@@ -27956,7 +27956,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             let tools = runtime.get_registered_tools().await.expect("get tools");
-            assert_eq!(tools, [] as [extensions_js::ExtensionToolDef; 0]);
+            assert!(tools.is_empty());
         });
     }
 
@@ -32428,12 +32428,12 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert!(r["hexDigest"].is_string());
             let hex = r["hexDigest"].as_str().unwrap();
             // djb2-simulated hash, not real SHA-256 — verify it's a non-empty hex string
-            assert_ne!(hex, "");
+            assert!(!hex.is_empty());
             assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
             // chained usage also works
             assert!(r["chainedHex"].is_string());
             let chained = r["chainedHex"].as_str().unwrap();
-            assert_ne!(chained, "");
+            assert!(!chained.is_empty());
             assert!(chained.chars().all(|c| c.is_ascii_hexdigit()));
             // Two different inputs produce different hashes
             assert_ne!(r["hexDigest"], r["chainedHex"]);

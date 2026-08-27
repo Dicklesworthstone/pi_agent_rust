@@ -1917,7 +1917,7 @@ mod tests {
                 // Every shape has at least an empty list or some fields
                 assert!(fields.len() <= 6);
                 for &f in fields {
-                    assert_ne!(f, "");
+                    assert!(!f.is_empty());
                 }
             }
 
@@ -1933,7 +1933,7 @@ mod tests {
             #[test]
             fn typical_capabilities_nonempty(shape in arb_extension_shape()) {
                 let caps = shape.typical_capabilities();
-                assert_ne!(caps, [] as [extension_conformance_matrix::HostCapability; 0]);
+                assert!(!caps.is_empty());
             }
 
             /// `classify_cause_to_bucket` never panics on arbitrary strings.
@@ -1981,8 +1981,8 @@ mod tests {
             /// `RemediationBucket` description and hint are non-empty.
             #[test]
             fn bucket_description_and_hint_nonempty(bucket in arb_remediation_bucket()) {
-                assert_ne!(bucket.description(), "");
-                assert_ne!(bucket.remediation_hint(), "");
+                assert!(!bucket.description().is_empty());
+                assert!(!bucket.remediation_hint().is_empty());
             }
 
             /// `RegistrationSnapshot` field_count returns 0 for unknown fields.

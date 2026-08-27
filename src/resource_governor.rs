@@ -3941,7 +3941,7 @@ mod tests {
 
         assert_eq!(plan.schema, SWARM_CAPACITY_PLAN_SCHEMA);
         assert_eq!(plan.confidence, SwarmCapacityConfidence::High);
-        assert_eq!(plan.uncertainties, [] as [std::string::String; 0]);
+        assert!(plan.uncertainties.is_empty());
         assert_eq!(plan.evidence.complete_records, 3);
         assert_eq!(plan.recommended_agent_concurrency, 32);
         assert_eq!(plan.recommended_tool_concurrency, 64);
@@ -4563,7 +4563,7 @@ mod tests {
             alignment.replay_severity,
             SwarmAdmissionReplayDigestSeverity::Degraded
         );
-        assert_eq!(alignment.actionable_assertions, [] as [resource_governor::SwarmAdmissionReplayDigestAssertion; 0]);
+        assert!(alignment.actionable_assertions.is_empty());
         assert!(
             alignment
                 .digest_evidence_pointers
@@ -4755,7 +4755,7 @@ mod tests {
         assert_eq!(second_recovery.regime, TailLatencyRegime::Calibrated);
         assert!(!second_recovery.fallback_active);
         assert!(second_recovery.changed);
-        assert_eq!(second_recovery.reasons, [] as [resource_governor::TailLatencyFallbackReason; 0]);
+        assert!(second_recovery.reasons.is_empty());
     }
 
     #[test]

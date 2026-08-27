@@ -1177,10 +1177,10 @@ mod compatibility_scanner_comment_tests {
         let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
         let ledger = scanner.scan_path(&entry).expect("scan");
 
-        assert_eq!(ledger.capabilities, [] as [extensions::CompatCapabilityEvidence; 0]);
-        assert_eq!(ledger.rewrites, [] as [extensions::CompatRewriteEvidence; 0]);
-        assert_eq!(ledger.forbidden, [] as [extensions::CompatIssueEvidence; 0]);
-        assert_eq!(ledger.flagged, [] as [extensions::CompatIssueEvidence; 0]);
+        assert!(ledger.capabilities.is_empty());
+        assert!(ledger.rewrites.is_empty());
+        assert!(ledger.forbidden.is_empty());
+        assert!(ledger.flagged.is_empty());
     }
 
     #[test]
@@ -1255,8 +1255,8 @@ pi.exec("echo hello");
                 .iter()
                 .any(|cap| cap.capability == "exec")
         );
-        assert_eq!(ledger.forbidden, [] as [extensions::CompatIssueEvidence; 0]);
-        assert_eq!(ledger.flagged, [] as [extensions::CompatIssueEvidence; 0]);
+        assert!(ledger.forbidden.is_empty());
+        assert!(ledger.flagged.is_empty());
     }
 
     #[test]
@@ -1347,10 +1347,10 @@ pi.exec("echo hello");
         let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
         let ledger = scanner.scan_path(&entry).expect("scan");
 
-        assert_eq!(ledger.capabilities, [] as [extensions::CompatCapabilityEvidence; 0]);
-        assert_eq!(ledger.rewrites, [] as [extensions::CompatRewriteEvidence; 0]);
-        assert_eq!(ledger.forbidden, [] as [extensions::CompatIssueEvidence; 0]);
-        assert_eq!(ledger.flagged, [] as [extensions::CompatIssueEvidence; 0]);
+        assert!(ledger.capabilities.is_empty());
+        assert!(ledger.rewrites.is_empty());
+        assert!(ledger.forbidden.is_empty());
+        assert!(ledger.flagged.is_empty());
     }
 
     #[test]
@@ -1393,8 +1393,8 @@ pi.exec("echo hello");
             !ledger.rewrites.iter().any(|rewrite| rewrite.from == "fs"),
             "commented fs require must not create rewrite evidence"
         );
-        assert_eq!(ledger.forbidden, [] as [extensions::CompatIssueEvidence; 0]);
-        assert_eq!(ledger.flagged, [] as [extensions::CompatIssueEvidence; 0]);
+        assert!(ledger.forbidden.is_empty());
+        assert!(ledger.flagged.is_empty());
     }
 
     #[test]

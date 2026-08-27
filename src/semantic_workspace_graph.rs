@@ -6619,6 +6619,6 @@ mod git_record_parser_tests {
             .output()
             .expect("probe sanitized global Git configuration");
         assert!(!global_lookup.status.success());
-        assert_eq!(global_lookup.stdout, [] as [u8; 0]);
+        assert!(global_lookup.stdout.is_empty());
     }
 }

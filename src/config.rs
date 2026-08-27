@@ -3043,7 +3043,7 @@ mod tests {
             policy.mode,
             crate::extensions::ExtensionPolicyMode::Permissive
         );
-        assert_eq!(policy.deny_caps, [] as [std::string::String; 0]);
+        assert!(policy.deny_caps.is_empty());
     }
 
     #[test]
@@ -3367,8 +3367,8 @@ mod tests {
             explanation.mode,
             crate::extensions::ExtensionPolicyMode::Strict
         );
-        assert_ne!(explanation.dangerous_denied, [] as [std::string::String; 0]);
-        assert_eq!(explanation.dangerous_allowed, [] as [std::string::String; 0]);
+        assert!(!explanation.dangerous_denied.is_empty());
+        assert!(explanation.dangerous_allowed.is_empty());
     }
 
     // ====================================================================

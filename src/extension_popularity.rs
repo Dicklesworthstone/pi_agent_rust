@@ -576,23 +576,23 @@ mod tests {
 
     #[test]
     fn slug_guess_empty_returns_empty() {
-        assert_eq!(github_repo_guesses_from_slug(""), [] as [extension_popularity::GitHubRepoRef; 0]);
+        assert!(github_repo_guesses_from_slug("").is_empty());
     }
 
     #[test]
     fn slug_guess_whitespace_returns_empty() {
-        assert_eq!(github_repo_guesses_from_slug("   "), [] as [extension_popularity::GitHubRepoRef; 0]);
+        assert!(github_repo_guesses_from_slug("   ").is_empty());
     }
 
     #[test]
     fn slug_guess_no_hyphen_returns_empty() {
-        assert_eq!(github_repo_guesses_from_slug("nohyphen"), [] as [extension_popularity::GitHubRepoRef; 0]);
+        assert!(github_repo_guesses_from_slug("nohyphen").is_empty());
     }
 
     #[test]
     fn slug_guess_multiple_hyphens_gives_multiple_guesses() {
         let guesses = github_repo_guesses_from_slug("a-b-c");
-        assert_ne!(guesses, [] as [extension_popularity::GitHubRepoRef; 0]);
+        assert!(!guesses.is_empty());
         // Should contain at least first-split ("a"/"b-c") and last-split ("a-b"/"c").
         assert!(guesses.iter().any(|r| r.owner == "a" && r.repo == "b-c"));
         assert!(guesses.iter().any(|r| r.owner == "a-b" && r.repo == "c"));
@@ -974,8 +974,8 @@ mod tests {
             #[test]
             fn slug_guesses_fields_nonempty(slug in "[a-zA-Z0-9_-]{1,30}") {
                 for guess in github_repo_guesses_from_slug(&slug) {
-                    assert_ne!(guess.owner, "");
-                    assert_ne!(guess.repo, "");
+                    assert!(!guess.owner.is_empty());
+                    assert!(!guess.repo.is_empty());
                 }
             }
 

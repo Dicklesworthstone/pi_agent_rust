@@ -561,7 +561,7 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
     fn test_platform_detection_and_candidates() {
         if let Some(plat) = PlatformInfo::current() {
             let candidates = plat.candidate_asset_names("0.2.0");
-            assert_ne!(candidates, [] as [std::string::String; 0]);
+            assert!(!candidates.is_empty());
             assert!(candidates.iter().any(|c| c.contains("pi")));
         }
     }

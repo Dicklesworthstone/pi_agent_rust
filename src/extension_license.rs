@@ -1171,7 +1171,7 @@ mod tests {
             fn spdx_strings_are_clean(idx in 0..13usize) {
                 let licenses = all_known_licenses();
                 let spdx = licenses[idx].spdx();
-                assert_ne!(spdx, "");
+                assert!(!spdx.is_empty());
                 assert_eq!(spdx, spdx.trim());
             }
 

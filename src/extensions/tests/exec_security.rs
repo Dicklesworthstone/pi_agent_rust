@@ -305,19 +305,19 @@ fn classify_recursive_delete_with_escaped_whitespace() {
 #[test]
 fn classify_safe_command_empty() {
     let classes = classify_dangerous_command("ls", &["-la".into()]);
-    assert_eq!(classes, [] as [extensions::DangerousCommandClass; 0]);
+    assert!(classes.is_empty());
 }
 
 #[test]
 fn classify_safe_command_git() {
     let classes = classify_dangerous_command("git", &["commit".into(), "-m".into(), "test".into()]);
-    assert_eq!(classes, [] as [extensions::DangerousCommandClass; 0]);
+    assert!(classes.is_empty());
 }
 
 #[test]
 fn classify_safe_command_echo() {
     let classes = classify_dangerous_command("echo", &["hello world".into()]);
-    assert_eq!(classes, [] as [extensions::DangerousCommandClass; 0]);
+    assert!(classes.is_empty());
 }
 
 #[test]
@@ -638,8 +638,8 @@ fn extension_policy_default_has_exec_mediation() {
 fn extension_policy_default_has_secret_broker() {
     let policy = ExtensionPolicy::default();
     assert!(policy.secret_broker.enabled);
-    assert_ne!(policy.secret_broker.secret_suffixes, [] as [std::string::String; 0]);
-    assert_ne!(policy.secret_broker.secret_exact, [] as [std::string::String; 0]);
+    assert!(!policy.secret_broker.secret_suffixes.is_empty());
+    assert!(!policy.secret_broker.secret_exact.is_empty());
 }
 
 #[test]
@@ -684,13 +684,13 @@ fn extension_policy_deserialize_without_sec43_fields_uses_defaults() {
 #[test]
 fn classify_no_args_safe() {
     let classes = classify_dangerous_command("ls", &[]);
-    assert_eq!(classes, [] as [extensions::DangerousCommandClass; 0]);
+    assert!(classes.is_empty());
 }
 
 #[test]
 fn classify_empty_cmd() {
     let classes = classify_dangerous_command("", &[]);
-    assert_eq!(classes, [] as [extensions::DangerousCommandClass; 0]);
+    assert!(classes.is_empty());
 }
 
 #[test]

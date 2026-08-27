@@ -699,7 +699,7 @@ mod tests {
         write(&agent_dir.join("bin/fd"), "existing-fd");
 
         let report = run_startup_migrations_with_agent_dir(&agent_dir, &cwd);
-        assert_eq!(report.migrated_tool_binaries, [] as [std::string::String; 0]);
+        assert!(report.migrated_tool_binaries.is_empty());
         assert!(!agent_dir.join("tools/fd").exists());
         assert_eq!(
             fs::read_to_string(agent_dir.join("bin/fd")).expect("read existing bin/fd"),
@@ -718,7 +718,7 @@ mod tests {
         write(&agent_dir.join("tools/custom.sh"), "#!/bin/sh\necho hi\n");
 
         let report = run_startup_migrations_with_agent_dir(&agent_dir, &cwd);
-        assert_ne!(report.deprecation_warnings, [] as [std::string::String; 0]);
+        assert!(!report.deprecation_warnings.is_empty());
         assert!(
             report
                 .messages()
@@ -747,14 +747,14 @@ mod tests {
         write(&agent_dir.join("tools/fd"), "fd-binary");
 
         let first = run_startup_migrations_with_agent_dir(&agent_dir, &cwd);
-        assert_ne!(first.migrated_auth_providers, [] as [std::string::String; 0]);
+        assert!(!first.migrated_auth_providers.is_empty());
         assert!(first.migrated_session_files > 0);
 
         let second = run_startup_migrations_with_agent_dir(&agent_dir, &cwd);
-        assert_eq!(second.migrated_auth_providers, [] as [std::string::String; 0]);
+        assert!(second.migrated_auth_providers.is_empty());
         assert_eq!(second.migrated_session_files, 0);
-        assert_eq!(second.migrated_commands_dirs, [] as [std::path::PathBuf; 0]);
-        assert_eq!(second.migrated_tool_binaries, [] as [std::string::String; 0]);
+        assert!(second.migrated_commands_dirs.is_empty());
+        assert!(second.migrated_tool_binaries.is_empty());
     }
 
     #[test]
@@ -765,12 +765,12 @@ mod tests {
         fs::create_dir_all(&cwd).expect("create cwd");
 
         let report = run_startup_migrations_with_agent_dir(&agent_dir, &cwd);
-        assert_eq!(report.migrated_auth_providers, [] as [std::string::String; 0]);
+        assert!(report.migrated_auth_providers.is_empty());
         assert_eq!(report.migrated_session_files, 0);
-        assert_eq!(report.migrated_commands_dirs, [] as [std::path::PathBuf; 0]);
-        assert_eq!(report.migrated_tool_binaries, [] as [std::string::String; 0]);
-        assert_eq!(report.deprecation_warnings, [] as [std::string::String; 0]);
-        assert_eq!(report.warnings, [] as [std::string::String; 0]);
+        assert!(report.migrated_commands_dirs.is_empty());
+        assert!(report.migrated_tool_binaries.is_empty());
+        assert!(report.deprecation_warnings.is_empty());
+        assert!(report.warnings.is_empty());
     }
 
     mod proptest_migrations {
@@ -782,7 +782,7 @@ mod tests {
             #[test]
             fn empty_report_no_messages(_dummy in 0..1u8) {
                 let report = MigrationReport::default();
-                assert_eq!(report.messages(), [] as [std::string::String; 0]);
+                assert!(report.messages().is_empty());
             }
 
             /// Auth provider migration message includes all provider names.

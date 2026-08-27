@@ -794,7 +794,7 @@ mod tests {
                 let m = arb_model(rate);
                 let single = m.calculate_cost(tokens, 0, 0, 0);
                 let double = m.calculate_cost(tokens * 2, 0, 0, 0);
-                assert!(single.mul_add(-2.0, double).abs() < 1e-6,
+                assert!((double - single * 2.0).abs() < 1e-6,
                     "doubling tokens should double cost: single={single}, double={double}");
             }
 

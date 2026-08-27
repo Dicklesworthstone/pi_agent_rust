@@ -7668,9 +7668,11 @@ fn runtime_risk_calibration_candidate(
         RuntimeRiskCalibrationObjective::MinFalsePositives => {
             (false_negative_rate * fn_weight).mul_add(0.25, false_positive_rate * fp_weight)
         }
-        RuntimeRiskCalibrationObjective::BalancedAccuracy => {
-            f64::mul_add(false_negative_rate, fn_weight, false_positive_rate * fp_weight)
-        }
+        RuntimeRiskCalibrationObjective::BalancedAccuracy => f64::mul_add(
+            false_negative_rate,
+            fn_weight,
+            false_positive_rate * fp_weight,
+        ),
     };
 
     RuntimeRiskThresholdCalibration {
