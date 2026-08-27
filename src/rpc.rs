@@ -6460,7 +6460,11 @@ fn rpc_schedule_extension_ui_timeout(
     let generation = admitted.generation;
     runtime_handle.spawn(async move {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let cancelled = Box::pin(cancel_rx);
+        let cancelled = Box::pin(async move {
+            let mut cancel_rx = cancel_rx;
+            let cx = AgentCx::for_current_or_request();
+            let _ = cancel_rx.recv(cx.cx()).await;
+        });
         let deadline = Box::pin(sleep(wall_now(), remaining));
         if matches!(
             futures::future::select(cancelled, deadline).await,
@@ -9435,7 +9439,7 @@ mod retry_tests {
 
             let provider = Arc::new(FlakyProvider::new());
             let agent = Agent::new(
-                Arc::clone(&provider),
+                provider.clone(),
                 ToolRegistry::new(&[], temp.path(), None),
                 AgentConfig::default(),
             );
@@ -9561,7 +9565,7 @@ mod retry_tests {
 
             let provider = Arc::new(FlakyProvider::new());
             let agent = Agent::new(
-                Arc::clone(&provider),
+                provider.clone(),
                 ToolRegistry::new(&[], temp.path(), None),
                 AgentConfig::default(),
             );
