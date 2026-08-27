@@ -7553,8 +7553,8 @@ fn retry_delay_ms(config: &Config, attempt: u32) -> u32 {
 
 #[cfg(test)]
 mod retry_tests {
-    use super::*;
     use super::tests::{build_test_rpc_options, dummy_entry};
+    use super::*;
     use crate::agent::{Agent, AgentConfig, AgentSession};
     use crate::model::{AssistantMessage, Usage};
     use crate::provider::{InputType, Model, ModelCost, Provider};

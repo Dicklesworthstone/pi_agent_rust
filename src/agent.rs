@@ -14750,8 +14750,8 @@ fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::extensions_integration_tests::PiAiCaptureProvider;
+    use super::*;
     use crate::auth::AuthCredential;
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;

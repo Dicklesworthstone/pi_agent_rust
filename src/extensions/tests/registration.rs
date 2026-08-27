@@ -1131,6 +1131,42 @@ fn session_set_name_invalidates_ctx_cache_generation() {
 }
 
 #[test]
+fn session_fast_lane_mutations_invalidate_ctx_cache_generation() {
+    asupersync::test_utils::run_test(|| async {
+        let manager = ExtensionManager::new();
+        manager.set_session(Arc::new(MockSession::new()));
+        let cases = [
+            ("set_name", json!({ "name": "Fast Session" })),
+            (
+                "set_model",
+                json!({ "provider": "anthropic", "modelId": "claude-opus" }),
+            ),
+            ("set_thinking_level", json!({ "level": "high" })),
+            (
+                "set_label",
+                json!({ "targetId": "entry-42", "label": "important" }),
+            ),
+        ];
+
+        for (op, params) in cases {
+            let generation_before = manager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ctx_generation;
+            let outcome = dispatch_hostcall_session_fast_ref(&manager, op, &params).await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)), "op={op}");
+            let generation_after = manager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ctx_generation;
+            assert_eq!(generation_after, generation_before + 1, "op={op}");
+        }
+    });
+}
+
+#[test]
 fn session_set_label_dispatches_to_session() {
     asupersync::test_utils::run_test(|| async {
         let manager = ExtensionManager::new();
@@ -1579,6 +1615,12 @@ fn events_send_message_dispatches_to_host_actions() {
         .await;
 
         assert!(matches!(outcome, HostcallOutcome::Success(_)));
+        let generation_after = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ctx_generation;
+        assert_eq!(generation_after, generation_before + 1);
         {
             let msgs = actions
                 .messages
@@ -1602,6 +1644,11 @@ fn events_send_message_requires_custom_type() {
         let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
         let actions = Arc::new(MockHostActions::new());
         manager.set_host_actions(actions.clone());
+        let generation_before = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ctx_generation;
 
         let outcome = dispatch_hostcall_events(
             "call-1",
@@ -1663,6 +1710,11 @@ fn events_send_user_message_dispatches_to_host_actions() {
         let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
         let actions = Arc::new(MockHostActions::new());
         manager.set_host_actions(actions.clone());
+        let generation_before = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ctx_generation;
 
         let outcome = dispatch_hostcall_events(
             "call-1",
@@ -1679,6 +1731,12 @@ fn events_send_user_message_dispatches_to_host_actions() {
         .await;
 
         assert!(matches!(outcome, HostcallOutcome::Success(_)));
+        let generation_after = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ctx_generation;
+        assert_eq!(generation_after, generation_before + 1);
         {
             let msgs = actions
                 .user_messages

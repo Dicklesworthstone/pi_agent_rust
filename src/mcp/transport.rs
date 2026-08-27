@@ -1515,13 +1515,11 @@ impl HttpTransport {
     /// renewal and aborting the replacement session.
     fn abort_if_session_generation(&self, generation: u64) -> bool {
         let session = Self::lock(&self.session);
-        if session.generation != generation
-            || !self.alive.load(std::sync::atomic::Ordering::SeqCst)
+        if session.generation != generation || !self.alive.load(std::sync::atomic::Ordering::SeqCst)
         {
             return false;
         }
-        self.alive
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
         drop(session);
         self.abort_notify.notify_waiters();
         true
@@ -3289,7 +3287,7 @@ mod tests {
             let request_lines_for_thread = std::sync::Arc::clone(&request_lines);
             let handle = std::thread::spawn(move || {
                 for response in responses {
-                    let (stream, _) = match listener.accept() {
+                    let (mut stream, _) = match listener.accept() {
                         Ok(pair) => pair,
                         Err(_) => break,
                     };
@@ -3378,6 +3376,99 @@ mod tests {
     }
 
     impl Drop for ScriptedHttpServer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Returns headers immediately, then drip-feeds a chunked body. This
+    /// catches accidental body-idle semantics where a lifecycle operation is
+    /// required to have an absolute deadline or ignore a non-semantic body.
+    struct DripBodyHttpServer {
+        addr: std::net::SocketAddr,
+        request_received: std::sync::Arc<AtomicBool>,
+        accepted: std::sync::Arc<AtomicU64>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl DripBodyHttpServer {
+        fn start(status: u16, reason: &'static str) -> Self {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind drip http server");
+            let addr = listener.local_addr().expect("listener addr");
+            let request_received = std::sync::Arc::new(AtomicBool::new(false));
+            let request_received_for_thread = std::sync::Arc::clone(&request_received);
+            let accepted = std::sync::Arc::new(AtomicU64::new(0));
+            let accepted_for_thread = std::sync::Arc::clone(&accepted);
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept drip request");
+                accepted_for_thread.fetch_add(1, Ordering::AcqRel);
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone drip request stream"));
+                loop {
+                    let mut line = String::new();
+                    match std::io::BufRead::read_line(&mut reader, &mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if line.trim_end().is_empty() => break,
+                        Ok(_) => {}
+                    }
+                }
+                request_received_for_thread.store(true, Ordering::Release);
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n"
+                );
+                if stream.write_all(head.as_bytes()).is_ok() && stream.flush().is_ok() {
+                    for _ in 0..200 {
+                        if stream.write_all(b"1\r\nx\r\n").is_err() || stream.flush().is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let _ = stream.write_all(b"0\r\n\r\n");
+                    let _ = stream.flush();
+                }
+                drop(stream);
+
+                // Keep the listening socket briefly available so a mistaken
+                // initialize cancellation notification becomes observable as
+                // a second HTTP connection.
+                listener.set_nonblocking(true).ok();
+                for _ in 0..50 {
+                    match listener.accept() {
+                        Ok((_stream, _)) => {
+                            accepted_for_thread.fetch_add(1, Ordering::AcqRel);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                request_received,
+                accepted,
+                handle: Some(handle),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/mcp", self.addr)
+        }
+
+        fn finish(mut self) -> u64 {
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("join drip http server");
+            }
+            self.accepted.load(Ordering::Acquire)
+        }
+    }
+
+    impl Drop for DripBodyHttpServer {
         fn drop(&mut self) {
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
@@ -3963,6 +4054,11 @@ mod tests {
         assert_eq!(cursor.resume_id(), Some("checkpoint-1"));
 
         let idless_request = crate::sse::SseEvent {
+            // The parser carries the last id value forward, but marks that it
+            // was not explicit on this event. Treating `id.is_some()` alone as
+            // resumable would skip or replay this side effect incorrectly.
+            id: Some("checkpoint-1".to_string()),
+            id_was_explicit: false,
             data: r#"{"jsonrpc":"2.0","id":"ping-1","method":"ping"}"#.to_string(),
             ..crate::sse::SseEvent::default()
         };
@@ -4010,6 +4106,52 @@ mod tests {
     }
 
     #[test]
+    fn streamable_http_generation_change_wins_ready_listener_error() {
+        let transport =
+            HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new()).expect("HTTP transport");
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-old".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture old session");
+        let old = transport.wire_state();
+        let runtime = runtime_for_tests();
+        let outcome = runtime.block_on(async {
+            transport
+                .run_until_session_change(old.generation, async {
+                    // Make both the operation error and generation-change
+                    // waiter ready in one poll. A left-biased select must not
+                    // let the stale error escape.
+                    transport.capture_initialize_state(
+                        &initialize_success_body(),
+                        Some("sid-new".to_string()),
+                        &serde_json::json!({"params": {}}),
+                    )?;
+                    Err::<(), Error>(tool_err(
+                        "MCP_TRANSPORT_IO",
+                        "old listener failed during renewal",
+                    ))
+                })
+                .await
+        });
+        assert!(
+            outcome.expect("generation race result").is_none(),
+            "the old listener result must be discarded after renewal"
+        );
+        assert!(
+            !transport.abort_if_session_generation(old.generation),
+            "a stale listener must not retire the replacement session"
+        );
+        assert!(transport.is_alive());
+        assert_eq!(
+            transport.wire_state().session_id.as_deref(),
+            Some("sid-new")
+        );
+    }
+
+    #[test]
     fn streamable_http_get_404_fails_activation_and_retires_transport() {
         let server = ScriptedHttpServer::start(vec![
             http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-expired"),
@@ -4039,6 +4181,104 @@ mod tests {
     }
 
     #[test]
+    fn streamable_http_resumed_get_404_retires_current_session() {
+        let first_stream = concat!(
+            "id: stream-expired:1\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}\n\n",
+        );
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-expired"),
+            http_empty(202, "Accepted"),
+            http_event_stream(first_stream),
+            http_empty(202, "Accepted"),
+            http_empty(404, "Not Found"),
+        ]);
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        let runtime = runtime_for_tests();
+        runtime.block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized notification");
+            std::sync::Arc::clone(&transport)
+                .activate()
+                .await
+                .expect("activate initial GET stream");
+            wait_for_requests(&server, 5).await;
+            for _ in 0..200 {
+                if !transport.is_alive() {
+                    return;
+                }
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10))
+                    .await;
+            }
+            panic!("resumed GET 404 did not retire the current transport");
+        });
+        assert!(!transport.is_alive());
+        assert_eq!(server.request_lines()[4], "GET /mcp HTTP/1.1");
+    }
+
+    #[test]
+    fn streamable_http_get_404_ignores_drip_body() {
+        let server = DripBodyHttpServer::start(404, "Not Found");
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-drip-get".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture session");
+        let wire_state = transport.wire_state();
+        let runtime = runtime_for_tests();
+        let started_at = std::time::Instant::now();
+        let opened = runtime
+            .block_on(transport.open_event_stream(
+                &wire_state,
+                None,
+                Some(Duration::from_millis(50)),
+            ))
+            .expect("classify GET 404");
+        assert!(matches!(opened, HttpEventStreamOpen::SessionExpired));
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "GET expiry classification waited for a non-semantic drip body"
+        );
+        assert_eq!(server.finish(), 1);
+    }
+
+    #[test]
+    fn streamable_http_delete_error_has_absolute_deadline() {
+        let server = DripBodyHttpServer::start(500, "Internal Server Error");
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-drip-delete".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture session");
+        let started_at = std::time::Instant::now();
+        let error = runtime_for_tests()
+            .block_on(transport.send_session_delete_with_timeout(
+                transport.wire_state(),
+                Duration::from_millis(50),
+            ))
+            .expect_err("drip-fed DELETE error must hit its absolute deadline");
+        assert!(error.to_string().contains("MCP_TRANSPORT_IO"), "{error}");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "DELETE exceeded its absolute close budget"
+        );
+        assert_eq!(server.finish(), 1);
+    }
+
+    #[test]
     fn streamable_http_unfinished_initialize_guard_aborts_without_cancellation() {
         let transport =
             HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new()).expect("HTTP transport");
@@ -4051,6 +4291,40 @@ mod tests {
             };
         }
         assert!(!transport.is_alive());
+    }
+
+    #[test]
+    fn streamable_http_dropped_initialize_future_aborts_without_cancellation() {
+        let server = DripBodyHttpServer::start(500, "Internal Server Error");
+        let transport = std::sync::Arc::new(
+            HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport"),
+        );
+        let runtime = runtime_for_tests();
+        runtime.block_on(async {
+            let initialize = Box::pin(transport.request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ));
+            let request_started = Box::pin(async {
+                wait_for_flag(&server.request_received, "initialize request dispatch").await;
+            });
+            match futures::future::select(initialize, request_started).await {
+                futures::future::Either::Left((result, _)) => {
+                    panic!("initialize unexpectedly completed: {result:?}");
+                }
+                futures::future::Either::Right(((), pending_initialize)) => {
+                    drop(pending_initialize);
+                }
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+        });
+        assert!(!transport.is_alive());
+        assert_eq!(
+            server.finish(),
+            1,
+            "initialize has no request id, so dropping it must not emit notifications/cancelled"
+        );
     }
 
     /// Once an HTTP request has reached a response stream, its absolute timeout
@@ -4066,6 +4340,7 @@ mod tests {
                 .request("initialize", serde_json::json!({}), Duration::from_secs(5))
                 .await
                 .expect("initialize");
+            let started_at = std::time::Instant::now();
             let error = transport
                 .request(
                     "tools/call",
@@ -4073,8 +4348,12 @@ mod tests {
                     Duration::from_millis(50),
                 )
                 .await
-                .expect_err("body-idle timeout must fail the request");
+                .expect_err("absolute timeout must fail the request");
             assert!(error.to_string().contains("MCP_TRANSPORT_IO"), "{error}");
+            assert!(
+                started_at.elapsed() < Duration::from_secs(2),
+                "active SSE drip traffic must not extend the logical request deadline"
+            );
             wait_for_flag(&server.cancellation_received, "timeout cancellation").await;
         });
         assert!(!transport.is_alive());
