@@ -1062,6 +1062,10 @@ enum QueueKind {
 struct SequencedQueuedMessage {
     seq: u64,
     enqueued_at: i64,
+    /// Session that owns a background-job completion. Ordinary queue entries
+    /// remain unscoped so only generated job notices are filtered when the
+    /// owning surface switches sessions between staging and delivery.
+    job_owner_session_id: Option<String>,
     delivery: QueuedAgentMessage,
 }
 
@@ -1094,18 +1098,23 @@ impl MessageQueue {
         self.steering.len() + self.follow_up.len()
     }
 
-    fn next_entry(&mut self, delivery: QueuedAgentMessage) -> SequencedQueuedMessage {
+    fn next_entry(
+        &mut self,
+        delivery: QueuedAgentMessage,
+        job_owner_session_id: Option<String>,
+    ) -> SequencedQueuedMessage {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         SequencedQueuedMessage {
             seq,
             enqueued_at: Utc::now().timestamp_millis(),
+            job_owner_session_id,
             delivery,
         }
     }
 
     fn push(&mut self, kind: QueueKind, delivery: QueuedAgentMessage) -> u64 {
-        let entry = self.next_entry(delivery);
+        let entry = self.next_entry(delivery, None);
         let seq = entry.seq;
         match kind {
             QueueKind::Steering => {
@@ -1119,12 +1128,23 @@ impl MessageQueue {
                 self.steering.push_back(entry);
             }
             QueueKind::FollowUp => {
-                if self.follow_up.len() >= MAX_FOLLOW_UP_QUEUE_SIZE {
+                let ordinary_count = self
+                    .follow_up
+                    .iter()
+                    .filter(|entry| entry.job_owner_session_id.is_none())
+                    .count();
+                if ordinary_count >= MAX_FOLLOW_UP_QUEUE_SIZE {
                     tracing::warn!(
                         "Follow-up queue full ({} messages), dropping oldest message",
                         MAX_FOLLOW_UP_QUEUE_SIZE
                     );
-                    self.follow_up.pop_front();
+                    if let Some(oldest) = self
+                        .follow_up
+                        .iter()
+                        .position(|entry| entry.job_owner_session_id.is_none())
+                    {
+                        let _ = self.follow_up.remove(oldest);
+                    }
                 }
                 self.follow_up.push_back(entry);
             }
@@ -1137,7 +1157,7 @@ impl MessageQueue {
     }
 
     fn push_steering_lossless(&mut self, delivery: QueuedAgentMessage) -> u64 {
-        let entry = self.next_entry(delivery);
+        let entry = self.next_entry(delivery, None);
         let seq = entry.seq;
         self.steering.push_back(entry);
         seq
@@ -1146,7 +1166,7 @@ impl MessageQueue {
     fn restore_steering_front_lossless(&mut self, deliveries: Vec<QueuedAgentMessage>) {
         let mut restored = deliveries
             .into_iter()
-            .map(|delivery| self.next_entry(delivery))
+            .map(|delivery| self.next_entry(delivery, None))
             .collect::<VecDeque<_>>();
         restored.append(&mut self.steering);
         self.steering = restored;
@@ -1157,10 +1177,53 @@ impl MessageQueue {
     }
 
     fn push_follow_up_lossless(&mut self, delivery: QueuedAgentMessage) -> u64 {
-        let entry = self.next_entry(delivery);
+        let entry = self.next_entry(delivery, None);
         let seq = entry.seq;
         self.follow_up.push_back(entry);
         seq
+    }
+
+    fn push_job_follow_up_lossless(
+        &mut self,
+        owner_session_id: String,
+        delivery: QueuedAgentMessage,
+    ) -> u64 {
+        let entry = self.next_entry(delivery, Some(owner_session_id));
+        let seq = entry.seq;
+        self.follow_up.push_back(entry);
+        seq
+    }
+
+    fn has_job_follow_up(&self) -> bool {
+        self.follow_up
+            .iter()
+            .any(|entry| entry.job_owner_session_id.is_some())
+    }
+
+    /// Remove staged job notices that do not belong to the selected session.
+    /// The caller restores the returned entries to the bounded job registry so
+    /// switching sessions cannot leak or silently discard an owner's notice.
+    fn take_job_follow_ups_except(
+        &mut self,
+        owner_session_id: Option<&str>,
+    ) -> Vec<(String, QueuedAgentMessage)> {
+        let mut retained = VecDeque::with_capacity(self.follow_up.len());
+        let mut released = Vec::new();
+        while let Some(entry) = self.follow_up.pop_front() {
+            let should_release = entry
+                .job_owner_session_id
+                .as_deref()
+                .is_some_and(|owner| Some(owner) != owner_session_id);
+            if should_release {
+                if let Some(owner) = entry.job_owner_session_id {
+                    released.push((owner, entry.delivery));
+                }
+            } else {
+                retained.push_back(entry);
+            }
+        }
+        self.follow_up = retained;
+        released
     }
 
     fn pop_steering(&mut self) -> Vec<QueuedAgentMessage> {
@@ -1455,9 +1518,10 @@ pub struct Agent {
     /// Fetchers for queued follow-up messages (idle).
     follow_up_fetchers: Vec<MessageFetcher>,
 
-    /// Session-scoped background completion source. Its registry is already
-    /// bounded, so the handoff preserves every drained notice.
-    job_follow_up_fetcher: MessageFetcher,
+    /// Live owner resolver for background completions. Notices retain the
+    /// resolved owner across the registry-to-Agent handoff and are checked
+    /// again immediately before provider delivery.
+    job_session_scope: crate::jobs::JobSessionScope,
 
     /// Internal queue for steering/follow-up messages.
     message_queue: MessageQueue,
@@ -1559,7 +1623,7 @@ impl Agent {
             .stream_options
             .thinking_level
             .unwrap_or(crate::model::ThinkingLevel::Off);
-        let job_follow_up_fetcher = crate::jobs::follow_up_fetcher(tools.job_session_scope());
+        let job_session_scope = tools.job_session_scope();
         Self {
             provider,
             tools,
@@ -1569,7 +1633,7 @@ impl Agent {
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
-            job_follow_up_fetcher,
+            job_session_scope,
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
             scoped_rules: None,
@@ -2642,7 +2706,7 @@ impl Agent {
                         .system_prompt
                         .clone_from(&turn_baseline_system_prompt);
                     turn_keyword_words.clear();
-                    pending_messages = self.message_queue.pop_follow_up();
+                    pending_messages = self.pop_follow_up_for_current_session().await;
                     follow_up_staged = false;
                     required_initial_follow_up_pending = false;
                 }
@@ -3274,10 +3338,45 @@ impl Agent {
     }
 
     async fn fetch_job_follow_up_messages(&mut self) {
-        let job_notices = self.fetch_messages(Some(&self.job_follow_up_fetcher)).await;
-        for notice in job_notices {
-            self.message_queue.push_follow_up_lossless(notice);
+        let Ok(owner_session_id) = self.job_session_scope.session_id().await else {
+            self.restore_job_follow_ups_except(None);
+            return;
+        };
+        self.restore_job_follow_ups_except(Some(&owner_session_id));
+        // One registry drain is already bounded per session. Do not drain a
+        // second batch until every staged job notice from the first batch has
+        // reached the model; otherwise OneAtATime mode grows by roughly one
+        // registry batch per turn boundary.
+        if self.message_queue.has_job_follow_up() {
+            return;
         }
+        for notice in crate::jobs::take_completion_notices(&owner_session_id) {
+            self.message_queue.push_job_follow_up_lossless(
+                owner_session_id.clone(),
+                QueuedAgentMessage::generated(notice),
+            );
+        }
+    }
+
+    async fn pop_follow_up_for_current_session(&mut self) -> Vec<QueuedAgentMessage> {
+        let owner_session_id = self.job_session_scope.session_id().await.ok();
+        self.restore_job_follow_ups_except(owner_session_id.as_deref());
+        self.message_queue.pop_follow_up()
+    }
+
+    fn restore_job_follow_ups_except(&mut self, owner_session_id: Option<&str>) {
+        let stale = self
+            .message_queue
+            .take_job_follow_ups_except(owner_session_id);
+        if stale.is_empty() {
+            return;
+        }
+        crate::jobs::restore_completion_notices(
+            stale
+                .into_iter()
+                .map(|(owner, delivery)| (owner, delivery.into_message()))
+                .collect(),
+        );
     }
 
     async fn fetch_initial_follow_up_messages(&mut self) {
@@ -6010,6 +6109,46 @@ mod message_queue_tests {
                 if matches!(content, UserContent::Text(text) if text == "f2")
         ));
         assert!(queue.pop_follow_up().is_empty());
+    }
+
+    #[test]
+    fn ordinary_overflow_does_not_evict_an_older_job_notice() {
+        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::All);
+        queue.push_job_follow_up_lossless(
+            "owner-a".to_string(),
+            QueuedAgentMessage::generated(user_message("job-notice")),
+        );
+        for index in 0..=MAX_FOLLOW_UP_QUEUE_SIZE {
+            queue.push_follow_up(queued_user_message(&format!("ordinary-{index}")));
+        }
+
+        assert_eq!(
+            queue
+                .follow_up
+                .iter()
+                .filter(|entry| entry.job_owner_session_id.is_none())
+                .count(),
+            MAX_FOLLOW_UP_QUEUE_SIZE
+        );
+        assert_eq!(
+            queue
+                .follow_up
+                .iter()
+                .filter(|entry| entry.job_owner_session_id.as_deref() == Some("owner-a"))
+                .count(),
+            1,
+            "ordinary admission pressure must evict only ordinary follow-ups"
+        );
+        let drained = queue.pop_follow_up();
+        assert!(drained.iter().any(|delivery| {
+            matches!(
+                delivery.message(),
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) if text == "job-notice"
+            )
+        }));
     }
 }
 
@@ -13786,15 +13925,14 @@ mod tests {
                 ResolvedCompactionSettings::default(),
             );
 
-            crate::jobs::push_completion_notice(&first_id, "first-session-notice");
-            crate::jobs::push_completion_notice(&second_id, "second-session-notice");
+            crate::jobs::push_completion_notice(&first_id, "first-session-notice")
+                .expect("first notice");
+            crate::jobs::push_completion_notice(&second_id, "second-session-notice")
+                .expect("second notice");
             agent_session.agent.fetch_additive_follow_up_messages().await;
-            let first_delivery = agent_session.agent.message_queue.pop_follow_up();
-            assert_eq!(first_delivery.len(), 1);
-            assert_user_text(first_delivery[0].message(), "first-session-notice");
             assert!(
-                !agent_session.agent.has_staged_follow_up(),
-                "the other session's notice must remain in the registry, not the local queue"
+                agent_session.agent.has_staged_follow_up(),
+                "the first owner's notice must be staged before the session switch"
             );
 
             {
@@ -13803,9 +13941,37 @@ mod tests {
                 guard.header.id.clone_from(&second_id);
             }
             agent_session.agent.fetch_additive_follow_up_messages().await;
-            let second_delivery = agent_session.agent.message_queue.pop_follow_up();
+            let second_delivery = agent_session
+                .agent
+                .pop_follow_up_for_current_session()
+                .await;
             assert_eq!(second_delivery.len(), 1);
             assert_user_text(second_delivery[0].message(), "second-session-notice");
+            assert!(second_delivery.iter().all(|delivery| {
+                !matches!(
+                    delivery.message(),
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) if text == "first-session-notice"
+                )
+            }));
+
+            {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let mut guard = session.lock(cx.cx()).await.expect("session lock");
+                guard.header.id.clone_from(&first_id);
+            }
+            agent_session.agent.fetch_additive_follow_up_messages().await;
+            let restored_first_delivery = agent_session
+                .agent
+                .pop_follow_up_for_current_session()
+                .await;
+            assert_eq!(restored_first_delivery.len(), 1);
+            assert_user_text(
+                restored_first_delivery[0].message(),
+                "first-session-notice",
+            );
             assert!(crate::jobs::take_completion_notices(&first_id).is_empty());
             assert!(crate::jobs::take_completion_notices(&second_id).is_empty());
         });
@@ -13847,7 +14013,8 @@ mod tests {
                 ResolvedCompactionSettings::default(),
             );
 
-            crate::jobs::push_completion_notice(&session_id, "bounded-job-notice");
+            crate::jobs::push_completion_notice(&session_id, "bounded-job-notice")
+                .expect("job notice");
             agent_session.agent.fetch_additive_follow_up_messages().await;
             let deliveries = agent_session.agent.message_queue.pop_follow_up();
             assert_eq!(deliveries.len(), MAX_FOLLOW_UP_QUEUE_SIZE + 1);
@@ -13893,13 +14060,74 @@ mod tests {
                 ResolvedCompactionSettings::default(),
             );
 
-            crate::jobs::push_completion_notice(&session_id, "non-starved-job-notice");
+            crate::jobs::push_completion_notice(&session_id, "non-starved-job-notice")
+                .expect("job notice");
             assert!(agent_session.agent.stage_follow_up_messages().await);
             let deliveries = agent_session.agent.message_queue.pop_follow_up();
             assert_eq!(deliveries.len(), 2);
             assert_user_text(deliveries[0].message(), "owning-follow-up");
             assert_user_text(deliveries[1].message(), "non-starved-job-notice");
             assert!(crate::jobs::take_completion_notices(&session_id).is_empty());
+        });
+    }
+
+    #[test]
+    fn one_at_a_time_job_handoff_keeps_only_one_registry_batch_staged() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session_state = Session::in_memory();
+            let session_id = session_state.header.id.clone();
+            let session = Arc::new(Mutex::new(session_state));
+            let mut agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::OneAtATime);
+            let mut agent_session = AgentSession::new(
+                agent,
+                session,
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            for round in 0..3 {
+                for index in 0..crate::jobs::MAX_COMPLETION_NOTICES_PER_SESSION {
+                    crate::jobs::push_completion_notice(
+                        &session_id,
+                        format!("job-notice-{round}-{index}"),
+                    )
+                    .expect("job notice");
+                }
+
+                assert!(agent_session.agent.stage_follow_up_messages().await);
+                let staged_jobs = agent_session
+                    .agent
+                    .message_queue
+                    .follow_up
+                    .iter()
+                    .filter(|entry| entry.job_owner_session_id.is_some())
+                    .count();
+                assert!(
+                    staged_jobs <= crate::jobs::MAX_COMPLETION_NOTICES_PER_SESSION,
+                    "the Agent queue must retain at most one bounded registry batch"
+                );
+                assert_eq!(
+                    agent_session.agent.message_queue.pop_follow_up().len(),
+                    1,
+                    "one-at-a-time mode must consume exactly one staged notice"
+                );
+            }
+
+            let retained_registry_batch = crate::jobs::take_completion_notices(&session_id);
+            assert_eq!(
+                retained_registry_batch.len(),
+                crate::jobs::MAX_COMPLETION_NOTICES_PER_SESSION,
+                "the registry must retain only its independent bounded batch"
+            );
         });
     }
 

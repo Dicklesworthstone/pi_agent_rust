@@ -138,7 +138,7 @@ const MAX_ASYNC_WAIT_SLICE: Duration = Duration::from_secs(60 * 60);
 /// Maximum undelivered completion notices across background job and `/tan`
 /// producers. The oldest notice is discarded first if a session never
 /// reaches another delivery boundary.
-const MAX_COMPLETION_NOTICES: usize = 64;
+pub(crate) const MAX_COMPLETION_NOTICES_PER_SESSION: usize = 64;
 
 /// Process-wide backstop across many session identities in a long-lived RPC
 /// host. The per-session cap above preserves fairness; this bound prevents a
@@ -154,7 +154,12 @@ const MAX_COMPLETION_NOTICE_BYTES: usize = 32 * 1024;
 
 /// Settled descriptors remain queryable for recent history, but the process
 /// must not retain every command/tail forever during a long-lived RPC session.
-const MAX_RETAINED_SETTLED_JOBS: usize = 128;
+const MAX_RETAINED_SETTLED_JOBS_PER_SESSION: usize = 128;
+
+/// Process-wide backstop for settled descriptors across many short-lived
+/// session identities. Per-session pruning runs first so one busy session
+/// cannot evict another session's recent descriptor under ordinary load.
+const MAX_TOTAL_RETAINED_SETTLED_JOBS: usize = 512;
 
 /// How a background job settled (or is settling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1213,6 +1218,33 @@ fn settle_job_and_enqueue_notice(
 }
 
 fn prune_settled_jobs(reg: &mut JobRegistry) {
+    let mut settled_by_owner: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+    for job in reg.jobs.values().filter(|job| job.status.settled()) {
+        if let Some(sequence) = job.settled_sequence {
+            settled_by_owner
+                .entry(job.owner_session_id.clone())
+                .or_default()
+                .push((sequence, job.id.clone()));
+        }
+    }
+
+    let mut remove_ids = Vec::new();
+    for settled in settled_by_owner.values_mut() {
+        settled.sort();
+        let remove_count = settled
+            .len()
+            .saturating_sub(MAX_RETAINED_SETTLED_JOBS_PER_SESSION);
+        remove_ids.extend(
+            settled
+                .iter()
+                .take(remove_count)
+                .map(|(_, id)| id.clone()),
+        );
+    }
+    for id in remove_ids {
+        reg.jobs.remove(&id);
+    }
+
     let mut settled: Vec<_> = reg
         .jobs
         .values()
@@ -1222,11 +1254,10 @@ fn prune_settled_jobs(reg: &mut JobRegistry) {
                 .map(|sequence| (sequence, job.id.clone()))
         })
         .collect();
-    if settled.len() <= MAX_RETAINED_SETTLED_JOBS {
-        return;
-    }
     settled.sort();
-    let remove_count = settled.len() - MAX_RETAINED_SETTLED_JOBS;
+    let remove_count = settled
+        .len()
+        .saturating_sub(MAX_TOTAL_RETAINED_SETTLED_JOBS);
     for (_, id) in settled.into_iter().take(remove_count) {
         reg.jobs.remove(&id);
     }
@@ -1512,7 +1543,7 @@ pub async fn cancel_async(owner_session_id: &str, id: &str) -> Result<JobSnapsho
 }
 
 /// Drain pending completion notices as follow-up messages for the agent.
-/// The fetcher registered with the agent calls this on every poll.
+/// The Agent's owner-aware job handoff calls this on every poll.
 #[must_use]
 pub fn take_completion_notices(owner_session_id: &str) -> Vec<Message> {
     let mut reg = registry()
@@ -1531,6 +1562,67 @@ pub fn take_completion_notices(owner_session_id: &str) -> Vec<Message> {
     matched
 }
 
+/// Return staged notices to the bounded registry when the live Agent session
+/// changes before delivery. Entries are prepended because they predate notices
+/// that could have settled while they were staged; normal per-owner and global
+/// retention then discards the oldest entries if either bound is exceeded.
+pub(crate) fn restore_completion_notices(notices: Vec<(String, Message)>) {
+    let restored = notices
+        .into_iter()
+        .filter_map(|(owner_session_id, message)| {
+            if owner_session_id.trim().is_empty() {
+                return None;
+            }
+            let Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) = message
+            else {
+                return None;
+            };
+            Some(CompletionNotice {
+                owner_session_id,
+                text: truncate_utf8_bytes(&text, MAX_COMPLETION_NOTICE_BYTES),
+            })
+        })
+        .collect::<Vec<_>>();
+    if restored.is_empty() {
+        return;
+    }
+
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for notice in restored.into_iter().rev() {
+        reg.notices.push_front(notice);
+    }
+    prune_completion_notices(&mut reg);
+}
+
+fn prune_completion_notices(reg: &mut JobRegistry) {
+    let mut owner_counts = HashMap::<String, usize>::new();
+    for notice in &reg.notices {
+        *owner_counts
+            .entry(notice.owner_session_id.clone())
+            .or_default() += 1;
+    }
+
+    let mut retained = VecDeque::with_capacity(reg.notices.len());
+    while let Some(notice) = reg.notices.pop_front() {
+        if let Some(owner_count) = owner_counts.get_mut(&notice.owner_session_id)
+            && *owner_count > MAX_COMPLETION_NOTICES_PER_SESSION
+        {
+            *owner_count -= 1;
+            continue;
+        }
+        retained.push_back(notice);
+    }
+    reg.notices = retained;
+    while reg.notices.len() > MAX_TOTAL_COMPLETION_NOTICES {
+        let _ = reg.notices.pop_front();
+    }
+}
+
 fn completion_notice_message(text: String) -> Message {
     Message::User(UserMessage {
         content: UserContent::Text(text),
@@ -1543,13 +1635,24 @@ fn completion_notice_message(text: String) -> Message {
 /// `/tan` shares this seam with background bash jobs so queue
 /// modes, persistence, RPC behavior, and turn-boundary semantics stay
 /// identical.
-pub fn push_completion_notice(owner_session_id: &str, text: impl Into<String>) {
+///
+/// # Errors
+/// Returns `PI_JOBS_SESSION_UNAVAILABLE` when the owner identity is empty or
+/// whitespace-only.
+pub fn push_completion_notice(owner_session_id: &str, text: impl Into<String>) -> Result<()> {
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: completion notice owner is empty".to_string(),
+        ));
+    }
     let text = text.into();
     let text = truncate_utf8_bytes(&text, MAX_COMPLETION_NOTICE_BYTES);
     let mut reg = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     enqueue_completion_notice(&mut reg, owner_session_id, text);
+    Ok(())
 }
 
 fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text: String) {
@@ -1558,7 +1661,7 @@ fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text
         .iter()
         .filter(|notice| notice.owner_session_id == owner_session_id)
         .count();
-    if owner_notice_count >= MAX_COMPLETION_NOTICES
+    if owner_notice_count >= MAX_COMPLETION_NOTICES_PER_SESSION
         && let Some(oldest) = reg
             .notices
             .iter()
@@ -1573,24 +1676,6 @@ fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text
     while reg.notices.len() > MAX_TOTAL_COMPLETION_NOTICES {
         let _ = reg.notices.pop_front();
     }
-}
-
-/// Build the follow-up fetcher that delivers job completion notices into
-/// the agent's message queue.
-#[must_use]
-pub fn follow_up_fetcher(scope: JobSessionScope) -> crate::agent::MessageFetcher {
-    std::sync::Arc::new(move || {
-        let scope = scope.clone();
-        Box::pin(async move {
-            let Ok(owner_session_id) = scope.session_id().await else {
-                return Vec::new();
-            };
-            take_completion_notices(&owner_session_id)
-                .into_iter()
-                .map(crate::agent::QueuedAgentMessage::generated)
-                .collect()
-        }) as futures::future::BoxFuture<'static, Vec<crate::agent::QueuedAgentMessage>>
-    })
 }
 
 /// Kill every running job (session exit). Called once from the main
@@ -2050,7 +2135,7 @@ mod tests {
     fn settled_job_retention_is_bounded() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut reg = JobRegistry::default();
-        for index in 0..(MAX_RETAINED_SETTLED_JOBS + 3) {
+        for index in 0..(MAX_RETAINED_SETTLED_JOBS_PER_SESSION + 3) {
             let id = format!("job-{index:03}");
             let file = std::fs::File::create(temp.path().join(format!("{id}.log")))
                 .expect("artifact");
@@ -2082,11 +2167,74 @@ mod tests {
         }
 
         prune_settled_jobs(&mut reg);
-        assert_eq!(reg.jobs.len(), MAX_RETAINED_SETTLED_JOBS);
+        assert_eq!(reg.jobs.len(), MAX_RETAINED_SETTLED_JOBS_PER_SESSION);
         assert!(!reg.jobs.contains_key("job-000"));
         assert!(reg.jobs.contains_key(&format!(
             "job-{:03}",
-            MAX_RETAINED_SETTLED_JOBS + 2
+            MAX_RETAINED_SETTLED_JOBS_PER_SESSION + 2
+        )));
+    }
+
+    #[test]
+    fn settled_job_retention_is_fair_across_sessions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut reg = JobRegistry::default();
+        let owner_a_id = "owner-a-job".to_string();
+        let mut owner_a = synthetic_entry(
+            &owner_a_id,
+            temp.path().join("owner-a.log"),
+            0,
+            false,
+        );
+        owner_a.owner_session_id = "owner-a".to_string();
+        owner_a.status = JobStatus::Exited;
+        owner_a.settled_sequence = Some(0);
+        reg.jobs.insert(owner_a_id.clone(), owner_a);
+
+        for index in 0..MAX_RETAINED_SETTLED_JOBS_PER_SESSION {
+            let id = format!("owner-b-{index:03}");
+            let mut entry = synthetic_entry(
+                &id,
+                temp.path().join(format!("{id}.log")),
+                u64::try_from(index + 1).expect("index fits"),
+                false,
+            );
+            entry.owner_session_id = "owner-b".to_string();
+            entry.status = JobStatus::Exited;
+            entry.settled_sequence = Some(u64::try_from(index + 1).expect("index fits"));
+            reg.jobs.insert(id, entry);
+        }
+
+        prune_settled_jobs(&mut reg);
+        assert!(
+            reg.jobs.contains_key(&owner_a_id),
+            "one session's retained history must not be evicted by another session's ordinary cap"
+        );
+    }
+
+    #[test]
+    fn settled_job_retention_has_a_process_wide_backstop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut reg = JobRegistry::default();
+        for index in 0..=MAX_TOTAL_RETAINED_SETTLED_JOBS {
+            let id = format!("global-owner-job-{index:03}");
+            let mut entry = synthetic_entry(
+                &id,
+                temp.path().join(format!("{id}.log")),
+                u64::try_from(index).expect("index fits"),
+                false,
+            );
+            entry.owner_session_id = format!("global-owner-{index:03}");
+            entry.status = JobStatus::Exited;
+            entry.settled_sequence = Some(u64::try_from(index).expect("index fits"));
+            reg.jobs.insert(id, entry);
+        }
+
+        prune_settled_jobs(&mut reg);
+        assert_eq!(reg.jobs.len(), MAX_TOTAL_RETAINED_SETTLED_JOBS);
+        assert!(!reg.jobs.contains_key("global-owner-job-000"));
+        assert!(reg.jobs.contains_key(&format!(
+            "global-owner-job-{MAX_TOTAL_RETAINED_SETTLED_JOBS:03}"
         )));
     }
 
@@ -2107,8 +2255,8 @@ mod tests {
     fn completion_notices_are_drained_only_by_their_owner_session() {
         let owner_a = format!("owner-a-{}", uuid::Uuid::new_v4().simple());
         let owner_b = format!("owner-b-{}", uuid::Uuid::new_v4().simple());
-        push_completion_notice(&owner_a, "notice-a");
-        push_completion_notice(&owner_b, "notice-b");
+        push_completion_notice(&owner_a, "notice-a").expect("owner-a notice");
+        push_completion_notice(&owner_b, "notice-b").expect("owner-b notice");
 
         let first = take_completion_notices(&owner_a);
         assert_eq!(first.len(), 1);
@@ -2132,6 +2280,82 @@ mod tests {
                 content: UserContent::Text(text),
                 ..
             }) if text == "notice-b"
+        ));
+    }
+
+    #[test]
+    fn completion_notice_retention_is_fair_across_sessions() {
+        let mut reg = JobRegistry::default();
+        enqueue_completion_notice(&mut reg, "owner-a", "owner-a-notice".to_string());
+        for index in 0..=MAX_COMPLETION_NOTICES_PER_SESSION {
+            enqueue_completion_notice(
+                &mut reg,
+                "owner-b",
+                format!("owner-b-notice-{index}"),
+            );
+        }
+
+        assert_eq!(
+            reg.notices
+                .iter()
+                .filter(|notice| notice.owner_session_id == "owner-a")
+                .count(),
+            1,
+            "one owner's ordinary cap pressure must not evict another owner"
+        );
+        assert_eq!(
+            reg.notices
+                .iter()
+                .filter(|notice| notice.owner_session_id == "owner-b")
+                .count(),
+            MAX_COMPLETION_NOTICES_PER_SESSION
+        );
+        assert!(reg
+            .notices
+            .iter()
+            .all(|notice| notice.text != "owner-b-notice-0"));
+    }
+
+    #[test]
+    fn completion_notice_retention_has_a_process_wide_backstop() {
+        let mut reg = JobRegistry::default();
+        for index in 0..=MAX_TOTAL_COMPLETION_NOTICES {
+            enqueue_completion_notice(
+                &mut reg,
+                &format!("owner-{index}"),
+                format!("notice-{index}"),
+            );
+        }
+
+        assert_eq!(reg.notices.len(), MAX_TOTAL_COMPLETION_NOTICES);
+        assert!(reg.notices.iter().all(|notice| notice.text != "notice-0"));
+        assert!(reg
+            .notices
+            .iter()
+            .any(|notice| notice.text == format!("notice-{MAX_TOTAL_COMPLETION_NOTICES}")));
+    }
+
+    #[test]
+    fn host_completion_notice_rejects_empty_owner_without_consuming_capacity() {
+        let valid_owner = format!("valid-owner-{}", uuid::Uuid::new_v4().simple());
+        for (owner, text) in [("", "empty-owner"), ("   ", "blank-owner")] {
+            let error = push_completion_notice(owner, text).expect_err("invalid owner");
+            assert!(error.to_string().contains("PI_JOBS_SESSION_UNAVAILABLE"));
+            assert!(
+                take_completion_notices(owner).is_empty(),
+                "an invalid owner must fail before consuming registry capacity"
+            );
+        }
+        push_completion_notice(&valid_owner, "valid-notice").expect("valid notice");
+
+        let notices = take_completion_notices(&valid_owner);
+        assert_eq!(notices.len(), 1);
+        assert!(matches!(
+            &notices[0],
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "valid-notice"
         ));
     }
 

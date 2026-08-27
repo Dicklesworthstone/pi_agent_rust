@@ -479,19 +479,27 @@ fn main_impl() -> Result<()> {
 
     // Ultra-fast paths that don't need tracing or the async runtime.
     if let Some(command) = &cli.command {
+        let project_trusted = if subcommand_uses_package_manager(command) {
+            Some(establish_package_subcommand_trust(&cwd, cli.trust)?)
+        } else {
+            None
+        };
         match command {
             cli::Commands::Install { source, local } => {
-                let manager = PackageManager::new(cwd);
+                let manager = PackageManager::new(cwd.clone())
+                    .with_project_trust(project_trusted.unwrap_or(false));
                 handle_package_install_blocking(&manager, source, *local)?;
                 return Ok(());
             }
             cli::Commands::Remove { source, local } => {
-                let manager = PackageManager::new(cwd);
+                let manager = PackageManager::new(cwd.clone())
+                    .with_project_trust(project_trusted.unwrap_or(false));
                 handle_package_remove_blocking(&manager, source, *local)?;
                 return Ok(());
             }
             cli::Commands::Update { source } => {
-                let manager = PackageManager::new(cwd);
+                let manager = PackageManager::new(cwd.clone())
+                    .with_project_trust(project_trusted.unwrap_or(false));
                 handle_package_update_blocking(&manager, source.as_deref())?;
                 return Ok(());
             }
@@ -557,7 +565,8 @@ fn main_impl() -> Result<()> {
                 return Ok(());
             }
             cli::Commands::List => {
-                let manager = PackageManager::new(cwd);
+                let manager = PackageManager::new(cwd.clone())
+                    .with_project_trust(project_trusted.unwrap_or(false));
                 handle_package_list_blocking(&manager)?;
                 return Ok(());
             }
@@ -596,7 +605,8 @@ fn main_impl() -> Result<()> {
                     return Ok(());
                 }
                 if !*paths && (*show || *json) {
-                    let manager = PackageManager::new(cwd.clone());
+                    let manager = PackageManager::new(cwd.clone())
+                        .with_project_trust(project_trusted.unwrap_or(false));
                     let entries = manager.list_packages_blocking()?;
                     if entries.is_empty() {
                         if *show {
@@ -1101,7 +1111,12 @@ async fn run(
     }
 
     if let Some(command) = cli.command.take() {
-        handle_subcommand(command, &cwd).await?;
+        let project_trusted = if subcommand_uses_package_manager(&command) {
+            establish_package_subcommand_trust(&cwd, cli.trust)?
+        } else {
+            false
+        };
+        handle_subcommand(command, &cwd, project_trusted).await?;
         return Ok(());
     }
 
@@ -1792,10 +1807,11 @@ async fn run(
     let mcp_manager = if ftui_requested {
         None
     } else {
-        Some(std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
+        Some(std::sync::Arc::new(pi::mcp::bootstrap_with_project_trust(
             &cwd,
             &pi::config::Config::global_dir(),
             &cli.mcp_config,
+            workspace_trusted,
         )?))
     };
     let mut extension_model_entries = Vec::new();
@@ -2110,6 +2126,7 @@ async fn run(
                 model: cli.model.clone(),
                 api_key: cli.api_key.clone(),
                 working_directory: Some(cwd.clone()),
+                workspace_trusted,
                 // Session persistence honors the same flags as the default
                 // stack: saved by default, --no-session for ephemeral,
                 // --session/--session-dir for explicit paths. The SDK path
@@ -2284,9 +2301,68 @@ async fn run(
     result
 }
 
+fn subcommand_uses_package_manager(command: &cli::Commands) -> bool {
+    matches!(
+        command,
+        cli::Commands::Install { .. }
+            | cli::Commands::Remove { .. }
+            | cli::Commands::Update { .. }
+            | cli::Commands::List
+            | cli::Commands::Config {
+                show: true,
+                paths: false,
+                ..
+            }
+            | cli::Commands::Config {
+                json: true,
+                paths: false,
+                ..
+            }
+            | cli::Commands::Config {
+                show: false,
+                paths: false,
+                json: false,
+            }
+    )
+}
+
+fn establish_package_subcommand_trust(cwd: &Path, cli_trust: bool) -> Result<bool> {
+    let trust_all_workspaces = Config::load_global_only()
+        .ok()
+        .and_then(|global| global.trust_all_workspaces)
+        .unwrap_or(false);
+    let inputs = pi::workspace_trust::TrustInputs {
+        cli_trust,
+        trust_all_workspaces,
+        env_override: std::env::var(pi::workspace_trust::TRUST_ENV_VAR).ok(),
+        // Package subcommands do not run the interactive agent UI. Project
+        // configuration therefore requires a stored decision or an explicit
+        // --trust/env/global override.
+        interactive: false,
+    };
+    let state = pi::workspace_trust::establish(
+        cwd,
+        &pi::workspace_trust::WorkspaceTrustStore::default_path(),
+        &inputs,
+        prompt_workspace_trust,
+    )?;
+    if !state.trusted {
+        eprintln!(
+            "Warning: workspace not trusted; project-local package configuration is disabled for this subcommand. Pass --trust once or set {}=trusted to enable it.",
+            pi::workspace_trust::TRUST_ENV_VAR
+        );
+    }
+    Ok(state.trusted)
+}
+
 #[allow(clippy::too_many_lines)]
-async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
-    let manager = PackageManager::new(cwd.to_path_buf());
+async fn handle_subcommand(
+    command: cli::Commands,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<()> {
+    let manager =
+        PackageManager::new(cwd.to_path_buf()).with_project_trust(project_trusted);
     match command {
         cli::Commands::Install { source, local } => {
             handle_package_install(&manager, &source, local).await?;
@@ -7947,6 +8023,7 @@ fn prompt_workspace_trust(
 
     eprintln!();
     eprintln!("This workspace declares project-local Pi configuration that can execute code:");
+    eprintln!("  Workspace: {}", surface.workspace_display);
     if surface.has_project_settings {
         let noun = if surface.package_count == 1 {
             "package entry"
@@ -9113,6 +9190,33 @@ mod tests {
     fn exit_code_classifier_defaults_to_general_failure() {
         let runtime_err = anyhow::Error::new(pi::error::Error::auth("missing key"));
         assert_eq!(exit_code_for_error(&runtime_err), EXIT_CODE_FAILURE);
+    }
+
+    #[test]
+    fn package_subcommand_trust_scope_excludes_config_paths_only() {
+        assert!(subcommand_uses_package_manager(&cli::Commands::List));
+        assert!(subcommand_uses_package_manager(&cli::Commands::Config {
+            show: false,
+            paths: false,
+            json: false,
+        }));
+        assert!(subcommand_uses_package_manager(&cli::Commands::Config {
+            show: true,
+            paths: false,
+            json: false,
+        }));
+        assert!(subcommand_uses_package_manager(&cli::Commands::Config {
+            show: false,
+            paths: false,
+            json: true,
+        }));
+        assert!(!subcommand_uses_package_manager(
+            &cli::Commands::Config {
+                show: false,
+                paths: true,
+                json: false,
+            }
+        ));
     }
 
     #[test]

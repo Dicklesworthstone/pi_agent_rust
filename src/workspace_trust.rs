@@ -30,6 +30,8 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// File name of the trust store inside the global configuration directory.
@@ -41,6 +43,9 @@ pub const TRUST_STORE_FILE: &str = "workspace-trust.json";
 pub const TRUST_ENV_VAR: &str = "PI_WORKSPACE_TRUST";
 
 const TRUST_STORE_VERSION: u32 = 1;
+const TRUST_SURFACE_DIGEST_DOMAIN: &[u8] = b"pi_agent_rust:workspace-trust-surface:v2";
+const MAX_TRUST_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_TRUST_EXTENSION_BYTES: usize = 16 * 1024 * 1024;
 
 /// A recorded (or requested) trust decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +58,9 @@ pub enum TrustDecision {
 /// What the workspace declares that could execute local code.
 #[derive(Debug, Clone)]
 pub struct WorkspaceTrustSurface {
+    /// Escaped canonical workspace path suitable for an untrusted terminal
+    /// prompt. The trust-store key retains the underlying canonical path.
+    pub workspace_display: String,
     /// True when `.pi/settings.json` exists.
     pub has_project_settings: bool,
     /// Number of `packages` entries declared in `.pi/settings.json`.
@@ -88,16 +96,7 @@ impl WorkspaceTrustSurface {
         let settings_path = project_dir.join("settings.json");
         let extensions_dir = project_dir.join("extensions");
 
-        let settings_bytes = match std::fs::read(&settings_path) {
-            Ok(bytes) => Some(bytes),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(Error::config(format!(
-                    "Failed to read {}: {err}",
-                    settings_path.display()
-                )));
-            }
-        };
+        let settings_bytes = read_bounded_regular_file(&settings_path, MAX_TRUST_CONFIG_BYTES)?;
 
         let mut extension_files = Vec::new();
         collect_files_recursive(&extensions_dir, &extensions_dir, &mut extension_files)?;
@@ -106,15 +105,8 @@ impl WorkspaceTrustSurface {
         let mut mcp_config_files = Vec::new();
         for relative in PROJECT_MCP_CONFIGS {
             let absolute = cwd.join(relative);
-            match std::fs::read(&absolute) {
-                Ok(bytes) => mcp_config_files.push(((*relative).to_string(), bytes)),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(Error::config(format!(
-                        "Failed to read {}: {err}",
-                        absolute.display()
-                    )));
-                }
+            if let Some(bytes) = read_bounded_regular_file(&absolute, MAX_TRUST_CONFIG_BYTES)? {
+                mcp_config_files.push((PathBuf::from(*relative), bytes));
             }
         }
 
@@ -132,46 +124,110 @@ impl WorkspaceTrustSurface {
             })
             .unwrap_or(0);
 
-        // Canonical manifest: one line per surface file, sorted, tab-separated
-        // relative path and content sha256. The digest is over the manifest.
-        let mut manifest = String::new();
+        // Versioned, domain-separated records use raw path bytes and explicit
+        // lengths, so control characters or non-UTF-8 names cannot make two
+        // different surface sets hash to the same manifest.
+        let mut surface_hasher = Sha256::new();
+        surface_hasher.update(TRUST_SURFACE_DIGEST_DOMAIN);
         if let Some(bytes) = &settings_bytes {
-            manifest.push_str(".pi/settings.json\t");
-            manifest.push_str(&crate::package_manager::hex_encode(&Sha256::digest(bytes)));
-            manifest.push('\n');
+            hash_surface_record(
+                &mut surface_hasher,
+                b"settings",
+                Path::new(".pi/settings.json"),
+                bytes,
+            );
         }
         let mut extension_entries = Vec::with_capacity(extension_files.len());
         for found in &extension_files {
-            let bytes = std::fs::read(&found.absolute).map_err(|err| {
-                Error::config(format!(
-                    "Failed to read {}: {err}",
-                    found.absolute.display()
-                ))
-            })?;
-            let display = format!(".pi/extensions/{}", found.relative.display());
-            manifest.push_str(&display);
-            manifest.push('\t');
-            manifest.push_str(&crate::package_manager::hex_encode(&Sha256::digest(&bytes)));
-            manifest.push('\n');
-            extension_entries.push(display);
+            let bytes = read_bounded_regular_file(&found.absolute, MAX_TRUST_EXTENSION_BYTES)?
+                .ok_or_else(|| {
+                    Error::config(format!(
+                        "Trust surface disappeared while scanning {}",
+                        escaped_path(&found.absolute)
+                    ))
+                })?;
+            let relative = Path::new(".pi/extensions").join(&found.relative);
+            hash_surface_record(&mut surface_hasher, b"extension", &relative, &bytes);
+            extension_entries.push(escaped_path(&relative));
         }
         let mut mcp_config_entries = Vec::with_capacity(mcp_config_files.len());
         for (relative, bytes) in mcp_config_files {
-            manifest.push_str(&relative);
-            manifest.push('\t');
-            manifest.push_str(&crate::package_manager::hex_encode(&Sha256::digest(bytes)));
-            manifest.push('\n');
-            mcp_config_entries.push(relative);
+            hash_surface_record(&mut surface_hasher, b"mcp", &relative, &bytes);
+            mcp_config_entries.push(escaped_path(&relative));
         }
 
         Ok(Some(Self {
+            workspace_display: escaped_path(
+                &std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+            ),
             has_project_settings: settings_bytes.is_some(),
             package_count,
             extension_entries,
             mcp_config_entries,
-            digest: crate::package_manager::hex_encode(&Sha256::digest(manifest.as_bytes())),
+            digest: crate::package_manager::hex_encode(&surface_hasher.finalize()),
         }))
     }
+}
+
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(Error::config(format!(
+                "Failed to inspect {}: {err}",
+                escaped_path(path)
+            )));
+        }
+    };
+    if !metadata.is_file() {
+        return Err(Error::config(format!(
+            "Trust surface is not a regular file: {}",
+            escaped_path(path)
+        )));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(Error::config(format!(
+            "Trust surface exceeds {max_bytes} bytes: {}",
+            escaped_path(path)
+        )));
+    }
+
+    let file = File::open(path).map_err(|err| {
+        Error::config(format!("Failed to read {}: {err}", escaped_path(path)))
+    })?;
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            Error::config(format!("Failed to read {}: {err}", escaped_path(path)))
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(Error::config(format!(
+            "Trust surface exceeds {max_bytes} bytes: {}",
+            escaped_path(path)
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+fn hash_surface_record(hasher: &mut Sha256, kind: &[u8], path: &Path, bytes: &[u8]) {
+    hash_length_prefixed(hasher, kind);
+    hash_length_prefixed(hasher, path.as_os_str().as_encoded_bytes());
+    hash_length_prefixed(hasher, bytes);
+}
+
+fn hash_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn escaped_path(path: &Path) -> String {
+    path.as_os_str()
+        .to_string_lossy()
+        .chars()
+        .flat_map(char::escape_default)
+        .collect()
 }
 
 /// A surface file discovered under `.pi/extensions/`: the absolute path comes
@@ -344,10 +400,11 @@ pub struct TrustInputs {
 /// Canonical store key for a workspace path.
 #[must_use]
 pub fn workspace_key(cwd: &Path) -> String {
-    std::fs::canonicalize(cwd)
-        .unwrap_or_else(|_| cwd.to_path_buf())
-        .display()
-        .to_string()
+    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    format!(
+        "path-v2:{}",
+        crate::package_manager::hex_encode(canonical.as_os_str().as_encoded_bytes())
+    )
 }
 
 /// Decide whether the workspace at `cwd` is trusted, prompting via `prompt`
@@ -581,6 +638,53 @@ mod tests {
     }
 
     #[test]
+    fn scan_rejects_non_regular_and_oversized_trust_surfaces() {
+        let non_regular = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(non_regular.path().join(".pi/mcp.json"))
+            .expect("create non-regular MCP surface");
+        let err = WorkspaceTrustSurface::scan(non_regular.path())
+            .expect_err("directories must not be read as trust surfaces");
+        assert!(err.to_string().contains("not a regular file"));
+
+        let oversized = tempfile::tempdir().expect("tempdir");
+        write(
+            &oversized.path().join(".pi/mcp.json"),
+            &"x".repeat(MAX_TRUST_CONFIG_BYTES + 1),
+        );
+        let err = WorkspaceTrustSurface::scan(oversized.path())
+            .expect_err("oversized configs must fail before allocation grows unbounded");
+        assert!(err.to_string().contains("exceeds 1048576 bytes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_rejects_device_symlinks_and_escapes_untrusted_names() {
+        use std::os::unix::fs::symlink;
+
+        let device = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(device.path().join(".pi")).expect("create project dir");
+        symlink("/dev/zero", device.path().join(".pi/mcp.json"))
+            .expect("create device symlink");
+        let err = WorkspaceTrustSurface::scan(device.path())
+            .expect_err("device symlinks must be rejected before opening");
+        assert!(err.to_string().contains("not a regular file"));
+
+        let controls = tempfile::tempdir().expect("tempdir");
+        write(
+            &controls.path().join(".pi/extensions/evil\n\u{1b}[2J.js"),
+            "export {}\n",
+        );
+        let surface = WorkspaceTrustSurface::scan(controls.path())
+            .expect("scan")
+            .expect("surface");
+        let displayed = surface.extension_entries.join(" ");
+        assert!(!displayed.contains('\n'));
+        assert!(!displayed.contains('\u{1b}'));
+        assert!(displayed.contains("\\n"));
+        assert!(displayed.contains("\\u{1b}"));
+    }
+
+    #[test]
     fn store_roundtrip_and_digest_mismatch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store_path = dir.path().join("workspace-trust.json");
@@ -599,6 +703,32 @@ mod tests {
             "a digest change must invalidate the stored decision"
         );
         assert_eq!(reloaded.decision("/other", "d1"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_keys_preserve_non_utf8_canonical_path_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir
+            .path()
+            .join(OsString::from_vec(vec![b'w', b's', b'-', 0x80]));
+        let second = dir
+            .path()
+            .join(OsString::from_vec(vec![b'w', b's', b'-', 0x81]));
+        std::fs::create_dir_all(&first).expect("create first workspace");
+        std::fs::create_dir_all(&second).expect("create second workspace");
+
+        let first_key = workspace_key(&first);
+        let second_key = workspace_key(&second);
+        assert_ne!(
+            first_key, second_key,
+            "distinct raw canonical paths must never share trust decisions"
+        );
+        assert!(first_key.starts_with("path-v2:"));
+        assert!(first_key.is_ascii(), "store keys must remain JSON-safe");
     }
 
     #[test]
