@@ -1509,6 +1509,24 @@ impl HttpTransport {
         Self::lock(&self.session).generation
     }
 
+    /// Retire the transport only if `generation` still names the active
+    /// protocol session. Holding the session lock across the terminal state
+    /// transition prevents an old GET listener from racing a successful
+    /// renewal and aborting the replacement session.
+    fn abort_if_session_generation(&self, generation: u64) -> bool {
+        let session = Self::lock(&self.session);
+        if session.generation != generation
+            || !self.alive.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        self.alive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(session);
+        self.abort_notify.notify_waiters();
+        true
+    }
+
     fn cancellation_dispatch(&self, request_id: u64) -> HttpCancellationDispatch {
         HttpCancellationDispatch {
             client: self.client.clone(),
@@ -1604,7 +1622,16 @@ impl HttpTransport {
             .fuse();
         futures::pin_mut!(operation, changed);
         match futures::future::select(operation, changed).await {
-            futures::future::Either::Left((result, _)) => result.map(Some),
+            futures::future::Either::Left((result, _)) => {
+                // Both futures can become ready in the same scheduling turn.
+                // In that tie the left-biased select may return an error from
+                // the old stream, so re-check before exposing its result.
+                if self.session_generation() != generation {
+                    Ok(None)
+                } else {
+                    result.map(Some)
+                }
+            }
             futures::future::Either::Right(((), _)) => Ok(None),
         }
     }
@@ -2008,59 +2035,70 @@ impl HttpTransport {
             request = request.header("Last-Event-ID", last_event_id.to_string());
         }
         let header_timeout = timeout.unwrap_or(DEFAULT_MCP_TIMEOUT);
-        let response = Self::run_with_deadline(
+        Self::run_with_deadline(
             async move {
-                request.no_timeout().send().await.map_err(|err| {
+                let response = request.no_timeout().send().await.map_err(|err| {
                     tool_err(
                         "MCP_TRANSPORT_IO",
                         format!("open server event stream: {err}"),
                     )
-                })
+                })?;
+                let status = response.status();
+                if status == 405 {
+                    // GET is optional. Do not let a hostile or broken server
+                    // hold activation open by drip-feeding an ignored body.
+                    return Ok(HttpEventStreamOpen::Unsupported);
+                }
+                if status == 404 && had_session {
+                    // The status is sufficient to classify expiry; dropping
+                    // the body makes fail-close independent of body progress.
+                    return Ok(HttpEventStreamOpen::SessionExpired);
+                }
+                if status != 200 {
+                    let body = response.text_limited(4096).await.unwrap_or_default();
+                    return Err(tool_err(
+                        "MCP_HTTP_STATUS",
+                        format!("HTTP {status} opening server event stream: {}", body.trim()),
+                    ));
+                }
+                let content_type = response
+                    .headers()
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, value)| value.as_str())
+                    .unwrap_or_default();
+                if !content_type
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+                {
+                    return Err(tool_err(
+                        "MCP_PROTOCOL",
+                        format!(
+                            "HTTP GET server stream requires Content-Type text/event-stream, received {content_type:?}"
+                        ),
+                    ));
+                }
+                Ok(HttpEventStreamOpen::Stream(response))
             },
             header_timeout,
             "HTTP server-event stream establishment",
         )
-        .await?;
-        let status = response.status();
-        if status == 405 {
-            let _ = response.bytes_limited(4096).await;
-            return Ok(HttpEventStreamOpen::Unsupported);
-        }
-        if status == 404 && had_session {
-            let _ = response.bytes_limited(4096).await;
-            return Ok(HttpEventStreamOpen::SessionExpired);
-        }
-        if status != 200 {
-            let body = response.text_limited(4096).await.unwrap_or_default();
-            return Err(tool_err(
-                "MCP_HTTP_STATUS",
-                format!("HTTP {status} opening server event stream: {}", body.trim()),
-            ));
-        }
-        let content_type = response
-            .headers()
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.as_str())
-            .unwrap_or_default();
-        if !content_type
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .eq_ignore_ascii_case("text/event-stream")
-        {
-            return Err(tool_err(
-                "MCP_PROTOCOL",
-                format!(
-                    "HTTP GET server stream requires Content-Type text/event-stream, received {content_type:?}"
-                ),
-            ));
-        }
-        Ok(HttpEventStreamOpen::Stream(response))
+        .await
     }
 
     async fn send_session_delete(&self, wire_state: HttpWireState) -> Result<()> {
+        self.send_session_delete_with_timeout(wire_state, HTTP_CLOSE_TIMEOUT)
+            .await
+    }
+
+    async fn send_session_delete_with_timeout(
+        &self,
+        wire_state: HttpWireState,
+        timeout: Duration,
+    ) -> Result<()> {
         let Some(session_id) = wire_state.session_id else {
             return Ok(());
         };
@@ -2072,24 +2110,27 @@ impl HttpTransport {
         if let Some(protocol_version) = wire_state.protocol_version {
             request = request.header("Mcp-Protocol-Version", protocol_version);
         }
-        let response = request
-            .timeout(HTTP_CLOSE_TIMEOUT)
-            .send()
-            .await
-            .map_err(|err| {
-                tool_err("MCP_TRANSPORT_IO", format!("terminate HTTP session: {err}"))
-            })?;
-        let status = response.status();
-        if (200..300).contains(&status) || status == 405 {
-            let _ = response.bytes_limited(4096).await;
-            Ok(())
-        } else {
-            let body = response.text_limited(4096).await.unwrap_or_default();
-            Err(tool_err(
-                "MCP_HTTP_STATUS",
-                format!("HTTP {status} terminating session: {}", body.trim()),
-            ))
-        }
+        Self::run_with_deadline(
+            async move {
+                let response = request.no_timeout().send().await.map_err(|err| {
+                    tool_err("MCP_TRANSPORT_IO", format!("terminate HTTP session: {err}"))
+                })?;
+                let status = response.status();
+                if (200..300).contains(&status) || status == 405 {
+                    // Session teardown is complete once the status arrives.
+                    // The body is non-semantic and must not extend close time.
+                    return Ok(());
+                }
+                let body = response.text_limited(4096).await.unwrap_or_default();
+                Err(tool_err(
+                    "MCP_HTTP_STATUS",
+                    format!("HTTP {status} terminating session: {}", body.trim()),
+                ))
+            },
+            timeout,
+            "HTTP session termination",
+        )
+        .await
     }
 
     async fn handle_sse_message(

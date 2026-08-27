@@ -7703,14 +7703,14 @@ mod extensions_integration_tests {
     }
 
     #[derive(Debug, Default)]
-    struct PiAiCapturedProviderContext {
-        system_prompt: Option<String>,
-        messages: Vec<Message>,
+    pub(super) struct PiAiCapturedProviderContext {
+        pub(super) system_prompt: Option<String>,
+        pub(super) messages: Vec<Message>,
     }
 
     #[derive(Debug)]
-    struct PiAiCaptureProvider {
-        calls: Arc<StdMutex<Vec<PiAiCapturedProviderContext>>>,
+    pub(super) struct PiAiCaptureProvider {
+        pub(super) calls: Arc<StdMutex<Vec<PiAiCapturedProviderContext>>>,
     }
 
     #[async_trait]
@@ -14751,6 +14751,7 @@ fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::extensions_integration_tests::PiAiCaptureProvider;
     use crate::auth::AuthCredential;
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;

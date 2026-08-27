@@ -29,7 +29,8 @@ use crate::extensions::{
     ExtensionUiResponse,
 };
 use crate::model::{
-    ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
+    ContentBlock, ImageContent, Message, StopReason, TextContent, ThinkingLevel, UserContent,
+    UserMessage,
 };
 use crate::models::{ModelEntry, model_requires_configured_credential};
 use crate::provider::InputType;
@@ -1082,6 +1083,11 @@ struct RpcSessionTransitionPermits {
     _session_action: OwnedMutexGuard<()>,
 }
 
+struct RpcSessionTransitionAuthority {
+    session: OwnedMutexGuard<AgentSession>,
+    permits: RpcSessionTransitionPermits,
+}
+
 impl RpcSessionTransitionPermits {
     fn commit_session_change(&self) {
         self.session_action_admission.advance_generation();
@@ -1095,6 +1101,13 @@ async fn rpc_session_transition_snapshot(
     let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
         .await
         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    rpc_session_transition_snapshot_from_guard(&guard, cx).await
+}
+
+async fn rpc_session_transition_snapshot_from_guard(
+    guard: &AgentSession,
+    cx: &AgentCx,
+) -> Result<RpcSessionTransitionSnapshot> {
     let inner = guard
         .session
         .lock(cx.cx())
@@ -1187,7 +1200,7 @@ async fn acquire_rpc_session_transition(
     shared_state: &Arc<Mutex<RpcSharedState>>,
     bash_state: &Arc<Mutex<Option<RunningBash>>>,
     cx: &AgentCx,
-) -> Result<RpcSessionTransitionPermits> {
+) -> Result<RpcSessionTransitionAuthority> {
     let (provider_admission, session_action_admission) = {
         let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
             .await
@@ -1197,37 +1210,81 @@ async fn acquire_rpc_session_transition(
             guard.session_action_admission_gate(),
         )
     };
-    // Extension message actions never acquire provider admission. This order
-    // therefore cannot invert with model/compaction paths that already hold
-    // the inner Session before acquiring provider admission.
+    // Capture the action generation before waiting, then acquire the outer
+    // AgentSession before provider admission. Existing model/thinking and
+    // compaction transitions use the same outer -> provider order, so neither
+    // side can own one lock while waiting for the other.
     let session_action_permit = session_action_admission.acquire(cx.cx()).await?;
+    let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
     let provider_permit = provider_admission.acquire(cx.cx()).await?;
     provider_admission.ensure_allowed()?;
 
-    if let Some(reason) = rpc_session_transition_blocker(
-        is_streaming,
-        is_compacting,
-        turn_phase_linearizer,
-        session,
-        shared_state,
-        bash_state,
-        cx,
-    )
-    .await?
-    {
+    let phase = {
+        let _phase_guard = lock_rpc_turn_phase(turn_phase_linearizer);
+        rpc_turn_phase(is_streaming, is_compacting)
+    };
+    let phase_blocker = match phase {
+        RpcTurnPhase::Streaming => {
+            Some("Agent is currently streaming; abort or wait before changing sessions")
+        }
+        RpcTurnPhase::Compacting => {
+            Some("Agent is currently compacting; wait before changing sessions")
+        }
+        RpcTurnPhase::Idle => None,
+    };
+    if let Some(reason) = phase_blocker {
         return Err(Error::session(reason));
     }
 
-    let current = rpc_session_transition_snapshot(session, cx).await?;
+    guard.ensure_provider_reentry_allowed()?;
+    if guard.agent.has_staged_follow_up() {
+        return Err(Error::session(
+            "An accepted follow-up is still pending; resume it before changing sessions",
+        ));
+    }
+    if guard.has_pending_extension_idle_actions() {
+        return Err(Error::session(
+            "An extension-triggered action is still pending; resume it before changing sessions",
+        ));
+    }
+
+    let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+    state.bind_provider_admission(provider_admission.clone());
+    state.ensure_session_advancement_allowed()?;
+    if state.pending_count() > 0 {
+        return Err(Error::session(
+            "Acknowledged RPC input is still pending; resume or persist it before changing sessions",
+        ));
+    }
+    drop(state);
+
+    if OwnedMutexGuard::lock(Arc::clone(bash_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
+        .is_some()
+    {
+        return Err(Error::session(
+            "A background bash command is still running; wait before changing sessions",
+        ));
+    }
+
+    let current = rpc_session_transition_snapshot_from_guard(&guard, cx).await?;
     if current != *baseline {
         return Err(Error::session(
             "an accepted action modified the source Session while the transition was pending; the transition was rejected so the action remains owned by that Session",
         ));
     }
-    Ok(RpcSessionTransitionPermits {
-        session_action_admission,
-        _provider: provider_permit,
-        _session_action: session_action_permit,
+    Ok(RpcSessionTransitionAuthority {
+        session: guard,
+        permits: RpcSessionTransitionPermits {
+            session_action_admission,
+            _provider: provider_permit,
+            _session_action: session_action_permit,
+        },
     })
 }
 
@@ -3729,7 +3786,7 @@ pub async fn run(
                     ));
                     continue;
                 }
-                let session_transition_permit = match acquire_rpc_session_transition(
+                let session_transition = match acquire_rpc_session_transition(
                     &transition_baseline,
                     &is_streaming,
                     &is_compacting,
@@ -3747,15 +3804,16 @@ pub async fn run(
                         continue;
                     }
                 };
+                let RpcSessionTransitionAuthority {
+                    session: mut guard,
+                    permits: session_transition_permit,
+                } = session_transition;
 
                 let parent = parsed
                     .get("parentSession")
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let result: Result<(String, Option<String>)> = async {
-                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
@@ -3806,12 +3864,16 @@ pub async fn run(
                         .agent
                         .reset_session_scoped_state(crate::plan::PlanMode::Off);
                     guard.refresh_extension_completion_host_state();
+                    if let Some(region) = &guard.extensions {
+                        region.manager().invalidate_ctx_cache();
+                    }
                     state.clear_all_pending();
                     state.clear_failover_lifecycle();
 
                     Ok((session_id, previous_session_file))
                 }
                 .await;
+                drop(guard);
                 drop(session_transition_permit);
                 match result {
                     Ok((session_id, previous_session_file)) => {
@@ -3875,25 +3937,6 @@ pub async fn run(
                     ));
                     continue;
                 }
-                let session_transition_permit = match acquire_rpc_session_transition(
-                    &transition_baseline,
-                    &is_streaming,
-                    &is_compacting,
-                    &turn_phase_linearizer,
-                    &session,
-                    &shared_state,
-                    &bash_state,
-                    &cx,
-                )
-                .await
-                {
-                    Ok(permit) => permit,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
-                        continue;
-                    }
-                };
-
                 // Validate relative paths against the sessions directory to prevent traversal.
                 let session_path_buf = std::path::PathBuf::from(session_path);
                 let sessions_dir = crate::config::Config::sessions_dir();
@@ -3920,6 +3963,32 @@ pub async fn run(
                     crate::session::Session::open(resolved_path.to_string_lossy().as_ref()).await;
                 match loaded {
                     Ok(mut new_session) => {
+                        let session_transition = match acquire_rpc_session_transition(
+                            &transition_baseline,
+                            &is_streaming,
+                            &is_compacting,
+                            &turn_phase_linearizer,
+                            &session,
+                            &shared_state,
+                            &bash_state,
+                            &cx,
+                        )
+                        .await
+                        {
+                            Ok(authority) => authority,
+                            Err(err) => {
+                                let _ = out_tx.send(response_error_with_hints(
+                                    id,
+                                    "switch_session",
+                                    &err,
+                                ));
+                                continue;
+                            }
+                        };
+                        let RpcSessionTransitionAuthority {
+                            session: mut guard,
+                            permits: session_transition_permit,
+                        } = session_transition;
                         let target_session_file = new_session.path.as_ref().map_or_else(
                             || resolved_path.display().to_string(),
                             |p| p.display().to_string(),
@@ -3929,11 +3998,6 @@ pub async fn run(
                             // prepare the target provider before replacing the
                             // live Session. After the assignment below, only
                             // infallible in-memory installation remains.
-                            let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
-                                .await
-                                .map_err(|err| {
-                                    Error::session(format!("session lock failed: {err}"))
-                                })?;
                             let mut state =
                                 OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                                     .await
@@ -4052,6 +4116,7 @@ pub async fn run(
                             Ok((previous_session_file, session_id))
                         }
                         .await;
+                        drop(guard);
                         drop(session_transition_permit);
 
                         match result {
@@ -4083,7 +4148,6 @@ pub async fn run(
                         }
                     }
                     Err(err) => {
-                        drop(session_transition_permit);
                         let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
                     }
                 }
@@ -4161,7 +4225,7 @@ pub async fn run(
                     // Phase 3: prepare and persist the complete target runtime,
                     // then atomically install Session + agent model state.
                     {
-                        let session_transition_permit = acquire_rpc_session_transition(
+                        let session_transition = acquire_rpc_session_transition(
                             &transition_baseline,
                             &is_streaming,
                             &is_compacting,
@@ -4172,9 +4236,10 @@ pub async fn run(
                             &cx,
                         )
                         .await?;
-                        let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
-                            .await
-                            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                        let RpcSessionTransitionAuthority {
+                            session: mut guard,
+                            permits: session_transition_permit,
+                        } = session_transition;
                         let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                             .await
                             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
@@ -7489,6 +7554,7 @@ fn retry_delay_ms(config: &Config, attempt: u32) -> u32 {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+    use super::tests::{build_test_rpc_options, dummy_entry};
     use crate::agent::{Agent, AgentConfig, AgentSession};
     use crate::model::{AssistantMessage, Usage};
     use crate::provider::{InputType, Model, ModelCost, Provider};
@@ -11482,7 +11548,7 @@ mod tests {
         }
     }
 
-    fn dummy_entry(id: &str, reasoning: bool) -> ModelEntry {
+    pub(super) fn dummy_entry(id: &str, reasoning: bool) -> ModelEntry {
         ModelEntry {
             model: dummy_model(id, reasoning),
             api_key: None,
@@ -12299,7 +12365,7 @@ mod tests {
         rank.saturating_sub(1).min(len - 1)
     }
 
-    fn build_test_rpc_options(
+    pub(super) fn build_test_rpc_options(
         handle: &asupersync::runtime::RuntimeHandle,
         auth_path: PathBuf,
     ) -> RpcOptions {
