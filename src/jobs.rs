@@ -1228,6 +1228,14 @@ pub fn wait(id: &str, timeout: Duration) -> Result<JobSnapshot> {
 /// # Errors
 /// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids.
 pub async fn wait_async(id: &str, timeout: Duration) -> Result<JobSnapshot> {
+    wait_async_with_slice(id, timeout, MAX_ASYNC_WAIT_SLICE).await
+}
+
+async fn wait_async_with_slice(
+    id: &str,
+    timeout: Duration,
+    max_wait_slice: Duration,
+) -> Result<JobSnapshot> {
     let handle = wait_handle(id)?;
     let cx = crate::agent_cx::AgentCx::for_current_or_request();
     let now = cx
@@ -1243,7 +1251,9 @@ pub async fn wait_async(id: &str, timeout: Duration) -> Result<JobSnapshot> {
             .cx()
             .timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        let Some(sleep_for) = remaining_wait_slice(now, deadline) else {
+        let Some(sleep_for) = remaining_wait_slice(now, deadline)
+            .map(|sleep_for| sleep_for.min(max_wait_slice))
+        else {
             return snapshot_now_best_effort(&handle);
         };
         let notified = handle
@@ -2005,6 +2015,53 @@ mod tests {
             Some(MAX_ASYNC_WAIT_SLICE),
             "an unrepresentable deadline must remain a bounded infinite wait"
         );
+    }
+
+    #[test]
+    fn async_wait_continues_after_intermediate_timer_slice() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-sliced-wait-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let remained_pending = runtime.block_on(async {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let waiting = wait_async_with_slice(
+                &id,
+                Duration::from_secs(1),
+                Duration::from_millis(5),
+            )
+            .fuse();
+            let observation =
+                asupersync::time::sleep(now, Duration::from_millis(30)).fuse();
+            futures::pin_mut!(waiting, observation);
+            matches!(
+                futures::future::select(waiting, observation).await,
+                futures::future::Either::Right(((), _))
+            )
+        });
+        assert!(
+            remained_pending,
+            "an intermediate timer slice must not complete a still-running job wait"
+        );
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
     }
 
     #[test]

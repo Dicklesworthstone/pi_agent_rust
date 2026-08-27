@@ -12,9 +12,13 @@
 //!
 //! Merge semantics: per server name, the highest-precedence source wins the
 //! whole definition; every server records where it came from. Malformed
-//! entries are skipped with a warning record — they never abort the load.
+//! entries are skipped with a warning record. A whole-file failure in a native
+//! or explicitly selected source blocks all lower-precedence sources so a
+//! configuration error cannot revive an older trusted execution target.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -22,6 +26,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const TRUST_FINGERPRINT_DOMAIN: &[u8] = b"pi_agent_rust:mcp-trust-surface:v2";
+const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
 
 /// `HttpTransport` always installs Content-Type + Accept and may add an MCP
 /// session header after initialize. Leave room for all three inside the HTTP
@@ -498,16 +503,60 @@ fn parse_server(name: &str, raw: &Value) -> std::result::Result<RawServer, Strin
     serde_json::from_value(raw.clone()).map_err(|err| format!("entry {name:?}: {err}"))
 }
 
-/// Load one config file. Missing file → empty; malformed JSON → one warning.
+fn read_bounded_config(path: &Path) -> std::io::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "MCP config path is not a regular file",
+        ));
+    }
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_MCP_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_MCP_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("MCP config exceeds {MAX_MCP_CONFIG_BYTES} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("MCP config is not valid UTF-8: {err}"),
+        )
+    })
+}
+
+/// Load one config file.
+///
+/// Returns `true` when a whole-file failure in a native or explicitly selected
+/// source must block all lower-precedence sources. Missing default files are
+/// normal; missing explicit CLI files fail closed.
 fn load_file(
     path: &Path,
     provenance: Provenance,
     out: &mut Vec<(String, RawServer, Provenance, PathBuf)>,
     warnings: &mut Vec<ConfigWarning>,
     claimed_names: &mut std::collections::HashSet<String>,
-) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return; // absent files are normal
+) -> bool {
+    let content = match read_bounded_config(path) {
+        Ok(content) => content,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && provenance != Provenance::Cli =>
+        {
+            return false; // absent default files are normal
+        }
+        Err(err) => {
+            warnings.push(ConfigWarning {
+                source_file: path.to_path_buf(),
+                entry: "<file>".to_string(),
+                reason: format!("cannot read MCP config: {err}"),
+            });
+            return provenance.is_native();
+        }
     };
     // TOML is only supported for .codex/config.toml via a minimal parse: the
     // [mcp_servers.NAME] tables. Everything else is JSON.
@@ -525,7 +574,7 @@ fn load_file(
                 entry: "<file>".to_string(),
                 reason,
             });
-            return;
+            return provenance.is_native();
         }
     };
     // Accept both `{"mcpServers": {...}}` and a bare `{name: {...}}` map.
@@ -537,7 +586,7 @@ fn load_file(
             entry: "<file>".to_string(),
             reason: "MCP config root must be an object".to_string(),
         });
-        return;
+        return provenance.is_native();
     };
     let servers: HashMap<String, Value> = if let Some(wrapped) = root.get("mcpServers") {
         let Some(wrapped) = wrapped.as_object() else {
@@ -546,9 +595,14 @@ fn load_file(
                 entry: "<file>".to_string(),
                 reason: "mcpServers must be an object".to_string(),
             });
-            return;
+            return provenance.is_native();
         };
         wrapped.clone().into_iter().collect()
+    } else if provenance.is_native() {
+        // Native and explicit CLI files are MCP-only surfaces. Claim every
+        // bare-map key before parsing so a malformed high-precedence override
+        // cannot fall through to an older, already-trusted definition.
+        root.clone().into_iter().collect()
     } else {
         // Foreign settings files share their root with unrelated settings, so
         // only object values carrying an MCP execution field are candidates.
@@ -573,6 +627,7 @@ fn load_file(
             }),
         }
     }
+    false
 }
 
 /// Minimal TOML extraction for `.codex/config.toml` `[mcp_servers.NAME]`
@@ -657,9 +712,16 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
     let mut warnings = Vec::new();
     let mut claimed_names = std::collections::HashSet::new();
 
-    // Precedence high → low. Later layers only fill names not already set.
+    // Precedence high → low. Later layers only fill names not already set. A
+    // whole-file failure in a native or explicit source blocks every lower
+    // layer; otherwise an invalid override could revive an older trusted
+    // command or URL.
+    let mut lower_layers_blocked = false;
     for path in cli_paths {
-        load_file(
+        if lower_layers_blocked {
+            break;
+        }
+        lower_layers_blocked = load_file(
             path,
             Provenance::Cli,
             &mut layered,
@@ -667,35 +729,43 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
             &mut claimed_names,
         );
     }
-    load_file(
-        &cwd.join(".pi/mcp.json"),
-        Provenance::ProjectPi,
-        &mut layered,
-        &mut warnings,
-        &mut claimed_names,
-    );
-    load_file(
-        &cwd.join(".agents/mcp.json"),
-        Provenance::ProjectAgents,
-        &mut layered,
-        &mut warnings,
-        &mut claimed_names,
-    );
-    load_file(
-        &global_dir.join("mcp.json"),
-        Provenance::GlobalPi,
-        &mut layered,
-        &mut warnings,
-        &mut claimed_names,
-    );
-    for foreign in FOREIGN_PROJECT_FILES {
-        load_file(
-            &cwd.join(foreign),
-            Provenance::Foreign,
+    if !lower_layers_blocked {
+        lower_layers_blocked = load_file(
+            &cwd.join(".pi/mcp.json"),
+            Provenance::ProjectPi,
             &mut layered,
             &mut warnings,
             &mut claimed_names,
         );
+    }
+    if !lower_layers_blocked {
+        lower_layers_blocked = load_file(
+            &cwd.join(".agents/mcp.json"),
+            Provenance::ProjectAgents,
+            &mut layered,
+            &mut warnings,
+            &mut claimed_names,
+        );
+    }
+    if !lower_layers_blocked {
+        lower_layers_blocked = load_file(
+            &global_dir.join("mcp.json"),
+            Provenance::GlobalPi,
+            &mut layered,
+            &mut warnings,
+            &mut claimed_names,
+        );
+    }
+    if !lower_layers_blocked {
+        for foreign in FOREIGN_PROJECT_FILES {
+            load_file(
+                &cwd.join(foreign),
+                Provenance::Foreign,
+                &mut layered,
+                &mut warnings,
+                &mut claimed_names,
+            );
+        }
     }
 
     let mut servers = Vec::new();
@@ -767,7 +837,7 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
 ///
 /// Returns an error when the file exists but is not valid JSON.
 pub fn read_project_config(path: &Path) -> Result<Value, crate::error::Error> {
-    match std::fs::read_to_string(path) {
+    match read_bounded_config(path) {
         Ok(content) => serde_json::from_str(&content).map_err(|err| {
             crate::error::Error::tool(
                 "mcp",
@@ -776,6 +846,12 @@ pub fn read_project_config(path: &Path) -> Result<Value, crate::error::Error> {
         }),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             Ok(serde_json::json!({ "mcpServers": {} }))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            Err(crate::error::Error::tool(
+                "mcp",
+                format!("[MCP_CONFIG_INVALID] {}: {err}", path.display()),
+            ))
         }
         Err(err) => Err(crate::error::Error::tool(
             "mcp",
@@ -801,6 +877,14 @@ pub fn write_project_config(path: &Path, value: &Value) -> Result<(), crate::err
     let rendered = serde_json::to_string_pretty(value).map_err(|err| {
         crate::error::Error::tool("mcp", format!("[MCP_CONFIG_IO] serialize failed: {err}"))
     })?;
+    if rendered.len().saturating_add(1) > MAX_MCP_CONFIG_BYTES {
+        return Err(crate::error::Error::tool(
+            "mcp",
+            format!(
+                "[MCP_CONFIG_INVALID] rendered MCP config exceeds {MAX_MCP_CONFIG_BYTES} bytes"
+            ),
+        ));
+    }
     std::fs::write(path, format!("{rendered}\n")).map_err(|err| {
         crate::error::Error::tool(
             "mcp",
@@ -922,6 +1006,26 @@ mod tests {
     }
 
     #[test]
+    fn malformed_native_bare_map_entry_shadows_lower_server() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        let global = temp.path().join("global");
+        write(&cwd.join(".pi/mcp.json"), r#"{"shared":42}"#);
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{"shared":{"command":"global"}}}"#,
+        );
+
+        let discovery = discover(&cwd, &global, &[]);
+        assert!(
+            discovery.servers.is_empty(),
+            "a malformed bare-map override must still own its server name"
+        );
+        assert_eq!(discovery.warnings.len(), 1);
+        assert_eq!(discovery.warnings[0].entry, "shared");
+    }
+
+    #[test]
     fn ambiguous_transport_shapes_are_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("proj");
@@ -958,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_file_warns_without_losing_other_files() {
+    fn malformed_native_file_blocks_lower_precedence_servers() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("proj");
         let global = temp.path().join("global");
@@ -968,8 +1072,81 @@ mod tests {
             r#"{"mcpServers": {"g": {"command": "ok"}}}"#,
         );
         let discovery = discover(&cwd, &global, &[]);
-        assert_eq!(discovery.servers.len(), 1);
+        assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
+    }
+
+    #[test]
+    fn non_regular_native_config_blocks_lower_precedence_servers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        let global = temp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi/mcp.json"))
+            .expect("non-regular config fixture");
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{"fallback":{"command":"ok"}}}"#,
+        );
+
+        let discovery = discover(&cwd, &global, &[]);
+        assert!(discovery.servers.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+        assert_eq!(
+            discovery.warnings[0].source_file,
+            cwd.join(".pi/mcp.json")
+        );
+        assert!(
+            discovery.warnings[0]
+                .reason
+                .contains("cannot read MCP config")
+        );
+    }
+
+    #[test]
+    fn oversized_native_config_blocks_lower_precedence_servers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        let global = temp.path().join("global");
+        let project_config = cwd.join(".pi/mcp.json");
+        std::fs::create_dir_all(project_config.parent().expect("config parent"))
+            .expect("project config directory");
+        std::fs::write(&project_config, vec![b' '; MAX_MCP_CONFIG_BYTES + 1])
+            .expect("oversized config fixture");
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{"fallback":{"command":"ok"}}}"#,
+        );
+
+        let discovery = discover(&cwd, &global, &[]);
+        assert!(discovery.servers.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+        assert!(
+            discovery.warnings[0]
+                .reason
+                .contains("exceeds 1048576 bytes")
+        );
+    }
+
+    #[test]
+    fn missing_explicit_cli_config_blocks_lower_precedence_servers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        let global = temp.path().join("global");
+        let missing = temp.path().join("explicit-missing.json");
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{"fallback":{"command":"must-not-run"}}}"#,
+        );
+
+        let discovery = discover(&cwd, &global, &[missing.clone()]);
+        assert!(discovery.servers.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+        assert_eq!(discovery.warnings[0].source_file, missing);
+        assert!(
+            discovery.warnings[0]
+                .reason
+                .contains("cannot read MCP config")
+        );
     }
 
     #[test]
@@ -1197,5 +1374,44 @@ mod tests {
             reread["mcpServers"]["added"]["command"].as_str(),
             Some("new-cmd")
         );
+    }
+
+    #[test]
+    fn project_config_read_rejects_oversized_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(".pi/mcp.json");
+        std::fs::create_dir_all(path.parent().expect("config parent"))
+            .expect("config directory");
+        std::fs::write(&path, vec![b' '; MAX_MCP_CONFIG_BYTES + 1])
+            .expect("oversized config fixture");
+
+        let error = read_project_config(&path).expect_err("oversized config must fail closed");
+        assert!(
+            error.to_string().contains("MCP_CONFIG_INVALID"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("exceeds 1048576 bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn project_config_write_rejects_output_above_read_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(".pi/mcp.json");
+        let value = serde_json::json!({
+            "mcpServers": {
+                "oversized": {"command": "x".repeat(MAX_MCP_CONFIG_BYTES)}
+            }
+        });
+
+        let error = write_project_config(&path, &value)
+            .expect_err("writer must not create a config the bounded reader rejects");
+        assert!(
+            error.to_string().contains("MCP_CONFIG_INVALID"),
+            "{error}"
+        );
+        assert!(!path.exists(), "rejected output must not create the config file");
     }
 }

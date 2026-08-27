@@ -1,11 +1,182 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use asupersync::sync::OwnedMutexGuard;
+use asupersync::Cx;
+use asupersync::sync::{Mutex, OwnedMutexGuard};
 use serde_json::{Value, json};
 
-use super::{AgentState, Cmd, EXTENSION_EVENT_TIMEOUT_MS, PiApp, PiMsg, conversation_from_session};
+use super::{
+    AgentState, Cmd, ConversationMessage, EXTENSION_EVENT_TIMEOUT_MS, PiApp, PiMsg,
+    conversation_from_session,
+};
 use crate::extension_events::{SessionBeforeCompactOutcome, apply_session_before_compact_response};
+use crate::model::{Message, Usage};
+use crate::session::{CompactionEntry, Session, SessionEntry};
+
+async fn deliver_compaction_terminal_event(
+    event_tx: &asupersync::channel::mpsc::Sender<PiMsg>,
+    cx: &Cx,
+    message: PiMsg,
+) -> bool {
+    let delivered = crate::interactive::enqueue_pi_event(event_tx, cx, message).await;
+    if !delivered {
+        tracing::error!("terminal compaction event was not delivered before runtime shutdown");
+    }
+    delivered
+}
+
+fn spawn_compaction_terminal_event(
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+    event_tx: asupersync::channel::mpsc::Sender<PiMsg>,
+    message: PiMsg,
+) {
+    if let Err(err) = runtime_handle.try_spawn_with_cx(move |completion_cx| async move {
+        deliver_compaction_terminal_event(&event_tx, &completion_cx, message).await;
+    }) {
+        tracing::error!(
+            error = %err,
+            "terminal compaction event could not be admitted by the runtime"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionPersistenceOutcome {
+    Confirmed,
+    Disabled,
+    ReconciledButUnconfirmed,
+}
+
+impl CompactionPersistenceOutcome {
+    const fn may_emit_success_event(self) -> bool {
+        matches!(self, Self::Confirmed | Self::Disabled)
+    }
+}
+
+#[derive(Debug)]
+struct CompactionSessionCommit {
+    messages_for_agent: Vec<Message>,
+    messages_for_ui: Vec<ConversationMessage>,
+    usage: Usage,
+    compaction_entry: CompactionEntry,
+    persistence: CompactionPersistenceOutcome,
+}
+
+async fn confirm_exact_compaction_after_save_error(
+    candidate: &Session,
+    entry_id: &str,
+    expected_entry: &[u8],
+) -> Option<()> {
+    let path = candidate.path.as_ref()?;
+    let (reopened, diagnostics) = Session::open_with_diagnostics(
+        path.to_string_lossy().as_ref(),
+    )
+    .await
+    .ok()?;
+    if !diagnostics.skipped_entries.is_empty()
+        || !diagnostics.orphaned_parent_links.is_empty()
+    {
+        return None;
+    }
+    if reopened.header.id != candidate.header.id || reopened.leaf_id() != Some(entry_id) {
+        return None;
+    }
+    if serde_json::to_vec(&reopened.header).ok()? != serde_json::to_vec(&candidate.header).ok()?
+        || serde_json::to_vec(&reopened.entries).ok()?
+            != serde_json::to_vec(&candidate.entries).ok()?
+    {
+        return None;
+    }
+    let reopened_entry = reopened.get_entry(entry_id)?;
+    if serde_json::to_vec(reopened_entry).ok()?.as_slice() != expected_entry {
+        return None;
+    }
+    Some(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_and_commit_compaction_session(
+    session: Arc<Mutex<Session>>,
+    expected_session_id: &str,
+    expected_leaf_id: Option<&str>,
+    summary: String,
+    first_kept_entry_id: String,
+    tokens_before: u64,
+    details: Option<Value>,
+    from_hook: Option<bool>,
+    save_enabled: bool,
+    cx: &Cx,
+) -> crate::error::Result<CompactionSessionCommit> {
+    let mut live = OwnedMutexGuard::lock(session, cx)
+        .await
+        .map_err(|err| crate::error::Error::session(err.to_string()))?;
+    if live.header.id != expected_session_id || live.leaf_id() != expected_leaf_id {
+        return Err(crate::error::Error::session(
+            "Session changed while compaction was running; compaction was not applied".to_string(),
+        ));
+    }
+
+    let mut candidate = live.clone();
+    let entry_id = candidate.append_compaction(
+        summary,
+        first_kept_entry_id,
+        tokens_before,
+        details,
+        from_hook,
+    );
+    let compaction_entry = candidate
+        .get_entry(&entry_id)
+        .and_then(|entry| match entry {
+            SessionEntry::Compaction(compaction) => Some(compaction.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            crate::error::Error::session(
+                "Staged compaction entry disappeared before commit".to_string(),
+            )
+        })?;
+    let expected_entry = serde_json::to_vec(&SessionEntry::Compaction(compaction_entry.clone()))?;
+    let mut persistence = if save_enabled {
+        CompactionPersistenceOutcome::Confirmed
+    } else {
+        CompactionPersistenceOutcome::Disabled
+    };
+    if save_enabled {
+        if let Err(err) = candidate.save().await {
+            tracing::error!(
+                error = %err,
+                entry_id,
+                "compaction save failed; reconciling the exact operation against current disk state"
+            );
+            if confirm_exact_compaction_after_save_error(
+                &candidate,
+                &entry_id,
+                &expected_entry,
+            )
+            .await
+            .is_none()
+            {
+                return Err(crate::error::Error::session(
+                    "Compaction persistence was not confirmed, current disk state could not be reconciled, and the active in-memory session was left unchanged"
+                        .to_string(),
+                ));
+            }
+            persistence = CompactionPersistenceOutcome::ReconciledButUnconfirmed;
+        }
+    }
+
+    let messages_for_agent = candidate.to_messages_for_current_path();
+    let (messages_for_ui, usage) = conversation_from_session(&candidate);
+
+    *live = candidate;
+    Ok(CompactionSessionCommit {
+        messages_for_agent,
+        messages_for_ui,
+        usage,
+        compaction_entry,
+        persistence,
+    })
+}
 
 /// Safely convert `Duration::as_micros()` (u128) to u64 with saturation.
 #[inline]
@@ -1039,7 +1210,9 @@ impl PiApp {
         let agent = Arc::clone(&self.agent);
         let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
+        let completion_runtime_handle = runtime_handle.clone();
         let reserve_tokens = self.config.compaction_reserve_tokens();
+        let save_enabled = self.save_enabled;
         let keep_recent_tokens = if aggressive_mode {
             self.config.compaction_keep_recent_tokens() / 2
         } else {
@@ -1057,29 +1230,30 @@ impl PiApp {
         self.extension_compacting
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        runtime_handle.spawn(async move {
-            let cx = asupersync::Cx::for_request();
-
-            let path_entries = {
+        runtime_handle.spawn_with_cx(move |cx| async move {
+            let (path_entries, expected_session_id, expected_leaf_id) = {
                 let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
+                        spawn_compaction_terminal_event(
+                            &completion_runtime_handle,
+                            event_tx.clone(),
                             PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
+                        );
                         return;
                     }
                 };
                 guard.ensure_entry_ids();
-                guard
-                    .entries_for_current_path()
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
+                (
+                    guard
+                        .entries_for_current_path()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    guard.header.id.clone(),
+                    guard.leaf_id().map(str::to_string),
+                )
             };
 
             let settings = crate::compaction::ResolvedCompactionSettings {
@@ -1090,14 +1264,13 @@ impl PiApp {
             };
             let Some(prep) = crate::compaction::prepare_compaction(&path_entries, settings) else {
                 is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                spawn_compaction_terminal_event(
+                    &completion_runtime_handle,
+                    event_tx.clone(),
                     PiMsg::System(
                         "Nothing to compact (already compacted or too little history)".to_string(),
                     ),
-                )
-                .await;
+                );
                 return;
             };
 
@@ -1130,12 +1303,11 @@ impl PiApp {
 
             if before_outcome.cancel {
                 is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                spawn_compaction_terminal_event(
+                    &completion_runtime_handle,
+                    event_tx.clone(),
                     PiMsg::System("Compaction cancelled by extension".to_string()),
-                )
-                .await;
+                );
                 return;
             }
 
@@ -1164,12 +1336,11 @@ impl PiApp {
                         Ok(result) => result,
                         Err(err) => {
                             is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &cx,
+                            spawn_compaction_terminal_event(
+                                &completion_runtime_handle,
+                                event_tx.clone(),
                                 PiMsg::AgentError(format!("Compaction failed: {err}")),
-                            )
-                            .await;
+                            );
                             return;
                         }
                     };
@@ -1186,108 +1357,137 @@ impl PiApp {
                 };
 
             let summary_tokens_after = crate::compaction::estimate_text_tokens(&summary);
-            let (messages_for_agent, compaction_entry) = {
-                let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                let from_hook = if from_extension { Some(true) } else { None };
-                let entry_id = guard.append_compaction(
-                    summary,
-                    first_kept_entry_id,
-                    tokens_before,
-                    details,
-                    from_hook,
-                );
-                let _ = guard.save().await;
-                let compaction_entry = guard.get_entry(&entry_id).and_then(|entry| {
-                    if let crate::session::SessionEntry::Compaction(compaction) = entry {
-                        Some(compaction.clone())
+            // Provider/extension work can consume or cancel the original task
+            // context. Commit and terminal delivery therefore run in a fresh
+            // runtime child so already-incurred work still resolves to exactly
+            // one coherent Session/Agent/UI outcome.
+            let completion_is_compacting = Arc::clone(&is_compacting);
+            let fallback_event_tx = event_tx.clone();
+            let completion_spawn = completion_runtime_handle.try_spawn_with_cx(
+                move |completion_cx| async move {
+                    // Acquire every fallible live-state lock before persistence.
+                    // The staged helper either confirms/reconciles the exact
+                    // operation or leaves the active Session untouched;
+                    // installing the matching Agent transcript is then infallible.
+                    let mut agent_guard = match OwnedMutexGuard::lock(
+                        Arc::clone(&agent),
+                        &completion_cx,
+                    )
+                    .await
+                    {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            completion_is_compacting
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            deliver_compaction_terminal_event(
+                                &event_tx,
+                                &completion_cx,
+                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    let from_hook = if from_extension { Some(true) } else { None };
+                    let commit = match stage_and_commit_compaction_session(
+                        Arc::clone(&session),
+                        &expected_session_id,
+                        expected_leaf_id.as_deref(),
+                        summary,
+                        first_kept_entry_id,
+                        tokens_before,
+                        details,
+                        from_hook,
+                        save_enabled,
+                        &completion_cx,
+                    )
+                    .await
+                    {
+                        Ok(commit) => commit,
+                        Err(err) => {
+                            drop(agent_guard);
+                            completion_is_compacting
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            deliver_compaction_terminal_event(
+                                &event_tx,
+                                &completion_cx,
+                                PiMsg::AgentError(format!(
+                                    "Compaction could not be confirmed: {err}"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    let CompactionSessionCommit {
+                        messages_for_agent,
+                        messages_for_ui: messages,
+                        usage,
+                        compaction_entry,
+                        persistence,
+                    } = commit;
+                    agent_guard.replace_messages(messages_for_agent);
+                    drop(agent_guard);
+
+                    completion_is_compacting
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    let label = if shake_mode {
+                        "shake"
+                    } else if aggressive_mode {
+                        "aggressive"
                     } else {
-                        None
-                    }
-                });
-                (guard.to_messages_for_current_path(), compaction_entry)
-            };
-
-            {
-                let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                agent_guard.replace_messages(messages_for_agent);
-            }
-
-            let (messages, usage) = {
-                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                conversation_from_session(&guard)
-            };
-
-            is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-            let _ = crate::interactive::enqueue_pi_event(
-                &event_tx,
-                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                PiMsg::ConversationReset {
-                    messages,
-                    usage,
-                    status: Some({
-                        let label = if shake_mode {
-                            "shake"
-                        } else if aggressive_mode {
-                            "aggressive"
-                        } else {
-                            "summary"
-                        };
-                        format!(
+                        "summary"
+                    };
+                    let status = match persistence {
+                        CompactionPersistenceOutcome::Confirmed
+                        | CompactionPersistenceOutcome::Disabled => format!(
                             "Compaction complete ({label}: {tokens_before} → ~{summary_tokens_after} tokens in compacted span)"
-                        )
-                    }),
-                },
-            )
-            .await;
-
-            if let Some(manager) = extensions
-                && let Some(compaction_entry) = compaction_entry
-            {
-                let _ = manager
-                    .dispatch_event(
-                        crate::extensions::ExtensionEventName::SessionCompact,
-                        Some(json!({
-                            "compactionEntry": compaction_entry,
-                            "fromExtension": from_extension,
-                        })),
+                        ),
+                        CompactionPersistenceOutcome::ReconciledButUnconfirmed => format!(
+                            "Persistence warning: compaction is present in the current disk and active session state, but final durability was not confirmed ({label}: {tokens_before} → ~{summary_tokens_after} tokens)"
+                        ),
+                    };
+                    let delivered = deliver_compaction_terminal_event(
+                        &event_tx,
+                        &completion_cx,
+                        PiMsg::ConversationReset {
+                            messages,
+                            usage,
+                            status: Some(status),
+                        },
                     )
                     .await;
+
+                    if delivered
+                        && persistence.may_emit_success_event()
+                        && let Some(manager) = extensions
+                    {
+                        let _ = manager
+                            .dispatch_event(
+                                crate::extensions::ExtensionEventName::SessionCompact,
+                                Some(json!({
+                                    "compactionEntry": compaction_entry,
+                                    "fromExtension": from_extension,
+                                })),
+                            )
+                            .await;
+                    }
+                },
+            );
+            if let Err(err) = completion_spawn {
+                is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    error = %err,
+                    "compaction completion could not be admitted by the runtime"
+                );
+                deliver_compaction_terminal_event(
+                    &fallback_event_tx,
+                    &cx,
+                    PiMsg::AgentError(
+                        "Compaction completion could not be admitted by the runtime".to_string(),
+                    ),
+                )
+                .await;
             }
         });
         None
@@ -1583,10 +1783,330 @@ impl RenderBuffers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interactive::state::{ConversationMessage, MessageRole};
+    use crate::interactive::state::MessageRole;
+    use asupersync::runtime::RuntimeBuilder;
     use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    fn runtime() -> &'static asupersync::runtime::Runtime {
+        static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 4)
+                .build()
+                .expect("build runtime")
+        })
+    }
+
+    #[test]
+    fn compaction_terminal_event_waits_for_capacity_instead_of_being_dropped() {
+        let (event_tx, mut event_rx) = asupersync::channel::mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("occupy channel".to_string()))
+            .expect("fill event channel");
+        let runtime_handle = runtime().handle();
+        spawn_compaction_terminal_event(
+            &runtime_handle,
+            event_tx,
+            PiMsg::System("terminal compaction result".to_string()),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PiMsg::System(message)) if message == "occupy channel"
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match event_rx.try_recv() {
+                Ok(PiMsg::System(message)) if message == "terminal compaction result" => break,
+                Ok(other) => {
+                    panic!("unexpected event while awaiting compaction result: {other:?}")
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => {
+                    panic!("compaction result was not delivered after capacity freed: {err}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn staged_compaction_save_failure_leaves_live_session_exact() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let mut raw_session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path);
+        let expected_session_id = raw_session.header.id.clone();
+        let expected_leaf_id = raw_session.leaf_id().map(str::to_string);
+        let expected_entries =
+            serde_json::to_value(&raw_session.entries).expect("serialize entries");
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let error = runtime()
+            .block_on(stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                &expected_session_id,
+                expected_leaf_id.as_deref(),
+                "staged summary".to_string(),
+                "first-kept".to_string(),
+                42,
+                None,
+                None,
+                true,
+                &cx,
+            ))
+            .expect_err("directory session path must reject compaction save");
+        assert!(!error.to_string().is_empty());
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock unchanged session");
+            assert_eq!(guard.header.id, expected_session_id);
+            assert_eq!(guard.leaf_id(), expected_leaf_id.as_deref());
+            assert_eq!(
+                serde_json::to_value(&guard.entries).expect("serialize live entries"),
+                expected_entries
+            );
+            assert_eq!(guard.autosave_metrics().pending_mutations, 0);
+        });
+    }
+
+    #[test]
+    fn staged_compaction_rejects_stale_session_identity_before_mutation() {
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let cx = Cx::for_testing();
+        let error = runtime()
+            .block_on(stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                "replaced-session-id",
+                None,
+                "stale summary".to_string(),
+                "first-kept".to_string(),
+                1,
+                None,
+                None,
+                false,
+                &cx,
+            ))
+            .expect_err("stale compaction must fail closed");
+        assert!(error.to_string().contains("Session changed"));
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock rejected session");
+            assert!(guard.entries.is_empty());
+            assert!(guard.leaf_id().is_none());
+            assert_eq!(guard.autosave_metrics().pending_mutations, 0);
+        });
+    }
+
+    #[test]
+    fn staged_compaction_rejects_stale_leaf_before_mutation() {
+        let mut raw_session = Session::in_memory();
+        let session_id = raw_session.header.id.clone();
+        let live_leaf = raw_session.append_message(crate::session::SessionMessage::User {
+            content: crate::model::UserContent::Text("new live turn".to_string()),
+            timestamp: Some(0),
+        });
+        let expected_entries =
+            serde_json::to_value(&raw_session.entries).expect("serialize entries");
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let error = runtime()
+            .block_on(stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                &session_id,
+                None,
+                "stale summary".to_string(),
+                "first-kept".to_string(),
+                1,
+                None,
+                None,
+                false,
+                &cx,
+            ))
+            .expect_err("stale leaf must fail closed");
+        assert!(error.to_string().contains("Session changed"));
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock rejected session");
+            assert_eq!(guard.leaf_id(), Some(live_leaf.as_str()));
+            assert_eq!(
+                serde_json::to_value(&guard.entries).expect("serialize live entries"),
+                expected_entries
+            );
+            assert_eq!(guard.autosave_metrics().pending_mutations, 1);
+        });
+    }
+
+    #[test]
+    fn staged_compaction_with_saving_disabled_commits_only_in_memory() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_dir = temp.path().join("sessions");
+        let raw_session = Session::create_with_dir(Some(session_dir.clone()));
+        let expected_session_id = raw_session.header.id.clone();
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let commit = runtime()
+            .block_on(stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                &expected_session_id,
+                None,
+                "memory-only summary".to_string(),
+                "first-kept".to_string(),
+                7,
+                None,
+                Some(true),
+                false,
+                &cx,
+            ))
+            .expect("memory-only compaction");
+        assert_eq!(commit.compaction_entry.summary, "memory-only summary");
+        assert_eq!(commit.persistence, CompactionPersistenceOutcome::Disabled);
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock memory-only session");
+            assert!(guard.path.is_none());
+            assert!(matches!(
+                guard.entries.as_slice(),
+                [SessionEntry::Compaction(entry)] if entry.summary == "memory-only summary"
+            ));
+            assert_eq!(guard.autosave_metrics().pending_mutations, 1);
+        });
+        assert!(
+            !session_dir.exists(),
+            "--no-session compaction must not create durable state"
+        );
+    }
+
+    #[test]
+    fn staged_compaction_success_reopens_committed_entry() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp.path().join("sessions"),
+        ))));
+        let cx = Cx::for_testing();
+        let expected_session_id = runtime().block_on(async {
+            OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock new session")
+                .header
+                .id
+                .clone()
+        });
+
+        let persisted_path = runtime().block_on(async {
+            let commit = stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                &expected_session_id,
+                None,
+                "durable summary".to_string(),
+                "first-kept".to_string(),
+                99,
+                None,
+                None,
+                true,
+                &cx,
+            )
+            .await
+            .expect("durable compaction");
+            assert_eq!(commit.persistence, CompactionPersistenceOutcome::Confirmed);
+            OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock saved session")
+                .path
+                .clone()
+                .expect("saved path")
+        });
+
+        let reopened = runtime()
+            .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
+            .expect("reopen compacted session");
+        assert!(matches!(
+            reopened.entries.as_slice(),
+            [SessionEntry::Compaction(entry)] if entry.summary == "durable summary"
+        ));
+    }
+
+    #[test]
+    fn post_error_reconciliation_requires_exact_compaction_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut candidate = Session::create_with_dir(Some(temp.path().join("sessions")));
+        runtime()
+            .block_on(candidate.save())
+            .expect("persist baseline session");
+
+        let entry_id = candidate.append_compaction(
+            "durable despite terminal error".to_string(),
+            "first-kept".to_string(),
+            11,
+            None,
+            None,
+        );
+        let expected_entry = serde_json::to_vec(
+            candidate
+                .get_entry(&entry_id)
+                .expect("staged compaction entry"),
+        )
+        .expect("serialize compaction entry");
+        runtime()
+            .block_on(candidate.save())
+            .expect("persist simulated post-write state");
+
+        assert!(
+            runtime()
+                .block_on(confirm_exact_compaction_after_save_error(
+                    &candidate,
+                    &entry_id,
+                    &expected_entry,
+                ))
+                .is_some(),
+            "exact durable operation should reconcile"
+        );
+
+        let mut wrong_surrounding_state = candidate.clone();
+        wrong_surrounding_state.header.cwd.push_str("-different");
+        assert!(
+            runtime()
+                .block_on(confirm_exact_compaction_after_save_error(
+                    &wrong_surrounding_state,
+                    &entry_id,
+                    &expected_entry,
+                ))
+                .is_none(),
+            "reconciliation must reject a matching operation on mismatched session state"
+        );
+
+        let mut wrong_entry = expected_entry;
+        wrong_entry.push(b' ');
+        assert!(
+            runtime()
+                .block_on(confirm_exact_compaction_after_save_error(
+                    &candidate,
+                    &entry_id,
+                    &wrong_entry,
+                ))
+                .is_none(),
+            "reconciliation must reject a mismatched operation payload"
+        );
+    }
 
     // ========================================================================
     // FrameTimingStats unit tests (PERF-3)

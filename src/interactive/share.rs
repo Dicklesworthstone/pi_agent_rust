@@ -132,10 +132,8 @@ impl ShareProcess {
         let _ = self.child.take();
         self.stop_readers();
         let drain_deadline = Instant::now() + SHARE_PIPE_DRAIN_TIMEOUT;
-        let stdout_result =
-            Self::join_reader(self.stdout_reader.take(), "stdout", drain_deadline);
-        let stderr_result =
-            Self::join_reader(self.stderr_reader.take(), "stderr", drain_deadline);
+        let stdout_result = Self::join_reader(self.stdout_reader.take(), "stdout", drain_deadline);
+        let stderr_result = Self::join_reader(self.stderr_reader.take(), "stderr", drain_deadline);
         let mut stdout = stdout_result?;
         let mut stderr = stderr_result?;
         let max_bytes = share_command_output_max_bytes_usize();
@@ -244,8 +242,7 @@ async fn run_command_output_with_timeout(
         ));
     }
 
-    let (mut child, launch_guard) =
-        crate::tools::command_with_job_gate_in_dir(program, args, cwd)?;
+    let (mut child, launch_guard) = crate::tools::command_with_job_gate_in_dir(program, args, cwd)?;
     child
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -394,13 +391,19 @@ pub(super) fn format_command_output(output: &ShareCommandOutput) -> String {
         if !stdout.is_empty() {
             stdout.push('\n');
         }
-        let _ = write!(stdout, "[stdout omitted after exceeding {SHARE_COMMAND_OUTPUT_MAX_BYTES} bytes]");
+        let _ = write!(
+            stdout,
+            "[stdout omitted after exceeding {SHARE_COMMAND_OUTPUT_MAX_BYTES} bytes]"
+        );
     }
     if output.stderr_truncated {
         if !stderr.is_empty() {
             stderr.push('\n');
         }
-        let _ = write!(stderr, "[stderr omitted after exceeding {SHARE_COMMAND_OUTPUT_MAX_BYTES} bytes]");
+        let _ = write!(
+            stderr,
+            "[stderr omitted after exceeding {SHARE_COMMAND_OUTPUT_MAX_BYTES} bytes]"
+        );
     }
     match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => "(no output)".to_string(),
@@ -581,9 +584,7 @@ mod tests {
 
     #[test]
     fn parse_gist_url_rejects_query_fragment_and_credentials() {
-        assert!(
-            parse_gist_url_and_id("https://gist.github.com/octocat/aaa111?secret=1").is_none()
-        );
+        assert!(parse_gist_url_and_id("https://gist.github.com/octocat/aaa111?secret=1").is_none());
         assert!(parse_gist_url_and_id("https://gist.github.com/octocat/aaa111#raw").is_none());
         assert!(
             parse_gist_url_and_id("https://user:pass@gist.github.com/octocat/aaa111").is_none()
@@ -687,10 +688,8 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let temp = tempfile::tempdir().expect("tempdir");
             let marker = temp.path().join("leaked");
-            let script = write_executable_script(
-                temp.path(),
-                "(sleep 1; printf leaked > \"$1\") &\nexit 0",
-            );
+            let script =
+                write_executable_script(temp.path(), "(sleep 1; printf leaked > \"$1\") &\nexit 0");
             let (_abort_handle, abort_signal) = crate::agent::AbortHandle::new();
             let output = run_command_output_with_timeout(
                 script.to_str().expect("utf8 script path"),
@@ -865,11 +864,17 @@ mod tests {
     fn share_snapshot_fails_fast_while_session_is_busy() {
         let session = Arc::new(Mutex::new(Session::in_memory()));
         let held = session.try_lock().expect("hold session lock");
-        assert!(capture_share_snapshot(&session).expect("busy result").is_none());
+        assert!(
+            capture_share_snapshot(&session)
+                .expect("busy result")
+                .is_none()
+        );
         drop(held);
-        assert!(capture_share_snapshot(&session)
-            .expect("share result")
-            .is_some());
+        assert!(
+            capture_share_snapshot(&session)
+                .expect("share result")
+                .is_some()
+        );
     }
 }
 

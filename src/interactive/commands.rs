@@ -11,6 +11,162 @@ use crate::provider_metadata::{
 #[cfg(feature = "clipboard")]
 use arboard::Clipboard as ArboardClipboard;
 
+const BASH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExcludedBashPersistenceOutcome {
+    Saved,
+    Disabled,
+    NotConfirmed {
+        pending_mutations: Option<usize>,
+        failed_flushes: Option<u64>,
+    },
+}
+
+impl ExcludedBashPersistenceOutcome {
+    fn warning_text(self) -> Option<String> {
+        let Self::NotConfirmed {
+            pending_mutations,
+            failed_flushes,
+        } = self
+        else {
+            return None;
+        };
+
+        let pending = pending_mutations.map_or_else(
+            || "unavailable".to_string(),
+            |count| count.to_string(),
+        );
+        let failed = failed_flushes.map_or_else(
+            || "unavailable".to_string(),
+            |count| count.to_string(),
+        );
+        Some(format!(
+            "[Persistence warning]\n\
+- Execution ended and may have performed side effects; do not rerun it to repair this save problem.\n\
+- Session record: not confirmed saved.\n\
+- Pending mutation slots (bounded/coalescing): {pending}\n\
+- Total failed save attempts: {failed}"
+        ))
+    }
+}
+
+async fn persist_excluded_bash_execution(
+    session: Arc<Mutex<Session>>,
+    message: SessionMessage,
+    save_enabled: bool,
+    cx: &Cx,
+) -> ExcludedBashPersistenceOutcome {
+    let mut session_guard = match OwnedMutexGuard::lock(session, cx).await {
+        Ok(guard) => guard,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "completed excluded-context bash command could not lock its session for recording"
+            );
+            return ExcludedBashPersistenceOutcome::NotConfirmed {
+                pending_mutations: None,
+                failed_flushes: None,
+            };
+        }
+    };
+
+    session_guard.append_message(message);
+    if !save_enabled {
+        return ExcludedBashPersistenceOutcome::Disabled;
+    }
+
+    if let Err(err) = session_guard.save().await {
+        let metrics = session_guard.autosave_metrics();
+        tracing::error!(
+            error = %err,
+            pending_mutations = metrics.pending_mutations,
+            failed_flushes = metrics.flush_failed,
+            "completed excluded-context bash command was retained in memory but its session save was not confirmed"
+        );
+        return ExcludedBashPersistenceOutcome::NotConfirmed {
+            pending_mutations: Some(metrics.pending_mutations),
+            failed_flushes: Some(metrics.flush_failed),
+        };
+    }
+
+    ExcludedBashPersistenceOutcome::Saved
+}
+
+async fn persist_excluded_bash_execution_bounded(
+    session: Arc<Mutex<Session>>,
+    message: SessionMessage,
+    save_enabled: bool,
+    cx: &Cx,
+) -> ExcludedBashPersistenceOutcome {
+    match asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        BASH_COMPLETION_TIMEOUT,
+        persist_excluded_bash_execution(session, message, save_enabled, cx),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::error!(
+                "completed excluded-context bash command exceeded its persistence cleanup budget"
+            );
+            ExcludedBashPersistenceOutcome::NotConfirmed {
+                pending_mutations: None,
+                failed_flushes: None,
+            }
+        }
+    }
+}
+
+async fn deliver_bash_result(
+    event_tx: &asupersync::channel::mpsc::Sender<PiMsg>,
+    cx: &Cx,
+    message: PiMsg,
+) {
+    if !crate::interactive::enqueue_pi_event(event_tx, cx, message).await {
+        tracing::error!("terminal bash result was not delivered before runtime shutdown");
+    }
+}
+
+fn spawn_bash_completion(
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+    event_tx: asupersync::channel::mpsc::Sender<PiMsg>,
+    persistence: Option<(Arc<Mutex<Session>>, SessionMessage, bool)>,
+    mut display: String,
+    content_for_agent: Option<Vec<ContentBlock>>,
+) {
+    if let Err(err) = runtime_handle.try_spawn_with_cx(move |completion_cx| async move {
+        if let Some((session, message, save_enabled)) = persistence {
+            let persistence = persist_excluded_bash_execution_bounded(
+                session,
+                message,
+                save_enabled,
+                &completion_cx,
+            )
+            .await;
+            if let Some(warning) = persistence.warning_text() {
+                display.push_str("\n\n");
+                display.push_str(&warning);
+            }
+        }
+        deliver_bash_result(
+            &event_tx,
+            &completion_cx,
+            PiMsg::BashResult {
+                display,
+                content_for_agent,
+            },
+        )
+        .await;
+    }) {
+        tracing::error!(
+            error = %err,
+            "terminal bash completion could not be admitted by the runtime"
+        );
+    }
+}
+
 /// Available slash commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -1506,9 +1662,9 @@ impl PiApp {
         let command_prefix = self.config.shell_command_prefix.clone();
         let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+        let completion_runtime_handle = runtime_handle.clone();
 
-        runtime_handle.spawn(async move {
+        runtime_handle.spawn_with_cx(move |_command_cx| async move {
             let mut override_result = None;
             if let Some(manager) = extensions {
                 let response = manager
@@ -1542,7 +1698,6 @@ impl PiApp {
                     .await
                 }
             };
-
             match result {
                 Ok(result) => {
                     let display = bash_execution_to_text(
@@ -1569,53 +1724,35 @@ impl PiApp {
                             extra,
                         };
 
-                        // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9)
-                        // and this future is spawned, so the guard held across
-                        // `save().await` must itself be `Send`.
-                        if let Ok(mut session_guard) =
-                            OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                        {
-                            session_guard.append_message(bash_message);
-                            if save_enabled {
-                                let _ = session_guard.save().await;
-                            }
-                        }
-
                         let mut display = display;
                         display.push_str("\n\n[Output excluded from model context]");
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::BashResult {
-                                display,
-                                content_for_agent: None,
-                            },
-                        )
-                        .await;
+                        spawn_bash_completion(
+                            &completion_runtime_handle,
+                            event_tx.clone(),
+                            Some((Arc::clone(&session), bash_message, save_enabled)),
+                            display,
+                            None,
+                        );
                     } else {
                         let content_for_agent =
                             vec![ContentBlock::Text(TextContent::new(display.clone()))];
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::BashResult {
-                                display,
-                                content_for_agent: Some(content_for_agent),
-                            },
-                        )
-                        .await;
+                        spawn_bash_completion(
+                            &completion_runtime_handle,
+                            event_tx.clone(),
+                            None,
+                            display,
+                            Some(content_for_agent),
+                        );
                     }
                 }
                 Err(err) => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::BashResult {
-                            display: format!("Bash command failed: {err}"),
-                            content_for_agent: None,
-                        },
-                    )
-                    .await;
+                    spawn_bash_completion(
+                        &completion_runtime_handle,
+                        event_tx,
+                        None,
+                        format!("Bash command failed: {err}"),
+                        None,
+                    );
                 }
             }
         });
@@ -4400,12 +4537,497 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bash_command, parse_extension_command, should_show_startup_oauth_hint};
+    use super::{
+        ExcludedBashPersistenceOutcome, PiMsg, parse_bash_command, parse_extension_command,
+        persist_excluded_bash_execution, should_show_startup_oauth_hint, spawn_bash_completion,
+    };
+    #[cfg(unix)]
+    use super::PiApp;
+    #[cfg(unix)]
+    use crate::agent::{Agent, AgentConfig};
     use crate::auth::{AuthCredential, AuthStorage};
+    #[cfg(unix)]
+    use crate::config::Config;
+    #[cfg(unix)]
+    use crate::keybindings::KeyBindings;
+    #[cfg(unix)]
+    use crate::model::{StreamEvent, Usage};
     use crate::models::ModelEntry;
     use crate::provider::{InputType, Model, ModelCost};
+    #[cfg(unix)]
+    use crate::provider::{Context, Provider, StreamOptions};
+    #[cfg(unix)]
+    use crate::resources::{ResourceCliOptions, ResourceLoader};
+    use crate::session::{Session, SessionEntry, SessionMessage};
+    #[cfg(unix)]
+    use crate::tools::ToolRegistry;
+    use asupersync::Cx;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::sync::{Mutex, OwnedMutexGuard};
+    #[cfg(unix)]
+    use futures::stream;
     use std::collections::{HashMap, HashSet};
+    #[cfg(unix)]
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::pin::Pin;
+    use std::sync::{Arc, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+
+    #[cfg(unix)]
+    struct DummyProvider;
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl Provider for DummyProvider {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn api(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "dummy-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn runtime() -> &'static asupersync::runtime::Runtime {
+        static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 4)
+                .build()
+                .expect("build runtime")
+        })
+    }
+
+    fn excluded_bash_message(command: &str) -> SessionMessage {
+        SessionMessage::BashExecution {
+            command: command.to_string(),
+            output: "side effect completed".to_string(),
+            exit_code: 0,
+            cancelled: Some(false),
+            truncated: Some(false),
+            full_output_path: None,
+            timestamp: None,
+            extra: HashMap::from([(
+                "excludeFromContext".to_string(),
+                serde_json::Value::Bool(true),
+            )]),
+        }
+    }
+
+    fn assert_exact_excluded_bash_record(
+        session: &Session,
+        expected_command: &str,
+        expected_output: &str,
+        expected_timestamp_range: Option<std::ops::RangeInclusive<i64>>,
+    ) {
+        let records = session
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message(message) => match &message.message {
+                    SessionMessage::BashExecution {
+                        command,
+                        output,
+                        exit_code,
+                        cancelled,
+                        truncated,
+                        full_output_path,
+                        timestamp,
+                        extra,
+                    } => Some((
+                        command,
+                        output,
+                        exit_code,
+                        cancelled,
+                        truncated,
+                        full_output_path,
+                        timestamp,
+                        extra,
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "exactly one bash record must exist");
+        let (
+            command,
+            output,
+            exit_code,
+            cancelled,
+            truncated,
+            full_output_path,
+            timestamp,
+            extra,
+        ) = records[0];
+        assert_eq!(command, expected_command);
+        assert_eq!(output, expected_output);
+        assert_eq!(*exit_code, 0);
+        assert_eq!(*cancelled, Some(false));
+        assert_eq!(*truncated, Some(false));
+        assert!(full_output_path.is_none());
+        match expected_timestamp_range {
+            Some(range) => assert!(
+                timestamp.as_ref().is_some_and(|value| range.contains(value)),
+                "bash timestamp {timestamp:?} must fall inside the submission window {range:?}"
+            ),
+            None => assert!(timestamp.is_none()),
+        }
+        assert_eq!(
+            extra,
+            &HashMap::from([(
+                "excludeFromContext".to_string(),
+                serde_json::Value::Bool(true),
+            )])
+        );
+    }
+
+    #[test]
+    fn excluded_bash_persistence_success_reopens_exact_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp.path().join("sessions"),
+        ))));
+        let cx = Cx::for_testing();
+
+        let persisted_path = runtime().block_on(async {
+            let outcome = persist_excluded_bash_execution(
+                Arc::clone(&session),
+                excluded_bash_message("create-once"),
+                true,
+                &cx,
+            )
+            .await;
+            assert_eq!(outcome, ExcludedBashPersistenceOutcome::Saved);
+
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock saved session");
+            guard.path.clone().expect("saved session path")
+        });
+
+        let reopened = runtime()
+            .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
+            .expect("reopen saved session");
+        assert_exact_excluded_bash_record(
+            &reopened,
+            "create-once",
+            "side effect completed",
+            None,
+        );
+    }
+
+    #[test]
+    fn excluded_bash_save_failure_preserves_result_and_warns_against_rerun() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let mut raw_session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path.clone());
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let outcome = runtime().block_on(persist_excluded_bash_execution(
+            Arc::clone(&session),
+            excluded_bash_message("charge-card-once"),
+            true,
+            &cx,
+        ));
+        assert_eq!(
+            outcome,
+            ExcludedBashPersistenceOutcome::NotConfirmed {
+                pending_mutations: Some(1),
+                failed_flushes: Some(1),
+            }
+        );
+
+        let warning = outcome.warning_text().expect("persistence warning");
+        assert!(warning.contains("Execution ended and may have performed side effects"));
+        assert!(warning.contains("do not rerun"));
+        assert!(warning.contains("Pending mutation slots (bounded/coalescing): 1"));
+        assert!(warning.contains("Total failed save attempts: 1"));
+        assert!(
+            !warning.contains(blocked_path.to_string_lossy().as_ref()),
+            "user-facing warning should not leak storage paths"
+        );
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock failed-save session");
+            assert_exact_excluded_bash_record(
+                &guard,
+                "charge-card-once",
+                "side effect completed",
+                None,
+            );
+            let metrics = guard.autosave_metrics();
+            assert_eq!(metrics.pending_mutations, 1);
+            assert_eq!(metrics.flush_failed, 1);
+        });
+    }
+
+    #[test]
+    fn excluded_bash_completion_survives_cancelled_command_context() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let mut raw_session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path);
+        let session = Arc::new(Mutex::new(raw_session));
+        let (event_tx, mut event_rx) = asupersync::channel::mpsc::channel(4);
+        let command_runtime_handle = runtime().handle();
+        let completion_runtime_handle = command_runtime_handle.clone();
+        let session_for_task = Arc::clone(&session);
+
+        command_runtime_handle.spawn_with_cx(move |command_cx| async move {
+            command_cx.set_cancel_requested(true);
+            spawn_bash_completion(
+                &completion_runtime_handle,
+                event_tx,
+                Some((
+                    session_for_task,
+                    excluded_bash_message("side-effect-before-cancellation"),
+                    true,
+                )),
+                "side effect completed\n\n[Output excluded from model context]".to_string(),
+                None,
+            );
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            match event_rx.try_recv() {
+                Ok(message @ PiMsg::BashResult { .. }) => break message,
+                Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(other) => panic!("unexpected event after bash deadline: {other:?}"),
+                Err(err) => panic!("bash completion was not delivered before deadline: {err}"),
+            }
+        };
+        let PiMsg::BashResult {
+            display,
+            content_for_agent,
+        } = result
+        else {
+            unreachable!("loop only exits with BashResult")
+        };
+        assert!(display.contains("side effect completed"));
+        assert!(display.contains("[Persistence warning]"));
+        assert!(display.contains("do not rerun"));
+        assert!(content_for_agent.is_none());
+
+        let cx = Cx::for_testing();
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock completion session");
+            assert_exact_excluded_bash_record(
+                &guard,
+                "side-effect-before-cancellation",
+                "side effect completed",
+                None,
+            );
+            assert_eq!(guard.autosave_metrics().pending_mutations, 1);
+            assert_eq!(guard.autosave_metrics().flush_failed, 1);
+        });
+    }
+
+    #[test]
+    fn bash_completion_waits_for_event_capacity_instead_of_dropping_terminal_result() {
+        let (event_tx, mut event_rx) = asupersync::channel::mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("occupy channel".to_string()))
+            .expect("fill event channel");
+        let runtime_handle = runtime().handle();
+        spawn_bash_completion(
+            &runtime_handle,
+            event_tx,
+            None,
+            "terminal bash result".to_string(),
+            None,
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PiMsg::System(message)) if message == "occupy channel"
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match event_rx.try_recv() {
+                Ok(PiMsg::BashResult {
+                    display,
+                    content_for_agent,
+                }) => {
+                    assert_eq!(display, "terminal bash result");
+                    assert!(content_for_agent.is_none());
+                    break;
+                }
+                Ok(other) => panic!("unexpected event while awaiting bash result: {other:?}"),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("bash result was not delivered after capacity freed: {err}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn build_bash_test_app(
+        session: Arc<Mutex<Session>>,
+        cwd: &Path,
+    ) -> (PiApp, asupersync::channel::mpsc::Receiver<PiMsg>) {
+        let current = test_model_entry("dummy", "dummy-model");
+        let agent = Agent::new(
+            Arc::new(DummyProvider),
+            ToolRegistry::new(&[], cwd, None),
+            AgentConfig::default(),
+        );
+        let resources = ResourceLoader::empty(false);
+        let resource_cli = ResourceCliOptions {
+            no_skills: false,
+            no_prompt_templates: false,
+            no_extensions: false,
+            no_themes: false,
+            skill_paths: Vec::new(),
+            prompt_paths: Vec::new(),
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        let (event_tx, event_rx) = asupersync::channel::mpsc::channel(64);
+        let config = Config {
+            last_changelog_version: Some(crate::platform::VERSION.to_string()),
+            ..Config::default()
+        };
+        let app = PiApp::new(
+            agent,
+            session,
+            config,
+            resources,
+            resource_cli,
+            cwd.to_path_buf(),
+            current.clone(),
+            Vec::new(),
+            vec![current],
+            None,
+            Vec::new(),
+            event_tx,
+            runtime().handle(),
+            true,
+            false,
+            None,
+            Some(KeyBindings::new()),
+            Vec::new(),
+            Usage::default(),
+            None,
+        );
+        (app, event_rx)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_bash_production_path_ignores_cancelled_ambient_context_during_cleanup() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let mut raw_session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path.clone());
+        let session = Arc::new(Mutex::new(raw_session));
+        let (mut app, mut event_rx) = build_bash_test_app(Arc::clone(&session), temp.path());
+
+        let cancelled_ambient = Cx::for_testing();
+        cancelled_ambient.set_cancel_requested(true);
+        let _current_cx = Cx::set_current(Some(cancelled_ambient));
+
+        let command = "printf side-effect-output";
+        let submitted_at = chrono::Utc::now().timestamp_millis();
+        let _ = app.submit_bash_command(
+            &format!("! {command}"),
+            command.to_string(),
+            true,
+        );
+        assert!(
+            app.bash_running,
+            "command should be marked running until its result is handled"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result_message = loop {
+            match event_rx.try_recv() {
+                Ok(message @ PiMsg::BashResult { .. }) => break message,
+                Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(other) => panic!("unexpected event after bash deadline: {other:?}"),
+                Err(err) => panic!("bash result was not delivered before deadline: {err}"),
+            }
+        };
+
+        let PiMsg::BashResult {
+            display,
+            content_for_agent,
+        } = &result_message
+        else {
+            unreachable!("loop only exits with BashResult")
+        };
+        assert!(display.contains("side-effect-output"));
+        assert!(display.contains("[Output excluded from model context]"));
+        assert!(display.contains("[Persistence warning]"));
+        assert!(display.contains("do not rerun"));
+        assert!(content_for_agent.is_none());
+        let delivered_at = chrono::Utc::now().timestamp_millis();
+        assert!(
+            !display.contains(blocked_path.to_string_lossy().as_ref()),
+            "user-facing result should not leak storage paths"
+        );
+
+        let _ = app.handle_pi_message(result_message);
+        assert!(
+            !app.bash_running,
+            "handling the terminal result must clear running state"
+        );
+        let visible = app.messages.last().expect("visible bash result");
+        assert!(visible.content.contains("side-effect-output"));
+        assert!(visible.content.contains("[Persistence warning]"));
+
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock production session");
+            assert_exact_excluded_bash_record(
+                &guard,
+                command,
+                "side-effect-output",
+                Some(submitted_at..=delivered_at),
+            );
+            let metrics = guard.autosave_metrics();
+            assert_eq!(metrics.pending_mutations, 1);
+            assert_eq!(metrics.flush_failed, 1);
+        });
+    }
 
     fn empty_auth_storage() -> AuthStorage {
         let nonce = SystemTime::now()

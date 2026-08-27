@@ -8,11 +8,12 @@
 //! - Stdio fixture lifecycle (feature `internal-mcp-fixture`): trust →
 //!   mount → `mcp__fixture__echo` round-trips through a `ToolRegistry`,
 //!   env-allowlist proof via `env_probe`, stderr capture, crash → bounded
-//!   restart with backoff → recovery.
+//!   restart with delivery-safe recovery.
 //!
-//! The env-allowlist proof is strongest under `scripts/e2e/run_mcp.sh`,
-//! which exports `PI_MCP_SECRET_MARKER` before the run (the crate forbids
-//! unsafe, so tests never mutate process env themselves).
+//! The env-allowlist test relaunches its own test process with a guaranteed
+//! ambient secret marker, avoiding unsafe process-environment mutation while
+//! ensuring the negative assertion is mutation-sensitive in every runner.
+//! No-Claim: the local fixture does not certify any third-party MCP server.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
 //! recorded as artifacts.
@@ -550,13 +551,84 @@ fn mcp_http_transport_sse_response() {
 #[cfg(feature = "internal-mcp-fixture")]
 mod fixture_lanes {
     use super::*;
+    use pi::mcp::transport::StdioTransport;
+    use std::io::Write as _;
 
     const FIXTURE_BIN: &str = env!("CARGO_BIN_EXE_pi_mcp_fixture");
+    const ENV_ALLOWLIST_CHILD_ATTESTATION: &str = "pi-mcp-env-allowlist-child-complete";
 
     fn fixture_manager(harness: &TestHarness, extra_env: &[(&str, &str)]) -> McpManager {
         let root = harness.temp_path(".");
         write_project_mcp_config(&root, "fixture", FIXTURE_BIN, extra_env);
         McpManager::bootstrap(&root, &harness.temp_path("global"), &[]).expect("bootstrap")
+    }
+
+    fn fixture_transport(harness: &TestHarness, extra_env: &[(&str, &str)]) -> StdioTransport {
+        let env: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        StdioTransport::spawn(FIXTURE_BIN, &[], &env, &harness.temp_path("."))
+            .expect("spawn stdio fixture")
+    }
+
+    fn wait_for_transport_diagnostics(
+        transport: &StdioTransport,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let tail = transport.diagnostics_tail();
+            if tail.contains(needle) || std::time::Instant::now() >= deadline {
+                return tail;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_manager_diagnostics(
+        manager: &McpManager,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let tail = manager.server_diagnostics("fixture").unwrap_or_default();
+            if tail.contains(needle) || std::time::Instant::now() >= deadline {
+                return tail;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let target = sysinfo::Pid::from_u32(pid);
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+            if system.process(target).is_none() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn fixture_descendant_pid(transport: &StdioTransport) -> u32 {
+        let tail = wait_for_transport_diagnostics(
+            transport,
+            "descendant pid=",
+            std::time::Duration::from_secs(1),
+        );
+        tail.split("descendant pid=")
+            .nth(1)
+            .and_then(|suffix| suffix.lines().next())
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .expect("descendant pid in fixture diagnostics")
     }
 
     #[test]
@@ -603,6 +675,250 @@ mod fixture_lanes {
     }
 
     #[test]
+    fn mcp_fixture_rejects_lsp_content_length_framing() {
+        let case = "mcp_fixture_rejects_lsp_content_length_framing";
+        let harness = TestHarness::new(case);
+        let mut child = std::process::Command::new(FIXTURE_BIN)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn raw fixture");
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let mut stdin = child.stdin.take().expect("fixture stdin");
+        write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write LSP header");
+        stdin.write_all(body).expect("write LSP body");
+        drop(stdin);
+        let output = child.wait_with_output().expect("wait for fixture rejection");
+        assert!(output.stdout.is_empty(), "fixture must not answer LSP framing");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("protocol input rejected"),
+            "fixture did not report rejecting LSP framing: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        finish_case(&harness, case);
+    }
+
+    #[test]
+    fn mcp_stdio_fixture_surfaces_malformed_oversize_eof_and_wrong_id() {
+        for (mode, expected_code) in [
+            ("malformed", "MCP_PROTOCOL"),
+            ("oversize", "MCP_PROTOCOL"),
+            ("eof", "MCP_TRANSPORT_CLOSED"),
+            ("wrong-id", "MCP_TRANSPORT_CLOSED"),
+        ] {
+            let case = format!("mcp_stdio_fixture_rejects_{mode}");
+            let harness = TestHarness::new(&case);
+            let manager = fixture_manager(
+                &harness,
+                &[("PI_MCP_FIXTURE_RESPONSE_MODE", mode)],
+            );
+            let error = block_on_local(manager.trust("fixture"))
+                .expect_err("hostile fixture response must fail connection");
+            assert!(
+                error.to_string().contains(expected_code),
+                "mode {mode} returned unexpected error: {error}"
+            );
+            finish_case(&harness, &case);
+        }
+    }
+
+    #[test]
+    fn mcp_stdio_timeout_sends_cancellation_and_aborts_connection() {
+        let case = "mcp_stdio_timeout_sends_cancellation_and_aborts_connection";
+        let harness = TestHarness::new(case);
+        let transport = fixture_transport(&harness, &[]);
+        let error = block_on_local(transport.request(
+            "fixture/await-cancellation",
+            json!({}),
+            std::time::Duration::from_millis(100),
+        ))
+        .expect_err("fixture deliberately withholds the response");
+        assert!(error.to_string().contains("MCP_TIMEOUT"), "{error}");
+        let tail = wait_for_transport_diagnostics(
+            &transport,
+            "observed cancellation",
+            std::time::Duration::from_secs(1),
+        );
+        assert!(
+            tail.contains("observed cancellation for pending request"),
+            "fixture did not observe MCP cancellation: {tail}"
+        );
+        assert!(!transport.is_alive(), "timed-out transport must be aborted");
+        finish_case(&harness, case);
+    }
+
+    #[test]
+    fn mcp_stdio_blocked_writer_timeout_reaps_descendant_tree() {
+        let case = "mcp_stdio_blocked_writer_timeout_reaps_descendant_tree";
+        let harness = TestHarness::new(case);
+        let transport = fixture_transport(
+            &harness,
+            &[
+                ("PI_MCP_FIXTURE_RESPONSE_MODE", "no-read"),
+                ("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1"),
+            ],
+        );
+        let descendant_pid = fixture_descendant_pid(&transport);
+
+        let started = std::time::Instant::now();
+        let error = block_on_local(transport.request(
+            "tools/call",
+            json!({ "blob": "x".repeat(2 * 1024 * 1024) }),
+            std::time::Duration::from_millis(100),
+        ))
+        .expect_err("non-reading server must time out");
+        assert!(error.to_string().contains("MCP_TIMEOUT"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "blocked pipe write escaped the request deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            wait_for_process_exit(descendant_pid, std::time::Duration::from_secs(2)),
+            "descendant process {descendant_pid} survived timeout tree cleanup"
+        );
+        finish_case(&harness, case);
+    }
+
+    #[test]
+    fn mcp_stdio_close_and_drop_reap_descendant_trees() {
+        let case = "mcp_stdio_close_and_drop_reap_descendant_trees";
+        let harness = TestHarness::new(case);
+
+        let closing = fixture_transport(
+            &harness,
+            &[("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1")],
+        );
+        let closing_descendant = fixture_descendant_pid(&closing);
+        block_on_local(closing.close());
+        assert!(
+            wait_for_process_exit(closing_descendant, std::time::Duration::from_secs(2)),
+            "descendant process {closing_descendant} survived graceful close"
+        );
+
+        let dropping = fixture_transport(
+            &harness,
+            &[
+                ("PI_MCP_FIXTURE_RESPONSE_MODE", "no-read"),
+                ("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1"),
+            ],
+        );
+        let dropping_descendant = fixture_descendant_pid(&dropping);
+        drop(dropping);
+        assert!(
+            wait_for_process_exit(dropping_descendant, std::time::Duration::from_secs(2)),
+            "descendant process {dropping_descendant} survived transport drop"
+        );
+        finish_case(&harness, case);
+    }
+
+    #[test]
+    fn mcp_stdio_dropped_request_and_close_futures_reap_descendant_trees() {
+        let case = "mcp_stdio_dropped_request_and_close_futures_reap_descendant_trees";
+        let harness = TestHarness::new(case);
+
+        let requesting = fixture_transport(
+            &harness,
+            &[("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1")],
+        );
+        let requesting_descendant = fixture_descendant_pid(&requesting);
+        block_on_local(async {
+            let request = Box::pin(requesting.request(
+                "fixture/await-cancellation",
+                json!({}),
+                std::time::Duration::MAX,
+            ));
+            let dispatched = Box::pin(async {
+                let tail = wait_for_transport_diagnostics(
+                    &requesting,
+                    "method=fixture/await-cancellation",
+                    std::time::Duration::from_secs(1),
+                );
+                assert!(
+                    tail.contains("method=fixture/await-cancellation"),
+                    "request was not dispatched before its future was dropped: {tail}"
+                );
+            });
+            match futures::future::select(request, dispatched).await {
+                futures::future::Either::Left((result, _)) => {
+                    panic!("fixture unexpectedly completed held request: {result:?}");
+                }
+                futures::future::Either::Right(((), pending_request)) => {
+                    drop(pending_request);
+                }
+            }
+        });
+        assert!(
+            wait_for_process_exit(
+                requesting_descendant,
+                std::time::Duration::from_secs(2),
+            ),
+            "descendant process {requesting_descendant} survived request-future cancellation"
+        );
+
+        let closing = fixture_transport(
+            &harness,
+            &[
+                ("PI_MCP_FIXTURE_RESPONSE_MODE", "no-read"),
+                ("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1"),
+            ],
+        );
+        let closing_descendant = fixture_descendant_pid(&closing);
+        block_on_local(async {
+            let close = Box::pin(closing.close());
+            let cx = pi::agent_cx::AgentCx::for_current_or_request();
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let observed_pending =
+                Box::pin(asupersync::time::sleep(now, std::time::Duration::from_millis(20)));
+            match futures::future::select(close, observed_pending).await {
+                futures::future::Either::Left(((), _)) => {
+                    panic!("close unexpectedly finished before its grace period");
+                }
+                futures::future::Either::Right(((), pending_close)) => {
+                    drop(pending_close);
+                }
+            }
+        });
+        assert!(
+            wait_for_process_exit(closing_descendant, std::time::Duration::from_secs(2)),
+            "descendant process {closing_descendant} survived close-future cancellation"
+        );
+        finish_case(&harness, case);
+    }
+
+    #[test]
+    fn mcp_stdio_dead_root_reaps_descendant_that_holds_output_open() {
+        let case = "mcp_stdio_dead_root_reaps_descendant_that_holds_output_open";
+        let harness = TestHarness::new(case);
+        let transport = fixture_transport(
+            &harness,
+            &[
+                ("PI_MCP_FIXTURE_RESPONSE_MODE", "root-exit"),
+                ("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1"),
+                ("PI_MCP_FIXTURE_DESCENDANT_INHERIT_OUTPUT", "1"),
+            ],
+        );
+        let descendant_pid = fixture_descendant_pid(&transport);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while transport.is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !transport.is_alive(),
+            "transport must observe the exited root even while a descendant holds its pipes open"
+        );
+        assert!(
+            wait_for_process_exit(descendant_pid, std::time::Duration::from_secs(2)),
+            "descendant process {descendant_pid} survived dead-root cleanup"
+        );
+        finish_case(&harness, case);
+    }
+
+    #[test]
     fn mcp_live_transport_rechecks_shared_denial() {
         let case = "mcp_live_transport_rechecks_shared_denial";
         let harness = TestHarness::new(case);
@@ -631,6 +947,29 @@ mod fixture_lanes {
 
     #[test]
     fn mcp_stdio_env_allowlist_proven() {
+        if std::env::var_os("PI_MCP_SECRET_MARKER").is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current integration-test executable"),
+            )
+            .arg("--exact")
+            .arg("fixture_lanes::mcp_stdio_env_allowlist_proven")
+            .arg("--nocapture")
+            .env("PI_MCP_SECRET_MARKER", "controlled-parent-secret")
+            .output()
+            .expect("launch controlled env-allowlist child test");
+            assert!(
+                output.status.success(),
+                "controlled env-allowlist child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(ENV_ALLOWLIST_CHILD_ATTESTATION),
+                "controlled child exited without executing the env-allowlist assertions"
+            );
+            return;
+        }
+
         let case = "mcp_stdio_env_allowlist_proven";
         let harness = TestHarness::new(case);
         let manager = fixture_manager(&harness, &[]);
@@ -642,38 +981,41 @@ mod fixture_lanes {
         harness.log().info("verify", format!("env_probe: {text}"));
         let report: Value = serde_json::from_str(&text).expect("env_probe JSON");
         assert_eq!(report["PATH"], true, "allowlisted PATH must pass through");
-        // The marker is only present when run_mcp.sh exports it; either way
-        // the fixture must never see it (allowlist has no secrets).
         assert_eq!(
             report["PI_MCP_SECRET_MARKER"], false,
             "ambient secret markers must not leak to servers"
         );
         assert_eq!(report["AWS_SECRET_ACCESS_KEY"], false);
         finish_case(&harness, case);
+        println!("{ENV_ALLOWLIST_CHILD_ATTESTATION}");
     }
 
     #[test]
-    fn mcp_stdio_crash_transparent_restart() {
-        let case = "mcp_stdio_crash_transparent_restart";
+    fn mcp_stdio_crash_reports_indeterminate_delivery_then_recovers() {
+        let case = "mcp_stdio_crash_reports_indeterminate_delivery_then_recovers";
         let harness = TestHarness::new(case);
         // Crash after request 3: initialize(1), tools/list(2), first echo(3)
-        // succeed; the second echo hits the dying process and is retried
-        // through an immediate transparent restart.
+        // succeed; the second echo hits the dying process. Pi reconnects, but
+        // must not replay a call whose delivery cannot be known.
         let manager = fixture_manager(&harness, &[("PI_MCP_FIXTURE_CRASH_AFTER", "3")]);
         block_on_local(manager.trust("fixture")).expect("trust");
 
         let first = block_on_local(manager.call_tool("fixture", "echo", json!({"text": "one"})))
             .expect("first echo works");
         let second = block_on_local(manager.call_tool("fixture", "echo", json!({"text": "two"})))
-            .expect("crash triggers a transparent restart");
+            .expect_err("ambiguous delivery must not be retried");
+        assert!(
+            second.to_string().contains("MCP_DELIVERY_INDETERMINATE"),
+            "{second}"
+        );
         let third = block_on_local(manager.call_tool("fixture", "echo", json!({"text": "three"})))
             .expect("fresh server keeps serving");
         harness.log().info(
             "verify",
             format!(
-                "sequence: one={} two={} three={}",
+                "sequence: one={} two_error={} three={}",
                 mcp_text(&first),
-                mcp_text(&second),
+                second,
                 mcp_text(&third)
             ),
         );
@@ -686,10 +1028,8 @@ mod fixture_lanes {
                 .map(str::to_string)
         };
         let pid1 = pid_of(&first).expect("pid in response");
-        let pid2 = pid_of(&second).expect("pid in response");
         let pid3 = pid_of(&third).expect("pid in response");
-        assert_ne!(pid1, pid2, "restart must produce a new process");
-        assert_eq!(pid2, pid3, "the restarted server keeps serving");
+        assert_ne!(pid1, pid3, "recovery must produce a new process");
         finish_case(&harness, case);
     }
 
@@ -755,9 +1095,11 @@ mod fixture_lanes {
         block_on_local(manager.trust("fixture")).expect("trust");
         // The fixture wrote its startup marker to stderr; the stdio
         // transport retains it for /mcp diagnostics.
-        let tail = manager
-            .server_diagnostics("fixture")
-            .expect("diagnostics for live server");
+        let tail = wait_for_manager_diagnostics(
+            &manager,
+            "7f3a9c-v2",
+            std::time::Duration::from_secs(1),
+        );
         harness.log().info("verify", format!("stderr tail: {tail}"));
         assert!(
             tail.contains("7f3a9c-v2"),
