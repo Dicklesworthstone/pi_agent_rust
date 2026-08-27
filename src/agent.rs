@@ -18258,6 +18258,88 @@ mod tests {
     }
 
     #[test]
+    fn session_compact_hook_can_reenter_provider_after_transition_install() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("compaction-reentry.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                import { complete } from "@mariozechner/pi-ai";
+
+                export default function init(pi) {
+                  pi.on("session_compact", async () => {
+                    await complete(
+                      { id: "capture-model" },
+                      [{ role: "user", content: "after compaction" }],
+                      { maxTokens: 16 }
+                    );
+                  });
+                }
+                "#,
+            )
+            .expect("write compaction extension");
+
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let provider = Arc::new(PiAiCaptureProvider {
+                calls: Arc::clone(&calls),
+            });
+            let tools = ToolRegistry::new(&[], temp_dir.path(), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable compaction extension");
+
+            let result = compaction::CompactionResult {
+                summary: "Compacted before provider re-entry".to_string(),
+                first_kept_entry_id: "entry-5".to_string(),
+                tokens_before: 12_000,
+                details: compaction::CompactionDetails::default(),
+                snap_payload: None,
+            };
+            let provider_admission = agent_session
+                .provider_admission
+                .acquire(&asupersync::Cx::for_testing())
+                .await
+                .expect("provider admission");
+            let on_event: AgentEventHandler = Arc::new(|_| {});
+
+            let outcome = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                agent_session.apply_compaction_result(result, on_event, provider_admission),
+            )
+            .await
+            .expect("session_compact hook must not deadlock on provider admission");
+            outcome.expect("apply compaction result");
+
+            let captured = calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                captured.len(),
+                1,
+                "post-install session_compact hook must reach the provider exactly once"
+            );
+            assert!(matches!(
+                captured[0].messages.as_slice(),
+                [Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                })] if text == "after compaction"
+            ));
+        });
+    }
+
+    #[test]
     fn compaction_persistence_failure_preserves_live_session_and_quarantines_provider() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

@@ -545,6 +545,40 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[derive(Debug)]
+    struct NeverCompletingProvider;
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for NeverCompletingProvider {
+        fn name(&self) -> &str {
+            "never-completing-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "never-completing-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::provider::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            futures::future::pending().await
+        }
+    }
+
     fn make_worker(quota: CompactionQuota) -> CompactionWorkerState {
         CompactionWorkerState::new(quota)
     }
@@ -957,6 +991,45 @@ mod tests {
                 aborted.load(Ordering::SeqCst),
                 "timing out the worker should abort the pending task"
             );
+        });
+    }
+
+    #[test]
+    fn provider_timeout_finishes_without_foreground_polling() {
+        run_async(|runtime_handle| async move {
+            let mut worker = make_worker(CompactionQuota {
+                cooldown: Duration::ZERO,
+                timeout: Duration::from_millis(25),
+                max_attempts_per_session: 1,
+            });
+            let mut preparation = compaction_admission_preparation(1_000);
+            preparation.messages_to_summarize = vec![crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("summarize me".to_string()),
+                timestamp: Some(1),
+            }];
+
+            worker.start(
+                &runtime_handle,
+                preparation,
+                Arc::new(NeverCompletingProvider),
+                "test-key".to_string(),
+                None,
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(100)).await;
+
+            assert!(
+                worker
+                    .pending
+                    .as_ref()
+                    .is_some_and(PendingCompaction::is_finished),
+                "the worker must enforce its own timeout without try_recv polling"
+            );
+            let outcome = worker
+                .try_recv()
+                .await
+                .expect("timed-out compaction result");
+            let error = outcome.expect_err("never-completing provider must time out");
+            assert!(error.to_string().contains("timed out"), "got: {error}");
         });
     }
 
