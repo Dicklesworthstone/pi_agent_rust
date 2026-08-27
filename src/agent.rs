@@ -7757,8 +7757,11 @@ mod extensions_integration_tests {
                 .expect("new-generation action");
             let cx = crate::agent_cx::AgentCx::for_request();
             let guard = session.lock(cx.cx()).await.expect("session lock");
-            let custom_contents = guard
-                .to_messages_for_current_path()
+            // Bind the owned message vec first: iterating the temporary
+            // directly would leave &str borrows pointing at a value dropped
+            // at the end of this let statement.
+            let messages = guard.to_messages_for_current_path();
+            let custom_contents = messages
                 .iter()
                 .filter_map(|message| match message {
                     Message::Custom(CustomMessage { content, .. }) => Some(content.as_str()),
@@ -7780,10 +7783,15 @@ mod extensions_integration_tests {
             let foreign_gate = SessionActionAdmissionGate::default();
             assert_eq!(gate.generation(), foreign_gate.generation());
 
-            let err = gate
+            let err = match gate
                 .acquire_origin(&foreign_gate.capture_origin())
                 .await
-                .expect_err("a same-counter token from another Session gate must be rejected");
+            {
+                Ok(unexpected) => {
+                    panic!("a same-counter token from another Session gate must be rejected; got {unexpected:?}")
+                }
+                Err(error) => error,
+            };
             assert!(
                 err.to_string().contains("active Session changed"),
                 "unexpected foreign-origin error: {err}"

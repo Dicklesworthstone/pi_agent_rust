@@ -1177,7 +1177,7 @@ fn session_fast_lane_mutations_invalidate_ctx_cache_generation() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .ctx_generation;
-            let outcome = dispatch_hostcall_session_fast_ref(&manager, op, &params).await;
+            let outcome = dispatch_hostcall_session_fast_ref(&manager, op, &params, None).await;
             assert!(matches!(outcome, HostcallOutcome::Success(_)), "op={op}");
             let generation_after = manager
                 .inner

@@ -350,8 +350,10 @@ mod lifecycle {
             let (exit_tx, exit_rx) = oneshot::channel::<()>();
             drop(exit_tx);
 
+            let manager = crate::extensions::ExtensionManager::new();
             let runtime = JsExtensionRuntimeHandle {
                 sender,
+                manager_ref: Arc::downgrade(&manager.inner),
                 compat_scan_mode: false,
                 exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
             };
