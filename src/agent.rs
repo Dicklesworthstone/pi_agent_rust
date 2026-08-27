@@ -5233,6 +5233,10 @@ pub struct AgentSession {
     /// provider future; model/session transitions hold it across persistence
     /// and live installation, so a check cannot race provider entry.
     provider_admission: ProviderAdmissionGate,
+    /// Serializes extension-authored Session actions with Session identity
+    /// replacement. The generation rejects an action that began before a
+    /// replacement but only acquired the permit after the replacement.
+    session_action_admission: SessionActionAdmissionGate,
 }
 
 #[derive(Clone, Debug)]
@@ -5296,6 +5300,46 @@ impl ProviderAdmissionGate {
         self.ensure_allowed()?;
         self.block(reason);
         Ok(permit)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionActionAdmissionGate {
+    permit: Arc<Mutex<()>>,
+    generation: Arc<AtomicU64>,
+}
+
+impl Default for SessionActionAdmissionGate {
+    fn default() -> Self {
+        Self {
+            permit: Arc::new(Mutex::new(())),
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl SessionActionAdmissionGate {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn acquire(&self, cx: &asupersync::Cx) -> Result<OwnedMutexGuard<()>> {
+        OwnedMutexGuard::lock(Arc::clone(&self.permit), cx)
+            .await
+            .map_err(|err| Error::session(format!("session action admission lock failed: {err}")))
+    }
+
+    pub(crate) fn ensure_generation(&self, expected: u64) -> Result<()> {
+        if self.generation() != expected {
+            return Err(Error::session(
+                "active Session changed before the extension action could be applied",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn advance_generation(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -5409,6 +5453,7 @@ struct AgentSessionHostActions {
     pending_idle_actions: Arc<StdMutex<VecDeque<PendingIdleAction>>>,
     ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
     provider_admission: ProviderAdmissionGate,
+    session_action_admission: SessionActionAdmissionGate,
 }
 
 #[derive(Clone)]
@@ -5423,6 +5468,15 @@ impl AgentSessionHostActions {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let permit = self.provider_admission.acquire(cx.cx()).await?;
         self.provider_admission.ensure_allowed()?;
+        Ok(permit)
+    }
+
+    async fn acquire_session_action_admission(&self) -> Result<OwnedMutexGuard<()>> {
+        let generation = self.session_action_admission.generation();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let permit = self.session_action_admission.acquire(cx.cx()).await?;
+        self.session_action_admission
+            .ensure_generation(generation)?;
         Ok(permit)
     }
 
@@ -5465,7 +5519,7 @@ impl AgentSessionHostActions {
 #[async_trait]
 impl ExtensionHostActions for AgentSessionHostActions {
     async fn send_message(&self, message: ExtensionSendMessage) -> Result<()> {
-        let _session_action_permit = self.acquire_provider_admission().await?;
+        let _session_action_permit = self.acquire_session_action_admission().await?;
         let custom_message = Message::Custom(CustomMessage {
             content: message.content,
             custom_type: message.custom_type,
@@ -5496,7 +5550,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
     }
 
     async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()> {
-        let _session_action_permit = self.acquire_provider_admission().await?;
+        let _session_action_permit = self.acquire_session_action_admission().await?;
         let text = message.text;
         let user_message = Message::User(UserMessage {
             content: UserContent::Text(text.clone()),
@@ -7512,6 +7566,7 @@ mod extensions_integration_tests {
                     models: Vec::new(),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let hold_cx = crate::agent_cx::AgentCx::for_request();
@@ -7561,7 +7616,7 @@ mod extensions_integration_tests {
 
         runtime.block_on(async move {
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let provider_admission = ProviderAdmissionGate::default();
+            let session_action_admission = SessionActionAdmissionGate::default();
             let actions = AgentSessionHostActions {
                 session: Arc::clone(&session),
                 injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
@@ -7573,10 +7628,11 @@ mod extensions_integration_tests {
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
                 })),
-                provider_admission: provider_admission.clone(),
+                provider_admission: ProviderAdmissionGate::default(),
+                session_action_admission: session_action_admission.clone(),
             };
             let transition_cx = crate::agent_cx::AgentCx::for_request();
-            let transition_permit = provider_admission
+            let transition_permit = session_action_admission
                 .acquire(transition_cx.cx())
                 .await
                 .expect("transition admission");
@@ -7709,6 +7765,7 @@ mod extensions_integration_tests {
                     })],
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let result = actions
@@ -7812,6 +7869,7 @@ mod extensions_integration_tests {
                     models: Vec::new(),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let preparation = json!({
@@ -8030,6 +8088,7 @@ mod extensions_integration_tests {
                     models: Vec::new(),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let preparation = json!({
@@ -11175,6 +11234,7 @@ impl AgentSession {
             api_key_override: None,
             semantic_context_bundle: None,
             provider_admission: ProviderAdmissionGate::default(),
+            session_action_admission: SessionActionAdmissionGate::default(),
         }
     }
 
@@ -11297,6 +11357,10 @@ impl AgentSession {
 
     pub(crate) fn provider_admission_gate(&self) -> ProviderAdmissionGate {
         self.provider_admission.clone()
+    }
+
+    pub(crate) fn session_action_admission_gate(&self) -> SessionActionAdmissionGate {
+        self.session_action_admission.clone()
     }
 
     pub(crate) fn ensure_provider_reentry_allowed(&self) -> Result<()> {
@@ -12797,6 +12861,7 @@ impl AgentSession {
             pending_idle_actions: Arc::clone(&self.extensions_pending_idle_actions),
             ai_completion: Arc::clone(&self.extension_ai_completion),
             provider_admission: self.provider_admission.clone(),
+            session_action_admission: self.session_action_admission.clone(),
         };
         self.extension_queue_modes = Some(Arc::clone(&queue_modes));
         self.extension_injected_queue = Some(Arc::clone(&injected));

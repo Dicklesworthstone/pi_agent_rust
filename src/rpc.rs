@@ -13,7 +13,7 @@
 
 use crate::agent::{
     AbortHandle, AgentEvent, AgentSession, InputSource, ProviderAdmissionGate, QueueMode,
-    QueuedAgentMessage,
+    QueuedAgentMessage, SessionActionAdmissionGate,
 };
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
@@ -1073,6 +1073,18 @@ struct RpcSessionTransitionSnapshot {
     entry_count: usize,
 }
 
+struct RpcSessionTransitionPermits {
+    session_action_admission: SessionActionAdmissionGate,
+    _provider: OwnedMutexGuard<()>,
+    _session_action: OwnedMutexGuard<()>,
+}
+
+impl RpcSessionTransitionPermits {
+    fn commit_session_change(&self) {
+        self.session_action_admission.advance_generation();
+    }
+}
+
 async fn rpc_session_transition_snapshot(
     session: &Arc<Mutex<AgentSession>>,
     cx: &AgentCx,
@@ -1169,14 +1181,21 @@ async fn acquire_rpc_session_transition_after_hook(
     shared_state: &Arc<Mutex<RpcSharedState>>,
     bash_state: &Arc<Mutex<Option<RunningBash>>>,
     cx: &AgentCx,
-) -> Result<OwnedMutexGuard<()>> {
-    let provider_admission = {
+) -> Result<RpcSessionTransitionPermits> {
+    let (provider_admission, session_action_admission) = {
         let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
             .await
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        guard.provider_admission_gate()
+        (
+            guard.provider_admission_gate(),
+            guard.session_action_admission_gate(),
+        )
     };
-    let permit = provider_admission.acquire(cx.cx()).await?;
+    // Extension message actions never acquire provider admission. This order
+    // therefore cannot invert with model/compaction paths that already hold
+    // the inner Session before acquiring provider admission.
+    let session_action_permit = session_action_admission.acquire(cx.cx()).await?;
+    let provider_permit = provider_admission.acquire(cx.cx()).await?;
     provider_admission.ensure_allowed()?;
 
     if let Some(reason) = rpc_session_transition_blocker(
@@ -1199,7 +1218,11 @@ async fn acquire_rpc_session_transition_after_hook(
             "session_before_switch modified the source Session; the transition was rejected so the accepted action remains owned by that Session",
         ));
     }
-    Ok(permit)
+    Ok(RpcSessionTransitionPermits {
+        session_action_admission,
+        _provider: provider_permit,
+        _session_action: session_action_permit,
+    })
 }
 
 #[derive(Debug, Clone)]
