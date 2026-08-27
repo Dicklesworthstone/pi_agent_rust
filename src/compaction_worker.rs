@@ -7,6 +7,7 @@ use crate::compaction::{self, CompactionPreparation, CompactionResult};
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use asupersync::runtime::{JoinHandle, RuntimeHandle};
+use asupersync::sync::OwnedMutexGuard;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use serde::Serialize;
@@ -166,10 +167,18 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
 
 type CompactionOutcome = Result<CompactionResult>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionOrigin {
+    pub session_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+}
+
 struct PendingCompaction {
     join: JoinHandle<CompactionOutcome>,
     abort_tx: Option<oneshot::Sender<()>>,
     started_at: Instant,
+    origin: Option<CompactionOrigin>,
 }
 
 impl PendingCompaction {
@@ -277,7 +286,9 @@ impl CompactionWorkerState {
     }
 
     /// Non-blocking check for a completed compaction result.
-    pub async fn try_recv(&mut self) -> Option<CompactionOutcome> {
+    pub async fn try_recv_bound(
+        &mut self,
+    ) -> Option<(Option<CompactionOrigin>, CompactionOutcome)> {
         // Check timeout first (read-only borrow, then drop before mutation).
         let timed_out = self
             .pending
@@ -287,10 +298,14 @@ impl CompactionWorkerState {
         if timed_out {
             if let Some(mut pending) = self.pending.take() {
                 pending.abort();
+                return Some((
+                    pending.origin,
+                    Err(Error::session(
+                        "Background compaction timed out".to_string(),
+                    )),
+                ));
             }
-            return Some(Err(Error::session(
-                "Background compaction timed out".to_string(),
-            )));
+            return None;
         }
 
         if !self
@@ -302,6 +317,7 @@ impl CompactionWorkerState {
         }
 
         let pending = self.pending.take()?;
+        let origin = pending.origin;
         let outcome = pending.join.await;
         if outcome.is_ok() {
             // A successful compaction ends any failure streak. The per-session
@@ -311,12 +327,60 @@ impl CompactionWorkerState {
             // blocked once it crosses `max_attempts_per_session`.
             self.attempt_count = 0;
         }
-        Some(outcome)
+        Some((origin, outcome))
+    }
+
+    #[cfg(test)]
+    pub async fn try_recv(&mut self) -> Option<CompactionOutcome> {
+        self.try_recv_bound().await.map(|(_, outcome)| outcome)
     }
 
     /// Spawn a background compaction on the provided runtime.
+    pub fn start_for_origin(
+        &mut self,
+        origin: CompactionOrigin,
+        provider_permit: OwnedMutexGuard<()>,
+        runtime_handle: &RuntimeHandle,
+        preparation: CompactionPreparation,
+        provider: Arc<dyn Provider>,
+        api_key: String,
+        custom_instructions: Option<String>,
+    ) {
+        self.start_inner(
+            Some(origin),
+            Some(provider_permit),
+            runtime_handle,
+            preparation,
+            provider,
+            api_key,
+            custom_instructions,
+        );
+    }
+
+    #[cfg(test)]
     pub fn start(
         &mut self,
+        runtime_handle: &RuntimeHandle,
+        preparation: CompactionPreparation,
+        provider: Arc<dyn Provider>,
+        api_key: String,
+        custom_instructions: Option<String>,
+    ) {
+        self.start_inner(
+            None,
+            None,
+            runtime_handle,
+            preparation,
+            provider,
+            api_key,
+            custom_instructions,
+        );
+    }
+
+    fn start_inner(
+        &mut self,
+        origin: Option<CompactionOrigin>,
+        provider_permit: Option<OwnedMutexGuard<()>>,
         runtime_handle: &RuntimeHandle,
         preparation: CompactionPreparation,
         provider: Arc<dyn Provider>,
@@ -331,6 +395,7 @@ impl CompactionWorkerState {
         let (abort_tx, abort_rx) = oneshot::channel();
         let now = Instant::now();
         let join = runtime_handle.spawn(async move {
+            let _provider_permit = provider_permit;
             run_compaction_task(
                 preparation,
                 provider,
@@ -345,6 +410,7 @@ impl CompactionWorkerState {
             join,
             abort_tx: Some(abort_tx),
             started_at: now,
+            origin,
         });
         self.last_start = Some(now);
         self.attempt_count = self.attempt_count.saturating_add(1);
@@ -354,6 +420,14 @@ impl CompactionWorkerState {
     #[cfg(test)]
     pub(crate) const fn set_attempt_count_for_test(&mut self, attempt_count: u32) {
         self.attempt_count = attempt_count;
+    }
+
+    pub(crate) fn invalidate_for_context_switch(&mut self) {
+        if let Some(mut pending) = self.pending.take() {
+            pending.abort();
+        }
+        self.last_start = None;
+        self.attempt_count = 0;
     }
 }
 
@@ -493,6 +567,7 @@ mod tests {
             join,
             abort_tx: None,
             started_at: Instant::now(),
+            origin: None,
         }
     }
 
@@ -514,6 +589,7 @@ mod tests {
             join,
             abort_tx: Some(abort_tx),
             started_at: Instant::now(),
+            origin: None,
         }
     }
 
@@ -880,6 +956,34 @@ mod tests {
             let result = outcome.expect("should be Ok");
             assert_eq!(result.summary, "test summary");
             assert!(w.pending.is_none());
+        });
+    }
+
+    #[test]
+    fn try_recv_bound_preserves_compaction_origin() {
+        run_async(|runtime_handle| async move {
+            let mut worker = default_worker();
+            let origin = CompactionOrigin {
+                session_id: "session-a".to_string(),
+                provider_id: "provider-a".to_string(),
+                model_id: "model-a".to_string(),
+            };
+            let mut pending =
+                ready_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
+            pending.origin = Some(origin.clone());
+            inject_pending(&mut worker, pending);
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let (actual_origin, outcome) = worker
+                .try_recv_bound()
+                .await
+                .expect("completed bound compaction");
+            assert_eq!(actual_origin, Some(origin));
+            assert!(outcome.is_ok());
         });
     }
 

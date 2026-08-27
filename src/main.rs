@@ -854,14 +854,23 @@ fn main_impl() -> Result<()> {
 }
 
 fn print_error_with_hints(err: &anyhow::Error) {
+    eprint!("{}", format_error_with_hints(err));
+}
+
+fn format_error_with_hints(err: &anyhow::Error) -> String {
     for cause in err.chain() {
         if let Some(pi_error) = cause.downcast_ref::<pi::error::Error>() {
-            eprint!("{}", pi::error_hints::format_error_with_hints(pi_error));
-            return;
+            let formatted = pi::error_hints::format_error_with_hints(pi_error);
+            let outer_context = err.to_string();
+            return if outer_context == pi_error.to_string() {
+                formatted
+            } else {
+                format!("{outer_context}\n{formatted}")
+            };
         }
     }
 
-    eprintln!("{err:?}");
+    format!("{err:?}\n")
 }
 
 fn exit_code_for_error(err: &anyhow::Error) -> i32 {
@@ -2117,6 +2126,16 @@ async fn run(
                 .model_entry
                 .clamp_thinking_level(pi::model::ThinkingLevel::Max),
         );
+        agent_session
+            .agent
+            .set_tool_call_dialect(selection.model_entry.tool_call_dialect());
+        agent_session.agent.set_model_accepts_images(
+            selection
+                .model_entry
+                .model
+                .input
+                .contains(&InputType::Image),
+        );
         {
             let stream_options = agent_session.agent.stream_options_mut();
             stream_options.api_key.clone_from(&resolved_key);
@@ -2124,10 +2143,17 @@ async fn run(
                 .headers
                 .clone_from(&selection.model_entry.headers);
             stream_options.thinking_level = Some(selection.thinking_level);
+            stream_options.max_tokens = Some(selection.model_entry.model.max_tokens);
         }
         agent_session
             .set_compaction_context_window(context_window_tokens_for_entry(&selection.model_entry));
         agent_session.refresh_extension_completion_host_state();
+        if let Some(region) = &agent_session.extensions {
+            region.manager().set_current_model(
+                Some(selection.model_entry.model.provider.clone()),
+                Some(selection.model_entry.model.id.clone()),
+            );
+        }
     }
 
     {
@@ -8746,9 +8772,10 @@ async fn try_print_failover(
         return Ok(None);
     };
     let cap = config.max_failovers_per_turn() as usize;
+    let mut cursor = *position;
 
-    while *position < chain.entries.len() && *position < cap {
-        let spec = &chain.entries[*position];
+    while cursor < chain.entries.len() && cursor < cap {
+        let spec = &chain.entries[cursor];
         let candidate = (|| {
             let (provider, model_id) = pi::provider_metadata::split_provider_model_spec(spec)?;
             ctx.available_models
@@ -8760,7 +8787,7 @@ async fn try_print_failover(
                 .cloned()
                 .or_else(|| pi::models::ad_hoc_model_entry(provider, model_id))
         })();
-        *position += 1;
+        cursor += 1;
         let Some(entry) = candidate else { continue };
         let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
         if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
@@ -8792,17 +8819,38 @@ async fn try_print_failover(
         let restored_messages = candidate.to_messages_for_current_path();
         let to_provider = entry.model.provider.clone();
         let to_model = entry.model.id.clone();
-        candidate.set_model_header(Some(to_provider.clone()), Some(to_model.clone()), None);
+        let target_thinking = entry.clamp_thinking_level(
+            session
+                .agent
+                .stream_options()
+                .thinking_level
+                .unwrap_or_default(),
+        );
+        let target_thinking_text = target_thinking.to_string();
+        let thinking_changed = candidate.effective_thinking_level_for_current_path().as_deref()
+            != Some(target_thinking_text.as_str());
+        candidate.set_model_header(
+            Some(to_provider.clone()),
+            Some(to_model.clone()),
+            Some(target_thinking_text.clone()),
+        );
         candidate.append_custom_entry(
             "failover".to_string(),
             Some(serde_json::json!({
                 "from": format!("{from_provider}/{from_model}"),
                 "to": format!("{to_provider}/{to_model}"),
                 "class": format!("{class:?}").to_ascii_lowercase(),
-                "attempt": *position,
+                "attempt": cursor,
             })),
         );
-        candidate.append_model_change(to_provider.clone(), to_model.clone());
+        candidate.append_model_change_with_role(
+            to_provider.clone(),
+            to_model.clone(),
+            Some("failover".to_string()),
+        );
+        if thinking_changed {
+            candidate.append_thinking_level_change(target_thinking_text);
+        }
         if session.save_enabled()
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -8821,12 +8869,26 @@ async fn try_print_failover(
         session.agent.set_keyword_max_thinking_level(
             entry.clamp_thinking_level(pi::model::ThinkingLevel::Max),
         );
-        session.agent.stream_options_mut().api_key.clone_from(&key);
+        session.agent.set_tool_call_dialect(entry.tool_call_dialect());
         session
             .agent
-            .stream_options_mut()
-            .headers
-            .clone_from(&entry.headers);
+            .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
+        {
+            let stream_options = session.agent.stream_options_mut();
+            stream_options.api_key.clone_from(&key);
+            stream_options.headers.clone_from(&entry.headers);
+            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.thinking_level = Some(target_thinking);
+        }
+        session.set_compaction_context_window(context_window_tokens_for_entry(&entry));
+        session.refresh_extension_completion_host_state();
+        if let Some(region) = &session.extensions {
+            region.manager().set_current_model(
+                Some(to_provider.clone()),
+                Some(to_model.clone()),
+            );
+        }
+        *position = cursor;
         drop(inner);
 
         if is_json {
@@ -8843,12 +8905,13 @@ async fn try_print_failover(
                 to_provider: to_provider.clone(),
                 to_model: to_model.clone(),
                 class: format!("{class:?}").to_ascii_lowercase(),
-                attempt: u32::try_from(*position).unwrap_or(u32::MAX),
+                attempt: u32::try_from(cursor).unwrap_or(u32::MAX),
             });
         }
 
         return Ok(Some((to_provider, to_model)));
     }
+    *position = cursor;
     Ok(None)
 }
 
@@ -9100,7 +9163,12 @@ where
                         if let Some(auth) = failover_ctx.map(|ctx| ctx.auth)
                             && let Some(fresh) = auth.resolve_api_key(&provider_name, None)
                         {
-                            session.agent.stream_options_mut().api_key = Some(fresh);
+                            let changed = session.agent.stream_options().api_key.as_deref()
+                                != Some(fresh.as_str());
+                            if changed {
+                                session.agent.stream_options_mut().api_key = Some(fresh);
+                                session.refresh_extension_completion_host_state();
+                            }
                         }
                     }
                     current_result = session
@@ -9462,6 +9530,20 @@ mod tests {
     fn exit_code_classifier_defaults_to_general_failure() {
         let runtime_err = anyhow::Error::new(pi::error::Error::auth("missing key"));
         assert_eq!(exit_code_for_error(&runtime_err), EXIT_CODE_FAILURE);
+    }
+
+    #[test]
+    fn error_renderer_preserves_outer_recovery_context_and_typed_hints() {
+        use anyhow::Context as _;
+
+        let error = anyhow::Error::new(pi::error::Error::auth("provider unavailable"))
+            .context("retry restoration failed before provider re-entry");
+        let rendered = format_error_with_hints(&error);
+
+        assert!(rendered.contains("retry restoration failed before provider re-entry"));
+        assert!(rendered.contains("provider unavailable"));
+        assert!(rendered.contains("Suggestions:"));
+        assert!(rendered.contains("Check your API credentials"));
     }
 
     #[test]
@@ -10892,6 +10974,483 @@ mod tests {
         assert!(!message_marks_session_persistence(
             "500 internal server error"
         ));
+    }
+
+    #[test]
+    fn print_retry_and_failover_persist_restored_candidates() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let model_entry = |provider: &str,
+                               model_id: &str,
+                               api: &str,
+                               base_url: &str,
+                               key: &str,
+                               header_name: &str| {
+                ModelEntry {
+                    model: pi::provider::Model {
+                        id: model_id.to_string(),
+                        name: model_id.to_string(),
+                        api: api.to_string(),
+                        provider: provider.to_string(),
+                        base_url: base_url.to_string(),
+                        reasoning: false,
+                        input: vec![InputType::Text],
+                        cost: pi::provider::ModelCost {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        context_window: 8_192,
+                        max_tokens: 1_024,
+                        headers: std::collections::HashMap::new(),
+                    },
+                    api_key: Some(key.to_string()),
+                    headers: std::collections::HashMap::from([(
+                        header_name.to_string(),
+                        "true".to_string(),
+                    )]),
+                    auth_header: true,
+                    compat: None,
+                    oauth_config: None,
+                }
+            };
+            let mut primary = model_entry(
+                "openai",
+                "primary-model",
+                "openai-completions",
+                "https://api.openai.com/v1",
+                "primary-key",
+                "x-primary",
+            );
+            primary.model.reasoning = true;
+            primary.model.input = vec![InputType::Text, InputType::Image];
+            primary.model.context_window = 16_384;
+            primary.model.max_tokens = 1_536;
+            let mut fallback = model_entry(
+                "anthropic",
+                "fallback-model",
+                "anthropic",
+                "https://api.anthropic.com",
+                "fallback-key",
+                "x-fallback",
+            );
+            fallback.model.context_window = 4_096;
+            fallback.model.max_tokens = 2_048;
+            fallback.compat = Some(pi::models::CompatConfig {
+                tool_call_dialect: Some(pi::dialects::Dialect::Xmlish),
+                ..Default::default()
+            });
+            let provider = providers::create_provider(&primary, None).expect("primary provider");
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.stream_options_mut().api_key = Some("primary-key".to_string());
+            agent.stream_options_mut().headers.clone_from(&primary.headers);
+            agent.stream_options_mut().max_tokens = Some(primary.model.max_tokens);
+            agent.stream_options_mut().thinking_level = Some(pi::model::ThinkingLevel::High);
+            agent.set_model_accepts_images(true);
+
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let mut stored = Session::create_with_dir(Some(session_temp.path().join("sessions")));
+            stored.append_message(pi::session::SessionMessage::User {
+                content: pi::model::UserContent::Text("hello".to_string()),
+                timestamp: Some(0),
+            });
+            stored.append_message(pi::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: Vec::new(),
+                    api: "openai-completions".to_string(),
+                    provider: "openai".to_string(),
+                    model: "primary-model".to_string(),
+                    usage: pi::model::Usage::default(),
+                    stop_reason: StopReason::Error,
+                    stop_details: None,
+                    error_message: Some("server error".to_string()),
+                    timestamp: 0,
+                },
+            });
+            stored.save().await.expect("persist failed assistant tail");
+            let persisted_path = stored.path.clone().expect("session path");
+            let initial_messages = stored.to_messages_for_current_path();
+            let session_store = Arc::new(Mutex::new(stored));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session_store),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            agent_session.agent.replace_messages(initial_messages);
+
+            restore_print_retry_tail(&mut agent_session, true)
+                .await
+                .expect("durable same-provider restoration");
+            {
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let inner = OwnedMutexGuard::lock(Arc::clone(&session_store), &cx)
+                    .await
+                    .expect("restored Session lock");
+                assert_eq!(
+                    serde_json::to_value(agent_session.agent.messages())
+                        .expect("serialize Agent messages"),
+                    serde_json::to_value(inner.to_messages_for_current_path())
+                        .expect("serialize Session messages")
+                );
+                assert!(inner.entries_for_current_path().iter().all(|entry| !matches!(
+                    entry,
+                    pi::session::SessionEntry::Message(message)
+                        if matches!(
+                            &message.message,
+                            pi::session::SessionMessage::Assistant { message }
+                                if message.stop_reason == StopReason::Error
+                        )
+                )));
+            }
+            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen restored Session");
+            assert!(reopened.entries_for_current_path().iter().all(|entry| !matches!(
+                entry,
+                pi::session::SessionEntry::Message(message)
+                    if matches!(
+                        &message.message,
+                        pi::session::SessionMessage::Assistant { message }
+                            if message.stop_reason == StopReason::Error
+                    )
+            )));
+
+            let mut config = Config::default();
+            config.retry = Some(pi::config::RetrySettings {
+                fallback_chains: Some(std::collections::HashMap::from([(
+                    "default".to_string(),
+                    vec!["anthropic/fallback-model".to_string()],
+                )])),
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let auth = AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load");
+            let available_models = vec![fallback];
+            let failover_ctx = Some(FailoverResolution {
+                available_models: &available_models,
+                auth: &auth,
+                cli_api_key: None,
+            });
+            let mut position = 0;
+            let no_tail = try_print_failover(
+                &mut agent_session,
+                &config,
+                failover_ctx,
+                &mut position,
+                Some("server error"),
+                false,
+                true,
+                None,
+            )
+            .await
+            .expect_err("known assistant failure requires a restorable tail");
+            assert!(no_tail.to_string().contains("no incomplete assistant tail"));
+            assert_eq!(agent_session.agent.provider().name(), "openai");
+
+            {
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let mut inner = OwnedMutexGuard::lock(Arc::clone(&session_store), &cx)
+                    .await
+                    .expect("seed second failed tail");
+                inner.append_message(pi::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: Vec::new(),
+                        api: "openai-completions".to_string(),
+                        provider: "openai".to_string(),
+                        model: "primary-model".to_string(),
+                        usage: pi::model::Usage::default(),
+                        stop_reason: StopReason::Error,
+                        stop_details: None,
+                        error_message: Some("server error".to_string()),
+                        timestamp: 0,
+                    },
+                });
+                inner.save().await.expect("persist second failed tail");
+                agent_session
+                    .agent
+                    .replace_messages(inner.to_messages_for_current_path());
+            }
+            position = 0;
+            assert!(
+                try_print_failover(
+                    &mut agent_session,
+                    &config,
+                    failover_ctx,
+                    &mut position,
+                    Some("server error"),
+                    false,
+                    true,
+                    None,
+                )
+                .await
+                .expect("durable print failover")
+                .is_some()
+            );
+            assert_eq!(agent_session.agent.provider().name(), "anthropic");
+            assert_eq!(agent_session.agent.provider().model_id(), "fallback-model");
+            assert_eq!(
+                agent_session.agent.stream_options().api_key.as_deref(),
+                Some("fallback-key")
+            );
+            assert_eq!(
+                agent_session
+                    .agent
+                    .stream_options()
+                    .headers
+                    .get("x-fallback")
+                    .map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(
+                agent_session.agent.stream_options().max_tokens,
+                Some(2_048)
+            );
+            assert_eq!(
+                agent_session.agent.tool_call_dialect(),
+                pi::dialects::Dialect::Xmlish
+            );
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                Some(pi::model::ThinkingLevel::Off)
+            );
+            assert!(!agent_session.agent.model_accepts_images());
+            assert_eq!(
+                agent_session.compaction_settings().context_window_tokens,
+                4_096
+            );
+            {
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let inner = OwnedMutexGuard::lock(Arc::clone(&session_store), &cx)
+                    .await
+                    .expect("failover Session lock");
+                assert_eq!(
+                    serde_json::to_value(agent_session.agent.messages())
+                        .expect("serialize failover Agent messages"),
+                    serde_json::to_value(inner.to_messages_for_current_path())
+                        .expect("serialize failover Session messages"),
+                    "failover must install the restored transcript in both stores"
+                );
+                assert_eq!(inner.header.provider.as_deref(), Some("anthropic"));
+                assert_eq!(inner.header.model_id.as_deref(), Some("fallback-model"));
+                assert_eq!(inner.header.thinking_level.as_deref(), Some("off"));
+            }
+
+            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen failover Session");
+            assert!(reopened.entries_for_current_path().iter().any(|entry| matches!(
+                entry,
+                pi::session::SessionEntry::ModelChange(change)
+                    if change.provider == "anthropic"
+                        && change.model_id == "fallback-model"
+                        && change.role.as_deref() == Some("failover")
+            )));
+            assert_eq!(
+                reopened
+                    .effective_thinking_level_for_current_path()
+                    .as_deref(),
+                Some("off")
+            );
+            assert!(reopened.entries_for_current_path().iter().all(|entry| !matches!(
+                entry,
+                pi::session::SessionEntry::Message(message)
+                    if matches!(
+                        &message.message,
+                        pi::session::SessionMessage::Assistant { message }
+                            if message.stop_reason == StopReason::Error
+                    )
+            )));
+        });
+    }
+
+    #[test]
+    fn print_retry_restore_save_failure_preserves_live_tail() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let entry = ModelEntry {
+                model: pi::provider::Model {
+                    id: "primary-model".to_string(),
+                    name: "primary-model".to_string(),
+                    api: "openai-completions".to_string(),
+                    provider: "openai".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    reasoning: true,
+                    input: vec![InputType::Text, InputType::Image],
+                    cost: pi::provider::ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 16_384,
+                    max_tokens: 1_536,
+                    headers: std::collections::HashMap::new(),
+                },
+                api_key: Some("primary-key".to_string()),
+                headers: std::collections::HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            let provider = providers::create_provider(&entry, None).expect("primary provider");
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let temp = tempfile::tempdir().expect("tempdir");
+            let blocked_path = temp.path().join("blocked.jsonl");
+            std::fs::create_dir_all(&blocked_path).expect("create blocking directory");
+            let mut stored = Session::in_memory();
+            stored.path = Some(blocked_path);
+            stored.append_message(pi::session::SessionMessage::User {
+                content: pi::model::UserContent::Text("hello".to_string()),
+                timestamp: Some(0),
+            });
+            stored.append_message(pi::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: Vec::new(),
+                    api: "openai-completions".to_string(),
+                    provider: "openai".to_string(),
+                    model: "primary-model".to_string(),
+                    usage: pi::model::Usage::default(),
+                    stop_reason: StopReason::Error,
+                    stop_details: None,
+                    error_message: Some("server error".to_string()),
+                    timestamp: 0,
+                },
+            });
+            let original_messages = stored.to_messages_for_current_path();
+            let session_store = Arc::new(Mutex::new(stored));
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.stream_options_mut().api_key = Some("primary-key".to_string());
+            agent.stream_options_mut().max_tokens = Some(entry.model.max_tokens);
+            agent.stream_options_mut().thinking_level = Some(pi::model::ThinkingLevel::High);
+            agent.set_model_accepts_images(true);
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session_store),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            agent_session.set_compaction_context_window(entry.model.context_window);
+            agent_session
+                .agent
+                .replace_messages(original_messages.clone());
+
+            let error = restore_print_retry_tail(&mut agent_session, true)
+                .await
+                .expect_err("unwritable candidate must fail restoration");
+            assert!(error.to_string().contains("PI_SESSION_PERSISTENCE_FAILED"));
+            let cx = pi::agent_cx::AgentCx::for_request();
+            let inner = OwnedMutexGuard::lock(Arc::clone(&session_store), &cx)
+                .await
+                .expect("Session lock");
+            assert_eq!(
+                serde_json::to_value(inner.to_messages_for_current_path())
+                    .expect("serialize Session path"),
+                serde_json::to_value(&original_messages).expect("serialize original path")
+            );
+            assert_eq!(
+                serde_json::to_value(agent_session.agent.messages())
+                    .expect("serialize Agent messages"),
+                serde_json::to_value(&original_messages).expect("serialize original messages")
+            );
+            drop(inner);
+
+            let mut fallback = entry.clone();
+            fallback.model.id = "fallback-model".to_string();
+            fallback.model.name = "fallback-model".to_string();
+            fallback.model.provider = "anthropic".to_string();
+            fallback.model.api = "anthropic".to_string();
+            fallback.model.base_url = "https://api.anthropic.com".to_string();
+            fallback.model.reasoning = false;
+            fallback.model.input = vec![InputType::Text];
+            fallback.model.context_window = 4_096;
+            fallback.model.max_tokens = 2_048;
+            fallback.api_key = Some("fallback-key".to_string());
+            fallback.headers = std::collections::HashMap::from([(
+                "x-fallback".to_string(),
+                "true".to_string(),
+            )]);
+            fallback.compat = Some(pi::models::CompatConfig {
+                tool_call_dialect: Some(pi::dialects::Dialect::Xmlish),
+                ..Default::default()
+            });
+            let mut config = Config::default();
+            config.retry = Some(pi::config::RetrySettings {
+                fallback_chains: Some(std::collections::HashMap::from([(
+                    "default".to_string(),
+                    vec!["anthropic/fallback-model".to_string()],
+                )])),
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let auth = AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load");
+            let available_models = vec![fallback];
+            let failover_ctx = Some(FailoverResolution {
+                available_models: &available_models,
+                auth: &auth,
+                cli_api_key: None,
+            });
+            let original_dialect = agent_session.agent.tool_call_dialect();
+            let mut position = 0;
+            let failover_error = try_print_failover(
+                &mut agent_session,
+                &config,
+                failover_ctx,
+                &mut position,
+                Some("server error"),
+                false,
+                true,
+                None,
+            )
+            .await
+            .expect_err("unwritable candidate must block failover");
+            assert!(
+                failover_error
+                    .to_string()
+                    .contains("PI_SESSION_PERSISTENCE_FAILED")
+            );
+            assert_eq!(position, 0, "failed persistence must not consume the fallback");
+            assert_eq!(agent_session.agent.provider().name(), "openai");
+            assert_eq!(agent_session.agent.provider().model_id(), "primary-model");
+            assert_eq!(
+                agent_session.agent.stream_options().api_key.as_deref(),
+                Some("primary-key")
+            );
+            assert_eq!(agent_session.agent.stream_options().max_tokens, Some(1_536));
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                Some(pi::model::ThinkingLevel::High)
+            );
+            assert!(agent_session.agent.model_accepts_images());
+            assert_eq!(agent_session.agent.tool_call_dialect(), original_dialect);
+            assert_eq!(
+                agent_session.compaction_settings().context_window_tokens,
+                16_384
+            );
+            let inner = OwnedMutexGuard::lock(session_store, &cx)
+                .await
+                .expect("Session lock after blocked failover");
+            assert_eq!(
+                serde_json::to_value(inner.to_messages_for_current_path())
+                    .expect("serialize Session path after blocked failover"),
+                serde_json::to_value(&original_messages).expect("serialize original path")
+            );
+            assert_eq!(
+                serde_json::to_value(agent_session.agent.messages())
+                    .expect("serialize Agent messages after blocked failover"),
+                serde_json::to_value(&original_messages).expect("serialize original messages")
+            );
+        });
     }
 
     /// End-to-end (`pi_agent_rust#118`): a transient connection drop must be
