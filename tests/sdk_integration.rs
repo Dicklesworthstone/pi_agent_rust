@@ -679,7 +679,9 @@ fn sdk_extensions_load_and_expose_registration_surface() {
         r#"export default function init(pi) {
   pi.registerCommand("sdk-visible", {
     description: "visible command",
-    handler: async (args) => ({ display: "sdk-visible:" + (args || "") })
+    handler: async (args) => ({
+      display: "sdk-visible:" + (args || "") + ":" + pi.getFlag("sdk-flag")
+    })
   });
   pi.registerFlag("sdk-flag", {
     type: "string",
@@ -693,6 +695,10 @@ fn sdk_extensions_load_and_expose_registration_surface() {
         api_key: Some(TEST_API_KEY.to_string()),
         extension_paths: vec![extension_path],
         extension_policy: Some("safe".to_string()),
+        extension_flags: vec![pi::cli::ExtensionCliFlag {
+            name: "sdk-flag".to_string(),
+            value: Some("from-cli".to_string()),
+        }],
         no_session: true,
         ..SessionOptions::default()
     };
@@ -731,7 +737,7 @@ fn sdk_extensions_load_and_expose_registration_surface() {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     assert!(
-        display.contains("sdk-visible:ok"),
+        display.contains("sdk-visible:ok:from-cli"),
         "unexpected extension command display payload: {command_result:?}"
     );
 }

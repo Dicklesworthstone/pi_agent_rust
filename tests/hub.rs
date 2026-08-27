@@ -65,7 +65,16 @@ fn block_on_local<F: std::future::Future>(future: F) -> F::Output {
 }
 
 fn hub_exec(cwd: &std::path::Path, input: Value) -> ToolOutput {
-    let tool = pi::tools::HubTool::new(cwd);
+    hub_exec_for_session(cwd, "hub-integration-session", input)
+}
+
+fn hub_exec_for_session(
+    cwd: &std::path::Path,
+    session_id: &str,
+    input: Value,
+) -> ToolOutput {
+    let mut tool = pi::tools::HubTool::new(cwd);
+    tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
     block_on_local(tool.execute("call-1", input, None)).expect("hub execute")
 }
 
@@ -360,7 +369,8 @@ fn hub_jobs_group_wraps_background_jobs() {
     let root = harness.temp_path(".");
 
     // Spawn a background job through the bash tool, then manage it via hub.
-    let bash = pi::tools::BashTool::new(&root);
+    let mut bash = pi::tools::BashTool::new(&root);
+    bash.bind_job_session_scope(pi::jobs::JobSessionScope::fixed("hub-integration-session"));
     let out = block_on_local(bash.execute(
         "call-1",
         json!({"command": "echo hub-jobs-marker", "background": true, "timeout": 30}),
@@ -392,5 +402,74 @@ fn hub_jobs_group_wraps_background_jobs() {
         .log()
         .info("verify", format!("hub jobs wait: {waited_text}"));
     assert!(waited_text.contains("exited"), "{waited_text}");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn hub_jobs_group_hides_foreign_session_jobs() {
+    let _guard = hub_test_guard();
+    let case = "hub_jobs_group_hides_foreign_session_jobs";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("hub-owner-{}", uuid::Uuid::new_v4().simple());
+    let foreign = format!("hub-foreign-{}", uuid::Uuid::new_v4().simple());
+    let mut bash = pi::tools::BashTool::new(&root);
+    bash.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(owner.clone()));
+    let output = block_on_local(bash.execute(
+        "owner-job",
+        json!({
+            "command": "printf private-hub-marker",
+            "background": true,
+            "timeout": 30
+        }),
+        None,
+    ))
+    .expect("bash background");
+    let job_id = output.details.as_ref().expect("job details")["id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+
+    let foreign_list = hub_exec_for_session(
+        &root,
+        &foreign,
+        json!({"op": "jobs", "action": "list"}),
+    );
+    assert!(!first_text(&foreign_list).contains(&job_id));
+    let foreign_wait = hub_exec_for_session(
+        &root,
+        &foreign,
+        json!({
+            "op": "jobs",
+            "action": "wait",
+            "jobId": job_id.clone(),
+            "timeoutMs": 10
+        }),
+    );
+    assert!(foreign_wait.is_error);
+    let foreign_text = first_text(&foreign_wait);
+    assert!(foreign_text.contains("PI_JOBS_UNKNOWN_ID"));
+    assert!(!foreign_text.contains("private-hub-marker"));
+    let foreign_cancel = hub_exec_for_session(
+        &root,
+        &foreign,
+        json!({"op": "jobs", "action": "cancel", "jobId": job_id.clone()}),
+    );
+    assert!(foreign_cancel.is_error);
+    assert!(first_text(&foreign_cancel).contains("PI_JOBS_UNKNOWN_ID"));
+
+    let owner_wait = hub_exec_for_session(
+        &root,
+        &owner,
+        json!({
+            "op": "jobs",
+            "action": "wait",
+            "jobId": job_id,
+            "timeoutMs": 10_000
+        }),
+    );
+    assert!(!owner_wait.is_error);
+    assert!(first_text(&owner_wait).contains("exited"));
+    let _ = pi::jobs::take_completion_notices(&owner);
     finish_case(&harness, case);
 }

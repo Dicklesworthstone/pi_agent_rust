@@ -675,6 +675,136 @@ mod fixture_lanes {
     }
 
     #[test]
+    fn acknowledged_extension_server_is_mounted_by_startup_connect_seam() {
+        let case = "acknowledged_extension_server_is_mounted_by_startup_connect_seam";
+        let harness = TestHarness::new(case);
+        let root = harness.temp_path(".");
+        let global = harness.temp_path("global");
+        let spec = json!({
+            "name": "extension-fixture",
+            "command": FIXTURE_BIN,
+            "extension_id": "fixture-extension"
+        });
+        let pending_spec = json!({
+            "name": "extension-pending",
+            "command": FIXTURE_BIN,
+            "extension_id": "fixture-extension"
+        });
+
+        // First launch: the operator acknowledges this exact extension-owned
+        // definition, which persists trust for later sessions.
+        let first = McpManager::bootstrap(&root, &global, &[]).expect("first bootstrap");
+        first.register_extension_server("extension-fixture", &spec);
+        block_on_local(first.trust("extension-fixture")).expect("persist extension trust");
+        drop(first);
+
+        // Next launch: the production SDK/FTUI seam must load its own
+        // extension, register that extension's server into its own manager,
+        // connect after registration, and mount the wrapper into its live
+        // Agent rather than the discarded classic session (bd-vjfol).
+        let extension_path = root.join("fixture-extension.native.json");
+        std::fs::write(
+            &extension_path,
+            serde_json::to_vec(&json!({
+                "id": "fixture-extension",
+                "name": "fixture-extension",
+                "version": "1.0.0",
+                "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                "mcpServers": [spec, pending_spec]
+            }))
+            .expect("serialize native extension"),
+        )
+        .expect("write native extension");
+        let mut handle = block_on_local(pi::sdk::create_agent_session(pi::sdk::SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(root.clone()),
+            no_session: true,
+            enabled_tools: Some(Vec::new()),
+            extension_paths: vec![extension_path],
+            mcp: Some(pi::sdk::McpSessionOptions {
+                config_paths: Vec::new(),
+                global_dir: Some(global.clone()),
+            }),
+            ..pi::sdk::SessionOptions::default()
+        }))
+        .expect("create MCP-enabled SDK session");
+        assert!(
+            handle
+                .session()
+                .agent
+                .has_tool("mcp__extension-fixture__echo"),
+            "the actual SDK Agent must own the mounted extension tool"
+        );
+        let manager = handle.mcp_manager().expect("SDK-owned MCP manager");
+        let row = manager
+            .list()
+            .into_iter()
+            .find(|row| row.name == "extension-fixture")
+            .expect("extension server listed");
+        assert_eq!(row.provenance, "extension");
+        assert_eq!(row.trust, "acknowledged");
+        assert!(
+            !handle
+                .session()
+                .agent
+                .has_tool("mcp__extension-pending__echo"),
+            "a pending extension server must not leak wrappers at startup"
+        );
+
+        // The runtime trust path mounts only the selected server and filters
+        // names already present in the live Agent. This is the exact
+        // algorithm used by FTUI `/mcp trust` and `/mcp test`.
+        block_on_local(manager.trust("extension-pending"))
+            .expect("trust the pending extension server at runtime");
+        let pending_wrappers = pi::mcp::mount_server_tools(&manager, "extension-pending");
+        assert!(
+            !pending_wrappers.is_empty(),
+            "the newly trusted server must expose wrappers"
+        );
+        assert!(
+            pending_wrappers
+                .iter()
+                .all(|tool| tool.name().starts_with("mcp__extension-pending__")),
+            "targeted mounting must not re-append another server's wrappers"
+        );
+        let mounted = handle.mount_mcp_server_tools_if_absent("extension-pending");
+        assert!(mounted > 0, "the first runtime mount must add the selected server");
+        assert!(
+            handle
+                .session()
+                .agent
+                .has_tool("mcp__extension-pending__echo"),
+            "the live SDK Agent must receive runtime-trusted wrappers"
+        );
+        assert_eq!(
+            handle.mount_mcp_server_tools_if_absent("extension-pending"),
+            0,
+            "repeating trust/test must not duplicate live Agent tools"
+        );
+
+        let tools = pi::mcp::mount_tools(&manager);
+        let echo = tools
+            .iter()
+            .find(|tool| tool.name() == "mcp__extension-fixture__echo")
+            .expect("acknowledged extension tool mounted during startup");
+        let output = block_on_local(echo.execute(
+            "extension-call",
+            json!({"text": "startup-extension"}),
+            None,
+        ))
+        .expect("mounted extension MCP tool executes");
+        assert!(
+            first_text(&output).starts_with("echo: startup-extension"),
+            "{}",
+            first_text(&output)
+        );
+        assert!(!output.is_error);
+        finish_case(&harness, case);
+    }
+
+    #[test]
     fn mcp_fixture_rejects_lsp_content_length_framing() {
         let case = "mcp_fixture_rejects_lsp_content_length_framing";
         let harness = TestHarness::new(case);

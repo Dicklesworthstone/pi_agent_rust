@@ -33,6 +33,7 @@ fn first_text(output: &ToolOutput) -> &str {
 /// serialize on this lock so capacity/kill assertions don't race.
 static JOBS_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+const TEST_SESSION_ID: &str = "jobs-integration-session";
 
 fn finish_case(harness: &TestHarness, case: &str) {
     harness
@@ -59,11 +60,36 @@ fn execute(tool: &pi::tools::BashTool, input: serde_json::Value) -> ToolOutput {
     block_on_local(tool.execute("call-1", input, None)).expect("execute")
 }
 
-const fn jobs_tool() -> pi::tools::JobsTool {
-    pi::tools::JobsTool
+fn bash_tool(root: &std::path::Path) -> pi::tools::BashTool {
+    bash_tool_for_session(root, TEST_SESSION_ID)
+}
+
+fn bash_tool_for_session(root: &std::path::Path, session_id: &str) -> pi::tools::BashTool {
+    let mut tool = pi::tools::BashTool::new(root);
+    tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
+    tool
+}
+
+fn jobs_tool() -> pi::tools::JobsTool {
+    jobs_tool_for_session(TEST_SESSION_ID)
+}
+
+fn jobs_tool_for_session(session_id: &str) -> pi::tools::JobsTool {
+    let mut tool = pi::tools::JobsTool::new();
+    tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
+    tool
 }
 
 fn execute_jobs(action: &str, job_id: Option<&str>, timeout_ms: Option<u64>) -> ToolOutput {
+    execute_jobs_for_session(TEST_SESSION_ID, action, job_id, timeout_ms)
+}
+
+fn execute_jobs_for_session(
+    session_id: &str,
+    action: &str,
+    job_id: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> ToolOutput {
     let mut input = json!({"action": action});
     if let Some(id) = job_id {
         input["jobId"] = json!(id); // ubs:ignore Value index assignment never panics
@@ -71,7 +97,8 @@ fn execute_jobs(action: &str, job_id: Option<&str>, timeout_ms: Option<u64>) -> 
     if let Some(ms) = timeout_ms {
         input["timeoutMs"] = json!(ms); // ubs:ignore Value index assignment never panics
     }
-    block_on_local(jobs_tool().execute("call-1", input, None)).expect("jobs execute") // ubs:ignore test helper
+    block_on_local(jobs_tool_for_session(session_id).execute("call-1", input, None))
+        .expect("jobs execute") // ubs:ignore test helper
 }
 
 fn job_id(output: &ToolOutput) -> String {
@@ -88,7 +115,7 @@ fn background_returns_instantly_and_notices_with_tail() {
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
 
-    let tool = pi::tools::BashTool::new(&root);
+    let tool = bash_tool(&root);
     let started = std::time::Instant::now();
     let out = execute(
         &tool,
@@ -122,7 +149,7 @@ fn background_returns_instantly_and_notices_with_tail() {
     assert!(waited_text.contains("exited"), "{waited_text}");
     assert!(waited_text.contains("bg-marker-"), "{waited_text}");
 
-    let notices = pi::jobs::take_completion_notices();
+    let notices = pi::jobs::take_completion_notices(TEST_SESSION_ID);
     let rendered: Vec<String> = notices
         .iter()
         .map(|message| match &message {
@@ -147,6 +174,55 @@ fn background_returns_instantly_and_notices_with_tail() {
 }
 
 #[test]
+fn jobs_tool_rejects_a_foreign_session_job_id_without_metadata() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock"); // ubs:ignore test guard
+    let case = "jobs_tool_rejects_a_foreign_session_job_id_without_metadata";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("jobs-owner-{}", uuid::Uuid::new_v4().simple());
+    let foreign = format!("jobs-foreign-{}", uuid::Uuid::new_v4().simple());
+    let tool = bash_tool_for_session(&root, &owner);
+    let output = execute(
+        &tool,
+        json!({
+            "command": "printf private-jobs-marker",
+            "background": true,
+            "timeout": 30
+        }),
+    );
+    let id = job_id(&output);
+    let artifact_path = output.details.as_ref().expect("details")["artifactPath"]
+        .as_str()
+        .expect("artifact path")
+        .to_string();
+
+    let foreign_list = execute_jobs_for_session(&foreign, "list", None, None);
+    assert!(!first_text(&foreign_list).contains(&id));
+    let foreign_wait = block_on_local(jobs_tool_for_session(&foreign).execute(
+        "foreign-wait",
+        json!({"action": "wait", "jobId": id.clone(), "timeoutMs": 10}),
+        None,
+    ))
+    .expect_err("foreign wait must fail closed");
+    let rendered = foreign_wait.to_string();
+    assert!(rendered.contains("PI_JOBS_UNKNOWN_ID"));
+    assert!(!rendered.contains("private-jobs-marker"));
+    assert!(!rendered.contains(&artifact_path));
+    let foreign_cancel = block_on_local(jobs_tool_for_session(&foreign).execute(
+        "foreign-cancel",
+        json!({"action": "cancel", "jobId": id.clone()}),
+        None,
+    ))
+    .expect_err("foreign cancel must fail closed");
+    assert!(foreign_cancel.to_string().contains("PI_JOBS_UNKNOWN_ID"));
+
+    let owner_wait = execute_jobs_for_session(&owner, "wait", Some(&id), Some(10_000));
+    assert!(first_text(&owner_wait).contains("exited"));
+    let _ = pi::jobs::take_completion_notices(&owner);
+    finish_case(&harness, case);
+}
+
+#[test]
 fn cancel_kills_whole_tree() {
     let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock"); // ubs:ignore test guard
     let case = "cancel_kills_whole_tree";
@@ -162,7 +238,7 @@ fn cancel_kills_whole_tree() {
     )
     .expect("write spawner");
 
-    let tool = pi::tools::BashTool::new(&root);
+    let tool = bash_tool(&root);
     let out = execute(
         &tool,
         json!({"command": "sh spawner.sh", "background": true, "timeout": 300}),
@@ -217,7 +293,7 @@ fn session_exit_kills_all_survivors() {
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
 
-    let tool = pi::tools::BashTool::new(&root);
+    let tool = bash_tool(&root);
     let first = execute(
         &tool,
         json!({"command": "sleep 300", "background": true, "timeout": 300}),
@@ -263,7 +339,7 @@ fn capacity_rejects_ninth_job() {
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
 
-    let tool = pi::tools::BashTool::new(&root);
+    let tool = bash_tool(&root);
     let mut started = Vec::new();
     for index in 0..8 {
         let out = execute(
@@ -347,6 +423,12 @@ fn bash_background_through_registry() {
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
     let registry = ToolRegistry::new(&["bash", "jobs"], &root, None::<&pi::config::Config>);
+    let session_id = TEST_SESSION_ID.to_string();
+    let resolver: pi::jobs::JobSessionIdResolver = std::sync::Arc::new(move || {
+        let session_id = session_id.clone();
+        Box::pin(async move { Some(session_id) })
+    });
+    registry.bind_job_session_resolver(resolver);
     let bash = registry
         .tools()
         .iter()
@@ -362,8 +444,15 @@ fn bash_background_through_registry() {
     harness.log().info("verify", format!("registry bg: {text}"));
     assert!(text.contains("Background job"), "{text}");
     let id = job_id(&out);
-    let waited = execute_jobs("wait", Some(&id), Some(10_000));
+    let jobs = registry.get("jobs").expect("jobs tool");
+    let waited = block_on_local(jobs.execute(
+        "call-2",
+        json!({"action": "wait", "jobId": id, "timeoutMs": 10_000}),
+        None,
+    ))
+    .expect("wait through registry jobs tool");
     assert!(first_text(&waited).contains("exited"));
+    let _ = pi::jobs::take_completion_notices(TEST_SESSION_ID);
     pi::jobs::kill_all();
     finish_case(&harness, case);
 }
