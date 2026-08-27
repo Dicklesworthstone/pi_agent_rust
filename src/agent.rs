@@ -1455,6 +1455,10 @@ pub struct Agent {
     /// Fetchers for queued follow-up messages (idle).
     follow_up_fetchers: Vec<MessageFetcher>,
 
+    /// Session-scoped background completion source. Its registry is already
+    /// bounded, so the handoff preserves every drained notice.
+    job_follow_up_fetcher: MessageFetcher,
+
     /// Internal queue for steering/follow-up messages.
     message_queue: MessageQueue,
 
@@ -1555,6 +1559,7 @@ impl Agent {
             .stream_options
             .thinking_level
             .unwrap_or(crate::model::ThinkingLevel::Off);
+        let job_follow_up_fetcher = crate::jobs::follow_up_fetcher(tools.job_session_scope());
         Self {
             provider,
             tools,
@@ -1564,6 +1569,7 @@ impl Agent {
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
+            job_follow_up_fetcher,
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
             scoped_rules: None,
@@ -3230,20 +3236,26 @@ impl Agent {
     }
 
     async fn stage_follow_up_messages(&mut self) -> bool {
-        if self.message_queue.follow_up_batch_len() > 0 {
-            return true;
-        }
-
-        let owning_surface = self
-            .fetch_messages(self.initial_follow_up_fetcher.as_ref())
-            .await;
-        if !owning_surface.is_empty() {
+        let mut owning_surface_ready = self.message_queue.follow_up_batch_len() > 0;
+        if !owning_surface_ready {
+            let owning_surface = self
+                .fetch_messages(self.initial_follow_up_fetcher.as_ref())
+                .await;
+            owning_surface_ready = !owning_surface.is_empty();
             for message in owning_surface {
                 // The owning surface already applied its queue mode and
                 // admission bound. Preserve its complete accepted batch until
                 // the synchronous delivery point after TurnStart.
                 self.message_queue.push_follow_up_lossless(message);
             }
+        }
+
+        if owning_surface_ready {
+            // Completion notices are already bounded per session by the jobs
+            // registry. Poll them even while the owning source stays busy so a
+            // continuously replenished RPC queue cannot starve the notice
+            // registry until its oldest completions are evicted.
+            self.fetch_job_follow_up_messages().await;
             return true;
         }
 
@@ -3257,6 +3269,14 @@ impl Agent {
             for message in fetched {
                 self.message_queue.push_follow_up(message);
             }
+        }
+        self.fetch_job_follow_up_messages().await;
+    }
+
+    async fn fetch_job_follow_up_messages(&mut self) {
+        let job_notices = self.fetch_messages(Some(&self.job_follow_up_fetcher)).await;
+        for notice in job_notices {
+            self.message_queue.push_follow_up_lossless(notice);
         }
     }
 
@@ -10658,6 +10678,18 @@ mod finish_turn_persistence_tests {
 }
 
 impl AgentSession {
+    fn job_session_id_resolver(session: &Arc<Mutex<Session>>) -> crate::jobs::JobSessionIdResolver {
+        let job_session = Arc::clone(session);
+        Arc::new(move || {
+            let job_session = Arc::clone(&job_session);
+            Box::pin(async move {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let session = OwnedMutexGuard::lock(job_session, cx.cx()).await.ok()?;
+                Some(session.header.id.clone())
+            })
+        })
+    }
+
     pub const fn runtime_repair_mode_from_policy_mode(mode: RepairPolicyMode) -> RepairMode {
         match mode {
             RepairPolicyMode::Off => RepairMode::Off,
@@ -10725,6 +10757,9 @@ impl AgentSession {
         save_enabled: bool,
         compaction_settings: ResolvedCompactionSettings,
     ) -> Self {
+        agent
+            .tools
+            .bind_job_session_resolver(Self::job_session_id_resolver(&session));
         let extension_ai_completion = Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
             provider: agent.provider(),
             stream_options: agent.stream_options().clone(),
@@ -11908,6 +11943,7 @@ impl AgentSession {
             manager.set_runtime(runtime);
             (manager, tools)
         };
+        tools.bind_job_session_resolver(Self::job_session_id_resolver(&self.session));
 
         // Session, host actions, and message fetchers are always set here
         // (after runtime boot) — the JS runtime only needs these when
@@ -11987,11 +12023,6 @@ impl AgentSession {
                 Some(Arc::new(follow_up_fetcher)),
             );
         }
-        // Background job completion notices (bd-cv653.3.10): additive
-        // follow-up source drained from the jobs registry.
-        self.agent
-            .register_message_fetchers(None, Some(crate::jobs::follow_up_fetcher()));
-
         if !js_specs.is_empty() {
             manager.load_js_extensions(js_specs).await?;
         }
@@ -13730,6 +13761,146 @@ mod tests {
         > {
             Ok(Box::pin(futures::stream::empty()))
         }
+    }
+
+    #[test]
+    fn background_job_follow_ups_track_the_live_agent_session() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let first_session = Session::in_memory();
+            let first_id = first_session.header.id.clone();
+            let second_id = format!("session-b-{}", uuid::Uuid::new_v4().simple());
+            let session = Arc::new(Mutex::new(first_session));
+            let agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            crate::jobs::push_completion_notice(&first_id, "first-session-notice");
+            crate::jobs::push_completion_notice(&second_id, "second-session-notice");
+            agent_session.agent.fetch_additive_follow_up_messages().await;
+            let first_delivery = agent_session.agent.message_queue.pop_follow_up();
+            assert_eq!(first_delivery.len(), 1);
+            assert_user_text(first_delivery[0].message(), "first-session-notice");
+            assert!(
+                !agent_session.agent.has_staged_follow_up(),
+                "the other session's notice must remain in the registry, not the local queue"
+            );
+
+            {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let mut guard = session.lock(cx.cx()).await.expect("session lock");
+                guard.header.id.clone_from(&second_id);
+            }
+            agent_session.agent.fetch_additive_follow_up_messages().await;
+            let second_delivery = agent_session.agent.message_queue.pop_follow_up();
+            assert_eq!(second_delivery.len(), 1);
+            assert_user_text(second_delivery[0].message(), "second-session-notice");
+            assert!(crate::jobs::take_completion_notices(&first_id).is_empty());
+            assert!(crate::jobs::take_completion_notices(&second_id).is_empty());
+        });
+    }
+
+    #[test]
+    fn background_job_notice_survives_a_full_additive_handoff() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session_state = Session::in_memory();
+            let session_id = session_state.header.id.clone();
+            let session = Arc::new(Mutex::new(session_state));
+            let mut agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let ordinary_fetcher: MessageFetcher = Arc::new(|| {
+                Box::pin(async move {
+                    (0..=MAX_FOLLOW_UP_QUEUE_SIZE)
+                        .map(|index| {
+                            QueuedAgentMessage::generated(Message::User(UserMessage {
+                                content: UserContent::Text(format!("ordinary-{index}")),
+                                timestamp: 0,
+                            }))
+                        })
+                        .collect()
+                })
+            });
+            agent.register_message_fetchers(None, Some(ordinary_fetcher));
+            agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::All);
+            let mut agent_session = AgentSession::new(
+                agent,
+                session,
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            crate::jobs::push_completion_notice(&session_id, "bounded-job-notice");
+            agent_session.agent.fetch_additive_follow_up_messages().await;
+            let deliveries = agent_session.agent.message_queue.pop_follow_up();
+            assert_eq!(deliveries.len(), MAX_FOLLOW_UP_QUEUE_SIZE + 1);
+            assert!(deliveries.iter().any(|delivery| matches!(
+                delivery.message(),
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) if text == "bounded-job-notice"
+            )));
+        });
+    }
+
+    #[test]
+    fn busy_owning_follow_up_source_does_not_starve_job_notices() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session_state = Session::in_memory();
+            let session_id = session_state.header.id.clone();
+            let session = Arc::new(Mutex::new(session_state));
+            let mut agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let owning_fetcher: MessageFetcher = Arc::new(|| {
+                Box::pin(async move {
+                    vec![QueuedAgentMessage::generated(Message::User(UserMessage {
+                        content: UserContent::Text("owning-follow-up".to_string()),
+                        timestamp: 0,
+                    }))]
+                })
+            });
+            agent.register_initial_follow_up_fetcher(owning_fetcher);
+            agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::All);
+            let mut agent_session = AgentSession::new(
+                agent,
+                session,
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            crate::jobs::push_completion_notice(&session_id, "non-starved-job-notice");
+            assert!(agent_session.agent.stage_follow_up_messages().await);
+            let deliveries = agent_session.agent.message_queue.pop_follow_up();
+            assert_eq!(deliveries.len(), 2);
+            assert_user_text(deliveries[0].message(), "owning-follow-up");
+            assert_user_text(deliveries[1].message(), "non-starved-job-notice");
+            assert!(crate::jobs::take_completion_notices(&session_id).is_empty());
+        });
     }
 
     #[derive(Debug)]

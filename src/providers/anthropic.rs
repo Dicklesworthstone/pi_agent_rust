@@ -850,14 +850,18 @@ impl Provider for AnthropicProvider {
                             let err = Error::sse(&e);
                             return Some((Err(err), state));
                         }
-                        // Stream ended before message_stop (e.g.
-                        // network disconnect).  Emit Done so the
-                        // agent loop receives the partial message.
+                        // A clean transport EOF is not a successful Anthropic
+                        // completion unless message_stop was observed. Return a
+                        // retry-classifiable error; the agent loop retains the
+                        // partial message while marking the turn as failed.
                         None => {
                             state.done = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            return Some((
+                                Err(Error::api(
+                                    "Anthropic stream ended before message_stop (unexpected EOF)",
+                                )),
+                                state,
+                            ));
                         }
                     }
                 }
@@ -2552,6 +2556,40 @@ mod tests {
             .filter(|item| matches!(item, Ok(StreamEvent::Done { .. })))
             .count();
         assert_eq!(done_count, 1, "expected exactly one terminal Done event");
+    }
+
+    #[test]
+    fn test_stream_rejects_transport_eof_before_message_stop() {
+        let body = [
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+            "",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial")),
+            "partial content should be emitted before the terminal error"
+        );
+        assert!(
+            !out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "premature EOF must never be reported as Done"
+        );
+        let error = out
+            .last()
+            .expect("terminal stream item")
+            .as_ref()
+            .expect_err("premature EOF must be a stream error")
+            .to_string();
+        assert!(error.contains("message_stop"), "{error}");
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert!(crate::error::is_retryable_error(&error, None, None));
     }
 
     #[test]

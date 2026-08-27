@@ -1155,10 +1155,6 @@ pub async fn run(
         guard
             .agent
             .register_initial_follow_up_fetcher(Arc::new(follow_fetcher));
-        // Background job completion notices (bd-cv653.3.10).
-        guard
-            .agent
-            .register_message_fetchers(None, Some(crate::jobs::follow_up_fetcher()));
     }
 
     // Set up extension UI channel for RPC mode.
@@ -13668,6 +13664,12 @@ export default function init(pi) {
             });
             let agent_session =
                 build_test_agent_session_with_provider(Session::in_memory(), provider);
+            let foreign_session_id =
+                format!("foreign-rpc-{}", uuid::Uuid::new_v4().simple());
+            crate::jobs::push_completion_notice(
+                &foreign_session_id,
+                "must remain outside this RPC session",
+            );
 
             let auth_path = tempfile::tempdir()
                 .expect("tempdir")
@@ -13727,14 +13729,11 @@ export default function init(pi) {
             let (server_result, ()) =
                 futures::future::join(run(agent_session, options, in_rx, out_tx), client).await;
             assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
-            // The jobs registry is process-global, so a background-job
-            // completion notice from a concurrently running test can inject an
-            // extra follow-up turn (and provider call) into this session. The
-            // contract under test is deadline inheritance, so require at least
-            // one call and that EVERY provider call observed the inherited
-            // deadline, rather than pinning the exact call count.
             let calls = state.calls.load(Ordering::SeqCst);
-            assert!(calls >= 1, "provider was never called");
+            assert_eq!(
+                calls, 1,
+                "a completion notice owned by another session must not inject an RPC follow-up"
+            );
             let deadlines = state
                 .observed_deadlines
                 .lock()
@@ -13744,6 +13743,9 @@ export default function init(pi) {
             for deadline in deadlines {
                 assert_eq!(deadline, Some(expected_deadline));
             }
+            let foreign_notices =
+                crate::jobs::take_completion_notices(&foreign_session_id);
+            assert_eq!(foreign_notices.len(), 1);
         });
     }
 

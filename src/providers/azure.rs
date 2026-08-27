@@ -381,15 +381,17 @@ impl Provider for AzureOpenAIProvider {
                             let err = Error::sse(&e);
                             return Some((Err(err), state));
                         }
-                        // Stream ended without [DONE] sentinel (e.g.
-                        // premature server disconnect).  Emit Done so the
-                        // agent loop receives the accumulated partial
-                        // instead of silently losing it.
+                        // A clean transport EOF is not a successful Azure
+                        // OpenAI completion unless [DONE] was observed. The
+                        // agent loop retains partial content on this error.
                         None => {
                             state.done = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            return Some((
+                                Err(Error::api(
+                                    "Azure OpenAI stream ended before [DONE] sentinel (unexpected EOF)",
+                                )),
+                                state,
+                            ));
                         }
                     }
                 }
@@ -1462,6 +1464,68 @@ mod tests {
             "",
         ]
         .join("\n")
+    }
+
+    #[test]
+    fn stream_rejects_transport_eof_before_done_sentinel() {
+        let body = [
+            r#"data: {"choices":[{"delta":{"content":"partial"}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial")),
+            "partial content should be emitted before the terminal error"
+        );
+        assert!(
+            !out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "premature EOF must never be reported as Done"
+        );
+        let error = out
+            .last()
+            .expect("terminal stream item")
+            .as_ref()
+            .expect_err("premature EOF must be a stream error")
+            .to_string();
+        assert!(error.contains("[DONE]"), "{error}");
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert!(crate::error::is_retryable_error(&error, None, None));
+    }
+
+    fn collect_stream_items_from_body(body: &str) -> Vec<Result<StreamEvent>> {
+        let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-test").with_endpoint_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("azure-test-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                items.push(item);
+            }
+            items
+        })
     }
 
     fn spawn_test_server(

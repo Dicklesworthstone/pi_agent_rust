@@ -281,6 +281,17 @@ impl std::fmt::Debug for EventListeners {
     }
 }
 
+/// MCP discovery inputs for one SDK-owned session.
+#[derive(Debug, Clone, Default)]
+pub struct McpSessionOptions {
+    /// Explicit MCP configuration files, ordered after discovered project and
+    /// global configuration in the same way as CLI `--mcp-config` values.
+    pub config_paths: Vec<PathBuf>,
+    /// Optional global directory override. Embedders and tests can keep trust
+    /// state isolated; normal CLI callers use [`Config::global_dir`].
+    pub global_dir: Option<PathBuf>,
+}
+
 /// SDK session construction options.
 ///
 /// These options provide the programmatic equivalent of the core CLI startup
@@ -306,8 +317,19 @@ pub struct SessionOptions {
     pub extension_paths: Vec<PathBuf>,
     pub extension_policy: Option<String>,
     pub repair_policy: Option<String>,
+    /// Pre-parsed extension CLI flags to apply to this session's live runtime
+    /// after extension registration and before dependent startup bridges.
+    pub extension_flags: Vec<crate::cli::ExtensionCliFlag>,
     pub include_cwd_in_prompt: bool,
     pub max_tool_iterations: usize,
+
+    /// Opt in to MCP discovery for this SDK session.
+    ///
+    /// The manager is constructed inside [`create_agent_session`] so the
+    /// session's own extension runtime can register contributed servers before
+    /// the single connect-and-mount pass. This avoids cross-wiring tools from
+    /// a different, already-dropped session (bd-vjfol).
+    pub mcp: Option<McpSessionOptions>,
 
     /// Optional factory for the session's [`ToolRegistry`].
     ///
@@ -399,11 +421,13 @@ impl Default for SessionOptions {
             session_dir: None,
             extension_paths: Vec::new(),
             extension_policy: None,
+            extension_flags: Vec::new(),
             tool_factory: None,
             workspace: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
+            mcp: None,
             on_event: None,
             on_tool_start: None,
             on_tool_end: None,
@@ -469,6 +493,8 @@ pub struct AgentSessionHandle {
     /// Multi-root workspace handle when the session was created with one
     /// (bd-cv653.3.12). Clones share the live root set.
     workspace: Option<crate::workspace::WorkspaceHandle>,
+    /// MCP manager owned by this exact SDK session, when enabled.
+    mcp_manager: Option<Arc<crate::mcp::McpManager>>,
 }
 
 /// Snapshot of the current agent session state.
@@ -1270,6 +1296,7 @@ impl AgentSessionHandle {
             listeners,
             ask_tool: None,
             workspace: None,
+            mcp_manager: None,
         }
     }
 
@@ -1286,6 +1313,41 @@ impl AgentSessionHandle {
     #[must_use]
     pub fn workspace(&self) -> Option<crate::workspace::WorkspaceHandle> {
         self.workspace.clone()
+    }
+
+    /// MCP manager owned by this session, when MCP discovery was enabled.
+    #[must_use]
+    pub fn mcp_manager(&self) -> Option<Arc<crate::mcp::McpManager>> {
+        self.mcp_manager.clone()
+    }
+
+    /// Mount cached tools for one MCP server, skipping exact names already
+    /// present in this Agent. Returns the number of wrappers added.
+    ///
+    /// Runtime trust/test controls use this shared seam so repeated commands
+    /// cannot duplicate provider-visible tool definitions (bd-vjfol).
+    #[must_use]
+    pub fn mount_mcp_server_tools_if_absent(&mut self, server_name: &str) -> usize {
+        let Some(manager) = self.mcp_manager.clone() else {
+            return 0;
+        };
+        let mut wrappers = crate::mcp::mount_server_tools(&manager, server_name);
+        wrappers.retain(|tool| !self.session.agent.has_tool(tool.name()));
+        let mounted = wrappers.len();
+        self.session.agent.extend_tools(wrappers);
+        mounted
+    }
+
+    /// Start acknowledged MCP servers and mount their cached tools into this
+    /// exact Agent. Session replacement calls this only after the previous
+    /// handle has been dropped, preventing overlapping singleton transports.
+    pub(crate) async fn activate_mcp(&mut self) {
+        let Some(manager) = self.mcp_manager.clone() else {
+            return;
+        };
+        let mut wrappers = crate::mcp::connect_trusted_and_mount_tools(&manager).await;
+        wrappers.retain(|tool| !self.session.agent.has_tool(tool.name()));
+        self.session.agent.extend_tools(wrappers);
     }
 
     /// Send one user prompt through the agent loop.
@@ -1828,8 +1890,22 @@ fn build_stream_options_with_optional_key(
 ///
 /// This is the programmatic entrypoint for non-CLI consumers that want to run
 /// Pi sessions in-process.
-#[allow(clippy::too_many_lines)]
 pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessionHandle> {
+    let mut handle = create_agent_session_deferred_mcp(options).await?;
+    handle.activate_mcp().await;
+    Ok(handle)
+}
+
+/// Build a session without starting acknowledged MCP transports.
+///
+/// The default FTUI uses this only for atomic `/new` and `/resume` handoff:
+/// construct every fallible session component first, drop the old handle,
+/// then call [`AgentSessionHandle::activate_mcp`] so singleton MCP servers
+/// are never live in both sessions at once (bd-vjfol).
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn create_agent_session_deferred_mcp(
+    options: SessionOptions,
+) -> Result<AgentSessionHandle> {
     let process_cwd =
         std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
     let cwd = options.working_directory.as_deref().map_or_else(
@@ -2080,8 +2156,36 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             if !options.persist_extension_permissions {
                 manager.set_policy_prompt_persistence(false);
             }
+            crate::extensions::apply_cli_flags(manager, &options.extension_flags).await?;
         }
     }
+
+    let mcp_manager = if let Some(mcp) = &options.mcp {
+        let global_dir = mcp.global_dir.clone().unwrap_or_else(Config::global_dir);
+        let manager = Arc::new(crate::mcp::McpManager::bootstrap(
+            &cwd,
+            &global_dir,
+            &mcp.config_paths,
+        )?);
+        if let Some(extension_manager) = agent_session
+            .extensions
+            .as_ref()
+            .map(ExtensionRegion::manager)
+        {
+            for spec in extension_manager.extension_mcp_servers() {
+                let name = spec
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    manager.register_extension_server(name, &spec);
+                }
+            }
+        }
+        Some(manager)
+    } else {
+        None
+    };
 
     agent_session.set_model_registry(model_registry.clone());
     agent_session.set_auth_storage(auth);
@@ -2110,6 +2214,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         listeners,
         ask_tool: ask_tool_handle,
         workspace: options.workspace.clone(),
+        mcp_manager,
     })
 }
 
@@ -2989,6 +3094,8 @@ mod tests {
         assert!(options.extension_ui_handler.is_none());
         assert!(options.persist_extension_permissions);
         assert!(options.compaction_settings.is_none());
+        assert!(options.mcp.is_none());
+        assert!(options.extension_flags.is_empty());
     }
 
     #[test]
