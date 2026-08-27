@@ -15,7 +15,8 @@
 use crate::auth::AuthStorage;
 use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{
-    CompactionAdmissionReason, CompactionAdmissionSignals, CompactionQuota, CompactionWorkerState,
+    CompactionAdmissionReason, CompactionAdmissionSignals, CompactionOrigin, CompactionQuota,
+    CompactionWorkerState,
 };
 use crate::error::{Error, Result};
 use crate::extension_events::{
@@ -1888,6 +1889,17 @@ impl Agent {
     /// Install the model-catalog-selected tool-call dialect.
     pub const fn set_tool_call_dialect(&mut self, dialect: crate::dialects::Dialect) {
         self.tool_call_dialect = dialect;
+    }
+
+    /// Install whether the active model accepts image inputs.
+    pub const fn set_model_accepts_images(&mut self, accepts_images: bool) {
+        self.config.model_accepts_images = accepts_images;
+    }
+
+    /// Whether the active model accepts image inputs.
+    #[must_use]
+    pub const fn model_accepts_images(&self) -> bool {
+        self.config.model_accepts_images
     }
 
     /// The model-catalog-selected tool-call dialect.
@@ -5197,6 +5209,84 @@ pub struct AgentSession {
     auth_storage: Option<AuthStorage>,
     api_key_override: Option<String>,
     semantic_context_bundle: Option<SemanticContextBundleInjection>,
+    /// One process-local authority for provider admission and transition
+    /// quarantine. Extension hostcalls hold its permit across the complete
+    /// provider future; model/session transitions hold it across persistence
+    /// and live installation, so a check cannot race provider entry.
+    provider_admission: ProviderAdmissionGate,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderAdmissionGate {
+    permit: Arc<Mutex<()>>,
+    reason: Arc<StdMutex<Option<String>>>,
+}
+
+impl Default for ProviderAdmissionGate {
+    fn default() -> Self {
+        Self {
+            permit: Arc::new(Mutex::new(())),
+            reason: Arc::new(StdMutex::new(None)),
+        }
+    }
+}
+
+impl ProviderAdmissionGate {
+    pub(crate) fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn ensure_allowed(&self) -> Result<()> {
+        if let Some(reason) = self.reason() {
+            return Err(Error::session_persistence(format!(
+                "provider re-entry is quarantined after an indeterminate Session transition: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn block(&self, reason: String) {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    }
+
+    pub(crate) fn clear(&self) {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub(crate) async fn acquire(&self, cx: &asupersync::Cx) -> Result<OwnedMutexGuard<()>> {
+        OwnedMutexGuard::lock(Arc::clone(&self.permit), cx)
+            .await
+            .map_err(|err| Error::session(format!("provider admission lock failed: {err}")))
+    }
+
+    pub(crate) async fn begin_transition(
+        &self,
+        reason: String,
+        cx: &asupersync::Cx,
+    ) -> Result<OwnedMutexGuard<()>> {
+        let permit = self.acquire(cx).await?;
+        self.ensure_allowed()?;
+        self.block(reason);
+        Ok(permit)
+    }
+}
+
+struct PreparedModelSelection {
+    entry: Option<ModelEntry>,
+    provider: Option<Arc<dyn Provider>>,
+    resolved_key: Option<String>,
+    provider_id: String,
+    model_id: String,
+    thinking_level: crate::model::ThinkingLevel,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5299,6 +5389,7 @@ struct AgentSessionHostActions {
     is_turn_active: Arc<AtomicBool>,
     pending_idle_actions: Arc<StdMutex<VecDeque<PendingIdleAction>>>,
     ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
+    provider_admission: ProviderAdmissionGate,
 }
 
 #[derive(Clone)]
@@ -5309,6 +5400,13 @@ struct ExtensionAiCompletionHostState {
 }
 
 impl AgentSessionHostActions {
+    async fn acquire_provider_admission(&self) -> Result<OwnedMutexGuard<()>> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let permit = self.provider_admission.acquire(cx.cx()).await?;
+        self.provider_admission.ensure_allowed()?;
+        Ok(permit)
+    }
+
     fn enqueue(&self, deliver_as: Option<ExtensionDeliverAs>, message: Message) {
         let deliver_as = deliver_as.unwrap_or(ExtensionDeliverAs::Steer);
         let Ok(mut queue) = self.injected.lock() else {
@@ -5398,6 +5496,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
     }
 
     async fn complete_ai(&self, request: ExtensionAiCompletionRequest) -> Result<Value> {
+        let _provider_admission = self.acquire_provider_admission().await?;
         let (provider, mut stream_options) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
@@ -5470,6 +5569,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
     }
 
     async fn compact_session(&self, preparation: Value) -> Result<Value> {
+        let _provider_admission = self.acquire_provider_admission().await?;
         // gh #167 / bd-i28yz: bridge ctx.compact() / pi-coding-agent
         // compact() to the native compaction engine. The preparation JSON is
         // untrusted extension input; the strict deserializer rejects
@@ -5505,6 +5605,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
     }
 
     async fn compact_session_native(&self, preparation: Value, request: Value) -> Result<Value> {
+        let _provider_admission = self.acquire_provider_admission().await?;
         // gh #167: host-mediated native-Responses compaction. The extension
         // composes the compact request (so replay chains of previously
         // stored windows keep working) but the host owns endpoint + auth:
@@ -7389,6 +7490,7 @@ mod extensions_integration_tests {
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
                 })),
+                provider_admission: ProviderAdmissionGate::default(),
             };
 
             let hold_cx = crate::agent_cx::AgentCx::for_request();
@@ -7517,6 +7619,7 @@ mod extensions_integration_tests {
                         "api": "test-api",
                     })],
                 })),
+                provider_admission: ProviderAdmissionGate::default(),
             };
 
             let result = actions
@@ -7566,6 +7669,27 @@ mod extensions_integration_tests {
 
             let models = actions.list_ai_models().await.expect("list models");
             assert_eq!(models[0]["id"], json!("capture-model"));
+
+            actions
+                .provider_admission
+                .block("test quarantine".to_string());
+            let blocked = actions
+                .complete_ai(ExtensionAiCompletionRequest {
+                    model: json!({ "id": "capture-model" }),
+                    context: json!({
+                        "messages": [{ "role": "user", "content": "blocked" }]
+                    }),
+                    options: json!({}),
+                    simple: true,
+                })
+                .await
+                .expect_err("quarantined host action must not call the provider");
+            assert!(blocked.is_session_persistence());
+            assert_eq!(
+                calls.lock().expect("calls lock").len(),
+                1,
+                "quarantine must reject before provider.stream"
+            );
         });
     }
 
@@ -7598,6 +7722,7 @@ mod extensions_integration_tests {
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
                 })),
+                provider_admission: ProviderAdmissionGate::default(),
             };
 
             let preparation = json!({
@@ -7815,6 +7940,7 @@ mod extensions_integration_tests {
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
                 })),
+                provider_admission: ProviderAdmissionGate::default(),
             };
 
             let preparation = json!({
@@ -10959,6 +11085,7 @@ impl AgentSession {
             auth_storage: None,
             api_key_override: None,
             semantic_context_bundle: None,
+            provider_admission: ProviderAdmissionGate::default(),
         }
     }
 
@@ -11079,80 +11206,218 @@ impl AgentSession {
         &self.compaction_settings
     }
 
-    pub async fn set_provider_model(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
-        let already_active = {
-            let provider = self.agent.provider();
-            provider.name().eq(provider_id) && provider.model_id().eq(model_id)
+    pub(crate) fn provider_admission_gate(&self) -> ProviderAdmissionGate {
+        self.provider_admission.clone()
+    }
+
+    pub(crate) fn ensure_provider_reentry_allowed(&self) -> Result<()> {
+        self.provider_admission.ensure_allowed()
+    }
+
+    fn quarantine_provider_reentry(&self, reason: String) {
+        self.provider_admission.block(reason);
+    }
+
+    fn clear_provider_reentry_quarantine(&self) {
+        self.provider_admission.clear();
+    }
+
+    fn prepare_model_selection(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        requested_thinking: crate::model::ThinkingLevel,
+    ) -> Result<PreparedModelSelection> {
+        let active_provider = self.agent.provider();
+        let requested_matches_active =
+            active_provider.name().eq(provider_id) && active_provider.model_id().eq(model_id);
+        let entry = self
+            .model_registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider_id, model_id));
+
+        let Some(entry) = entry else {
+            if !requested_matches_active {
+                return Err(Error::validation(format!(
+                    "Unable to switch provider/model to {provider_id}/{model_id}"
+                )));
+            }
+            return Ok(PreparedModelSelection {
+                entry: None,
+                provider: None,
+                resolved_key: self.agent.stream_options().api_key.clone(),
+                provider_id: active_provider.name().to_string(),
+                model_id: active_provider.model_id().to_string(),
+                thinking_level: requested_thinking,
+            });
         };
+
+        let canonical_provider_id = entry.model.provider.clone();
+        let canonical_model_id = entry.model.id.clone();
+        let already_active = active_provider.name().eq(&canonical_provider_id)
+            && active_provider.model_id().eq(&canonical_model_id);
+        let requires_credential = model_requires_configured_credential(&entry);
+        let resolved_key = self.resolve_stream_api_key_for_model(&entry).or_else(|| {
+            (already_active && requires_credential)
+                .then(|| self.agent.stream_options().api_key.clone())
+                .flatten()
+        });
+        if requires_credential && resolved_key.is_none() {
+            return Err(Error::auth(format!(
+                "Missing credentials for {provider_id}/{model_id}"
+            )));
+        }
+        let provider = if already_active {
+            None
+        } else {
+            Some(
+                crate::providers::create_provider(
+                    &entry,
+                    self.extensions.as_ref().map(ExtensionRegion::manager),
+                )
+                .map_err(|e| {
+                    Error::validation(format!(
+                        "Unable to switch provider/model to {provider_id}/{model_id}: {e}"
+                    ))
+                })?,
+            )
+        };
+        let thinking_level = entry.clamp_thinking_level(requested_thinking);
+
+        Ok(PreparedModelSelection {
+            entry: Some(entry),
+            provider,
+            resolved_key,
+            provider_id: canonical_provider_id,
+            model_id: canonical_model_id,
+            thinking_level,
+        })
+    }
+
+    fn install_prepared_model_selection(&mut self, prepared: PreparedModelSelection) {
+        let active_provider = self.agent.provider();
+        if active_provider.name() != prepared.provider_id
+            || active_provider.model_id() != prepared.model_id
+        {
+            self.invalidate_background_compaction();
+        }
+        let PreparedModelSelection {
+            entry,
+            provider,
+            resolved_key,
+            provider_id,
+            model_id,
+            thinking_level,
+        } = prepared;
+        if let Some(provider) = provider {
+            tracing::info!("Updating agent provider to {provider_id}/{model_id}");
+            self.agent.set_provider(provider);
+        }
+
+        if let Some(entry) = entry {
+            self.agent.set_keyword_max_thinking_level(
+                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+            );
+            self.agent.set_tool_call_dialect(entry.tool_call_dialect());
+            self.agent.set_model_accepts_images(
+                entry
+                    .model
+                    .input
+                    .contains(&crate::provider::InputType::Image),
+            );
+            {
+                let stream_options = self.agent.stream_options_mut();
+                stream_options.api_key = resolved_key;
+                stream_options.headers.clone_from(&entry.headers);
+                stream_options.max_tokens = Some(entry.model.max_tokens);
+                stream_options.thinking_level = Some(thinking_level);
+            }
+            self.set_compaction_context_window(if entry.model.context_window == 0 {
+                ResolvedCompactionSettings::default().context_window_tokens
+            } else {
+                entry.model.context_window
+            });
+        } else {
+            self.agent.stream_options_mut().thinking_level = Some(thinking_level);
+        }
+
+        if let Some(region) = &self.extensions {
+            region
+                .manager()
+                .set_current_model(Some(provider_id), Some(model_id));
+        }
+        self.refresh_extension_completion_host_state();
+    }
+
+    pub async fn set_provider_model(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
+        self.ensure_provider_reentry_allowed()?;
         let current_thinking = self
             .agent
             .stream_options()
             .thinking_level
             .unwrap_or_default();
+        let prepared = self.prepare_model_selection(provider_id, model_id, current_thinking)?;
+        let target_provider_id = prepared.provider_id.clone();
+        let target_model_id = prepared.model_id.clone();
+        let next_thinking = prepared.thinking_level;
+        let active_provider = self.agent.provider();
+        let runtime_model_changed = active_provider.name() != target_provider_id
+            || active_provider.model_id() != target_model_id;
 
-        let target_entry = self
-            .model_registry
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let save_enabled = self.save_enabled;
+        let session_store = Arc::clone(&self.session);
+        let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = session.clone();
+        let previous_model = candidate.effective_model_for_current_path();
+        let previous_thinking = candidate
+            .effective_thinking_level_for_current_path()
+            .as_deref()
+            .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
+        if previous_model
             .as_ref()
-            .and_then(|registry| registry.find(provider_id, model_id));
-        let next_thinking = if let Some(target_entry) = target_entry {
-            let resolved_key = self.resolve_stream_api_key_for_model(&target_entry);
-            if !already_active
-                && model_requires_configured_credential(&target_entry)
-                && resolved_key.is_none()
-            {
-                return Err(Error::auth(format!(
-                    "Missing credentials for {provider_id}/{model_id}"
-                )));
-            }
-            self.clamp_thinking_level_for_model(provider_id, model_id, current_thinking)
-        } else if already_active {
-            current_thinking
-        } else {
-            return Err(Error::validation(format!(
-                "Unable to switch provider/model to {provider_id}/{model_id}"
-            )));
-        };
-
-        if !already_active {
-            self.apply_session_model_selection(provider_id, model_id)?;
-        }
-        self.agent.stream_options_mut().thinking_level = Some(next_thinking);
-        let keyword_max = self.keyword_max_thinking_level_for_model(provider_id, model_id);
-        self.agent.set_keyword_max_thinking_level(keyword_max);
-        let dialect = self.tool_call_dialect_for_model(provider_id, model_id);
-        self.agent.set_tool_call_dialect(dialect);
-        self.refresh_extension_completion_host_state();
-
+            .map(|(provider, model_id)| (provider.as_str(), model_id.as_str()))
+            != Some((target_provider_id.as_str(), target_model_id.as_str()))
         {
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            let previous_model = session.effective_model_for_current_path();
-            let previous_thinking = session
-                .effective_thinking_level_for_current_path()
-                .as_deref()
-                .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
-            if previous_model
-                .as_ref()
-                .map(|(provider, model_id)| (provider.as_str(), model_id.as_str()))
-                != Some((provider_id, model_id))
+            candidate.append_model_change(target_provider_id.clone(), target_model_id.clone());
+        }
+        candidate.set_model_header(
+            Some(target_provider_id),
+            Some(target_model_id),
+            Some(next_thinking.to_string()),
+        );
+        if !previous_thinking.is_some_and(|previous| previous.eq(&next_thinking)) {
+            candidate.append_thinking_level_change(next_thinking.to_string());
+        }
+        if runtime_model_changed {
+            self.invalidate_background_compaction();
+        }
+        let _provider_transition = self
+            .provider_admission
+            .begin_transition(
+                "model selection persistence was interrupted before live installation completed"
+                    .to_string(),
+                cx.cx(),
+            )
+            .await?;
+        if save_enabled {
+            if let Err(first_err) = candidate.save().await
+                && let Err(retry_err) = candidate.save().await
             {
-                session.append_model_change(provider_id.to_string(), model_id.to_string());
-            }
-            session.set_model_header(
-                Some(provider_id.to_string()),
-                Some(model_id.to_string()),
-                Some(next_thinking.to_string()),
-            );
-            if !previous_thinking.is_some_and(|previous| previous.eq(&next_thinking)) {
-                session.append_thinking_level_change(next_thinking.to_string());
+                let reason = format!(
+                    "model selection persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                );
+                self.quarantine_provider_reentry(reason.clone());
+                return Err(Error::session_persistence(reason));
             }
         }
-
-        self.persist_session().await
+        *session = candidate;
+        drop(session);
+        self.install_prepared_model_selection(prepared);
+        self.clear_provider_reentry_quarantine();
+        Ok(())
     }
 
     /// Update the thinking/reasoning level for this session at runtime.
@@ -11164,36 +11429,62 @@ impl AgentSession {
     /// callable directly on an [`AgentSession`] (e.g. from the ACP transport,
     /// which holds an `AgentSession` rather than an SDK handle).
     pub async fn set_thinking_level(&mut self, level: crate::model::ThinkingLevel) -> Result<()> {
+        self.ensure_provider_reentry_allowed()?;
         let cx = crate::agent_cx::AgentCx::for_request();
-        let (effective_level, changed) = {
-            let mut guard = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            let (provider_id, model_id) =
-                guard.effective_model_for_current_path().unwrap_or_else(|| {
+        let save_enabled = self.save_enabled;
+        let session_store = Arc::clone(&self.session);
+        let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = session.clone();
+        let (provider_id, model_id) =
+            candidate
+                .effective_model_for_current_path()
+                .unwrap_or_else(|| {
                     let provider = self.agent.provider();
                     (provider.name().to_string(), provider.model_id().to_string())
                 });
-            let effective_level =
-                self.clamp_thinking_level_for_model(&provider_id, &model_id, level);
-            let level_string = effective_level.to_string();
-            let changed = guard.effective_thinking_level_for_current_path().as_deref()
-                != Some(level_string.as_str());
-            guard.set_model_header(None, None, Some(level_string.clone()));
-            if changed {
-                guard.append_thinking_level_change(level_string);
-            }
-            (effective_level, changed)
+        let effective_level = self.clamp_thinking_level_for_model(&provider_id, &model_id, level);
+        let level_string = effective_level.to_string();
+        let changed = candidate
+            .effective_thinking_level_for_current_path()
+            .as_deref()
+            != Some(level_string.as_str());
+        candidate.set_model_header(None, None, Some(level_string.clone()));
+        if changed {
+            candidate.append_thinking_level_change(level_string);
+        }
+        let _provider_transition = if changed {
+            Some(
+                self.provider_admission
+                    .begin_transition(
+                        "thinking-level persistence was interrupted before live installation completed"
+                            .to_string(),
+                        cx.cx(),
+                    )
+                    .await?,
+            )
+        } else {
+            None
         };
+        if save_enabled && changed {
+            if let Err(first_err) = candidate.save().await
+                && let Err(retry_err) = candidate.save().await
+            {
+                let reason = format!(
+                    "thinking-level persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                );
+                self.quarantine_provider_reentry(reason.clone());
+                return Err(Error::session_persistence(reason));
+            }
+        };
+        *session = candidate;
         self.agent.stream_options_mut().thinking_level = Some(effective_level);
         self.refresh_extension_completion_host_state();
         if changed {
-            self.persist_session().await
-        } else {
-            Ok(())
+            self.clear_provider_reentry_quarantine();
         }
+        Ok(())
     }
 
     pub(crate) fn clamp_thinking_level_for_model(
@@ -11206,33 +11497,6 @@ impl AgentSession {
             .as_ref()
             .and_then(|registry| registry.find(provider_id, model_id))
             .map_or(level, |entry| entry.clamp_thinking_level(level))
-    }
-
-    fn keyword_max_thinking_level_for_model(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-    ) -> crate::model::ThinkingLevel {
-        self.model_registry
-            .as_ref()
-            .and_then(|registry| registry.find(provider_id, model_id))
-            .map_or(self.agent.keyword_max_thinking_level, |entry| {
-                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
-            })
-    }
-
-    fn tool_call_dialect_for_model(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-    ) -> crate::dialects::Dialect {
-        self.model_registry
-            .as_ref()
-            .and_then(|registry| registry.find(provider_id, model_id))
-            .map_or_else(
-                || self.agent.tool_call_dialect(),
-                |entry| entry.tool_call_dialect(),
-            )
     }
 
     fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Option<String> {
@@ -11253,30 +11517,20 @@ impl AgentSession {
     }
 
     pub(crate) async fn sync_runtime_selection_from_session_header(&mut self) -> Result<()> {
-        let session_state = {
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            (
-                session.effective_model_for_current_path(),
-                session.effective_thinking_level_for_current_path(),
-            )
-        };
-
-        let (session_model, session_thinking) = session_state;
+        self.ensure_provider_reentry_allowed()?;
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session_store = Arc::clone(&self.session);
+        let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = session.clone();
+        let session_model = candidate.effective_model_for_current_path();
+        let session_thinking = candidate.effective_thinking_level_for_current_path();
         let current_thinking = self
             .agent
             .stream_options()
             .thinking_level
             .unwrap_or_default();
-
-        if let Some((provider_id, model_id)) = session_model.as_ref() {
-            self.apply_session_model_selection(provider_id, model_id)?;
-        }
-
         let parsed_session_thinking = session_thinking.as_deref().and_then(|raw| {
             raw.parse::<crate::model::ThinkingLevel>().map_or_else(
                 |_| {
@@ -11287,117 +11541,103 @@ impl AgentSession {
             )
         });
         let requested = parsed_session_thinking.unwrap_or(current_thinking);
-
-        let (active_provider_id, active_model_id) = session_model.clone().unwrap_or_else(|| {
+        let (requested_provider_id, requested_model_id) = session_model.unwrap_or_else(|| {
             let provider = self.agent.provider();
             (provider.name().to_string(), provider.model_id().to_string())
         });
-        let effective =
-            self.clamp_thinking_level_for_model(&active_provider_id, &active_model_id, requested);
-        let keyword_max =
-            self.keyword_max_thinking_level_for_model(&active_provider_id, &active_model_id);
-        let dialect = self.tool_call_dialect_for_model(&active_provider_id, &active_model_id);
+        let prepared =
+            self.prepare_model_selection(&requested_provider_id, &requested_model_id, requested)?;
+        let canonical_provider_id = prepared.provider_id.clone();
+        let canonical_model_id = prepared.model_id.clone();
+        let effective = prepared.thinking_level;
+        let effective_string = effective.to_string();
+        let active_provider = self.agent.provider();
+        let runtime_model_changed = active_provider.name() != canonical_provider_id
+            || active_provider.model_id() != canonical_model_id;
 
-        self.agent.stream_options_mut().thinking_level = Some(effective);
-        self.agent.set_keyword_max_thinking_level(keyword_max);
-        self.agent.set_tool_call_dialect(dialect);
-        self.refresh_extension_completion_host_state();
+        let previous_model = candidate.effective_model_for_current_path();
+        let previous_thinking = candidate
+            .effective_thinking_level_for_current_path()
+            .as_deref()
+            .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
+        let model_changed = previous_model
+            .as_ref()
+            .map(|(provider, model_id)| (provider.as_str(), model_id.as_str()))
+            != Some((canonical_provider_id.as_str(), canonical_model_id.as_str()));
+        let thinking_changed = !previous_thinking.is_some_and(|level| level.eq(&effective));
+        let header_changed = candidate.header.provider.as_deref()
+            != Some(canonical_provider_id.as_str())
+            || candidate.header.model_id.as_deref() != Some(canonical_model_id.as_str())
+            || candidate.header.thinking_level.as_deref() != Some(effective_string.as_str());
 
-        let thinking_changed = !effective.eq(&current_thinking);
-        let persist_needed = if session_thinking.is_some() {
-            !parsed_session_thinking.is_some_and(|parsed| parsed.eq(&effective))
-        } else {
-            thinking_changed
-        };
-        if !persist_needed {
-            return Ok(());
+        if model_changed {
+            candidate
+                .append_model_change(canonical_provider_id.clone(), canonical_model_id.clone());
+        }
+        candidate.set_model_header(
+            Some(canonical_provider_id),
+            Some(canonical_model_id),
+            Some(effective_string.clone()),
+        );
+        if thinking_changed {
+            candidate.append_thinking_level_change(effective_string);
         }
 
-        {
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            let previous_thinking = session
-                .header
-                .thinking_level
-                .as_deref()
-                .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
-            session.set_model_header(None, None, Some(effective.to_string()));
-            if thinking_changed
-                && !previous_thinking.is_some_and(|previous| previous.eq(&effective))
+        let persist_needed = model_changed || thinking_changed || header_changed;
+        let save_enabled = self.save_enabled;
+        if runtime_model_changed {
+            self.invalidate_background_compaction();
+        }
+        let _provider_transition = self
+            .provider_admission
+            .begin_transition(
+                "Session-header synchronization persistence was interrupted before live installation completed"
+                    .to_string(),
+                cx.cx(),
+            )
+            .await?;
+        if save_enabled && persist_needed {
+            if let Err(first_err) = candidate.save().await
+                && let Err(retry_err) = candidate.save().await
             {
-                session.append_thinking_level_change(effective.to_string());
+                let reason = format!(
+                    "Session-header synchronization persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                );
+                self.quarantine_provider_reentry(reason.clone());
+                return Err(Error::session_persistence(reason));
             }
         }
 
-        self.persist_session().await
-    }
-
-    fn apply_session_model_selection(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
-        if self.agent.provider().name().eq(provider_id)
-            && self.agent.provider().model_id().eq(model_id)
-        {
-            return Ok(());
-        }
-
-        let Some(registry) = &self.model_registry else {
-            return Err(Error::validation(format!(
-                "Unable to switch provider/model to {provider_id}/{model_id}"
-            )));
-        };
-
-        let Some(entry) = registry.find(provider_id, model_id) else {
-            return Err(Error::validation(format!(
-                "Unable to switch provider/model to {provider_id}/{model_id}"
-            )));
-        };
-
-        let resolved_key = self.resolve_stream_api_key_for_model(&entry);
-        if model_requires_configured_credential(&entry) && resolved_key.is_none() {
-            return Err(Error::auth(format!(
-                "Missing credentials for {provider_id}/{model_id}"
-            )));
-        }
-
-        match crate::providers::create_provider(
-            &entry,
-            self.extensions.as_ref().map(ExtensionRegion::manager),
-        ) {
-            Ok(provider) => {
-                tracing::info!("Updating agent provider to {provider_id}/{model_id}");
-                self.agent.set_provider(provider);
-
-                let stream_options = self.agent.stream_options_mut();
-                stream_options.api_key.clone_from(&resolved_key);
-                stream_options.headers.clone_from(&entry.headers);
-                // Track the new model's configured output cap so a runtime
-                // model switch (e.g. RPC `set_model`) honors its registry
-                // `maxTokens` instead of carrying over the previous model's
-                // limit or falling back to the provider default.
-                stream_options.max_tokens = Some(entry.model.max_tokens);
-                self.refresh_extension_completion_host_state();
-                // gh #167: bump the extension ctx generation so handlers see
-                // the fresh ctx.model instead of a cached payload built for
-                // the previous model.
-                if let Some(region) = &self.extensions {
-                    region.manager().set_current_model(
-                        Some(provider_id.to_string()),
-                        Some(model_id.to_string()),
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => Err(Error::validation(format!(
-                "Unable to switch provider/model to {provider_id}/{model_id}: {e}"
-            ))),
-        }
+        *session = candidate;
+        drop(session);
+        self.install_prepared_model_selection(prepared);
+        self.clear_provider_reentry_quarantine();
+        Ok(())
     }
 
     pub const fn save_enabled(&self) -> bool {
         self.save_enabled
+    }
+
+    pub(crate) fn invalidate_background_compaction(&mut self) {
+        self.compaction_worker.invalidate_for_context_switch();
+        self.extensions_is_compacting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {
+        let provider = self.agent.provider();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(CompactionOrigin {
+            session_id: session.header.id.clone(),
+            provider_id: provider.name().to_string(),
+            model_id: provider.model_id().to_string(),
+        })
     }
 
     /// Force-run compaction synchronously (used by `/compact` slash command).
@@ -11405,6 +11645,7 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
+        self.ensure_provider_reentry_allowed()?;
         self.compact_synchronous(Arc::new(on_event)).await
     }
 
@@ -11427,6 +11668,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<Value> {
+        self.ensure_provider_reentry_allowed()?;
         let manager = self
             .extensions
             .as_ref()
@@ -11473,13 +11715,65 @@ impl AgentSession {
         }
 
         // Phase 1: apply completed background result.
-        if let Some(outcome) = self.compaction_worker.try_recv().await {
+        if let Some((origin, outcome)) = self.compaction_worker.try_recv_bound().await {
             self.extensions_is_compacting
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            let current_origin = self.current_compaction_origin().await?;
+            if origin.as_ref() != Some(&current_origin) {
+                let origin_description = origin.map_or_else(
+                    || "missing origin metadata".to_string(),
+                    |origin| {
+                        format!(
+                            "session {}/{}/{}",
+                            origin.session_id, origin.provider_id, origin.model_id
+                        )
+                    },
+                );
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: true,
+                    will_retry: false,
+                    error_message: Some(format!(
+                        "Discarded stale background compaction from {origin_description}; current context is session {}/{}/{}",
+                        current_origin.session_id,
+                        current_origin.provider_id,
+                        current_origin.model_id
+                    )),
+                });
+                return Ok(());
+            }
             match outcome {
                 Ok(result) => {
-                    self.apply_compaction_result(result, Arc::clone(&on_event))
-                        .await?;
+                    let _compacting_guard =
+                        AtomicBoolGuard::activate(&self.extensions_is_compacting);
+                    let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                    let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
+                        Ok(provider_admission) => provider_admission,
+                        Err(err) => {
+                            on_event(AgentEvent::AutoCompactionEnd {
+                                result: None,
+                                aborted: false,
+                                will_retry: false,
+                                error_message: Some(err.to_string()),
+                            });
+                            return Err(err);
+                        }
+                    };
+                    if let Err(err) = self.provider_admission.ensure_allowed() {
+                        on_event(AgentEvent::AutoCompactionEnd {
+                            result: None,
+                            aborted: false,
+                            will_retry: false,
+                            error_message: Some(err.to_string()),
+                        });
+                        return Err(err);
+                    }
+                    self.apply_compaction_result(
+                        result,
+                        Arc::clone(&on_event),
+                        &provider_admission,
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     on_event(AgentEvent::AutoCompactionEnd {
@@ -11545,8 +11839,20 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
-                self.extensions_is_compacting
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
+                    Ok(provider_admission) => provider_admission,
+                    Err(err) => {
+                        on_event(AgentEvent::AutoCompactionEnd {
+                            result: None,
+                            aborted: false,
+                            will_retry: false,
+                            error_message: Some(err.to_string()),
+                        });
+                        return Err(err);
+                    }
+                };
                 let apply_result = self
                     .apply_compaction_entry(
                         compaction.summary.clone(),
@@ -11554,11 +11860,21 @@ impl AgentSession {
                         compaction.tokens_before,
                         compaction.details.clone(),
                         true,
+                        &provider_admission,
                     )
                     .await;
-                self.extensions_is_compacting
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                let tokens_after = apply_result?;
+                let tokens_after = match apply_result {
+                    Ok(tokens_after) => tokens_after,
+                    Err(err) => {
+                        on_event(AgentEvent::AutoCompactionEnd {
+                            result: None,
+                            aborted: false,
+                            will_retry: false,
+                            error_message: Some(err.to_string()),
+                        });
+                        return Err(err);
+                    }
+                };
                 let result_value = Some(Self::auto_compaction_result_payload(
                     compaction.summary,
                     compaction.first_kept_entry_id,
@@ -11596,10 +11912,51 @@ impl AgentSession {
                 }
             };
 
-            self.compaction_worker
-                .start(&runtime_handle, prep, provider, credential, None);
+            let origin = match self.current_compaction_origin().await {
+                Ok(origin) => origin,
+                Err(err) => {
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(err.to_string()),
+                    });
+                    return Err(err);
+                }
+            };
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let provider_permit = match self.provider_admission.acquire(cx.cx()).await {
+                Ok(provider_permit) => provider_permit,
+                Err(err) => {
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(err.to_string()),
+                    });
+                    return Err(err);
+                }
+            };
+            if let Err(err) = self.provider_admission.ensure_allowed() {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(err.to_string()),
+                });
+                return Err(err);
+            }
             self.extensions_is_compacting
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.compaction_worker.start_for_origin(
+                origin,
+                provider_permit,
+                &runtime_handle,
+                prep,
+                provider,
+                credential,
+                None,
+            );
         }
 
         Ok(())
@@ -11659,13 +12016,23 @@ impl AgentSession {
         });
 
         let result = compaction::compact_local(prep);
-        self.extensions_is_compacting
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
+            Ok(provider_admission) => provider_admission,
+            Err(err) => {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(err.to_string()),
+                });
+                return Err(err);
+            }
+        };
         let apply_result = self
-            .apply_compaction_result(result, Arc::clone(&on_event))
+            .apply_compaction_result(result, Arc::clone(&on_event), &provider_admission)
             .await;
-        self.extensions_is_compacting
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         apply_result
     }
 
@@ -11716,14 +12083,17 @@ impl AgentSession {
         tokens_before: u64,
         details: Option<Value>,
         from_extension: bool,
+        _provider_admission: &OwnedMutexGuard<()>,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
+        self.provider_admission.ensure_allowed()?;
+        let mut candidate = session.clone();
 
         let from_hook = if from_extension { Some(true) } else { None };
-        let entry_id = session.append_compaction(
+        let entry_id = candidate.append_compaction(
             summary,
             first_kept_entry_id,
             tokens_before,
@@ -11732,24 +12102,38 @@ impl AgentSession {
         );
 
         if self.save_enabled {
-            session
-                .flush_autosave(AutosaveFlushTrigger::Periodic)
-                .await?;
+            self.provider_admission.block(
+                "compaction persistence was interrupted before live installation completed"
+                    .to_string(),
+            );
+            if let Err(first_err) = candidate.save().await
+                && let Err(retry_err) = candidate.save().await
+            {
+                let reason = format!(
+                    "compaction persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                );
+                self.provider_admission.block(reason.clone());
+                return Err(Error::session_persistence(reason));
+            }
         }
 
         // Estimate the context the *next* provider request will see now that the
         // compacted history is written: the post-compaction current path via the
         // shared char-based heuristic, ignoring any retained assistant `usage`.
         let tokens_after =
-            compaction::estimate_entries_context_tokens(&session.entries_for_current_path());
+            compaction::estimate_entries_context_tokens(&candidate.entries_for_current_path());
 
-        let compaction_entry = session.get_entry(&entry_id).and_then(|entry| {
+        let compaction_entry = candidate.get_entry(&entry_id).and_then(|entry| {
             if let crate::session::SessionEntry::Compaction(compaction) = entry {
                 Some(compaction.clone())
             } else {
                 None
             }
         });
+        *session = candidate;
+        if self.save_enabled {
+            self.provider_admission.clear();
+        }
         drop(session);
 
         if let (Some(region), Some(compaction_entry)) = (&self.extensions, compaction_entry) {
@@ -11774,17 +12158,42 @@ impl AgentSession {
         &self,
         result: compaction::CompactionResult,
         on_event: AgentEventHandler,
+        provider_admission: &OwnedMutexGuard<()>,
     ) -> Result<()> {
-        let details = Some(compaction::compaction_details_to_value(&result.details)?);
-        let tokens_after = self
+        let details = match compaction::compaction_details_to_value(&result.details) {
+            Ok(details) => Some(details),
+            Err(err) => {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(err.to_string()),
+                });
+                return Err(err);
+            }
+        };
+        let tokens_after = match self
             .apply_compaction_entry(
                 result.summary.clone(),
                 result.first_kept_entry_id.clone(),
                 result.tokens_before,
                 details.clone(),
                 false,
+                provider_admission,
             )
-            .await?;
+            .await
+        {
+            Ok(tokens_after) => tokens_after,
+            Err(err) => {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(err.to_string()),
+                });
+                return Err(err);
+            }
+        };
 
         let result_value = Some(Self::auto_compaction_result_payload(
             result.summary,
@@ -11805,7 +12214,7 @@ impl AgentSession {
     }
 
     /// Run compaction synchronously (inline), blocking until completion.
-    async fn compact_synchronous(&self, on_event: AgentEventHandler) -> Result<()> {
+    async fn compact_synchronous(&mut self, on_event: AgentEventHandler) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
         }
@@ -11844,8 +12253,20 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
-                self.extensions_is_compacting
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
+                    Ok(provider_admission) => provider_admission,
+                    Err(err) => {
+                        on_event(AgentEvent::AutoCompactionEnd {
+                            result: None,
+                            aborted: false,
+                            will_retry: false,
+                            error_message: Some(err.to_string()),
+                        });
+                        return Err(err);
+                    }
+                };
                 let apply_result = self
                     .apply_compaction_entry(
                         compaction.summary.clone(),
@@ -11853,11 +12274,21 @@ impl AgentSession {
                         compaction.tokens_before,
                         compaction.details.clone(),
                         true,
+                        &provider_admission,
                     )
                     .await;
-                self.extensions_is_compacting
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                let tokens_after = apply_result?;
+                let tokens_after = match apply_result {
+                    Ok(tokens_after) => tokens_after,
+                    Err(err) => {
+                        on_event(AgentEvent::AutoCompactionEnd {
+                            result: None,
+                            aborted: false,
+                            will_retry: false,
+                            error_message: Some(err.to_string()),
+                        });
+                        return Err(err);
+                    }
+                };
                 let result_value = Some(Self::auto_compaction_result_payload(
                     compaction.summary,
                     compaction.first_kept_entry_id,
@@ -11873,8 +12304,6 @@ impl AgentSession {
                 });
                 return Ok(());
             }
-            self.extensions_is_compacting
-                .store(true, std::sync::atomic::Ordering::SeqCst);
 
             let provider = self.agent.provider();
             let credential = self
@@ -11884,14 +12313,40 @@ impl AgentSession {
                 .clone()
                 .unwrap_or_default();
 
+            self.invalidate_background_compaction();
+            let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
+                Ok(provider_admission) => provider_admission,
+                Err(err) => {
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(err.to_string()),
+                    });
+                    return Err(err);
+                }
+            };
+            if let Err(err) = self.provider_admission.ensure_allowed() {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(err.to_string()),
+                });
+                return Err(err);
+            }
             let compaction_result = compaction::compact(prep, provider, &credential, None).await;
-            self.extensions_is_compacting
-                .store(false, std::sync::atomic::Ordering::SeqCst);
 
             match compaction_result {
                 Ok(result) => {
-                    self.apply_compaction_result(result, Arc::clone(&on_event))
-                        .await?;
+                    self.apply_compaction_result(
+                        result,
+                        Arc::clone(&on_event),
+                        &provider_admission,
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     on_event(AgentEvent::AutoCompactionEnd {
@@ -12162,6 +12617,7 @@ impl AgentSession {
             is_turn_active: Arc::clone(&self.extensions_turn_active),
             pending_idle_actions: Arc::clone(&self.extensions_pending_idle_actions),
             ai_completion: Arc::clone(&self.extension_ai_completion),
+            provider_admission: self.provider_admission.clone(),
         };
         self.extension_queue_modes = Some(Arc::clone(&queue_modes));
         self.extension_injected_queue = Some(Arc::clone(&injected));
@@ -12378,6 +12834,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.ensure_provider_reentry_allowed()?;
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
             // Consume the one-shot provenance before extension dispatch so a
@@ -12453,6 +12910,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.ensure_provider_reentry_allowed()?;
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
             // See the text path above: provenance is one-shot even when an
@@ -12888,6 +13346,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.ensure_provider_reentry_allowed()?;
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
             let base_system_prompt = self.agent.system_prompt().map(str::to_string);
@@ -13185,6 +13644,7 @@ impl AgentSession {
         on_ready: impl FnOnce() -> bool + Send + 'static,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.ensure_provider_reentry_allowed()?;
         let on_event: AgentEventHandler = Arc::new(on_event);
         self.sync_runtime_selection_from_session_header().await?;
 
@@ -14007,7 +14467,10 @@ mod tests {
                 .expect("first notice");
             crate::jobs::push_completion_notice(&second_id, "second-session-notice")
                 .expect("second notice");
-            agent_session.agent.fetch_additive_follow_up_messages().await;
+            agent_session
+                .agent
+                .fetch_additive_follow_up_messages()
+                .await;
             assert!(
                 agent_session.agent.has_staged_follow_up(),
                 "the first owner's notice must be staged before the session switch"
@@ -14026,7 +14489,10 @@ mod tests {
                 stale_delivery.is_empty(),
                 "delivery-time owner validation must not expose the staged first-session notice"
             );
-            agent_session.agent.fetch_additive_follow_up_messages().await;
+            agent_session
+                .agent
+                .fetch_additive_follow_up_messages()
+                .await;
             let second_delivery = agent_session
                 .agent
                 .pop_follow_up_for_current_session()
@@ -14048,16 +14514,16 @@ mod tests {
                 let mut guard = session.lock(cx.cx()).await.expect("session lock");
                 guard.header.id.clone_from(&first_id);
             }
-            agent_session.agent.fetch_additive_follow_up_messages().await;
+            agent_session
+                .agent
+                .fetch_additive_follow_up_messages()
+                .await;
             let restored_first_delivery = agent_session
                 .agent
                 .pop_follow_up_for_current_session()
                 .await;
             assert_eq!(restored_first_delivery.len(), 1);
-            assert_user_text(
-                restored_first_delivery[0].message(),
-                "first-session-notice",
-            );
+            assert_user_text(restored_first_delivery[0].message(), "first-session-notice");
             assert!(crate::jobs::take_completion_notices(&first_id).is_empty());
             assert!(crate::jobs::take_completion_notices(&second_id).is_empty());
         });
@@ -14150,16 +14616,15 @@ mod tests {
             });
             agent.register_message_fetchers(None, Some(ordinary_fetcher));
             agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::All);
-            let mut agent_session = AgentSession::new(
-                agent,
-                session,
-                false,
-                ResolvedCompactionSettings::default(),
-            );
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             crate::jobs::push_completion_notice(&session_id, "bounded-job-notice")
                 .expect("job notice");
-            agent_session.agent.fetch_additive_follow_up_messages().await;
+            agent_session
+                .agent
+                .fetch_additive_follow_up_messages()
+                .await;
             let deliveries = agent_session.agent.message_queue.pop_follow_up();
             assert_eq!(deliveries.len(), MAX_FOLLOW_UP_QUEUE_SIZE + 1);
             assert!(deliveries.iter().any(|delivery| matches!(
@@ -14197,12 +14662,8 @@ mod tests {
             });
             agent.register_initial_follow_up_fetcher(owning_fetcher);
             agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::All);
-            let mut agent_session = AgentSession::new(
-                agent,
-                session,
-                false,
-                ResolvedCompactionSettings::default(),
-            );
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             crate::jobs::push_completion_notice(&session_id, "non-starved-job-notice")
                 .expect("job notice");
@@ -14231,12 +14692,8 @@ mod tests {
                 AgentConfig::default(),
             );
             agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::OneAtATime);
-            let mut agent_session = AgentSession::new(
-                agent,
-                session,
-                false,
-                ResolvedCompactionSettings::default(),
-            );
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             for round in 0..3 {
                 for index in 0..crate::jobs::MAX_COMPLETION_NOTICES_PER_SESSION {
@@ -16518,7 +16975,56 @@ mod tests {
     }
 
     #[test]
-    fn apply_session_model_selection_updates_stream_credentials_and_headers() {
+    fn provider_transition_waits_for_active_provider_permit() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let gate = ProviderAdmissionGate::default();
+            let active_cx = crate::agent_cx::AgentCx::for_request();
+            let active_provider = gate
+                .acquire(active_cx.cx())
+                .await
+                .expect("acquire active provider permit");
+
+            let transition_gate = gate.clone();
+            let transition = runtime_handle.spawn(async move {
+                let transition_cx = crate::agent_cx::AgentCx::for_request();
+                let permit = transition_gate
+                    .begin_transition(
+                        "test transition interrupted".to_string(),
+                        transition_cx.cx(),
+                    )
+                    .await
+                    .expect("begin transition");
+                drop(permit);
+            });
+
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(10),
+            )
+            .await;
+            assert!(
+                !transition.is_finished(),
+                "transition must not pass an active provider future"
+            );
+
+            drop(active_provider);
+            transition.await;
+            assert_eq!(
+                gate.reason().as_deref(),
+                Some("test transition interrupted")
+            );
+            gate.clear();
+            assert!(gate.reason().is_none());
+        });
+    }
+
+    #[test]
+    fn prepared_model_selection_updates_stream_credentials_and_headers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth_path = dir.path().join("auth.json");
         let mut auth = AuthStorage::load(auth_path).expect("load auth");
@@ -16536,9 +17042,10 @@ mod tests {
         );
 
         let mut agent_session = build_switch_test_session(&auth);
-        agent_session
-            .apply_session_model_selection("openai", "gpt-4o")
-            .expect("switch should update stream options");
+        let prepared = agent_session
+            .prepare_model_selection("openai", "gpt-4o", crate::model::ThinkingLevel::Off)
+            .expect("prepare switch");
+        agent_session.install_prepared_model_selection(prepared);
 
         assert_eq!(agent_session.agent.provider().name(), "openai");
         assert_eq!(agent_session.agent.provider().model_id(), "gpt-4o");
@@ -16553,7 +17060,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_session_model_selection_clears_stale_key_for_keyless_target() {
+    fn prepared_model_selection_clears_stale_key_for_keyless_target() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth_path = dir.path().join("auth.json");
         let mut auth = AuthStorage::load(auth_path).expect("load auth");
@@ -16593,9 +17100,14 @@ mod tests {
 
         let mut agent_session = build_switch_test_session(&auth);
         agent_session.set_model_registry(registry);
-        agent_session
-            .apply_session_model_selection("acme-local", "local-model")
-            .expect("keyless local model should still activate");
+        let prepared = agent_session
+            .prepare_model_selection(
+                "acme-local",
+                "local-model",
+                crate::model::ThinkingLevel::Off,
+            )
+            .expect("prepare keyless local model");
+        agent_session.install_prepared_model_selection(prepared);
 
         assert_eq!(agent_session.agent.provider().name(), "acme-local");
         assert_eq!(
@@ -16603,10 +17115,25 @@ mod tests {
             None,
             "stale key must be cleared when target model has no configured key"
         );
+
+        agent_session.agent.stream_options_mut().api_key = Some("stale-again".to_string());
+        let prepared = agent_session
+            .prepare_model_selection(
+                "acme-local",
+                "local-model",
+                crate::model::ThinkingLevel::Off,
+            )
+            .expect("prepare already-active keyless model");
+        agent_session.install_prepared_model_selection(prepared);
+        assert_eq!(
+            agent_session.agent.stream_options().api_key,
+            None,
+            "an already-active keyless model must not retain a stale credential"
+        );
     }
 
     #[test]
-    fn apply_session_model_selection_treats_blank_model_key_as_missing_credential() {
+    fn prepared_model_selection_treats_blank_model_key_as_missing_credential() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth_path = dir.path().join("auth.json");
         let auth = AuthStorage::load(auth_path).expect("load auth");
@@ -16641,8 +17168,9 @@ mod tests {
         let mut agent_session = build_switch_test_session(&auth);
         agent_session.set_model_registry(registry);
         let err = agent_session
-            .apply_session_model_selection("acme", "blank-model")
-            .expect_err("blank keys must not satisfy credential requirements");
+            .prepare_model_selection("acme", "blank-model", crate::model::ThinkingLevel::Off)
+            .err()
+            .expect("blank keys must not satisfy credential requirements");
 
         assert!(
             err.to_string()
@@ -16762,6 +17290,146 @@ mod tests {
     }
 
     #[test]
+    fn set_provider_model_quarantines_failed_persistence_without_runtime_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_path = dir.path().join("auth.json");
+            let mut auth = AuthStorage::load(auth_path).expect("load auth");
+            auth.set(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "anthropic-key".to_string(),
+                },
+            );
+            auth.set(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "openai-key".to_string(),
+                },
+            );
+            let mut agent_session = build_switch_test_session(&auth);
+            let blocked_path = dir.path().join("blocked.jsonl");
+            std::fs::create_dir_all(&blocked_path).expect("create blocking directory");
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock");
+                session.path = Some(blocked_path);
+            }
+            agent_session.save_enabled = true;
+            let original_compaction_window =
+                agent_session.compaction_settings().context_window_tokens;
+
+            let err = agent_session
+                .set_provider_model("openai", "gpt-4o")
+                .await
+                .expect_err("unwritable model-selection candidate must fail closed");
+            assert!(err.is_session_persistence(), "unexpected error: {err}");
+            assert_eq!(agent_session.agent.provider().name(), "anthropic");
+            assert_eq!(
+                agent_session.agent.provider().model_id(),
+                "claude-sonnet-4-5"
+            );
+            assert_eq!(
+                agent_session.agent.stream_options().api_key.as_deref(),
+                Some("stale-key")
+            );
+            assert_eq!(
+                agent_session.compaction_settings().context_window_tokens,
+                original_compaction_window
+            );
+            assert!(agent_session.provider_admission.reason().is_some());
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(session.header.provider.as_deref(), Some("anthropic"));
+            assert_eq!(
+                session.header.model_id.as_deref(),
+                Some("claude-sonnet-4-5")
+            );
+            assert!(
+                session
+                    .entries_for_current_path()
+                    .iter()
+                    .all(|entry| !matches!(entry, crate::session::SessionEntry::ModelChange(_)))
+            );
+            drop(session);
+
+            let blocked = agent_session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .expect_err("quarantine must block later provider re-entry");
+            assert!(blocked.is_session_persistence());
+        });
+    }
+
+    #[test]
+    fn set_thinking_level_quarantines_failed_persistence_without_live_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_path = dir.path().join("auth.json");
+            let auth = AuthStorage::load(auth_path).expect("load auth");
+            let mut agent_session = build_switch_test_session(&auth);
+            let blocked_path = dir.path().join("blocked.jsonl");
+            std::fs::create_dir_all(&blocked_path).expect("create blocking directory");
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock");
+                session.path = Some(blocked_path);
+            }
+            agent_session.save_enabled = true;
+            let original_thinking = agent_session.agent.stream_options().thinking_level;
+
+            let err = agent_session
+                .set_thinking_level(crate::model::ThinkingLevel::High)
+                .await
+                .expect_err("unwritable thinking candidate must fail closed");
+            assert!(err.is_session_persistence(), "unexpected error: {err}");
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                original_thinking
+            );
+            assert!(agent_session.provider_admission.reason().is_some());
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert!(session.header.thinking_level.is_none());
+            assert!(
+                session
+                    .entries_for_current_path()
+                    .iter()
+                    .all(|entry| !matches!(
+                        entry,
+                        crate::session::SessionEntry::ThinkingLevelChange(_)
+                    ))
+            );
+        });
+    }
+
+    #[test]
     fn set_provider_model_clamps_thinking_for_non_reasoning_targets() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -16829,6 +17497,15 @@ mod tests {
                 agent_session.agent.keyword_max_thinking_level,
                 crate::model::ThinkingLevel::Off,
                 "ultrathink must use the target model's clamped maximum"
+            );
+            assert!(
+                !agent_session.agent.model_accepts_images(),
+                "runtime model switches must install the target image policy"
+            );
+            assert_eq!(
+                agent_session.compaction_settings().context_window_tokens,
+                128_000,
+                "runtime model switches must install the target compaction window"
             );
 
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -16909,6 +17586,113 @@ mod tests {
                 .filter(|entry| matches!(entry, crate::session::SessionEntry::ModelChange(_)))
                 .count();
             assert_eq!(model_changes, 1);
+        });
+    }
+
+    #[test]
+    fn set_provider_model_persists_canonical_registry_identity() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_path = dir.path().join("auth.json");
+            let mut auth = AuthStorage::load(auth_path).expect("load auth");
+            auth.set(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "openai-key".to_string(),
+                },
+            );
+
+            let mut agent_session = build_switch_test_session(&auth);
+            agent_session
+                .set_provider_model(" OpenAI ", "GPT-4O")
+                .await
+                .expect("mixed-case alias should resolve");
+
+            assert_eq!(agent_session.agent.provider().name(), "openai");
+            assert_eq!(agent_session.agent.provider().model_id(), "gpt-4o");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(session.header.provider.as_deref(), Some("openai"));
+            assert_eq!(session.header.model_id.as_deref(), Some("gpt-4o"));
+            assert_eq!(
+                session.effective_model_for_current_path(),
+                Some(("openai".to_string(), "gpt-4o".to_string()))
+            );
+        });
+    }
+
+    #[test]
+    fn model_and_thinking_transitions_reopen_with_complete_state() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_path = dir.path().join("auth.json");
+            let mut auth = AuthStorage::load(auth_path).expect("load auth");
+            auth.set(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "openai-key".to_string(),
+                },
+            );
+            let mut agent_session = build_switch_test_session(&auth);
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock");
+                let mut persistent = Session::create_with_dir(Some(dir.path().join("sessions")));
+                persistent.header.provider = Some("anthropic".to_string());
+                persistent.header.model_id = Some("claude-sonnet-4-5".to_string());
+                *session = persistent;
+            }
+            agent_session.save_enabled = true;
+
+            agent_session
+                .set_provider_model("openai", "gpt-5.5")
+                .await
+                .expect("persist model transition");
+            agent_session
+                .set_thinking_level(crate::model::ThinkingLevel::High)
+                .await
+                .expect("persist thinking transition");
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            let path = session.path.clone().expect("persisted session path");
+            drop(session);
+            let reopened = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen persisted transitions");
+            assert_eq!(reopened.header.provider.as_deref(), Some("openai"));
+            assert_eq!(reopened.header.model_id.as_deref(), Some("gpt-5.5"));
+            assert_eq!(reopened.header.thinking_level.as_deref(), Some("high"));
+            assert_eq!(
+                reopened.effective_model_for_current_path(),
+                Some(("openai".to_string(), "gpt-5.5".to_string()))
+            );
+            assert_eq!(
+                reopened
+                    .effective_thinking_level_for_current_path()
+                    .as_deref(),
+                Some("high")
+            );
         });
     }
 
@@ -17132,6 +17916,88 @@ mod tests {
     }
 
     #[test]
+    fn sync_runtime_selection_quarantines_failed_normalization_without_live_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_path = dir.path().join("auth.json");
+            let mut auth = AuthStorage::load(auth_path).expect("load auth");
+            auth.set(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "openai-key".to_string(),
+                },
+            );
+            let mut agent_session = build_switch_test_session(&auth);
+            let blocked_path = dir.path().join("blocked.jsonl");
+            std::fs::create_dir_all(&blocked_path).expect("create blocking directory");
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock");
+                session.path = Some(blocked_path);
+                session.header.provider = Some("openai".to_string());
+                session.header.model_id = Some("GPT-4O".to_string());
+                session.header.thinking_level = Some("high".to_string());
+            }
+            agent_session.save_enabled = true;
+            let original_provider = agent_session.agent.provider();
+            let original_options = agent_session.agent.stream_options().clone();
+
+            let err = agent_session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .expect_err("unwritable normalization must fail closed");
+            assert!(err.is_session_persistence(), "unexpected error: {err}");
+            assert_eq!(
+                agent_session.agent.provider().name(),
+                original_provider.name()
+            );
+            assert_eq!(
+                agent_session.agent.provider().model_id(),
+                original_provider.model_id()
+            );
+            assert_eq!(
+                agent_session.agent.stream_options().api_key,
+                original_options.api_key
+            );
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                original_options.thinking_level
+            );
+            assert!(agent_session.provider_admission.reason().is_some());
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(session.header.provider.as_deref(), Some("openai"));
+            assert_eq!(session.header.model_id.as_deref(), Some("GPT-4O"));
+            assert_eq!(session.header.thinking_level.as_deref(), Some("high"));
+            drop(session);
+
+            let compact_err = agent_session
+                .compact_now(|_| {})
+                .await
+                .expect_err("compaction must honor transition quarantine");
+            assert!(compact_err.is_session_persistence());
+            let extension_err = agent_session
+                .execute_extension_command("unused", "", 1, |_| {})
+                .await
+                .expect_err("extension execution must honor transition quarantine");
+            assert!(extension_err.is_session_persistence());
+        });
+    }
+
+    #[test]
     fn set_provider_model_allows_current_model_without_registry() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -17253,9 +18119,14 @@ mod tests {
                 },
                 snap_payload: None,
             };
+            let provider_admission = agent_session
+                .provider_admission
+                .acquire(&asupersync::Cx::for_testing())
+                .await
+                .expect("provider admission");
 
             agent_session
-                .apply_compaction_result(result, on_event)
+                .apply_compaction_result(result, on_event, &provider_admission)
                 .await
                 .expect("apply compaction result");
 
@@ -17291,6 +18162,110 @@ mod tests {
             );
             assert_eq!(payload["details"]["readFiles"], json!(["src/main.rs"]));
             assert_eq!(payload["details"]["modifiedFiles"], json!(["src/agent.rs"]));
+        });
+    }
+
+    #[test]
+    fn compaction_persistence_failure_preserves_live_session_and_quarantines_provider() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let blocked_root = tempfile::tempdir().expect("tempdir");
+            let blocked_session_dir = blocked_root.path().join("not-a-directory");
+            std::fs::write(&blocked_session_dir, b"blocked").expect("write path blocker");
+
+            let provider = Arc::new(SilentProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                blocked_session_dir,
+            ))));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            let metrics_before = {
+                let cx = asupersync::Cx::for_testing();
+                session
+                    .lock(&cx)
+                    .await
+                    .expect("session lock")
+                    .autosave_metrics()
+            };
+
+            let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = Arc::clone(&events);
+            let on_event: AgentEventHandler = Arc::new(move |event| {
+                sink.lock().expect("lock compaction events").push(event);
+            });
+            let result = compaction::CompactionResult {
+                summary: "private candidate must not leak".to_string(),
+                first_kept_entry_id: "entry-5".to_string(),
+                tokens_before: 12_000,
+                details: compaction::CompactionDetails::default(),
+                snap_payload: None,
+            };
+            let provider_admission = agent_session
+                .provider_admission
+                .acquire(&asupersync::Cx::for_testing())
+                .await
+                .expect("provider admission");
+
+            let err = agent_session
+                .apply_compaction_result(result, on_event, &provider_admission)
+                .await
+                .expect_err("blocked persistence must fail");
+            assert!(
+                err.to_string()
+                    .contains("compaction persistence remained indeterminate"),
+                "unexpected persistence error: {err}"
+            );
+            assert!(
+                agent_session.provider_admission.reason().is_some_and(
+                    |reason| reason.contains("compaction persistence remained indeterminate")
+                ),
+                "indeterminate persistence must quarantine provider re-entry"
+            );
+
+            let cx = asupersync::Cx::for_testing();
+            let session = session.lock(&cx).await.expect("session lock after failure");
+            assert!(
+                session
+                    .entries_for_current_path()
+                    .iter()
+                    .all(|entry| !matches!(
+                        entry,
+                        crate::session::SessionEntry::Compaction(compaction)
+                            if compaction.summary == "private candidate must not leak"
+                    )),
+                "failed private candidate must not be installed into the live session"
+            );
+            let metrics_after = session.autosave_metrics();
+            assert_eq!(
+                metrics_after.pending_mutations, metrics_before.pending_mutations,
+                "failed private candidate must not alter the live autosave queue"
+            );
+            assert_eq!(
+                metrics_after.flush_started, metrics_before.flush_started,
+                "candidate flush attempts must remain private"
+            );
+
+            let events = events.lock().expect("lock compaction events");
+            assert_eq!(events.len(), 1, "failure must emit one terminal event");
+            assert!(matches!(
+                &events[0],
+                AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(message),
+                } if message.contains("compaction persistence remained indeterminate")
+            ));
         });
     }
 
