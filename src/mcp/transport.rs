@@ -4,7 +4,7 @@
 //! allowlist; streamable HTTP does POST-per-message with JSON or SSE responses,
 //! `Mcp-Session-Id` continuity, and custom headers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -28,6 +28,13 @@ use crate::tools::{ProcessCleanupMode, ProcessGuard};
 pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on an HTTP response body (10 MiB).
 const MAX_HTTP_BODY: usize = 10 * 1024 * 1024;
+/// Bound teardown calls so an unresponsive server cannot stall shutdown.
+const HTTP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cancellation is best-effort, but must never become an unbounded drop task.
+const HTTP_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Per-logical-stream event-id budget. Exhaustion fails closed rather than
+/// forgetting old ids and risking duplicate server-request side effects.
+const MAX_HTTP_SSE_EVENT_IDS: usize = 4096;
 /// MCP protocol revision this client speaks.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -47,6 +54,12 @@ pub trait McpTransport: Send + Sync {
     /// Synchronously abort in-flight work. This is the cancellation-safe
     /// teardown path used when a connection future is dropped at a deadline.
     fn abort(&self);
+    /// Activate transport-owned background work after the MCP handshake.
+    /// Stdio has no separate receive channel; Streamable HTTP uses this for
+    /// its optional server-message GET stream.
+    fn activate(self: std::sync::Arc<Self>) -> Result<()> {
+        Ok(())
+    }
     /// Close the transport (best effort).
     async fn close(&self);
     /// Recent server stderr (stdio) or last HTTP error detail, for `/mcp`.
@@ -1171,6 +1184,7 @@ pub struct HttpTransport {
     session: Mutex<HttpSessionState>,
     next_id: AtomicU64,
     alive: std::sync::atomic::AtomicBool,
+    listener_started: AtomicBool,
     abort_notify: asupersync::sync::Notify,
     lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
 }
@@ -1232,6 +1246,7 @@ impl HttpTransport {
             session: Mutex::new(HttpSessionState::default()),
             next_id: AtomicU64::new(1),
             alive: std::sync::atomic::AtomicBool::new(true),
+            listener_started: AtomicBool::new(false),
             abort_notify: asupersync::sync::Notify::new(),
             lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
         })
