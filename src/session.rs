@@ -10883,8 +10883,8 @@ mod tests {
         let header = SessionHeader::new();
         assert_eq!(header.r#type, "session");
         assert_eq!(header.version, Some(SESSION_VERSION));
-        assert!(!header.id.is_empty());
-        assert!(!header.timestamp.is_empty());
+        assert_ne!(header.id, "");
+        assert_ne!(header.timestamp, "");
         assert!(header.provider.is_none());
         assert!(header.model_id.is_none());
         assert!(header.thinking_level.is_none());
@@ -11292,7 +11292,7 @@ mod tests {
     fn test_set_name_returns_entry_id() {
         let mut session = Session::in_memory();
         let id = session.set_name("test-name");
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         let entry = session.get_entry(&id).unwrap();
         assert!(matches!(entry, SessionEntry::SessionInfo(_)));
     }
@@ -12149,8 +12149,8 @@ mod tests {
 
         assert_eq!(header["type"], "session");
         assert_eq!(header["version"], SESSION_VERSION);
-        assert!(!header["id"].as_str().unwrap().is_empty());
-        assert!(!header["timestamp"].as_str().unwrap().is_empty());
+        assert_ne!(header["id"].as_str().unwrap(), "");
+        assert_ne!(header["timestamp"].as_str().unwrap(), "");
     }
 
     #[test]
@@ -12509,7 +12509,7 @@ mod tests {
         let scanned =
             run_async(async { scan_sessions_on_disk(&session_dir, vec![stale_known_entry]).await })
                 .expect("scan sessions");
-        assert!(scanned.failed_paths.is_empty());
+        assert_eq!(scanned.failed_paths, [] as [std::path::PathBuf; 0]);
         assert_eq!(scanned.entries.len(), 1);
         assert_eq!(scanned.refreshed_entries.len(), 1);
         assert_eq!(scanned.entries[0].path, path);
@@ -13227,7 +13227,7 @@ mod tests {
                 .expect("scan sessions");
         let (updated_ms, updated_size) = session_file_stats(&path).expect("updated stats");
 
-        assert!(scanned.failed_paths.is_empty());
+        assert_eq!(scanned.failed_paths, [] as [std::path::PathBuf; 0]);
         assert_eq!(scanned.entries.len(), 1);
         assert_eq!(scanned.refreshed_entries.len(), 1);
         assert_eq!(scanned.entries[0].path, path);

@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn file_args_empty_when_none() {
         let cli = Cli::parse_from(["pi", "hello", "world"]);
-        assert!(cli.file_args().is_empty());
+        assert_eq!(cli.file_args(), [] as [&str; 0]);
         assert_eq!(cli.message_args(), vec!["hello", "world"]);
     }
 
@@ -881,14 +881,14 @@ mod tests {
     fn message_args_empty_when_only_files() {
         let cli = Cli::parse_from(["pi", "@src/main.rs", "@Cargo.toml"]);
         assert_eq!(cli.file_args(), vec!["src/main.rs", "Cargo.toml"]);
-        assert!(cli.message_args().is_empty());
+        assert_eq!(cli.message_args(), [] as [&str; 0]);
     }
 
     #[test]
     fn no_positional_args_yields_empty() {
         let cli = Cli::parse_from(["pi"]);
-        assert!(cli.file_args().is_empty());
-        assert!(cli.message_args().is_empty());
+        assert_eq!(cli.file_args(), [] as [&str; 0]);
+        assert_eq!(cli.message_args(), [] as [&str; 0]);
     }
 
     #[test]
@@ -1228,7 +1228,7 @@ mod tests {
     #[test]
     fn no_tools_flag_returns_empty() {
         let cli = Cli::parse_from(["pi", "--no-tools"]);
-        assert!(cli.enabled_tools().is_empty());
+        assert_eq!(cli.enabled_tools(), [] as [&str; 0]);
     }
 
     #[test]
@@ -1354,7 +1354,7 @@ mod tests {
         .expect("parse with session durability");
 
         assert_eq!(parsed.cli.session_durability.as_deref(), Some("throughput"));
-        assert!(parsed.extension_flags.is_empty());
+        assert_eq!(parsed.extension_flags, [] as [cli::ExtensionCliFlag; 0]);
         assert!(parsed.cli.print);
     }
 
@@ -1585,7 +1585,7 @@ mod tests {
         assert!(cli.append_system_prompt.is_none());
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
-        assert!(cli.args.is_empty());
+        assert_eq!(cli.args, [] as [std::string::String; 0]);
         // The bare-invocation default must stay in lockstep with the
         // canonical default-enabled tool list.
         assert_eq!(cli.tools, crate::xdev::default_enabled_tools().join(","));
@@ -1925,7 +1925,7 @@ mod tests {
                 let result = preprocess_extension_flags(&[]);
                 assert_eq!(result.0, vec!["pi"]);
                 let extracted: &[ExtensionCliFlag] = &result.1;
-                assert!(extracted.is_empty());
+                assert_eq!(extracted, []);
             }
 
             #[test]

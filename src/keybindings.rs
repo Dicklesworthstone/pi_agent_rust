@@ -2260,7 +2260,7 @@ mod tests {
         let result = KeyBindings::load_from_path_with_diagnostics(&path);
 
         assert!(!result.has_warnings());
-        assert!(result.bindings.get_bindings(AppAction::CursorUp).is_empty());
+        assert_eq!(result.bindings.get_bindings(AppAction::CursorUp), []);
         assert_ne!(
             result.bindings.lookup(&KeyBinding::plain("up")),
             Some(AppAction::CursorUp)

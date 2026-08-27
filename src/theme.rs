@@ -1070,7 +1070,7 @@ mod tests {
     #[test]
     fn glob_json_nonexistent_dir() {
         let result = glob_json(Path::new("/nonexistent/dir"));
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
@@ -1095,7 +1095,7 @@ mod tests {
             project_dir: dir.path().join("project"),
         };
         let themes = Theme::discover_themes_with_roots(&roots);
-        assert!(themes.is_empty());
+        assert_eq!(themes, [] as [std::path::PathBuf; 0]);
     }
 
     // ── Theme serialization roundtrip ────────────────────────────────

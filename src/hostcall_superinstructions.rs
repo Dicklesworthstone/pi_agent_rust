@@ -382,7 +382,7 @@ mod tests {
         ];
 
         let plans = compiler.compile_plans(&traces);
-        assert!(!plans.is_empty());
+        assert_ne!(plans, [] as [hostcall_superinstructions::HostcallSuperinstructionPlan; 0]);
         assert!(plans.iter().any(|entry| {
             entry.opcode_window
                 == opcode_trace(&[
@@ -520,7 +520,7 @@ mod tests {
             opcode_trace(&["a", "b", "c"]),
         ];
         let plans = compiler.compile_plans(&traces);
-        assert!(plans.is_empty());
+        assert_eq!(plans, [] as [hostcall_superinstructions::HostcallSuperinstructionPlan; 0]);
     }
 
     // ── Compiler edge cases ──
@@ -534,14 +534,14 @@ mod tests {
             opcode_trace(&["single"]),
         ];
         let plans = compiler.compile_plans(&traces);
-        assert!(plans.is_empty());
+        assert_eq!(plans, [] as [hostcall_superinstructions::HostcallSuperinstructionPlan; 0]);
     }
 
     #[test]
     fn compiler_ignores_empty_traces() {
         let compiler = HostcallSuperinstructionCompiler::new(true, 1, 4);
         let plans = compiler.compile_plans(&[Vec::new(), Vec::new()]);
-        assert!(plans.is_empty());
+        assert_eq!(plans, [] as [hostcall_superinstructions::HostcallSuperinstructionPlan; 0]);
     }
 
     #[test]
@@ -614,7 +614,7 @@ mod tests {
             opcode_trace(&["x", "y", "z"]),
         ];
         let plans = compiler.compile_plans(&traces);
-        assert!(!plans.is_empty());
+        assert_ne!(plans, [] as [hostcall_superinstructions::HostcallSuperinstructionPlan; 0]);
         for p in &plans {
             let json = serde_json::to_string(p).expect("serialize");
             let roundtrip: HostcallSuperinstructionPlan =

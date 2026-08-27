@@ -20,7 +20,7 @@ fn alert_from_policy_denial_has_correct_fields() {
     assert_eq!(alert.reason_codes, vec!["deny_caps"]);
     assert!(alert.summary.contains("exec"));
     assert!(alert.summary.contains("my-ext"));
-    assert!(!alert.remediation.is_empty());
+    assert_ne!(alert.remediation, "");
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn alert_from_exec_mediation_with_class() {
     assert_eq!(alert.severity, SecurityAlertSeverity::Error);
     assert_eq!(alert.capability, "exec");
     assert!(alert.summary.contains("recursive_delete"));
-    assert!(!alert.context_hash.is_empty());
+    assert_ne!(alert.context_hash, "");
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn alert_from_secret_redaction() {
     assert_eq!(alert.severity, SecurityAlertSeverity::Info);
     assert_eq!(alert.action, SecurityAlertAction::Redact);
     assert!(alert.summary.contains("AWS_SECRET_KEY"));
-    assert!(!alert.context_hash.is_empty());
+    assert_ne!(alert.context_hash, "");
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn alert_from_enforcement_transition_escalation() {
     assert_eq!(alert.action, SecurityAlertAction::Deny);
     assert!(alert.summary.contains("allow"));
     assert!(alert.summary.contains("deny"));
-    assert!(!alert.remediation.is_empty());
+    assert_ne!(alert.remediation, "");
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn alert_from_enforcement_transition_de_escalation() {
     let alert = SecurityAlert::from_enforcement_transition("ext-1", &transition);
     assert_eq!(alert.severity, SecurityAlertSeverity::Info);
     assert_eq!(alert.action, SecurityAlertAction::Allow);
-    assert!(alert.remediation.is_empty());
+    assert_eq!(alert.remediation, "");
 }
 
 #[test]
@@ -1015,7 +1015,7 @@ fn rcu_register_provider_invalidates_snapshot() {
 
         // Snapshot should initially have no providers.
         let snap_before = manager.read_snapshot();
-        assert!(snap_before.providers.is_empty());
+        assert_eq!(snap_before.providers, [] as [serde_json::Value; 0]);
         drop(snap_before);
 
         // Register a provider via hostcall.
@@ -1054,7 +1054,7 @@ fn rcu_register_flag_invalidates_snapshot() {
         let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
 
         // Snapshot should initially have no flags.
-        assert!(manager.read_snapshot().all_flags.is_empty());
+        assert_eq!(manager.read_snapshot().all_flags, [] as [serde_json::Value; 0]);
 
         // Register a flag via hostcall.
         dispatch_hostcall_events(
@@ -1206,7 +1206,7 @@ fn rcu_snapshot_readers_get_consistent_view() {
 
     // Take a snapshot reference before registration.
     let snap_before = manager.read_snapshot();
-    assert!(snap_before.all_commands.is_empty());
+    assert_eq!(snap_before.all_commands, [] as [serde_json::Value; 0]);
 
     // Register an extension.
     manager.register(RegisterPayload {
@@ -1684,7 +1684,7 @@ fn isolated_runtime_dynamic_command_mutates_only_authoritative_owner() {
         .inner
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(guard.extensions[0].slash_commands.is_empty());
+    assert_eq!(guard.extensions[0].slash_commands, [] as [serde_json::Value; 0]);
     assert_eq!(
         extract_slash_command_name(&guard.extensions[1].slash_commands[0]),
         Some("owned".to_string())

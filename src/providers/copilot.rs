@@ -347,7 +347,7 @@ mod tests {
 
         let resp: CopilotTokenResponse = serde_json::from_str(json).expect("parse");
         assert_eq!(resp.token, "ghu_abc");
-        assert!(resp.endpoints.api.is_empty());
+        assert_eq!(resp.endpoints.api, "");
     }
 
     #[test]

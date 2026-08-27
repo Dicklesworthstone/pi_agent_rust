@@ -3044,7 +3044,7 @@ mod tests {
 
         assert_eq!(digest.schema, SWARM_ACTIVITY_DIGEST_SCHEMA);
         assert_eq!(digest.event_count, 0);
-        assert!(digest.active_agents.is_empty());
+        assert_eq!(digest.active_agents, [] as [swarm_activity_ledger::SwarmActivityHotspot; 0]);
         assert!(!digest.saturation.saturated);
         assert!(digest.to_text().contains("No swarm activity events."));
     }
@@ -3374,7 +3374,7 @@ mod tests {
         let text = digest.to_text();
 
         assert!(!digest.saturation.saturated);
-        assert!(digest.recommendations.is_empty());
+        assert_eq!(digest.recommendations, [] as [swarm_activity_ledger::SwarmActivitySkillSwitchRecommendation; 0]);
         assert!(text.contains("Saturation: no"));
         assert!(!text.contains("Skill-switch recommendations"));
     }
@@ -3389,8 +3389,8 @@ mod tests {
             .find(|recommendation| recommendation.mode == mode)
             .expect("expected skill-switch recommendation");
 
-        assert!(!recommendation.reason.is_empty());
-        assert!(!recommendation.confidence_reason.is_empty());
+        assert_ne!(recommendation.reason, "");
+        assert_ne!(recommendation.confidence_reason, "");
         assert!(
             recommendation
                 .evidence_pointers

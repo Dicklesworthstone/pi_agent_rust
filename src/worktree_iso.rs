@@ -444,7 +444,7 @@ mod tests {
         std::fs::write(handle.path.join("child.txt"), "child work\n").expect("child write");
         let (patch, stat) = collect_diff(&handle).expect("collect");
         assert!(patch.contains("child.txt"), "patch must include child work");
-        assert!(!stat.is_empty());
+        assert_ne!(stat, "");
 
         // Apply mode lands it byte-identical in the parent.
         apply_to_parent(&handle, &patch).expect("apply");

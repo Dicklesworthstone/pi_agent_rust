@@ -364,7 +364,7 @@ mod tests {
             }),
         ];
         let (text, images) = split_content_blocks_for_input(&blocks);
-        assert!(text.is_empty());
+        assert_eq!(text, "");
         assert!(images.is_empty());
     }
 

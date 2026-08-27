@@ -3286,8 +3286,8 @@ mod tests {
     fn compute_file_lists_empty() {
         let ops = FileOperations::default();
         let (read_only, modified) = compute_file_lists(&ops);
-        assert!(read_only.is_empty());
-        assert!(modified.is_empty());
+        assert_eq!(read_only, [] as [std::string::String; 0]);
+        assert_eq!(modified, [] as [std::string::String; 0]);
     }
 
     // ── format_file_operations ───────────────────────────────────────
@@ -3850,7 +3850,7 @@ mod tests {
 
     #[test]
     fn find_valid_cut_points_empty() {
-        assert!(find_valid_cut_points(&[], 0, 0).is_empty());
+        assert_eq!(find_valid_cut_points(&[], 0, 0), [] as [usize; 0]);
     }
 
     #[test]
@@ -3942,7 +3942,7 @@ mod tests {
 
     #[test]
     fn serialize_conversation_empty() {
-        assert!(serialize_conversation(&[]).is_empty());
+        assert_eq!(serialize_conversation(&[]), "");
     }
 
     #[test]
@@ -3951,7 +3951,7 @@ mod tests {
             content: UserContent::Text(String::new()),
             timestamp: 0,
         })];
-        assert!(serialize_conversation(&messages).is_empty());
+        assert_eq!(serialize_conversation(&messages), "");
     }
 
     #[test]
@@ -4907,7 +4907,7 @@ mod tests {
             #[test]
             fn format_file_ops_empty(_dummy in 0..10u32) {
                 let result = format_file_operations(&[], &[]);
-                assert!(result.is_empty());
+                assert_eq!(result, "");
             }
 
             /// `format_file_operations`: read files produce `<read-files>` tag.

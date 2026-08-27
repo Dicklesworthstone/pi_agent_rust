@@ -1959,7 +1959,7 @@ pub mod normalization {
 
         #[test]
         fn schema_version_is_set() {
-            assert!(!SCHEMA_VERSION.is_empty());
+            assert_ne!(SCHEMA_VERSION, "");
             assert_eq!(
                 SCHEMA_VERSION.split('.').count(),
                 3,
@@ -3247,7 +3247,7 @@ mod tests {
                 commit: None,
             },
         };
-        assert!(validate_artifact_spec(&spec).is_empty());
+        assert_eq!(validate_artifact_spec(&spec), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -3282,7 +3282,7 @@ mod tests {
                 url: None,
             },
         };
-        assert!(validate_artifact_spec(&spec).is_empty());
+        assert_eq!(validate_artifact_spec(&spec), [] as [std::string::String; 0]);
 
         // Missing package name
         let bad = ArtifactSpec {
@@ -3293,7 +3293,7 @@ mod tests {
             },
             ..spec
         };
-        assert!(!validate_artifact_spec(&bad).is_empty());
+        assert_ne!(validate_artifact_spec(&bad), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -3308,7 +3308,7 @@ mod tests {
                 url: "https://example.com/ext.ts".into(),
             },
         };
-        assert!(validate_artifact_spec(&spec).is_empty());
+        assert_eq!(validate_artifact_spec(&spec), [] as [std::string::String; 0]);
     }
 
     #[test]

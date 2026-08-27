@@ -11321,11 +11321,10 @@ not-json
         let recommendations = &data["reservation_recommendations"];
 
         assert_eq!(recommendations["mail_available"], serde_json::json!(true));
-        assert!(
+        assert_eq!(
             recommendations["degraded_caveats"]
                 .as_array()
-                .unwrap()
-                .is_empty()
+                .unwrap().as_slice(), []
         );
         assert!(
             recommendations["avoid"]
@@ -11367,8 +11366,8 @@ not-json
             recommendations["schema"],
             SWARM_DOCTOR_RESERVATION_RECOMMENDATIONS_SCHEMA
         );
-        assert!(recommendations["avoid"].as_array().unwrap().is_empty());
-        assert!(recommendations["observe"].as_array().unwrap().is_empty());
+        assert_eq!(recommendations["avoid"].as_array().unwrap().as_slice(), []);
+        assert_eq!(recommendations["observe"].as_array().unwrap().as_slice(), []);
         assert_eq!(
             recommendations["safe_fallback_lanes"]
                 .as_array()
@@ -12896,7 +12895,7 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
         let data = finding_data(&finding);
 
         assert_eq!(finding.severity, Severity::Pass);
-        assert!(plan.blockers.is_empty());
+        assert_eq!(plan.blockers, [] as [std::string::String; 0]);
         assert_eq!(data["schema"], SWARM_DOCTOR_RCH_AFFINITY_SCHEMA);
         assert_eq!(data["job_count"], serde_json::json!(2));
         assert_eq!(data["groups"][0]["recommendation"], "share_warm_target");
@@ -13422,7 +13421,7 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
         let plan = swarm_lane_placement_plan(&snapshot, &[]);
 
         assert_eq!(plan.status, "ready");
-        assert!(plan.caveats.is_empty());
+        assert_eq!(plan.caveats, [] as [std::string::String; 0]);
         assert_eq!(plan.lane_groups.len(), 4);
         assert_eq!(plan.lane_groups[0].lane_id, "numa-node-0");
         assert_eq!(plan.lane_groups[0].cpu_affinity_hint, "0-15");
@@ -14290,7 +14289,7 @@ export default function(pi) {
                     CheckCategory::Extensions,
                 ];
                 let label = cats[idx].label();
-                assert!(!label.is_empty());
+                assert_ne!(label, "");
                 // Label starts with uppercase
                 assert!(label.starts_with(|c: char| c.is_uppercase()));
             }

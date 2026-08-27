@@ -1227,14 +1227,14 @@ mod tests {
         let found = scan_sessions_on_disk(tmp.path(), &HashMap::new());
         assert_eq!(found.metas.len(), 1);
         assert_eq!(found.metas[0].id, "scan-test");
-        assert!(found.failed_paths.is_empty());
+        assert_eq!(found.failed_paths, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
     fn scan_sessions_on_disk_nonexistent_dir_returns_empty() {
         let found = scan_sessions_on_disk(Path::new("/nonexistent/dir"), &HashMap::new());
         assert!(found.metas.is_empty());
-        assert!(found.failed_paths.is_empty());
+        assert_eq!(found.failed_paths, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
@@ -1255,7 +1255,7 @@ mod tests {
         let found = scan_sessions_on_disk(tmp.path(), &cached_by_path);
 
         assert!(found.metas.is_empty());
-        assert!(found.failed_paths.is_empty());
+        assert_eq!(found.failed_paths, [] as [std::path::PathBuf; 0]);
         assert_eq!(take_session_scan_parse_count(), 0);
     }
 

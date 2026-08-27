@@ -2588,7 +2588,7 @@ mod tests {
         let ContentBlock::Thinking(thinking) = &done_message.content[0] else {
             panic!("expected thinking block");
         };
-        assert!(thinking.thinking.is_empty());
+        assert_eq!(thinking.thinking, "");
         let signature_value: Value = serde_json::from_str(
             thinking
                 .thinking_signature

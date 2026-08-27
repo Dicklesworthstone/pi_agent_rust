@@ -3461,7 +3461,7 @@ impl OcoTunerState {
         let loss = if overloaded {
             (1.0 + utilization).clamp(1.0, 2.0)
         } else {
-            0.15 + utilization * 0.35
+            f64::mul_add(utilization, 0.35, 0.15)
         };
         let baseline_loss = if overloaded { 1.0 } else { 0.2 };
         self.cumulative_loss += loss;
@@ -3471,11 +3471,11 @@ impl OcoTunerState {
         let grad_queue = if overloaded {
             -(1.0 + utilization)
         } else {
-            0.3 + utilization * 0.2
+            f64::mul_add(utilization, 0.2, 0.3)
         };
         let grad_batch = if overloaded { -0.75 } else { 0.25 };
         let grad_time_slice = if overloaded {
-            -0.5 - utilization * 0.25
+            f64::mul_add(utilization, -0.25, -0.5)
         } else {
             0.2
         };
@@ -7669,7 +7669,7 @@ fn runtime_risk_calibration_candidate(
             (false_negative_rate * fn_weight).mul_add(0.25, false_positive_rate * fp_weight)
         }
         RuntimeRiskCalibrationObjective::BalancedAccuracy => {
-            (false_positive_rate * fp_weight) + (false_negative_rate * fn_weight)
+            f64::mul_add(false_negative_rate, fn_weight, false_positive_rate * fp_weight)
         }
     };
 

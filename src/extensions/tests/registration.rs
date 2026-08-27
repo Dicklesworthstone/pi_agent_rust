@@ -583,7 +583,7 @@ fn register_provider_oauth_no_redirect_uri() {
             .expect("oauth should be present");
         assert_eq!(oauth.client_id, "client-nr");
         assert!(oauth.redirect_uri.is_none());
-        assert!(oauth.scopes.is_empty());
+        assert_eq!(oauth.scopes, [] as [std::string::String; 0]);
     });
 }
 

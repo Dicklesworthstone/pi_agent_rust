@@ -997,11 +997,11 @@ mod tests {
 
         // Feed partial data
         let events = parser.feed("data: hel");
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [sse::SseEvent; 0]);
 
         // Feed more
         let events = parser.feed("lo\n");
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [sse::SseEvent; 0]);
 
         // Feed blank line to complete event
         let events = parser.feed("\n");
@@ -1017,12 +1017,12 @@ mod tests {
 
         // Feed partial event data that fills buffer but doesn't complete event
         let events = parser.feed("data: start");
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [sse::SseEvent; 0]);
         assert!(parser.has_pending()); // Buffer should have partial data
 
         // Feed more data that triggers slow path processing and leaves partial data
         let events = parser.feed("_middle_incomplete");
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [sse::SseEvent; 0]);
         assert!(parser.has_pending()); // Should still have buffered data
 
         // Complete the event - this should work without duplicated data
@@ -1154,7 +1154,7 @@ mod tests {
     fn test_keep_alive_comment_does_not_emit_event() {
         let mut parser = SseParser::new();
         let events = parser.feed(": keepalive\n\n");
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [sse::SseEvent; 0]);
     }
 
     #[test]
@@ -1169,7 +1169,7 @@ mod tests {
     fn test_flush_pending() {
         let mut parser = SseParser::new();
         let events = parser.feed("data: incomplete");
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [sse::SseEvent; 0]);
         assert!(parser.has_pending());
 
         // Flush at stream end
@@ -1238,7 +1238,7 @@ mod tests {
     #[test]
     fn test_buffer_limit_overflow_resets_parser_state() {
         let mut parser = SseParser::new();
-        assert!(parser.feed("data: stale\n").is_empty());
+        assert_eq!(parser.feed("data: stale\n"), [] as [sse::SseEvent; 0]);
 
         let oversized = "x".repeat(10 * 1024 * 1024 + 1);
         let overflow_events = parser.feed(&oversized);
@@ -1273,7 +1273,7 @@ mod tests {
     #[test]
     fn test_large_complete_chunk_does_not_trip_buffer_limit_with_buffered_prefix() {
         let mut parser = SseParser::new();
-        assert!(parser.feed("data: ").is_empty());
+        assert_eq!(parser.feed("data: "), [] as [sse::SseEvent; 0]);
 
         let payload = "x".repeat(10 * 1024 * 1024 + 1);
         let events = parser.feed(&format!("{payload}\n\n"));
@@ -1559,7 +1559,7 @@ data: {"type":"message_stop"}
         let mut parser = SseParser::new();
         // Feed empty chunk first - should not mark BOM as checked
         let events = parser.feed("");
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [sse::SseEvent; 0]);
 
         // Feed content with BOM
         let events = parser.feed("\u{FEFF}data: hello\n\n");

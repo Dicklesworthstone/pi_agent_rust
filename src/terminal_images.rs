@@ -575,7 +575,7 @@ mod tests {
     fn kitty_empty_data_produces_empty_output() {
         let result = encode_kitty(&[], 40);
         // Empty bytes → empty base64 → no chunks → empty output
-        assert!(result.is_empty());
+        assert_eq!(result, "");
     }
 
     // ── iterm2 with empty data ───────────────────────────────────────

@@ -305,12 +305,12 @@ mod tests {
 
     #[test]
     fn os_name_not_empty() {
-        assert!(!os_name().is_empty());
+        assert_ne!(os_name(), "");
     }
 
     #[test]
     fn arch_name_not_empty() {
-        assert!(!arch_name().is_empty());
+        assert_ne!(arch_name(), "");
     }
 
     #[test]

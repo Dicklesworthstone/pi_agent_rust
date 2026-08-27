@@ -282,12 +282,11 @@ mod tests {
 
     #[test]
     fn lint_gate_rejects_bad_names_and_descriptions() {
-        assert!(!lint_skill_draft("Bad Name", "ok", &["name", "description"]).is_empty());
-        assert!(!lint_skill_draft("ok-name", "", &["name", "description"]).is_empty());
-        assert!(!lint_skill_draft(&"x".repeat(65), "ok", &["name", "description"]).is_empty());
-        assert!(
-            lint_skill_draft("good-name", "a real description", &["name", "description"])
-                .is_empty()
+        assert_ne!(lint_skill_draft("Bad Name", "ok", &["name", "description"]), [] as [std::string::String; 0]);
+        assert_ne!(lint_skill_draft("ok-name", "", &["name", "description"]), [] as [std::string::String; 0]);
+        assert_ne!(lint_skill_draft(&"x".repeat(65), "ok", &["name", "description"]), [] as [std::string::String; 0]);
+        assert_eq!(
+            lint_skill_draft("good-name", "a real description", &["name", "description"]), [] as [std::string::String; 0]
         );
     }
 

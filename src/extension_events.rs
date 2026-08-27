@@ -1021,7 +1021,7 @@ mod tests {
                     name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                     "not snake_case: {name}"
                 );
-                assert!(!name.is_empty());
+                assert_ne!(name, "");
             }
 
             /// `apply_input_event_response(None, ..)` always returns Continue with original.

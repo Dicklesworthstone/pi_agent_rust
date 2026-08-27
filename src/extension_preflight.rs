@@ -3389,7 +3389,7 @@ mod tests {
     #[test]
     fn extract_import_specifiers_skips_relative() {
         let specs = extract_import_specifiers_simple("import foo from './foo';");
-        assert!(specs.is_empty());
+        assert_eq!(specs, [] as [std::string::String; 0]);
     }
 
     #[test]

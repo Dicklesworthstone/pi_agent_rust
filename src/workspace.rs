@@ -300,7 +300,7 @@ mod tests {
         handle.add_root(&extra);
 
         assert!(handle.remove_root(&extra));
-        assert!(handle.additional_roots().is_empty());
+        assert_eq!(handle.additional_roots(), [] as [std::path::PathBuf; 0]);
         // Dot-segment lexical form still matches canonically.
         handle.add_root(&extra);
         assert!(handle.remove_root(&extra.join("sub").join("..")));
@@ -344,7 +344,7 @@ mod tests {
         assert!(handle.is_within(&std::env::temp_dir()));
         let snapshot = handle.snapshot_or(&cwd);
         assert_eq!(snapshot.primary(), cwd.as_path());
-        assert!(snapshot.additional().is_empty());
+        assert_eq!(snapshot.additional(), []);
         assert_eq!(snapshot.all(), vec![cwd]);
     }
 

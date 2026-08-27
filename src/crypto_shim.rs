@@ -1578,7 +1578,7 @@ mod tests {
 
     #[test]
     fn node_crypto_js_has_content() {
-        assert!(!NODE_CRYPTO_JS.is_empty());
+        assert_ne!(NODE_CRYPTO_JS, "");
         assert!(NODE_CRYPTO_JS.contains("createHash"));
         assert!(NODE_CRYPTO_JS.contains("createHmac"));
         assert!(NODE_CRYPTO_JS.contains("randomUUID"));

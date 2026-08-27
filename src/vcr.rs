@@ -2276,7 +2276,7 @@ mod tests {
                 .collect()
                 .await
         });
-        assert!(chunks.is_empty());
+        assert_eq!(chunks, [] as [std::vec::Vec<u8>; 0]);
     }
 
     #[test]

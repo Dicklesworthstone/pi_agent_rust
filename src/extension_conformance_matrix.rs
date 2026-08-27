@@ -1296,10 +1296,10 @@ mod tests {
                 let behaviors = build_behaviors(&cats[cat_idx], cap);
                 // All behaviors should have non-empty fields
                 for b in &behaviors {
-                    assert!(!b.description.is_empty());
-                    assert!(!b.protocol_surface.is_empty());
-                    assert!(!b.pass_criteria.is_empty());
-                    assert!(!b.fail_criteria.is_empty());
+                    assert_ne!(b.description, "");
+                    assert_ne!(b.protocol_surface, "");
+                    assert_ne!(b.pass_criteria, "");
+                    assert_ne!(b.fail_criteria, "");
                 }
             }
 

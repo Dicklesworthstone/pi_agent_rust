@@ -787,8 +787,8 @@ mod tests {
         assert_eq!(got[0].1.start.character, 1);
 
         // Null and garbage.
-        assert!(parse_locations(&Value::Null).is_empty());
-        assert!(parse_locations(&serde_json::json!(42)).is_empty());
+        assert_eq!(parse_locations(&Value::Null), [] as [(std::string::String, lsp::text::Range); 0]);
+        assert_eq!(parse_locations(&serde_json::json!(42)), [] as [(std::string::String, lsp::text::Range); 0]);
     }
 
     #[test]

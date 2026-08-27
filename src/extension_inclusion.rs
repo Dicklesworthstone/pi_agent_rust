@@ -659,7 +659,7 @@ mod tests {
                     ExtensionCategory::General,
                 ];
                 let result = build_rationale(tiers[tier_idx], score, &cats[cat_idx], &source);
-                assert!(!result.is_empty());
+                assert_ne!(result, "");
                 assert!(result.ends_with('.'));
             }
 

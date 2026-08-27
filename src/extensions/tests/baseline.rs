@@ -1628,8 +1628,8 @@ fn explanation_e2e_through_manager() {
         decision.explanation_schema,
         RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION
     );
-    assert!(!decision.top_contributors.is_empty());
-    assert!(!decision.explanation_summary.is_empty());
+    assert_ne!(decision.top_contributors, [] as [extensions::RuntimeRiskExplanationContributor; 0]);
+    assert_ne!(decision.explanation_summary, "");
     // Verify deterministic replay
     let manager2 = ExtensionManager::new();
     manager2.set_runtime_risk_config(RuntimeRiskConfig {

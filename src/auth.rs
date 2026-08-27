@@ -7054,8 +7054,8 @@ mod tests {
     #[test]
     fn test_generate_pkce_is_base64url_no_pad() {
         let (verifier, challenge) = generate_pkce();
-        assert!(!verifier.is_empty());
-        assert!(!challenge.is_empty());
+        assert_ne!(verifier, "");
+        assert_ne!(challenge, "");
         assert!(!verifier.contains('+'));
         assert!(!verifier.contains('/'));
         assert!(!verifier.contains('='));
@@ -7145,7 +7145,7 @@ mod tests {
         let info = start_extension_oauth("my-ext-provider", &config).expect("start");
 
         assert_eq!(info.provider, "my-ext-provider");
-        assert!(!info.verifier.is_empty());
+        assert_ne!(info.verifier, "");
 
         let (base, query) = info.url.split_once('?').expect("missing query");
         assert_eq!(base, "https://auth.example.com/authorize");
@@ -9021,7 +9021,7 @@ mod tests {
     #[test]
     fn test_parse_query_pairs_empty_string() {
         let pairs = parse_query_pairs("");
-        assert!(pairs.is_empty());
+        assert_eq!(pairs, [] as [(std::string::String, std::string::String); 0]);
     }
 
     #[test]
@@ -9405,7 +9405,7 @@ mod tests {
         let info = start_copilot_browser_oauth(&config).expect("start");
 
         assert_eq!(info.provider, "github-copilot");
-        assert!(!info.verifier.is_empty());
+        assert_ne!(info.verifier, "");
 
         let (base, query) = info.url.split_once('?').expect("missing query");
         assert_eq!(base, GITHUB_OAUTH_AUTHORIZE_URL);
@@ -9861,7 +9861,7 @@ mod tests {
         let info = start_gitlab_oauth(&config).expect("start");
 
         assert_eq!(info.provider, "gitlab");
-        assert!(!info.verifier.is_empty());
+        assert_ne!(info.verifier, "");
 
         let (base, query) = info.url.split_once('?').expect("missing query");
         assert_eq!(base, "https://gitlab.com/oauth/authorize");
@@ -10067,7 +10067,7 @@ mod tests {
         // #97: the default now ships the well-known public Copilot client id so
         // login works without the user registering their own GitHub App.
         assert_eq!(config.client_id, DEFAULT_COPILOT_CLIENT_ID);
-        assert!(!config.client_id.is_empty());
+        assert_ne!(config.client_id, "");
         assert_eq!(config.github_base_url, "https://github.com");
         assert_eq!(config.scopes, GITHUB_COPILOT_SCOPES);
     }
@@ -10085,7 +10085,7 @@ mod tests {
     #[test]
     fn test_gitlab_config_default() {
         let config = GitLabOAuthConfig::default();
-        assert!(config.client_id.is_empty());
+        assert_eq!(config.client_id, "");
         assert_eq!(config.base_url, GITLAB_DEFAULT_BASE_URL);
         assert_eq!(config.scopes, GITLAB_DEFAULT_SCOPES);
         assert!(config.redirect_uri.is_none());
@@ -12372,7 +12372,7 @@ sso_region = us-east-1
         );
 
         let pruned = auth.prune_stale_credentials(24 * 60 * 60 * 1000);
-        assert!(pruned.is_empty());
+        assert_eq!(pruned, [] as [std::string::String; 0]);
         assert!(auth.entries.contains_key("ext-prov"));
     }
 

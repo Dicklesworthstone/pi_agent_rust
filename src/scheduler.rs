@@ -4157,7 +4157,7 @@ mod tests {
         assert_eq!(mesh.total_depth(), 0);
         assert!(!mesh.has_pending());
         assert_eq!(mesh.queue_depth(0), None);
-        assert!(mesh.telemetry().queue_depths.is_empty());
+        assert_eq!(mesh.telemetry().queue_depths, [] as [usize; 0]);
 
         let err = mesh
             .enqueue_event("evt".to_string(), serde_json::json!(null))
@@ -4197,7 +4197,7 @@ mod tests {
     fn reactor_placement_manifest_zero_shards() {
         let manifest = ReactorPlacementManifest::plan(0, None);
         assert_eq!(manifest.shard_count, 0);
-        assert!(manifest.bindings.is_empty());
+        assert_eq!(manifest.bindings, [] as [scheduler::ReactorShardBinding; 0]);
         assert!(manifest.fallback_reason.is_none());
     }
 

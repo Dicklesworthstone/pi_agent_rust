@@ -5389,7 +5389,7 @@ mod tool_effect_batch_planning_tests {
     fn metamorphic_empty_tool_batch_matches_sequential_oracle() {
         let cases = Vec::new();
 
-        assert!(plan_tool_effect_batches(&effect_plan(&cases)).is_empty());
+        assert_eq!(plan_tool_effect_batches(&effect_plan(&cases)), [] as [agent::ToolEffectBatch; 0]);
         assert_eq!(
             scheduled_transcript(&cases, BatchArrivalOrder::Forward),
             sequential_oracle(&cases)

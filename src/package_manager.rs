@@ -5414,8 +5414,8 @@ mod tests {
     #[test]
     fn split_patterns_empty_input() {
         let (plain, patterns) = split_patterns(&[]);
-        assert!(plain.is_empty());
-        assert!(patterns.is_empty());
+        assert_eq!(plain, [] as [std::string::String; 0]);
+        assert_eq!(patterns, [] as [std::string::String; 0]);
     }
 
     // ======================================================================
@@ -5612,7 +5612,7 @@ mod tests {
     #[test]
     fn extract_string_array_from_null() {
         let result = extract_string_array(None);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -5995,7 +5995,7 @@ mod tests {
         assert_eq!(snapshot.extensions, vec!["ext1.js"]);
         assert_eq!(snapshot.skills, vec!["my-skill"]);
         assert_eq!(snapshot.themes, vec!["dark.json", "light.json"]);
-        assert!(snapshot.prompts.is_empty());
+        assert_eq!(snapshot.prompts, [] as [std::string::String; 0]);
     }
 
     // ======================================================================
@@ -6035,7 +6035,7 @@ mod tests {
         update_package_sources(&path, "npm:foo", UpdateAction::Remove, dir.path()).expect("remove");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
-        assert!(packages.is_empty());
+        assert_eq!(packages.as_slice(), []);
     }
 
     #[test]
@@ -6792,7 +6792,7 @@ mod tests {
     #[test]
     fn collect_auto_prompt_entries_nonexistent_dir() {
         let entries = collect_auto_prompt_entries(Path::new("/nonexistent"));
-        assert!(entries.is_empty());
+        assert_eq!(entries, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
@@ -7187,7 +7187,7 @@ mod tests {
             PackageManager::collect_manifest_files(&package_root, ResourceType::Extensions)
                 .expect("collect manifest files");
 
-        assert!(all_files.is_empty());
+        assert_eq!(all_files, [] as [std::path::PathBuf; 0]);
         assert!(enabled.is_empty());
     }
 
@@ -8110,7 +8110,7 @@ mod tests {
         let pruned = manager
             .reconcile_lockfile_sync(PackageScope::Project)
             .expect("reconcile should not error on missing lockfile");
-        assert!(pruned.is_empty());
+        assert_eq!(pruned, [] as [package_manager::PackageLockEntry; 0]);
     }
 
     #[test]

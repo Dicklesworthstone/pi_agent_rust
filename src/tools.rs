@@ -15614,7 +15614,7 @@ mod tests {
         assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
         assert_eq!(result.output_lines, 0);
         assert_eq!(result.output_bytes, 0);
-        assert!(result.content.is_empty());
+        assert_eq!(result.content, "");
     }
 
     #[test]
@@ -15672,7 +15672,7 @@ mod tests {
                 .to_string()
                 .contains("invalid path.bytes base64")
         );
-        assert!(matches.is_empty());
+        assert_eq!(matches, [] as [(std::path::PathBuf, usize); 0]);
         assert_eq!(match_count, 0);
         assert!(!match_limit_reached);
 
@@ -15831,7 +15831,7 @@ mod tests {
             );
 
             let lines = get_file_lines_async(&path, tmp.path()).await;
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [std::string::String; 0]);
         });
     }
 
@@ -15855,7 +15855,7 @@ mod tests {
             );
 
             let lines = get_file_lines_async(&path, tmp.path()).await;
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [std::string::String; 0]);
         });
     }
 
@@ -16439,7 +16439,7 @@ mod tests {
                 .unwrap();
             // Binary files are read as lossy UTF-8 with replacement characters
             let text = get_text(&out.content);
-            assert!(!text.is_empty());
+            assert_ne!(text, "");
             assert!(!out.is_error);
         });
     }

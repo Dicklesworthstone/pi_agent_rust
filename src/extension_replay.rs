@@ -1465,7 +1465,7 @@ mod tests {
     fn builder_empty_events_produces_valid_bundle() {
         let builder = ReplayTraceBuilder::new("trace-empty");
         let bundle = builder.build().expect("empty bundle should be valid");
-        assert!(bundle.events.is_empty());
+        assert_eq!(bundle.events, [] as [extension_replay::ReplayTraceEvent; 0]);
         assert_eq!(bundle.schema, REPLAY_TRACE_SCHEMA_V1);
         assert_eq!(bundle.trace_id, "trace-empty");
     }
@@ -1889,7 +1889,7 @@ mod tests {
         let result = recorder
             .finish(within_budget_observation())
             .expect("finish");
-        assert!(result.bundle.events.is_empty());
+        assert_eq!(result.bundle.events, [] as [extension_replay::ReplayTraceEvent; 0]);
         assert!(result.gate_report.capture_allowed);
         assert_eq!(result.diagnostic.event_count, 0);
     }
@@ -2088,7 +2088,7 @@ mod tests {
         assert_eq!(result.diagnostic.schema, REPLAY_TRACE_SCHEMA_V1);
         assert_eq!(result.diagnostic.event_count, 2);
         assert!(result.diagnostic.divergence.is_none());
-        assert!(result.diagnostic.root_cause_hints.is_empty());
+        assert_eq!(result.diagnostic.root_cause_hints, [] as [extension_replay::ReplayRootCauseHint; 0]);
     }
 
     #[test]
@@ -2113,7 +2113,7 @@ mod tests {
             .finish_and_compare(within_budget_observation(), &reference)
             .expect("compare");
         assert!(comparison.divergence.is_none());
-        assert!(comparison.root_cause_hints.is_empty());
+        assert_eq!(comparison.root_cause_hints, [] as [extension_replay::ReplayRootCauseHint; 0]);
         assert_eq!(comparison.reference_trace_id, "trace-cmp");
         assert_eq!(comparison.observed_trace_id, "trace-cmp");
         assert!(result.diagnostic.divergence.is_none());
@@ -2148,7 +2148,7 @@ mod tests {
             ReplayDivergenceReason::EventFieldMismatch { ref field, .. } if field == "kind"
         ));
         assert!(result.diagnostic.divergence.is_some());
-        assert!(!result.diagnostic.root_cause_hints.is_empty());
+        assert_ne!(result.diagnostic.root_cause_hints, [] as [extension_replay::ReplayRootCauseHint; 0]);
     }
 
     #[test]
@@ -2192,7 +2192,7 @@ mod tests {
         let (diagnostic, comparison) =
             super::compare_replay_bundles(&bundle, &bundle, gate).expect("compare");
         assert!(comparison.divergence.is_none());
-        assert!(comparison.root_cause_hints.is_empty());
+        assert_eq!(comparison.root_cause_hints, [] as [extension_replay::ReplayRootCauseHint; 0]);
         assert!(diagnostic.divergence.is_none());
     }
 
@@ -2211,7 +2211,7 @@ mod tests {
         let (diagnostic, comparison) =
             super::compare_replay_bundles(&reference, &observed, gate).expect("compare");
         assert!(comparison.divergence.is_some());
-        assert!(!comparison.root_cause_hints.is_empty());
+        assert_ne!(comparison.root_cause_hints, [] as [extension_replay::ReplayRootCauseHint; 0]);
         assert!(diagnostic.divergence.is_some());
     }
 

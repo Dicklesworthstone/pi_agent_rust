@@ -943,7 +943,7 @@ mod tests {
         let plan = executor.plan_batch(Vec::new());
         assert_eq!(plan.total_requests, 0);
         assert!(plan.groups.is_empty());
-        assert!(plan.decisions.is_empty());
+        assert_eq!(plan.decisions, [] as [hostcall_amac::AmacToggleDecision; 0]);
     }
 
     #[test]

@@ -1516,7 +1516,7 @@ mod tests {
             report.saturation_summary.recommended_operator_posture,
             RecommendedOperatorPosture::ContinueCurrentSwarm
         );
-        assert!(report.suppressed_claims.is_empty());
+        assert_eq!(report.suppressed_claims, [] as [std::string::String; 0]);
     }
 
     #[test]
