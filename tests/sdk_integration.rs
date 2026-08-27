@@ -24,7 +24,8 @@ use pi::model::{
 };
 use pi::provider::{Context, Provider, StreamOptions};
 use pi::sdk::{
-    AgentSessionHandle, AgentSessionState, SessionOptions, SubscriptionId, create_agent_session,
+    AgentSessionHandle, AgentSessionState, McpSessionOptions, SessionOptions, SubscriptionId,
+    create_agent_session,
 };
 use pi::session::Session;
 use pi::tools::ToolRegistry;
@@ -829,6 +830,58 @@ fn sdk_extension_policy_safe_denies_exec_and_records_hostcall_telemetry() {
         "expected deny policy source for safe profile, got: {}",
         exec_alert.policy_source
     );
+}
+
+// ============================================================================
+// SDK workspace trust gates project MCP discovery
+// ============================================================================
+
+#[test]
+fn sdk_mcp_discovery_honors_workspace_trust() {
+    let harness = TestHarness::new("sdk_mcp_discovery_honors_workspace_trust");
+    let project_mcp = harness.temp_path(".pi/mcp.json");
+    let global_dir = harness.temp_path("mcp-global");
+    std::fs::create_dir_all(project_mcp.parent().expect("project MCP parent"))
+        .expect("create project MCP dir");
+    std::fs::create_dir_all(&global_dir).expect("create global MCP dir");
+    std::fs::write(
+        &project_mcp,
+        r#"{"mcpServers":{"project-server":{"command":"project-bin"}}}"#,
+    )
+    .expect("write project MCP config");
+    std::fs::write(
+        global_dir.join("mcp.json"),
+        r#"{"mcpServers":{"global-server":{"command":"global-bin"}}}"#,
+    )
+    .expect("write global MCP config");
+
+    let mut options = default_session_options(&harness);
+    options.workspace_trusted = false;
+    options.mcp = Some(McpSessionOptions {
+        config_paths: Vec::new(),
+        global_dir: Some(global_dir.clone()),
+    });
+
+    let untrusted = run_async(create_agent_session(options.clone())).expect("create session");
+    let untrusted_manager = untrusted.mcp_manager().expect("MCP manager");
+    let untrusted_names = untrusted_manager
+        .list()
+        .into_iter()
+        .map(|server| server.name)
+        .collect::<Vec<_>>();
+    assert_eq!(untrusted_names, vec!["global-server"]);
+
+    options.workspace_trusted = true;
+    let trusted = run_async(create_agent_session(options)).expect("create trusted session");
+    let mut trusted_names = trusted
+        .mcp_manager()
+        .expect("MCP manager")
+        .list()
+        .into_iter()
+        .map(|server| server.name)
+        .collect::<Vec<_>>();
+    trusted_names.sort_unstable();
+    assert_eq!(trusted_names, vec!["global-server", "project-server"]);
 }
 
 // ============================================================================

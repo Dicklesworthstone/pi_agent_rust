@@ -1951,6 +1951,9 @@ fn e2e_cli_config_show_reports_empty_packages_when_none_configured() {
 fn e2e_cli_config_show_lists_discovered_package_resources() {
     let mut harness = CliTestHarness::new("e2e_cli_config_show_lists_discovered_package_resources");
     harness.env.remove("PI_CONFIG_PATH");
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
 
     let package_root = harness.harness.create_dir("config-ui-pkg");
     fs::create_dir_all(package_root.join("extensions")).expect("create package extensions");
@@ -2015,6 +2018,9 @@ fn e2e_cli_config_show_lists_discovered_package_resources() {
 fn e2e_cli_config_show_surfaces_invalid_package_settings() {
     let mut harness = CliTestHarness::new("e2e_cli_config_show_surfaces_invalid_package_settings");
     harness.env.remove("PI_CONFIG_PATH");
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
     let project_settings = harness.harness.temp_dir().join(".pi").join("settings.json");
     fs::create_dir_all(
         project_settings
@@ -2051,6 +2057,9 @@ fn e2e_cli_config_without_tty_surfaces_invalid_package_settings() {
     let mut harness =
         CliTestHarness::new("e2e_cli_config_without_tty_surfaces_invalid_package_settings");
     harness.env.remove("PI_CONFIG_PATH");
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
     let project_settings = harness.harness.temp_dir().join(".pi").join("settings.json");
     fs::create_dir_all(
         project_settings
@@ -2114,6 +2123,52 @@ fn e2e_cli_workspace_trust_fails_closed_non_interactive() {
     assert!(
         !store_path.exists(),
         "non-interactive denial must not persist a trust decision"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_package_fast_paths_skip_untrusted_project_updates() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_package_fast_paths_skip_untrusted_project_updates");
+    harness.env.remove("PI_CONFIG_PATH");
+    let npm_ledger = harness.harness.temp_path("untrusted-update-npm.log");
+    harness.env.insert(
+        "PI_E2E_FAKE_NPM_LEDGER".to_string(),
+        npm_ledger.display().to_string(),
+    );
+    let project_settings = harness.harness.temp_dir().join(".pi/settings.json");
+    fs::create_dir_all(project_settings.parent().expect("project settings parent"))
+        .expect("create project settings dir");
+    fs::write(
+        &project_settings,
+        serde_json::to_string_pretty(&json!({ "packages": ["npm:blocked-project-pkg"] }))
+            .expect("serialize project settings"),
+    )
+    .expect("write project settings");
+
+    let update = harness.run(&["update"]);
+    assert_exit_code(&harness.harness, &update, 0);
+    assert_contains(&harness.harness, &update.stderr, "workspace not trusted");
+    assert!(
+        !npm_ledger.exists(),
+        "the synchronous update fast path must not execute an untrusted project package"
+    );
+
+    let list = harness.run(&["list"]);
+    assert_exit_code(&harness.harness, &list, 0);
+    assert_contains(&harness.harness, &list.stdout, "No packages installed.");
+    assert!(!list.stdout.contains("blocked-project-pkg"));
+
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
+    let trusted_list = harness.run(&["list"]);
+    assert_exit_code(&harness.harness, &trusted_list, 0);
+    assert_contains(
+        &harness.harness,
+        &trusted_list.stdout,
+        "blocked-project-pkg",
     );
 }
 
@@ -2401,6 +2456,9 @@ fn e2e_cli_list_subcommand_works_offline() {
 fn e2e_cli_packages_install_list_remove_offline() {
     let mut harness = CliTestHarness::new("e2e_cli_packages_install_list_remove_offline");
     harness.env.remove("PI_CONFIG_PATH");
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
 
     harness.harness.section("install local (project)");
     harness.harness.create_dir("local-pkg");
@@ -2510,6 +2568,9 @@ fn e2e_cli_packages_install_list_remove_offline() {
 fn e2e_cli_packages_update_respects_pinning_offline() {
     let mut harness = CliTestHarness::new("e2e_cli_packages_update_respects_pinning_offline");
     harness.env.remove("PI_CONFIG_PATH");
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
 
     let git = |cwd: &Path, args: &[&str]| -> String {
         let output = Command::new("git")
@@ -2634,6 +2695,9 @@ fn e2e_cli_extensions_install_update_manifest_resolution_offline() {
     let mut harness =
         CliTestHarness::new("e2e_cli_extensions_install_update_manifest_resolution_offline");
     harness.env.remove("PI_CONFIG_PATH");
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
 
     let write_extension_package = |root: &Path,
                                    package_name: &str,

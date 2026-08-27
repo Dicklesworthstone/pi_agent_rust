@@ -855,6 +855,34 @@ fn apply_pi(harness: &TestHarness, app: &mut PiApp, label: &str, msg: PiMsg) -> 
     apply_msg(harness, app, label, Message::new(msg))
 }
 
+fn apply_conversation_reset(
+    harness: &TestHarness,
+    app: &mut PiApp,
+    label: &str,
+    messages: Vec<ConversationMessage>,
+    usage: Usage,
+    status: Option<String>,
+) -> StepOutcome {
+    let session = app.session_handle();
+    let session_id = session
+        .try_lock()
+        .expect("lock session for conversation reset")
+        .header
+        .id
+        .clone();
+    apply_pi(
+        harness,
+        app,
+        label,
+        PiMsg::ConversationReset {
+            session_id,
+            messages,
+            usage,
+            status,
+        },
+    )
+}
+
 fn apply_key(harness: &TestHarness, app: &mut PiApp, label: &str, key: KeyMsg) -> StepOutcome {
     apply_msg(harness, app, label, Message::new(key))
 }
@@ -1367,15 +1395,13 @@ fn tui_state_pageup_changes_scroll_percent_when_scrollable() {
     let messages = (0..40)
         .map(|idx| user_msg(&format!("line {idx}")))
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(many)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let baseline_view = normalize_view(&BubbleteaModel::view(&app));
@@ -1398,15 +1424,13 @@ fn tui_state_pagedown_restores_scroll_percent_when_scrollable() {
     let messages = (0..40)
         .map(|idx| user_msg(&format!("line {idx}")))
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(many)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     press_pgup(&harness, &mut app);
@@ -1509,15 +1533,13 @@ fn tui_state_text_delta_preserves_manual_scroll_position() {
     let messages = (0..50)
         .map(|idx| user_msg(&format!("history {idx:03}")))
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(history)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let pgup_step = press_pgup(&harness, &mut app);
@@ -2527,15 +2549,13 @@ fn tui_state_conversation_reset_replaces_messages_sets_usage_and_status() {
     log_initial_state(&harness, &app);
 
     let messages = vec![user_msg("u1"), assistant_msg("a1")];
-    let step = apply_pi(
+    let step = apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages,
-            usage: sample_usage(11, 22),
-            status: Some("reset ok".to_string()),
-        },
+        messages,
+        sample_usage(11, 22),
+        Some("reset ok".to_string()),
     );
     assert_after_contains(&harness, &step, "reset ok");
     assert_after_contains(&harness, &step, "Tokens: 11 in / 22 out");
@@ -4012,15 +4032,13 @@ fn tui_state_slash_copy_reports_clipboard_unavailable_or_success() {
     log_initial_state(&harness, &app);
 
     let messages = vec![assistant_msg("hello from assistant")];
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     type_text(&harness, &mut app, "/copy");
@@ -4078,15 +4096,13 @@ fn tui_state_slash_clear_clears_conversation_and_sets_status() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages: vec![user_msg("hello")],
-            usage: Usage::default(),
-            status: None,
-        },
+        vec![user_msg("hello")],
+        Usage::default(),
+        None,
     );
     type_text(&harness, &mut app, "/clear");
     let step = press_enter(&harness, &mut app);
@@ -4101,15 +4117,13 @@ fn tui_state_slash_new_resets_conversation_and_sets_status() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages: vec![user_msg("hello"), assistant_msg("world")],
-            usage: sample_usage(12, 34),
-            status: Some("old".to_string()),
-        },
+        vec![user_msg("hello"), assistant_msg("world")],
+        sample_usage(12, 34),
+        Some("old".to_string()),
     );
 
     type_text(&harness, &mut app, "/new");
@@ -4140,15 +4154,13 @@ export default function init(pi) {
     );
     log_initial_state(&harness, &app);
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages: vec![user_msg("hello"), assistant_msg("world")],
-            usage: sample_usage(12, 34),
-            status: None,
-        },
+        vec![user_msg("hello"), assistant_msg("world")],
+        sample_usage(12, 34),
+        None,
     );
 
     type_text(&harness, &mut app, "/new");
@@ -4187,15 +4199,13 @@ export default function init(pi) {
     );
     log_initial_state(&harness, &app);
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages: vec![user_msg("hello"), assistant_msg("world")],
-            usage: sample_usage(12, 34),
-            status: None,
-        },
+        vec![user_msg("hello"), assistant_msg("world")],
+        sample_usage(12, 34),
+        None,
     );
 
     type_text(&harness, &mut app, "/new");
@@ -4323,7 +4333,7 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }));
         let has_editor = msgs
             .iter()
-            .any(|msg| matches!(msg, PiMsg::SetEditorText(_)));
+            .any(|msg| matches!(msg, PiMsg::SetEditorText { .. }));
         has_reset && has_editor
     });
 
@@ -4333,7 +4343,7 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
     for msg in events {
         match msg {
             PiMsg::ConversationReset { .. } => reset_msg = Some(msg),
-            PiMsg::SetEditorText(_) => editor_msg = Some(msg),
+            PiMsg::SetEditorText { .. } => editor_msg = Some(msg),
             PiMsg::AgentError(err) => {
                 fork_err = Some(err);
             }
@@ -7557,15 +7567,13 @@ fn tui_perf_degraded_mode_skips_markdown_cache() {
             thinking: None,
         })
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(cache+tools)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm the render cache first.
@@ -7637,15 +7645,13 @@ fn tui_perf_emergency_mode_raw_text_no_cache() {
             collapsed: false,
         })
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(cache-critical)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm caches/prefix before entering critical mode.
@@ -8183,15 +8189,13 @@ fn tui_perf_cache_feeds_prefix() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(50 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm the render cache + prefix by triggering a full rebuild.
@@ -8268,15 +8272,13 @@ fn tui_perf_streaming_to_cache_transition() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(5 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm cache + prefix.
@@ -8404,15 +8406,13 @@ fn tui_perf_render_buffer_reuses_cached_content() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(20 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // First call: populates cache + prefix + sets capacity hint via view().
@@ -8491,15 +8491,13 @@ fn tui_perf_buffer_survives_cache_invalidation() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(10 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm cache: full rebuild populates cache + prefix.
@@ -8835,15 +8833,13 @@ fn tui_perf_large_session_frame_budget_surfaces_emit_evidence() {
         collapsed: true,
     });
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(720 msgs + huge tool preview)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let mut conversation_probe = SurfaceProbe::default();
@@ -9101,15 +9097,13 @@ fn tui_perf_e2e_long_conversation_responsiveness() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(500 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Measure content build (where the cache effect is visible).
@@ -9252,15 +9246,13 @@ fn tui_frame_budget_snapshot_covers_large_session_surfaces() {
         })
         .collect();
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(600 mixed messages)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
     app.reset_frame_timing_for_test();
     let large_view = BubbleteaModel::view(&app);
@@ -9294,15 +9286,13 @@ fn tui_frame_budget_snapshot_covers_large_session_surfaces() {
             collapsed: true,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(large tool previews)",
-        PiMsg::ConversationReset {
-            messages: tool_messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        tool_messages,
+        Usage::default(),
+        None,
     );
     let tool_view = BubbleteaModel::view(&app);
     assert_view_fits("tool_preview", &tool_view, 40);
@@ -9443,15 +9433,13 @@ fn tui_perf_e2e_streaming_with_history() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(200 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let _ = BubbleteaModel::view(&app);
@@ -9728,15 +9716,13 @@ fn tui_perf_e2e_memory_pressure_response() {
             });
         }
     }
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(50 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let _ = BubbleteaModel::view(&app);

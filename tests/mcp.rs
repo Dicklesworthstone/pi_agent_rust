@@ -158,6 +158,82 @@ fn mcp_discovery_flows_into_manager_list() {
 }
 
 #[test]
+fn mcp_discovery_skips_untrusted_project_sources_without_reading_them() {
+    let case = "mcp_discovery_skips_untrusted_project_sources_without_reading_them";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let global = harness.temp_path("global");
+    std::fs::create_dir_all(root.join(".pi")).expect("create project config dir");
+    std::fs::create_dir_all(root.join(".agents")).expect("create agents config dir");
+    std::fs::create_dir_all(root.join(".claude")).expect("create foreign config dir");
+    std::fs::create_dir_all(&global).expect("create global config dir");
+
+    // This malformed high-precedence project file would block global config
+    // if discovery opened it. An untrusted workspace must skip it entirely.
+    std::fs::write(root.join(".pi/mcp.json"), "{ malformed")
+        .expect("write malformed project config");
+    std::fs::write(
+        root.join(".agents/mcp.json"),
+        r#"{"mcpServers":{"agents":{"command":"agents-bin"}}}"#,
+    )
+    .expect("write agents config");
+    std::fs::write(
+        root.join(".claude/mcp.json"),
+        r#"{"mcpServers":{"foreign":{"command":"foreign-bin"}}}"#,
+    )
+    .expect("write foreign config");
+    std::fs::write(
+        global.join("mcp.json"),
+        r#"{"mcpServers":{"global":{"command":"global-bin"}}}"#,
+    )
+    .expect("write global config");
+    let explicit = harness.temp_path("explicit-mcp.json");
+    std::fs::write(
+        &explicit,
+        r#"{"mcpServers":{"explicit":{"command":"explicit-bin"}}}"#,
+    )
+    .expect("write explicit config");
+
+    let untrusted = pi::mcp::config::discover_with_project_trust(
+        &root,
+        &global,
+        std::slice::from_ref(&explicit),
+        false,
+    );
+    let mut names = untrusted
+        .servers
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, vec!["explicit", "global"]);
+    assert!(
+        untrusted.warnings.is_empty(),
+        "skipped project files must not be opened or diagnosed: {:?}",
+        untrusted.warnings
+    );
+
+    write_project_mcp_config(&root, "project", "project-bin", &[]);
+    let trusted = pi::mcp::config::discover_with_project_trust(
+        &root,
+        &global,
+        std::slice::from_ref(&explicit),
+        true,
+    );
+    let mut names = trusted
+        .servers
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["agents", "explicit", "foreign", "global", "project"]
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
 fn mcp_pending_and_list_surfaces_do_not_expose_target_credentials() {
     let case = "mcp_pending_and_list_surfaces_do_not_expose_target_credentials";
     let harness = TestHarness::new(case);

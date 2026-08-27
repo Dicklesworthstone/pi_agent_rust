@@ -242,9 +242,17 @@ fn generate_conversation(n: usize) -> Vec<ConversationMessage> {
 }
 
 fn load_conversation(app: &mut PiApp, messages: Vec<ConversationMessage>) {
+    let session = app.session_handle();
+    let session_id = session
+        .try_lock()
+        .expect("lock session for conversation reset")
+        .header
+        .id
+        .clone();
     let _ = BubbleteaModel::update(
         app,
         Message::new(PiMsg::ConversationReset {
+            session_id,
             messages,
             usage: Usage::default(),
             status: None,

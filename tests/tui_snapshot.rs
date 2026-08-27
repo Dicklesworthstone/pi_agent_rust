@@ -170,9 +170,17 @@ fn set_conversation(
     usage: Usage,
     status: Option<&str>,
 ) {
+    let session = app.session_handle();
+    let session_id = session
+        .try_lock()
+        .expect("lock session for conversation reset")
+        .header
+        .id
+        .clone();
     send_pi(
         app,
         PiMsg::ConversationReset {
+            session_id,
             messages,
             usage,
             status: status.map(str::to_string),
