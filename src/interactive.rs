@@ -601,6 +601,66 @@ impl PiApp {
         });
     }
 
+    fn session_transition_blocker(&self) -> Option<&'static str> {
+        if self.agent_state != AgentState::Idle {
+            return Some("Cannot change sessions while processing");
+        }
+        if !self.pending_inputs.is_empty() {
+            return Some(
+                "Queued input is still pending; finish or restore it before changing sessions",
+            );
+        }
+
+        let Ok(agent) = self.agent.try_lock() else {
+            return Some("Session busy; try again");
+        };
+        if agent.queued_message_count() > 0 {
+            return Some(
+                "Queued input is still pending; finish or restore it before changing sessions",
+            );
+        }
+        drop(agent);
+
+        let Ok(user_queue) = self.message_queue.try_lock() else {
+            return Some("Session queue busy; try again");
+        };
+        if user_queue.pending_count() > 0 {
+            return Some(
+                "Queued input is still pending; finish or restore it before changing sessions",
+            );
+        }
+        drop(user_queue);
+
+        let Ok(injected_queue) = self.injected_queue.try_lock() else {
+            return Some("Session queue busy; try again");
+        };
+        (injected_queue.pending_count() > 0).then_some(
+            "Queued input is still pending; finish or restore it before changing sessions",
+        )
+    }
+
+    fn try_install_session(
+        session: &Arc<Mutex<Session>>,
+        agent: &Arc<Mutex<Agent>>,
+        new_session: Session,
+        messages_for_agent: Vec<ModelMessage>,
+        thinking_level: Option<ThinkingLevel>,
+    ) -> std::result::Result<(), &'static str> {
+        let Ok(mut agent_guard) = agent.try_lock() else {
+            return Err("Agent busy; session change was not applied");
+        };
+        let Ok(mut session_guard) = session.try_lock() else {
+            return Err("Session busy; session change was not applied");
+        };
+
+        *session_guard = new_session;
+        agent_guard.replace_messages(messages_for_agent);
+        if let Some(level) = thinking_level {
+            agent_guard.stream_options_mut().thinking_level = Some(level);
+        }
+        Ok(())
+    }
+
     fn toggle_queue_mode_setting(&mut self, entry: SettingsUiEntry) {
         let (key, current) = match entry {
             SettingsUiEntry::SteeringMode => ("steeringMode", self.config.steering_queue_mode()),
@@ -1494,6 +1554,11 @@ impl PiApp {
 
     #[allow(clippy::too_many_lines)]
     fn load_session_from_path(&mut self, path: &str) -> Option<Cmd> {
+        if let Some(reason) = self.session_transition_blocker() {
+            self.status_message = Some(reason.to_string());
+            return None;
+        }
+
         let path = path.to_string();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
@@ -1511,6 +1576,9 @@ impl PiApp {
                 guard.path.as_ref().map(|p| p.display().to_string()),
             )
         };
+
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some("Loading session...".to_string());
 
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
@@ -1553,64 +1621,28 @@ impl PiApp {
             loaded_session.session_dir = session_dir;
 
             let messages_for_agent = loaded_session.to_messages_for_current_path();
-
-            // Replace the session.
-            {
-                let mut session_guard =
-                    match OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &Cx::for_request(),
-                                PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                *session_guard = loaded_session;
+            let (messages, usage) = conversation_from_session(&loaded_session);
+            if let Err(err) = PiApp::try_install_session(
+                &session,
+                &agent,
+                loaded_session,
+                messages_for_agent,
+                None,
+            ) {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &task_cx,
+                    PiMsg::AgentError(err.to_string()),
+                )
+                .await;
+                return;
             }
-
-            // Update the agent messages.
-            {
-                let mut agent_guard =
-                    match OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &task_cx,
-                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                agent_guard.replace_messages(messages_for_agent);
-            }
-
-            let (messages, usage) = {
-                let session_guard =
-                    match OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &Cx::for_request(),
-                                PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                conversation_from_session(&session_guard)
-            };
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &task_cx,
                 PiMsg::ConversationReset {
+                    session_id: new_session_id.clone(),
                     messages,
                     usage,
                     status: Some("Session resumed".to_string()),
@@ -1633,7 +1665,6 @@ impl PiApp {
             }
         });
 
-        self.status_message = Some("Loading session...".to_string());
         None
     }
 }
@@ -1855,8 +1886,11 @@ pub enum PiMsg {
     AgentStart,
     /// Trigger processing of the next queued input (CLI startup messages).
     RunPending,
-    /// Enqueue a pending input (extensions may inject while idle).
-    EnqueuePendingInput(PendingInput),
+    /// Enqueue an input only while its originating session remains current.
+    EnqueuePendingInput {
+        session_id: String,
+        input: PendingInput,
+    },
     /// Internal: shut down the async→UI message bridge (used for clean exit).
     UiShutdown,
     /// Periodic autocomplete refresh tick (background file index).
@@ -1900,7 +1934,10 @@ pub enum PiMsg {
     },
     /// Auto-titling result: a tiny/smol-role model suggested a session name
     /// (bd-cv653.3.1). Applied only if the session is still unnamed.
-    SessionTitleSuggestion { title: String },
+    SessionTitleSuggestion {
+        owner_session_id: String,
+        title: String,
+    },
     /// Agent error.
     AgentError(String),
     /// Credentials changed for a provider; refresh in-memory provider auth state.
@@ -1909,6 +1946,11 @@ pub enum PiMsg {
     System(String),
     /// System note that does not mutate agent state (safe during streaming).
     SystemNote(String),
+    /// Session-bound system note; discarded if its origin is no longer current.
+    SessionSystemNote {
+        owner_session_id: String,
+        message: String,
+    },
     /// Update last user message content (input transform/redaction).
     UpdateLastUserMessage(String),
     /// Bash command result (non-agent).
@@ -1926,14 +1968,19 @@ pub enum PiMsg {
     },
     /// Replace conversation state from session (compaction/fork).
     ConversationReset {
+        session_id: String,
         messages: Vec<ConversationMessage>,
         usage: Usage,
         status: Option<String>,
     },
     /// Set the editor contents (used by /tree selection of user/custom messages).
-    SetEditorText(String),
+    SetEditorText {
+        owner_session_id: String,
+        text: String,
+    },
     /// Open the session tree selector (async from extension hooks).
     OpenTree {
+        owner_session_id: String,
         initial_selected_id: Option<String>,
         label: Option<String>,
     },
@@ -2411,6 +2458,10 @@ pub struct PiApp {
 
     // Session and config
     session: Arc<Mutex<Session>>,
+    /// Session whose state is currently rendered by this `PiApp`. This is UI
+    /// transition bookkeeping only; security-sensitive event ownership still
+    /// verifies the authoritative Session mutex and fails closed on contention.
+    displayed_session_id: Option<String>,
     config: Config,
     theme: Theme,
     styles: TuiStyles,
@@ -2748,9 +2799,6 @@ impl PiApp {
                 Some(Arc::new(follow_up_fetcher)),
             );
         }
-        // Background job completion notices (bd-cv653.3.10).
-        agent.register_message_fetchers(None, Some(crate::jobs::follow_up_fetcher()));
-
         let keybindings = keybindings_override.unwrap_or_else(|| {
             // Load keybindings from user config (with defaults as fallback).
             let keybindings_result = KeyBindings::load_from_user_config();
@@ -2788,6 +2836,10 @@ impl PiApp {
             crate::embedded_assets::changelog,
         );
 
+        let displayed_session_id = session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone());
         let mut app = Self {
             input,
             workspace: WorkspaceHandle::default(),
@@ -2817,6 +2869,7 @@ impl PiApp {
             pending_tool_output: None,
             todo_summary: None,
             session,
+            displayed_session_id,
             config,
             theme,
             styles,

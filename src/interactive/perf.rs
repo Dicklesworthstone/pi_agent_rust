@@ -1113,7 +1113,7 @@ impl PiApp {
             self.status_message = Some("Cannot retry while processing".to_string());
             return None;
         }
-        let (preparation, ui_messages, usage, agent_messages) = {
+        let (preparation, ui_messages, usage, agent_messages, session_id) = {
             let Ok(mut session_guard) = self.session.try_lock() else {
                 self.status_message = Some("Session busy; try again".to_string());
                 return None;
@@ -1125,7 +1125,8 @@ impl PiApp {
             };
             let (ui_messages, usage) = conversation_from_session(&session_guard);
             let agent_messages = session_guard.to_messages_for_current_path();
-            (preparation, ui_messages, usage, agent_messages)
+            let session_id = session_guard.header.id.clone();
+            (preparation, ui_messages, usage, agent_messages, session_id)
         };
         // The session leaf already moved; if the agent lock is gone we must
         // roll the tree back onto the abandoned turn instead of half-rewinding.
@@ -1161,7 +1162,10 @@ impl PiApp {
             crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &cx,
-                PiMsg::EnqueuePendingInput(crate::interactive::PendingInput::Text(text)),
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: crate::interactive::PendingInput::Text(text),
+                },
             )
             .await
         });

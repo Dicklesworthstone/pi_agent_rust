@@ -84,6 +84,86 @@ async fn dispatch_input_event(
     Ok(apply_input_event_response(response, text, images))
 }
 
+fn before_agent_start_payload(
+    prompt: &str,
+    images: &[ImageContent],
+    system_prompt: &str,
+) -> Value {
+    let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
+    json!({
+        "prompt": prompt,
+        "images": images_value,
+        "systemPrompt": system_prompt,
+    })
+}
+
+async fn dispatch_before_agent_start_event(
+    manager: &ExtensionManager,
+    prompt: &str,
+    images: &[ImageContent],
+    system_prompt: &str,
+) -> BeforeAgentStartOutcome {
+    let payload = before_agent_start_payload(prompt, images, system_prompt);
+    let response = manager
+        .dispatch_event_with_response(
+            ExtensionEventName::BeforeAgentStart,
+            Some(payload),
+            EXTENSION_EVENT_TIMEOUT_MS,
+        )
+        .await;
+
+    match response {
+        Ok(value) => apply_before_agent_start_response(value, Utc::now().timestamp_millis()),
+        Err(err) => {
+            tracing::warn!("before_agent_start extension hook failed (fail-open): {err}");
+            BeforeAgentStartOutcome {
+                messages: Vec::new(),
+                system_prompt: None,
+            }
+        }
+    }
+}
+
+struct TurnSystemPromptGuard<'a> {
+    agent: &'a mut crate::agent::Agent,
+    base_system_prompt: Option<String>,
+}
+
+impl<'a> TurnSystemPromptGuard<'a> {
+    fn new(
+        agent: &'a mut crate::agent::Agent,
+        base_system_prompt: Option<String>,
+        turn_system_prompt: Option<String>,
+    ) -> Self {
+        agent.set_system_prompt(turn_system_prompt.or_else(|| base_system_prompt.clone()));
+        Self {
+            agent,
+            base_system_prompt,
+        }
+    }
+}
+
+impl std::ops::Deref for TurnSystemPromptGuard<'_> {
+    type Target = crate::agent::Agent;
+
+    fn deref(&self) -> &Self::Target {
+        self.agent
+    }
+}
+
+impl std::ops::DerefMut for TurnSystemPromptGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.agent
+    }
+}
+
+impl Drop for TurnSystemPromptGuard<'_> {
+    fn drop(&mut self) {
+        self.agent
+            .set_system_prompt(self.base_system_prompt.take());
+    }
+}
+
 const UI_STREAM_DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(45);
 const UI_STREAM_DELTA_MAX_BUFFER_BYTES: usize = 2 * 1024;
 
@@ -791,6 +871,12 @@ async fn flush_ui_stream_batcher_with_backpressure(batcher: &StdMutex<UiStreamDe
 }
 
 impl PiApp {
+    fn event_session_is_current(&self, expected_session_id: &str) -> bool {
+        self.session
+            .try_lock()
+            .is_ok_and(|session| session.header.id.as_str() == expected_session_id)
+    }
+
     /// Handle custom Pi messages from the agent.
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_pi_message(&mut self, msg: PiMsg) -> Option<Cmd> {
@@ -804,7 +890,12 @@ impl PiApp {
             PiMsg::RunPending => {
                 return self.run_next_pending();
             }
-            PiMsg::EnqueuePendingInput(input) => {
+            PiMsg::EnqueuePendingInput { session_id, input } => {
+                if self.agent_state != AgentState::Idle
+                    || !self.event_session_is_current(&session_id)
+                {
+                    return None;
+                }
                 self.pending_inputs.push_back(input);
                 if self.agent_state == AgentState::Idle {
                     return self.run_next_pending();
@@ -998,17 +1089,18 @@ impl PiApp {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
-            PiMsg::SessionTitleSuggestion { title } => {
+            PiMsg::SessionTitleSuggestion {
+                owner_session_id,
+                title,
+            } => {
                 // Apply only when the session is STILL unnamed (a manual /name
-                // during the title call always wins) and persistence is on.
+                // during the title call always wins), the originating session
+                // is still current, and persistence is on.
                 if self.save_enabled {
-                    let still_unnamed = self
-                        .session
-                        .try_lock()
-                        .ok()
-                        .and_then(|guard| guard.get_name())
-                        .is_none();
-                    if still_unnamed && let Ok(mut guard) = self.session.try_lock() {
+                    if let Ok(mut guard) = self.session.try_lock()
+                        && guard.header.id == owner_session_id
+                        && guard.get_name().is_none()
+                    {
                         guard.set_name(&title);
                         drop(guard);
                         self.status_message = Some(format!("Session named: {title}"));
@@ -1083,6 +1175,21 @@ impl PiApp {
                 }
             }
             PiMsg::SystemNote(message) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: message,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+            }
+            PiMsg::SessionSystemNote {
+                owner_session_id,
+                message,
+            } => {
+                if !self.event_session_is_current(&owner_session_id) {
+                    return None;
+                }
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content: message,
@@ -1171,6 +1278,9 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.current_tool_id = None;
                 self.current_tool_summary.clear();
                 self.abort_handle = None;
+                self.title_requested = false;
+                self.todo_summary = None;
+                self.pending_oauth = None;
                 self.status_message = status;
                 self.message_render_cache.clear();
                 // Session replacement invalidates outstanding prompts: drop
@@ -1187,6 +1297,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.input.focus();
             }
             PiMsg::OpenTree {
+                owner_session_id,
                 initial_selected_id,
                 label,
             } => {
@@ -1199,6 +1310,9 @@ After approving access in the browser, press Enter in Pi to complete login."
                     self.status_message = Some("Session busy; try again".to_string());
                     return None;
                 };
+                if session_guard.header.id != owner_session_id {
+                    return None;
+                }
                 let selector = TreeSelectorState::new(
                     &session_guard,
                     self.term_height,
@@ -1431,6 +1545,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 value: None,
                 cancelled: true,
             });
+            self.complete_input_card_transition(InputCardKind::Extension);
         }
 
         self.active_input_card_kind = None;
@@ -1988,6 +2103,10 @@ After approving access in the browser, press Enter in Pi to complete login."
                 });
                 card.question_index += 1;
                 if card.question_index < card.request.request.questions.len() {
+                    // The previous answer belongs to the resolved question,
+                    // never to the successor editor state.
+                    self.input.reset();
+                    self.input.focus();
                     self.active_ask_ui = Some(card);
                     self.show_active_ask_question();
                 } else {
@@ -1995,8 +2114,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
             }
         }
-        self.input.reset();
-        self.input.focus();
         true
     }
 
@@ -2030,8 +2147,6 @@ After approving access in the browser, press Enter in Pi to complete login."
             return false;
         };
         self.finish_ask_ui(&card, true);
-        self.input.reset();
-        self.input.focus();
         true
     }
 
@@ -2053,15 +2168,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         } else if dismissed {
             self.status_message = Some("Question dismissed".to_string());
         }
-        // Free the global slot BEFORE stepping the order ledger so the
-        // successor's activation gate is open (bd-1qol9).
-        if self.active_input_card_kind == Some(InputCardKind::Ask) {
-            self.active_input_card_kind = None;
-        }
-        match self.resolve_order_head_after(InputCardKind::Ask) {
-            true => self.try_activate_next_input_card_impl(),
-            false => self.advance_ask_ui_queue(),
-        }
+        self.complete_input_card_transition(InputCardKind::Ask);
     }
 
     /// Resolve an ACTIVE extension text-card by parsing the editor line.
@@ -2073,17 +2180,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         match parse_extension_ui_response(&active, message) {
             Ok(response) => {
                 self.send_extension_ui_response(response);
-                // Free the global slot BEFORE stepping the ledger so the
-                // successor's activation gate is open (bd-1qol9).
-                if self.active_input_card_kind == Some(InputCardKind::Extension) {
-                    self.active_input_card_kind = None;
-                }
-                match self.resolve_order_head_after(InputCardKind::Extension) {
-                    true => self.try_activate_next_input_card_impl(),
-                    false => self.advance_extension_ui_queue(),
-                }
-                self.input.reset();
-                self.input.focus();
+                self.complete_input_card_transition(InputCardKind::Extension);
             }
             Err(err) => {
                 self.status_message = Some(err);
@@ -2102,6 +2199,29 @@ After approving access in the browser, press Enter in Pi to complete login."
         } else {
             false
         }
+    }
+
+    /// Atomically relinquish the editor after a terminal card resolution.
+    ///
+    /// Consumed input must be cleared before a successor activates; otherwise
+    /// its draft-capture step can mistake the previous card's answer for a
+    /// pre-card user draft. This is also the single place that advances the
+    /// global order ledger and restores the original draft once the burst is
+    /// fully settled (bd-q66i1).
+    fn complete_input_card_transition(&mut self, kind: InputCardKind) {
+        self.input.reset();
+        self.input.focus();
+        if self.active_input_card_kind == Some(kind) {
+            self.active_input_card_kind = None;
+        }
+        match self.resolve_order_head_after(kind) {
+            true => self.try_activate_next_input_card_impl(),
+            false => match kind {
+                InputCardKind::Ask => self.advance_ask_ui_queue(),
+                InputCardKind::Extension => self.advance_extension_ui_queue(),
+            },
+        }
+        self.restore_card_draft_after_cards_settle();
     }
 
     /// Snapshot the user's in-progress draft exactly once per card burst
@@ -2126,8 +2246,8 @@ After approving access in the browser, press Enter in Pi to complete login."
         if !self.ask_ui_queue.is_empty() || !self.extension_ui_queue.is_empty() {
             return;
         }
-        if let Some(draft) = self.card_draft_snapshot.take()
-            && self.input.value().trim().is_empty()
+        if self.input.value().trim().is_empty()
+            && let Some(draft) = self.card_draft_snapshot.take()
         {
             self.input.set_value(&draft);
         }
@@ -2138,13 +2258,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// a cancelled response. The provider turn is never aborted.
     pub(super) fn dismiss_active_input_card(&mut self) -> bool {
         match self.active_input_card_kind {
-            Some(InputCardKind::Ask) => {
-                let dismissed = self.dismiss_active_ask_ui();
-                let _ = self.resolve_order_head_after(InputCardKind::Ask);
-                self.try_activate_next_input_card_impl();
-                self.restore_card_draft_after_cards_settle();
-                dismissed
-            }
+            Some(InputCardKind::Ask) => self.dismiss_active_ask_ui(),
             Some(InputCardKind::Extension) => {
                 if let Some(active) = self.active_extension_ui.take() {
                     self.send_extension_ui_response_quiet(ExtensionUiResponse {
@@ -2152,14 +2266,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                         value: None,
                         cancelled: true,
                     });
-                    let _ = self.resolve_order_head_after(InputCardKind::Extension);
-                    // Mirror the ask path: free the global slot before the
-                    // stepper, or settle-restore short-circuits (bd-1qol9).
-                    self.active_input_card_kind = None;
-                    self.input.reset();
-                    self.input.focus();
-                    self.try_activate_next_input_card_impl();
-                    self.restore_card_draft_after_cards_settle();
+                    self.complete_input_card_transition(InputCardKind::Extension);
                     true
                 } else {
                     false
@@ -2382,15 +2489,14 @@ After approving access in the browser, press Enter in Pi to complete login."
         let Some(entry) = self.title_model_entry.clone() else {
             return;
         };
-        let still_unnamed = self
-            .session
-            .try_lock()
-            .ok()
-            .and_then(|guard| guard.get_name())
-            .is_none();
-        if !still_unnamed {
+        let Some(owner_session_id) = self.session.try_lock().ok().and_then(|guard| {
+            guard
+                .get_name()
+                .is_none()
+                .then(|| guard.header.id.clone())
+        }) else {
             return;
-        }
+        };
         let mut user_texts = self
             .messages
             .iter()
@@ -2424,7 +2530,10 @@ After approving access in the browser, press Enter in Pi to complete login."
                 crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &cx,
-                    PiMsg::SessionTitleSuggestion { title },
+                    PiMsg::SessionTitleSuggestion {
+                        owner_session_id,
+                        title,
+                    },
                 )
                 .await;
             }
@@ -2828,21 +2937,13 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
 
                 let (text, images) = split_content_blocks_for_input(&content_for_agent);
-                let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
-                let payload = json!({
-                    "prompt": text,
-                    "images": images_value,
-                    "systemPrompt": base_system_prompt.as_deref().unwrap_or(""),
-                });
-                let response = manager
-                    .dispatch_event_with_response(
-                        ExtensionEventName::BeforeAgentStart,
-                        Some(payload),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(None);
-                apply_before_agent_start_response(response, Utc::now().timestamp_millis())
+                dispatch_before_agent_start_event(
+                    &manager,
+                    &text,
+                    &images,
+                    base_system_prompt.as_deref().unwrap_or(""),
+                )
+                .await
             } else {
                 BeforeAgentStartOutcome {
                     messages: Vec::new(),
@@ -2867,14 +2968,11 @@ After approving access in the browser, press Enter in Pi to complete login."
                 messages: before_messages,
                 system_prompt,
             } = before_start;
-            if let Some(prompt) = system_prompt {
-                agent_guard.set_system_prompt(Some(prompt));
-            } else {
-                agent_guard.set_system_prompt(base_system_prompt.clone());
-            }
+            let mut turn_agent =
+                TurnSystemPromptGuard::new(&mut agent_guard, base_system_prompt, system_prompt);
             let preserve_plain_text_shape = keyword_scan_source.as_deref() == Some("");
-            agent_guard.set_magic_keyword_scan_override(keyword_scan_source);
-            let previous_len = agent_guard.messages().len();
+            turn_agent.set_magic_keyword_scan_override(keyword_scan_source);
+            let previous_len = turn_agent.messages().len();
 
             let event_sender = event_tx.clone();
             let extensions = extensions.clone();
@@ -2902,7 +3000,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             prompts.push(user_message);
             prompts.extend(before_messages.into_iter().map(ModelMessage::Custom));
 
-            let result = agent_guard
+            let result = turn_agent
                 .run_with_messages_with_abort(prompts, Some(abort_signal), move |event| {
                     {
                         let mut batcher = match ui_stream_batcher_for_events.lock() {
@@ -2919,7 +3017,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 .await;
             flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
 
-            agent_guard.set_system_prompt(base_system_prompt);
+            drop(turn_agent);
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
@@ -3162,7 +3260,27 @@ After approving access in the browser, press Enter in Pi to complete login."
         runtime_handle.spawn(async move {
             let mut message_for_agent = message_for_agent;
             let mut input_images = Vec::new();
-            if let Some(manager) = extensions.clone() {
+            let base_system_prompt = {
+                let guard =
+                    match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            let _ = crate::interactive::enqueue_pi_event(
+                                &event_tx,
+                                &Cx::for_request(),
+                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                let prompt = guard.system_prompt().map(str::to_string);
+                drop(guard);
+                prompt
+            };
+            let before_start = if let Some(manager) = extensions.clone() {
                 match dispatch_input_event(&manager, message_for_agent.clone(), Vec::new()).await {
                     Ok(InputEventOutcome::Continue { text, images }) => {
                         message_for_agent = text;
@@ -3202,10 +3320,19 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 }
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                    .await;
-            }
+                dispatch_before_agent_start_event(
+                    &manager,
+                    &message_for_agent,
+                    &input_images,
+                    base_system_prompt.as_deref().unwrap_or(""),
+                )
+                .await
+            } else {
+                BeforeAgentStartOutcome {
+                    messages: Vec::new(),
+                    system_prompt: None,
+                }
+            };
 
             let mut agent_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
@@ -3220,8 +3347,14 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
-            let previous_len = agent_guard.messages().len();
-            agent_guard.set_magic_keyword_scan_override(Some(keyword_scan_source));
+            let BeforeAgentStartOutcome {
+                messages: before_messages,
+                system_prompt,
+            } = before_start;
+            let mut turn_agent =
+                TurnSystemPromptGuard::new(&mut agent_guard, base_system_prompt, system_prompt);
+            let previous_len = turn_agent.messages().len();
+            turn_agent.set_magic_keyword_scan_override(Some(keyword_scan_source));
 
             let event_sender = event_tx.clone();
             let extensions = extensions.clone();
@@ -3233,48 +3366,40 @@ After approving access in the browser, press Enter in Pi to complete login."
                     event_sender.clone(),
                     Arc::clone(&tui_pressure_frame_p99_us),
                 )));
-            let result = if input_images.is_empty() {
-                let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
-                agent_guard
-                    .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
-                        {
-                            let mut batcher = match ui_stream_batcher_for_events.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            dispatch_agent_event_to_ui(&event, &mut batcher);
-                        }
-
-                        if let Some(coal) = &coalescer {
-                            coal.dispatch_agent_event_lazy(&event, &runtime_handle_for_agent);
-                        }
-                    })
-                    .await
+            let user_content = if input_images.is_empty() {
+                UserContent::Text(message_for_agent)
             } else {
-                let content_for_agent =
-                    build_content_blocks_for_input(&message_for_agent, &input_images);
-                let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
-                agent_guard
-                    .run_with_content_with_abort(
-                        content_for_agent,
-                        Some(abort_signal),
-                        move |event| {
-                            {
-                                let mut batcher = match ui_stream_batcher_for_events.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                                dispatch_agent_event_to_ui(&event, &mut batcher);
-                            }
-
-                            if let Some(coal) = &coalescer {
-                                coal.dispatch_agent_event_lazy(&event, &runtime_handle_for_agent);
-                            }
-                        },
-                    )
-                    .await
+                UserContent::Blocks(build_content_blocks_for_input(
+                    &message_for_agent,
+                    &input_images,
+                ))
             };
+            let user_message = ModelMessage::User(UserMessage {
+                content: user_content,
+                timestamp: Utc::now().timestamp_millis(),
+            });
+            let mut prompts = Vec::with_capacity(1 + before_messages.len());
+            prompts.push(user_message);
+            prompts.extend(before_messages.into_iter().map(ModelMessage::Custom));
+            let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
+            let result = turn_agent
+                .run_with_messages_with_abort(prompts, Some(abort_signal), move |event| {
+                    {
+                        let mut batcher = match ui_stream_batcher_for_events.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        dispatch_agent_event_to_ui(&event, &mut batcher);
+                    }
+
+                    if let Some(coal) = &coalescer {
+                        coal.dispatch_agent_event_lazy(&event, &runtime_handle_for_agent);
+                    }
+                })
+                .await;
             flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
+
+            drop(turn_agent);
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
@@ -3444,7 +3569,7 @@ mod stream_delta_batcher_tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
     struct DummyProvider;
 
@@ -3471,6 +3596,40 @@ mod stream_delta_batcher_tests {
         > {
             Ok(Box::pin(stream::empty()))
         }
+    }
+
+    #[test]
+    fn turn_system_prompt_guard_restores_base_prompt_when_guard_is_dropped() {
+        let mut agent = Agent::new(
+            Arc::new(DummyProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.set_system_prompt(Some("base-system".to_string()));
+        {
+            let turn_agent = TurnSystemPromptGuard::new(
+                &mut agent,
+                Some("base-system".to_string()),
+                Some("hook-system".to_string()),
+            );
+            assert_eq!(turn_agent.system_prompt(), Some("hook-system"));
+        }
+        assert_eq!(agent.system_prompt(), Some("base-system"));
+    }
+
+    #[test]
+    fn before_agent_start_payload_preserves_prompt_images_and_system_prompt() {
+        let image = ImageContent {
+            data: "aW1hZ2U=".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        let payload = before_agent_start_payload("hello", &[image], "base-system");
+        assert_eq!(payload["prompt"], json!("hello"));
+        assert_eq!(
+            payload["images"],
+            json!([{"data": "aW1hZ2U=", "mimeType": "image/png"}])
+        );
+        assert_eq!(payload["systemPrompt"], json!("base-system"));
     }
 
     fn runtime() -> &'static asupersync::runtime::Runtime {
@@ -3805,6 +3964,144 @@ mod stream_delta_batcher_tests {
         manager
     }
 
+    fn build_test_extension_manager_with_before_agent_start_output(
+        output: &Value,
+    ) -> crate::extensions::ExtensionManager {
+        let manager = crate::extensions::ExtensionManager::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("before-agent-start.native.json");
+        let descriptor = json!({
+            "id": "before-agent-start-test",
+            "name": "before-agent-start-test",
+            "version": "1.0.0",
+            "apiVersion": crate::extensions::PROTOCOL_VERSION,
+            "eventHooks": ["before_agent_start"],
+            "eventResponses": {
+                "before_agent_start": output
+            }
+        });
+        std::fs::write(
+            &entry,
+            serde_json::to_vec(&descriptor).expect("serialize native extension descriptor"),
+        )
+        .expect("write native extension descriptor");
+
+        runtime().block_on(async {
+            let native_runtime = crate::extensions::NativeRustExtensionRuntimeHandle::start()
+                .await
+                .expect("start native runtime");
+            manager.set_native_runtime(native_runtime);
+            manager
+                .load_native_extensions(vec![
+                    crate::extensions::NativeRustExtensionLoadSpec::from_entry_path(&entry)
+                        .expect("build native extension load spec"),
+                ])
+                .await
+                .expect("load native extension");
+        });
+
+        manager
+    }
+
+    #[derive(Default)]
+    struct BeforeAgentStartProbeState {
+        calls: AtomicUsize,
+        saw_user_message: AtomicBool,
+        saw_custom_message: AtomicBool,
+        saw_user_before_custom: AtomicBool,
+        saw_expected_system_prompt: AtomicBool,
+    }
+
+    struct BeforeAgentStartProbeProvider {
+        state: Arc<BeforeAgentStartProbeState>,
+        expected_system_prompt: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BeforeAgentStartProbeProvider {
+        fn name(&self) -> &'static str {
+            "before-agent-start-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "before-agent-start-probe"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "before-agent-start-probe-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.state.calls.fetch_add(1, Ordering::SeqCst);
+            let user_index = context
+                .messages
+                .iter()
+                .position(|message| matches!(message, ModelMessage::User(_)));
+            let custom_index = context.messages.iter().position(|message| {
+                matches!(
+                    message,
+                    ModelMessage::Custom(CustomMessage { custom_type, content, .. })
+                        if custom_type == "hook-note" && content == "injected"
+                )
+            });
+            self.state
+                .saw_user_message
+                .store(user_index.is_some(), Ordering::SeqCst);
+            self.state
+                .saw_custom_message
+                .store(custom_index.is_some(), Ordering::SeqCst);
+            self.state.saw_user_before_custom.store(
+                user_index
+                    .zip(custom_index)
+                    .is_some_and(|(user, custom)| user < custom),
+                Ordering::SeqCst,
+            );
+            self.state.saw_expected_system_prompt.store(
+                context.system_prompt == Some(self.expected_system_prompt),
+                Ordering::SeqCst,
+            );
+
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("done"))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            })])))
+        }
+    }
+
+    fn wait_for_agent_done(event_rx: &mut mpsc::Receiver<PiMsg>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match event_rx.try_recv() {
+                Ok(PiMsg::AgentDone { error_message, .. }) => {
+                    assert!(error_message.is_none(), "turn error: {error_message:?}");
+                    return;
+                }
+                Ok(PiMsg::AgentError(err)) => panic!("interactive turn failed: {err}"),
+                Ok(_) | Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        panic!("interactive turn did not finish before the deadline");
+    }
+
     #[derive(Default)]
     struct ContinueProbeState {
         calls: AtomicUsize,
@@ -4128,6 +4425,94 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn session_bound_events_reject_stale_input_and_display_notes() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+        app.agent_state = AgentState::Processing;
+        let original_messages = app.messages.len();
+
+        let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput {
+            session_id: "replaced-session".to_string(),
+            input: PendingInput::GeneratedText("stale input".to_string()),
+        });
+        let _ = app.handle_pi_message(PiMsg::SessionSystemNote {
+            owner_session_id: "replaced-session".to_string(),
+            message: "stale tan card".to_string(),
+        });
+        assert!(
+            app.pending_inputs.is_empty(),
+            "an in-transit input from the old session must not enter the new queue"
+        );
+        assert_eq!(
+            app.messages.len(),
+            original_messages,
+            "an old session's display card must not enter the new transcript"
+        );
+
+        let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput {
+            session_id: session_id.clone(),
+            input: PendingInput::GeneratedText("current input".to_string()),
+        });
+        assert!(
+            app.pending_inputs.is_empty(),
+            "session-bound input must also fail closed while a transition owns the UI"
+        );
+        app.agent_state = AgentState::Idle;
+        let command = app.handle_pi_message(PiMsg::EnqueuePendingInput {
+            session_id: session_id.clone(),
+            input: PendingInput::GeneratedText("current input".to_string()),
+        });
+        let _ = app.handle_pi_message(PiMsg::SessionSystemNote {
+            owner_session_id: session_id,
+            message: "current tan card".to_string(),
+        });
+        assert!(command.is_some(), "current idle-session input must still run");
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationMessage { role: MessageRole::System, content, .. })
+                if content == "current tan card"
+        ));
+    }
+
+    #[test]
+    fn open_tree_event_is_bound_to_its_originating_session() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let current_session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+
+        let _ = app.handle_pi_message(PiMsg::OpenTree {
+            owner_session_id: "replaced-session".to_string(),
+            initial_selected_id: None,
+            label: Some("stale tree".to_string()),
+        });
+        assert!(
+            app.tree_ui.is_none(),
+            "an old session's async tree request must not open in its replacement"
+        );
+
+        let _ = app.handle_pi_message(PiMsg::OpenTree {
+            owner_session_id: current_session_id,
+            initial_selected_id: None,
+            label: Some("current tree".to_string()),
+        });
+        assert!(
+            app.tree_ui.is_some(),
+            "the current idle session's tree request must still open"
+        );
+    }
+
+    #[test]
     fn continue_pending_input_runs_agent_without_new_user_message() {
         let state = Arc::new(ContinueProbeState::default());
         let provider: Arc<dyn Provider> = Arc::new(ContinueProbeProvider {
@@ -4149,7 +4534,17 @@ mod stream_delta_batcher_tests {
             }));
         });
 
-        let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput(PendingInput::Continue));
+        let session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+        let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput {
+            session_id,
+            input: PendingInput::Continue,
+        });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let mut saw_done = false;
@@ -4189,6 +4584,78 @@ mod stream_delta_batcher_tests {
             !state.saw_user_message.load(Ordering::SeqCst),
             "continue path should not synthesize a user message"
         );
+    }
+
+    #[test]
+    fn ordinary_prompt_applies_before_agent_start_messages_and_system_prompt_once() {
+        let state = Arc::new(BeforeAgentStartProbeState::default());
+        let provider: Arc<dyn Provider> = Arc::new(BeforeAgentStartProbeProvider {
+            state: Arc::clone(&state),
+            expected_system_prompt: "hook-system",
+        });
+        let (mut app, mut event_rx) = build_test_app_with_provider(provider);
+        runtime().block_on(async {
+            let cx = Cx::for_request();
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+                .await
+                .expect("lock agent");
+            guard.set_system_prompt(Some("base-system".to_string()));
+        });
+        app.extensions = Some(build_test_extension_manager_with_before_agent_start_output(
+            &json!({
+                "systemPrompt": "hook-system",
+                "messages": [{
+                    "customType": "hook-note",
+                    "content": "injected",
+                    "display": false
+                }]
+            }),
+        ));
+
+        let _ = app.submit_message("hello");
+        wait_for_agent_done(&mut event_rx);
+
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        assert!(state.saw_user_message.load(Ordering::SeqCst));
+        assert!(state.saw_custom_message.load(Ordering::SeqCst));
+        assert!(state.saw_user_before_custom.load(Ordering::SeqCst));
+        assert!(state.saw_expected_system_prompt.load(Ordering::SeqCst));
+        runtime().block_on(async {
+            let cx = Cx::for_request();
+            let guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+                .await
+                .expect("lock agent");
+            assert_eq!(guard.system_prompt(), Some("base-system"));
+        });
+    }
+
+    #[test]
+    fn ordinary_prompt_keeps_base_context_when_before_agent_start_has_no_mutation() {
+        let state = Arc::new(BeforeAgentStartProbeState::default());
+        let provider: Arc<dyn Provider> = Arc::new(BeforeAgentStartProbeProvider {
+            state: Arc::clone(&state),
+            expected_system_prompt: "base-system",
+        });
+        let (mut app, mut event_rx) = build_test_app_with_provider(provider);
+        runtime().block_on(async {
+            let cx = Cx::for_request();
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+                .await
+                .expect("lock agent");
+            guard.set_system_prompt(Some("base-system".to_string()));
+        });
+        app.extensions = Some(build_test_extension_manager_with_before_agent_start_output(
+            &json!({}),
+        ));
+
+        let _ = app.submit_message("hello");
+        wait_for_agent_done(&mut event_rx);
+
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        assert!(state.saw_user_message.load(Ordering::SeqCst));
+        assert!(!state.saw_custom_message.load(Ordering::SeqCst));
+        assert!(!state.saw_user_before_custom.load(Ordering::SeqCst));
+        assert!(state.saw_expected_system_prompt.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -4369,7 +4836,17 @@ mod stream_delta_batcher_tests {
         );
         let _current = Cx::set_current(Some(ambient_cx));
 
-        let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput(PendingInput::Continue));
+        let session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+        let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput {
+            session_id,
+            input: PendingInput::Continue,
+        });
 
         let recorded = loop {
             let res = probe_rx
@@ -4380,6 +4857,78 @@ mod stream_delta_batcher_tests {
             }
         };
         assert_eq!(recorded, Some(expected_deadline));
+    }
+
+    #[test]
+    fn conversation_reset_clears_session_scoped_ui_state() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        app.title_requested = true;
+        app.todo_summary = Some("1 todo pending".to_string());
+        let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
+            provider: "fixture-provider".to_string(),
+            device_code: "device-code".to_string(),
+            user_code: "user-code".to_string(),
+            verification_uri: "https://example.test/device".to_string(),
+            expires_in: 300,
+        });
+        assert!(app.pending_oauth.is_some());
+
+        let _ = app.handle_pi_message(PiMsg::ConversationReset {
+            messages: Vec::new(),
+            usage: Usage::default(),
+            status: Some("Session replaced".to_string()),
+        });
+
+        assert!(
+            !app.title_requested,
+            "the replacement session must be eligible for auto-title"
+        );
+        assert!(
+            app.todo_summary.is_none(),
+            "the previous session's todo footer must not leak"
+        );
+        assert!(
+            app.pending_oauth.is_none(),
+            "the previous session's OAuth continuation must not leak"
+        );
+    }
+
+    #[test]
+    fn session_title_suggestion_is_bound_to_its_originating_session() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let current_session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+
+        let _ = app.handle_pi_message(PiMsg::SessionTitleSuggestion {
+            owner_session_id: "replaced-session".to_string(),
+            title: "stale title".to_string(),
+        });
+        assert!(
+            app.session
+                .try_lock()
+                .expect("lock session")
+                .get_name()
+                .is_none(),
+            "a title generated for an old session must not rename its replacement"
+        );
+
+        let _ = app.handle_pi_message(PiMsg::SessionTitleSuggestion {
+            owner_session_id: current_session_id,
+            title: "current title".to_string(),
+        });
+        assert_eq!(
+            app.session
+                .try_lock()
+                .expect("lock session")
+                .get_name()
+                .as_deref(),
+            Some("current title")
+        );
     }
 
     #[test]

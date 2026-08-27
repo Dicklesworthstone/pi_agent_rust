@@ -54,6 +54,141 @@ use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
+fn parse_cli_bool_flag_value(flag_name: &str, raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(Error::validation(format!(
+            "Invalid boolean value for extension flag --{flag_name}: \"{raw}\". Use one of: true,false,1,0,yes,no,on,off."
+        ))),
+    }
+}
+
+/// Coerce one pre-parsed CLI extension flag according to its registered
+/// runtime type.
+pub fn coerce_cli_flag_value(
+    flag: &crate::cli::ExtensionCliFlag,
+    declared_type: &str,
+) -> Result<Value> {
+    match declared_type.trim().to_ascii_lowercase().as_str() {
+        "bool" | "boolean" => flag.value.as_deref().map_or(Ok(Value::Bool(true)), |raw| {
+            parse_cli_bool_flag_value(&flag.name, raw).map(Value::Bool)
+        }),
+        "number" | "int" | "integer" | "float" => {
+            let Some(raw) = flag.value.as_deref() else {
+                return Err(Error::validation(format!(
+                    "Extension flag --{} requires a numeric value.",
+                    flag.name
+                )));
+            };
+            if let Ok(parsed) = raw.parse::<i64>() {
+                return Ok(Value::Number(parsed.into()));
+            }
+            let parsed = raw.parse::<f64>().map_err(|_| {
+                Error::validation(format!(
+                    "Invalid numeric value for extension flag --{}: \"{}\"",
+                    flag.name, raw
+                ))
+            })?;
+            let Some(number) = serde_json::Number::from_f64(parsed) else {
+                return Err(Error::validation(format!(
+                    "Numeric value for extension flag --{} is not finite: \"{}\"",
+                    flag.name, raw
+                )));
+            };
+            Ok(Value::Number(number))
+        }
+        _ => {
+            let Some(raw) = flag.value.as_deref() else {
+                return Err(Error::validation(format!(
+                    "Extension flag --{} requires a value.",
+                    flag.name
+                )));
+            };
+            Ok(Value::String(raw.to_string()))
+        }
+    }
+}
+
+/// Apply CLI extension flags to a loaded runtime.
+///
+/// Unknown flags stay non-fatal because the CLI pre-parser cannot know which
+/// resource set will ultimately load. Known flags fail closed on malformed
+/// metadata or values (bd-vjfol).
+pub async fn apply_cli_flags(
+    manager: &ExtensionManager,
+    extension_flags: &[crate::cli::ExtensionCliFlag],
+) -> Result<()> {
+    if extension_flags.is_empty() {
+        return Ok(());
+    }
+
+    let registered = manager.list_flags();
+    let known_names: BTreeSet<String> = registered
+        .iter()
+        .filter_map(|flag| flag.get("name").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect();
+
+    for cli_flag in extension_flags {
+        let matches = registered
+            .iter()
+            .filter(|flag| {
+                flag.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&cli_flag.name))
+            })
+            .collect::<Vec<_>>();
+
+        if matches.is_empty() {
+            let known = if known_names.is_empty() {
+                "(none)".to_string()
+            } else {
+                known_names
+                    .iter()
+                    .map(|name| format!("--{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            tracing::debug!(
+                event = "pi.extensions.flags.ignored_unknown",
+                flag = %cli_flag.display_name(),
+                registered = %known,
+                "Ignoring unknown extension flag (not registered by any loaded extension)."
+            );
+            continue;
+        }
+
+        for spec in matches {
+            let Some(extension_id) = spec.get("extension_id").and_then(Value::as_str) else {
+                return Err(Error::validation(format!(
+                    "Extension flag --{} cannot be set because extension metadata is missing extension_id.",
+                    cli_flag.name
+                )));
+            };
+            if extension_id.trim().is_empty() {
+                return Err(Error::validation(format!(
+                    "Extension flag --{} cannot be set because extension_id is empty.",
+                    cli_flag.name
+                )));
+            }
+            let registered_name = spec.get("name").and_then(Value::as_str).ok_or_else(|| {
+                Error::validation(format!(
+                    "Extension flag --{} is missing name metadata.",
+                    cli_flag.name
+                ))
+            })?;
+            let flag_type = spec.get("type").and_then(Value::as_str).unwrap_or("string");
+            let value = coerce_cli_flag_value(cli_flag, flag_type)?;
+            manager
+                .set_flag_value(extension_id, registered_name, value)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
 // Public filesystem contracts stay defined in this façade so both their
 // import paths and `std::any::type_name` identities remain unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -41,15 +41,34 @@ impl InteractiveExtensionHostActions {
         Ok(())
     }
 
-    async fn append_to_session(&self, message: ModelMessage) -> crate::error::Result<()> {
+    async fn append_idle_message(&self, message: ModelMessage) -> crate::error::Result<String> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut session_guard = self
-            .session
+        // Match session-transition lock order (Agent, then Session) and hold
+        // both through the mutation so an idle extension message cannot land
+        // in one session log and another session's Agent history.
+        let mut agent_guard = self
+            .agent
             .lock(&cx)
             .await
             .map_err(|e| crate::error::Error::session(e.to_string()))?;
-        session_guard.append_model_message(message);
-        Ok(())
+        let Ok(mut session_guard) = self.session.try_lock() else {
+            return Err(crate::error::Error::session(
+                "session busy while delivering an extension message".to_string(),
+            ));
+        };
+        let session_id = session_guard.header.id.clone();
+        session_guard.append_model_message(message.clone());
+        agent_guard.add_message(message);
+        Ok(session_id)
+    }
+
+    fn current_session_id(&self) -> crate::error::Result<String> {
+        let Ok(session) = self.session.try_lock() else {
+            return Err(crate::error::Error::session(
+                "session busy while queuing extension input".to_string(),
+            ));
+        };
+        Ok(session.header.id.clone())
     }
 }
 
@@ -72,10 +91,14 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             if let ModelMessage::Custom(custom) = &custom_message
                 && custom.display
             {
+                let owner_session_id = self.current_session_id()?;
                 let _ = enqueue_pi_event(
                     &self.event_tx,
                     &cx,
-                    PiMsg::SystemNote(custom.content.clone()),
+                    PiMsg::SessionSystemNote {
+                        owner_session_id,
+                        message: custom.content.clone(),
+                    },
                 )
                 .await;
             }
@@ -83,11 +106,7 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
         }
 
         // Agent is idle: persist immediately and update in-memory history so it affects the next run.
-        self.append_to_session(custom_message.clone()).await?;
-
-        if let Ok(mut agent_guard) = self.agent.lock(&cx).await {
-            agent_guard.add_message(custom_message.clone());
-        }
+        let session_id = self.append_idle_message(custom_message.clone()).await?;
 
         if let ModelMessage::Custom(custom) = &custom_message
             && custom.display
@@ -95,7 +114,10 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             let _ = enqueue_pi_event(
                 &self.event_tx,
                 &cx,
-                PiMsg::SystemNote(custom.content.clone()),
+                PiMsg::SessionSystemNote {
+                    owner_session_id: session_id.clone(),
+                    message: custom.content.clone(),
+                },
             )
             .await;
         }
@@ -104,7 +126,10 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             let _ = enqueue_pi_event(
                 &self.event_tx,
                 &cx,
-                PiMsg::EnqueuePendingInput(PendingInput::Continue),
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: PendingInput::Continue,
+                },
             )
             .await;
         }
@@ -133,10 +158,14 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
         }
 
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
+        let session_id = self.current_session_id()?;
         let _ = enqueue_pi_event(
             &self.event_tx,
             &cx,
-            PiMsg::EnqueuePendingInput(PendingInput::GeneratedText(message.text)),
+            PiMsg::EnqueuePendingInput {
+                session_id,
+                input: PendingInput::GeneratedText(message.text),
+            },
         )
         .await;
         Ok(())
@@ -874,13 +903,17 @@ mod tests {
                 .expect("send_message");
 
             let queued = event_rx.try_recv().expect("continue should be queued");
-            assert!(matches!(
-                queued,
-                PiMsg::EnqueuePendingInput(PendingInput::Continue)
-            ));
+            let queued_session_id = match queued {
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: PendingInput::Continue,
+                } => session_id,
+                other => panic!("unexpected queued event: {other:?}"),
+            };
 
             let cx = Cx::for_request();
             let session_guard = session.lock(&cx).await.expect("lock session");
+            assert_eq!(queued_session_id, session_guard.header.id);
             assert!(
                 session_guard
                     .to_messages_for_current_path()
@@ -969,7 +1002,13 @@ mod tests {
 
             result.expect("send_message");
             assert!(matches!(first, PiMsg::System(text) if text == "busy"));
-            assert!(matches!(second, PiMsg::SystemNote(text) if text == "visible"));
+            assert!(matches!(
+                second,
+                PiMsg::SessionSystemNote {
+                    owner_session_id,
+                    message,
+                } if !owner_session_id.is_empty() && message == "visible"
+            ));
         });
     }
 
@@ -1007,10 +1046,19 @@ mod tests {
 
             result.expect("send_message");
             assert!(matches!(first, PiMsg::System(text) if text == "busy"));
-            assert!(matches!(second, PiMsg::SystemNote(text) if text == "continue-now"));
+            assert!(matches!(
+                second,
+                PiMsg::SessionSystemNote {
+                    owner_session_id,
+                    message,
+                } if !owner_session_id.is_empty() && message == "continue-now"
+            ));
             assert!(matches!(
                 third,
-                PiMsg::EnqueuePendingInput(PendingInput::Continue)
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: PendingInput::Continue,
+                } if !session_id.is_empty()
             ));
         });
     }
@@ -1046,8 +1094,10 @@ mod tests {
             assert!(matches!(first, PiMsg::System(text) if text == "busy"));
             assert!(matches!(
                 second,
-                PiMsg::EnqueuePendingInput(PendingInput::GeneratedText(text))
-                    if text == "hello from extension"
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: PendingInput::GeneratedText(text),
+                } if !session_id.is_empty() && text == "hello from extension"
             ));
         });
     }

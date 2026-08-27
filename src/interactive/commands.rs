@@ -2074,8 +2074,8 @@ impl PiApp {
                 None
             }
             SlashCommand::Resume => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message = Some("Cannot resume while processing".to_string());
+                if let Some(reason) = self.session_transition_blocker() {
+                    self.status_message = Some(reason.to_string());
                     return None;
                 }
 
@@ -2101,13 +2101,16 @@ impl PiApp {
                 None
             }
             SlashCommand::New => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message =
-                        Some("Cannot start a new session while processing".to_string());
+                if let Some(reason) = self.session_transition_blocker() {
+                    self.status_message = Some(reason.to_string());
                     return None;
                 }
 
                 let Some(extensions) = self.extensions.clone() else {
+                    let Ok(mut agent_guard) = self.agent.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
                     let Ok(mut session_guard) = self.session.try_lock() else {
                         self.status_message = Some("Session busy; try again".to_string());
                         return None;
@@ -2117,12 +2120,11 @@ impl PiApp {
                     session_guard.header.provider = Some(self.model_entry.model.provider.clone());
                     session_guard.header.model_id = Some(self.model_entry.model.id.clone());
                     session_guard.header.thinking_level = Some(ThinkingLevel::Off.to_string());
+                    let new_session_id = session_guard.header.id.clone();
+                    agent_guard.replace_messages(Vec::new());
+                    agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
                     drop(session_guard);
-
-                    if let Ok(mut agent_guard) = self.agent.try_lock() {
-                        agent_guard.replace_messages(Vec::new());
-                        agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
-                    }
+                    drop(agent_guard);
 
                     self.messages.clear();
                     self.message_render_cache.clear();
@@ -2130,9 +2132,13 @@ impl PiApp {
                     self.current_response.clear();
                     self.current_thinking.clear();
                     self.current_tool = None;
+                    self.todo_summary = None;
                     self.pending_tool_output = None;
                     self.abort_handle = None;
                     self.pending_oauth = None;
+                    self.title_requested = false;
+                    self.role_model_overrides.clear();
+                    self.displayed_session_id = Some(new_session_id);
                     self.session_picker = None;
                     self.tree_ui = None;
                     self.autocomplete.close();
@@ -2155,11 +2161,16 @@ impl PiApp {
                 let agent = Arc::clone(&self.agent);
                 let runtime_handle = self.runtime_handle.clone();
 
-                let previous_session_file = self
-                    .session
-                    .try_lock()
-                    .ok()
-                    .and_then(|guard| guard.path.as_ref().map(|p| p.display().to_string()));
+                let (session_dir, previous_session_file) = {
+                    let Ok(guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    (
+                        guard.session_dir.clone(),
+                        guard.path.as_ref().map(|p| p.display().to_string()),
+                    )
+                };
 
                 self.agent_state = AgentState::Processing;
                 self.status_message = Some("Starting new session...".to_string());
@@ -2184,52 +2195,32 @@ impl PiApp {
                         return;
                     }
 
-                    let new_session_id = {
-                        let mut guard =
-                            match OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await {
-                                Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = crate::interactive::enqueue_pi_event(
-                                    &event_tx,
-                                    &asupersync::Cx::for_request(),
-                                    PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        let session_dir = guard.session_dir.clone();
-                        let mut new_session = Session::create_with_dir(session_dir);
-                        new_session.header.provider = Some(model_provider);
-                        new_session.header.model_id = Some(model_id);
-                        new_session.header.thinking_level = Some(ThinkingLevel::Off.to_string());
-                        let new_id = new_session.header.id.clone();
-                        *guard = new_session;
-                        new_id
-                    };
-
-                    {
-                        let mut agent_guard =
-                            match OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                                Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = crate::interactive::enqueue_pi_event(
-                                    &event_tx,
-                                    &task_cx,
-                                    PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        agent_guard.replace_messages(Vec::new());
-                        agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
+                    let mut new_session = Session::create_with_dir(session_dir);
+                    new_session.header.provider = Some(model_provider);
+                    new_session.header.model_id = Some(model_id);
+                    new_session.header.thinking_level = Some(ThinkingLevel::Off.to_string());
+                    let new_session_id = new_session.header.id.clone();
+                    if let Err(err) = PiApp::try_install_session(
+                        &session,
+                        &agent,
+                        new_session,
+                        Vec::new(),
+                        Some(ThinkingLevel::Off),
+                    ) {
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &task_cx,
+                            PiMsg::AgentError(err.to_string()),
+                        )
+                        .await;
+                        return;
                     }
 
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
                         &task_cx,
                         PiMsg::ConversationReset {
+                            session_id: new_session_id.clone(),
                             messages: Vec::new(),
                             usage: Usage::default(),
                             status: Some(format!(
@@ -2378,6 +2369,13 @@ impl PiApp {
                 }
 
                 if let Some(extensions) = self.extensions.clone() {
+                    let owner_session_id = match self.session.try_lock() {
+                        Ok(session) => session.header.id.clone(),
+                        Err(_) => {
+                            self.status_message = Some("Session busy; try again".to_string());
+                            return None;
+                        }
+                    };
                     let session = Arc::clone(&self.session);
                     let event_tx = self.event_tx.clone();
                     let runtime_handle = self.runtime_handle.clone();
@@ -2389,6 +2387,11 @@ impl PiApp {
                         let (initial_selected_id, branch_count, entry_count) =
                             match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                                 Ok(session_guard) => {
+                                    if session_guard.header.id.as_str()
+                                        != owner_session_id.as_str()
+                                    {
+                                        return;
+                                    }
                                     let initial_selected_id =
                                         resolve_tree_selector_initial_id(&session_guard, &args);
                                     let branch_count = session_guard.list_leaves().len();
@@ -2399,7 +2402,10 @@ impl PiApp {
                                     let _ = crate::interactive::enqueue_pi_event(
                                         &event_tx,
                                         &task_cx,
-                                        PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                                        PiMsg::SessionSystemNote {
+                                            owner_session_id: owner_session_id.clone(),
+                                            message: format!("Failed to lock session: {err}"),
+                                        },
                                     )
                                     .await;
                                     return;
@@ -2410,6 +2416,7 @@ impl PiApp {
                             .dispatch_event_with_response(
                                 ExtensionEventName::SessionBeforeTree,
                                 Some(json!({
+                                    "sessionId": owner_session_id.clone(),
                                     "preparation": {
                                         "branchCount": branch_count,
                                         "entryCount": entry_count,
@@ -2446,7 +2453,10 @@ impl PiApp {
                             let _ = crate::interactive::enqueue_pi_event(
                                 &event_tx,
                                 &task_cx,
-                                PiMsg::System("Session tree cancelled by extension".to_string()),
+                                PiMsg::SessionSystemNote {
+                                    owner_session_id,
+                                    message: "Session tree cancelled by extension".to_string(),
+                                },
                             )
                             .await;
                             return;
@@ -2456,6 +2466,7 @@ impl PiApp {
                             &event_tx,
                             &task_cx,
                             PiMsg::OpenTree {
+                                owner_session_id,
                                 initial_selected_id,
                                 label,
                             },
@@ -3433,6 +3444,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 (String::new(), question)
             }
         };
+        let owner_session_id = match self.session.try_lock() {
+            Ok(session) => session.header.id.clone(),
+            Err(_) => {
+                self.status_message = Some("/btw unavailable: session is busy".to_string());
+                self.scroll_to_bottom();
+                return None;
+            }
+        };
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
             content: format!("(/btw) {question}"),
@@ -3446,12 +3465,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             let result = client.ask(&context, &question).await;
             // Display-only delivery via the UI event channel; the session
             // writer never sees this message.
-            // SystemNote is display-only. PiMsg::System/AgentError reset
-            // live agent state (Idle + dropped abort handle) — an answer
-            // landing mid-turn must not clobber a running stream.
-            let msg = match result {
-                Ok(answer) => PiMsg::SystemNote(format!("(/btw) {answer}")),
-                Err(err) => PiMsg::SystemNote(format!("(/btw) failed: {err}")),
+            // SessionSystemNote is display-only. PiMsg::System/AgentError
+            // reset live agent state (Idle + dropped abort handle), while an
+            // answer landing after a session switch must be discarded.
+            let message = match result {
+                Ok(answer) => format!("(/btw) {answer}"),
+                Err(err) => format!("(/btw) failed: {err}"),
+            };
+            let msg = PiMsg::SessionSystemNote {
+                owner_session_id,
+                message,
             };
             let _ = crate::interactive::enqueue_pi_event(&event_tx, &Cx::for_request(), msg).await;
         });
@@ -3502,6 +3525,15 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             TanGate::Enabled => {}
         }
 
+        let owner_session_id = match self.session.try_lock() {
+            Ok(session) => session.header.id.clone(),
+            Err(_) => {
+                self.status_message = Some("/tan unavailable: session is busy".to_string());
+                self.scroll_to_bottom();
+                return None;
+            }
+        };
+
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
             .with_role_model_spec(pi::app::subagent_role_spec(&self.config));
         let runtime = self.runtime_handle.clone();
@@ -3511,14 +3543,23 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         runtime.spawn(async move {
             let card = match tool.run_background_tan(&work).await {
                 Ok(completion) => {
-                    pi::jobs::push_completion_notice(completion.follow_up_text());
+                    pi::jobs::push_completion_notice(
+                        &owner_session_id,
+                        completion.follow_up_text(),
+                    );
                     completion.card_text()
                 }
                 Err(err) => format!("(/tan failed)\n{err}"),
             };
-            let _ =
-                crate::interactive::enqueue_pi_event(&event_tx, &task_cx, PiMsg::SystemNote(card))
-                    .await;
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &task_cx,
+                PiMsg::SessionSystemNote {
+                    owner_session_id,
+                    message: card,
+                },
+            )
+            .await;
         });
 
         self.messages.push(ConversationMessage {
@@ -4541,44 +4582,33 @@ mod tests {
         ExcludedBashPersistenceOutcome, PiMsg, parse_bash_command, parse_extension_command,
         persist_excluded_bash_execution, should_show_startup_oauth_hint, spawn_bash_completion,
     };
-    #[cfg(unix)]
-    use super::PiApp;
-    #[cfg(unix)]
-    use crate::agent::{Agent, AgentConfig};
+    use super::{AgentState, PendingInput, PiApp, SlashCommand};
+    use crate::agent::{Agent, AgentConfig, QueuedAgentMessage};
     use crate::auth::{AuthCredential, AuthStorage};
-    #[cfg(unix)]
     use crate::config::Config;
-    #[cfg(unix)]
     use crate::keybindings::KeyBindings;
-    #[cfg(unix)]
-    use crate::model::{StreamEvent, Usage};
+    use crate::model::{
+        Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage,
+    };
     use crate::models::ModelEntry;
     use crate::provider::{InputType, Model, ModelCost};
-    #[cfg(unix)]
     use crate::provider::{Context, Provider, StreamOptions};
-    #[cfg(unix)]
     use crate::resources::{ResourceCliOptions, ResourceLoader};
     use crate::session::{Session, SessionEntry, SessionMessage};
-    #[cfg(unix)]
     use crate::tools::ToolRegistry;
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::sync::{Mutex, OwnedMutexGuard};
-    #[cfg(unix)]
     use futures::stream;
     use std::collections::{HashMap, HashSet};
-    #[cfg(unix)]
     use std::path::Path;
-    #[cfg(unix)]
     use std::pin::Pin;
     use std::sync::{Arc, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
-    #[cfg(unix)]
     struct DummyProvider;
 
-    #[cfg(unix)]
     #[async_trait::async_trait]
     impl Provider for DummyProvider {
         fn name(&self) -> &'static str {
@@ -4893,7 +4923,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn build_bash_test_app(
         session: Arc<Mutex<Session>>,
         cwd: &Path,
@@ -4943,6 +4972,223 @@ mod tests {
             None,
         );
         (app, event_rx)
+    }
+
+    fn stage_private_follow_up(app: &PiApp) {
+        let mut agent = app.agent.try_lock().expect("test agent lock");
+        agent.queue_follow_up(ModelMessage::User(UserMessage {
+            content: UserContent::Text("old-session follow-up".to_string()),
+            timestamp: 0,
+        }));
+    }
+
+    fn current_session_id(app: &PiApp) -> String {
+        app.session
+            .try_lock()
+            .expect("test session lock")
+            .header
+            .id
+            .clone()
+    }
+
+    fn assert_staged_transition_rejected(app: &PiApp, original_session_id: &str) {
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(current_session_id(app), original_session_id);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("Queued input is still pending"))
+        );
+    }
+
+    #[test]
+    fn new_session_rejects_staged_old_session_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        stage_private_follow_up(&app);
+
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+
+        assert_staged_transition_rejected(&app, &original_session_id);
+        assert_eq!(
+            app.agent
+                .try_lock()
+                .expect("test agent lock")
+                .queued_message_count(),
+            1,
+            "rejected transition must leave the old-session delivery intact"
+        );
+    }
+
+    #[test]
+    fn fork_rejects_staged_old_session_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut raw_session = Session::in_memory();
+        raw_session.append_model_message(ModelMessage::User(UserMessage {
+            content: UserContent::Text("fork source".to_string()),
+            timestamp: 0,
+        }));
+        let session = Arc::new(Mutex::new(raw_session));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        app.message_queue
+            .lock()
+            .expect("test user queue lock")
+            .push_follow_up(QueuedAgentMessage::generated(ModelMessage::User(
+                UserMessage {
+                    content: UserContent::Text("queued authored delivery".to_string()),
+                    timestamp: 0,
+                },
+            )));
+
+        let _ = app.handle_slash_fork("");
+
+        assert_staged_transition_rejected(&app, &original_session_id);
+        assert_eq!(
+            app.message_queue
+                .lock()
+                .expect("test user queue lock")
+                .follow_up_len(),
+            1
+        );
+    }
+
+    #[test]
+    fn resume_rejects_staged_old_session_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        app.injected_queue
+            .lock()
+            .expect("test injected queue lock")
+            .push_follow_up(ModelMessage::User(UserMessage {
+                content: UserContent::Text("queued extension delivery".to_string()),
+                timestamp: 0,
+            }));
+
+        let _ = app.load_session_from_path(
+            temp.path()
+                .join("unused-session.jsonl")
+                .to_string_lossy()
+                .as_ref(),
+        );
+
+        assert_staged_transition_rejected(&app, &original_session_id);
+        assert_eq!(
+            app.injected_queue
+                .lock()
+                .expect("test injected queue lock")
+                .pending_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn new_session_rejects_unconsumed_pending_input() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        app.pending_inputs
+            .push_back(PendingInput::Text("old-session startup input".to_string()));
+
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+
+        assert_staged_transition_rejected(&app, &original_session_id);
+        assert_eq!(app.pending_inputs.len(), 1);
+    }
+
+    #[test]
+    fn new_session_clears_session_derived_title_and_todo_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        app.title_requested = true;
+        app.todo_summary = Some("1/2 todos complete".to_string());
+
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+
+        assert_ne!(current_session_id(&app), original_session_id);
+        assert!(!app.title_requested);
+        assert!(app.todo_summary.is_none());
+    }
+
+    #[test]
+    fn atomic_session_install_does_not_mutate_agent_when_session_is_busy() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (app, _event_rx) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let original_session_id = current_session_id(&app);
+        app.agent
+            .try_lock()
+            .expect("test agent lock")
+            .add_message(ModelMessage::User(UserMessage {
+                content: UserContent::Text("old-agent-history".to_string()),
+                timestamp: 0,
+            }));
+        let held_session = session.try_lock().expect("hold session lock");
+        let replacement_message = ModelMessage::User(UserMessage {
+            content: UserContent::Text("replacement-history".to_string()),
+            timestamp: 0,
+        });
+
+        let result = PiApp::try_install_session(
+            &session,
+            &app.agent,
+            Session::in_memory(),
+            vec![replacement_message],
+            None,
+        );
+
+        assert!(result.is_err());
+        drop(held_session);
+        assert_eq!(current_session_id(&app), original_session_id);
+        let agent = app.agent.try_lock().expect("test agent lock");
+        assert_eq!(agent.messages().len(), 1);
+        assert!(matches!(
+            &agent.messages()[0],
+            ModelMessage::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "old-agent-history"
+        ));
+    }
+
+    #[test]
+    fn resume_marks_processing_before_async_session_load() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, temp.path());
+
+        let _ = app.load_session_from_path(
+            temp.path()
+                .join("missing-session.jsonl")
+                .to_string_lossy()
+                .as_ref(),
+        );
+        assert!(matches!(app.agent_state, AgentState::Processing));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let terminal = loop {
+            match event_rx.try_recv() {
+                Ok(message @ PiMsg::AgentError(_)) => break message,
+                Ok(other) => panic!("unexpected resume event: {other:?}"),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("resume error was not delivered before deadline: {err}"),
+            }
+        };
+        assert!(
+            matches!(app.agent_state, AgentState::Processing),
+            "background completion must not mutate UI state before its event is handled"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
     }
 
     #[cfg(unix)]

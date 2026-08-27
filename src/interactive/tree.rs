@@ -279,8 +279,8 @@ fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
 impl PiApp {
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_fork(&mut self, args: &str) -> Option<Cmd> {
-        if self.agent_state != AgentState::Idle {
-            self.status_message = Some("Cannot fork while processing a request".to_string());
+        if let Some(reason) = self.session_transition_blocker() {
+            self.status_message = Some(reason.to_string());
             return None;
         }
 
@@ -439,58 +439,28 @@ impl PiApp {
             }
 
             let messages_for_agent = new_session.to_messages_for_current_path();
-            {
-                let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                agent_guard.replace_messages(messages_for_agent);
+            let (messages, usage) = conversation_from_session(&new_session);
+            if let Err(err) = PiApp::try_install_session(
+                &session,
+                &agent,
+                new_session,
+                messages_for_agent,
+                None,
+            ) {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError(err.to_string()),
+                )
+                .await;
+                return;
             }
-
-            {
-                let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                *guard = new_session;
-            }
-
-            let (messages, usage) = {
-                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                conversation_from_session(&guard)
-            };
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
                 PiMsg::ConversationReset {
+                    session_id: new_session_id.clone(),
                     messages,
                     usage,
                     status: Some(format!("Forked new session from {}", selection.summary)),
@@ -501,7 +471,10 @@ impl PiApp {
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                PiMsg::SetEditorText(selected_text),
+                PiMsg::SetEditorText {
+                    owner_session_id: new_session_id.clone(),
+                    text: selected_text,
+                },
             )
             .await;
 

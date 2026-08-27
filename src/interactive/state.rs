@@ -843,6 +843,10 @@ impl InteractiveMessageQueue {
         (steering, follow_up)
     }
 
+    pub(super) fn pending_count(&self) -> usize {
+        self.steering.len().saturating_add(self.follow_up.len())
+    }
+
     pub(super) fn steering_len(&self) -> usize {
         self.steering.len()
     }
@@ -968,6 +972,10 @@ impl InjectedMessageQueue {
 
     pub(super) fn pop_follow_up(&mut self) -> Vec<ModelMessage> {
         self.pop_kind(QueuedMessageKind::FollowUp)
+    }
+
+    pub(super) fn pending_count(&self) -> usize {
+        self.steering.len().saturating_add(self.follow_up.len())
     }
 }
 

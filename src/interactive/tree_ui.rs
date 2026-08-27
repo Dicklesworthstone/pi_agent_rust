@@ -547,6 +547,7 @@ impl PiApp {
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
                 PiMsg::ConversationReset {
+                    session_id: pending.session_id.clone(),
                     messages,
                     usage,
                     status,
@@ -558,7 +559,10 @@ impl PiApp {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                    PiMsg::SetEditorText(text),
+                    PiMsg::SetEditorText {
+                        owner_session_id: pending.session_id.clone(),
+                        text,
+                    },
                 )
                 .await;
             }

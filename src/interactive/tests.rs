@@ -825,6 +825,10 @@ fn ask_card_answer_is_not_queued_as_steering_while_agent_busy() {
         app.view().contains("question 2 of 2"),
         "Enter must advance the card while busy"
     );
+    assert!(
+        app.input.value().is_empty(),
+        "the first answer must be cleared before the next question"
+    );
     let queued = app
         .message_queue
         .lock()
@@ -924,6 +928,10 @@ fn mixed_cards_extension_then_ask_serialize_in_arrival_order() {
     assert!(app.active_extension_ui.is_none(), "ext resolved");
     assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
     assert!(app.view().contains("question 1 of 1"), "ask promoted");
+    assert!(
+        app.card_draft_snapshot.is_none(),
+        "the consumed extension answer must not become a draft"
+    );
 
     app.input.set_value("A");
     let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
@@ -983,6 +991,113 @@ fn mixed_cards_ask_then_ext_preserve_drafts_across_resolution_paths() {
     );
     assert!(app.agent_state == AgentState::ToolRunning);
     app.agent_state = AgentState::Idle;
+}
+
+/// bd-q66i1: normal (non-Escape) completion clears each consumed answer
+/// before successor activation, then restores only the genuine pre-card draft
+/// after the final card settles.
+#[test]
+fn normal_card_resolution_restores_only_the_preexisting_draft() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+    app.input.set_value("keep this draft");
+
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e-normal", "Env?")));
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}]
+    }))
+    .expect("ask request");
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-normal".to_string(),
+        request,
+    }));
+
+    app.input.set_value("extension answer");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert!(
+        app.input.value().is_empty(),
+        "successor starts with an empty editor"
+    );
+    assert_eq!(app.card_draft_snapshot.as_deref(), Some("keep this draft"));
+
+    app.input.set_value("Yes");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_input_card_kind.is_none());
+    assert_eq!(app.input.value(), "keep this draft");
+    assert!(app.card_draft_snapshot.is_none());
+}
+
+/// bd-q66i1: Escape resolves exactly one order-ledger entry. The historical
+/// double-pop skipped the second Ask entry and stranded the following
+/// extension card.
+#[test]
+fn escape_advances_one_card_at_a_time_across_ask_ask_extension() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    for (id, label) in [("a-first", "First?"), ("a-second", "Second?")] {
+        let request: crate::ask::AskRequest = serde_json::from_value(json!({
+            "questions": [{"question": label, "options": [{"label": "Yes"}]}]
+        }))
+        .expect("ask request");
+        app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+            id: id.to_string(),
+            request,
+        }));
+    }
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e-third", "Third?")));
+
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert_eq!(
+        app.active_ask_ui
+            .as_ref()
+            .map(|card| card.request.id.as_str()),
+        Some("a-second")
+    );
+    assert_eq!(app.input_card_order.front(), Some(&InputCardKind::Ask));
+
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Extension));
+    assert_eq!(
+        app.active_extension_ui.as_ref().map(|request| request.id.as_str()),
+        Some("e-third")
+    );
+
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert!(app.active_input_card_kind.is_none());
+    assert!(app.input_card_order.is_empty());
+}
+
+/// bd-q66i1: turn-end invalidation treats partial card input as consumed and
+/// restores the genuine draft captured before the card burst.
+#[test]
+fn agent_done_discards_partial_extension_answer_and_restores_draft() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.input.set_value("original draft");
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card(
+        "e-invalidated",
+        "Answer?",
+    )));
+    app.input.set_value("partial card answer");
+
+    let _ = app.handle_pi_message(PiMsg::AgentDone {
+        usage: None,
+        stop_reason: StopReason::Aborted,
+        error_message: None,
+    });
+
+    assert!(app.active_extension_ui.is_none());
+    assert!(app.active_input_card_kind.is_none());
+    assert_eq!(app.input.value(), "original draft");
+    assert!(app.card_draft_snapshot.is_none());
 }
 
 /// bd-1qol9 terminal/abort cleanup: AgentDone invalidates the ACTIVE ask,

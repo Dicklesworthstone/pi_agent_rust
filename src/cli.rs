@@ -77,6 +77,10 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "verbose"
         | "no-tools"
         | "no-extensions"
+        | "plan-mode"
+        | "plan-yolo"
+        | "yolo"
+        | "auto-approve"
         | "explain-extension-policy"
         | "explain-repair-policy"
         | "no-skills"
@@ -105,6 +109,11 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "model"
         | "api-key"
         | "models"
+        | "smol"
+        | "slow"
+        | "plan"
+        | "advisor"
+        | "approval-mode"
         | "thinking"
         | "system-prompt"
         | "append-system-prompt"
@@ -115,6 +124,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "mode"
         | "tools"
         | "extension"
+        | "mcp-config"
         | "extension-policy"
         | "repair-policy"
         | "skill"
@@ -122,6 +132,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "theme"
         | "theme-path"
         | "max-tool-iterations"
+        | "max-time"
         | "request-timeout"
         | "export"
         | "fetch-models" => (true, false),
@@ -670,8 +681,12 @@ pub struct Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ROOT_SUBCOMMANDS, parse_with_extension_flags};
+    use super::{
+        Cli, Commands, ExtensionCliFlag, ROOT_SUBCOMMANDS, known_long_option,
+        parse_with_extension_flags,
+    };
     use clap::{CommandFactory, Parser, error::ErrorKind};
+    use std::path::PathBuf;
 
     // ── 1. Basic flag parsing ────────────────────────────────────────
 
@@ -1198,6 +1213,92 @@ mod tests {
     }
 
     #[test]
+    fn formerly_omitted_builtin_flags_survive_production_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--smol",
+                "openai/smol",
+                "--slow",
+                "anthropic/slow",
+                "--plan",
+                "openai/plan",
+                "--advisor",
+                "openai/advisor",
+                "--plan-mode",
+                "--plan-yolo",
+                "--approval-mode",
+                "write",
+                "--yolo",
+                "--mcp-config",
+                "project.mcp.json",
+                "--max-time",
+                "37",
+                "hello",
+                "--extension-answer",
+                "ship-it",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .expect("parse built-in and extension flags through the production pre-parser");
+
+        assert_eq!(parsed.cli.message_args(), vec!["hello"]);
+        assert_eq!(parsed.cli.smol.as_deref(), Some("openai/smol"));
+        assert_eq!(parsed.cli.slow.as_deref(), Some("anthropic/slow"));
+        assert_eq!(parsed.cli.plan.as_deref(), Some("openai/plan"));
+        assert_eq!(parsed.cli.advisor.as_deref(), Some("openai/advisor"));
+        assert!(parsed.cli.plan_mode);
+        assert!(parsed.cli.plan_yolo);
+        assert_eq!(parsed.cli.approval_mode.as_deref(), Some("write"));
+        assert!(parsed.cli.yolo);
+        assert_eq!(parsed.cli.mcp_config, vec![PathBuf::from("project.mcp.json")]);
+        assert_eq!(parsed.cli.max_time, Some(37));
+        assert_eq!(
+            parsed.extension_flags,
+            vec![ExtensionCliFlag {
+                name: "extension-answer".to_string(),
+                value: Some("ship-it".to_string()),
+            }]
+        );
+
+        let alias = parse_with_extension_flags(
+            ["pi", "--auto-approve"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("parse yolo alias through the production pre-parser");
+        assert!(alias.cli.yolo);
+        assert!(alias.extension_flags.is_empty());
+    }
+
+    #[test]
+    fn extension_preparser_classifies_every_top_level_clap_long_option_and_alias() {
+        let mut missing = Vec::new();
+        for arg in Cli::command().get_arguments() {
+            let mut names = arg.get_long().into_iter().collect::<Vec<_>>();
+            if let Some(aliases) = arg.get_all_aliases() {
+                names.extend(aliases);
+            }
+            for name in names {
+                // Clap's generated help flag is handled by the early DisplayHelp
+                // return in parse_with_extension_flags, before preprocessing.
+                if name != "help" && known_long_option(name).is_none() {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "top-level Clap options missing from extension pre-parser: {missing:?}"
+        );
+    }
+
+    #[test]
     fn persist_models_requires_fetch_models() {
         let error = Cli::try_parse_from(["pi", "--persist-models"])
             .expect_err("persist-models without fetch-models must be rejected");
@@ -1308,7 +1409,7 @@ mod tests {
     fn extension_flags_are_extracted_in_second_pass_parse() {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship it".to_string(),
             "--model".to_string(),
             "gpt-4o".to_string(),
@@ -1317,7 +1418,7 @@ mod tests {
 
         assert_eq!(parsed.cli.model.as_deref(), Some("gpt-4o"));
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship it"));
     }
 
@@ -1392,7 +1493,7 @@ mod tests {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
             "--no-mouse-capture".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
@@ -1403,7 +1504,7 @@ mod tests {
         assert!(parsed.cli.print);
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1424,7 +1525,7 @@ mod tests {
             "pi".to_string(),
             "-pe".to_string(),
             "ext.js".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "hello".to_string(),
         ])
@@ -1434,7 +1535,7 @@ mod tests {
         assert_eq!(parsed.cli.extension, vec!["ext.js".to_string()]);
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1443,14 +1544,14 @@ mod tests {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
             "hello".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
         ])
         .expect("parse extension flag after message");
 
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1458,7 +1559,7 @@ mod tests {
     fn extension_flag_inline_value_matches_separate_value() {
         let separate = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
@@ -1467,7 +1568,7 @@ mod tests {
 
         let inline = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan=ship-it".to_string(),
+            "--extension-plan=ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
         ])

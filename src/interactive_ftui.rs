@@ -776,6 +776,11 @@ pub enum UiCommand {
     },
     /// Show provider usage/quota state (`/usage`, bd-cv653.7.4).
     Usage { refresh: bool },
+    /// Inspect or change this session's MCP server state.
+    Mcp {
+        subcommand: String,
+        name: Option<String>,
+    },
     /// Dispatch a non-built-in slash command to the extension runtime; the
     /// driver checks registration and reports unknown commands.
     ExtensionCommand { name: String, args: String },
@@ -1633,6 +1638,25 @@ impl PiFtuiModel {
             self.send_command(UiCommand::Usage { refresh });
             return true;
         }
+        if let Some(rest) = strip_command(clean, "/mcp") {
+            let mut parts = rest.split_whitespace();
+            let subcommand = parts.next().unwrap_or("list").to_ascii_lowercase();
+            let name = parts.next().map(str::to_string);
+            let valid = match subcommand.as_str() {
+                "list" => name.is_none() && parts.next().is_none(),
+                "trust" | "deny" | "test" => name.is_some() && parts.next().is_none(),
+                _ => false,
+            };
+            if valid {
+                self.send_command(UiCommand::Mcp { subcommand, name });
+            } else {
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from("usage: /mcp [list|trust <name>|deny <name>|test <name>]"),
+                );
+            }
+            return true;
+        }
         if canon == "/theme" {
             self.picker = Some(PickerOverlay {
                 title: String::from("Theme (Enter to apply, Esc to close)"),
@@ -1667,7 +1691,7 @@ impl PiFtuiModel {
                 EntryRole::System,
                 String::from(
                     "ftui preview commands: /model [provider/model], /resume, /compact, \
-                     /theme, /new, /clear, /session, /tree, /thinking [level], \
+                     /theme, /new, /clear, /session, /tree, /mcp, /thinking [level], \
                      /name <name>, /exit, /help, !<cmd> (runs + sends output to the \
                      agent), !!<cmd> (display-only)",
                 ),
@@ -2677,17 +2701,13 @@ async fn run_prompt_turn(
 /// Template for `/resume`: a resumed session keeps the launch selection
 /// (provider/model/key/cwd) but swaps the session file.
 fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::SessionOptions {
-    crate::sdk::SessionOptions {
-        provider: options.provider.clone(),
-        model: options.model.clone(),
-        api_key: options.api_key.clone(),
-        working_directory: options.working_directory.clone(),
-        session_dir: options.session_dir.clone(),
-        extension_paths: options.extension_paths.clone(),
-        extension_policy: options.extension_policy.clone(),
-        no_session: false,
-        ..Default::default()
-    }
+    let mut template = options.clone();
+    template.no_session = false;
+    template.session_path = None;
+    // The replacement session must receive the live handler created by this
+    // driver's reply channel, never retain an earlier handler instance.
+    template.extension_ui_handler = None;
+    template
 }
 
 /// Match the bubbletea stack's interactive extension-command budget.
@@ -2758,6 +2778,98 @@ async fn run_extension_command(
     let _ = agent_tx.send(msg);
 }
 
+/// Handle the default FTUI's MCP control surface against the manager owned by
+/// this exact SDK session (bd-vjfol).
+async fn run_mcp_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    subcommand: &str,
+    name: Option<&str>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let Some(manager) = handle.mcp_manager() else {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "MCP discovery is disabled for this session",
+        )));
+        return;
+    };
+
+    if subcommand == "list" {
+        let rows = manager.list();
+        let mut content = String::from("MCP servers (Model Context Protocol)\n");
+        if rows.is_empty() {
+            content.push_str("\n  No MCP servers configured.\n");
+        } else {
+            let _ = writeln!(content, "\n  {} configured:", rows.len());
+            for row in rows {
+                let _ = writeln!(
+                    content,
+                    "    • {} — {} [{}; trust: {}; {}]",
+                    row.name, row.target, row.provenance, row.trust, row.health
+                );
+            }
+        }
+        for warning in manager.warnings() {
+            let _ = writeln!(
+                content,
+                "  ⚠ {}: {} ({})",
+                warning.source_file.display(),
+                warning.entry,
+                warning.reason
+            );
+        }
+        let _ = agent_tx.send(PiMsg::System(content));
+        return;
+    }
+
+    let Some(name) = name else {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "usage: /mcp {subcommand} <name>"
+        )));
+        return;
+    };
+    let outcome = match subcommand {
+        "deny" => manager.deny(name).await.map(|()| Vec::new()),
+        "test" => manager.test(name).await,
+        "trust" => manager.trust(name).await,
+        _ => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!(
+                "unknown /mcp subcommand {subcommand:?}"
+            )));
+            return;
+        }
+    };
+    let message = match outcome {
+        Ok(_) if subcommand == "deny" => format!("MCP server {name:?} denied and stopped."),
+        Ok(tools) => {
+            let mounted = handle.mount_mcp_server_tools_if_absent(name);
+            let verb = if subcommand == "test" {
+                "tested"
+            } else {
+                "trusted"
+            };
+            let mut line = format!(
+                "MCP server {name:?} {verb}: {} tool(s) available.",
+                tools.len()
+            );
+            for tool in tools.iter().take(12) {
+                let _ = writeln!(line, "  • {} — {}", tool.name, tool.description);
+            }
+            if tools.len() > 12 {
+                let _ = writeln!(line, "  … and {} more", tools.len() - 12);
+            }
+            if mounted > 0 {
+                let _ = writeln!(
+                    line,
+                    "Mounted {mounted} new mcp__* tool(s) into the live session."
+                );
+            }
+            line
+        }
+        Err(err) => format!("MCP {name:?}: {err}"),
+    };
+    let _ = agent_tx.send(PiMsg::System(message));
+}
+
 /// Handle a model switch in the driver, reporting the outcome to the UI.
 async fn run_set_model_command(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -2799,54 +2911,48 @@ async fn run_compact_command(
 
 /// Handle `/new` in the driver: build a fresh session from the launch
 /// template with the CURRENT provider/model selection preserved and thinking
-/// reset to off (SlashCommand::New parity), then swap it in exactly like
-/// `/resume`. Returns the replacement handle on success; failures surface as
-/// UI errors and keep the current session.
+/// reset to off (SlashCommand::New parity). MCP activation is deferred until
+/// after the old handle is dropped so singleton servers never overlap.
+/// Construction failures surface as UI errors and keep the current session.
 async fn new_session_command(
     template: &crate::sdk::SessionOptions,
-    handle: &crate::sdk::AgentSessionHandle,
+    handle: &mut crate::sdk::AgentSessionHandle,
     current_ask: &CurrentAsk,
     ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) -> Option<crate::sdk::AgentSessionHandle> {
+) {
     let (provider, model_id) = handle.model();
-    let options = crate::sdk::SessionOptions {
-        provider: Some(provider.clone()),
-        model: Some(model_id.clone()),
-        api_key: template.api_key.clone(),
-        working_directory: template.working_directory.clone(),
-        session_dir: template.session_dir.clone(),
-        extension_paths: template.extension_paths.clone(),
-        extension_policy: template.extension_policy.clone(),
-        extension_ui_handler: Some(
-            Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>
-        ),
-        thinking: Some(crate::model::ThinkingLevel::Off),
-        no_session: false,
-        ..Default::default()
-    };
-    match crate::sdk::create_agent_session(options).await {
+    let mut options = template.clone();
+    options.provider = Some(provider.clone());
+    options.model = Some(model_id.clone());
+    options.session_path = None;
+    options.extension_ui_handler =
+        Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
+    options.thinking = Some(crate::model::ThinkingLevel::Off);
+    options.no_session = false;
+    match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
+            let old_handle = std::mem::replace(handle, new_handle);
+            drop(old_handle);
             *current_ask
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = new_handle.ask_tool();
-            if let Some(ask) = new_handle.ask_tool() {
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = handle.ask_tool();
+            if let Some(ask) = handle.ask_tool() {
                 install_ask_forwarder(&ask, agent_tx, runtime_handle);
             }
+            handle.activate_mcp().await;
             send_conversation_reset(
-                &new_handle,
+                handle,
                 agent_tx,
                 &format!(
                     "Started new session\nModel set to {provider}/{model_id}\nThinking level: off"
                 ),
             )
             .await;
-            Some(new_handle)
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("new session: {err}")));
-            None
         }
     }
 }
@@ -3089,47 +3195,38 @@ async fn run_usage_command(refresh: bool, agent_tx: &Sender<PiMsg>) {
 }
 
 /// Handle `/resume` in the driver: open the chosen session file with the
-/// launch selection preserved, rewire the ask bridge to the new handle, and
-/// replay the conversation into the UI. Returns the replacement handle on
-/// success (the caller swaps it in); failures surface as UI errors and keep
-/// the current session.
+/// launch selection preserved, drop the previous handle before starting the
+/// replacement's MCP servers, rewire the ask bridge, and replay the
+/// conversation into the UI. Construction failures keep the current session.
 async fn resume_session_command(
     path: &str,
     template: &crate::sdk::SessionOptions,
+    handle: &mut crate::sdk::AgentSessionHandle,
     current_ask: &CurrentAsk,
     ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) -> Option<crate::sdk::AgentSessionHandle> {
-    let options = crate::sdk::SessionOptions {
-        session_path: Some(std::path::PathBuf::from(path)),
-        provider: template.provider.clone(),
-        model: template.model.clone(),
-        api_key: template.api_key.clone(),
-        working_directory: template.working_directory.clone(),
-        session_dir: template.session_dir.clone(),
-        extension_paths: template.extension_paths.clone(),
-        extension_policy: template.extension_policy.clone(),
-        extension_ui_handler: Some(
-            Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>
-        ),
-        no_session: false,
-        ..Default::default()
-    };
-    match crate::sdk::create_agent_session(options).await {
-        Ok(handle) => {
+) {
+    let mut options = template.clone();
+    options.session_path = Some(std::path::PathBuf::from(path));
+    options.extension_ui_handler =
+        Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
+    options.no_session = false;
+    match crate::sdk::create_agent_session_deferred_mcp(options).await {
+        Ok(new_handle) => {
+            let old_handle = std::mem::replace(handle, new_handle);
+            drop(old_handle);
             *current_ask
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = handle.ask_tool();
             if let Some(ask) = handle.ask_tool() {
                 install_ask_forwarder(&ask, agent_tx, runtime_handle);
             }
-            send_conversation_reset(&handle, agent_tx, "session resumed").await;
-            Some(handle)
+            handle.activate_mcp().await;
+            send_conversation_reset(handle, agent_tx, "session resumed").await;
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("resume: {err}")));
-            None
         }
     }
 }
@@ -3341,37 +3438,41 @@ pub fn run(
                         Ok(UiCommand::Usage { refresh }) => {
                             run_usage_command(refresh, &agent_tx).await;
                         }
+                        Ok(UiCommand::Mcp { subcommand, name }) => {
+                            run_mcp_command(
+                                &mut handle,
+                                &subcommand,
+                                name.as_deref(),
+                                &agent_tx,
+                            )
+                            .await;
+                        }
                         Ok(UiCommand::ExtensionCommand { name, args }) => {
                             run_extension_command(&handle, &bash_cwd, &name, &args, &agent_tx)
                                 .await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
-                            if let Some(new_handle) = resume_session_command(
+                            resume_session_command(
                                 &path,
                                 &resume_template,
+                                &mut handle,
                                 &current_ask,
                                 &ext_handler,
                                 &agent_tx,
                                 &runtime_handle,
                             )
-                            .await
-                            {
-                                handle = new_handle;
-                            }
+                            .await;
                         }
                         Ok(UiCommand::NewSession) => {
-                            if let Some(new_handle) = new_session_command(
+                            new_session_command(
                                 &resume_template,
-                                &handle,
+                                &mut handle,
                                 &current_ask,
                                 &ext_handler,
                                 &agent_tx,
                                 &runtime_handle,
                             )
-                            .await
-                            {
-                                handle = new_handle;
-                            }
+                            .await;
                         }
                         Ok(UiCommand::SessionInfo) => {
                             run_session_info_command(&handle, &agent_tx).await;
@@ -3443,6 +3544,43 @@ mod tests {
     fn new_model() -> (mpsc::Sender<PiMsg>, PiFtuiModel) {
         let (tx, rx) = mpsc::channel();
         (tx, PiFtuiModel::new(rx))
+    }
+
+    #[test]
+    fn replacement_session_template_preserves_launch_capabilities() {
+        let options = crate::sdk::SessionOptions {
+            no_session: true,
+            session_path: Some(std::path::PathBuf::from("original.jsonl")),
+            enabled_tools: Some(vec!["read".to_string()]),
+            repair_policy: Some("auto-safe".to_string()),
+            extension_flags: vec![crate::cli::ExtensionCliFlag {
+                name: "verbose".to_string(),
+                value: Some("true".to_string()),
+            }],
+            max_tool_iterations: 17,
+            mcp: Some(crate::sdk::McpSessionOptions {
+                config_paths: vec![std::path::PathBuf::from("extra-mcp.json")],
+                global_dir: Some(std::path::PathBuf::from("isolated-global")),
+            }),
+            ..crate::sdk::SessionOptions::default()
+        };
+
+        let template = resume_template_from(&options);
+        assert!(!template.no_session);
+        assert!(template.session_path.is_none());
+        assert_eq!(template.enabled_tools, options.enabled_tools);
+        assert_eq!(template.repair_policy, options.repair_policy);
+        assert_eq!(template.extension_flags, options.extension_flags);
+        assert_eq!(template.max_tool_iterations, 17);
+        let mcp = template.mcp.expect("MCP launch options preserved");
+        assert_eq!(
+            mcp.config_paths,
+            vec![std::path::PathBuf::from("extra-mcp.json")]
+        );
+        assert_eq!(
+            mcp.global_dir,
+            Some(std::path::PathBuf::from("isolated-global"))
+        );
     }
 
     #[test]
@@ -4692,6 +4830,34 @@ mod tests {
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
             UiCommand::SetName(String::from("ship-it"))
+        );
+        type_str(&mut sim, "/mcp");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Mcp {
+                subcommand: String::from("list"),
+                name: None,
+            }
+        );
+        type_str(&mut sim, "/mcp trust docs");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Mcp {
+                subcommand: String::from("trust"),
+                name: Some(String::from("docs")),
+            }
+        );
+        type_str(&mut sim, "/mcp trust");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.role == EntryRole::Error
+                    && entry.text.contains("usage: /mcp"))
         );
     }
 

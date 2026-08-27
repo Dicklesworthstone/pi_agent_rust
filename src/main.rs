@@ -832,145 +832,6 @@ fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> 
     Ok(())
 }
 
-fn parse_bool_flag_value(flag_name: &str, raw: &str) -> Result<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(pi::error::Error::validation(format!(
-            "Invalid boolean value for extension flag --{flag_name}: \"{raw}\". Use one of: true,false,1,0,yes,no,on,off."
-        ))
-        .into()),
-    }
-}
-
-fn coerce_extension_flag_value(
-    flag: &cli::ExtensionCliFlag,
-    declared_type: &str,
-) -> Result<serde_json::Value> {
-    match declared_type.trim().to_ascii_lowercase().as_str() {
-        "bool" | "boolean" => {
-            if let Some(raw) = flag.value.as_deref() {
-                Ok(Value::Bool(parse_bool_flag_value(&flag.name, raw)?))
-            } else {
-                Ok(Value::Bool(true))
-            }
-        }
-        "number" | "int" | "integer" | "float" => {
-            let Some(raw) = flag.value.as_deref() else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} requires a numeric value.",
-                    flag.name
-                ))
-                .into());
-            };
-            if let Ok(parsed) = raw.parse::<i64>() {
-                return Ok(Value::Number(parsed.into()));
-            }
-            let parsed = raw.parse::<f64>().map_err(|_| {
-                pi::error::Error::validation(format!(
-                    "Invalid numeric value for extension flag --{}: \"{}\"",
-                    flag.name, raw
-                ))
-            })?;
-            let Some(number) = serde_json::Number::from_f64(parsed) else {
-                return Err(pi::error::Error::validation(format!(
-                    "Numeric value for extension flag --{} is not finite: \"{}\"",
-                    flag.name, raw
-                ))
-                .into());
-            };
-            Ok(Value::Number(number))
-        }
-        _ => {
-            let Some(raw) = flag.value.as_deref() else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} requires a value.",
-                    flag.name
-                ))
-                .into());
-            };
-            Ok(Value::String(raw.to_string()))
-        }
-    }
-}
-
-async fn apply_extension_cli_flags(
-    manager: &pi::extensions::ExtensionManager,
-    extension_flags: &[cli::ExtensionCliFlag],
-) -> Result<()> {
-    if extension_flags.is_empty() {
-        return Ok(());
-    }
-
-    let registered = manager.list_flags();
-    let known_names: std::collections::BTreeSet<String> = registered
-        .iter()
-        .filter_map(|flag| flag.get("name").and_then(Value::as_str))
-        .map(ToString::to_string)
-        .collect();
-
-    for cli_flag in extension_flags {
-        let matches = registered
-            .iter()
-            .filter(|flag| {
-                flag.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&cli_flag.name))
-            })
-            .collect::<Vec<_>>();
-
-        if matches.is_empty() {
-            let known = if known_names.is_empty() {
-                "(none)".to_string()
-            } else {
-                known_names
-                    .iter()
-                    .map(|name| format!("--{name}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            tracing::debug!(
-                event = "pi.extensions.flags.ignored_unknown",
-                flag = %cli_flag.display_name(),
-                registered = %known,
-                "Ignoring unknown extension flag (not registered by any loaded extension)."
-            );
-            continue;
-        }
-
-        for spec in matches {
-            let Some(extension_id) = spec.get("extension_id").and_then(Value::as_str) else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} cannot be set because extension metadata is missing extension_id.",
-                    cli_flag.name
-                ))
-                .into());
-            };
-            if extension_id.trim().is_empty() {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} cannot be set because extension_id is empty.",
-                    cli_flag.name
-                ))
-                .into());
-            }
-            let registered_name = spec.get("name").and_then(Value::as_str).ok_or_else(|| {
-                pi::error::Error::validation(format!(
-                    "Extension flag --{} is missing name metadata.",
-                    cli_flag.name
-                ))
-            })?;
-            let flag_type = spec.get("type").and_then(Value::as_str).unwrap_or("string");
-            let value = coerce_extension_flag_value(cli_flag, flag_type)?;
-            manager
-                .set_flag_value(extension_id, registered_name, value)
-                .await
-                .map_err(anyhow::Error::new)?;
-        }
-    }
-
-    Ok(())
-}
-
 fn policy_config_example(profile: &str, allow_dangerous: bool) -> serde_json::Value {
     serde_json::json!({
         "extensionPolicy": {
@@ -1273,57 +1134,49 @@ async fn run(
     // and execute. Explicit CLI resource paths are user consent and stay
     // ungated.
     let workspace_trusted = {
-        let all_resources_disabled =
-            cli.no_skills && cli.no_prompt_templates && cli.no_extensions && cli.no_themes;
-        // A PI_CONFIG_PATH override already disables project settings and
-        // project auto-discovery everywhere (ResolveRoots::from_override), so
-        // no project-declared code can run and there is nothing to gate.
-        let config_override_active = Config::config_path_override_from_env(&cwd).is_some();
-        if all_resources_disabled || config_override_active {
-            // With every resource class disabled, configured resolution is
-            // skipped entirely (Issue #38 fast path) and no project-declared
-            // code can run, so there is nothing to gate.
-            true
-        } else {
-            let interactive_allowed = cli.command.is_none()
-                && cli.export.is_none()
-                && !cli.print
-                && cli.list_models.is_none()
-                && cli.mode.as_deref().is_none_or(|mode| mode == "interactive")
-                && io::stdin().is_terminal()
-                && io::stdout().is_terminal();
-            // trustAllWorkspaces is honored from the GLOBAL settings only: a
-            // project file granting itself trust would defeat the gate.
-            let trust_all = Config::load_global_only()
-                .ok()
-                .and_then(|global| global.trust_all_workspaces)
-                .unwrap_or(false);
-            let inputs = pi::workspace_trust::TrustInputs {
-                cli_trust: cli.trust,
-                trust_all_workspaces: trust_all,
-                env_override: std::env::var(pi::workspace_trust::TRUST_ENV_VAR).ok(),
-                interactive: interactive_allowed,
-            };
-            let state = pi::workspace_trust::establish(
-                &cwd,
-                &pi::workspace_trust::WorkspaceTrustStore::default_path(),
-                &inputs,
-                prompt_workspace_trust,
-            )?;
-            if !state.trusted {
-                if state.source == pi::workspace_trust::TrustSource::NonInteractive {
-                    eprintln!(
-                        "Warning: workspace not trusted (non-interactive session); project-local .pi configuration was skipped. Pass --trust once, set {}=trusted, or launch interactively to decide.",
-                        pi::workspace_trust::TRUST_ENV_VAR
-                    );
-                } else {
-                    eprintln!(
-                        "Note: project-local .pi configuration is disabled for this untrusted workspace. Run with --trust to enable it."
-                    );
-                }
+        // Always scan the complete workspace-controlled execution surface.
+        // Even when skills/extensions/themes are disabled or PI_CONFIG_PATH
+        // overrides settings, project MCP discovery remains independently
+        // enabled and must not bypass this gate. A workspace with no surface
+        // returns TrustSource::NoSurface without prompting or persisting.
+        let interactive_allowed = cli.command.is_none()
+            && cli.export.is_none()
+            && !cli.print
+            && cli.list_models.is_none()
+            && cli.mode.as_deref().is_none_or(|mode| mode == "interactive")
+            && io::stdin().is_terminal()
+            && io::stdout().is_terminal();
+        // trustAllWorkspaces is honored from the GLOBAL settings only: a
+        // project file granting itself trust would defeat the gate.
+        let trust_all = Config::load_global_only()
+            .ok()
+            .and_then(|global| global.trust_all_workspaces)
+            .unwrap_or(false);
+        let inputs = pi::workspace_trust::TrustInputs {
+            cli_trust: cli.trust,
+            trust_all_workspaces: trust_all,
+            env_override: std::env::var(pi::workspace_trust::TRUST_ENV_VAR).ok(),
+            interactive: interactive_allowed,
+        };
+        let state = pi::workspace_trust::establish(
+            &cwd,
+            &pi::workspace_trust::WorkspaceTrustStore::default_path(),
+            &inputs,
+            prompt_workspace_trust,
+        )?;
+        if !state.trusted {
+            if state.source == pi::workspace_trust::TrustSource::NonInteractive {
+                eprintln!(
+                    "Warning: workspace not trusted (non-interactive session); project-local executable configuration was skipped. Pass --trust once, set {}=trusted, or launch interactively to decide.",
+                    pi::workspace_trust::TRUST_ENV_VAR
+                );
+            } else {
+                eprintln!(
+                    "Note: project-local executable configuration is disabled for this untrusted workspace. Run with --trust to enable it."
+                );
             }
-            state.trusted
         }
+        state.trusted
     };
 
     let mut config = Config::load_with_project_trust(workspace_trusted)?;
@@ -1924,23 +1777,27 @@ async fn run(
         pi::btw::BtwClient::for_model_entry(entry, btw_api_key.as_deref(), &auth)
     });
 
+    #[cfg(feature = "ftui")]
+    let ftui_requested = is_interactive && !cli.classic;
+    #[cfg(not(feature = "ftui"))]
+    let ftui_requested = false;
+
     // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >
     // .agents > global > foreign), eagerly connect already-acknowledged
     // servers under a bounded global budget, and mount their tools as
     // first-class mcp__<server>__<tool> tools. Pending/denied servers are
-    // never spawned; /mcp shows provenance + health for everything.
-    let mcp_manager = std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
-        &cwd,
-        &pi::config::Config::global_dir(),
-        &cli.mcp_config,
-    )?);
-    mcp_manager.connect_trusted().await;
-    {
-        let mcp_wrappers = pi::mcp::mount_tools(&mcp_manager);
-        if !mcp_wrappers.is_empty() {
-            agent_session.agent.extend_tools(mcp_wrappers);
-        }
-    }
+    // never spawned; /mcp shows provenance + health for everything. The
+    // default FTUI constructs the manager owned by its actual SDK session,
+    // so do not discover and populate a second manager that will be dropped.
+    let mcp_manager = if ftui_requested {
+        None
+    } else {
+        Some(std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
+            &cwd,
+            &pi::config::Config::global_dir(),
+            &cli.mcp_config,
+        )?))
+    };
     let mut extension_model_entries = Vec::new();
 
     if !resources.extensions().is_empty() {
@@ -2008,7 +1865,9 @@ async fn run(
 
         if !extension_flags.is_empty() {
             if let Some(region) = &agent_session.extensions {
-                apply_extension_cli_flags(region.manager(), &extension_flags).await?;
+                pi::extensions::apply_cli_flags(region.manager(), &extension_flags)
+                    .await
+                    .map_err(anyhow::Error::new)?;
             } else {
                 return Err(pi::error::Error::validation(
                     "Extension flags were provided, but extensions are not active in this session.",
@@ -2022,14 +1881,16 @@ async fn run(
             // Bridge extension-registered MCP servers into the unified MCP
             // client registry (bd-cv653.6.1): same spawn path, same trust
             // gate, provenance=extension in /mcp.
-            for spec in region.manager().extension_mcp_servers() {
-                let name = spec
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if !name.is_empty() {
-                    mcp_manager.register_extension_server(&name, &spec);
+            if let Some(mcp_manager) = &mcp_manager {
+                for spec in region.manager().extension_mcp_servers() {
+                    let name = spec
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        mcp_manager.register_extension_server(&name, &spec);
+                    }
                 }
             }
             extension_model_entries = region.manager().extension_model_entries();
@@ -2109,6 +1970,16 @@ async fn run(
             flags = %rendered,
             "Extension flags provided but no extensions are loaded; ignoring."
         );
+    }
+
+    // The classic/RPC session owns this manager. FTUI constructs its actual
+    // Agent through the SDK below, so its SDK-owned manager performs the one
+    // connect-and-mount pass after that session's extensions load (bd-vjfol).
+    if let Some(mcp_manager) = &mcp_manager {
+        let mcp_wrappers = pi::mcp::connect_trusted_and_mount_tools(mcp_manager).await;
+        if !mcp_wrappers.is_empty() {
+            agent_session.agent.extend_tools(mcp_wrappers);
+        }
     }
 
     if has_extensions {
@@ -2201,11 +2072,6 @@ async fn run(
     // Clone session handle for shutdown flush (ensures autosave queue is drained).
     let session_handle = Arc::clone(&agent_session.session);
 
-    #[cfg(feature = "ftui")]
-    let ftui_requested = is_interactive && !cli.classic;
-    #[cfg(not(feature = "ftui"))]
-    let ftui_requested = false;
-
     let result = if mode.eq("rpc") {
         let available_models = rpc_available_models(&model_registry, cli.api_key.as_deref());
         let rpc_scoped_models = selection
@@ -2266,6 +2132,8 @@ async fn run(
                     resources.extensions().to_vec()
                 },
                 extension_policy: cli.extension_policy.clone(),
+                repair_policy: cli.repair_policy.clone(),
+                extension_flags: extension_flags.clone(),
                 // Prompt/tool/thinking flags flow through so deterministic
                 // harnesses (VCR body matching) and users get the same
                 // behavior as the default stack.
@@ -2273,6 +2141,10 @@ async fn run(
                 append_system_prompt: cli.append_system_prompt.clone(),
                 enabled_tools: if cli.no_tools { Some(Vec::new()) } else { None },
                 thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
+                mcp: Some(pi::sdk::McpSessionOptions {
+                    config_paths: cli.mcp_config.clone(),
+                    global_dir: Some(pi::config::Config::global_dir()),
+                }),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
@@ -2338,7 +2210,7 @@ async fn run(
             ask_tool,
             btw_client,
             Some(btw_factory),
-            Some(mcp_manager),
+            mcp_manager,
         ))
         .await
     } else {
@@ -8071,7 +7943,7 @@ fn print_model_table<R: ModelTableRow>(rows: &[R]) {
 fn prompt_workspace_trust(
     surface: &pi::workspace_trust::WorkspaceTrustSurface,
 ) -> pi::PiResult<bool> {
-    const MAX_LISTED_EXTENSIONS: usize = 10;
+    const MAX_LISTED_ENTRIES: usize = 10;
 
     eprintln!();
     eprintln!("This workspace declares project-local Pi configuration that can execute code:");
@@ -8096,13 +7968,33 @@ fn prompt_workspace_trust(
             "  - .pi/extensions ({} {noun}; JavaScript runs at session startup):",
             surface.extension_entries.len()
         );
-        for entry in surface.extension_entries.iter().take(MAX_LISTED_EXTENSIONS) {
+        for entry in surface.extension_entries.iter().take(MAX_LISTED_ENTRIES) {
             eprintln!("      {entry}");
         }
-        if surface.extension_entries.len() > MAX_LISTED_EXTENSIONS {
+        if surface.extension_entries.len() > MAX_LISTED_ENTRIES {
             eprintln!(
                 "      ... and {} more",
-                surface.extension_entries.len() - MAX_LISTED_EXTENSIONS
+                surface.extension_entries.len() - MAX_LISTED_ENTRIES
+            );
+        }
+    }
+    if !surface.mcp_config_entries.is_empty() {
+        let noun = if surface.mcp_config_entries.len() == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        eprintln!(
+            "  - project MCP configuration ({} {noun}; trusted servers may execute or receive requests):",
+            surface.mcp_config_entries.len()
+        );
+        for entry in surface.mcp_config_entries.iter().take(MAX_LISTED_ENTRIES) {
+            eprintln!("      {entry}");
+        }
+        if surface.mcp_config_entries.len() > MAX_LISTED_ENTRIES {
+            eprintln!(
+                "      ... and {} more",
+                surface.mcp_config_entries.len() - MAX_LISTED_ENTRIES
             );
         }
     }
@@ -9589,7 +9481,7 @@ mod tests {
         }];
 
         futures::executor::block_on(async {
-            apply_extension_cli_flags(&manager, &flags)
+            pi::extensions::apply_cli_flags(&manager, &flags)
                 .await
                 .expect("unknown extension flag should be ignored");
         });
@@ -9636,7 +9528,7 @@ mod tests {
             name: "dry-run".to_string(),
             value: None,
         };
-        let value = coerce_extension_flag_value(&flag, "bool").expect("coerce bool");
+        let value = pi::extensions::coerce_cli_flag_value(&flag, "bool").expect("coerce bool");
         assert_eq!(value, Value::Bool(true));
     }
 
@@ -9646,7 +9538,8 @@ mod tests {
             name: "dry-run".to_string(),
             value: Some("maybe".to_string()),
         };
-        let err = coerce_extension_flag_value(&flag, "bool").expect_err("invalid bool should fail");
+        let err = pi::extensions::coerce_cli_flag_value(&flag, "bool")
+            .expect_err("invalid bool should fail");
         assert!(err.to_string().contains("Invalid boolean value"));
     }
 
