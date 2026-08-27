@@ -2407,13 +2407,26 @@ impl HttpTransport {
         let mut next_stream = Some(first);
         loop {
             if let Some(stream) = next_stream.take() {
-                match self
+                let listener_result = self
                     .run_until_session_change(
                         wire_state.generation,
                         self.run_server_event_listener(&wire_state, stream),
                     )
-                    .await?
-                {
+                    .await;
+                let listener_result = match listener_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if self.abort_if_session_generation(wire_state.generation) {
+                            tracing::warn!(error = %error, "MCP HTTP server-event listener failed");
+                            return Err(error);
+                        }
+                        // A newer session won the race with the old listener
+                        // failure. Its terminal state belongs only to the old
+                        // generation, so continue with the replacement.
+                        continue;
+                    }
+                };
+                match listener_result {
                     Some(()) => {
                         // The optional channel ended or exhausted its single
                         // resume. Stay dormant until a newly initialized
@@ -2445,7 +2458,17 @@ impl HttpTransport {
                     wire_state.generation,
                     self.open_event_stream(&wire_state, None, None),
                 )
-                .await?;
+                .await;
+            let opened = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    if self.abort_if_session_generation(wire_state.generation) {
+                        tracing::warn!(error = %error, "MCP HTTP server-event listener failed");
+                        return Err(error);
+                    }
+                    continue;
+                }
+            };
             let Some(opened) = opened else {
                 continue;
             };
@@ -2460,10 +2483,14 @@ impl HttpTransport {
                         .await?;
                 }
                 HttpEventStreamOpen::SessionExpired => {
-                    return Err(tool_err(
+                    let error = tool_err(
                         "MCP_SESSION_EXPIRED",
                         "server rejected the active GET stream session with HTTP 404",
-                    ));
+                    );
+                    if self.abort_if_session_generation(wire_state.generation) {
+                        tracing::warn!(error = %error, "MCP HTTP server-event listener failed");
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -2772,7 +2799,6 @@ impl McpTransport for HttpTransport {
                 && listener_transport.is_alive()
             {
                 tracing::warn!(error = %error, "MCP HTTP server-event listener failed");
-                listener_transport.abort();
             }
         }) {
             self.listener_started.store(false, Ordering::Release);

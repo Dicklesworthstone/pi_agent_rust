@@ -16512,7 +16512,17 @@ async fn dispatch_hostcall_session_fast_ref(
         };
     };
 
-    let result = match parse_session_opcode_atom(op) {
+    let opcode = parse_session_opcode_atom(op);
+    let invalidate_ctx_cache = matches!(
+        opcode,
+        Some(
+            CommonHostcallOpcode::SessionSetName
+                | CommonHostcallOpcode::SessionSetModel
+                | CommonHostcallOpcode::SessionSetThinkingLevel
+                | CommonHostcallOpcode::SessionSetLabel
+        )
+    );
+    let result = match opcode {
         Some(CommonHostcallOpcode::SessionGetState) => Ok(session.get_state().await),
         Some(CommonHostcallOpcode::SessionGetMessages) => {
             serde_json::to_value(session.get_messages().await)
@@ -16634,7 +16644,12 @@ async fn dispatch_hostcall_session_fast_ref(
     };
 
     match result {
-        Ok(value) => HostcallOutcome::Success(value),
+        Ok(value) => {
+            if invalidate_ctx_cache {
+                manager.invalidate_ctx_cache();
+            }
+            HostcallOutcome::Success(value)
+        }
         Err(err) => HostcallOutcome::Error {
             code: err.hostcall_error_code().to_string(),
             message: err.to_string(),
@@ -18670,7 +18685,10 @@ async fn dispatch_hostcall_events_ref(
             };
 
             match actions.send_message(msg).await {
-                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Ok(()) => {
+                    manager.invalidate_ctx_cache();
+                    HostcallOutcome::Success(Value::Null)
+                }
                 Err(err) => HostcallOutcome::Error {
                     code: "io".to_string(),
                     message: err.to_string(),
@@ -18721,7 +18739,10 @@ async fn dispatch_hostcall_events_ref(
             };
 
             match actions.send_user_message(msg).await {
-                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Ok(()) => {
+                    manager.invalidate_ctx_cache();
+                    HostcallOutcome::Success(Value::Null)
+                }
                 Err(err) => HostcallOutcome::Error {
                     code: "io".to_string(),
                     message: err.to_string(),
@@ -18945,22 +18966,26 @@ async fn dispatch_hostcall_events_ref(
                 .or_else(|| payload.get("model_id").and_then(Value::as_str))
                 .map(ToString::to_string);
 
-            // Persist before updating the manager cache. The session bridge owns
-            // transition admission, so a stale action must not update cache state
-            // for a replacement Session after its durable mutation is rejected.
             let p = provider.unwrap_or_default();
             let m = model_id.unwrap_or_default();
-            if let Some(session) = manager.session_handle()
-                && !p.is_empty()
-                && !m.is_empty()
-                && let Err(err) = session.set_model(p, m).await
-            {
-                return HostcallOutcome::Error {
-                    code: "io".to_string(),
-                    message: format!("setModel: session update failed: {err}"),
-                };
+            if let Some(session) = manager.session_handle() {
+                if !p.is_empty()
+                    && !m.is_empty()
+                    && let Err(err) = session.set_model(p, m).await
+                {
+                    return HostcallOutcome::Error {
+                        code: "io".to_string(),
+                        message: format!("setModel: session update failed: {err}"),
+                    };
+                }
+                // Session state is authoritative while a bridge is attached.
+                // Updating the fallback cache after the fenced call would reopen
+                // a race with Session replacement, so only invalidate derived ctx.
+                manager.invalidate_ctx_cache();
+            } else {
+                manager
+                    .set_current_model((!p.is_empty()).then_some(p), (!m.is_empty()).then_some(m));
             }
-            manager.set_current_model((!p.is_empty()).then_some(p), (!m.is_empty()).then_some(m));
             HostcallOutcome::Success(Value::Null)
         }
         EventsHostcallOp::GetThinkingLevel => {
@@ -18980,18 +19005,19 @@ async fn dispatch_hostcall_events_ref(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
-            // As with model changes, update the cache only after the fenced
-            // session mutation succeeds.
-            if let Some(session) = manager.session_handle()
-                && let Some(ref lvl) = level
-                && let Err(err) = session.set_thinking_level(lvl.clone()).await
-            {
-                return HostcallOutcome::Error {
-                    code: "io".to_string(),
-                    message: format!("setThinkingLevel: session update failed: {err}"),
-                };
+            if let Some(session) = manager.session_handle() {
+                if let Some(ref lvl) = level
+                    && let Err(err) = session.set_thinking_level(lvl.clone()).await
+                {
+                    return HostcallOutcome::Error {
+                        code: "io".to_string(),
+                        message: format!("setThinkingLevel: session update failed: {err}"),
+                    };
+                }
+                manager.invalidate_ctx_cache();
+            } else {
+                manager.set_current_thinking_level(level);
             }
-            manager.set_current_thinking_level(level);
             HostcallOutcome::Success(Value::Null)
         }
         EventsHostcallOp::RegisterFlag => {
