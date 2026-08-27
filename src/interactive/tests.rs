@@ -870,3 +870,173 @@ fn ask_card_answer_is_not_queued_as_steering_while_agent_busy() {
     );
     assert_eq!(app.agent_state, AgentState::ToolRunning);
 }
+
+/// bd-1qol9 harness helpers: a minimal text-answer extension card.
+fn ext_input_card(id: &str, prompt_text: &str) -> ExtensionUiRequest {
+    ExtensionUiRequest::new(
+        id,
+        "input",
+        serde_json::json!({
+            "title": "Ext",
+            "message": prompt_text,
+            "extension_id": "ext-cards"
+        }),
+    )
+    .with_extension_id(Some("ext-cards".to_string()))
+}
+
+/// bd-1qol9 mixed arrival order (extension FIRST, ask SECOND): exactly one
+/// card may own the editor; the later ask queues behind and promotes only
+/// after the extension resolves, so answers can never be reordered.
+#[test]
+fn mixed_cards_extension_then_ask_serialize_in_arrival_order() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e1", "Say?")));
+    assert_eq!(
+        app.active_input_card_kind,
+        Some(InputCardKind::Extension),
+        "extension activates first"
+    );
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Which?", "options": [{"label": "A"}]}]
+    }))
+    .expect("ask request");
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a1".to_string(),
+        request,
+    }));
+    assert_eq!(
+        app.active_input_card_kind,
+        Some(InputCardKind::Extension),
+        "later ask must NOT steal the editor from the active card"
+    );
+    assert!(app.active_ask_ui.is_none());
+
+    // The ext-active answer routes to the EXTENSION parser, not the ask one:
+    // an arbitrary string would fail numeric ask parsing but succeed here.
+    app.input.set_value("free-form reply");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_extension_ui.is_none(), "ext resolved");
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert!(app.view().contains("question 1 of 1"), "ask promoted");
+
+    app.input.set_value("A");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_ask_ui.is_none());
+    assert!(app.active_input_card_kind.is_none());
+}
+
+/// bd-1qol9 reverse order (ask FIRST, extension SECOND) plus draft
+/// capture/restore across answer and Escape resolution paths.
+#[test]
+fn mixed_cards_ask_then_ext_preserve_drafts_across_resolution_paths() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    // Preexisting steering draft gets snapshotted + cleared on activation.
+    app.input.set_value("cargo test -- --filter bd_1");
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Run tests?", "options": [{"label": "Yes"}, {"label": "No"}]}]
+    }))
+    .expect("ask request");
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-order".to_string(),
+        request,
+    }));
+    assert!(
+        app.input.value().is_empty(),
+        "card activation clears the captured draft"
+    );
+    assert!(app.card_draft_snapshot.is_some());
+
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e-order", "Env?")));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+
+    // Answer the ACTIVE ask through the REAL Enter path; the queued ext
+    // promotes automatically afterward.
+    app.input.set_value("Yes");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Extension));
+
+    // Generic Escape dismisses the promoted EXTENSION card without aborting
+    // anything and restores the pre-card draft into the empty editor.
+    app.agent_state = AgentState::ToolRunning;
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert!(app.active_extension_ui.is_none());
+    assert!(app.active_input_card_kind.is_none());
+    assert_ne!(
+        app.status_message.as_deref(),
+        Some("Aborting request..."),
+        "Escape on a card never aborts the turn"
+    );
+    assert_eq!(
+        app.input.value(),
+        "cargo test -- --filter bd_1",
+        "explicit merge policy restores the draft after the last card settles"
+    );
+    assert!(app.agent_state == AgentState::ToolRunning);
+    app.agent_state = AgentState::Idle;
+}
+
+/// bd-1qol9 terminal/abort cleanup: AgentDone invalidates the ACTIVE ask,
+/// every QUEUED card of both kinds, and answers them fail-closed BEFORE any
+/// RunPending/idle input can run. Mutation-sensitive: before this fix the
+/// queues survived the turn boundary and could swallow the next idle prompt.
+#[test]
+fn agent_done_invalidates_all_outstanding_cards_before_idle() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Active?", "options": [{"label": "A"}]}]
+    }))
+    .expect("active ask");
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-done".to_string(),
+        request,
+    }));
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-queued".to_string(),
+        request: serde_json::from_value(json!({
+            "questions": [{"question": "Queued?", "options": [{"label": "B"}]}]
+        }))
+        .expect("queued ask"),
+    }));
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e-done", "late?")));
+
+    assert!(!app.ask_ui_queue.is_empty());
+    assert!(!app.extension_ui_queue.is_empty());
+
+    app.pending_inputs
+        .push_back(PendingInput::Text("queued user input".to_string()));
+    let cmd = app.handle_pi_message(PiMsg::AgentDone {
+        usage: None,
+        stop_reason: StopReason::Aborted,
+        error_message: None,
+    });
+
+    assert!(cmd.is_some(), "idle handoff still schedules RunPending");
+    assert!(app.active_ask_ui.is_none());
+    assert!(app.active_extension_ui.is_none());
+    assert!(app.ask_ui_queue.is_empty(), "queued asks invalidated");
+    assert!(app.extension_ui_queue.is_empty(), "queued exts invalidated");
+    assert!(app.active_input_card_kind.is_none());
+    assert!(
+        app.status_message.as_deref() == Some("Question dismissed")
+            || app
+                .status_message
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with("Ask request expired")),
+        "dismissal surfaced: {:?}",
+        app.status_message
+    );
+}

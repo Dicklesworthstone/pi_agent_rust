@@ -562,10 +562,12 @@ impl PiApp {
             // Application actions
             // =========================================================
             AppAction::Interrupt => {
-                // Escape with a pending ask card dismisses the card (the
-                // tool sees `dismissed`), matching the ftui stack; it must
-                // not abort the whole turn (gh #184).
-                if self.dismiss_active_ask_ui() {
+                // Escape generically dismisses whichever input card owns the
+                // editor (bd-1qol9): ask cards resolve as dismissed and
+                // extension prompts as cancelled, WITHOUT aborting the
+                // provider turn. Only when no card is pending does Escape
+                // fall through to busy-turn interruption semantics.
+                if self.has_pending_input_card() && self.dismiss_active_input_card() {
                     return None;
                 }
                 // Escape: Abort if processing, otherwise context-dependent

@@ -990,6 +990,9 @@ impl PiApp {
                 if !matches!(stop_reason, StopReason::Aborted | StopReason::Error) {
                     self.maybe_request_session_title();
                 }
+                // bd-1qol9: terminal/abort cleanup invalidates every card
+                // from this turn BEFORE idle input or RunPending runs.
+                self.invalidate_input_cards_for_turn_end();
 
                 if !self.pending_inputs.is_empty() {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
@@ -1034,6 +1037,8 @@ impl PiApp {
                 self.extension_streaming.store(false, Ordering::SeqCst);
                 self.extension_compacting.store(false, Ordering::SeqCst);
                 self.input.focus();
+                // bd-1qol9: an errored turn cancels its outstanding cards.
+                self.invalidate_input_cards_for_turn_end();
                 self.refresh_conversation_viewport(true);
 
                 if !self.pending_inputs.is_empty() {
@@ -1068,6 +1073,8 @@ impl PiApp {
                 self.abort_handle = None;
                 self.extension_streaming.store(false, Ordering::SeqCst);
                 self.extension_compacting.store(false, Ordering::SeqCst);
+                // bd-1qol9: hard reset also cancels outstanding cards.
+                self.invalidate_input_cards_for_turn_end();
                 self.scroll_to_bottom();
                 self.input.focus();
 
@@ -1910,12 +1917,16 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// Ask cards (bd-cv653.3.8): show the next queued request's current
     /// question as a conversation card and focus the input for the reply.
     fn advance_ask_ui_queue(&mut self) {
-        if self.active_ask_ui.is_some() {
+        // bd-1qol9: cards are globally serialized — whichever kind is active
+        // owns the editor until it resolves; nothing else may activate.
+        if self.active_input_card_kind.is_some() {
             return;
         }
         let Some(request) = self.ask_ui_queue.pop_front() else {
             return;
         };
+        self.capture_preexisting_card_draft();
+        self.active_input_card_kind = Some(InputCardKind::Ask);
         self.active_ask_ui = Some(crate::interactive::ActiveAskCard {
             request,
             question_index: 0,
@@ -2042,19 +2053,167 @@ After approving access in the browser, press Enter in Pi to complete login."
         } else if dismissed {
             self.status_message = Some("Question dismissed".to_string());
         }
-        self.advance_ask_ui_queue();
+        // Free the global slot BEFORE stepping the order ledger so the
+        // successor's activation gate is open (bd-1qol9).
+        if self.active_input_card_kind == Some(InputCardKind::Ask) {
+            self.active_input_card_kind = None;
+        }
+        match self.resolve_order_head_after(InputCardKind::Ask) {
+            true => self.try_activate_next_input_card_impl(),
+            false => self.advance_ask_ui_queue(),
+        }
+    }
+
+    /// Resolve an ACTIVE extension text-card by parsing the editor line.
+    /// Mirrors the ask-side bookkeeping (bd-1qol9).
+    fn resolve_active_extension_ui_with_line(&mut self, message: &str) -> bool {
+        let Some(active) = self.active_extension_ui.take() else {
+            return false;
+        };
+        match parse_extension_ui_response(&active, message) {
+            Ok(response) => {
+                self.send_extension_ui_response(response);
+                // Free the global slot BEFORE stepping the ledger so the
+                // successor's activation gate is open (bd-1qol9).
+                if self.active_input_card_kind == Some(InputCardKind::Extension) {
+                    self.active_input_card_kind = None;
+                }
+                match self.resolve_order_head_after(InputCardKind::Extension) {
+                    true => self.try_activate_next_input_card_impl(),
+                    false => self.advance_extension_ui_queue(),
+                }
+                self.input.reset();
+                self.input.focus();
+            }
+            Err(err) => {
+                self.status_message = Some(err);
+                self.active_extension_ui = Some(active);
+            }
+        }
+        true
+    }
+
+    /// Pop the resolved kind off the global order ledger. Returns `true` when
+    /// the head matched (caller should then try to activate the successor).
+    fn resolve_order_head_after(&mut self, kind: InputCardKind) -> bool {
+        if self.input_card_order.front() == Some(&kind) {
+            self.input_card_order.pop_front();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Snapshot the user's in-progress draft exactly once per card burst
+    /// (bd-1qol9). Subsequent arrivals and queue promotions never clobber an
+    /// existing snapshot.
+    fn capture_preexisting_card_draft(&mut self) {
+        if self.card_draft_snapshot.is_none() && !self.input.value().trim().is_empty() {
+            self.card_draft_snapshot = Some(self.input.value().to_string());
+            // AC: first activation snapshots AND clears the preexisting draft
+            // (bd-1qol9); the editor now belongs to the card.
+            self.input.reset();
+        }
+    }
+
+    /// Explicit merge policy: once the LAST card resolves, restore the
+    /// captured draft only into an empty editor (the modal ownership model
+    /// means anything typed meanwhile would have been consumed as answers).
+    pub(super) fn restore_card_draft_after_cards_settle(&mut self) {
+        if self.has_pending_input_card() || self.active_input_card_kind.is_some() {
+            return;
+        }
+        if !self.ask_ui_queue.is_empty() || !self.extension_ui_queue.is_empty() {
+            return;
+        }
+        if let Some(draft) = self.card_draft_snapshot.take()
+            && self.input.value().trim().is_empty()
+        {
+            self.input.set_value(&draft);
+        }
+    }
+
+    /// Generically dismiss whichever card currently owns the editor (Escape,
+    /// bd-1qol9): ask cards resolve as dismissed; extension prompts receive
+    /// a cancelled response. The provider turn is never aborted.
+    pub(super) fn dismiss_active_input_card(&mut self) -> bool {
+        match self.active_input_card_kind {
+            Some(InputCardKind::Ask) => {
+                let dismissed = self.dismiss_active_ask_ui();
+                let _ = self.resolve_order_head_after(InputCardKind::Ask);
+                self.try_activate_next_input_card_impl();
+                self.restore_card_draft_after_cards_settle();
+                dismissed
+            }
+            Some(InputCardKind::Extension) => {
+                if let Some(active) = self.active_extension_ui.take() {
+                    self.send_extension_ui_response_quiet(ExtensionUiResponse {
+                        id: active.id,
+                        value: None,
+                        cancelled: true,
+                    });
+                    let _ = self.resolve_order_head_after(InputCardKind::Extension);
+                    // Mirror the ask path: free the global slot before the
+                    // stepper, or settle-restore short-circuits (bd-1qol9).
+                    self.active_input_card_kind = None;
+                    self.input.reset();
+                    self.input.focus();
+                    self.try_activate_next_input_card_impl();
+                    self.restore_card_draft_after_cards_settle();
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Global activation stepper: promote the next queued card of ANY kind
+    /// while its order head still stands, honoring mutual exclusion.
+    pub(super) fn try_activate_next_input_card_impl(&mut self) {
+        loop {
+            if self.active_input_card_kind.is_some() {
+                return;
+            }
+            let Some(head) = self.input_card_order.front().copied() else {
+                return;
+            };
+            match head {
+                InputCardKind::Ask => {
+                    if self.ask_ui_queue.is_empty() {
+                        self.input_card_order.pop_front();
+                        continue;
+                    }
+                    self.advance_ask_ui_queue();
+                    return;
+                }
+                InputCardKind::Extension => {
+                    if self.extension_ui_queue.is_empty() {
+                        self.input_card_order.pop_front();
+                        continue;
+                    }
+                    self.advance_extension_ui_queue();
+                    return;
+                }
+            }
+        }
     }
 
     fn advance_extension_ui_queue(&mut self) {
-        if self.active_extension_ui.is_some() {
+        // bd-1qol9: global serialization — see advance_ask_ui_queue.
+        if self.active_input_card_kind.is_some() {
             return;
         }
         if let Some(next) = self.extension_ui_queue.pop_front() {
             if next.method == "custom" {
+                // Custom overlays poll independent of the text-card slot.
                 self.handle_custom_extension_ui_request(next);
                 self.advance_extension_ui_queue();
                 return;
             }
+            self.capture_preexisting_card_draft();
+            self.active_input_card_kind = Some(InputCardKind::Extension);
             let prompt = format_extension_ui_prompt(&next);
             self.active_extension_ui = Some(next);
             self.messages.push(ConversationMessage {
@@ -2838,25 +2997,15 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
 
-        // Ask cards consume input before every other interpretation
-        // (bd-cv653.3.8): a pending question owns the input line.
-        if self.handle_ask_ui_input(message) {
+        // bd-1qol9: exactly ONE card owns the editor — the ACTIVE slot wins
+        // regardless of kind, so a newer extension card can no longer have
+        // its answer stolen by an older ask card (or vice versa).
+        if self.active_input_card_kind == Some(InputCardKind::Extension)
+            && self.resolve_active_extension_ui_with_line(message)
+        {
             return None;
         }
-
-        if let Some(active) = self.active_extension_ui.take() {
-            match parse_extension_ui_response(&active, message) {
-                Ok(response) => {
-                    self.send_extension_ui_response(response);
-                    self.advance_extension_ui_queue();
-                }
-                Err(err) => {
-                    self.status_message = Some(err);
-                    self.active_extension_ui = Some(active);
-                }
-            }
-            self.input.reset();
-            self.input.focus();
+        if self.handle_ask_ui_input(message) {
             return None;
         }
 
