@@ -129,9 +129,9 @@ pub struct PackageManager {
     cwd: PathBuf,
     /// Workspace-trust gate (GH #151): when false, project-local settings and
     /// auto-discovery (`.pi/settings.json` packages, `.pi/extensions/`, …)
-    /// are excluded from resolution. Defaults to true because every explicit
-    /// `pi install`/`pi remove`-style subcommand is direct user consent; the
-    /// interactive startup path lowers it for untrusted workspaces.
+    /// are excluded from resolution. Direct API construction defaults to true;
+    /// trust-aware CLI and SDK entry points must override it with their
+    /// established workspace decision before resolving project resources.
     project_trust: bool,
 }
 

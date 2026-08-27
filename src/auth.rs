@@ -15,7 +15,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(unix))]
 use tempfile::NamedTempFile;
@@ -2069,21 +2071,192 @@ where
     Ok(Some(raw.to_string()))
 }
 
-fn run_api_key_source_command(command: &str) -> std::result::Result<Option<String>, String> {
-    let output = build_api_key_command_shell(command)
-        .output()
-        .map_err(|e| format!("Failed to run API key command: {e}"))?;
+const SECRET_CMD_DEADLINE: Duration = Duration::from_secs(10);
+const SECRET_CMD_KILL_GRACE: Duration = Duration::from_millis(750);
+const SECRET_CMD_STDOUT_CAP: usize = 64 * 1024;
+const SECRET_CMD_STDERR_CAP: usize = 16 * 1024;
 
-    if !output.status.success() {
-        let status = output.status.code().map_or_else(
+/// Owns the spawned helper's leader pid until the run settles. If this
+/// guard drops early — error path, panic, caller cancellation — the whole
+/// isolated process group is torn down instead of leaking a running secret
+/// holder (bd-wuswt).
+struct SecretCmdGuard {
+    pid: Option<u32>,
+    settled: Arc<AtomicBool>,
+}
+
+impl SecretCmdGuard {
+    fn arm(pid: u32) -> Self {
+        Self {
+            pid: Some(pid),
+            settled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn settle(&mut self) {
+        self.settled.store(true, Ordering::Relaxed);
+        if let Some(pid) = self.pid.take() {
+            // Reap the leader even on success so no zombie outlives us.
+            let _ = crate::platform::reap_pid(pid);
+        }
+    }
+}
+
+impl Drop for SecretCmdGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take()
+            && !self.settled.load(Ordering::Relaxed)
+        {
+            crate::tools::kill_process_group_tree(Some(pid));
+        }
+    }
+}
+
+#[derive(Default)]
+struct CappedCapture {
+    kept: Mutex<Vec<u8>>,
+    overflowed: AtomicBool,
+    finished: AtomicBool,
+}
+
+impl CappedCapture {
+    /// Drain a pipe until EOF, keeping at most `cap` head bytes and discarding
+    /// beyond that. Draining (rather than early-closing) plus group teardown
+    /// means a hostile writer can wedge neither the collector nor a sibling
+    /// pipe (bd-wuswt dual-pipe case).
+    fn drain<R: std::io::Read>(&self, mut reader: R, cap: usize) {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    {
+                        let mut kept = self.kept.lock().expect("secret capture lock");
+                        let remaining = cap.saturating_sub(kept.len());
+                        if remaining > 0 {
+                            let take = remaining.min(n);
+                            kept.extend_from_slice(&chunk[..take]);
+                        }
+                        if kept.len() >= cap
+                            && !self.overflowed.swap(true, Ordering::Relaxed)
+                        {
+                            tracing::warn!(
+                                event = "pi.auth.secret_cmd_output_overflow",
+                                "secret helper output exceeded its bounded cap; \
+                                 draining to EOF then failing closed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.finished.store(true, Ordering::Relaxed);
+    }
+
+    fn join_grace(handle: std::thread::JoinHandle<()>, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.is_finished()
+    }
+}
+
+fn run_api_key_source_command(command: &str) -> std::result::Result<Option<String>, String> {
+    run_bounded_secret_command(command, SECRET_CMD_DEADLINE)
+}
+
+fn run_bounded_secret_command(
+    command: &str,
+    deadline: Duration,
+) -> std::result::Result<Option<String>, String> {
+    let started = Instant::now();
+    let mut cmd = build_api_key_command_shell(command);
+    crate::tools::isolate_command_process_group(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|_| {
+        // Intentionally excludes command text and OS error detail.
+        "[MCP_SECRET_CMD_SPAWN] failed to start secret helper".to_string()
+    })?;
+    let pid = child.id();
+    let mut guard = SecretCmdGuard::arm(pid);
+
+    let stdout_pipe = child.stdout.take().ok_or_else(|| {
+        "[MCP_SECRET_CMD_IO] secret helper stdout unavailable".to_string()
+    })?;
+    let stderr_pipe = child.stderr.take().ok_or_else(|| {
+        "[MCP_SECRET_CMD_IO] secret helper stderr unavailable".to_string()
+    })?;
+    let stdout_capture = Arc::new(CappedCapture::default());
+    let stderr_capture = Arc::new(CappedCapture::default());
+    let stdout_handle = std::thread::spawn({
+        let capture = Arc::clone(&stdout_capture);
+        move || capture.drain(stdout_pipe, SECRET_CMD_STDOUT_CAP)
+    });
+    let stderr_handle = std::thread::spawn({
+        let capture = Arc::clone(&stderr_capture);
+        move || capture.drain(stderr_pipe, SECRET_CMD_STDERR_CAP)
+    });
+
+    let wait_deadline = started + deadline;
+    let mut status_out: Option<std::process::ExitStatus> = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                status_out = Some(status);
+                break;
+            }
+            Ok(None) if Instant::now() >= wait_deadline => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => break,
+        }
+    }
+    let timed_out = status_out.is_none();
+    if timed_out {
+        crate::tools::kill_process_group_tree(Some(pid));
+        let _ = child.wait();
+    }
+    // Grandchildren may hold pipe write-ends past leader exit; give readers a
+    // short grace after either exit or kill, then force the tree down so the
+    // collector can never hang forever (bd-wuswt).
+    let drained =
+        CappedCapture::join_grace(stdout_handle, SECRET_CMD_KILL_GRACE)
+            & CappedCapture::join_grace(stderr_handle, SECRET_CMD_KILL_GRACE);
+    if !drained {
+        crate::tools::kill_process_group_tree(Some(pid));
+        CappedCapture::join_grace(stdout_handle, Duration::from_millis(250));
+        CappedCapture::join_grace(stderr_handle, Duration::from_millis(250));
+    }
+    guard.settle();
+
+    if timed_out {
+        return Err(format!(
+            "[MCP_SECRET_CMD_TIMEOUT] secret helper exceeded {}s deadline",
+            deadline.as_secs()
+        ));
+    }
+    if stdout_capture.overflowed.load(Ordering::Relaxed)
+        || stderr_capture.overflowed.load(Ordering::Relaxed)
+    {
+        return Err(format!(
+            "[MCP_SECRET_CMD_OUTPUT_OVERFLOW] secret helper output exceeded caps \
+             (stdout_cap={SECRET_CMD_STDOUT_CAP}, stderr_cap={SECRET_CMD_STDERR_CAP})"
+        ));
+    }
+    let status = status_out.expect("settled run has an exit status");
+    if !status.success() {
+        let status_text = status.code().map_or_else(
             || "terminated by signal".to_string(),
             |code| format!("exit code {code}"),
         );
-        return Err(format!("API key command failed ({status})"));
+        return Err(format!("[MCP_SECRET_CMD_FAILED] ({status_text})"));
     }
-
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| "API key command output is not valid UTF-8".to_string())?;
+    let stdout_bytes = stdout_capture.kept.lock().expect("capture lock").clone();
+    let stdout = String::from_utf8(stdout_bytes).map_err(|_| {
+        "[MCP_SECRET_CMD_NOT_UTF8] secret helper stdout is not valid UTF-8".to_string()
+    })?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         tracing::warn!(
@@ -2092,7 +2265,6 @@ fn run_api_key_source_command(command: &str) -> std::result::Result<Option<Strin
         );
         return Ok(None);
     }
-
     Ok(Some(trimmed.to_string()))
 }
 

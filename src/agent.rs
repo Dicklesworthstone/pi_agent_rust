@@ -14057,15 +14057,29 @@ mod tests {
                 stream_calls: StdArc::clone(&stream_calls),
             });
             let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            let turn_starts = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+            let turn_starts_for_events = StdArc::clone(&turn_starts);
 
             crate::jobs::push_completion_notice(&first_id, "stale-only-notice")
                 .expect("first owner notice");
-            agent.run("initial prompt", |_| {}).await.expect("agent run");
+            agent
+                .run("initial prompt", move |event| {
+                    if matches!(event, AgentEvent::TurnStart { .. }) {
+                        turn_starts_for_events.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .await
+                .expect("agent run");
 
             assert_eq!(
                 stream_calls.load(Ordering::SeqCst),
                 1,
                 "a stale-only staged batch must not create an empty provider turn"
+            );
+            assert_eq!(
+                turn_starts.load(Ordering::SeqCst),
+                1,
+                "a stale-only staged batch must not emit an unmatched turn start"
             );
             let restored = crate::jobs::take_completion_notices(&first_id);
             assert_eq!(restored.len(), 1);

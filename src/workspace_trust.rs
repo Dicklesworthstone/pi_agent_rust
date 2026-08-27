@@ -401,8 +401,38 @@ pub struct TrustInputs {
 #[must_use]
 pub fn workspace_key(cwd: &Path) -> String {
     let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+
+    // The tag is part of the persistence contract. Changing it deliberately
+    // invalidates older decisions and causes a safe re-prompt instead of
+    // interpreting path bytes with a different platform/toolchain encoding.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        return format!(
+            "path-v3:unix:{}",
+            crate::package_manager::hex_encode(canonical.as_os_str().as_bytes())
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let bytes = canonical
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        return format!(
+            "path-v3:windows-utf16le:{}",
+            crate::package_manager::hex_encode(&bytes)
+        );
+    }
+
+    #[cfg(not(any(unix, windows)))]
     format!(
-        "path-v2:{}",
+        "path-v3:platform-encoded:{}",
         crate::package_manager::hex_encode(canonical.as_os_str().as_encoded_bytes())
     )
 }
@@ -727,8 +757,29 @@ mod tests {
             first_key, second_key,
             "distinct raw canonical paths must never share trust decisions"
         );
-        assert!(first_key.starts_with("path-v2:"));
+        assert!(first_key.starts_with("path-v3:unix:"));
         assert!(first_key.is_ascii(), "store keys must remain JSON-safe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_keys_use_tagged_utf16le_path_encoding() {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonical workspace");
+        let expected_bytes = canonical
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            workspace_key(dir.path()),
+            format!(
+                "path-v3:windows-utf16le:{}",
+                crate::package_manager::hex_encode(&expected_bytes)
+            )
+        );
     }
 
     #[test]

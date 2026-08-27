@@ -477,13 +477,16 @@ fn main_impl() -> Result<()> {
         cli.mode = Some("rpc".to_string());
     }
 
+    let package_subcommand_trust = cli
+        .command
+        .as_ref()
+        .filter(|command| subcommand_uses_package_manager(command))
+        .map(|_| establish_package_subcommand_trust(&cwd, cli.trust))
+        .transpose()?;
+
     // Ultra-fast paths that don't need tracing or the async runtime.
     if let Some(command) = &cli.command {
-        let project_trusted = if subcommand_uses_package_manager(command) {
-            Some(establish_package_subcommand_trust(&cwd, cli.trust)?)
-        } else {
-            None
-        };
+        let project_trusted = package_subcommand_trust;
         match command {
             cli::Commands::Install { source, local } => {
                 let manager = PackageManager::new(cwd.clone())
@@ -774,7 +777,12 @@ fn main_impl() -> Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let handle = runtime.handle();
-    let result = runtime.block_on(run(cli, extension_flags, handle));
+    let result = runtime.block_on(run(
+        cli,
+        extension_flags,
+        handle,
+        package_subcommand_trust,
+    ));
     // `run()` owns graceful application shutdown. Exiting here avoids waiting on
     // runtime-owned background tasks after the CLI/TUI has already finished.
     // Background bash jobs are session-scoped (bd-cv653.3.10): kill any
@@ -1091,6 +1099,7 @@ async fn run(
     mut cli: cli::Cli,
     extension_flags: Vec<cli::ExtensionCliFlag>,
     runtime_handle: RuntimeHandle,
+    package_subcommand_trust: Option<bool>,
 ) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -1112,7 +1121,10 @@ async fn run(
 
     if let Some(command) = cli.command.take() {
         let project_trusted = if subcommand_uses_package_manager(&command) {
-            establish_package_subcommand_trust(&cwd, cli.trust)?
+            match package_subcommand_trust {
+                Some(trusted) => trusted,
+                None => establish_package_subcommand_trust(&cwd, cli.trust)?,
+            }
         } else {
             false
         };
