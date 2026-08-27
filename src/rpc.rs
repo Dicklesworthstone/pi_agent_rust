@@ -6911,11 +6911,14 @@ mod retry_tests {
         runtime.block_on(async move {
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(Arc::new(AlwaysErrorProvider), tools, AgentConfig::default());
-            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                session_temp.path().join("sessions"),
+            ))));
             let agent_session = AgentSession::new(
                 agent,
                 inner_session,
-                false,
+                true,
                 crate::compaction::ResolvedCompactionSettings::default(),
             );
             let session = Arc::new(Mutex::new(agent_session));
@@ -7089,6 +7092,7 @@ mod retry_tests {
                 .lock(cx.cx())
                 .await
                 .expect("inner session lock");
+            let persisted_path = inner.path.clone().expect("persisted failover path");
             let path = inner.entries_for_current_path();
             assert_eq!(
                 serde_json::to_value(guard.agent.messages()).expect("serialize Agent messages"),
@@ -7118,6 +7122,27 @@ mod retry_tests {
             )));
             drop(inner);
             drop(guard);
+
+            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen committed failover Session");
+            let reopened_path = reopened.entries_for_current_path();
+            assert!(reopened_path.iter().all(|entry| !matches!(
+                entry,
+                SessionEntry::Message(message)
+                    if matches!(
+                        &message.message,
+                        SessionMessage::Assistant { message }
+                            if message.stop_reason == StopReason::Error
+                    )
+            )));
+            assert!(reopened_path.iter().any(|entry| matches!(
+                entry,
+                SessionEntry::ModelChange(change)
+                    if change.provider == "anthropic"
+                        && change.model_id == "fallback-model"
+                        && change.role.as_deref() == Some("failover")
+            )));
 
             let state = shared_state.lock(&cx).await.expect("shared state lock");
             assert_eq!(
