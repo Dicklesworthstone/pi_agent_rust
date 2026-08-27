@@ -2,7 +2,7 @@
 
 ## Building
 
-Pi release builds use the exact `nightly-2026-07-05` toolchain pinned in
+Pi release builds use the exact `nightly-2026-08-25` toolchain pinned in
 `rust-toolchain.toml`. The locked dependency graph requires Rust 1.95 or newer;
 use the repository pin so compiler and Clippy results remain reproducible.
 

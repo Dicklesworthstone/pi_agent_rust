@@ -339,7 +339,7 @@ jobs:
       - name: Install frozen Rust toolchain for release gates
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # upstream commit verified 2026-08-04
         with:
-          toolchain: nightly-2026-07-05
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - name: Cache frozen release gate artifacts
@@ -642,7 +642,7 @@ jobs:
       - name: Install Rust toolchain (nightly)
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # upstream commit verified 2026-08-04
         with:
-          toolchain: nightly-2026-07-05
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - name: Add target
@@ -2137,7 +2137,7 @@ jobs:
       - name: Install frozen Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # upstream commit verified 2026-08-04
         with:
-          toolchain: nightly-2026-07-05
+          toolchain: nightly-2026-08-25
 
       - name: Resolve exact root package
         id: package
@@ -2572,7 +2572,7 @@ jobs:
       - name: Install frozen Rust toolchain without running package code
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # upstream commit verified 2026-08-04
         with:
-          toolchain: nightly-2026-07-05
+          toolchain: nightly-2026-08-25
 
       - name: Revalidate source and immutable refs on the fresh runner
         env:

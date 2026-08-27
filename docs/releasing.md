@@ -341,9 +341,9 @@ for release_tool in \
     exit 1
   fi
 done
-export RUSTUP_TOOLCHAIN="nightly-2026-07-05"
+export RUSTUP_TOOLCHAIN="nightly-2026-08-25"
 export RCH_CARGO_WRAPPER_BYPASS=1
-test "$RUSTUP_TOOLCHAIN" = nightly-2026-07-05
+test "$RUSTUP_TOOLCHAIN" = nightly-2026-08-25
 test "$RCH_CARGO_WRAPPER_BYPASS" = 1
 # Capture the crates.io credential into one non-exported shell variable before
 # starting any subprocess. The release shell keeps it unavailable to git,

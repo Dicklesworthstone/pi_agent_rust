@@ -748,12 +748,12 @@ command -v legacy-pi && legacy-pi --version
 ### From Source
 
 Repository builds are tested with the exact toolchain pinned in
-`rust-toolchain.toml` (`nightly-2026-07-05`). The locked dependency graph
+`rust-toolchain.toml` (`nightly-2026-08-25`). The locked dependency graph
 requires Rust 1.95 or newer; use the pin for release-reproducible builds:
 
 ```bash
 # Install the repository's pinned toolchain and components
-rustup toolchain install nightly-2026-07-05 --component rustfmt --component clippy
+rustup toolchain install nightly-2026-08-25 --component rustfmt --component clippy
 
 # Clone and build
 git clone https://github.com/Dicklesworthstone/pi_agent_rust.git
@@ -2569,7 +2569,7 @@ Pi is honest about what it doesn't do:
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | Common stubs are provided; unlisted npm packages still require a stub. See docs/planning/EXTENSIONS.md §8.1 |
 | **English-centric** | Works but not optimized for other languages |
-| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-07-05`; locked dependencies require Rust 1.95+ |
+| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-08-25`; locked dependencies require Rust 1.95+ |
 
 ---
 
