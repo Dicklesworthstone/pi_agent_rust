@@ -1014,20 +1014,34 @@ impl ExtensionSession for MockSession {
     async fn get_branch(&self) -> Vec<Value> {
         Vec::new()
     }
-    async fn set_name(&self, name: String) -> Result<()> {
+    async fn set_name(&self, name: String, _origin: Option<SessionActionOrigin>) -> Result<()> {
         *self
             .name
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name);
         Ok(())
     }
-    async fn append_message(&self, _message: crate::session::SessionMessage) -> Result<()> {
+    async fn append_message(
+        &self,
+        _message: crate::session::SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         Ok(())
     }
-    async fn append_custom_entry(&self, _custom_type: String, _data: Option<Value>) -> Result<()> {
+    async fn append_custom_entry(
+        &self,
+        _custom_type: String,
+        _data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         Ok(())
     }
-    async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         *self
             .model
             .lock()
@@ -1040,7 +1054,11 @@ impl ExtensionSession for MockSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
-    async fn set_thinking_level(&self, level: String) -> Result<()> {
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         *self
             .thinking_level
             .lock()
@@ -1053,7 +1071,12 @@ impl ExtensionSession for MockSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
-    async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.labels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1546,14 +1569,22 @@ impl MockHostActions {
 
 #[async_trait]
 impl ExtensionHostActions for MockHostActions {
-    async fn send_message(&self, message: ExtensionSendMessage) -> Result<()> {
+    async fn send_message(
+        &self,
+        message: ExtensionSendMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.messages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(message);
         Ok(())
     }
-    async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()> {
+    async fn send_user_message(
+        &self,
+        message: ExtensionSendUserMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.user_messages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2476,6 +2507,44 @@ fn stream_simple_error_in_js_propagates() {
 }
 
 #[test]
+fn provider_stream_cleanup_retains_route_until_inner_cleanup_succeeds() {
+    let stream_id = "provider-stream-1";
+    let mut shards = JsRuntimeShardSet::default();
+    shards.provider_stream_routes.insert(
+        stream_id.to_string(),
+        JsProviderStreamRoute {
+            shard_index: 0,
+            inner_stream_id: "inner-stream-1".to_string(),
+            origin: None,
+        },
+    );
+
+    let cleanup_error = shards
+        .finish_provider_stream_cleanup(
+            stream_id,
+            Err(Error::extension("injected cleanup failure")),
+        )
+        .expect_err("failed cleanup must remain visible to the caller");
+    assert!(
+        cleanup_error
+            .to_string()
+            .contains("injected cleanup failure")
+    );
+    assert!(
+        shards.provider_stream_routes.contains_key(stream_id),
+        "failed cleanup must retain the only route available for retry"
+    );
+
+    shards
+        .finish_provider_stream_cleanup(stream_id, Ok(()))
+        .expect("successful retry");
+    assert!(
+        !shards.provider_stream_routes.contains_key(stream_id),
+        "the route should retire only after confirmed inner cleanup"
+    );
+}
+
+#[test]
 fn stream_simple_cancel_stops_iteration() {
     let manager = ExtensionManager::new();
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -2554,6 +2623,54 @@ fn stream_simple_cancel_stops_iteration() {
             .await
             .expect("next after cancel");
         assert!(after_cancel.is_none(), "expected None after cancellation");
+
+        // Cancellation remains resource cleanup even when the request/reply
+        // caller disappears before the actor handles the command.
+        let abandoned_stream_id = js_runtime
+            .provider_stream_simple_start(
+                "cancel-provider".to_string(),
+                json!({"id": "cancel-model"}),
+                json!({"messages": []}),
+                json!({}),
+                30_000,
+            )
+            .await
+            .expect("start stream for abandoned cancel");
+        let first = js_runtime
+            .provider_stream_simple_next(abandoned_stream_id.clone(), 30_000)
+            .await
+            .expect("first next before abandoned cancel");
+        assert!(first.is_some());
+
+        let cx = Cx::for_request();
+        let (abandoned_reply, abandoned_receiver) = oneshot::channel();
+        drop(abandoned_receiver);
+        js_runtime
+            .sender
+            .send(
+                &cx,
+                JsRuntimeCommand::ProviderStreamSimpleCancel {
+                    stream_id: abandoned_stream_id.clone(),
+                    timeout_ms: 30_000,
+                    deadline: js_runtime_request_deadline(30_000),
+                    reply: Some(abandoned_reply),
+                },
+            )
+            .await
+            .expect("enqueue abandoned cancel");
+        let _ = js_runtime
+            .get_registered_tools()
+            .await
+            .expect("actor ordering barrier");
+
+        let after_abandoned_cancel = js_runtime
+            .provider_stream_simple_next(abandoned_stream_id, 30_000)
+            .await
+            .expect("next after abandoned cancel");
+        assert!(
+            after_abandoned_cancel.is_none(),
+            "abandoned cancel must still retire the provider route"
+        );
 
         let unknown = js_runtime
             .provider_stream_simple_next("provider-stream-999".to_string(), 30_000)

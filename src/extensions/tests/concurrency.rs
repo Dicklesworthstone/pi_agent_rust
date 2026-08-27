@@ -1901,6 +1901,7 @@ mod proptest_dispatch {
                     manager: None,
                     policy: &policy,
                     js_runtime: None,
+                    session_action_origin: None,
                     interceptor: None,
                 };
                 let call = HostCallPayload {
@@ -1967,6 +1968,7 @@ mod proptest_dispatch {
                     manager: None,
                     policy: &policy,
                     js_runtime: None,
+                    session_action_origin: None,
                     interceptor: None,
                 };
                 let call = HostCallPayload {
@@ -2011,6 +2013,7 @@ mod proptest_dispatch {
                     manager: None,
                     policy: &policy,
                     js_runtime: None,
+                    session_action_origin: None,
                     interceptor: None,
                 };
                 let call = HostCallPayload {
@@ -2156,6 +2159,7 @@ mod proptest_dispatch {
                     manager: None,
                     policy: &policy,
                     js_runtime: None,
+                    session_action_origin: None,
                     interceptor: None,
                 };
                 let call = HostCallPayload {

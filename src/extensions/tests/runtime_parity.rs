@@ -920,6 +920,7 @@ fn parity_tool_read_success_shared_vs_protocol() {
         manager: None,
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

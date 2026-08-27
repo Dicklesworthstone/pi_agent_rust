@@ -506,6 +506,7 @@ fn dispatch_shared_allowed_global_kill_switch_forces_compat_lane() {
         manager: Some(manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -554,6 +555,7 @@ fn dispatch_shared_allowed_extension_kill_switch_only_affects_target_extension()
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
     let (_outcome, compat_lane_meta) =
@@ -577,6 +579,7 @@ fn dispatch_shared_allowed_extension_kill_switch_only_affects_target_extension()
         manager: Some(manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
     let (_outcome, fast_lane_meta) =
@@ -966,6 +969,7 @@ fn dispatch_shared_allowed_budget_controller_forces_compat_lane() {
         manager: Some(manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -1025,6 +1029,7 @@ fn dispatch_shared_allowed_reactor_overflow_uses_conservative_lane() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -2160,6 +2165,7 @@ fn dispatch_shared_allowed_fast_and_forced_compat_match_on_malformed_payload() {
         manager: Some(fast_manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
     let compat_ctx = HostCallContext {
@@ -2170,6 +2176,7 @@ fn dispatch_shared_allowed_fast_and_forced_compat_match_on_malformed_payload() {
         manager: Some(compat_manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -2236,6 +2243,7 @@ fn runtime_hostcall_telemetry_records_lane_reason_fallback_and_latency_share() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
     let payload = typed_tool_read_payload("lane-telemetry", file.to_str().expect("utf-8 path"));
@@ -2307,6 +2315,7 @@ fn replay_bundle_records_lane_pressure_resource_and_transcript_metadata() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
     let mut payload =
@@ -2534,6 +2543,7 @@ fn runtime_hostcall_telemetry_records_marshalling_fallback_reason_and_counter() 
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

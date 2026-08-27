@@ -28,6 +28,7 @@ fn shared_dispatch_ui_confirm_success() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -117,6 +118,7 @@ fn shared_dispatch_ui_no_sender_returns_denied() {
         manager: Some(manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -161,6 +163,7 @@ fn shared_dispatch_ui_cancelled_returns_deterministic_value() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -232,6 +235,7 @@ fn shared_dispatch_ui_empty_op_returns_invalid_request() {
         manager: Some(manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -270,6 +274,7 @@ fn shared_dispatch_ui_logs_params_hash_no_raw_payload() {
         manager: Some(manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -517,6 +522,7 @@ fn protocol_adapter_tool_success_roundtrip() {
         manager: None,
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

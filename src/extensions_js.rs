@@ -78,7 +78,7 @@ macro_rules! compressed_js_literal {
 
 use crate::extensions::{
     ExecMediationResult, ExtensionPolicy, ExtensionPolicyMode, SecretBrokerPolicy,
-    evaluate_exec_mediation,
+    SessionActionOrigin, evaluate_exec_mediation,
 };
 
 /// Helper to check `exec` capability for sync execution where we cannot prompt.
@@ -4673,12 +4673,25 @@ impl InterruptBudget {
     }
 }
 
+#[must_use = "the Session-action origin scope ends when the guard is dropped"]
+pub(crate) struct SessionActionOriginGuard {
+    active_origin: Rc<RefCell<Option<SessionActionOrigin>>>,
+    previous: Option<SessionActionOrigin>,
+}
+
+impl Drop for SessionActionOriginGuard {
+    fn drop(&mut self) {
+        self.active_origin.replace(self.previous.take());
+    }
+}
+
 #[derive(Debug, Default)]
 struct HostcallTracker {
     pending: HashSet<String>,
     cancelled: HashSet<String>,
     call_to_timer: HashMap<String, u64>,
     timer_to_call: HashMap<u64, String>,
+    call_origins: HashMap<String, SessionActionOrigin>,
     enqueued_at_ms: HashMap<String, u64>,
     stream_last_seq: HashMap<String, u64>,
 }
@@ -4696,7 +4709,13 @@ struct HostcallCancellation {
 }
 
 impl HostcallTracker {
-    fn register(&mut self, call_id: String, timer_id: Option<u64>, enqueued_at_ms: u64) {
+    fn register(
+        &mut self,
+        call_id: String,
+        timer_id: Option<u64>,
+        enqueued_at_ms: u64,
+        origin: Option<SessionActionOrigin>,
+    ) {
         self.pending.insert(call_id.clone());
         self.cancelled.remove(&call_id);
         self.stream_last_seq.remove(&call_id);
@@ -4704,8 +4723,23 @@ impl HostcallTracker {
             self.call_to_timer.insert(call_id.clone(), timer_id);
             self.timer_to_call.insert(timer_id, call_id.clone());
         }
+        if let Some(origin) = origin {
+            self.call_origins.insert(call_id.clone(), origin);
+        } else {
+            self.call_origins.remove(&call_id);
+        }
         // Last insert consumes call_id, avoiding one clone.
         self.enqueued_at_ms.insert(call_id, enqueued_at_ms);
+    }
+
+    fn origin_for_call(&self, call_id: &str) -> Option<SessionActionOrigin> {
+        self.call_origins.get(call_id).cloned()
+    }
+
+    fn origin_for_timer(&self, timer_id: u64) -> Option<SessionActionOrigin> {
+        self.timer_to_call
+            .get(&timer_id)
+            .and_then(|call_id| self.origin_for_call(call_id))
     }
 
     fn pending_count(&self) -> usize {
@@ -4770,6 +4804,7 @@ impl HostcallTracker {
         }
 
         let timer_id = self.call_to_timer.remove(call_id);
+        self.call_origins.remove(call_id);
         self.enqueued_at_ms.remove(call_id);
         self.cancelled.remove(call_id);
         self.stream_last_seq.remove(call_id);
@@ -4783,6 +4818,7 @@ impl HostcallTracker {
     fn take_timed_out_call(&mut self, timer_id: u64) -> Option<String> {
         let call_id = self.timer_to_call.remove(&timer_id)?;
         self.call_to_timer.remove(&call_id);
+        self.call_origins.remove(&call_id);
         self.enqueued_at_ms.remove(&call_id);
         self.cancelled.remove(&call_id);
         self.stream_last_seq.remove(&call_id);
@@ -4831,21 +4867,20 @@ fn enqueue_hostcall_request_with_backpressure<C: SchedulerClock>(
             depth,
             overflow_depth,
         } => {
-            let completion = tracker.borrow_mut().on_complete(&call_id);
-            if let HostcallCompletion::Delivered { timer_id } = completion {
-                if let Some(timer_id) = timer_id {
-                    let _ = scheduler.borrow_mut().clear_timeout(timer_id);
-                }
-                scheduler.borrow_mut().enqueue_hostcall_complete(
-                    call_id.clone(),
-                    HostcallOutcome::Error {
-                        code: "overloaded".to_string(),
-                        message: format!(
-                            "Hostcall queue overloaded (depth={depth}, overflow_depth={overflow_depth})"
-                        ),
-                    },
-                );
-            }
+            // Keep the tracker entry live until the completion macrotask is
+            // delivered. Finalizing here would make handle_macrotask observe
+            // an unknown call and discard the overload error, leaving the JS
+            // Promise unresolved. The delivery path performs the single
+            // tracker removal and timeout cleanup for every final outcome.
+            scheduler.borrow_mut().enqueue_hostcall_complete(
+                call_id.clone(),
+                HostcallOutcome::Error {
+                    code: "overloaded".to_string(),
+                    message: format!(
+                        "Hostcall queue overloaded (depth={depth}, overflow_depth={overflow_depth})"
+                    ),
+                },
+            );
             tracing::warn!(
                 event = "pijs.hostcall.queue.rejected",
                 call_id = %call_id,
@@ -17045,6 +17080,8 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     hostcall_queue: HostcallQueue,
     trace_seq: Arc<AtomicU64>,
     hostcall_tracker: Rc<RefCell<HostcallTracker>>,
+    active_session_action_origin: Rc<RefCell<Option<SessionActionOrigin>>>,
+    user_timer_origins: Rc<RefCell<HashMap<u64, SessionActionOrigin>>>,
     hostcalls_total: Arc<AtomicU64>,
     hostcalls_timed_out: Arc<AtomicU64>,
     last_memory_used_bytes: Arc<AtomicU64>,
@@ -17282,6 +17319,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             HostcallRequestQueue::with_capacities(fast_queue_capacity, overflow_queue_capacity),
         ));
         let hostcall_tracker = Rc::new(RefCell::new(HostcallTracker::default()));
+        let active_session_action_origin = Rc::new(RefCell::new(None));
+        let user_timer_origins = Rc::new(RefCell::new(HashMap::new()));
         let hostcalls_total = Arc::new(AtomicU64::new(0));
         let hostcalls_timed_out = Arc::new(AtomicU64::new(0));
         let last_memory_used_bytes = Arc::new(AtomicU64::new(0));
@@ -17298,6 +17337,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             hostcall_queue,
             trace_seq,
             hostcall_tracker,
+            active_session_action_origin,
+            user_timer_origins,
             hostcalls_total,
             hostcalls_timed_out,
             last_memory_used_bytes,
@@ -17452,6 +17493,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
         self.hostcall_queue.borrow_mut().clear();
         *self.hostcall_tracker.borrow_mut() = HostcallTracker::default();
+        self.active_session_action_origin.replace(None);
+        self.user_timer_origins.borrow_mut().clear();
 
         if let Ok(mut roots) = self.allowed_read_roots.lock() {
             roots.clear();
@@ -17625,6 +17668,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         // Clear hostcall state.
         self.hostcall_queue.borrow_mut().clear();
         *self.hostcall_tracker.borrow_mut() = HostcallTracker::default();
+        self.active_session_action_origin.replace(None);
+        self.user_timer_origins.borrow_mut().clear();
         if let Ok(mut roots) = self.allowed_read_roots.lock() {
             roots.clear();
         }
@@ -17838,6 +17883,45 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         true
     }
 
+    /// Enter a causal Session-action origin for synchronous JS work and all
+    /// microtasks drained before this guard is dropped.
+    pub(crate) fn enter_session_action_origin(
+        &self,
+        origin: Option<SessionActionOrigin>,
+    ) -> SessionActionOriginGuard {
+        let previous = self.active_session_action_origin.replace(origin);
+        SessionActionOriginGuard {
+            active_origin: Rc::clone(&self.active_session_action_origin),
+            previous,
+        }
+    }
+
+    /// Return the trusted origin captured when a hostcall was created.
+    pub(crate) fn session_action_origin_for_hostcall(
+        &self,
+        call_id: &str,
+    ) -> Option<SessionActionOrigin> {
+        self.hostcall_tracker.borrow().origin_for_call(call_id)
+    }
+
+    fn take_session_action_origin_for_macrotask(
+        &self,
+        task: &crate::scheduler::Macrotask,
+    ) -> Option<SessionActionOrigin> {
+        use crate::scheduler::MacrotaskKind as SMK;
+
+        match &task.kind {
+            SMK::HostcallComplete { call_id, .. } => {
+                self.hostcall_tracker.borrow().origin_for_call(call_id)
+            }
+            SMK::TimerFired { timer_id } => {
+                let hostcall_origin = self.hostcall_tracker.borrow().origin_for_timer(*timer_id);
+                hostcall_origin.or_else(|| self.user_timer_origins.borrow_mut().remove(timer_id))
+            }
+            SMK::InboundEvent { .. } => None,
+        }
+    }
+
     /// Enqueue an inbound event to be delivered on next tick.
     pub fn enqueue_event(&self, event_id: impl Into<String>, payload: serde_json::Value) {
         self.scheduler
@@ -17849,12 +17933,22 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     ///
     /// Returns the timer ID for cancellation.
     pub fn set_timeout(&self, delay_ms: u64) -> u64 {
-        self.scheduler.borrow_mut().set_timeout(delay_ms)
+        let timer_id = self.scheduler.borrow_mut().set_timeout(delay_ms);
+        if let Some(origin) = self.active_session_action_origin.borrow().clone() {
+            self.user_timer_origins
+                .borrow_mut()
+                .insert(timer_id, origin);
+        }
+        timer_id
     }
 
     /// Cancel a timer by ID.
     pub fn clear_timeout(&self, timer_id: u64) -> bool {
-        self.scheduler.borrow_mut().clear_timeout(timer_id)
+        let cleared = self.scheduler.borrow_mut().clear_timeout(timer_id);
+        if cleared {
+            self.user_timer_origins.borrow_mut().remove(&timer_id);
+        }
+        cleared
     }
 
     /// Get the current time from the clock.
@@ -17884,6 +17978,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         if let Some(task) = macrotask {
             stats.ran_macrotask = true;
             self.interrupt_budget.reset();
+            let origin = self.take_session_action_origin_for_macrotask(&task);
+            let _origin_guard = self.enter_session_action_origin(origin);
 
             // Handle the macrotask inside the JS context
             let result = self
@@ -18302,6 +18398,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let hostcall_queue = self.hostcall_queue.clone();
         let scheduler = Rc::clone(&self.scheduler);
         let hostcall_tracker = Rc::clone(&self.hostcall_tracker);
+        let active_session_action_origin = Rc::clone(&self.active_session_action_origin);
+        let user_timer_origins = Rc::clone(&self.user_timer_origins);
         let hostcalls_total = Arc::clone(&self.hostcalls_total);
         let trace_seq = Arc::clone(&self.trace_seq);
         let default_hostcall_timeout_ms = self.config.limits.hostcall_timeout_ms;
@@ -18364,6 +18462,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -18380,7 +18479,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
@@ -18404,6 +18508,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -18450,7 +18555,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
@@ -18474,6 +18584,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>, req: Value<'_>| -> rquickjs::Result<String> {
@@ -18487,7 +18598,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
@@ -18511,6 +18627,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -18527,7 +18644,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
@@ -18551,6 +18673,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -18567,7 +18690,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
@@ -18591,6 +18719,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -18607,7 +18736,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
@@ -18631,6 +18765,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>, entry: Value<'_>| -> rquickjs::Result<String> {
@@ -18644,7 +18779,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
@@ -18666,8 +18806,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     "__pi_set_timeout_native",
                     Func::from({
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
+                        let timer_origins = Rc::clone(&user_timer_origins);
                         move |_ctx: Ctx<'_>, delay_ms: u64| -> rquickjs::Result<u64> {
-                            Ok(scheduler.borrow_mut().set_timeout(delay_ms))
+                            let timer_id = scheduler.borrow_mut().set_timeout(delay_ms);
+                            if let Some(origin) = active_origin.borrow().clone() {
+                                timer_origins.borrow_mut().insert(timer_id, origin);
+                            }
+                            Ok(timer_id)
                         }
                     }),
                 )?;
@@ -18678,11 +18824,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let scheduler = Rc::clone(&scheduler);
                         let tracker = hostcall_tracker.clone();
+                        let timer_origins = Rc::clone(&user_timer_origins);
                         move |_ctx: Ctx<'_>, timer_id: u64| -> rquickjs::Result<bool> {
                             if tracker.borrow().timer_to_call.contains_key(&timer_id) {
                                 return Ok(false);
                             }
-                            Ok(scheduler.borrow_mut().clear_timeout(timer_id))
+                            let cleared = scheduler.borrow_mut().clear_timeout(timer_id);
+                            if cleared {
+                                timer_origins.borrow_mut().remove(&timer_id);
+                            }
+                            Ok(cleared)
                         }
                     }),
                 )?;
@@ -18756,6 +18907,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>, code: i32| -> rquickjs::Result<()> {
@@ -18770,7 +18922,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let enqueued_at_ms = scheduler.borrow().now_ms();
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), None, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    None,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id,
@@ -25082,6 +25239,7 @@ for (const name of Object.getOwnPropertyNames(globalThis)) {
 #[allow(clippy::future_not_send)]
 mod tests {
     use super::*;
+    use crate::extensions::SessionActionOriginSource;
     use crate::scheduler::DeterministicClock;
     use serde_json::json;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -26513,6 +26671,105 @@ import { isIPv4 as netIsIpv4 } from "node:net";
     }
 
     #[test]
+    fn timer_callback_hostcalls_retain_the_timer_origin() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let source = SessionActionOriginSource::default();
+
+            {
+                let _origin_guard = runtime.enter_session_action_origin(Some(source.capture()));
+                runtime
+                    .eval("setTimeout(() => pi.log({ from: 'timer' }), 10);")
+                    .await
+                    .expect("schedule timer");
+            }
+
+            source.advance();
+            clock.set(10);
+            let stats = runtime.tick().await.expect("fire timer");
+            assert!(stats.ran_macrotask);
+            assert!(runtime.user_timer_origins.borrow().is_empty());
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = requests[0].call_id.clone();
+            let stale_origin = runtime
+                .session_action_origin_for_hostcall(&call_id)
+                .expect("timer callback hostcall should retain an origin");
+            assert!(!source.accepts(&stale_origin));
+
+            runtime.complete_hostcall(
+                call_id.clone(),
+                HostcallOutcome::Success(serde_json::json!(null)),
+            );
+            runtime.tick().await.expect("deliver completion");
+            assert!(
+                runtime
+                    .session_action_origin_for_hostcall(&call_id)
+                    .is_none(),
+                "final completion must erase hostcall provenance"
+            );
+        });
+    }
+
+    #[test]
+    fn promise_continuation_hostcalls_retain_the_completed_call_origin() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let source = SessionActionOriginSource::default();
+
+            {
+                let _origin_guard = runtime.enter_session_action_origin(Some(source.capture()));
+                runtime
+                    .eval("pi.log({ step: 1 }).then(() => pi.log({ step: 2 }));")
+                    .await
+                    .expect("start hostcall chain");
+            }
+
+            let first_requests = runtime.drain_hostcall_requests();
+            assert_eq!(first_requests.len(), 1);
+            let first_call_id = first_requests[0].call_id.clone();
+            assert!(
+                source.accepts(
+                    &runtime
+                        .session_action_origin_for_hostcall(&first_call_id)
+                        .expect("first hostcall origin")
+                )
+            );
+
+            source.advance();
+            runtime.complete_hostcall(
+                first_call_id.clone(),
+                HostcallOutcome::Success(serde_json::json!(null)),
+            );
+            runtime
+                .tick()
+                .await
+                .expect("complete first hostcall and drain continuation");
+            assert!(
+                runtime
+                    .session_action_origin_for_hostcall(&first_call_id)
+                    .is_none(),
+                "completed call provenance must be erased"
+            );
+
+            let second_requests = runtime.drain_hostcall_requests();
+            assert_eq!(second_requests.len(), 1);
+            let second_call_id = &second_requests[0].call_id;
+            let stale_origin = runtime
+                .session_action_origin_for_hostcall(second_call_id)
+                .expect("Promise continuation hostcall should retain an origin");
+            assert!(!source.accepts(&stale_origin));
+        });
+    }
+
+    #[test]
     fn hostcall_request_queue_spills_to_overflow_with_stable_order() {
         fn req(id: usize) -> HostcallRequest {
             HostcallRequest {
@@ -27435,7 +27692,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             runtime
                 .hostcall_tracker
                 .borrow_mut()
-                .register("call-1".to_string(), Some(42), 0);
+                .register("call-1".to_string(), Some(42), 0, None);
             runtime
                 .hostcalls_total
                 .store(11, std::sync::atomic::Ordering::SeqCst);
@@ -29048,6 +29305,58 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 )
                 .await
                 .expect("verify error");
+        });
+    }
+
+    #[test]
+    fn pijs_runtime_queue_overload_rejects_promise_exactly_once() {
+        futures::executor::block_on(async {
+            let mut config = PiJsRuntimeConfig::default();
+            config.limits.hostcall_fast_queue_capacity = 1;
+            config.limits.hostcall_overflow_queue_capacity = 1;
+            config.limits.hostcall_timeout_ms = Some(1_000);
+            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
+                .await
+                .expect("create bounded-queue runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+            globalThis.overloadError = null;
+            void pi.tool("first", {});
+            void pi.tool("second", {});
+            pi.tool("rejected", {}).catch(error => {
+                globalThis.overloadError = { code: error.code, message: error.message };
+            });
+        "#,
+                ))
+                .await
+                .expect("enqueue overloaded hostcall");
+
+            assert_eq!(
+                runtime.pending_hostcall_count(),
+                3,
+                "the rejected request must remain tracked until its completion is delivered"
+            );
+            let stats = runtime.tick().await.expect("deliver overload completion");
+            assert!(stats.ran_macrotask);
+            assert_eq!(
+                runtime.pending_hostcall_count(),
+                2,
+                "overload delivery must finalize only the rejected request"
+            );
+            let error = runtime
+                .read_global_json("overloadError")
+                .await
+                .expect("read overload rejection");
+            assert_eq!(error["code"], "overloaded");
+            assert!(
+                error["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Hostcall queue overloaded")),
+                "unexpected overload rejection: {error}"
+            );
         });
     }
 

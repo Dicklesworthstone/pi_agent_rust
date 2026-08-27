@@ -23,6 +23,7 @@ where
         manager: None,
         policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     }
 }
@@ -146,6 +147,7 @@ fn shared_dispatch_policy_denial_skips_runtime_risk_ledger() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -237,6 +239,7 @@ fn shared_dispatch_runtime_risk_disabled_is_isomorphic() {
         manager: Some(manager),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -288,6 +291,7 @@ fn shared_dispatch_runtime_risk_hardens_exec_calls() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -350,6 +354,7 @@ fn shared_dispatch_runtime_risk_quarantines_repeated_unsafe_attempts() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -417,6 +422,7 @@ fn shared_dispatch_runtime_risk_ledger_is_tamper_evident() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -482,6 +488,7 @@ fn shared_dispatch_runtime_risk_ledger_replay_reconstructs_decision_path() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -547,6 +554,7 @@ fn shared_dispatch_runtime_risk_ledger_verifies_after_ring_buffer_truncation() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -613,6 +621,7 @@ fn runtime_risk_calibration_is_deterministic_for_identical_ledger() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -1024,6 +1033,7 @@ fn runtime_hostcall_feature_vectors_are_deterministic_for_identical_traces() {
             manager: Some(manager.clone()),
             policy: &policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
 
@@ -1097,6 +1107,7 @@ fn runtime_hostcall_feature_extraction_overhead_stays_bounded() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -1552,6 +1563,7 @@ fn shared_dispatch_per_extension_allow_overrides_global_deny() {
         manager: None,
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

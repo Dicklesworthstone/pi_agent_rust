@@ -733,6 +733,11 @@ pub struct HostCallContext<'a> {
     pub policy: &'a ExtensionPolicy,
     /// Optional JS runtime for exec streaming.
     pub js_runtime: Option<&'a PiJsRuntime>,
+    /// Host-authenticated Session provenance for this causal JS task.
+    ///
+    /// This is populated from Rust-owned runtime bookkeeping, never from the
+    /// extension-controlled hostcall payload.
+    pub session_action_origin: Option<SessionActionOrigin>,
     /// Test interceptor (if any).
     pub interceptor: Option<&'a dyn HostcallInterceptor>,
 }
@@ -973,6 +978,52 @@ pub struct ExtensionUiResponse {
     pub cancelled: bool,
 }
 
+/// Process-local identity and generation source for extension Session actions.
+///
+/// The source identity matters as much as the counter: two unrelated gates can
+/// both be at generation zero, so a bare integer cannot authenticate the
+/// Session that created an asynchronous extension task.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionActionOriginSource(Arc<AtomicU64>);
+
+impl Default for SessionActionOriginSource {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+}
+
+impl SessionActionOriginSource {
+    pub(crate) fn capture(&self) -> SessionActionOrigin {
+        SessionActionOrigin {
+            source: self.clone(),
+            generation: self.0.load(StdOrdering::SeqCst),
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.0.load(StdOrdering::SeqCst)
+    }
+
+    pub(crate) fn accepts(&self, origin: &SessionActionOrigin) -> bool {
+        Arc::ptr_eq(&self.0, &origin.source.0) && self.generation() == origin.generation
+    }
+
+    pub(crate) fn advance(&self) {
+        self.0.fetch_add(1, StdOrdering::SeqCst);
+    }
+}
+
+/// Opaque provenance captured when a root extension task starts.
+///
+/// Extensions cannot construct or inspect this token. Host dispatch carries it
+/// across timers and Promise continuations and Session adapters validate it
+/// only after acquiring the action-serialization permit.
+#[derive(Clone, Debug)]
+pub struct SessionActionOrigin {
+    source: SessionActionOriginSource,
+    generation: u64,
+}
+
 /// Minimal session access for extensions (hostcalls).
 #[async_trait]
 pub trait ExtensionSession: Send + Sync {
@@ -980,14 +1031,37 @@ pub trait ExtensionSession: Send + Sync {
     async fn get_messages(&self) -> Vec<SessionMessage>;
     async fn get_entries(&self) -> Vec<Value>;
     async fn get_branch(&self) -> Vec<Value>;
-    async fn set_name(&self, name: String) -> Result<()>;
-    async fn append_message(&self, message: SessionMessage) -> Result<()>;
-    async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()>;
-    async fn set_model(&self, provider: String, model_id: String) -> Result<()>;
+    async fn set_name(&self, name: String, origin: Option<SessionActionOrigin>) -> Result<()>;
+    async fn append_message(
+        &self,
+        message: SessionMessage,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()>;
+    async fn append_custom_entry(
+        &self,
+        custom_type: String,
+        data: Option<Value>,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()>;
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()>;
     async fn get_model(&self) -> (Option<String>, Option<String>);
-    async fn set_thinking_level(&self, level: String) -> Result<()>;
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()>;
     async fn get_thinking_level(&self) -> Option<String>;
-    async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()>;
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1025,8 +1099,16 @@ pub struct ExtensionAiCompletionRequest {
 
 #[async_trait]
 pub trait ExtensionHostActions: Send + Sync {
-    async fn send_message(&self, message: ExtensionSendMessage) -> Result<()>;
-    async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()>;
+    async fn send_message(
+        &self,
+        message: ExtensionSendMessage,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()>;
+    async fn send_user_message(
+        &self,
+        message: ExtensionSendUserMessage,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()>;
 
     async fn complete_ai(&self, _request: ExtensionAiCompletionRequest) -> Result<Value> {
         Err(Error::extension(
@@ -10867,6 +10949,7 @@ impl JsRuntimeHost {
 enum JsRuntimeCommand {
     LoadExtensions {
         specs: Vec<JsExtensionLoadSpec>,
+        origin: Option<SessionActionOrigin>,
         deadline: Instant,
         reply: oneshot::Sender<Result<Vec<JsExtensionSnapshot>>>,
     },
@@ -10882,6 +10965,7 @@ enum JsRuntimeCommand {
         event_name: String,
         event_payload: Value,
         ctx_payload: Arc<Value>,
+        origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
@@ -10890,6 +10974,7 @@ enum JsRuntimeCommand {
     DispatchEventBatch {
         events: Vec<(String, Value)>,
         ctx_payload: Arc<Value>,
+        origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
         reply: oneshot::Sender<Result<Vec<Result<Value>>>>,
@@ -10899,6 +10984,7 @@ enum JsRuntimeCommand {
         tool_call_id: String,
         input: Value,
         ctx_payload: Arc<Value>,
+        origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
@@ -10907,6 +10993,7 @@ enum JsRuntimeCommand {
         command_name: String,
         args: String,
         ctx_payload: Arc<Value>,
+        origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
@@ -10914,6 +11001,7 @@ enum JsRuntimeCommand {
     ExecuteShortcut {
         key_id: String,
         ctx_payload: Arc<Value>,
+        origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
@@ -10923,6 +11011,7 @@ enum JsRuntimeCommand {
         model: Value,
         context: Value,
         options: Value,
+        origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
         reply: oneshot::Sender<Result<String>>,
@@ -10983,6 +11072,7 @@ struct JsRuntimeShard {
 struct JsProviderStreamRoute {
     shard_index: usize,
     inner_stream_id: String,
+    origin: Option<SessionActionOrigin>,
 }
 
 #[derive(Default)]
@@ -11186,6 +11276,21 @@ impl JsRuntimeShardSet {
             && stream_id == format!("provider-stream-{sequence}")
     }
 
+    /// Retire an outer route only after the inner iterator confirms cleanup.
+    ///
+    /// A failed or timed-out cleanup must leave the route addressable so an
+    /// explicit retry or cold-reload cleanup can still reach the inner stream.
+    fn finish_provider_stream_cleanup(
+        &mut self,
+        stream_id: &str,
+        cleanup_result: Result<()>,
+    ) -> Result<()> {
+        if cleanup_result.is_ok() {
+            self.provider_stream_routes.remove(stream_id);
+        }
+        cleanup_result
+    }
+
     fn shard_index_for_extension(&self, extension_id: &str) -> Result<usize> {
         let shard_index = self
             .extension_owner
@@ -11344,6 +11449,9 @@ fn short_warm_pool_fingerprint(fingerprint: &str) -> &str {
 /// `exit_signal`.
 pub struct JsExtensionRuntimeHandle {
     sender: mpsc::Sender<JsRuntimeCommand>,
+    /// Weak manager access used only to capture trusted Session provenance
+    /// before root JS commands enter the runtime thread.
+    manager_ref: Weak<Mutex<ExtensionManagerInner>>,
     /// Frozen compatibility policy from the runtime config. This is shared
     /// with the manager-side static-registration fallback so every
     /// conformance-only behavior observes the same per-runtime decision.
@@ -11358,6 +11466,7 @@ impl Clone for JsExtensionRuntimeHandle {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            manager_ref: self.manager_ref.clone(),
             compat_scan_mode: self.compat_scan_mode,
             exit_signal: Arc::clone(&self.exit_signal),
         }
@@ -11461,9 +11570,10 @@ impl JsExtensionRuntimeHandle {
 
         apply_env_capability(&mut config, &policy);
 
+        let manager_ref = Arc::downgrade(&manager.inner);
         let host = JsRuntimeHost {
             tools,
-            manager_ref: Arc::downgrade(&manager.inner),
+            manager_ref: manager_ref.clone(),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(HttpConnector::with_defaults()),
@@ -11519,6 +11629,7 @@ impl JsExtensionRuntimeHandle {
                         JsRuntimeCommand::Shutdown => break,
                         JsRuntimeCommand::LoadExtensions {
                             specs,
+                            origin,
                             deadline,
                             reply,
                         } => {
@@ -11549,6 +11660,7 @@ impl JsExtensionRuntimeHandle {
                                     &runtime_policy,
                                     &host,
                                     &specs,
+                                    origin.as_ref(),
                                 )),
                             )
                             .await;
@@ -11638,6 +11750,7 @@ impl JsExtensionRuntimeHandle {
                             event_name,
                             event_payload,
                             ctx_payload,
+                            origin,
                             timeout_ms: _,
                             deadline,
                             reply,
@@ -11658,6 +11771,7 @@ impl JsExtensionRuntimeHandle {
                                 &event_name,
                                 event_payload,
                                 ctx_payload.as_ref(),
+                                origin.as_ref(),
                                 timeout_ms,
                             )
                             .await;
@@ -11666,6 +11780,7 @@ impl JsExtensionRuntimeHandle {
                         JsRuntimeCommand::DispatchEventBatch {
                             events,
                             ctx_payload,
+                            origin,
                             timeout_ms: _,
                             deadline,
                             reply,
@@ -11685,6 +11800,7 @@ impl JsExtensionRuntimeHandle {
                                 &host,
                                 events,
                                 ctx_payload.as_ref(),
+                                origin.as_ref(),
                                 timeout_ms,
                             )
                             .await;
@@ -11695,6 +11811,7 @@ impl JsExtensionRuntimeHandle {
                             tool_call_id,
                             input,
                             ctx_payload,
+                            origin,
                             timeout_ms: _,
                             deadline,
                             reply,
@@ -11724,6 +11841,7 @@ impl JsExtensionRuntimeHandle {
                                             tool_call_id: &tool_call_id,
                                             input,
                                             ctx_payload: ctx_payload.as_ref(),
+                                            origin: origin.as_ref(),
                                             timeout_ms,
                                         },
                                     )
@@ -11737,6 +11855,7 @@ impl JsExtensionRuntimeHandle {
                             command_name,
                             args,
                             ctx_payload,
+                            origin,
                             timeout_ms: _,
                             deadline,
                             reply,
@@ -11765,6 +11884,7 @@ impl JsExtensionRuntimeHandle {
                                         route_name,
                                         &args,
                                         ctx_payload.as_ref(),
+                                        origin.as_ref(),
                                         timeout_ms,
                                     )
                                     .await
@@ -11776,6 +11896,7 @@ impl JsExtensionRuntimeHandle {
                         JsRuntimeCommand::ExecuteShortcut {
                             key_id,
                             ctx_payload,
+                            origin,
                             timeout_ms: _,
                             deadline,
                             reply,
@@ -11803,6 +11924,7 @@ impl JsExtensionRuntimeHandle {
                                         shard_index,
                                         &route_name,
                                         ctx_payload.as_ref(),
+                                        origin.as_ref(),
                                         timeout_ms,
                                     )
                                     .await
@@ -11816,6 +11938,7 @@ impl JsExtensionRuntimeHandle {
                             model,
                             context,
                             options,
+                            origin,
                             timeout_ms: _,
                             deadline,
                             reply,
@@ -11849,6 +11972,7 @@ impl JsExtensionRuntimeHandle {
                                             model,
                                             context,
                                             options,
+                                            origin: origin.as_ref(),
                                             timeout_ms,
                                         },
                                     )
@@ -11866,6 +11990,7 @@ impl JsExtensionRuntimeHandle {
                                                 shard_index,
                                                 &inner_stream_id,
                                                 timeout_ms,
+                                                origin.as_ref(),
                                             )
                                             .await
                                         {
@@ -11889,6 +12014,7 @@ impl JsExtensionRuntimeHandle {
                                                 shard_index,
                                                 &inner_stream_id,
                                                 1,
+                                                origin.as_ref(),
                                             )
                                             .await
                                         {
@@ -11913,6 +12039,7 @@ impl JsExtensionRuntimeHandle {
                                             shard_index,
                                             &inner_stream_id,
                                             continuation_timeout_ms,
+                                            origin.as_ref(),
                                         )
                                         .await
                                     {
@@ -11935,6 +12062,7 @@ impl JsExtensionRuntimeHandle {
                                     JsProviderStreamRoute {
                                         shard_index,
                                         inner_stream_id,
+                                        origin: origin.clone(),
                                     },
                                 );
                                 Ok(outer_stream_id)
@@ -11944,7 +12072,8 @@ impl JsExtensionRuntimeHandle {
                                 if let Ok(outer_stream_id) = result.as_ref()
                                     && let Some(route) = shard_set
                                         .provider_stream_routes
-                                        .remove(outer_stream_id)
+                                        .get(outer_stream_id)
+                                        .cloned()
                                 {
                                     let cleanup_timeout_ms = deadline
                                         .checked_duration_since(Instant::now())
@@ -11953,15 +12082,21 @@ impl JsExtensionRuntimeHandle {
                                                 .unwrap_or(u64::MAX)
                                                 .max(1)
                                         });
-                                    if let Err(cleanup_err) =
+                                    let cleanup_result =
                                         cancel_extension_provider_stream_simple_best_effort(
                                             &mut shard_set,
                                             &host,
                                             route.shard_index,
                                             &route.inner_stream_id,
                                             cleanup_timeout_ms,
+                                            route.origin.as_ref(),
                                         )
-                                        .await
+                                        .await;
+                                    if let Err(cleanup_err) = shard_set
+                                        .finish_provider_stream_cleanup(
+                                            outer_stream_id,
+                                            cleanup_result,
+                                        )
                                     {
                                         tracing::warn!(
                                             event = "extension_runtime.provider_stream.route_publish_cleanup_failed",
@@ -12014,6 +12149,7 @@ impl JsExtensionRuntimeHandle {
                                     route.shard_index,
                                     &route.inner_stream_id,
                                     timeout_ms,
+                                    route.origin.as_ref(),
                                 )
                                 .await;
                                 match result {
@@ -12023,7 +12159,6 @@ impl JsExtensionRuntimeHandle {
                                         Ok(None)
                                     }
                                     Err(err) => {
-                                        shard_set.provider_stream_routes.remove(&stream_id);
                                         let cleanup_timeout_ms = deadline
                                             .checked_duration_since(Instant::now())
                                             .map_or(1, |remaining| {
@@ -12031,15 +12166,21 @@ impl JsExtensionRuntimeHandle {
                                                     .unwrap_or(u64::MAX)
                                                     .max(1)
                                             });
-                                        if let Err(cleanup_err) =
+                                        let cleanup_result =
                                             cancel_extension_provider_stream_simple_best_effort(
                                                 &mut shard_set,
                                                 &host,
                                                 route.shard_index,
                                                 &route.inner_stream_id,
                                                 cleanup_timeout_ms,
+                                                route.origin.as_ref(),
                                             )
-                                            .await
+                                            .await;
+                                        if let Err(cleanup_err) = shard_set
+                                            .finish_provider_stream_cleanup(
+                                                &stream_id,
+                                                cleanup_result,
+                                            )
                                         {
                                             tracing::warn!(
                                                 event = "extension_runtime.provider_stream.next_cleanup_failed",
@@ -12055,8 +12196,10 @@ impl JsExtensionRuntimeHandle {
                             }
                             .await;
                             if reply.is_closed() {
-                                if let Some(route) =
-                                    shard_set.provider_stream_routes.remove(&stream_id)
+                                if let Some(route) = shard_set
+                                    .provider_stream_routes
+                                    .get(&stream_id)
+                                    .cloned()
                                 {
                                     let cleanup_timeout_ms = deadline
                                         .checked_duration_since(Instant::now())
@@ -12065,15 +12208,21 @@ impl JsExtensionRuntimeHandle {
                                                 .unwrap_or(u64::MAX)
                                                 .max(1)
                                         });
-                                    if let Err(cleanup_err) =
+                                    let cleanup_result =
                                         cancel_extension_provider_stream_simple_best_effort(
                                             &mut shard_set,
                                             &host,
                                             route.shard_index,
                                             &route.inner_stream_id,
                                             cleanup_timeout_ms,
+                                            route.origin.as_ref(),
                                         )
-                                        .await
+                                        .await;
+                                    if let Err(cleanup_err) = shard_set
+                                        .finish_provider_stream_cleanup(
+                                            &stream_id,
+                                            cleanup_result,
+                                        )
                                     {
                                         tracing::warn!(
                                             event = "extension_runtime.provider_stream.abandoned_next_cleanup_failed",
@@ -12094,8 +12243,12 @@ impl JsExtensionRuntimeHandle {
                             deadline,
                             mut reply,
                         } => {
+                            // Cancellation is resource cleanup, not merely a
+                            // request/reply exchange. If the caller abandons
+                            // its reply, retain the command as fire-and-forget
+                            // work instead of leaking the provider route.
                             if reply.as_ref().is_some_and(oneshot::Sender::is_closed) {
-                                continue;
+                                reply = None;
                             }
                             let timeout_ms = match js_runtime_remaining_timeout_ms(
                                 deadline,
@@ -12130,10 +12283,10 @@ impl JsExtensionRuntimeHandle {
                                     route.shard_index,
                                     &route.inner_stream_id,
                                     timeout_ms,
+                                    route.origin.as_ref(),
                                 )
                                 .await;
-                                shard_set.provider_stream_routes.remove(&stream_id);
-                                result
+                                shard_set.finish_provider_stream_cleanup(&stream_id, result)
                             }
                             .await;
                             if let Some(reply) = reply {
@@ -12260,6 +12413,7 @@ impl JsExtensionRuntimeHandle {
 
         Ok(Self {
             sender: tx,
+            manager_ref,
             compat_scan_mode,
             exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
         })
@@ -12267,6 +12421,16 @@ impl JsExtensionRuntimeHandle {
 
     pub(crate) const fn compat_scan_mode(&self) -> bool {
         self.compat_scan_mode
+    }
+
+    fn capture_session_action_origin(&self) -> Option<SessionActionOrigin> {
+        self.manager_ref
+            .upgrade()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session_action_origin_source
+            .as_ref()
+            .map(SessionActionOriginSource::capture)
     }
 
     /// Request the JS runtime thread to shut down gracefully.
@@ -12328,6 +12492,7 @@ impl JsExtensionRuntimeHandle {
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::LoadExtensions {
             specs,
+            origin: self.capture_session_action_origin(),
             deadline,
             reply: reply_tx,
         };
@@ -12423,6 +12588,7 @@ impl JsExtensionRuntimeHandle {
             event_name,
             event_payload,
             ctx_payload,
+            origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
             reply: reply_tx,
@@ -12463,6 +12629,7 @@ impl JsExtensionRuntimeHandle {
         let command = JsRuntimeCommand::DispatchEventBatch {
             events,
             ctx_payload,
+            origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
             reply: reply_tx,
@@ -12503,6 +12670,7 @@ impl JsExtensionRuntimeHandle {
             tool_call_id,
             input,
             ctx_payload,
+            origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
             reply: reply_tx,
@@ -12541,6 +12709,7 @@ impl JsExtensionRuntimeHandle {
             command_name,
             args,
             ctx_payload,
+            origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
             reply: reply_tx,
@@ -12577,6 +12746,7 @@ impl JsExtensionRuntimeHandle {
         let command = JsRuntimeCommand::ExecuteShortcut {
             key_id,
             ctx_payload,
+            origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
             reply: reply_tx,
@@ -12731,6 +12901,7 @@ impl JsExtensionRuntimeHandle {
             model,
             context,
             options,
+            origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
             reply: reply_tx,
@@ -13298,6 +13469,7 @@ async fn build_js_runtime_shards(
     policy: &ExtensionPolicy,
     host: &JsRuntimeHost,
     specs: &[JsExtensionLoadSpec],
+    origin: Option<&SessionActionOrigin>,
 ) -> Result<JsRuntimeShardSet> {
     let explicit_entry_paths = specs
         .iter()
@@ -13337,7 +13509,7 @@ async fn build_js_runtime_shards(
         }
 
         for (spec, entry_paths) in extension_specs {
-            load_one_extension(&runtime, host, spec, &entry_paths).await?;
+            load_one_extension(&runtime, host, spec, &entry_paths, origin).await?;
         }
 
         let snapshot =
@@ -13456,6 +13628,7 @@ async fn load_one_extension(
     host: &JsRuntimeHost,
     spec: &JsExtensionLoadSpec,
     entry_paths: &[PathBuf],
+    origin: Option<&SessionActionOrigin>,
 ) -> Result<()> {
     if entry_paths.len() > 1 {
         tracing::info!(
@@ -13487,6 +13660,7 @@ async fn load_one_extension(
         let task_id = next_runtime_task_id("task-load");
         let meta_value = meta.clone();
         let bridge_secret = runtime.bridge_secret().to_string();
+        let _origin_guard = runtime.enter_session_action_origin(origin.cloned());
 
         let bootstrap_result = runtime
             .with_ctx(|ctx| {
@@ -13726,6 +13900,7 @@ struct JsEventPhaseDispatch<'a> {
     ctx_payload: &'a Value,
     phase: &'a str,
     batch_id: Option<&'a str>,
+    origin: Option<&'a SessionActionOrigin>,
     deadline: Instant,
 }
 
@@ -13742,16 +13917,18 @@ async fn dispatch_extension_event_phase_sharded(
         ctx_payload,
         phase,
         batch_id,
+        origin,
         deadline,
     } = dispatch;
     shards.ensure_shard_healthy(shard_index)?;
     let task_id = next_runtime_task_id("task-event-phase");
-    {
+    let origin_guard = {
         let runtime = &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
             .runtime;
+        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
         let bridge_secret = runtime.bridge_secret().to_string();
         runtime
             .with_ctx(|ctx| {
@@ -13785,7 +13962,8 @@ async fn dispatch_extension_event_phase_sharded(
                 Ok(())
             })
             .await?;
-    }
+        origin_guard
+    };
 
     let raw = await_js_task_in_shards_and_refresh(
         shards,
@@ -13795,6 +13973,7 @@ async fn dispatch_extension_event_phase_sharded(
         remaining_js_task_timeout(deadline, "event")?,
     )
     .await?;
+    drop(origin_guard);
     let envelope: JsEventPhaseEnvelope = serde_json::from_value(raw)
         .map_err(|err| Error::extension(format!("event phase envelope: {err}")))?;
     Ok(envelope.present.then_some(envelope.value))
@@ -13855,6 +14034,7 @@ async fn dispatch_extension_event_across_shards_until(
     event_payload: Value,
     ctx_payload: &Value,
     batch_id: Option<&str>,
+    origin: Option<&SessionActionOrigin>,
     deadline: Instant,
 ) -> Result<Value> {
     let owners = shards
@@ -13898,6 +14078,7 @@ async fn dispatch_extension_event_across_shards_until(
                         ctx_payload,
                         phase,
                         batch_id,
+                        origin,
                         deadline,
                     },
                 )
@@ -13965,6 +14146,7 @@ async fn dispatch_extension_event_across_shards_until(
                         ctx_payload,
                         phase,
                         batch_id,
+                        origin,
                         deadline,
                     },
                 )
@@ -14013,6 +14195,7 @@ async fn dispatch_extension_event_across_shards_until(
                         ctx_payload,
                         phase,
                         batch_id,
+                        origin,
                         deadline,
                     },
                 )
@@ -14055,6 +14238,7 @@ async fn dispatch_extension_event_across_shards_until(
                     ctx_payload,
                     phase,
                     batch_id,
+                    origin,
                     deadline,
                 },
             )
@@ -14085,6 +14269,7 @@ async fn dispatch_extension_event_across_shards(
     event_name: &str,
     event_payload: Value,
     ctx_payload: &Value,
+    origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
 ) -> Result<Value> {
     let deadline = Instant::now()
@@ -14097,6 +14282,7 @@ async fn dispatch_extension_event_across_shards(
         event_payload,
         ctx_payload,
         None,
+        origin,
         deadline,
     )
     .await
@@ -14180,6 +14366,7 @@ async fn dispatch_extension_event_batch_across_shards(
     host: &JsRuntimeHost,
     events: Vec<(String, Value)>,
     ctx_payload: &Value,
+    origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
 ) -> Result<Vec<Result<Value>>> {
     let deadline = Instant::now()
@@ -14197,6 +14384,7 @@ async fn dispatch_extension_event_batch_across_shards(
                 event_payload,
                 ctx_payload,
                 Some(batch_id.as_str()),
+                origin,
                 deadline,
             )
             .await,
@@ -14212,6 +14400,7 @@ struct JsToolExecution<'a> {
     tool_call_id: &'a str,
     input: Value,
     ctx_payload: &'a Value,
+    origin: Option<&'a SessionActionOrigin>,
     timeout_ms: u64,
 }
 
@@ -14227,6 +14416,7 @@ async fn execute_extension_tool_sharded(
         tool_call_id,
         input,
         ctx_payload,
+        origin,
         timeout_ms,
     } = execution;
     shards.ensure_shard_healthy(shard_index)?;
@@ -14239,12 +14429,13 @@ async fn execute_extension_tool_sharded(
         "Extension tool execution start"
     );
     let task_id = next_runtime_task_id("task-tool");
-    {
+    let origin_guard = {
         let runtime = &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
             .runtime;
+        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
         let bridge_secret = runtime.bridge_secret().to_string();
         runtime
             .with_ctx(|ctx| {
@@ -14265,7 +14456,8 @@ async fn execute_extension_tool_sharded(
                 Ok(())
             })
             .await?;
-    }
+        origin_guard
+    };
 
     let result = await_js_task_in_shards_and_refresh(
         shards,
@@ -14275,6 +14467,7 @@ async fn execute_extension_tool_sharded(
         Duration::from_millis(timeout_ms),
     )
     .await;
+    drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -14296,6 +14489,7 @@ async fn execute_extension_command_sharded(
     command_name: &str,
     args: &str,
     ctx_payload: &Value,
+    origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
 ) -> Result<Value> {
     shards.ensure_shard_healthy(shard_index)?;
@@ -14307,12 +14501,13 @@ async fn execute_extension_command_sharded(
         "Extension command execution start"
     );
     let task_id = next_runtime_task_id("task-cmd");
-    {
+    let origin_guard = {
         let runtime = &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
             .runtime;
+        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
         let bridge_secret = runtime.bridge_secret().to_string();
         runtime
             .with_ctx(|ctx| {
@@ -14327,7 +14522,8 @@ async fn execute_extension_command_sharded(
                 Ok(())
             })
             .await?;
-    }
+        origin_guard
+    };
 
     let result = await_js_task_in_shards_and_refresh(
         shards,
@@ -14337,6 +14533,7 @@ async fn execute_extension_command_sharded(
         Duration::from_millis(timeout_ms),
     )
     .await;
+    drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -14356,6 +14553,7 @@ async fn execute_extension_shortcut_sharded(
     shard_index: usize,
     key_id: &str,
     ctx_payload: &Value,
+    origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
 ) -> Result<Value> {
     shards.ensure_shard_healthy(shard_index)?;
@@ -14367,12 +14565,13 @@ async fn execute_extension_shortcut_sharded(
         "Extension shortcut execution start"
     );
     let task_id = next_runtime_task_id("task-shortcut");
-    {
+    let origin_guard = {
         let runtime = &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
             .runtime;
+        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
         let bridge_secret = runtime.bridge_secret().to_string();
         runtime
             .with_ctx(|ctx| {
@@ -14387,7 +14586,8 @@ async fn execute_extension_shortcut_sharded(
                 Ok(())
             })
             .await?;
-    }
+        origin_guard
+    };
 
     let result = await_js_task_in_shards_and_refresh(
         shards,
@@ -14397,6 +14597,7 @@ async fn execute_extension_shortcut_sharded(
         Duration::from_millis(timeout_ms),
     )
     .await;
+    drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -14422,6 +14623,7 @@ struct JsProviderStreamStart<'a> {
     model: Value,
     context: Value,
     options: Value,
+    origin: Option<&'a SessionActionOrigin>,
     timeout_ms: u64,
 }
 
@@ -14437,18 +14639,20 @@ async fn start_extension_provider_stream_simple_sharded(
         model,
         context,
         options,
+        origin,
         timeout_ms,
     } = start;
     shards.ensure_shard_healthy(shard_index)?;
     let timeout = Duration::from_millis(timeout_ms);
     let deadline = Instant::now().checked_add(timeout);
     let task_id = next_runtime_task_id("task-provider-stream-start");
-    {
+    let origin_guard = {
         let runtime = &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
             .runtime;
+        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
         let bridge_secret = runtime.bridge_secret().to_string();
         runtime
             .with_ctx(|ctx| {
@@ -14471,9 +14675,11 @@ async fn start_extension_provider_stream_simple_sharded(
                 Ok(())
             })
             .await?;
-    }
+        origin_guard
+    };
 
     let value = await_js_task_in_shards(shards, host, shard_index, &task_id, timeout).await?;
+    drop(origin_guard);
     let inner_stream_id = value
         .as_str()
         .map(ToString::to_string)
@@ -14493,6 +14699,7 @@ async fn start_extension_provider_stream_simple_sharded(
             shard_index,
             &inner_stream_id,
             cleanup_timeout_ms,
+            origin,
         )
         .await
         {
@@ -14517,15 +14724,17 @@ async fn next_extension_provider_stream_simple_sharded(
     shard_index: usize,
     stream_id: &str,
     timeout_ms: u64,
+    origin: Option<&SessionActionOrigin>,
 ) -> Result<Option<Value>> {
     shards.ensure_shard_healthy(shard_index)?;
     let task_id = next_runtime_task_id("task-provider-stream-next");
-    {
+    let origin_guard = {
         let runtime = &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
             .runtime;
+        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
         let bridge_secret = runtime.bridge_secret().to_string();
         runtime
             .with_ctx(|ctx| {
@@ -14540,7 +14749,8 @@ async fn next_extension_provider_stream_simple_sharded(
                 Ok(())
             })
             .await?;
-    }
+        origin_guard
+    };
 
     let value = await_js_task_in_shards_and_refresh(
         shards,
@@ -14550,6 +14760,7 @@ async fn next_extension_provider_stream_simple_sharded(
         Duration::from_millis(timeout_ms),
     )
     .await?;
+    drop(origin_guard);
     let result: JsProviderStreamNext = serde_json::from_value(value)
         .map_err(|err| Error::extension(format!("provider stream next: {err}")))?;
     if result.done {
@@ -14570,14 +14781,16 @@ async fn cancel_extension_provider_stream_simple_sharded(
     shard_index: usize,
     stream_id: &str,
     timeout_ms: u64,
+    origin: Option<&SessionActionOrigin>,
 ) -> Result<()> {
     let task_id = next_runtime_task_id("task-provider-stream-cancel");
-    {
+    let origin_guard = {
         let runtime = &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
             .runtime;
+        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
         let bridge_secret = runtime.bridge_secret().to_string();
         runtime
             .with_ctx(|ctx| {
@@ -14592,7 +14805,8 @@ async fn cancel_extension_provider_stream_simple_sharded(
                 Ok(())
             })
             .await?;
-    }
+        origin_guard
+    };
 
     let _ = await_js_task_in_shards_and_refresh(
         shards,
@@ -14602,6 +14816,7 @@ async fn cancel_extension_provider_stream_simple_sharded(
         Duration::from_millis(timeout_ms),
     )
     .await?;
+    drop(origin_guard);
     Ok(())
 }
 
@@ -14612,6 +14827,7 @@ async fn cancel_extension_provider_stream_simple_best_effort(
     shard_index: usize,
     stream_id: &str,
     timeout_ms: u64,
+    origin: Option<&SessionActionOrigin>,
 ) -> Result<()> {
     // Cleanup is the sole operation allowed to enter a quarantined realm. A
     // prior logical fault may still leave an async iterator that can release a
@@ -14627,6 +14843,7 @@ async fn cancel_extension_provider_stream_simple_best_effort(
         shard_index,
         stream_id,
         timeout_ms,
+        origin,
     )
     .await;
     if let Some(prior_fault) = prior_fault
@@ -14676,6 +14893,7 @@ async fn cancel_active_provider_streams_for_replacement(
             route.shard_index,
             &route.inner_stream_id,
             timeout_ms,
+            route.origin.as_ref(),
         )
         .await
         {
@@ -14878,6 +15096,11 @@ async fn pump_js_runtime_once_for_owner(
             runtime.complete_hostcalls_batch(completions);
         }
     }
+
+    // Run already-queued jobs under the current root origin before selecting a
+    // scheduler macrotask. Otherwise an older timer could temporarily install
+    // its origin first and causally mislabel a newly queued root microtask.
+    let _ = runtime.drain_microtasks().await?;
 
     // Process any hostcalls already queued before we advance the event loop.
     dispatch_requests(runtime, host, expected_owner, drain_requests(runtime)).await;
@@ -16504,6 +16727,7 @@ async fn dispatch_hostcall_session_fast_ref(
     manager: &ExtensionManager,
     op: &str,
     params: &Value,
+    origin: Option<SessionActionOrigin>,
 ) -> HostcallOutcome {
     let Some(session) = manager.session_handle() else {
         return HostcallOutcome::Error {
@@ -16560,7 +16784,10 @@ async fn dispatch_hostcall_session_fast_ref(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            session.set_name(name).await.map(|()| Value::Null)
+            session
+                .set_name(name, origin.clone())
+                .await
+                .map(|()| Value::Null)
         }
         Some(CommonHostcallOpcode::SessionSetModel) => {
             let provider = params
@@ -16581,7 +16808,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 };
             }
             session
-                .set_model(provider, model_id)
+                .set_model(provider, model_id, origin.clone())
                 .await
                 .map(|()| Value::Bool(true))
         }
@@ -16607,7 +16834,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 };
             }
             session
-                .set_thinking_level(level)
+                .set_thinking_level(level, origin.clone())
                 .await
                 .map(|()| Value::Null)
         }
@@ -16636,7 +16863,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             session
-                .set_label(target_id, label)
+                .set_label(target_id, label, origin)
                 .await
                 .map(|()| Value::Null)
         }
@@ -16687,7 +16914,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "get_name", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "get_name",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionSetName => {
             let Some(ref manager) = ctx.manager else {
@@ -16696,7 +16929,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "set_name", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "set_name",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionGetModel => {
             let Some(ref manager) = ctx.manager else {
@@ -16705,7 +16944,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "get_model", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "get_model",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionSetModel => {
             let Some(ref manager) = ctx.manager else {
@@ -16714,7 +16959,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "set_model", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "set_model",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionGetThinkingLevel => {
             let Some(ref manager) = ctx.manager else {
@@ -16723,7 +16974,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "get_thinking_level", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "get_thinking_level",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionSetThinkingLevel => {
             let Some(ref manager) = ctx.manager else {
@@ -16732,7 +16989,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "set_thinking_level", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "set_thinking_level",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionSetLabel => {
             let Some(ref manager) = ctx.manager else {
@@ -16741,7 +17004,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "set_label", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "set_label",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::EventsGetActiveTools => {
             let Some(ref manager) = ctx.manager else {
@@ -16757,6 +17026,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "get_active_tools",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16774,6 +17044,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "get_all_tools",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16791,6 +17062,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "set_active_tools",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16808,6 +17080,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "emit",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16825,6 +17098,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "list",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16836,7 +17110,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "get_state", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "get_state",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionGetMessages => {
             let Some(ref manager) = ctx.manager else {
@@ -16845,7 +17125,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "get_messages", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "get_messages",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionGetEntries => {
             let Some(ref manager) = ctx.manager else {
@@ -16854,7 +17140,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "get_entries", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "get_entries",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionGetBranch => {
             let Some(ref manager) = ctx.manager else {
@@ -16863,7 +17155,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "get_branch", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "get_branch",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         CommonHostcallOpcode::SessionGetFile => {
             let Some(ref manager) = ctx.manager else {
@@ -16872,7 +17170,13 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_fast_ref(manager, "get_file", &call.params).await
+            dispatch_hostcall_session_fast_ref(
+                manager,
+                "get_file",
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         // --- New fast-lane events operations (bd-3ar8v.4.12) ---
         CommonHostcallOpcode::EventsGetModel => {
@@ -16889,6 +17193,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "get_model",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16906,6 +17211,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "set_model",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16923,6 +17229,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "get_thinking_level",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16940,6 +17247,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "set_thinking_level",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16957,6 +17265,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "get_flag",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16974,6 +17283,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "list_flags",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -16991,6 +17301,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "append_entry",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -17008,6 +17319,7 @@ async fn dispatch_shared_allowed_fast(
                 ctx.extension_id,
                 "register_command",
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -17184,7 +17496,14 @@ async fn dispatch_shared_allowed_legacy(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session_ref(&call.call_id, manager, op, &call.params).await
+            dispatch_hostcall_session_ref(
+                &call.call_id,
+                manager,
+                op,
+                &call.params,
+                ctx.session_action_origin.clone(),
+            )
+            .await
         }
         "ui" => {
             let op = call
@@ -17234,6 +17553,7 @@ async fn dispatch_shared_allowed_legacy(
                 ctx.extension_id,
                 op,
                 &call.params,
+                ctx.session_action_origin.clone(),
             )
             .await
         }
@@ -17351,6 +17671,8 @@ async fn dispatch_hostcall_with_runtime(
         manager: host.manager(),
         policy: &host.policy,
         js_runtime: runtime,
+        session_action_origin: runtime
+            .and_then(|runtime| runtime.session_action_origin_for_hostcall(&request.call_id)),
         interceptor: None, // already checked above
     };
 
@@ -18055,7 +18377,7 @@ async fn dispatch_hostcall_session(
     op: &str,
     payload: Value,
 ) -> HostcallOutcome {
-    dispatch_hostcall_session_ref(call_id, manager, op, &payload).await
+    dispatch_hostcall_session_ref(call_id, manager, op, &payload, None).await
 }
 
 #[allow(clippy::future_not_send)]
@@ -18066,6 +18388,7 @@ async fn dispatch_hostcall_session_ref(
     manager: &ExtensionManager,
     op: &str,
     payload: &Value,
+    origin: Option<SessionActionOrigin>,
 ) -> HostcallOutcome {
     let _ = call_id;
     let Some(session) = manager.session_handle() else {
@@ -18107,7 +18430,10 @@ async fn dispatch_hostcall_session_ref(
                     }
                 };
             match parsed {
-                Ok(message) => session.append_message(message).await.map(|()| Value::Null),
+                Ok(message) => session
+                    .append_message(message, origin.clone())
+                    .await
+                    .map(|()| Value::Null),
                 Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
             }
         }
@@ -18121,7 +18447,7 @@ async fn dispatch_hostcall_session_ref(
                 .to_string();
             let data = payload.get("data").cloned();
             session
-                .append_custom_entry(custom_type, data)
+                .append_custom_entry(custom_type, data, origin.clone())
                 .await
                 .map(|()| Value::Null)
         }
@@ -18156,7 +18482,10 @@ async fn dispatch_hostcall_session_ref(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            session.set_name(name).await.map(|()| Value::Null)
+            session
+                .set_name(name, origin.clone())
+                .await
+                .map(|()| Value::Null)
         }
         SessionHostcallOp::SetModel => {
             let provider = payload
@@ -18177,7 +18506,7 @@ async fn dispatch_hostcall_session_ref(
                 };
             }
             session
-                .set_model(provider, model_id)
+                .set_model(provider, model_id, origin.clone())
                 .await
                 .map(|()| Value::Bool(true))
         }
@@ -18203,7 +18532,7 @@ async fn dispatch_hostcall_session_ref(
                 };
             }
             session
-                .set_thinking_level(level)
+                .set_thinking_level(level, origin.clone())
                 .await
                 .map(|()| Value::Null)
         }
@@ -18232,7 +18561,7 @@ async fn dispatch_hostcall_session_ref(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             session
-                .set_label(target_id, label)
+                .set_label(target_id, label, origin)
                 .await
                 .map(|()| Value::Null)
         }
@@ -18492,7 +18821,7 @@ async fn dispatch_hostcall_events(
     op: &str,
     payload: Value,
 ) -> HostcallOutcome {
-    dispatch_hostcall_events_ref(call_id, manager, tools, None, op, &payload).await
+    dispatch_hostcall_events_ref(call_id, manager, tools, None, op, &payload, None).await
 }
 
 fn authoritative_events_extension_id(
@@ -18531,6 +18860,7 @@ async fn dispatch_hostcall_events_ref(
     authoritative_extension_id: Option<&str>,
     op: &str,
     payload: &Value,
+    origin: Option<SessionActionOrigin>,
 ) -> HostcallOutcome {
     let _ = call_id;
     let Some(op_kind) = parse_events_hostcall_op(op) else {
@@ -18600,7 +18930,10 @@ async fn dispatch_hostcall_events_ref(
                 .unwrap_or_default()
                 .to_string();
             let data = payload.get("data").cloned();
-            match session.append_custom_entry(custom_type, data).await {
+            match session
+                .append_custom_entry(custom_type, data, origin.clone())
+                .await
+            {
                 Ok(()) => {
                     manager.invalidate_ctx_cache();
                     HostcallOutcome::Success(Value::Null)
@@ -18684,7 +19017,7 @@ async fn dispatch_hostcall_events_ref(
                 trigger_turn,
             };
 
-            match actions.send_message(msg).await {
+            match actions.send_message(msg, origin.clone()).await {
                 Ok(()) => {
                     manager.invalidate_ctx_cache();
                     HostcallOutcome::Success(Value::Null)
@@ -18738,7 +19071,7 @@ async fn dispatch_hostcall_events_ref(
                 deliver_as,
             };
 
-            match actions.send_user_message(msg).await {
+            match actions.send_user_message(msg, origin.clone()).await {
                 Ok(()) => {
                     manager.invalidate_ctx_cache();
                     HostcallOutcome::Success(Value::Null)
@@ -18971,7 +19304,7 @@ async fn dispatch_hostcall_events_ref(
             if let Some(session) = manager.session_handle() {
                 if !p.is_empty()
                     && !m.is_empty()
-                    && let Err(err) = session.set_model(p, m).await
+                    && let Err(err) = session.set_model(p, m, origin.clone()).await
                 {
                     return HostcallOutcome::Error {
                         code: "io".to_string(),
@@ -19007,7 +19340,9 @@ async fn dispatch_hostcall_events_ref(
 
             if let Some(session) = manager.session_handle() {
                 if let Some(ref lvl) = level
-                    && let Err(err) = session.set_thinking_level(lvl.clone()).await
+                    && let Err(err) = session
+                        .set_thinking_level(lvl.clone(), origin.clone())
+                        .await
                 {
                     return HostcallOutcome::Error {
                         code: "io".to_string(),
@@ -19456,6 +19791,9 @@ struct ExtensionManagerInner {
     /// (unless a per-decision override requests persistence).
     session_scoped_prompt_decisions: bool,
     pending_ui: HashMap<String, PendingExtensionUi>,
+    /// Origin source shared with the owning Agent Session-action gate.
+    /// Captured by Rust before each root JS task is submitted.
+    session_action_origin_source: Option<SessionActionOriginSource>,
     session: Option<Arc<dyn ExtensionSession>>,
     active_tools: Option<Vec<String>>,
     providers: Vec<Value>,

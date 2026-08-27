@@ -3581,7 +3581,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .unwrap_or_default()
                     .to_string();
                 self.session
-                    .set_name(name)
+                    .set_name(name, None)
                     .await
                     .map(|()| Value::Null)
                     .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
@@ -3595,7 +3595,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .to_string();
                 let data = payload.get("data").cloned();
                 self.session
-                    .append_custom_entry(custom_type, data)
+                    .append_custom_entry(custom_type, data, None)
                     .await
                     .map(|()| Value::Null)
                     .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
@@ -3608,7 +3608,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 match serde_json::from_value(message_value) {
                     Ok(message) => self
                         .session
-                        .append_message(message)
+                        .append_message(message, None)
                         .await
                         .map(|()| Value::Null)
                         .map_err(|err| (HostCallErrorCode::Io, err.to_string())),
@@ -3637,7 +3637,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     ))
                 } else {
                     self.session
-                        .set_model(provider, model_id)
+                        .set_model(provider, model_id, None)
                         .await
                         .map(|()| Value::Bool(true))
                         .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
@@ -3665,7 +3665,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     ))
                 } else {
                     self.session
-                        .set_thinking_level(level)
+                        .set_thinking_level(level, None)
                         .await
                         .map(|()| Value::Null)
                         .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
@@ -3693,7 +3693,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     ))
                 } else {
                     self.session
-                        .set_label(target_id, label)
+                        .set_label(target_id, label, None)
                         .await
                         .map(|()| Value::Null)
                         .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
@@ -4027,7 +4027,7 @@ mod tests {
     use crate::error::Error;
     use crate::extensions::{
         ExtensionBody, ExtensionMessage, ExtensionOverride, ExtensionPolicyMode, HostCallPayload,
-        PROTOCOL_VERSION, PolicyProfile,
+        PROTOCOL_VERSION, PolicyProfile, SessionActionOrigin,
     };
     use crate::scheduler::DeterministicClock;
     use crate::session::SessionMessage;
@@ -4168,11 +4168,19 @@ mod tests {
             Vec::new()
         }
 
-        async fn set_name(&self, _name: String) -> Result<()> {
+        async fn set_name(
+            &self,
+            _name: String,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             Ok(())
         }
 
-        async fn append_message(&self, _message: SessionMessage) -> Result<()> {
+        async fn append_message(
+            &self,
+            _message: SessionMessage,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -4180,11 +4188,17 @@ mod tests {
             &self,
             _custom_type: String,
             _data: Option<Value>,
+            _origin: Option<SessionActionOrigin>,
         ) -> Result<()> {
             Ok(())
         }
 
-        async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+        async fn set_model(
+            &self,
+            _provider: String,
+            _model_id: String,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -4192,7 +4206,11 @@ mod tests {
             (None, None)
         }
 
-        async fn set_thinking_level(&self, _level: String) -> Result<()> {
+        async fn set_thinking_level(
+            &self,
+            _level: String,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -4200,7 +4218,12 @@ mod tests {
             None
         }
 
-        async fn set_label(&self, _target_id: String, _label: Option<String>) -> Result<()> {
+        async fn set_label(
+            &self,
+            _target_id: String,
+            _label: Option<String>,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             Ok(())
         }
     }
@@ -4285,7 +4308,7 @@ mod tests {
                 .clone()
         }
 
-        async fn set_name(&self, name: String) -> Result<()> {
+        async fn set_name(&self, name: String, _origin: Option<SessionActionOrigin>) -> Result<()> {
             {
                 let mut guard = self
                     .name
@@ -4304,7 +4327,11 @@ mod tests {
             Ok(())
         }
 
-        async fn append_message(&self, message: SessionMessage) -> Result<()> {
+        async fn append_message(
+            &self,
+            message: SessionMessage,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             self.messages
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4316,6 +4343,7 @@ mod tests {
             &self,
             custom_type: String,
             data: Option<Value>,
+            _origin: Option<SessionActionOrigin>,
         ) -> Result<()> {
             self.custom_entries
                 .lock()
@@ -4324,7 +4352,12 @@ mod tests {
             Ok(())
         }
 
-        async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+        async fn set_model(
+            &self,
+            provider: String,
+            model_id: String,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             let mut state = self
                 .state
                 .lock()
@@ -4354,7 +4387,11 @@ mod tests {
             (provider, model_id)
         }
 
-        async fn set_thinking_level(&self, level: String) -> Result<()> {
+        async fn set_thinking_level(
+            &self,
+            level: String,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             let mut state = self
                 .state
                 .lock()
@@ -4379,7 +4416,12 @@ mod tests {
             level
         }
 
-        async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
+        async fn set_label(
+            &self,
+            target_id: String,
+            label: Option<String>,
+            _origin: Option<SessionActionOrigin>,
+        ) -> Result<()> {
             self.labels
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -10488,12 +10530,20 @@ mod tests {
                 async fn get_branch(&self) -> Vec<Value> {
                     Vec::new()
                 }
-                async fn set_name(&self, _name: String) -> Result<()> {
+                async fn set_name(
+                    &self,
+                    _name: String,
+                    _origin: Option<SessionActionOrigin>,
+                ) -> Result<()> {
                     Err(crate::error::Error::from(std::io::Error::other(
                         "disk full",
                     )))
                 }
-                async fn append_message(&self, _message: SessionMessage) -> Result<()> {
+                async fn append_message(
+                    &self,
+                    _message: SessionMessage,
+                    _origin: Option<SessionActionOrigin>,
+                ) -> Result<()> {
                     Err(crate::error::Error::from(std::io::Error::other(
                         "disk full",
                     )))
@@ -10502,12 +10552,18 @@ mod tests {
                     &self,
                     _custom_type: String,
                     _data: Option<Value>,
+                    _origin: Option<SessionActionOrigin>,
                 ) -> Result<()> {
                     Err(crate::error::Error::from(std::io::Error::other(
                         "disk full",
                     )))
                 }
-                async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+                async fn set_model(
+                    &self,
+                    _provider: String,
+                    _model_id: String,
+                    _origin: Option<SessionActionOrigin>,
+                ) -> Result<()> {
                     Err(crate::error::Error::from(std::io::Error::other(
                         "disk full",
                     )))
@@ -10515,7 +10571,11 @@ mod tests {
                 async fn get_model(&self) -> (Option<String>, Option<String>) {
                     (None, None)
                 }
-                async fn set_thinking_level(&self, _level: String) -> Result<()> {
+                async fn set_thinking_level(
+                    &self,
+                    _level: String,
+                    _origin: Option<SessionActionOrigin>,
+                ) -> Result<()> {
                     Err(crate::error::Error::from(std::io::Error::other(
                         "disk full",
                     )))
@@ -10527,6 +10587,7 @@ mod tests {
                     &self,
                     _target_id: String,
                     _label: Option<String>,
+                    _origin: Option<SessionActionOrigin>,
                 ) -> Result<()> {
                     Err(crate::error::Error::from(std::io::Error::other(
                         "disk full",
@@ -13319,11 +13380,19 @@ mod tests {
                     Vec::new()
                 }
 
-                async fn set_name(&self, _name: String) -> Result<()> {
+                async fn set_name(
+                    &self,
+                    _name: String,
+                    _origin: Option<SessionActionOrigin>,
+                ) -> Result<()> {
                     Ok(())
                 }
 
-                async fn append_message(&self, _message: SessionMessage) -> Result<()> {
+                async fn append_message(
+                    &self,
+                    _message: SessionMessage,
+                    _origin: Option<SessionActionOrigin>,
+                ) -> Result<()> {
                     Ok(())
                 }
 
@@ -13331,11 +13400,17 @@ mod tests {
                     &self,
                     _custom_type: String,
                     _data: Option<Value>,
+                    _origin: Option<SessionActionOrigin>,
                 ) -> Result<()> {
                     Ok(())
                 }
 
-                async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+                async fn set_model(
+                    &self,
+                    _provider: String,
+                    _model_id: String,
+                    _origin: Option<SessionActionOrigin>,
+                ) -> Result<()> {
                     Ok(())
                 }
 
@@ -13343,7 +13418,11 @@ mod tests {
                     (None, None)
                 }
 
-                async fn set_thinking_level(&self, _level: String) -> Result<()> {
+                async fn set_thinking_level(
+                    &self,
+                    _level: String,
+                    _origin: Option<SessionActionOrigin>,
+                ) -> Result<()> {
                     Ok(())
                 }
 
@@ -13355,6 +13434,7 @@ mod tests {
                     &self,
                     _target_id: String,
                     _label: Option<String>,
+                    _origin: Option<SessionActionOrigin>,
                 ) -> Result<()> {
                     Ok(())
                 }

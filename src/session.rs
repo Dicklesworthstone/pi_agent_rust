@@ -7,7 +7,7 @@ use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::extensions::ExtensionSession;
+use crate::extensions::{ExtensionSession, SessionActionOrigin};
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ToolResultMessage,
     UserContent, UserMessage,
@@ -2231,7 +2231,7 @@ impl ExtensionSession for SessionHandle {
             .collect()
     }
 
-    async fn set_name(&self, name: String) -> Result<()> {
+    async fn set_name(&self, name: String, _origin: Option<SessionActionOrigin>) -> Result<()> {
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
@@ -2244,7 +2244,11 @@ impl ExtensionSession for SessionHandle {
         Ok(())
     }
 
-    async fn append_message(&self, message: SessionMessage) -> Result<()> {
+    async fn append_message(
+        &self,
+        message: SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
@@ -2255,7 +2259,12 @@ impl ExtensionSession for SessionHandle {
         Ok(())
     }
 
-    async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()> {
+    async fn append_custom_entry(
+        &self,
+        custom_type: String,
+        data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
@@ -2269,7 +2278,12 @@ impl ExtensionSession for SessionHandle {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
@@ -2303,7 +2317,11 @@ impl ExtensionSession for SessionHandle {
         current_path_model_fields(&session)
     }
 
-    async fn set_thinking_level(&self, level: String) -> Result<()> {
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
@@ -2328,7 +2346,12 @@ impl ExtensionSession for SessionHandle {
         current_path_thinking_level(&session)
     }
 
-    async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
@@ -9897,26 +9920,31 @@ mod tests {
         session.path = Some(temp_dir.path().to_path_buf());
         let handle = SessionHandle(Arc::new(AsyncMutex::new(session)));
 
-        run_async(async { handle.set_name("deferred-save".to_string()).await })
+        run_async(async { handle.set_name("deferred-save".to_string(), None).await })
             .expect("set_name should not trigger immediate save");
-        run_async(async { handle.append_message(make_test_message("hello")).await })
-            .expect("append_message should not trigger immediate save");
+        run_async(async {
+            handle
+                .append_message(make_test_message("hello"), None)
+                .await
+        })
+        .expect("append_message should not trigger immediate save");
         run_async(async {
             handle
                 .append_custom_entry(
                     "marker".to_string(),
                     Some(serde_json::json!({ "value": 42 })),
+                    None,
                 )
                 .await
         })
         .expect("append_custom_entry should not trigger immediate save");
         run_async(async {
             handle
-                .set_model("prov".to_string(), "model".to_string())
+                .set_model("prov".to_string(), "model".to_string(), None)
                 .await
         })
         .expect("set_model should not trigger immediate save");
-        run_async(async { handle.set_thinking_level("high".to_string()).await })
+        run_async(async { handle.set_thinking_level("high".to_string(), None).await })
             .expect("set_thinking_level should not trigger immediate save");
 
         let branch = run_async(async { handle.get_branch().await });
@@ -9939,7 +9967,7 @@ mod tests {
             .expect("message entry id in branch");
         run_async(async {
             handle
-                .set_label(message_id, Some("hot-path".to_string()))
+                .set_label(message_id, Some("hot-path".to_string()), None)
                 .await
         })
         .expect("set_label should not trigger immediate save");
@@ -9997,7 +10025,7 @@ mod tests {
             let inner = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_millis(100),
-                handle.set_name("cancelled-name".to_string()),
+                handle.set_name("cancelled-name".to_string(), None),
             )
             .await;
             let outcome = inner.expect("cancelled helper should finish before timeout");
@@ -10056,7 +10084,7 @@ mod tests {
             });
             let _current = asupersync::Cx::set_current(Some(ambient_cx.cx().clone()));
             handle
-                .set_name("deadline-name".to_string())
+                .set_name("deadline-name".to_string(), None)
                 .await
                 .expect("set_name should succeed with inherited deadline");
 
@@ -10079,19 +10107,27 @@ mod tests {
 
         run_async(async {
             handle
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    None,
+                )
                 .await
         })
         .expect("set model");
         run_async(async {
             handle
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    None,
+                )
                 .await
         })
         .expect("repeat model");
-        run_async(async { handle.set_thinking_level("high".to_string()).await })
+        run_async(async { handle.set_thinking_level("high".to_string(), None).await })
             .expect("set thinking");
-        run_async(async { handle.set_thinking_level("high".to_string()).await })
+        run_async(async { handle.set_thinking_level("high".to_string(), None).await })
             .expect("repeat thinking");
 
         let branch = run_async(async { handle.get_branch().await });
@@ -10130,7 +10166,7 @@ mod tests {
 
         run_async(async {
             handle
-                .set_model("gemini".to_string(), "GEMINI-2.5-PRO".to_string())
+                .set_model("gemini".to_string(), "GEMINI-2.5-PRO".to_string(), None)
                 .await
         })
         .expect("alias-equivalent model should dedupe");
@@ -10248,11 +10284,11 @@ mod tests {
 
         run_async(async {
             handle
-                .set_model("openai".to_string(), "gpt-4o".to_string())
+                .set_model("openai".to_string(), "gpt-4o".to_string(), None)
                 .await
         })
         .expect("same-branch model should dedupe");
-        run_async(async { handle.set_thinking_level("low".to_string()).await })
+        run_async(async { handle.set_thinking_level("low".to_string(), None).await })
             .expect("same-branch thinking should dedupe");
 
         let branch = run_async(async { handle.get_branch().await });

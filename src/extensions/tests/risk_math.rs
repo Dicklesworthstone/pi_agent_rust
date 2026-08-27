@@ -337,6 +337,7 @@ fn build_baseline_deterministic() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -396,6 +397,7 @@ fn build_baseline_sparse_data_has_fallback() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -452,6 +454,7 @@ fn build_baseline_wrong_extension_returns_error() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

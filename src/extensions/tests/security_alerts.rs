@@ -659,28 +659,51 @@ impl ExtensionSession for TestNullSession {
     async fn get_branch(&self) -> Vec<Value> {
         Vec::new()
     }
-    async fn set_name(&self, _name: String) -> Result<()> {
+    async fn set_name(&self, _name: String, _origin: Option<SessionActionOrigin>) -> Result<()> {
         Ok(())
     }
-    async fn append_message(&self, _msg: SessionMessage) -> Result<()> {
+    async fn append_message(
+        &self,
+        _msg: SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         Ok(())
     }
-    async fn append_custom_entry(&self, _custom_type: String, _data: Option<Value>) -> Result<()> {
+    async fn append_custom_entry(
+        &self,
+        _custom_type: String,
+        _data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         Ok(())
     }
-    async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+    async fn set_model(
+        &self,
+        _provider: String,
+        _model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         Ok(())
     }
     async fn get_model(&self) -> (Option<String>, Option<String>) {
         (None, None)
     }
-    async fn set_thinking_level(&self, _level: String) -> Result<()> {
+    async fn set_thinking_level(
+        &self,
+        _level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         Ok(())
     }
     async fn get_thinking_level(&self) -> Option<String> {
         None
     }
-    async fn set_label(&self, _target_id: String, _label: Option<String>) -> Result<()> {
+    async fn set_label(
+        &self,
+        _target_id: String,
+        _label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         Ok(())
     }
 }

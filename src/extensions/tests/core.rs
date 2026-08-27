@@ -2257,6 +2257,7 @@ fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effect
                     command_name: "expired-probe".to_string(),
                     args: String::new(),
                     ctx_payload: Arc::new(json!({})),
+                    origin: None,
                     timeout_ms: 5_000,
                     deadline: Instant::now()
                         .checked_sub(Duration::from_millis(1))
@@ -2288,6 +2289,7 @@ fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effect
                     command_name: "expired-probe".to_string(),
                     args: String::new(),
                     ctx_payload: Arc::new(json!({})),
+                    origin: None,
                     timeout_ms: 5_000,
                     deadline: js_runtime_request_deadline(5_000),
                     reply: abandoned_tx,
@@ -4509,6 +4511,7 @@ fn unavailable_prompt_denies_current_call_without_caching_a_user_decision() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -4561,6 +4564,7 @@ fn one_shot_prompt_decision_is_not_reused_by_the_next_hostcall() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -4612,6 +4616,7 @@ fn only_remembered_persistent_prompt_decisions_survive_store_reopen() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -4693,6 +4698,7 @@ fn persistent_prompt_storage_failure_is_reported_without_losing_session_fallback
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -5080,6 +5086,7 @@ fn shared_dispatcher_logs_runtime_from_context() {
                 manager: None,
                 policy: &policy,
                 js_runtime: None,
+                session_action_origin: None,
                 interceptor: None,
             };
             dispatch_host_call_shared(&ctx, call).await

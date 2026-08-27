@@ -74,7 +74,11 @@ impl InteractiveExtensionHostActions {
 
 #[async_trait]
 impl ExtensionHostActions for InteractiveExtensionHostActions {
-    async fn send_message(&self, message: ExtensionSendMessage) -> crate::error::Result<()> {
+    async fn send_message(
+        &self,
+        message: ExtensionSendMessage,
+        _origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
         let custom_message = ModelMessage::Custom(CustomMessage {
             content: message.content,
             custom_type: message.custom_type,
@@ -140,6 +144,7 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
     async fn send_user_message(
         &self,
         message: ExtensionSendUserMessage,
+        _origin: Option<crate::extensions::SessionActionOrigin>,
     ) -> crate::error::Result<()> {
         let is_streaming = self.extension_streaming.load(Ordering::SeqCst);
         if is_streaming {
@@ -371,7 +376,11 @@ impl ExtensionSession for InteractiveExtensionSession {
             .collect()
     }
 
-    async fn set_name(&self, name: String) -> crate::error::Result<()> {
+    async fn set_name(
+        &self,
+        name: String,
+        _origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
             .await
@@ -383,7 +392,11 @@ impl ExtensionSession for InteractiveExtensionSession {
         Ok(())
     }
 
-    async fn append_message(&self, message: SessionMessage) -> crate::error::Result<()> {
+    async fn append_message(
+        &self,
+        message: SessionMessage,
+        _origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
             .await
@@ -399,6 +412,7 @@ impl ExtensionSession for InteractiveExtensionSession {
         &self,
         custom_type: String,
         data: Option<Value>,
+        _origin: Option<crate::extensions::SessionActionOrigin>,
     ) -> crate::error::Result<()> {
         if custom_type.trim().is_empty() {
             return Err(crate::error::Error::validation(
@@ -416,7 +430,12 @@ impl ExtensionSession for InteractiveExtensionSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
             .await
@@ -451,7 +470,11 @@ impl ExtensionSession for InteractiveExtensionSession {
         current_path_model_fields(&guard)
     }
 
-    async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        _origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let shared_model = self.model_entry.lock().map(|entry| entry.clone()).ok();
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
@@ -494,6 +517,7 @@ impl ExtensionSession for InteractiveExtensionSession {
         &self,
         target_id: String,
         label: Option<String>,
+        _origin: Option<crate::extensions::SessionActionOrigin>,
     ) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
@@ -929,7 +953,7 @@ mod tests {
             let inner = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_millis(100),
-                ext_session.set_name("cancelled-name".to_string()),
+                ext_session.set_name("cancelled-name".to_string(), None),
             )
             .await;
             let outcome = inner.expect("cancelled helper should finish before timeout");
@@ -957,15 +981,18 @@ mod tests {
             let (actions, mut event_rx, session, agent) = build_host_actions();
 
             actions
-                .send_message(ExtensionSendMessage {
-                    extension_id: Some("ext".to_string()),
-                    custom_type: "note".to_string(),
-                    content: "continue-now".to_string(),
-                    display: false,
-                    details: None,
-                    deliver_as: Some(ExtensionDeliverAs::Steer),
-                    trigger_turn: true,
-                })
+                .send_message(
+                    ExtensionSendMessage {
+                        extension_id: Some("ext".to_string()),
+                        custom_type: "note".to_string(),
+                        content: "continue-now".to_string(),
+                        display: false,
+                        details: None,
+                        deliver_as: Some(ExtensionDeliverAs::Steer),
+                        trigger_turn: true,
+                    },
+                    None,
+                )
                 .await
                 .expect("send_message");
 
@@ -1016,15 +1043,18 @@ mod tests {
             let (actions, mut event_rx, _session, _agent) = build_host_actions();
 
             actions
-                .send_message(ExtensionSendMessage {
-                    extension_id: Some("ext".to_string()),
-                    custom_type: "note".to_string(),
-                    content: "defer".to_string(),
-                    display: false,
-                    details: None,
-                    deliver_as: Some(ExtensionDeliverAs::NextTurn),
-                    trigger_turn: true,
-                })
+                .send_message(
+                    ExtensionSendMessage {
+                        extension_id: Some("ext".to_string()),
+                        custom_type: "note".to_string(),
+                        content: "defer".to_string(),
+                        display: false,
+                        details: None,
+                        deliver_as: Some(ExtensionDeliverAs::NextTurn),
+                        trigger_turn: true,
+                    },
+                    None,
+                )
                 .await
                 .expect("send_message");
 
@@ -1049,15 +1079,18 @@ mod tests {
                 .try_send(PiMsg::System("busy".to_string()))
                 .expect("fill bounded event channel");
 
-            let send_message = actions.send_message(ExtensionSendMessage {
-                extension_id: Some("ext".to_string()),
-                custom_type: "note".to_string(),
-                content: "visible".to_string(),
-                display: true,
-                details: None,
-                deliver_as: Some(ExtensionDeliverAs::Steer),
-                trigger_turn: false,
-            });
+            let send_message = actions.send_message(
+                ExtensionSendMessage {
+                    extension_id: Some("ext".to_string()),
+                    custom_type: "note".to_string(),
+                    content: "visible".to_string(),
+                    display: true,
+                    details: None,
+                    deliver_as: Some(ExtensionDeliverAs::Steer),
+                    trigger_turn: false,
+                },
+                None,
+            );
             let recv_cx = Cx::for_request();
             let recv_messages = async {
                 let first = event_rx.recv(&recv_cx).await.expect("busy message");
@@ -1092,15 +1125,18 @@ mod tests {
                 .try_send(PiMsg::System("busy".to_string()))
                 .expect("fill bounded event channel");
 
-            let send_message = actions.send_message(ExtensionSendMessage {
-                extension_id: Some("ext".to_string()),
-                custom_type: "note".to_string(),
-                content: "continue-now".to_string(),
-                display: true,
-                details: None,
-                deliver_as: Some(ExtensionDeliverAs::Steer),
-                trigger_turn: true,
-            });
+            let send_message = actions.send_message(
+                ExtensionSendMessage {
+                    extension_id: Some("ext".to_string()),
+                    custom_type: "note".to_string(),
+                    content: "continue-now".to_string(),
+                    display: true,
+                    details: None,
+                    deliver_as: Some(ExtensionDeliverAs::Steer),
+                    trigger_turn: true,
+                },
+                None,
+            );
             let recv_cx = Cx::for_request();
             let recv_messages = async {
                 let first = event_rx.recv(&recv_cx).await.expect("busy message");
@@ -1143,11 +1179,14 @@ mod tests {
                 .try_send(PiMsg::System("busy".to_string()))
                 .expect("fill bounded event channel");
 
-            let send_message = actions.send_user_message(ExtensionSendUserMessage {
-                extension_id: Some("ext".to_string()),
-                text: "hello from extension".to_string(),
-                deliver_as: None,
-            });
+            let send_message = actions.send_user_message(
+                ExtensionSendUserMessage {
+                    extension_id: Some("ext".to_string()),
+                    text: "hello from extension".to_string(),
+                    deliver_as: None,
+                },
+                None,
+            );
             let recv_cx = Cx::for_request();
             let recv_messages = async {
                 let first = event_rx.recv(&recv_cx).await.expect("busy message");
@@ -1189,11 +1228,11 @@ mod tests {
             };
 
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level("high".to_string(), None)
                 .await
                 .expect("first thinking update");
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level("high".to_string(), None)
                 .await
                 .expect("second thinking update");
 
@@ -1240,7 +1279,7 @@ mod tests {
             };
 
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level("high".to_string(), None)
                 .await
                 .expect("thinking update should preserve requested level");
 
@@ -1276,11 +1315,19 @@ mod tests {
             };
 
             ext_session
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    None,
+                )
                 .await
                 .expect("first model update");
             ext_session
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    None,
+                )
                 .await
                 .expect("second model update");
 
@@ -1323,7 +1370,7 @@ mod tests {
             };
 
             ext_session
-                .set_model("gemini".to_string(), "gemini-2.5-pro".to_string())
+                .set_model("gemini".to_string(), "gemini-2.5-pro".to_string(), None)
                 .await
                 .expect("alias target should dedupe");
 
@@ -1496,11 +1543,11 @@ mod tests {
             };
 
             ext_session
-                .set_model("openai".to_string(), "gpt-4o".to_string())
+                .set_model("openai".to_string(), "gpt-4o".to_string(), None)
                 .await
                 .expect("same-branch model should dedupe");
             ext_session
-                .set_thinking_level("low".to_string())
+                .set_thinking_level("low".to_string(), None)
                 .await
                 .expect("same-branch thinking should dedupe");
 
@@ -1587,18 +1634,21 @@ mod tests {
             handle
                 .spawn(async move {
                     ext_session
-                        .set_name("spawned-session".to_string())
+                        .set_name("spawned-session".to_string(), None)
                         .await
                         .expect("set_name");
                     ext_session
-                        .append_message(SessionMessage::User {
-                            content: crate::model::UserContent::Text("hello".to_string()),
-                            timestamp: Some(0),
-                        })
+                        .append_message(
+                            SessionMessage::User {
+                                content: crate::model::UserContent::Text("hello".to_string()),
+                                timestamp: Some(0),
+                            },
+                            None,
+                        )
                         .await
                         .expect("append_message");
                     ext_session
-                        .append_custom_entry("regression".to_string(), Some(json!({"n": 1})))
+                        .append_custom_entry("regression".to_string(), Some(json!({"n": 1})), None)
                         .await
                         .expect("append_custom_entry");
                 })

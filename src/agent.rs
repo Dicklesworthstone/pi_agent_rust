@@ -30,7 +30,8 @@ use crate::extensions::{
     ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec, ExtensionManager, ExtensionPolicy,
     ExtensionRegion, ExtensionRuntimeHandle, ExtensionSendMessage, ExtensionSendUserMessage,
     JsExtensionLoadSpec, JsExtensionRuntimeHandle, NativeRustExtensionLoadSpec,
-    NativeRustExtensionRuntimeHandle, RepairPolicyMode, resolve_extension_load_spec,
+    NativeRustExtensionRuntimeHandle, RepairPolicyMode, SessionActionOrigin,
+    SessionActionOriginSource, resolve_extension_load_spec,
 };
 #[cfg(feature = "wasm-host")]
 use crate::extensions::{WasmExtensionHost, WasmExtensionLoadSpec};
@@ -5306,7 +5307,7 @@ impl ProviderAdmissionGate {
 #[derive(Clone, Debug)]
 pub(crate) struct SessionActionAdmissionGate {
     permit: Arc<Mutex<()>>,
-    generation: Arc<AtomicU64>,
+    origin_source: SessionActionOriginSource,
     #[cfg(test)]
     pending_generation_checks: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -5327,7 +5328,7 @@ impl Default for SessionActionAdmissionGate {
     fn default() -> Self {
         Self {
             permit: Arc::new(Mutex::new(())),
-            generation: Arc::new(AtomicU64::new(0)),
+            origin_source: SessionActionOriginSource::default(),
             #[cfg(test)]
             pending_generation_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -5336,7 +5337,15 @@ impl Default for SessionActionAdmissionGate {
 
 impl SessionActionAdmissionGate {
     pub(crate) fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        self.origin_source.generation()
+    }
+
+    pub(crate) fn origin_source(&self) -> SessionActionOriginSource {
+        self.origin_source.clone()
+    }
+
+    pub(crate) fn capture_origin(&self) -> SessionActionOrigin {
+        self.origin_source.capture()
     }
 
     pub(crate) async fn acquire(&self, cx: &asupersync::Cx) -> Result<OwnedMutexGuard<()>> {
@@ -5345,8 +5354,7 @@ impl SessionActionAdmissionGate {
             .map_err(|err| Error::session(format!("session action admission lock failed: {err}")))
     }
 
-    async fn acquire_current_generation(&self) -> Result<OwnedMutexGuard<()>> {
-        let generation = self.generation();
+    async fn acquire_origin(&self, origin: &SessionActionOrigin) -> Result<OwnedMutexGuard<()>> {
         #[cfg(test)]
         let _pending_generation_check = {
             self.pending_generation_checks
@@ -5357,7 +5365,11 @@ impl SessionActionAdmissionGate {
         };
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let permit = self.acquire(cx.cx()).await?;
-        self.ensure_generation(generation)?;
+        if !self.origin_source.accepts(origin) {
+            return Err(Error::session(
+                "active Session changed before the extension action could be applied",
+            ));
+        }
         Ok(permit)
     }
 
@@ -5366,17 +5378,8 @@ impl SessionActionAdmissionGate {
         self.pending_generation_checks.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn ensure_generation(&self, expected: u64) -> Result<()> {
-        if self.generation() != expected {
-            return Err(Error::session(
-                "active Session changed before the extension action could be applied",
-            ));
-        }
-        Ok(())
-    }
-
     pub(crate) fn advance_generation(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.origin_source.advance();
     }
 }
 
@@ -5508,10 +5511,14 @@ impl AgentSessionHostActions {
         Ok(permit)
     }
 
-    async fn acquire_session_action_admission(&self) -> Result<OwnedMutexGuard<()>> {
-        self.session_action_admission
-            .acquire_current_generation()
-            .await
+    async fn acquire_session_action_admission(
+        &self,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<OwnedMutexGuard<()>> {
+        let origin = origin.ok_or_else(|| {
+            Error::session("extension Session action is missing trusted task provenance")
+        })?;
+        self.session_action_admission.acquire_origin(&origin).await
     }
 
     fn enqueue(&self, deliver_as: Option<ExtensionDeliverAs>, message: Message) {
@@ -5552,8 +5559,12 @@ impl AgentSessionHostActions {
 
 #[async_trait]
 impl ExtensionHostActions for AgentSessionHostActions {
-    async fn send_message(&self, message: ExtensionSendMessage) -> Result<()> {
-        let _session_action_permit = self.acquire_session_action_admission().await?;
+    async fn send_message(
+        &self,
+        message: ExtensionSendMessage,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let custom_message = Message::Custom(CustomMessage {
             content: message.content,
             custom_type: message.custom_type,
@@ -5583,8 +5594,12 @@ impl ExtensionHostActions for AgentSessionHostActions {
         self.append_to_session(custom_message).await
     }
 
-    async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()> {
-        let _session_action_permit = self.acquire_session_action_admission().await?;
+    async fn send_user_message(
+        &self,
+        message: ExtensionSendUserMessage,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let text = message.text;
         let user_message = Message::User(UserMessage {
             content: UserContent::Text(text.clone()),
@@ -7599,6 +7614,8 @@ mod extensions_integration_tests {
 
         runtime.block_on(async {
             let session = Arc::new(Mutex::new(Session::in_memory()));
+            let session_action_admission = SessionActionAdmissionGate::default();
+            let origin = session_action_admission.capture_origin();
             let actions = AgentSessionHostActions {
                 session: Arc::clone(&session),
                 injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
@@ -7611,7 +7628,7 @@ mod extensions_integration_tests {
                     models: Vec::new(),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
-                session_action_admission: SessionActionAdmissionGate::default(),
+                session_action_admission,
             };
 
             let hold_cx = crate::agent_cx::AgentCx::for_request();
@@ -7623,15 +7640,18 @@ mod extensions_integration_tests {
             let inner = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_millis(100),
-                actions.send_message(ExtensionSendMessage {
-                    extension_id: Some("ext".to_string()),
-                    custom_type: "note".to_string(),
-                    content: "blocked".to_string(),
-                    display: false,
-                    details: None,
-                    deliver_as: Some(ExtensionDeliverAs::NextTurn),
-                    trigger_turn: false,
-                }),
+                actions.send_message(
+                    ExtensionSendMessage {
+                        extension_id: Some("ext".to_string()),
+                        custom_type: "note".to_string(),
+                        content: "blocked".to_string(),
+                        display: false,
+                        details: None,
+                        deliver_as: Some(ExtensionDeliverAs::NextTurn),
+                        trigger_turn: false,
+                    },
+                    Some(origin),
+                ),
             )
             .await;
             let outcome = inner.expect("cancelled helper should finish before timeout");
@@ -7681,19 +7701,23 @@ mod extensions_integration_tests {
                 .acquire(transition_cx.cx())
                 .await
                 .expect("transition admission");
+            let source_origin = session_action_admission.capture_origin();
 
             let delayed_actions = actions.clone();
             let hostcall = runtime_handle.spawn(async move {
                 delayed_actions
-                    .send_message(ExtensionSendMessage {
-                        extension_id: Some("ext".to_string()),
-                        custom_type: "note".to_string(),
-                        content: "must wait for transition".to_string(),
-                        display: false,
-                        details: None,
-                        deliver_as: Some(ExtensionDeliverAs::NextTurn),
-                        trigger_turn: false,
-                    })
+                    .send_message(
+                        ExtensionSendMessage {
+                            extension_id: Some("ext".to_string()),
+                            custom_type: "note".to_string(),
+                            content: "must wait for transition".to_string(),
+                            display: false,
+                            details: None,
+                            deliver_as: Some(ExtensionDeliverAs::NextTurn),
+                            trigger_turn: false,
+                        },
+                        Some(source_origin),
+                    )
                     .await
             });
             wait_for_session_action_generation_capture(&session_action_admission).await;
@@ -7717,15 +7741,18 @@ mod extensions_integration_tests {
             );
 
             actions
-                .send_message(ExtensionSendMessage {
-                    extension_id: Some("ext".to_string()),
-                    custom_type: "note".to_string(),
-                    content: "belongs to the new session".to_string(),
-                    display: false,
-                    details: None,
-                    deliver_as: Some(ExtensionDeliverAs::NextTurn),
-                    trigger_turn: false,
-                })
+                .send_message(
+                    ExtensionSendMessage {
+                        extension_id: Some("ext".to_string()),
+                        custom_type: "note".to_string(),
+                        content: "belongs to the new session".to_string(),
+                        display: false,
+                        details: None,
+                        deliver_as: Some(ExtensionDeliverAs::NextTurn),
+                        trigger_turn: false,
+                    },
+                    Some(session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("new-generation action");
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -7739,6 +7766,34 @@ mod extensions_integration_tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(custom_contents, vec!["belongs to the new session"]);
+        });
+    }
+
+    #[test]
+    fn session_action_admission_rejects_foreign_origin_at_same_generation() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let gate = SessionActionAdmissionGate::default();
+            let foreign_gate = SessionActionAdmissionGate::default();
+            assert_eq!(gate.generation(), foreign_gate.generation());
+
+            let err = gate
+                .acquire_origin(&foreign_gate.capture_origin())
+                .await
+                .expect_err("a same-counter token from another Session gate must be rejected");
+            assert!(
+                err.to_string().contains("active Session changed"),
+                "unexpected foreign-origin error: {err}"
+            );
+
+            let current_permit = gate
+                .acquire_origin(&gate.capture_origin())
+                .await
+                .expect("the gate's own current origin must remain valid");
+            drop(current_permit);
         });
     }
 
@@ -8420,6 +8475,7 @@ mod extensions_integration_tests {
                 .acquire(transition_cx.cx())
                 .await
                 .expect("transition admission");
+            let source_origin = session_action_admission.capture_origin();
 
             let delayed_session = extension_session.clone();
             let hostcall = runtime_handle.spawn(async move {
@@ -8427,6 +8483,7 @@ mod extensions_integration_tests {
                     &delayed_session,
                     "stale-note".to_string(),
                     Some(json!({"owner": "source"})),
+                    Some(source_origin),
                 )
                 .await
             });
@@ -8525,8 +8582,9 @@ mod extensions_integration_tests {
                 .await
                 .expect("transition admission");
 
+            let delayed_manager = extension_manager.clone();
             let hostcall = runtime_handle.spawn(async move {
-                extension_manager
+                delayed_manager
                     .execute_command("append-late", "", 5_000)
                     .await
             });
@@ -8564,6 +8622,33 @@ mod extensions_integration_tests {
                     )
                 }),
                 "stale real-JS mutation crossed into the replacement Session"
+            );
+            drop(guard);
+
+            let current_result = extension_manager
+                .execute_command("append-late", "", 5_000)
+                .await
+                .expect("current-generation real-JS mutation");
+            assert_eq!(current_result, Value::String("appended".to_string()));
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let guard = session
+                .lock(cx.cx())
+                .await
+                .expect("replacement session lock after current mutation");
+            assert_eq!(guard.header.id, replacement_session_id);
+            assert_eq!(
+                guard
+                    .entries_for_current_path()
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "stale-js-note"
+                    ))
+                    .count(),
+                1,
+                "the provenance fence must admit the current generation exactly once"
             );
         });
     }
@@ -11189,10 +11274,14 @@ struct AgentExtensionSession {
 }
 
 impl AgentExtensionSession {
-    async fn acquire_session_action_admission(&self) -> Result<OwnedMutexGuard<()>> {
-        self.session_action_admission
-            .acquire_current_generation()
-            .await
+    async fn acquire_session_action_admission(
+        &self,
+        origin: Option<SessionActionOrigin>,
+    ) -> Result<OwnedMutexGuard<()>> {
+        let origin = origin.ok_or_else(|| {
+            Error::session("extension Session action is missing trusted task provenance")
+        })?;
+        self.session_action_admission.acquire_origin(&origin).await
     }
 
     fn current_queue_modes(&self) -> (QueueMode, QueueMode) {
@@ -11269,19 +11358,26 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         <SessionHandle as crate::extensions::ExtensionSession>::get_branch(&self.handle).await
     }
 
-    async fn set_name(&self, name: String) -> crate::error::Result<()> {
-        let _session_action_permit = self.acquire_session_action_admission().await?;
-        <SessionHandle as crate::extensions::ExtensionSession>::set_name(&self.handle, name).await
+    async fn set_name(
+        &self,
+        name: String,
+        origin: Option<SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
+        <SessionHandle as crate::extensions::ExtensionSession>::set_name(&self.handle, name, None)
+            .await
     }
 
     async fn append_message(
         &self,
         message: crate::session::SessionMessage,
+        origin: Option<SessionActionOrigin>,
     ) -> crate::error::Result<()> {
-        let _session_action_permit = self.acquire_session_action_admission().await?;
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         <SessionHandle as crate::extensions::ExtensionSession>::append_message(
             &self.handle,
             message,
+            None,
         )
         .await
     }
@@ -11290,22 +11386,30 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         &self,
         custom_type: String,
         data: Option<Value>,
+        origin: Option<SessionActionOrigin>,
     ) -> crate::error::Result<()> {
-        let _session_action_permit = self.acquire_session_action_admission().await?;
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         <SessionHandle as crate::extensions::ExtensionSession>::append_custom_entry(
             &self.handle,
             custom_type,
             data,
+            None,
         )
         .await
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
-        let _session_action_permit = self.acquire_session_action_admission().await?;
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        origin: Option<SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         <SessionHandle as crate::extensions::ExtensionSession>::set_model(
             &self.handle,
             provider,
             model_id,
+            None,
         )
         .await
     }
@@ -11314,11 +11418,16 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         <SessionHandle as crate::extensions::ExtensionSession>::get_model(&self.handle).await
     }
 
-    async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
-        let _session_action_permit = self.acquire_session_action_admission().await?;
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        origin: Option<SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         <SessionHandle as crate::extensions::ExtensionSession>::set_thinking_level(
             &self.handle,
             level,
+            None,
         )
         .await
     }
@@ -11332,12 +11441,14 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         &self,
         target_id: String,
         label: Option<String>,
+        origin: Option<SessionActionOrigin>,
     ) -> crate::error::Result<()> {
-        let _session_action_permit = self.acquire_session_action_admission().await?;
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         <SessionHandle as crate::extensions::ExtensionSession>::set_label(
             &self.handle,
             target_id,
             label,
+            None,
         )
         .await
     }
@@ -13083,6 +13194,7 @@ impl AgentSession {
             steering_mode,
             follow_up_mode,
         )));
+        manager.set_session_action_origin_source(self.session_action_admission.origin_source());
         manager.set_session(Arc::new(AgentExtensionSession {
             handle: SessionHandle(self.session.clone()),
             session_action_admission: self.session_action_admission.clone(),

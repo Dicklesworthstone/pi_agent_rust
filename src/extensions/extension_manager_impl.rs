@@ -3516,6 +3516,15 @@ impl ExtensionManager {
     }
 
     #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn set_session_action_origin_source(&self, source: SessionActionOriginSource) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.session_action_origin_source = Some(source);
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
     pub fn set_session(&self, session: Arc<dyn ExtensionSession>) {
         let mut guard = self
             .inner
