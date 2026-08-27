@@ -2166,7 +2166,7 @@ impl CappedCapture {
                         tracing::warn!(
                             event = "pi.auth.secret_cmd_output_overflow",
                             "secret helper output exceeded its bounded cap; \
-                                 draining to EOF then failing closed"
+                             draining to EOF then failing closed"
                         );
                     }
                 }
@@ -2175,7 +2175,9 @@ impl CappedCapture {
         self.finished.store(true, Ordering::Relaxed);
     }
 
-    fn join_grace(handle: std::thread::JoinHandle<()>, grace: Duration) -> bool {
+    /// Borrowing grace-join: the handles are re-checked (and re-joined after
+    /// forced teardown) on the caller side, so this must not consume them.
+    fn join_grace(handle: &std::thread::JoinHandle<()>, grace: Duration) -> bool {
         let deadline = Instant::now() + grace;
         while !handle.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -2245,12 +2247,12 @@ fn run_bounded_secret_command(
     // Grandchildren may hold pipe write-ends past leader exit; give readers a
     // short grace after either exit or kill, then force the tree down so the
     // collector can never hang forever (bd-wuswt).
-    let drained = CappedCapture::join_grace(stdout_handle, SECRET_CMD_KILL_GRACE)
-        & CappedCapture::join_grace(stderr_handle, SECRET_CMD_KILL_GRACE);
+    let drained = CappedCapture::join_grace(&stdout_handle, SECRET_CMD_KILL_GRACE)
+        & CappedCapture::join_grace(&stderr_handle, SECRET_CMD_KILL_GRACE);
     if !drained {
         crate::tools::kill_process_group_tree(Some(pid));
-        CappedCapture::join_grace(stdout_handle, Duration::from_millis(250));
-        CappedCapture::join_grace(stderr_handle, Duration::from_millis(250));
+        CappedCapture::join_grace(&stdout_handle, Duration::from_millis(250));
+        CappedCapture::join_grace(&stderr_handle, Duration::from_millis(250));
     }
     guard.settle();
 

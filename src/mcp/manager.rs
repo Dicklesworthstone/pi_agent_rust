@@ -725,8 +725,8 @@ impl McpManager {
         let current = Self::lock(&entry.transport);
         if self.inner.shutting_down.load(Ordering::Acquire)
             || !current
-            .as_ref()
-            .is_some_and(|candidate| Arc::ptr_eq(candidate, transport))
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, transport))
         {
             return false;
         }
@@ -2146,7 +2146,10 @@ mod tests {
         let error = runtime
             .block_on(manager.connect_and_list(&terminal_entry))
             .expect_err("a shut-down manager must never reconnect");
-        assert!(error.to_string().contains("MCP_MANAGER_SHUTDOWN"), "{error}");
+        assert!(
+            error.to_string().contains("MCP_MANAGER_SHUTDOWN"),
+            "{error}"
+        );
         assert!(McpManager::lock(&terminal_entry.transport).is_none());
     }
 
@@ -2194,7 +2197,10 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while !manager.inner.shutting_down.load(Ordering::Acquire) {
-            assert!(Instant::now() < deadline, "shutdown never sealed the manager");
+            assert!(
+                Instant::now() < deadline,
+                "shutdown never sealed the manager"
+            );
             std::thread::yield_now();
         }
         let shutdown_returned_before_release = shutdown_done_rx
@@ -2213,8 +2219,8 @@ mod tests {
             !shutdown_returned_before_release,
             "shutdown returned while a private handshake still held the connection lane"
         );
-        let connect_error = connect_result
-            .expect_err("terminal shutdown must reject handshake publication");
+        let connect_error =
+            connect_result.expect_err("terminal shutdown must reject handshake publication");
         assert!(
             connect_error.to_string().contains("MCP_MANAGER_SHUTDOWN"),
             "{connect_error}"
@@ -3286,5 +3292,132 @@ mod tests {
             "the manager observing revocation must close its transport"
         );
         assert!(McpManager::lock(&entry.transport).is_none());
+    }
+
+    /// bd-vjfol (defect b): `/mcp test` deliberately resets the restart
+    /// budget, so a server that exhausted MAX_RESTARTS recovers through it.
+    /// Mutation-sensitive: removing the reset makes `check_restart_budget`
+    /// reject the reconnect with MCP_RESTART_EXHAUSTED.
+    #[test]
+    fn mcp_test_resets_exhausted_restart_budget_and_recovers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry) = trusted_fixture_manager(&temp);
+        let manager = Arc::new(manager);
+
+        // Simulate a fully exhausted budget with an armed backoff window.
+        *McpManager::lock(&entry.restarts) = RestartState {
+            count: MAX_RESTARTS,
+            next_retry_at: Some(Instant::now() + Duration::from_secs(3600)),
+        };
+        *McpManager::lock(&entry.health) = ServerHealth::Failed {
+            reason: "fixture: exhausted".to_string(),
+        };
+
+        let closed = Arc::new(AtomicBool::new(false));
+        *McpManager::lock(&manager.inner.transport_factory) =
+            Some(Arc::new(move || -> Box<dyn McpTransport> {
+                Box::new(SuccessfulTransport {
+                    closed: Arc::clone(&closed),
+                })
+            }));
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let tools = runtime
+            .block_on(manager.test("fixture"))
+            .expect("exhausted server must recover through /mcp test");
+
+        // SuccessfulTransport advertises an empty (but parsed) tool list.
+        assert!(tools.is_empty());
+        let restarts = McpManager::lock(&entry.restarts);
+        assert_eq!(restarts.count, 0, "budget reset before reconnecting");
+        assert!(restarts.next_retry_at.is_none());
+        drop(restarts);
+        assert!(matches!(
+            &*McpManager::lock(&entry.health),
+            ServerHealth::Ready { .. }
+        ));
+        assert!(McpManager::lock(&entry.transport).is_some());
+    }
+
+    /// bd-vjfol (defect a): the single startup connect-and-mount pass covers
+    /// every registered definition — built-in AND extension-provided — and
+    /// never double-connects on repeated passes. Late registration after the
+    /// pass is a CALLER-ordering contract: it stays unconnected until an
+    /// explicit surface (like `/mcp test`) runs, which is exactly why
+    /// main.rs/sdk.rs must register extension servers before calling
+    /// connect_trusted.
+    #[test]
+    fn startup_pass_connects_all_acknowledged_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, fixture_entry) = trusted_fixture_manager(&temp);
+        let manager = Arc::new(manager);
+
+        manager.register_extension_server(
+            "ext-srv",
+            &serde_json::json!({
+                "command": "unused-ext",
+                "type": "stdio",
+                "trust": "acknowledged"
+            }),
+        );
+        let ext_entry = manager.entry("ext-srv").expect("ext entry");
+        let fingerprint = manager.trust_fingerprint(&ext_entry.config);
+        // Extension-provided definitions reach the SAME trust gate; a spec
+        // acknowledged up front participates in the startup pass.
+        TrustStore::load(&manager.inner.trust_path)
+            .expect("load trust")
+            .acknowledge("ext-srv", &fingerprint, "operator")
+            .expect("acknowledge ext server");
+
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_factory = Arc::clone(&factory_calls);
+        let closed = Arc::new(AtomicBool::new(false));
+        *McpManager::lock(&manager.inner.transport_factory) =
+            Some(Arc::new(move || -> Box<dyn McpTransport> {
+                calls_for_factory.fetch_add(1, Ordering::AcqRel);
+                Box::new(SuccessfulTransport {
+                    closed: Arc::clone(&closed),
+                })
+            }));
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(manager.connect_trusted_with_budget(Duration::from_secs(2)));
+
+        assert_eq!(
+            factory_calls.load(Ordering::Acquire),
+            2,
+            "one spawn per acknowledged definition (fixture + extension)"
+        );
+        assert!(McpManager::lock(&fixture_entry.transport).is_some());
+        assert!(McpManager::lock(&ext_entry.transport).is_some());
+
+        // A second startup pass must be idempotent: live transports are
+        // reused, so no additional spawn (no double connection) occurs and
+        // the mounted tool cache is not duplicated.
+        runtime.block_on(manager.connect_trusted_with_budget(Duration::from_secs(2)));
+        assert_eq!(
+            factory_calls.load(Ordering::Acquire),
+            2,
+            "repeated startup pass must reuse live transports"
+        );
+        assert!(
+            McpManager::lock(&ext_entry.tools_cache).is_some(),
+            "extension tools mounted exactly once"
+        );
+
+        // Late registration after the pass stays dormant by contract.
+        manager.register_extension_server(
+            "late-srv",
+            &serde_json::json!({"command": "unused-late", "type": "stdio"}),
+        );
+        let late_entry = manager.entry("late-srv").expect("late entry");
+        assert!(
+            McpManager::lock(&late_entry.transport).is_none(),
+            "post-pass registration must not spontaneously connect"
+        );
     }
 }

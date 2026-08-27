@@ -84,11 +84,7 @@ async fn dispatch_input_event(
     Ok(apply_input_event_response(response, text, images))
 }
 
-fn before_agent_start_payload(
-    prompt: &str,
-    images: &[ImageContent],
-    system_prompt: &str,
-) -> Value {
+fn before_agent_start_payload(prompt: &str, images: &[ImageContent], system_prompt: &str) -> Value {
     let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
     json!({
         "prompt": prompt,
@@ -159,8 +155,7 @@ impl std::ops::DerefMut for TurnSystemPromptGuard<'_> {
 
 impl Drop for TurnSystemPromptGuard<'_> {
     fn drop(&mut self) {
-        self.agent
-            .set_system_prompt(self.base_system_prompt.take());
+        self.agent.set_system_prompt(self.base_system_prompt.take());
     }
 }
 
@@ -887,20 +882,15 @@ impl PiApp {
         }
     }
 
-    fn retry_busy_session_event(
-        &mut self,
-        event: PiMsg,
-        attempts_remaining: u8,
-    ) -> Option<Cmd> {
+    fn retry_busy_session_event(&mut self, event: PiMsg, attempts_remaining: u8) -> Option<Cmd> {
         let retry = session_event_retry_cmd(event, attempts_remaining);
         if retry.is_none() {
             // The Session lock is still contended, so ownership remains
             // unknowable. Exhaustion must be observable but non-destructive:
             // mutating even reset-specific state here would let a delayed
             // reset for session A idle or clear a live session-B turn.
-            self.status_message = Some(
-                "Session remained busy; a delayed session update was not applied".to_string(),
-            );
+            self.status_message =
+                Some("Session remained busy; a delayed session update was not applied".to_string());
         }
         retry
     }
@@ -1784,9 +1774,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
     /// Queued prompts do not need repaint ticks. Wait directly for their own
     /// absolute deadline; promotion cancels and replaces this command.
-    fn capability_prompt_queue_deadline_cmd(
-        overlay: &CapabilityPromptOverlay,
-    ) -> Option<Cmd> {
+    fn capability_prompt_queue_deadline_cmd(overlay: &CapabilityPromptOverlay) -> Option<Cmd> {
         let expires_at = overlay.expires_at?;
         let id = overlay.request.id.clone();
         let generation = overlay.generation;
@@ -1832,23 +1820,17 @@ After approving access in the browser, press Enter in Pi to complete login."
         timer_generation: u64,
     ) -> Option<Cmd> {
         let now = std::time::Instant::now();
-        let matches_active = self
-            .capability_prompt
-            .as_ref()
-            .is_some_and(|prompt| {
+        let matches_active = self.capability_prompt.as_ref().is_some_and(|prompt| {
+            prompt.request.id == id
+                && prompt.generation == generation
+                && prompt.timer_generation() == timer_generation
+        });
+        if !matches_active {
+            let queue_index = self.capability_prompt_queue.iter().position(|prompt| {
                 prompt.request.id == id
                     && prompt.generation == generation
                     && prompt.timer_generation() == timer_generation
             });
-        if !matches_active {
-            let queue_index = self
-                .capability_prompt_queue
-                .iter()
-                .position(|prompt| {
-                    prompt.request.id == id
-                        && prompt.generation == generation
-                        && prompt.timer_generation() == timer_generation
-                });
             let Some(queue_index) = queue_index else {
                 return None;
             };
@@ -2715,12 +2697,12 @@ After approving access in the browser, press Enter in Pi to complete login."
         let Some(entry) = self.title_model_entry.clone() else {
             return;
         };
-        let Some(owner_session_id) = self.session.try_lock().ok().and_then(|guard| {
-            guard
-                .get_name()
-                .is_none()
-                .then(|| guard.header.id.clone())
-        }) else {
+        let Some(owner_session_id) = self
+            .session
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.get_name().is_none().then(|| guard.header.id.clone()))
+        else {
             return;
         };
         let mut user_texts = self
@@ -4289,7 +4271,7 @@ mod stream_delta_batcher_tests {
                 Ordering::SeqCst,
             );
             self.state.saw_expected_system_prompt.store(
-                context.system_prompt == Some(self.expected_system_prompt),
+                context.system_prompt == Some(self.expected_system_prompt.as_ref()),
                 Ordering::SeqCst,
             );
 
@@ -4698,7 +4680,10 @@ mod stream_delta_batcher_tests {
             owner_session_id: session_id,
             message: "current tan card".to_string(),
         });
-        assert!(command.is_some(), "current idle-session input must still run");
+        assert!(
+            command.is_some(),
+            "current idle-session input must still run"
+        );
         assert!(matches!(
             app.messages.last(),
             Some(ConversationMessage { role: MessageRole::System, content, .. })
@@ -5120,7 +5105,8 @@ mod stream_delta_batcher_tests {
         app.title_requested = true;
         app.todo_summary = Some("1 todo pending".to_string());
         app.extension_custom_active = true;
-        app.extension_custom_key_queue.push_back("old-key".to_string());
+        app.extension_custom_key_queue
+            .push_back("old-key".to_string());
         app.extension_custom_overlay = Some(ExtensionCustomOverlay::default());
         app.role_model_overrides.insert(
             crate::models::ModelRole::Smol,
@@ -5166,7 +5152,10 @@ mod stream_delta_batcher_tests {
         app.ask_tool = Some(ask_tool.clone());
         app.input.set_value("old session draft");
         let _ = app.handle_pi_message(PiMsg::AskUiRequest(ask_request));
-        assert!(app.active_ask_ui.is_some(), "fixture must activate a real Ask waiter");
+        assert!(
+            app.active_ask_ui.is_some(),
+            "fixture must activate a real Ask waiter"
+        );
         let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(ExtensionUiRequest::new(
             "old-session-extension",
             "confirm",
@@ -5205,7 +5194,10 @@ mod stream_delta_batcher_tests {
             app.role_model_overrides.is_empty(),
             "the previous session's role model overrides must not leak"
         );
-        assert!(app.tree_ui.is_none(), "the previous session's tree must close");
+        assert!(
+            app.tree_ui.is_none(),
+            "the previous session's tree must close"
+        );
         assert!(!app.extension_custom_active);
         assert!(app.extension_custom_key_queue.is_empty());
         assert!(app.extension_custom_overlay.is_none());
@@ -5258,7 +5250,10 @@ mod stream_delta_batcher_tests {
         });
         assert_eq!(app.agent_state, AgentState::Processing);
         assert_eq!(app.messages.len(), 1);
-        assert_eq!(app.displayed_session_id.as_deref(), Some(old_session_id.as_str()));
+        assert_eq!(
+            app.displayed_session_id.as_deref(),
+            Some(old_session_id.as_str())
+        );
 
         let _ = app.handle_pi_message(PiMsg::ConversationReset {
             session_id: replacement_session_id.clone(),
@@ -5372,17 +5367,19 @@ mod stream_delta_batcher_tests {
         assert!(exhausted.is_none());
         assert_eq!(app.agent_state, AgentState::Processing);
         assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].content, "session B persisted transcript");
         assert_eq!(
-            app.messages[0].content,
-            "session B persisted transcript"
+            app.displayed_session_id.as_deref(),
+            Some(session_id.as_str())
         );
-        assert_eq!(app.displayed_session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(app.current_response, "session B partial response");
         assert_eq!(app.current_thinking, "session B partial thinking");
         assert_eq!(app.current_tool.as_deref(), Some("session-b-tool"));
         assert_eq!(app.current_tool_id.as_deref(), Some("session-b-tool-id"));
         assert_eq!(
-            app.current_tool_summary.get("session-b-tool-id").map(String::as_str),
+            app.current_tool_summary
+                .get("session-b-tool-id")
+                .map(String::as_str),
             Some("session B invocation")
         );
         assert!(app.abort_handle.is_some());
@@ -5612,11 +5609,10 @@ mod stream_delta_batcher_tests {
                     asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
                         .await
                         .expect("lock session");
-                let root_id =
-                    session_guard.append_message(crate::session::SessionMessage::User {
-                        content: crate::model::UserContent::Text("root".to_string()),
-                        timestamp: Some(0),
-                    });
+                let root_id = session_guard.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text("root".to_string()),
+                    timestamp: Some(0),
+                });
                 let current_leaf_id =
                     session_guard.append_message(crate::session::SessionMessage::User {
                         content: crate::model::UserContent::Text("current".to_string()),
@@ -5661,7 +5657,10 @@ mod stream_delta_batcher_tests {
             None,
         );
 
-        assert!(!switched, "a busy Agent must reject the entire branch switch");
+        assert!(
+            !switched,
+            "a busy Agent must reject the entire branch switch"
+        );
         assert_eq!(app.status_message.as_deref(), Some("Agent busy; try again"));
         assert_eq!(
             serde_json::to_value(agent_guard.messages()).expect("serialize agent history"),
@@ -5877,15 +5876,13 @@ mod stream_delta_batcher_tests {
     }
 
     fn active_capability(app: &PiApp) -> Option<(String, u64, u64)> {
-        app.capability_prompt
-            .as_ref()
-            .map(|prompt| {
-                (
-                    prompt.request.id.clone(),
-                    prompt.generation,
-                    prompt.timer_generation(),
-                )
-            })
+        app.capability_prompt.as_ref().map(|prompt| {
+            (
+                prompt.request.id.clone(),
+                prompt.generation,
+                prompt.timer_generation(),
+            )
+        })
     }
 
     fn force_capability_deadline_elapsed(app: &mut PiApp, id: &str) {
@@ -5973,10 +5970,7 @@ mod stream_delta_batcher_tests {
             .is_none()
         );
         let survived = active_capability(&app).expect("live prompt untouched by stale wakes");
-        assert_eq!(
-            survived,
-            (second_id.clone(), second_gen, second_timer_gen)
-        );
+        assert_eq!(survived, (second_id.clone(), second_gen, second_timer_gen));
 
         // Correct final resolution empties everything; no successor exists.
         force_capability_deadline_elapsed(&mut app, &second_id);
@@ -6046,7 +6040,10 @@ mod stream_delta_batcher_tests {
         );
         assert!(!first_response.cancelled);
         assert!(!manager.ui_request_is_pending("timeout-first"));
-        assert!(successor_wake.is_some(), "second prompt owns the active tick");
+        assert!(
+            successor_wake.is_some(),
+            "second prompt owns the active tick"
+        );
         assert_eq!(
             active_capability(&app).map(|active| active.0),
             Some("timeout-second".to_string())
@@ -6128,7 +6125,10 @@ mod stream_delta_batcher_tests {
             let delivered = runtime().block_on(async {
                 assert!(futures::poll!(attempt.as_mut()).is_pending());
                 let cx = Cx::for_request();
-                ui_rx.recv(&cx).await.expect("manager publishes capability prompt")
+                ui_rx
+                    .recv(&cx)
+                    .await
+                    .expect("manager publishes capability prompt")
             });
             assert!(manager.ui_request_is_pending(&delivered.id));
             wakes.push(
@@ -6194,9 +6194,7 @@ mod stream_delta_batcher_tests {
             .capability_prompt_queue
             .front_mut()
             .expect("second prompt queues");
-        queued.expires_at = Some(
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
-        );
+        queued.expires_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
         let prompt_generation = queued.generation;
         let timer_generation = queued.timer_generation();
 
@@ -6342,11 +6340,8 @@ mod stream_delta_batcher_tests {
         app.capability_prompt
             .as_mut()
             .expect("prompt activates")
-            .expires_at = Some(
-                std::time::Instant::now() + std::time::Duration::from_secs(30),
-            );
-        let (id, generation, timer_generation) =
-            active_capability(&app).expect("prompt activates");
+            .expires_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        let (id, generation, timer_generation) = active_capability(&app).expect("prompt activates");
 
         let next_tick = app.handle_pi_message(PiMsg::CapabilityPromptTick {
             id: id.clone(),
@@ -6354,7 +6349,10 @@ mod stream_delta_batcher_tests {
             timer_generation,
         });
 
-        assert!(next_tick.is_some(), "a live prompt schedules its next repaint");
+        assert!(
+            next_tick.is_some(),
+            "a live prompt schedules its next repaint"
+        );
         let rearmed = active_capability(&app).expect("prompt remains active");
         assert_eq!(rearmed.0, id);
         assert_eq!(rearmed.1, generation);
@@ -6387,19 +6385,18 @@ mod stream_delta_batcher_tests {
         assert_eq!(prompt.remaining_secs(base), Some(1));
         prompt.expires_at = Some(base + std::time::Duration::from_secs(1));
         assert_eq!(prompt.remaining_secs(base), Some(1));
-        prompt.expires_at = Some(
-            base + std::time::Duration::from_secs(1) + std::time::Duration::from_nanos(1),
-        );
+        prompt.expires_at =
+            Some(base + std::time::Duration::from_secs(1) + std::time::Duration::from_nanos(1));
         assert_eq!(prompt.remaining_secs(base), Some(2));
         prompt.expires_at = Some(base + std::time::Duration::from_secs(2));
-        let prompt = app.capability_prompt.as_ref().expect("prompt remains active");
+        let prompt = app
+            .capability_prompt
+            .as_ref()
+            .expect("prompt remains active");
 
         let initial = app.render_capability_prompt_at(prompt, 0, base);
-        let next = app.render_capability_prompt_at(
-            prompt,
-            0,
-            base + std::time::Duration::from_secs(1),
-        );
+        let next =
+            app.render_capability_prompt_at(prompt, 0, base + std::time::Duration::from_secs(1));
 
         assert!(initial.contains("Auto-deny in 2s"), "{initial}");
         assert!(next.contains("Auto-deny in 1s"), "{next}");
@@ -6449,7 +6446,9 @@ mod stream_delta_batcher_tests {
         let mut app = build_test_app();
         let wake = app
             .handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
-                "cancel-tick", "ext-tick", "exec",
+                "cancel-tick",
+                "ext-tick",
+                "exec",
             )))
             .expect("bounded prompt schedules a wake");
 
