@@ -312,6 +312,10 @@ impl PiApp {
         // Fast path: no summary + no extensions. Keep it synchronous so unit tests can drive it
         // without running the async runtime.
         if !summary_requested && self.extensions.is_none() {
+            let Ok(mut agent_guard) = self.agent.try_lock() else {
+                self.status_message = Some("Agent busy; try again".to_string());
+                return false;
+            };
             let Ok(mut session_guard) = self.session.try_lock() else {
                 self.status_message = Some("Session busy; try again".to_string());
                 return false;
@@ -332,11 +336,9 @@ impl PiApp {
                 .new_leaf_id
                 .clone()
                 .unwrap_or_else(|| "root".to_string());
+            agent_guard.replace_messages(agent_messages);
             drop(session_guard);
-
-            if let Ok(mut agent_guard) = self.agent.try_lock() {
-                agent_guard.replace_messages(agent_messages);
-            }
+            drop(agent_guard);
 
             self.messages = messages;
             self.message_render_cache.clear();
@@ -448,92 +450,80 @@ impl PiApp {
             let mut summary_entry_payload: Option<Value> = None;
             let mut summary_entry_id: Option<String> = None;
 
-            let messages_for_agent = {
-                let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-
-                if let Some(target_id) = &pending.new_leaf_id {
-                    if !guard.navigate_to(target_id) {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                            PiMsg::AgentError(format!("Branch target not found: {target_id}")),
-                        )
-                        .await;
-                        return;
-                    }
-                } else {
-                    guard.reset_leaf();
+            // Keep Agent and Session branch histories atomic. Acquiring Agent
+            // first matches every full-session transition; no Session bytes
+            // change if the second lock cannot be acquired.
+            let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                    )
+                    .await;
+                    return;
                 }
-
-                if let Some(summary_text) = summary_text {
-                    let summary_clone = summary_text.clone();
-                    guard.append_branch_summary(
-                        pending.summary_from_id.clone(),
-                        summary_text,
-                        None,
-                        None,
-                    );
-                    summary_entry_id = guard.leaf_id.clone();
-                    let mut summary_entry = serde_json::Map::new();
-                    summary_entry.insert(
-                        "type".to_string(),
-                        Value::String("branch_summary".to_string()),
-                    );
-                    summary_entry.insert(
-                        "fromId".to_string(),
-                        Value::String(pending.summary_from_id.clone()),
-                    );
-                    summary_entry.insert("summary".to_string(), Value::String(summary_clone));
-                    summary_entry.insert("fromHook".to_string(), Value::Bool(false));
-                    summary_entry_payload = Some(Value::Object(summary_entry));
+            };
+            let mut session_guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                    )
+                    .await;
+                    return;
                 }
-
-                let _ = guard.save().await;
-                guard.to_messages_for_current_path()
             };
 
-            {
-                let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                agent_guard.replace_messages(messages_for_agent);
+            if let Some(target_id) = &pending.new_leaf_id {
+                if !session_guard.navigate_to(target_id) {
+                    drop(session_guard);
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::AgentError(format!("Branch target not found: {target_id}")),
+                    )
+                    .await;
+                    return;
+                }
+            } else {
+                session_guard.reset_leaf();
             }
 
-            let (messages, usage) = {
-                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                conversation_from_session(&guard)
-            };
+            if let Some(summary_text) = summary_text {
+                let summary_clone = summary_text.clone();
+                session_guard.append_branch_summary(
+                    pending.summary_from_id.clone(),
+                    summary_text,
+                    None,
+                    None,
+                );
+                summary_entry_id = session_guard.leaf_id.clone();
+                let mut summary_entry = serde_json::Map::new();
+                summary_entry.insert(
+                    "type".to_string(),
+                    Value::String("branch_summary".to_string()),
+                );
+                summary_entry.insert(
+                    "fromId".to_string(),
+                    Value::String(pending.summary_from_id.clone()),
+                );
+                summary_entry.insert("summary".to_string(), Value::String(summary_clone));
+                summary_entry.insert("fromHook".to_string(), Value::Bool(false));
+                summary_entry_payload = Some(Value::Object(summary_entry));
+            }
+
+            let messages_for_agent = session_guard.to_messages_for_current_path();
+            let (messages, usage) = conversation_from_session(&session_guard);
+            agent_guard.replace_messages(messages_for_agent);
+            drop(agent_guard);
+            let _ = session_guard.save().await;
+            drop(session_guard);
 
             let status = if summary_skipped {
                 Some(format!(

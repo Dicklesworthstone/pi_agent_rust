@@ -1455,6 +1455,7 @@ impl PiApp {
                         &event_tx,
                         &completion_cx,
                         PiMsg::ConversationReset {
+                            session_id: expected_session_id.clone(),
                             messages,
                             usage,
                             status: Some(status),

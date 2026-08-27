@@ -2132,6 +2132,8 @@ impl PiApp {
                     self.current_response.clear();
                     self.current_thinking.clear();
                     self.current_tool = None;
+                    self.current_tool_id = None;
+                    self.current_tool_summary.clear();
                     self.todo_summary = None;
                     self.pending_tool_output = None;
                     self.abort_handle = None;
@@ -2141,6 +2143,7 @@ impl PiApp {
                     self.displayed_session_id = Some(new_session_id);
                     self.session_picker = None;
                     self.tree_ui = None;
+                    self.drain_capability_prompts_for_session_reset();
                     self.autocomplete.close();
                     self.message_render_cache.clear();
 

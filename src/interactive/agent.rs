@@ -1265,10 +1265,14 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.status_message = None;
             }
             PiMsg::ConversationReset {
+                session_id,
                 messages,
                 usage,
                 status,
             } => {
+                let is_replacement =
+                    self.displayed_session_id.as_deref() != Some(session_id.as_str());
+                self.displayed_session_id = Some(session_id);
                 self.messages = messages;
                 self.total_usage = usage;
                 self.current_response.clear();
@@ -1278,9 +1282,12 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.current_tool_id = None;
                 self.current_tool_summary.clear();
                 self.abort_handle = None;
-                self.title_requested = false;
-                self.todo_summary = None;
-                self.pending_oauth = None;
+                if is_replacement {
+                    self.title_requested = false;
+                    self.todo_summary = None;
+                    self.pending_oauth = None;
+                    self.role_model_overrides.clear();
+                }
                 self.status_message = status;
                 self.message_render_cache.clear();
                 // Session replacement invalidates outstanding prompts: drop
@@ -1292,7 +1299,13 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.scroll_to_bottom();
                 self.input.focus();
             }
-            PiMsg::SetEditorText(text) => {
+            PiMsg::SetEditorText {
+                owner_session_id,
+                text,
+            } => {
+                if !self.event_session_is_current(&owner_session_id) {
+                    return None;
+                }
                 self.input.set_value(&text);
                 self.input.focus();
             }
@@ -1674,7 +1687,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// each is answered cancelled so manager pending entries clear promptly
     /// and hostcalls fail closed. Dropped prompts are never answered allow
     /// and persistent permission state is untouched (bd-yllbn).
-    fn drain_capability_prompts_for_session_reset(&mut self) {
+    pub(super) fn drain_capability_prompts_for_session_reset(&mut self) {
         let mut dropped = std::mem::take(&mut self.capability_prompt_queue);
         if let Some(active) = self.capability_prompt.take() {
             dropped.push_front(active);
@@ -4864,6 +4877,10 @@ mod stream_delta_batcher_tests {
         let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app.title_requested = true;
         app.todo_summary = Some("1 todo pending".to_string());
+        app.role_model_overrides.insert(
+            crate::models::ModelRole::Smol,
+            ("fixture-provider".to_string(), "fixture-model".to_string()),
+        );
         let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
             provider: "fixture-provider".to_string(),
             device_code: "device-code".to_string(),
@@ -4872,8 +4889,16 @@ mod stream_delta_batcher_tests {
             expires_in: 300,
         });
         assert!(app.pending_oauth.is_some());
+        let replacement_session_id = "replacement-session".to_string();
+        app.session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone_from(&replacement_session_id);
 
         let _ = app.handle_pi_message(PiMsg::ConversationReset {
+            session_id: replacement_session_id,
             messages: Vec::new(),
             usage: Usage::default(),
             status: Some("Session replaced".to_string()),
@@ -4891,6 +4916,47 @@ mod stream_delta_batcher_tests {
             app.pending_oauth.is_none(),
             "the previous session's OAuth continuation must not leak"
         );
+        assert!(
+            app.role_model_overrides.is_empty(),
+            "the previous session's role model overrides must not leak"
+        );
+    }
+
+    #[test]
+    fn same_session_conversation_reset_preserves_session_scoped_ui_state() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        app.title_requested = true;
+        app.todo_summary = Some("1 todo pending".to_string());
+        app.role_model_overrides.insert(
+            crate::models::ModelRole::Smol,
+            ("fixture-provider".to_string(), "fixture-model".to_string()),
+        );
+        let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
+            provider: "fixture-provider".to_string(),
+            device_code: "device-code".to_string(),
+            user_code: "user-code".to_string(),
+            verification_uri: "https://example.test/device".to_string(),
+            expires_in: 300,
+        });
+        let session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
+
+        let _ = app.handle_pi_message(PiMsg::ConversationReset {
+            session_id,
+            messages: Vec::new(),
+            usage: Usage::default(),
+            status: Some("Conversation compacted".to_string()),
+        });
+
+        assert!(app.title_requested);
+        assert_eq!(app.todo_summary.as_deref(), Some("1 todo pending"));
+        assert!(app.pending_oauth.is_some());
+        assert_eq!(app.role_model_overrides.len(), 1);
     }
 
     #[test]
@@ -4938,7 +5004,7 @@ mod stream_delta_batcher_tests {
         next.model.reasoning = false;
         app.available_models.push(next.clone());
 
-        runtime().block_on(async {
+        let session_id = runtime().block_on(async {
             let cx = Cx::for_request();
             let mut session_guard =
                 asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
@@ -4947,9 +5013,11 @@ mod stream_delta_batcher_tests {
             session_guard.header.provider = Some(next.model.provider.clone());
             session_guard.header.model_id = Some(next.model.id.clone());
             session_guard.header.thinking_level = Some("high".to_string());
+            session_guard.header.id.clone()
         });
 
         let _ = app.handle_pi_message(PiMsg::ConversationReset {
+            session_id,
             messages: Vec::new(),
             usage: Usage::default(),
             status: Some("Session resumed".to_string()),
@@ -5388,8 +5456,16 @@ mod stream_delta_batcher_tests {
         )));
         assert!(active_capability(&app).is_some());
         assert_eq!(app.capability_prompt_queue.len(), 2);
+        let session_id = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .header
+            .id
+            .clone();
 
         app.handle_pi_message(PiMsg::ConversationReset {
+            session_id,
             messages: Vec::new(),
             usage: Usage::default(),
             status: Some("session reset".to_string()),
