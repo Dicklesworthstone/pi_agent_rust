@@ -1172,7 +1172,7 @@ async fn rpc_session_transition_blocker(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn acquire_rpc_session_transition_after_hook(
+async fn acquire_rpc_session_transition(
     baseline: &RpcSessionTransitionSnapshot,
     is_streaming: &AtomicBool,
     is_compacting: &AtomicBool,
@@ -3723,7 +3723,7 @@ pub async fn run(
                     ));
                     continue;
                 }
-                let session_transition_permit = match acquire_rpc_session_transition_after_hook(
+                let session_transition_permit = match acquire_rpc_session_transition(
                     &transition_baseline,
                     &is_streaming,
                     &is_compacting,
@@ -3801,6 +3801,7 @@ pub async fn run(
                     guard.refresh_extension_completion_host_state();
                     state.clear_all_pending();
                     state.clear_failover_lifecycle();
+                    session_transition_permit.commit_session_change();
 
                     Ok((session_id, previous_session_file))
                 }
@@ -3868,7 +3869,7 @@ pub async fn run(
                     ));
                     continue;
                 }
-                let session_transition_permit = match acquire_rpc_session_transition_after_hook(
+                let session_transition_permit = match acquire_rpc_session_transition(
                     &transition_baseline,
                     &is_streaming,
                     &is_compacting,
@@ -4041,6 +4042,7 @@ pub async fn run(
                             }
                             state.clear_all_pending();
                             state.clear_failover_lifecycle();
+                            session_transition_permit.commit_session_change();
                             Ok((previous_session_file, session_id))
                         }
                         .await;
@@ -4100,6 +4102,14 @@ pub async fn run(
                     let _ = out_tx.send(response_error(id, "fork", "Missing entryId".to_string()));
                     continue;
                 };
+                let transition_baseline = match rpc_session_transition_snapshot(&session, &cx).await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "fork", &err));
+                        continue;
+                    }
+                };
 
                 let result: Result<String> = async {
                     // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
@@ -4145,6 +4155,17 @@ pub async fn run(
                     // Phase 3: prepare and persist the complete target runtime,
                     // then atomically install Session + agent model state.
                     {
+                        let session_transition_permit = acquire_rpc_session_transition(
+                            &transition_baseline,
+                            &is_streaming,
+                            &is_compacting,
+                            &turn_phase_linearizer,
+                            &session,
+                            &shared_state,
+                            &bash_state,
+                            &cx,
+                        )
+                        .await?;
                         let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                             .await
                             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
@@ -4215,7 +4236,6 @@ pub async fn run(
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
                         guard.invalidate_background_compaction();
-                        let _provider_transition = state.provider_admission.acquire(&cx).await?;
                         state.provider_admission.ensure_allowed()?;
                         let session_store = Arc::clone(&guard.session);
                         let mut inner = OwnedMutexGuard::lock(session_store, &cx)
@@ -4260,6 +4280,7 @@ pub async fn run(
                         }
                         state.clear_all_pending();
                         state.clear_failover_lifecycle();
+                        session_transition_permit.commit_session_change();
                     }
 
                     Ok(selected_text)
@@ -14968,7 +14989,7 @@ export default function init(pi) {
                 );
             }
 
-            let err = match acquire_rpc_session_transition_after_hook(
+            let err = match acquire_rpc_session_transition(
                 &baseline,
                 &AtomicBool::new(false),
                 &AtomicBool::new(false),
