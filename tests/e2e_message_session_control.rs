@@ -22,7 +22,7 @@ use pi::compaction::ResolvedCompactionSettings;
 use pi::error::Result;
 use pi::extensions::{
     ExtensionHostActions, ExtensionManager, ExtensionSendMessage, ExtensionSendUserMessage,
-    ExtensionSession, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    ExtensionSession, JsExtensionLoadSpec, JsExtensionRuntimeHandle, SessionActionOrigin,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::model::{
@@ -49,11 +49,19 @@ struct RecordingHostActions {
 
 #[async_trait]
 impl ExtensionHostActions for RecordingHostActions {
-    async fn send_message(&self, message: ExtensionSendMessage) -> Result<()> {
+    async fn send_message(
+        &self,
+        message: ExtensionSendMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.messages.lock().unwrap().push(message);
         Ok(())
     }
-    async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()> {
+    async fn send_user_message(
+        &self,
+        message: ExtensionSendUserMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.user_messages.lock().unwrap().push(message);
         Ok(())
     }

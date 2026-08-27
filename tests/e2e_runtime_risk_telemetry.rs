@@ -65,6 +65,7 @@ fn e2e_runtime_hostcall_telemetry_logs_required_fields() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

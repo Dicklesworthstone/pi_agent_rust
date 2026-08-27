@@ -84,6 +84,7 @@ fn e2e_baseline_deterministic_from_benign_traces() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -187,6 +188,7 @@ fn e2e_baseline_multi_capability_profiles() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -312,6 +314,7 @@ fn e2e_drift_detection_adversarial_shift() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -458,6 +461,7 @@ fn e2e_markov_transition_anomaly() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -572,6 +576,7 @@ fn e2e_baseline_artifact_roundtrip() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -653,6 +658,7 @@ fn e2e_baseline_jsonl_schema_compliance() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

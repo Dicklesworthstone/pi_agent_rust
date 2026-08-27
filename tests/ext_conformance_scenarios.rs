@@ -15,7 +15,7 @@ use pi::conformance::normalization::{is_path_key, path_suffix_match};
 use pi::extensions::{
     ExtensionAiCompletionRequest, ExtensionHostActions, ExtensionManager, ExtensionPolicy,
     ExtensionPolicyMode, ExtensionSendMessage, ExtensionSendUserMessage, ExtensionSession,
-    HostcallInterceptor, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    HostcallInterceptor, JsExtensionLoadSpec, JsExtensionRuntimeHandle, SessionActionOrigin,
 };
 use pi::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntimeConfig};
 use pi::resources::{
@@ -1952,12 +1952,20 @@ impl ExtensionSession for ConformanceSession {
         self.branch.lock().unwrap().clone()
     }
 
-    async fn set_name(&self, name: String) -> pi::error::Result<()> {
+    async fn set_name(
+        &self,
+        name: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         *self.name.lock().unwrap() = Some(name);
         Ok(())
     }
 
-    async fn append_message(&self, message: SessionMessage) -> pi::error::Result<()> {
+    async fn append_message(
+        &self,
+        message: SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         self.messages.lock().unwrap().push(message);
         Ok(())
     }
@@ -1966,6 +1974,7 @@ impl ExtensionSession for ConformanceSession {
         &self,
         custom_type: String,
         data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
     ) -> pi::error::Result<()> {
         self.entries.lock().unwrap().push(serde_json::json!({
             "type": custom_type,
@@ -1974,7 +1983,12 @@ impl ExtensionSession for ConformanceSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> pi::error::Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         *self.model.lock().unwrap() = (Some(provider), Some(model_id));
         Ok(())
     }
@@ -1983,7 +1997,11 @@ impl ExtensionSession for ConformanceSession {
         self.model.lock().unwrap().clone()
     }
 
-    async fn set_thinking_level(&self, level: String) -> pi::error::Result<()> {
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         *self.thinking_level.lock().unwrap() = Some(level);
         Ok(())
     }
@@ -1992,7 +2010,12 @@ impl ExtensionSession for ConformanceSession {
         self.thinking_level.lock().unwrap().clone()
     }
 
-    async fn set_label(&self, target_id: String, label: Option<String>) -> pi::error::Result<()> {
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         self.labels.lock().unwrap().push((target_id, label));
         Ok(())
     }
@@ -3813,11 +3836,19 @@ impl CompactBridgeSpyHostActions {
 
 #[async_trait]
 impl ExtensionHostActions for CompactBridgeSpyHostActions {
-    async fn send_message(&self, _message: ExtensionSendMessage) -> pi::error::Result<()> {
+    async fn send_message(
+        &self,
+        _message: ExtensionSendMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
-    async fn send_user_message(&self, _message: ExtensionSendUserMessage) -> pi::error::Result<()> {
+    async fn send_user_message(
+        &self,
+        _message: ExtensionSendUserMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -4130,11 +4161,19 @@ impl PiAiProviderBridgeHostActions {
 
 #[async_trait]
 impl ExtensionHostActions for PiAiProviderBridgeHostActions {
-    async fn send_message(&self, _message: ExtensionSendMessage) -> pi::error::Result<()> {
+    async fn send_message(
+        &self,
+        _message: ExtensionSendMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
-    async fn send_user_message(&self, _message: ExtensionSendUserMessage) -> pi::error::Result<()> {
+    async fn send_user_message(
+        &self,
+        _message: ExtensionSendUserMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 

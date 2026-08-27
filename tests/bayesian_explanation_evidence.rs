@@ -103,6 +103,7 @@ fn setup_context<'a>(
         manager: Some(manager.clone()),
         policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     }
 }

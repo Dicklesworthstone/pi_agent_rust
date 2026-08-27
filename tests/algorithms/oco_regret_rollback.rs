@@ -102,6 +102,7 @@ fn run_quota_loss_scenario(rollback_loss_threshold: f64) -> OcoRun {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

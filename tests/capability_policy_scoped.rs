@@ -53,6 +53,7 @@ fn make_ctx<'a>(
         manager: None,
         policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     }
 }
@@ -72,6 +73,7 @@ fn make_ctx_with_manager<'a>(
         manager: Some(manager),
         policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     }
 }

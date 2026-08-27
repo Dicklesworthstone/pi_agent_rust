@@ -80,6 +80,7 @@ fn make_ctx<'a>(
         manager: Some(manager.clone()),
         policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     }
 }
@@ -819,6 +820,7 @@ fn shadow_mode_allows_all_calls_but_records_telemetry() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -898,6 +900,7 @@ fn shadow_mode_vs_enforced_mode_telemetry_comparison() {
         manager: Some(manager_e.clone()),
         policy: &policy_e,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -922,6 +925,7 @@ fn shadow_mode_vs_enforced_mode_telemetry_comparison() {
         manager: Some(manager_s.clone()),
         policy: &policy_s,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -1300,6 +1304,7 @@ fn shadow_mode_toggle_at_runtime() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

@@ -113,6 +113,7 @@ fn e2e_quantile_harden_flow_with_evidence() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -282,6 +283,7 @@ fn e2e_quantile_quarantine_escalation_with_replay() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -383,6 +385,7 @@ fn e2e_quantile_recovery_flow_with_calibration() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -509,6 +512,7 @@ fn e2e_quantile_budget_enforcement_fail_closed() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -616,6 +620,7 @@ fn e2e_quantile_feature_stability_across_window_fill() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -723,6 +728,7 @@ fn e2e_quantile_conformal_determinism() {
             manager: Some(manager.clone()),
             policy: &policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
 

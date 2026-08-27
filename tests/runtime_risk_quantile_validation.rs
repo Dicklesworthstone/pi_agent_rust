@@ -80,6 +80,7 @@ fn e2e_harden_flow_deterministic_replay() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -209,6 +210,7 @@ fn e2e_quarantine_flow_deterministic() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -294,6 +296,7 @@ fn e2e_calibration_produces_reproducible_artifacts() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -425,6 +428,7 @@ fn e2e_feature_vectors_deterministic_across_replays() {
             manager: Some(manager.clone()),
             policy: &policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
 
@@ -524,6 +528,7 @@ fn e2e_ledger_integrity_after_truncation() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -605,6 +610,7 @@ fn e2e_recovery_flow_score_trajectory() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -741,6 +747,7 @@ fn e2e_conformal_residual_drift_detection() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -843,6 +850,7 @@ fn e2e_structured_jsonl_log_schema_compliance() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 

@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use pi::PiResult;
 use pi::extensions::{
     ExtensionManager, ExtensionSession, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    SessionActionOrigin,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::session::SessionMessage;
@@ -203,7 +204,7 @@ impl ExtensionSession for ConformanceMockSession {
         result
     }
 
-    async fn set_name(&self, name: String) -> PiResult<()> {
+    async fn set_name(&self, name: String, _origin: Option<SessionActionOrigin>) -> PiResult<()> {
         self.capture
             .record("set_name", Some(serde_json::json!({ "name": name })), None);
         self.name_history.lock().unwrap().push(name.clone());
@@ -214,14 +215,23 @@ impl ExtensionSession for ConformanceMockSession {
         Ok(())
     }
 
-    async fn append_message(&self, message: SessionMessage) -> PiResult<()> {
+    async fn append_message(
+        &self,
+        message: SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> PiResult<()> {
         self.capture
             .record("append_message", serde_json::to_value(&message).ok(), None);
         self.appended_messages.lock().unwrap().push(message);
         Ok(())
     }
 
-    async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> PiResult<()> {
+    async fn append_custom_entry(
+        &self,
+        custom_type: String,
+        data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> PiResult<()> {
         self.capture.record(
             "append_custom_entry",
             Some(serde_json::json!({
@@ -237,7 +247,12 @@ impl ExtensionSession for ConformanceMockSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> PiResult<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> PiResult<()> {
         self.capture.record(
             "set_model",
             Some(serde_json::json!({
@@ -263,7 +278,11 @@ impl ExtensionSession for ConformanceMockSession {
         result
     }
 
-    async fn set_thinking_level(&self, level: String) -> PiResult<()> {
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> PiResult<()> {
         self.capture.record(
             "set_thinking_level",
             Some(serde_json::json!({ "level": level })),
@@ -280,7 +299,12 @@ impl ExtensionSession for ConformanceMockSession {
         result
     }
 
-    async fn set_label(&self, target_id: String, label: Option<String>) -> PiResult<()> {
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> PiResult<()> {
         self.capture.record(
             "set_label",
             Some(serde_json::json!({
@@ -608,12 +632,18 @@ fn mock_session_captures_mutations() {
     common::run_async({
         let s = Arc::clone(&session);
         async move {
-            s.set_name("new-name".to_string()).await.unwrap();
-            s.set_model("openai".to_string(), "gpt-4".to_string())
+            s.set_name("new-name".to_string(), None).await.unwrap();
+            s.set_model("openai".to_string(), "gpt-4".to_string(), None)
                 .await
                 .unwrap();
-            s.set_thinking_level("high".to_string()).await.unwrap();
-            s.set_label("msg-123".to_string(), Some("important".to_string()))
+            s.set_thinking_level("high".to_string(), None)
+                .await
+                .unwrap();
+            s.set_label(
+                "msg-123".to_string(),
+                Some("important".to_string()),
+                None,
+            )
                 .await
                 .unwrap();
         }

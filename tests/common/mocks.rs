@@ -11,7 +11,9 @@
 use async_trait::async_trait;
 use pi::error::Result;
 use pi::extension_dispatcher::ExtensionUiHandler;
-use pi::extensions::{ExtensionSession, ExtensionUiRequest, ExtensionUiResponse};
+use pi::extensions::{
+    ExtensionSession, ExtensionUiRequest, ExtensionUiResponse, SessionActionOrigin,
+};
 use pi::session::SessionMessage;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -471,7 +473,7 @@ impl ExtensionSession for RecordingSession {
         self.branch.lock().unwrap().clone()
     }
 
-    async fn set_name(&self, name: String) -> Result<()> {
+    async fn set_name(&self, name: String, _origin: Option<SessionActionOrigin>) -> Result<()> {
         self.record_call("set_name", serde_json::json!({ "name": name }));
         let mut state = self.state.lock().unwrap();
         if let Value::Object(ref mut map) = *state {
@@ -480,7 +482,11 @@ impl ExtensionSession for RecordingSession {
         Ok(())
     }
 
-    async fn append_message(&self, message: SessionMessage) -> Result<()> {
+    async fn append_message(
+        &self,
+        message: SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.record_call(
             "append_message",
             serde_json::json!({ "variant": format!("{message:?}").chars().take(80).collect::<String>() }),
@@ -489,7 +495,12 @@ impl ExtensionSession for RecordingSession {
         Ok(())
     }
 
-    async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()> {
+    async fn append_custom_entry(
+        &self,
+        custom_type: String,
+        data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.record_call(
             "append_custom_entry",
             serde_json::json!({ "type": custom_type, "data": data }),
@@ -501,7 +512,12 @@ impl ExtensionSession for RecordingSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.record_call(
             "set_model",
             serde_json::json!({ "provider": provider, "model_id": model_id }),
@@ -528,7 +544,11 @@ impl ExtensionSession for RecordingSession {
         (provider, model_id)
     }
 
-    async fn set_thinking_level(&self, level: String) -> Result<()> {
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.record_call("set_thinking_level", serde_json::json!({ "level": level }));
         let mut state = self.state.lock().unwrap();
         if let Value::Object(ref mut map) = *state {
@@ -546,7 +566,12 @@ impl ExtensionSession for RecordingSession {
             .map(String::from)
     }
 
-    async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> Result<()> {
         self.record_call(
             "set_label",
             serde_json::json!({ "target_id": target_id, "label": label }),
@@ -932,17 +957,22 @@ mod tests {
         run_async({
             let s = Arc::clone(&session);
             async move {
-                s.set_name("test-session".to_string()).await.unwrap();
-                s.set_model("anthropic".to_string(), "claude-3".to_string())
+                s.set_name("test-session".to_string(), None).await.unwrap();
+                s.set_model("anthropic".to_string(), "claude-3".to_string(), None)
                     .await
                     .unwrap();
                 s.append_custom_entry(
                     "bookmark".to_string(),
                     Some(serde_json::json!({"url": "https://example.com"})),
+                    None,
                 )
                 .await
                 .unwrap();
-                s.set_label("entry-1".to_string(), Some("important".to_string()))
+                s.set_label(
+                    "entry-1".to_string(),
+                    Some("important".to_string()),
+                    None,
+                )
                     .await
                     .unwrap();
             }
@@ -1127,7 +1157,7 @@ mod tests {
         run_async({
             let s = Arc::clone(&session);
             async move {
-                s.set_name("tracked".to_string()).await.unwrap();
+                s.set_name("tracked".to_string(), None).await.unwrap();
             }
         });
 

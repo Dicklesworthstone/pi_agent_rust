@@ -80,6 +80,7 @@ fn run_golden_trace(
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -503,6 +504,7 @@ fn golden_telemetry_ledger_agreement() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
@@ -595,6 +597,7 @@ fn golden_score_escalation_pattern() {
         manager: Some(manager.clone()),
         policy: &policy,
         js_runtime: None,
+        session_action_origin: None,
         interceptor: None,
     };
 
