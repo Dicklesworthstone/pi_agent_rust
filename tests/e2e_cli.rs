@@ -2015,6 +2015,51 @@ fn e2e_cli_config_show_lists_discovered_package_resources() {
 }
 
 #[test]
+fn e2e_cli_startup_surfaces_configured_resource_failures() {
+    let mut harness = CliTestHarness::new("e2e_cli_startup_surfaces_configured_resource_failures");
+    harness.env.remove("PI_CONFIG_PATH");
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
+
+    let package_root = harness.harness.create_dir("diagnostic-pkg");
+    let skill = package_root.join("skills/oversized-skill/SKILL.md");
+    let prompt = package_root.join("prompts/oversized-prompt.md");
+    let theme = package_root.join("themes/oversized-theme.ini");
+    for path in [&skill, &prompt, &theme] {
+        fs::create_dir_all(path.parent().expect("resource parent")).expect("create resource dir");
+        let file = fs::File::create(path).expect("create oversized resource");
+        file.set_len(2 * 1024 * 1024)
+            .expect("extend oversized resource");
+    }
+    let project_settings = harness.harness.temp_dir().join(".pi/settings.json");
+    fs::create_dir_all(project_settings.parent().expect("settings parent"))
+        .expect("create settings dir");
+    fs::write(
+        &project_settings,
+        serde_json::to_vec_pretty(&json!({"packages": ["diagnostic-pkg"]}))
+            .expect("serialize settings"),
+    )
+    .expect("write settings");
+
+    let result = harness.run(&["--list-models"]);
+    assert_exit_code(&harness.harness, &result, 0);
+    for (label, path) in [
+        ("skill resource diagnostic", &skill),
+        ("prompt template resource diagnostic", &prompt),
+        ("theme resource diagnostic", &theme),
+    ] {
+        assert_contains(&harness.harness, &result.stderr, label);
+        assert_contains(
+            &harness.harness,
+            &result.stderr,
+            path.file_name().and_then(OsStr::to_str).expect("UTF-8 fixture"),
+        );
+    }
+    assert_contains(&harness.harness, &result.stderr, "resource limit");
+}
+
+#[test]
 fn e2e_cli_config_show_surfaces_invalid_package_settings() {
     let mut harness = CliTestHarness::new("e2e_cli_config_show_surfaces_invalid_package_settings");
     harness.env.remove("PI_CONFIG_PATH");

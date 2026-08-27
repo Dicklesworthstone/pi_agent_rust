@@ -4,8 +4,9 @@
 //! 1. background sleep+echo: tool returns id instantly; completion notice
 //!    arrives in the follow-up drain with the output tail.
 //! 2. cancel mid-run kills the whole process tree (child-spawning script).
-//! 3. `kill_all` (session exit) with 2 running jobs leaves zero survivors.
-//! 4. The concurrency cap rejects the 9th job with `PI_JOBS_AT_CAPACITY`.
+//! 3. Owner-scoped session shutdown kills only that session's jobs.
+//! 4. `kill_all` (process exit) with 2 running jobs leaves zero survivors.
+//! 5. The concurrency cap rejects the 9th job with `PI_JOBS_AT_CAPACITY`.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
 //! recorded as artifacts.
@@ -287,9 +288,66 @@ fn kill_zero(pid: u32) -> bool {
 }
 
 #[test]
-fn session_exit_kills_all_survivors() {
+fn owner_scoped_session_shutdown_preserves_foreign_jobs() {
     let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock"); // ubs:ignore test guard
-    let case = "session_exit_kills_all_survivors";
+    let case = "owner_scoped_session_shutdown_preserves_foreign_jobs";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner_a = format!("jobs-shutdown-a-{}", uuid::Uuid::new_v4().simple());
+    let owner_b = format!("jobs-shutdown-b-{}", uuid::Uuid::new_v4().simple());
+
+    let first = execute(
+        &bash_tool_for_session(&root, &owner_a),
+        json!({"command": "sleep 300", "background": true, "timeout": 300}),
+    );
+    let second = execute(
+        &bash_tool_for_session(&root, &owner_b),
+        json!({"command": "sleep 300", "background": true, "timeout": 300}),
+    );
+    let first_id = job_id(&first);
+    let second_id = job_id(&second);
+    let first_pid = u32::try_from(
+        first.details.as_ref().expect("first details")["pid"] // ubs:ignore test fixture
+            .as_u64()
+            .expect("first pid"), // ubs:ignore test fixture
+    )
+    .expect("pid fits u32");
+    let second_pid = u32::try_from(
+        second.details.as_ref().expect("second details")["pid"] // ubs:ignore test fixture
+            .as_u64()
+            .expect("second pid"), // ubs:ignore test fixture
+    )
+    .expect("pid fits u32");
+
+    block_on_local(pi::jobs::kill_session(&owner_a)).expect("owner A shutdown");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !kill_zero(first_pid),
+        "owner A job {first_id} survived owner-scoped shutdown"
+    );
+    assert!(
+        kill_zero(second_pid),
+        "foreign owner B job {second_id} was terminated by owner A shutdown"
+    );
+    let owner_a_jobs = pi::jobs::list(&owner_a).expect("owner A list");
+    assert!(owner_a_jobs.iter().any(|job| {
+        job.id == first_id && job.status == pi::jobs::JobStatus::Killed.as_str()
+    }));
+    let owner_b_jobs = pi::jobs::list(&owner_b).expect("owner B list");
+    assert!(owner_b_jobs.iter().any(|job| {
+        job.id == second_id && job.status == pi::jobs::JobStatus::Running.as_str()
+    }));
+
+    block_on_local(pi::jobs::kill_session(&owner_b)).expect("owner B cleanup");
+    let _ = pi::jobs::take_completion_notices(&owner_a);
+    let _ = pi::jobs::take_completion_notices(&owner_b);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn process_exit_kills_all_survivors() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock"); // ubs:ignore test guard
+    let case = "process_exit_kills_all_survivors";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
 

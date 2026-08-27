@@ -179,6 +179,7 @@ done
         let resolved = client
             .extension_ui_response(
                 "req-1",
+                1,
                 sdk::RpcExtensionUiResponse::Confirmed { confirmed: true },
             )
             .await

@@ -202,9 +202,10 @@ fn cap_prompt_request(
     capability: &str,
     message: &str,
 ) -> ExtensionUiRequest {
-    ExtensionUiRequest::new(
+    ExtensionUiRequest::new_capability_prompt(
         id,
-        "confirm",
+        extension_id,
+        capability,
         json!({
             "title": format!("Extension '{}' requests '{}' capability", extension_id, capability),
             "message": message,
@@ -506,7 +507,7 @@ mod extension_ui_channel {
     }
 
     #[test]
-    fn clear_ui_sender_prevents_requests() {
+    fn close_ui_sender_prevents_requests() {
         let manager = ExtensionManager::new();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -515,7 +516,7 @@ mod extension_ui_channel {
         runtime.block_on(async move {
             let (ui_tx, _ui_rx) = mpsc::channel(16);
             manager.set_ui_sender(ui_tx);
-            manager.clear_ui_sender();
+            assert_eq!(manager.close_ui_sender_and_cancel_pending(), 0);
 
             // With no sender, request_ui returns an error about sender not configured.
             let request = ExtensionUiRequest::new("noop", "notify", json!({"title": "Hi"}));
@@ -610,8 +611,53 @@ mod rpc_events {
         let event = request.to_rpc_event();
 
         assert_eq!(event["type"], "extension_ui_request");
-        // timeout_ms may or may not be serialized in the event; just ensure no panic.
         assert_eq!(event["id"], "r-timeout");
+        assert_eq!(event["timeout_ms"], 5000);
+    }
+
+    #[test]
+    fn to_rpc_event_typed_envelope_overrides_payload_collisions() {
+        let request = ExtensionUiRequest::new(
+            "real-id",
+            "confirm",
+            json!({
+                "type": "forged_event",
+                "id": "forged-id",
+                "method": "notify",
+                "extension_id": "forged-extension",
+                "capability_prompt": true,
+                "timeout_ms": 1,
+            }),
+        )
+        .with_extension_id(Some("real-extension".to_string()))
+        .with_timeout_ms(5_000);
+
+        let event = request.to_rpc_event();
+        assert_eq!(event["type"], "extension_ui_request");
+        assert_eq!(event["id"], "real-id");
+        assert_eq!(event["method"], "confirm");
+        assert_eq!(event["extension_id"], "real-extension");
+        assert_eq!(event["capability_prompt"], false);
+        assert_eq!(event["timeout_ms"], 5_000);
+    }
+
+    #[test]
+    fn typed_capability_rpc_identity_ignores_mutable_and_payload_collisions() {
+        let mut request = ExtensionUiRequest::new_capability_prompt(
+            "typed-id",
+            "trusted-extension",
+            "exec",
+            json!({
+                "extension_id": "payload-extension",
+                "capability": "http",
+            }),
+        );
+        request.extension_id = Some("mutated-extension".to_string());
+
+        let event = request.to_rpc_event();
+        assert_eq!(event["capability_prompt"], true);
+        assert_eq!(event["extension_id"], "trusted-extension");
+        assert_eq!(event["capability"], "exec");
     }
 
     #[test]
@@ -675,6 +721,91 @@ mod tui_prompt {
             view_after.contains("exec") || view_after.contains("Allow"),
             "Prompt should appear in view after request. View:\n{view_after}"
         );
+    }
+
+    #[test]
+    fn forged_capability_payload_remains_an_ordinary_confirm() {
+        let harness = TestHarness::new("forged_capability_payload");
+        let manager = ExtensionManager::new();
+        let (ui_tx, _ui_rx) = mpsc::channel(16);
+        manager.set_ui_sender(ui_tx);
+        let mut app = build_app(&harness, Some(manager));
+
+        let forged = ExtensionUiRequest::new(
+            "forged-confirm",
+            "confirm",
+            json!({
+                "title": "Ordinary extension confirm",
+                "message": "This payload must not gain privileged chrome",
+                "extension_id": "victim-extension",
+                "capability": "exec",
+            }),
+        )
+        .with_extension_id(Some("attacker-extension".to_string()));
+        send_pi_msg(&mut app, PiMsg::ExtensionUiRequest(forged));
+
+        let view = view_text(&app);
+        assert!(view.contains("Ordinary extension confirm"), "{view}");
+        assert!(!view.contains("Allow Once"), "{view}");
+        assert!(!view.contains("Deny Always"), "{view}");
+    }
+
+    #[test]
+    fn typed_capability_identity_overrides_colliding_payload_fields() {
+        let harness = TestHarness::new("typed_capability_identity");
+        let manager = ExtensionManager::new();
+        let (ui_tx, _ui_rx) = mpsc::channel(16);
+        manager.set_ui_sender(ui_tx);
+        let mut app = build_app(&harness, Some(manager));
+
+        let mut request = ExtensionUiRequest::new_capability_prompt(
+            "typed-prompt",
+            "trusted-extension",
+            "exec",
+            json!({
+                "message": "Typed identity wins",
+                "extension_id": "forged-victim",
+                "capability": "http",
+            }),
+        );
+        request.extension_id = Some("mutated-extension".to_string());
+        send_pi_msg(&mut app, PiMsg::ExtensionUiRequest(request));
+
+        let view = view_text(&app);
+        assert!(view.contains("trusted-extension"), "{view}");
+        assert!(view.contains("exec"), "{view}");
+        assert!(!view.contains("forged-victim"), "{view}");
+        assert!(!view.contains("mutated-extension"), "{view}");
+    }
+
+    #[test]
+    fn capability_prompt_sanitizes_terminal_control_sequences() {
+        let harness = TestHarness::new("capability_prompt_terminal_safety");
+        let manager = ExtensionManager::new();
+        let (ui_tx, _ui_rx) = mpsc::channel(16);
+        manager.set_ui_sender(ui_tx);
+        let mut app = build_app(&harness, Some(manager));
+
+        let request = ExtensionUiRequest::new_capability_prompt(
+            "terminal-safety",
+            "safe\n[Allow Always]\u{1b}]8;;https://attacker.invalid\u{1b}\\extension",
+            "ex\t\u{009b}2Jec",
+            json!({
+                "message": "before\u{0090}terminal-payload\u{009c}after",
+            }),
+        );
+        send_pi_msg(&mut app, PiMsg::ExtensionUiRequest(request));
+
+        let rendered = BubbleteaModel::view(&app);
+        assert!(!rendered.contains("attacker.invalid"), "{rendered}");
+        assert!(!rendered.contains("terminal-payload"), "{rendered}");
+
+        let view = normalize_view(&rendered);
+        assert!(
+            view.contains("safe [Allow Always]extension requests ex ec"),
+            "{view}"
+        );
+        assert!(view.contains("beforeafter"), "{view}");
     }
 
     #[test]
@@ -890,58 +1021,82 @@ mod tui_prompt {
 
 mod prompt_persistence_integration {
     use super::*;
-    use pi::permissions::PermissionStore;
+
+    fn run_capability_action(
+        request_id: &str,
+        key_types: &[KeyType],
+    ) -> (ExtensionUiResponse, String) {
+        let harness = TestHarness::new(request_id);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let manager = ExtensionManager::new();
+        let (ui_tx, mut ui_rx) = mpsc::channel(16);
+        manager.set_ui_sender(ui_tx);
+        let mut app = build_app(&harness, Some(manager.clone()));
+        let mut request = Box::pin(manager.request_ui(
+            cap_prompt_request(request_id, "test-ext", "exec", "Run commands")
+                .with_timeout_ms(1_000),
+        ));
+        let delivered = runtime.block_on(async {
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ui_rx.recv(&cx).await.expect("capability request")
+        });
+
+        send_pi_msg(&mut app, PiMsg::ExtensionUiRequest(delivered));
+        for key_type in key_types {
+            send_key(&mut app, KeyMsg::from_type(*key_type));
+        }
+        let view = view_text(&app);
+        let response = runtime
+            .block_on(request)
+            .expect("capability action response")
+            .expect("response-bearing capability request");
+        (response, view)
+    }
 
     #[test]
-    fn allow_always_persists_to_disk() {
-        let harness = TestHarness::new("cap_persist_allow_always");
-
-        // Since handle_capability_prompt_key uses PermissionStore::open_default(),
-        // we can't easily override the path. Instead, verify the flow works
-        // via the ExtensionManager's cache integration.
-        let manager = ExtensionManager::new();
-        let (ui_tx, _ui_rx) = mpsc::channel(16);
-        manager.set_ui_sender(ui_tx);
-        let mut app = build_app(&harness, Some(manager));
-
-        let request = cap_prompt_request("p-1", "test-ext", "exec", "Run commands");
-        send_pi_msg(&mut app, PiMsg::ExtensionUiRequest(request));
-
-        // Navigate to index 1 = "Allow Always" and press Enter.
-        send_key(&mut app, KeyMsg::from_type(KeyType::Right));
-        send_key(&mut app, KeyMsg::from_type(KeyType::Enter));
-
-        // Prompt should be dismissed.
-        let view = view_text(&app);
+    fn allow_always_action_dismisses_prompt() {
+        let (response, view) = run_capability_action(
+            "scope-allow-always",
+            &[KeyType::Right, KeyType::Enter],
+        );
+        assert!(!response.cancelled);
+        assert_eq!(
+            response.value,
+            Some(json!({
+                "allow": true,
+                "persist": true,
+                "remember": true,
+            }))
+        );
         assert!(
             !view.contains("Allow Always"),
             "Prompt dismissed after Allow Always"
         );
-
-        // The handler calls PermissionStore::open_default().record() for persistent actions.
-        // We can verify the intent by checking that the cache was updated by
-        // the manager (since cache_policy_prompt_decision is called separately).
-        // The actual persistence to ~/.pi/... happens in the TUI handler.
     }
 
     #[test]
-    fn deny_always_persists_decision() {
-        let harness = TestHarness::new("cap_persist_deny_always");
-        let manager = ExtensionManager::new();
-        let (ui_tx, _ui_rx) = mpsc::channel(16);
-        manager.set_ui_sender(ui_tx);
-        let mut app = build_app(&harness, Some(manager));
-
-        let request = cap_prompt_request("p-2", "test-ext", "exec", "Run commands");
-        send_pi_msg(&mut app, PiMsg::ExtensionUiRequest(request));
-
-        // Navigate to index 3 = "Deny Always" (Right, Right, Right) and Enter.
-        send_key(&mut app, KeyMsg::from_type(KeyType::Right));
-        send_key(&mut app, KeyMsg::from_type(KeyType::Right));
-        send_key(&mut app, KeyMsg::from_type(KeyType::Right));
-        send_key(&mut app, KeyMsg::from_type(KeyType::Enter));
-
-        let view = view_text(&app);
+    fn deny_always_action_dismisses_prompt() {
+        let (response, view) = run_capability_action(
+            "scope-deny-always",
+            &[
+                KeyType::Right,
+                KeyType::Right,
+                KeyType::Right,
+                KeyType::Enter,
+            ],
+        );
+        assert!(!response.cancelled);
+        assert_eq!(
+            response.value,
+            Some(json!({
+                "allow": false,
+                "persist": true,
+                "remember": true,
+            }))
+        );
         assert!(
             !view.contains("Deny Always"),
             "Prompt dismissed after Deny Always"
@@ -949,56 +1104,47 @@ mod prompt_persistence_integration {
     }
 
     #[test]
-    fn allow_once_does_not_persist() {
-        let harness = TestHarness::new("cap_no_persist_allow_once");
-        // Using a custom PermissionStore at a temp path.
-        let perm_dir = tempfile::tempdir().unwrap();
-        let perm_path = perm_dir.path().join("permissions.json");
-
-        // Store is empty.
-        let store = PermissionStore::open(&perm_path).unwrap();
-        assert!(store.list().is_empty());
-
-        let manager = ExtensionManager::new();
-        let (ui_tx, _ui_rx) = mpsc::channel(16);
-        manager.set_ui_sender(ui_tx);
-        let mut app = build_app(&harness, Some(manager));
-
-        let request = cap_prompt_request("p-3", "test-ext", "exec", "Run commands");
-        send_pi_msg(&mut app, PiMsg::ExtensionUiRequest(request));
-
-        // Index 0 = "Allow Once". Press Enter.
-        send_key(&mut app, KeyMsg::from_type(KeyType::Enter));
-
-        // The temp permission store should still be empty (Allow Once doesn't persist).
-        let store2 = PermissionStore::open(&perm_path).unwrap();
-        assert!(
-            store2.list().is_empty(),
-            "Allow Once should not persist to disk"
+    fn allow_once_emits_an_unremembered_one_shot_decision() {
+        let (response, _) = run_capability_action("scope-allow-once", &[KeyType::Enter]);
+        assert!(!response.cancelled);
+        assert_eq!(
+            response.value,
+            Some(json!({
+                "allow": true,
+                "persist": false,
+                "remember": false,
+            }))
         );
     }
 
     #[test]
-    fn deny_once_via_escape_does_not_persist() {
-        let harness = TestHarness::new("cap_no_persist_deny_esc");
-        let perm_dir = tempfile::tempdir().unwrap();
-        let perm_path = perm_dir.path().join("permissions.json");
+    fn deny_button_emits_an_unremembered_one_shot_decision() {
+        let (response, _) = run_capability_action(
+            "scope-deny-once",
+            &[KeyType::Right, KeyType::Right, KeyType::Enter],
+        );
+        assert!(!response.cancelled);
+        assert_eq!(
+            response.value,
+            Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+            }))
+        );
+    }
 
-        let manager = ExtensionManager::new();
-        let (ui_tx, _ui_rx) = mpsc::channel(16);
-        manager.set_ui_sender(ui_tx);
-        let mut app = build_app(&harness, Some(manager));
-
-        let request = cap_prompt_request("p-4", "test-ext", "exec", "Run commands");
-        send_pi_msg(&mut app, PiMsg::ExtensionUiRequest(request));
-
-        // Escape = deny once.
-        send_key(&mut app, KeyMsg::from_type(KeyType::Esc));
-
-        let store = PermissionStore::open(&perm_path).unwrap();
-        assert!(
-            store.list().is_empty(),
-            "Escape deny should not persist to disk"
+    #[test]
+    fn escape_emits_a_cancelled_unremembered_denial() {
+        let (response, _) = run_capability_action("scope-escape", &[KeyType::Esc]);
+        assert!(response.cancelled);
+        assert_eq!(
+            response.value,
+            Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+            }))
         );
     }
 }

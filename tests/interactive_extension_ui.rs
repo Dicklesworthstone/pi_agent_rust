@@ -81,6 +81,32 @@ fn format_confirm_provenance_struct_takes_priority() {
 }
 
 #[test]
+fn format_capability_prompt_uses_typed_provenance_and_sanitizes_terminal_controls() {
+    let mut req = ExtensionUiRequest::new_capability_prompt(
+        "req-cap-safe",
+        "trusted\n[Allow Always]\u{1b}]8;;https://attacker.invalid\u{1b}\\extension",
+        "ex\t\u{009b}2Jec",
+        json!({
+            "title": "payload claims http",
+            "message": "left\u{1b}Pterminal-payload\u{1b}\\right",
+            "extension_id": "payload-extension",
+            "capability": "http",
+        }),
+    );
+    req.extension_id = Some("mutated-extension".to_string());
+
+    let prompt = format_extension_ui_prompt(&req);
+    assert!(prompt.contains("[trusted [Allow Always]extension]"), "{prompt}");
+    assert!(prompt.contains("capability request: ex ec"), "{prompt}");
+    assert!(prompt.contains("leftright"), "{prompt}");
+    assert!(!prompt.contains("payload claims http"), "{prompt}");
+    assert!(!prompt.contains("attacker.invalid"), "{prompt}");
+    assert!(!prompt.contains("terminal-payload"), "{prompt}");
+    assert!(!prompt.contains("payload-extension"), "{prompt}");
+    assert!(!prompt.contains("mutated-extension"), "{prompt}");
+}
+
+#[test]
 fn format_confirm_no_provenance() {
     let req = make_request("confirm", json!({ "title": "OK?" }));
     let prompt = format_extension_ui_prompt(&req);
@@ -302,6 +328,25 @@ fn parse_confirm_whitespace() {
     let req = make_request("confirm", json!({ "title": "OK?" }));
     let resp = parse_extension_ui_response(&req, "  yes  ").unwrap();
     assert_eq!(resp.value, Some(Value::Bool(true)));
+}
+
+#[test]
+fn parse_capability_confirm_defaults_ftui_choice_to_one_shot_scope() {
+    let req = ExtensionUiRequest::new_capability_prompt(
+        "req-cap",
+        "trusted-extension",
+        "exec",
+        json!({"title": "Capability?"}),
+    );
+    let response = parse_extension_ui_response(&req, "yes").expect("parse capability confirm");
+    assert_eq!(
+        response.value,
+        Some(json!({
+            "allow": true,
+            "persist": false,
+            "remember": false,
+        }))
+    );
 }
 
 // ===========================================================================

@@ -4734,20 +4734,33 @@ fn tui_state_tool_update_with_progress_shows_timeout_suffix() {
 // Capability prompt overlay tests
 // ============================================================================
 
+fn typed_capability_prompt(
+    id: &str,
+    extension_id: &str,
+    capability: &str,
+    message: &str,
+) -> ExtensionUiRequest {
+    ExtensionUiRequest::new_capability_prompt(
+        id,
+        extension_id,
+        capability,
+        json!({"message": message}),
+    )
+}
+
 #[test]
 fn tui_state_capability_prompt_shows_overlay() {
     let harness = TestHarness::new("tui_state_capability_prompt_shows_overlay");
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
+    let request = ExtensionUiRequest::new_capability_prompt(
         "cap-1",
-        "confirm",
+        "my-ext",
+        "exec",
         json!({
             "title": "Allow extension capability: exec",
             "message": "Extension my-ext requests capability 'exec'. Allow?",
-            "extension_id": "my-ext",
-            "capability": "exec",
         }),
     );
     let step = apply_pi(
@@ -4771,15 +4784,7 @@ fn tui_state_capability_prompt_navigate_buttons() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-2",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "http",
-            "message": "test prompt",
-        }),
-    );
+    let request = typed_capability_prompt("cap-2", "test-ext", "http", "test prompt");
     apply_pi(
         &harness,
         &mut app,
@@ -4812,15 +4817,7 @@ fn tui_state_capability_prompt_escape_denies() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-3",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "exec",
-            "message": "test",
-        }),
-    );
+    let request = typed_capability_prompt("cap-3", "test-ext", "exec", "test");
     apply_pi(
         &harness,
         &mut app,
@@ -4846,15 +4843,7 @@ fn tui_state_capability_prompt_enter_confirms() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-4",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "exec",
-            "message": "test",
-        }),
-    );
+    let request = typed_capability_prompt("cap-4", "test-ext", "exec", "test");
     apply_pi(
         &harness,
         &mut app,
@@ -4907,15 +4896,7 @@ fn tui_state_capability_prompt_blocks_regular_input() {
     log_initial_state(&harness, &app);
 
     // Show capability prompt.
-    let request = ExtensionUiRequest::new(
-        "cap-block",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "exec",
-            "message": "test",
-        }),
-    );
+    let request = typed_capability_prompt("cap-block", "test-ext", "exec", "test");
     apply_pi(
         &harness,
         &mut app,
@@ -4937,15 +4918,7 @@ fn tui_state_capability_prompt_tab_cycles_buttons() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-tab",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "http",
-            "message": "test",
-        }),
-    );
+    let request = typed_capability_prompt("cap-tab", "test-ext", "http", "test");
     apply_pi(
         &harness,
         &mut app,
@@ -4992,15 +4965,13 @@ fn tui_state_capability_prompt_shows_auto_deny_timer() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
+    let request = typed_capability_prompt(
         "cap-timer",
-        "confirm",
-        json!({
-            "extension_id": "timer-ext",
-            "capability": "fs",
-            "message": "File system access",
-        }),
-    );
+        "timer-ext",
+        "fs",
+        "File system access",
+    )
+    .with_timeout_ms(30_000);
     let step = apply_pi(
         &harness,
         &mut app,
@@ -5018,14 +4989,11 @@ fn tui_state_capability_prompt_shows_description() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
+    let request = typed_capability_prompt(
         "cap-desc",
-        "confirm",
-        json!({
-            "extension_id": "fancy-ext",
-            "capability": "env",
-            "message": "Access environment variables HOME, PATH",
-        }),
+        "fancy-ext",
+        "env",
+        "Access environment variables HOME, PATH",
     );
     let step = apply_pi(
         &harness,

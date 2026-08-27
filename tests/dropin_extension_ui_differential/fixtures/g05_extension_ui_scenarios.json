@@ -3,7 +3,7 @@
   "bead": "bd-lnmtp.2.4",
   "description": "Extension UI request/response round-trip differential scenarios covering prompt types, timeout, abort, and concurrent prompt ordering for G05 parity validation.",
   "canonicalization": {
-    "volatile_fields": ["timestamp", "requestId", "id", "timeout"],
+    "volatile_fields": ["timestamp", "requestId", "requestGeneration", "id", "timeout"],
     "response_ordering": "preserve_request_sequence",
     "concurrent_prompts": "queue_based_serialization"
   },
@@ -170,6 +170,7 @@
           "id": "req-8-cancel",
           "type": "extension_ui_response",
           "requestId": "req-8",
+          "requestGeneration": 1,
           "cancelled": true
         }
       ],
@@ -197,6 +198,7 @@
           "id": "req-9-response",
           "type": "extension_ui_response",
           "requestId": "req-9",
+          "requestGeneration": 1,
           "value": "Valid A"
         }
       ],

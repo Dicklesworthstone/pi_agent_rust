@@ -428,6 +428,13 @@ remains reachable:
 
 All tools include automatic truncation for large outputs (2000 lines /
 1MB), detailed metadata in responses, and process-tree cleanup for bash.
+Background-job logs are preserved by default; when their dedicated directory
+cannot admit another 16 MiB artifact within its 256 MiB / 4096-entry budget,
+Pi refuses the new job instead of deleting history. Set
+`PI_JOBS_ARTIFACT_RETENTION=rotate` to opt into deleting the oldest unlocked
+artifacts while preserving active logs and at least eight recent logs. Job
+snapshots report the applied policy, removed-file count, and reclaimed bytes in
+`artifactCleanup`.
 Per-tool exposure is configurable via `tools.loadMode.<name>` set to
 `essential`, `discoverable`, or `off`; an explicit `--tools` list always
 wins:
@@ -1001,6 +1008,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 | `PI_CONFIG_PATH` | Custom config file path |
 | `PI_CODING_AGENT_DIR` | Override the global config directory |
 | `PI_SUBAGENT_PI_BINARY` | Explicit Rust Pi executable for native child agents; defaults to the current executable |
+| `PI_JOBS_ARTIFACT_RETENTION` | Background-job artifact policy: `preserve` (default) or explicit opt-in `rotate` |
 | `PI_PACKAGE_DIR` | Override the packages directory |
 | `PI_SESSIONS_DIR` | Custom sessions directory |
 
@@ -1782,7 +1790,7 @@ The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin
 
 Queue modes (`All` or `OneAtATime`) control whether multiple queued messages are batched into a single turn or processed individually.
 
-**Extension UI over RPC**: When an extension requests user input (capability prompt, selection dialog), Pi emits an `extension_ui_request` event. The client renders the prompt in its own UI and responds with an `extension_ui_response` message. IDE extensions can then present native UI for capability decisions instead of falling back to terminal prompts.
+**Extension UI over RPC**: When an extension requests user input (capability prompt, selection dialog), Pi emits an `extension_ui_request` event. Response-bearing events include a `requestGeneration` correlation token, which the client must echo alongside `requestId` in its `extension_ui_response`; this prevents a late response from resolving a newer request that reused the same public ID. IDE extensions can then present native UI for capability decisions instead of falling back to terminal prompts.
 
 ### Session Indexing
 

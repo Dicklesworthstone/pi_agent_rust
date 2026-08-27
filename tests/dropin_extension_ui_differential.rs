@@ -96,10 +96,14 @@ fn response_for_ui_event(event: &Value, index: usize) -> Value {
     let request_id = event["id"]
         .as_str()
         .expect("extension UI request id should be a string");
+    let request_generation = event["requestGeneration"]
+        .as_u64()
+        .expect("response-bearing extension UI request should carry a generation");
     let mut response = json!({
         "id": format!("ui-response-{index}"),
         "type": "extension_ui_response",
         "requestId": request_id,
+        "requestGeneration": request_generation,
     });
 
     let object = response
@@ -426,7 +430,10 @@ fn canonicalize_ui_response(value: &Value) -> Value {
             let mut canonicalized = BTreeMap::new();
             for (key, value) in object {
                 // Skip volatile fields specific to extension UI
-                if matches!(key.as_str(), "timestamp" | "requestId" | "id" | "timeout") {
+                if matches!(
+                    key.as_str(),
+                    "timestamp" | "requestId" | "requestGeneration" | "id" | "timeout"
+                ) {
                     continue;
                 }
                 canonicalized.insert(key.clone(), canonicalize_ui_response(value));
@@ -447,6 +454,16 @@ fn g05_extension_ui_differential_fixture_validation() {
         "pi.dropin.extension_ui_differential_scenarios.v1"
     );
     assert_eq!(scenarios["bead"], "bd-lnmtp.2.4");
+    assert!(
+        scenarios["canonicalization"]["volatile_fields"]
+            .as_array()
+            .is_some_and(|fields| {
+                fields
+                    .iter()
+                    .any(|field| field.as_str() == Some("requestGeneration"))
+            }),
+        "requestGeneration must be canonicalized across independently assigned RPC epochs"
+    );
 
     let ui_scenarios = scenarios["scenarios"]
         .as_array()
@@ -469,6 +486,22 @@ fn g05_extension_ui_differential_fixture_validation() {
             scenario.get("expected_patterns").is_some(),
             "{id} missing expected_patterns"
         );
+        for request in scenario["requests"]
+            .as_array()
+            .expect("scenario requests")
+        {
+            if request["type"] == "extension_ui_response"
+                && (request.get("requestId").is_some() || request.get("id").is_some())
+            {
+                assert!(
+                    request
+                        .get("requestGeneration")
+                        .and_then(Value::as_u64)
+                        .is_some(),
+                    "{id} response must carry an unsigned requestGeneration"
+                );
+            }
+        }
     }
 }
 
@@ -478,6 +511,7 @@ fn g05_extension_ui_canonicalization_stable() {
         json!({
             "type": "extension_ui_request",
             "id": "req-123",
+            "requestGeneration": 7,
             "method": "confirm",
             "title": "Continue?",
             "timestamp": "2026-04-23T00:00:00Z"
@@ -487,6 +521,7 @@ fn g05_extension_ui_canonicalization_stable() {
             "command": "extension_ui_response",
             "success": true,
             "requestId": "req-456",
+            "requestGeneration": 8,
             "timestamp": "2026-04-23T00:00:01Z"
         }),
     ];
@@ -509,6 +544,10 @@ fn g05_extension_ui_canonicalization_stable() {
             assert!(
                 !obj.contains_key("requestId"),
                 "requestId should be removed"
+            );
+            assert!(
+                !obj.contains_key("requestGeneration"),
+                "requestGeneration should be removed"
             );
             assert!(!obj.contains_key("id"), "id should be removed");
         }

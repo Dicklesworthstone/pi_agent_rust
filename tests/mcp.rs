@@ -533,23 +533,54 @@ fn mcp_http_command_reference_trust_is_scoped_to_project_cwd() {
 // HTTP transport over the loopback mock
 // ---------------------------------------------------------------------------
 
+fn mock_http_initialize_response(id: u64, session: &str) -> MockHttpResponse {
+    MockHttpResponse {
+        status: 200,
+        headers: vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Mcp-Session-Id".to_string(), session.to_string()),
+        ],
+        body: serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "mock", "version": "0"}
+            }
+        }))
+        .expect("serialize initialize response"),
+    }
+}
+
 #[test]
-fn mcp_http_transport_json_and_sse() {
-    let case = "mcp_http_transport_json_and_sse";
+fn mcp_http_transport_propagates_validated_initialize_state() {
+    let case = "mcp_http_transport_propagates_validated_initialize_state";
     let harness = TestHarness::new(case);
     let server = harness.start_mock_http_server();
-    server.add_route(
+    server.add_route_queue(
         "POST",
         "/mcp",
-        MockHttpResponse {
-            status: 200,
-            headers: vec![
-                ("Content-Type".to_string(), "application/json".to_string()),
-                ("Mcp-Session-Id".to_string(), "sess-123".to_string()),
-            ],
-            body: br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#
-                .to_vec(),
-        },
+        vec![
+            MockHttpResponse {
+                status: 200,
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("Mcp-Session-Id".to_string(), "sess-123".to_string()),
+                ],
+                body: br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#
+                    .to_vec(),
+            },
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse::json(
+                200,
+                &json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}),
+            ),
+        ],
     );
     let transport = pi::mcp::transport::HttpTransport::new(
         &format!("{}/mcp", server.base_url()),
@@ -566,9 +597,19 @@ fn mcp_http_transport_json_and_sse() {
         .log()
         .info("verify", format!("initialize result: {result}"));
     assert_eq!(result["protocolVersion"], "2025-06-18");
+    block_on_local(transport.notify("notifications/initialized", json!({})))
+        .expect("initialized notification over HTTP");
+    let tools = block_on_local(transport.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("tools/list over HTTP");
+    assert_eq!(tools["tools"], json!([]));
 
-    // The mock saw the request with the custom header and Accept pair.
+    // The mock saw the initial request with the custom header and Accept pair.
     let requests = server.requests();
+    assert_eq!(requests.len(), 3);
     let first = requests.first().expect("one request");
     assert!(
         first
@@ -588,6 +629,28 @@ fn mcp_http_transport_json_and_sse() {
         "accept pair required: {:?}",
         first.headers
     );
+    assert!(
+        !first.headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("mcp-session-id")
+                || name.eq_ignore_ascii_case("mcp-protocol-version")
+        }),
+        "initialize must not send state that has not been negotiated"
+    );
+    for request in &requests[1..] {
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("mcp-session-id") && value == "sess-123"
+        }));
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("mcp-protocol-version") && value == "2025-06-18"
+        }));
+    }
+    let initialized_frame: Value =
+        serde_json::from_slice(&requests[1].body).expect("initialized notification JSON");
+    assert_eq!(initialized_frame["method"], "notifications/initialized");
+    assert!(initialized_frame.get("id").is_none());
+    let tools_frame: Value =
+        serde_json::from_slice(&requests[2].body).expect("tools/list request JSON");
+    assert_eq!(tools_frame["id"], 2);
     finish_case(&harness, case);
 }
 
@@ -596,7 +659,7 @@ fn mcp_http_transport_sse_response() {
     let case = "mcp_http_transport_sse_response";
     let harness = TestHarness::new(case);
     let server = harness.start_mock_http_server();
-    let sse_body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"search\",\"description\":\"find things\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n";
+    let sse_body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"search\",\"description\":\"find things\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n";
     server.add_route(
         "POST",
         "/sse",
@@ -617,6 +680,951 @@ fn mcp_http_transport_sse_response() {
     .expect("tools/list over SSE");
     let tools = result["tools"].as_array().expect("tools array");
     assert_eq!(tools[0]["name"], "search");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_handles_ping_before_streamed_response() {
+    let case = "mcp_http_transport_handles_ping_before_streamed_response";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    let sse_body = concat!(
+        "event: message\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}\n\n",
+        "event: message\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"
+    );
+    server.add_route_queue(
+        "POST",
+        "/sse-ping",
+        vec![
+            MockHttpResponse {
+                status: 200,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/event-stream; charset=utf-8".to_string(),
+                )],
+                body: sse_body.as_bytes().to_vec(),
+            },
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/sse-ping", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+    let result = block_on_local(transport.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("streamed response after server ping");
+    assert_eq!(result["tools"], json!([]));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let ping_response: Value =
+        serde_json::from_slice(&requests[1].body).expect("ping response JSON");
+    assert_eq!(
+        ping_response,
+        json!({"jsonrpc": "2.0", "id": "server-ping", "result": {}})
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_initialize_sse_ping_uses_provisional_session() {
+    let case = "mcp_http_transport_initialize_sse_ping_uses_provisional_session";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    let sse_body = concat!(
+        "event: message\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":\"initialize-ping\",\"method\":\"ping\"}\n\n",
+        "event: message\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"serverInfo\":{\"name\":\"mock\",\"version\":\"0\"}}}\n\n"
+    );
+    server.add_route_queue(
+        "POST",
+        "/initialize-sse-ping",
+        vec![
+            MockHttpResponse {
+                status: 200,
+                headers: vec![
+                    ("Content-Type".to_string(), "text/event-stream".to_string()),
+                    ("Mcp-Session-Id".to_string(), "session-new".to_string()),
+                ],
+                body: sse_body.as_bytes().to_vec(),
+            },
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/initialize-sse-ping", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+
+    let result = block_on_local(transport.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "initialize-ping-test", "version": "1"}
+        }),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("initialize response after server ping");
+    assert_eq!(result["protocolVersion"], "2025-06-18");
+    block_on_local(transport.notify("notifications/initialized", json!({})))
+        .expect("initialized notification");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        !requests[0].headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("mcp-session-id")
+                || name.eq_ignore_ascii_case("mcp-protocol-version")
+        }),
+        "initialize request must not claim unnegotiated state"
+    );
+    assert!(requests[1].headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("mcp-session-id") && value == "session-new"
+    }));
+    assert!(
+        !requests[1]
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("mcp-protocol-version")),
+        "nested ping response precedes successful protocol negotiation"
+    );
+    assert!(requests[2].headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("mcp-session-id") && value == "session-new"
+    }));
+    assert!(requests[2].headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("mcp-protocol-version") && value == "2025-06-18"
+    }));
+
+    let ping_response: Value =
+        serde_json::from_slice(&requests[1].body).expect("ping response JSON");
+    assert_eq!(
+        ping_response,
+        json!({"jsonrpc": "2.0", "id": "initialize-ping", "result": {}})
+    );
+    let initialized_frame: Value =
+        serde_json::from_slice(&requests[2].body).expect("initialized notification JSON");
+    assert_eq!(initialized_frame["method"], "notifications/initialized");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_never_replays_after_nested_response_session_404() {
+    let case = "mcp_http_transport_never_replays_after_nested_response_session_404";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    let sse_body = concat!(
+        "event: message\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}\n\n",
+        "event: message\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[]}}\n\n"
+    );
+    server.add_route_queue(
+        "POST",
+        "/sse-nested-404",
+        vec![
+            mock_http_initialize_response(1, "session-old"),
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse {
+                status: 200,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/event-stream".to_string(),
+                )],
+                body: sse_body.as_bytes().to_vec(),
+            },
+            MockHttpResponse::text(404, "session expired while answering ping"),
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/sse-nested-404", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+    block_on_local(transport.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "nested-404-test", "version": "1"}
+        }),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("initialize");
+    block_on_local(transport.notify("notifications/initialized", json!({})))
+        .expect("initialized notification");
+
+    let error = block_on_local(transport.request(
+        "tools/call",
+        json!({"name": "non_idempotent", "arguments": {}}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect_err("nested response 404 makes original request delivery indeterminate");
+    assert!(
+        error.to_string().contains("MCP_DELIVERY_INDETERMINATE"),
+        "{error}"
+    );
+    assert!(!transport.is_alive(), "indeterminate transport must abort");
+
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "accepted outer tools/call must never be renewed or replayed"
+    );
+    let methods: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            let frame: Value = serde_json::from_slice(&request.body).expect("request frame JSON");
+            frame
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("response")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            String::from("initialize"),
+            String::from("notifications/initialized"),
+            String::from("tools/call"),
+            String::from("response")
+        ]
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_rejects_malformed_streamed_server_params() {
+    let case = "mcp_http_transport_rejects_malformed_streamed_server_params";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    let sse_body = concat!(
+        "event: message\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":\"bad-ping\",\"method\":\"ping\",\"params\":7}\n\n",
+        "event: message\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"
+    );
+    server.add_route(
+        "POST",
+        "/sse-invalid-params",
+        MockHttpResponse {
+            status: 200,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/event-stream".to_string(),
+            )],
+            body: sse_body.as_bytes().to_vec(),
+        },
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/sse-invalid-params", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+    let error = block_on_local(transport.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect_err("non-object MCP params must fail before a streamed response is accepted");
+    assert!(error.to_string().contains("params must be an object"), "{error}");
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "malformed ping must not emit a client response POST"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_rejects_result_or_error_on_streamed_method_envelopes() {
+    let case = "mcp_http_transport_rejects_result_or_error_on_streamed_method_envelopes";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/sse-mixed-envelope",
+        vec![
+            MockHttpResponse {
+                status: 200,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/event-stream".to_string(),
+                )],
+                body: b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"bad\",\"method\":\"ping\",\"result\":{}}\n\n"
+                    .to_vec(),
+            },
+            MockHttpResponse {
+                status: 200,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/event-stream".to_string(),
+                )],
+                body: b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"error\":{\"code\":-1,\"message\":\"bad\"}}\n\n"
+                    .to_vec(),
+            },
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/sse-mixed-envelope", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+
+    for label in ["request with result", "notification with error"] {
+        let error = block_on_local(transport.request(
+            "tools/list",
+            json!({}),
+            std::time::Duration::from_secs(10),
+        ))
+        .expect_err(label);
+        assert!(
+            error.to_string().contains("must not contain result or error"),
+            "unexpected {label} error: {error}"
+        );
+    }
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "malformed method envelopes must not emit nested responses"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_rejects_non_object_outgoing_params_before_dispatch() {
+    let case = "mcp_http_transport_rejects_non_object_outgoing_params_before_dispatch";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/params",
+        vec![
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse::json(
+                200,
+                &json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}),
+            ),
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/params", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+
+    let request_error = block_on_local(transport.request(
+        "tools/list",
+        json!(7),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect_err("scalar request params must fail locally");
+    assert!(request_error.to_string().contains("object-valued params"));
+    block_on_local(transport.notify("notifications/test", Value::Null))
+        .expect("null is the no-params sentinel");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let notification: Value =
+        serde_json::from_slice(&requests[0].body).expect("notification frame JSON");
+    assert!(
+        notification.get("params").is_none(),
+        "null sentinel must omit params from the wire frame"
+    );
+
+    let result = block_on_local(transport.request(
+        "tools/list",
+        Value::Null,
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("null request params are the no-params sentinel");
+    assert_eq!(result["tools"], json!([]));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let frame: Value = serde_json::from_slice(&requests[1].body).expect("request frame JSON");
+    assert_eq!(frame["id"], 1, "invalid params must not consume request ids");
+    assert!(
+        frame.get("params").is_none(),
+        "null request sentinel must omit params from the wire frame"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_distinguishes_request_and_notification_202() {
+    let case = "mcp_http_transport_distinguishes_request_and_notification_202";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/accepted",
+        vec![
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/accepted", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+
+    let request_error = block_on_local(transport.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect_err("HTTP 202 must not satisfy a JSON-RPC request");
+    assert!(
+        request_error.to_string().contains("MCP_PROTOCOL")
+            && request_error.to_string().contains("HTTP 202"),
+        "unexpected request error: {request_error}"
+    );
+    block_on_local(transport.notify("notifications/initialized", json!({})))
+        .expect("HTTP 202 must acknowledge a notification");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let request_frame: Value =
+        serde_json::from_slice(&requests[0].body).expect("request frame JSON");
+    assert_eq!(request_frame["id"], 1);
+    let notification_frame: Value =
+        serde_json::from_slice(&requests[1].body).expect("notification frame JSON");
+    assert!(notification_frame.get("id").is_none());
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_rejects_wrong_media_type_and_nonempty_202() {
+    let case = "mcp_http_transport_rejects_wrong_media_type_and_nonempty_202";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/wrong-media",
+        MockHttpResponse::text(
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#,
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/nonempty-accepted",
+        MockHttpResponse::text(202, "unexpected"),
+    );
+    for (path, content_type) in [
+        ("json-lookalike", "application/json-seq"),
+        ("sse-lookalike", "text/event-streamx"),
+    ] {
+        server.add_route(
+            "POST",
+            &format!("/{path}"),
+            MockHttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), content_type.to_string())],
+                body: br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#.to_vec(),
+            },
+        );
+    }
+
+    let wrong_media = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/wrong-media", server.base_url()),
+        vec![],
+    )
+    .expect("wrong-media transport construction");
+    let media_error = block_on_local(wrong_media.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect_err("text/plain must not carry a successful JSON-RPC request response");
+    assert!(
+        media_error.to_string().contains("Content-Type"),
+        "unexpected media-type error: {media_error}"
+    );
+    for path in ["json-lookalike", "sse-lookalike"] {
+        let transport = pi::mcp::transport::HttpTransport::new(
+            &format!("{}/{path}", server.base_url()),
+            vec![],
+        )
+        .expect("lookalike-media transport construction");
+        let error = block_on_local(transport.request(
+            "tools/list",
+            json!({}),
+            std::time::Duration::from_secs(10),
+        ))
+        .expect_err("media-type lookalikes must not pass exact classification");
+        assert!(
+            error.to_string().contains("Content-Type"),
+            "unexpected {path} error: {error}"
+        );
+    }
+
+    let nonempty_accepted = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/nonempty-accepted", server.base_url()),
+        vec![],
+    )
+    .expect("nonempty-accepted transport construction");
+    let body_error = block_on_local(
+        nonempty_accepted.notify("notifications/initialized", json!({})),
+    )
+    .expect_err("HTTP 202 acknowledgement must not carry a body");
+    assert!(
+        body_error.to_string().contains("no body")
+            || body_error.to_string().contains("not empty"),
+        "unexpected 202-body error: {body_error}"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_rejects_mismatched_jsonrpc_envelopes() {
+    let case = "mcp_http_transport_rejects_mismatched_jsonrpc_envelopes";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/mismatch",
+        vec![
+            MockHttpResponse::json(
+                200,
+                &json!({"jsonrpc": "1.0", "id": 1, "result": {"tools": []}}),
+            ),
+            MockHttpResponse::json(
+                200,
+                &json!({"jsonrpc": "2.0", "id": 99, "result": {"tools": []}}),
+            ),
+            MockHttpResponse {
+                status: 200,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/event-stream".to_string(),
+                )],
+                body: b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"tools\":[]}}\n\n"
+                    .to_vec(),
+            },
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/mismatch", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+
+    for reason in ["JSON version", "JSON id", "SSE id"] {
+        let error = block_on_local(transport.request(
+            "tools/list",
+            json!({}),
+            std::time::Duration::from_secs(10),
+        ))
+        .expect_err(reason);
+        assert!(
+            error.to_string().contains("MCP_PROTOCOL"),
+            "{reason} mismatch produced unexpected error: {error}"
+        );
+    }
+    assert_eq!(server.requests().len(), 3);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_does_not_retain_invalid_initialize_state() {
+    let case = "mcp_http_transport_does_not_retain_invalid_initialize_state";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/invalid-initialize",
+        vec![
+            MockHttpResponse {
+                status: 200,
+                headers: vec![
+                    ("Content-Type".to_string(), "text/event-stream".to_string()),
+                    ("Mcp-Session-Id".to_string(), "hostile-session".to_string()),
+                ],
+                body: format!(
+                    "event: message\ndata: {}\n\n",
+                    serde_json::to_string(&json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {"protocolVersion": "bad\u{001b}", "capabilities": {}}
+                    }))
+                    .expect("serialize hostile initialize response")
+                )
+                .into_bytes(),
+            },
+            MockHttpResponse::json(
+                200,
+                &json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}),
+            ),
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/invalid-initialize", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+
+    let initialize_error = block_on_local(transport.request(
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect_err("hostile initialize metadata must fail closed");
+    assert!(
+        initialize_error.to_string().contains("MCP_PROTOCOL"),
+        "unexpected initialize error: {initialize_error}"
+    );
+    let tools = block_on_local(transport.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("later request must remain usable without invalid initialize state");
+    assert_eq!(tools["tools"], json!([]));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests[1].headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("mcp-session-id")
+                || name.eq_ignore_ascii_case("mcp-protocol-version")
+        }),
+        "invalid initialize state must not be replayed: {:?}",
+        requests[1].headers
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_rejects_unsupported_version_and_invisible_session_id() {
+    let case = "mcp_http_transport_rejects_unsupported_version_and_invisible_session_id";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/unsupported-version",
+        MockHttpResponse::json(
+            200,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2024-11-05", "capabilities": {}}
+            }),
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/invisible-session",
+        MockHttpResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Mcp-Session-Id".to_string(), "contains space".to_string()),
+            ],
+            body: serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {"name": "mock", "version": "0"}
+                }
+            }))
+            .expect("serialize initialize response"),
+        },
+    );
+    server.add_route(
+        "POST",
+        "/empty-session",
+        MockHttpResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Mcp-Session-Id".to_string(), String::new()),
+            ],
+            body: serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {"name": "mock", "version": "0"}
+                }
+            }))
+            .expect("serialize initialize response"),
+        },
+    );
+    server.add_route(
+        "POST",
+        "/missing-capabilities",
+        MockHttpResponse::json(
+            200,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "serverInfo": {"name": "mock", "version": "0"}
+                }
+            }),
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/missing-server-info",
+        MockHttpResponse::json(
+            200,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2025-06-18", "capabilities": {}}
+            }),
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/invalid-server-info",
+        MockHttpResponse::json(
+            200,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {"name": "mock"}
+                }
+            }),
+        ),
+    );
+
+    for (path, expected) in [
+        ("unsupported-version", "unsupported protocolVersion"),
+        ("invisible-session", "visible ASCII"),
+        ("empty-session", "visible ASCII"),
+        ("missing-capabilities", "capabilities field"),
+        ("missing-server-info", "serverInfo field"),
+        ("invalid-server-info", "name and version"),
+    ] {
+        let transport = pi::mcp::transport::HttpTransport::new(
+            &format!("{}/{path}", server.base_url()),
+            vec![],
+        )
+        .expect("transport construction");
+        let error = block_on_local(transport.request(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+            std::time::Duration::from_secs(10),
+        ))
+        .expect_err("invalid initialize negotiation must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected negotiation error for {path}: {error}"
+        );
+    }
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_renews_expired_session_once() {
+    let case = "mcp_http_transport_renews_expired_session_once";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/renew",
+        vec![
+            mock_http_initialize_response(1, "session-old"),
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse::text(404, "expired"),
+            mock_http_initialize_response(3, "session-new"),
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse::json(
+                200,
+                &json!({"jsonrpc": "2.0", "id": 4, "result": {"tools": []}}),
+            ),
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/renew", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+    let initialize_params = json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {"sampling": {}},
+        "clientInfo": {"name": "renew-test", "version": "1"}
+    });
+
+    block_on_local(transport.request(
+        "initialize",
+        initialize_params.clone(),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("initial initialize");
+    block_on_local(transport.notify("notifications/initialized", json!({})))
+        .expect("initial initialized notification");
+    let tools = block_on_local(transport.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("expired session must be renewed and the rejected request retried once");
+    assert_eq!(tools["tools"], json!([]));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 6, "renewal must perform exactly three posts");
+    let frames: Vec<Value> = requests
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("request frame JSON"))
+        .collect();
+    assert_eq!(frames[0]["method"], "initialize");
+    assert_eq!(frames[0]["id"], 1);
+    assert_eq!(frames[2]["method"], "tools/list");
+    assert_eq!(frames[2]["id"], 2);
+    assert_eq!(frames[3]["method"], "initialize");
+    assert_eq!(frames[3]["id"], 3);
+    assert_eq!(frames[3]["params"], initialize_params);
+    assert_eq!(frames[4]["method"], "notifications/initialized");
+    assert!(frames[4].get("id").is_none());
+    assert_eq!(frames[5]["method"], "tools/list");
+    assert_eq!(frames[5]["id"], 4);
+
+    for request in &requests[1..=2] {
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("mcp-session-id") && value == "session-old"
+        }));
+    }
+    assert!(
+        !requests[3].headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("mcp-session-id")
+                || name.eq_ignore_ascii_case("mcp-protocol-version")
+        }),
+        "renewal initialize must not replay expired state"
+    );
+    for request in &requests[4..] {
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("mcp-session-id") && value == "session-new"
+        }));
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("mcp-protocol-version") && value == "2025-06-18"
+        }));
+    }
+    finish_case(&harness, case);
+}
+
+#[test]
+fn mcp_http_transport_aborts_after_second_session_404() {
+    let case = "mcp_http_transport_aborts_after_second_session_404";
+    let harness = TestHarness::new(case);
+    let server = harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/renew-twice",
+        vec![
+            mock_http_initialize_response(1, "session-old"),
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse::text(404, "expired"),
+            mock_http_initialize_response(3, "session-new"),
+            MockHttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            MockHttpResponse::text(404, "expired again"),
+        ],
+    );
+    let transport = pi::mcp::transport::HttpTransport::new(
+        &format!("{}/renew-twice", server.base_url()),
+        vec![],
+    )
+    .expect("transport construction");
+    block_on_local(transport.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "renew-test", "version": "1"}
+        }),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect("initial initialize");
+    block_on_local(transport.notify("notifications/initialized", json!({})))
+        .expect("initial initialized notification");
+    let error = block_on_local(transport.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect_err("a second session 404 must escape rather than renew recursively");
+    assert!(error.to_string().contains("MCP_SESSION_EXPIRED"), "{error}");
+    assert!(!transport.is_alive(), "failed one-shot renewal must abort");
+    assert_eq!(server.requests().len(), 6);
+
+    let later = block_on_local(transport.request(
+        "tools/list",
+        json!({}),
+        std::time::Duration::from_secs(10),
+    ))
+    .expect_err("aborted transport must reject later dispatch locally");
+    assert!(later.to_string().contains("MCP_TRANSPORT_UNAVAILABLE"));
+    assert_eq!(
+        server.requests().len(),
+        6,
+        "aborted transport must not emit another renewal attempt"
+    );
     finish_case(&harness, case);
 }
 
