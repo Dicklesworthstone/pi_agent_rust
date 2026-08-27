@@ -734,6 +734,40 @@ async fn rpc_dispatch_session_switch_event(manager: Option<ExtensionManager>, pa
         .await;
 }
 
+async fn rpc_dispatch_session_before_fork(
+    manager: Option<ExtensionManager>,
+    entry_id: &str,
+    summary: &str,
+    session_id: &str,
+) -> bool {
+    let Some(manager) = manager else {
+        return false;
+    };
+
+    manager
+        .dispatch_cancellable_event(
+            ExtensionEventName::SessionBeforeFork,
+            Some(json!({
+                "entryId": entry_id,
+                "summary": summary,
+                "sessionId": session_id,
+            })),
+            EXTENSION_EVENT_TIMEOUT_MS,
+        )
+        .await
+        .unwrap_or(false)
+}
+
+async fn rpc_dispatch_session_fork_event(manager: Option<ExtensionManager>, payload: Value) {
+    let Some(manager) = manager else {
+        return;
+    };
+
+    let _ = manager
+        .dispatch_event(ExtensionEventName::SessionFork, Some(payload))
+        .await;
+}
+
 fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) -> bool {
     loop {
         match tx.try_send(line) {
@@ -1201,25 +1235,36 @@ async fn acquire_rpc_session_transition(
     bash_state: &Arc<Mutex<Option<RunningBash>>>,
     cx: &AgentCx,
 ) -> Result<RpcSessionTransitionAuthority> {
-    let (provider_admission, session_action_admission) = {
-        let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
-            .await
-            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        (
-            guard.provider_admission_gate(),
-            guard.session_action_admission_gate(),
-        )
-    };
-    // Capture the action generation before waiting, then acquire the outer
-    // AgentSession before provider admission. Existing model/thinking and
-    // compaction transitions use the same outer -> provider order, so neither
-    // side can own one lock while waiting for the other.
-    let session_action_permit = session_action_admission.acquire(cx.cx()).await?;
+    // Background bash admission holds bash-state while it snapshots the outer
+    // AgentSession and only then publishes RunningBash. Check bash-state before
+    // taking transition authority so both paths follow bash-state -> outer.
+    // The RPC dispatcher serializes command admission, so no new background
+    // bash command can start while this command awaits; an existing worker can
+    // only clear the published state.
+    if OwnedMutexGuard::lock(Arc::clone(bash_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
+        .is_some()
+    {
+        return Err(Error::session(
+            "A background bash command is still running; wait before changing sessions",
+        ));
+    }
+
+    // The global order is outer AgentSession -> provider admission -> Session
+    // action admission. Provider callbacks and outer-held extension events can
+    // both re-enter Session host actions, so taking the action permit first
+    // would create action <-> provider and action <-> outer wait cycles. Any
+    // action that finishes before the final permit is acquired is detected by
+    // the source snapshot recheck below.
     let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
         .await
         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let provider_admission = guard.provider_admission_gate();
+    let session_action_admission = guard.session_action_admission_gate();
     let provider_permit = provider_admission.acquire(cx.cx()).await?;
     provider_admission.ensure_allowed()?;
+    let session_action_permit = session_action_admission.acquire(cx.cx()).await?;
 
     let phase = {
         let _phase_guard = lock_rpc_turn_phase(turn_phase_linearizer);
@@ -1261,16 +1306,6 @@ async fn acquire_rpc_session_transition(
         ));
     }
     drop(state);
-
-    if OwnedMutexGuard::lock(Arc::clone(bash_state), cx)
-        .await
-        .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
-        .is_some()
-    {
-        return Err(Error::session(
-            "A background bash command is still running; wait before changing sessions",
-        ));
-    }
 
     let current = rpc_session_transition_snapshot_from_guard(&guard, cx).await?;
     if current != *baseline {
@@ -4054,6 +4089,21 @@ pub async fn run(
                             )?;
                             let (thinking, normalization_changed) =
                                 normalize_resumed_session_model(&mut new_session, &entry);
+
+                            // Acquire and validate the live commit target before
+                            // writing normalized target bytes. Once persistence
+                            // succeeds, no cancellation-aware/fallible step may
+                            // remain between the durable and live transitions.
+                            let session_store = Arc::clone(&guard.session);
+                            let mut inner_session = OwnedMutexGuard::lock(session_store, &cx)
+                                .await
+                                .map_err(|err| {
+                                    Error::session(format!("inner session lock failed: {err}"))
+                                })?;
+                            let previous_session_file =
+                                inner_session.path.as_ref().map(|p| p.display().to_string());
+                            guard.invalidate_background_compaction();
+                            state.provider_admission.ensure_allowed()?;
                             if guard.save_enabled() && normalization_changed {
                                 if let Err(first_err) = new_session.save().await
                                     && let Err(retry_err) = new_session.save().await
@@ -4068,18 +4118,9 @@ pub async fn run(
                             let messages = new_session.to_messages_for_current_path();
                             let session_id = new_session.header.id.clone();
 
-                            guard.invalidate_background_compaction();
-                            state.provider_admission.ensure_allowed()?;
-                            let session_store = Arc::clone(&guard.session);
-                            let mut inner_session = OwnedMutexGuard::lock(session_store, &cx)
-                                .await
-                                .map_err(|err| {
-                                    Error::session(format!("inner session lock failed: {err}"))
-                                })?;
-                            let previous_session_file =
-                                inner_session.path.as_ref().map(|p| p.display().to_string());
                             *inner_session = new_session;
                             session_transition_permit.commit_session_change();
+                            drop(inner_session);
                             guard.agent.replace_messages(messages);
                             guard.agent.stream_options_mut().session_id = Some(session_id.clone());
                             guard.agent.reset_session_scoped_state(target_plan_mode);
@@ -4181,7 +4222,7 @@ pub async fn run(
                     }
                 };
 
-                let result: Result<String> = async {
+                let result: Result<Option<(String, Option<String>, String, String)>> = async {
                     // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
                     let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
                         let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
@@ -4198,8 +4239,20 @@ pub async fn run(
                         // Both locks released here.
                     };
 
+                    if rpc_dispatch_session_before_fork(
+                        rpc_extension_manager.clone(),
+                        entry_id,
+                        &fork_plan.selected_text,
+                        &header_snapshot.id,
+                    )
+                    .await
+                    {
+                        return Ok(None);
+                    }
+
                     // Phase 2: Build new session without holding any lock.
                     let selected_text = fork_plan.selected_text.clone();
+                    let previous_session_file = parent_path.clone();
 
                     let mut new_session = if save_enabled {
                         crate::session::Session::create_with_dir(session_dir)
@@ -4224,7 +4277,7 @@ pub async fn run(
 
                     // Phase 3: prepare and persist the complete target runtime,
                     // then atomically install Session + agent model state.
-                    {
+                    let session_id = {
                         let session_transition = acquire_rpc_session_transition(
                             &transition_baseline,
                             &is_streaming,
@@ -4293,6 +4346,23 @@ pub async fn run(
                         )?;
                         let (thinking, _) =
                             normalize_resumed_session_model(&mut new_session, &entry);
+
+                        // Resolve and validate the live commit target before
+                        // publishing the fork file. After save succeeds the
+                        // assignment and runtime-state install are infallible.
+                        let session_store = Arc::clone(&guard.session);
+                        let mut inner = OwnedMutexGuard::lock(session_store, &cx)
+                            .await
+                            .map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                        if inner.header.id != origin_session_id {
+                            return Err(Error::session(
+                                "active Session changed while the fork target was being prepared",
+                            ));
+                        }
+                        guard.invalidate_background_compaction();
+                        state.provider_admission.ensure_allowed()?;
                         if save_enabled {
                             if let Err(first_err) = new_session.save().await
                                 && let Err(retry_err) = new_session.save().await
@@ -4306,24 +4376,11 @@ pub async fn run(
                         let target_plan_mode = replayed_plan_mode(&new_session);
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
-                        guard.invalidate_background_compaction();
-                        state.provider_admission.ensure_allowed()?;
-                        let session_store = Arc::clone(&guard.session);
-                        let mut inner = OwnedMutexGuard::lock(session_store, &cx)
-                            .await
-                            .map_err(|err| {
-                                Error::session(format!("inner session lock failed: {err}"))
-                            })?;
-                        if inner.header.id != origin_session_id {
-                            return Err(Error::session(
-                                "active Session changed while the fork target was being prepared",
-                            ));
-                        }
                         *inner = new_session;
                         session_transition_permit.commit_session_change();
                         drop(inner);
                         guard.agent.replace_messages(messages);
-                        guard.agent.stream_options_mut().session_id = Some(session_id);
+                        guard.agent.stream_options_mut().session_id = Some(session_id.clone());
                         guard.agent.reset_session_scoped_state(target_plan_mode);
                         guard.agent.set_provider(provider_impl);
                         guard.agent.set_keyword_max_thinking_level(
@@ -4352,14 +4409,43 @@ pub async fn run(
                         }
                         state.clear_all_pending();
                         state.clear_failover_lifecycle();
-                    }
+                        session_id
+                    };
 
-                    Ok(selected_text)
+                    Ok(Some((
+                        selected_text,
+                        previous_session_file,
+                        origin_session_id,
+                        session_id,
+                    )))
                 }
                 .await;
 
                 match result {
-                    Ok(selected_text) => {
+                    Ok(None) => {
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "fork",
+                            Some(json!({ "cancelled": true })),
+                        ));
+                    }
+                    Ok(Some((
+                        selected_text,
+                        previous_session_file,
+                        source_session_id,
+                        new_session_id,
+                    ))) => {
+                        rpc_dispatch_session_fork_event(
+                            rpc_extension_manager.clone(),
+                            json!({
+                                "entryId": entry_id,
+                                "summary": selected_text.clone(),
+                                "sessionId": source_session_id,
+                                "newSessionId": new_session_id,
+                                "previousSessionFile": previous_session_file,
+                            }),
+                        )
+                        .await;
                         let _ = out_tx.send(response_ok(
                             id,
                             "fork",
@@ -7585,6 +7671,35 @@ mod retry_tests {
         }
     }
 
+    fn rpc_fork_source_session() -> (Session, String) {
+        let mut session = Session::in_memory();
+        session.header.provider = Some("anthropic".to_string());
+        session.header.model_id = Some("test-model".to_string());
+        session.header.thinking_level = Some("off".to_string());
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("fork this prompt".to_string()),
+            timestamp: Some(0),
+        });
+        let entry_id = session
+            .entries_for_current_path()
+            .last()
+            .and_then(SessionEntry::base_id)
+            .cloned()
+            .expect("fork source entry id");
+        (session, entry_id)
+    }
+
+    fn rpc_fork_test_options(
+        runtime_handle: &asupersync::runtime::RuntimeHandle,
+        auth_path: PathBuf,
+    ) -> RpcOptions {
+        let mut options = build_test_rpc_options(runtime_handle, auth_path);
+        let mut model = dummy_entry("test-model", false);
+        model.api_key = Some("test-key".to_string());
+        options.available_models.push(model);
+        options
+    }
+
     #[async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for FlakyProvider {
@@ -8383,9 +8498,9 @@ mod retry_tests {
                     },
                 });
                 inner.save().await.expect("persist second failed tail");
-                guard
-                    .agent
-                    .replace_messages(inner.to_messages_for_current_path());
+                let messages = inner.to_messages_for_current_path();
+                drop(inner);
+                guard.agent.replace_messages(messages);
             }
             assert!(
                 try_failover_to_next_chain_entry(
@@ -9397,7 +9512,7 @@ mod retry_tests {
     }
 
     #[test]
-    fn rpc_new_session_rejects_real_js_hook_actions_without_cross_session_delivery() {
+    fn rpc_new_session_rejects_real_js_queued_actions_without_cross_session_delivery() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -9411,10 +9526,6 @@ mod retry_tests {
                 r#"
                 export default function init(pi) {
                   pi.on("session_before_switch", async () => {
-                    await pi.session("appendEntry", {
-                      customType: "direct-source-entry",
-                      data: { owner: "source" }
-                    });
                     pi.sendMessage({
                       customType: "immediate-note",
                       content: "immediate source action",
@@ -9509,12 +9620,312 @@ mod retry_tests {
             assert!(durable_custom_types.contains(&"immediate-note"));
             assert!(durable_custom_types.contains(&"next-turn-note"));
             assert!(!durable_custom_types.contains(&"trigger-note"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn rpc_new_session_rejects_real_js_direct_source_session_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let extension_path = temp.path().join("direct-source-mutation.mjs");
+            std::fs::write(
+                &extension_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("session_before_switch", async () => {
+                    await pi.session("appendEntry", {
+                      customType: "direct-source-entry",
+                      data: { owner: "source" }
+                    });
+                  });
+                }
+                "#,
+            )
+            .expect("write direct source mutation extension");
+
+            let provider = Arc::new(FlakyProvider::new());
+            let agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+            let original_session_id = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("initial session lock")
+                .header
+                .id
+                .clone();
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            agent_session
+                .enable_extensions(&[], temp.path(), None, &[extension_path])
+                .await
+                .expect("enable direct source mutation extension");
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+            let send_cx = asupersync::Cx::for_testing();
+            in_tx
+                .send(&send_cx, r#"{"id":"1","type":"new_session"}"#.to_string())
+                .await
+                .expect("send new_session");
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+
+            run(agent_session, options, in_rx, out_tx)
+                .await
+                .expect("rpc server loop");
+
+            let response = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+                .find(|value| value["type"] == "response" && value["command"] == "new_session")
+                .expect("new_session response");
+            assert_eq!(
+                response["success"], false,
+                "unexpected response: {response}"
+            );
+            assert!(
+                response["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("modified the source Session")),
+                "unexpected transition error: {response}"
+            );
+
+            let cx = AgentCx::for_request();
+            let inner = inner_session.lock(&cx).await.expect("source session lock");
+            assert_eq!(inner.header.id, original_session_id);
             assert!(inner.entries_for_current_path().iter().any(|entry| {
                 matches!(
                     entry,
                     SessionEntry::Custom(custom)
                         if custom.custom_type == "direct-source-entry"
                             && custom.data == Some(json!({"owner": "source"}))
+                )
+            }));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn rpc_fork_dispatches_real_js_lifecycle_against_the_owned_sessions() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let extension_path = temp.path().join("fork-lifecycle.mjs");
+            std::fs::write(
+                &extension_path,
+                r#"
+                export default function init(pi) {
+                  let beforeEntryId = null;
+                  let beforeSessionId = null;
+                  pi.on("session_before_fork", (event) => {
+                    beforeEntryId = event.entryId;
+                    beforeSessionId = event.sessionId;
+                    return null;
+                  });
+                  pi.on("session_fork", async (event) => {
+                    await pi.session("appendEntry", {
+                      customType: "rpc-fork-lifecycle",
+                      data: {
+                        beforeEntryId,
+                        beforeSessionId,
+                        afterEntryId: event.entryId,
+                        afterSessionId: event.sessionId,
+                        newSessionId: event.newSessionId
+                      }
+                    });
+                  });
+                }
+                "#,
+            )
+            .expect("write fork lifecycle extension");
+
+            let provider = Arc::new(FlakyProvider::new());
+            let agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let (source, entry_id) = rpc_fork_source_session();
+            let source_session_id = source.header.id.clone();
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(source));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            agent_session
+                .enable_extensions(&[], temp.path(), None, &[extension_path])
+                .await
+                .expect("enable fork lifecycle extension");
+            let options = rpc_fork_test_options(
+                &runtime_handle,
+                temp.path().join("fork-lifecycle-auth.json"),
+            );
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+            let send_cx = asupersync::Cx::for_testing();
+            in_tx
+                .send(
+                    &send_cx,
+                    json!({"id": "1", "type": "fork", "entryId": entry_id.clone()}).to_string(),
+                )
+                .await
+                .expect("send fork");
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+
+            run(agent_session, options, in_rx, out_tx)
+                .await
+                .expect("rpc server loop");
+
+            let response = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+                .find(|value| value["type"] == "response" && value["command"] == "fork")
+                .expect("fork response");
+            assert_eq!(response["success"], true, "unexpected response: {response}");
+            assert_eq!(response["data"]["cancelled"], false);
+            assert_eq!(response["data"]["text"], "fork this prompt");
+
+            let cx = AgentCx::for_request();
+            let inner = inner_session.lock(&cx).await.expect("forked session lock");
+            let new_session_id = inner.header.id.clone();
+            assert_ne!(new_session_id, source_session_id);
+            let lifecycle = inner
+                .entries_for_current_path()
+                .iter()
+                .find_map(|entry| match entry {
+                    SessionEntry::Custom(custom) if custom.custom_type == "rpc-fork-lifecycle" => {
+                        custom.data.as_ref()
+                    }
+                    _ => None,
+                })
+                .expect("session_fork lifecycle marker");
+            assert_eq!(lifecycle["beforeEntryId"], entry_id);
+            assert_eq!(lifecycle["afterEntryId"], entry_id);
+            assert_eq!(lifecycle["beforeSessionId"], source_session_id);
+            assert_eq!(lifecycle["afterSessionId"], source_session_id);
+            assert_eq!(lifecycle["newSessionId"], new_session_id);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn rpc_fork_real_js_veto_keeps_hook_actions_on_the_source_session() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let extension_path = temp.path().join("fork-veto.mjs");
+            std::fs::write(
+                &extension_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("session_before_fork", async (event) => {
+                    await pi.session("appendEntry", {
+                      customType: "rpc-fork-veto-source",
+                      data: { entryId: event.entryId, sessionId: event.sessionId }
+                    });
+                    return { cancel: true };
+                  });
+                  pi.on("session_fork", async () => {
+                    await pi.session("appendEntry", {
+                      customType: "rpc-fork-after-veto",
+                      data: null
+                    });
+                  });
+                }
+                "#,
+            )
+            .expect("write fork veto extension");
+
+            let provider = Arc::new(FlakyProvider::new());
+            let agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let (source, entry_id) = rpc_fork_source_session();
+            let source_session_id = source.header.id.clone();
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(source));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            agent_session
+                .enable_extensions(&[], temp.path(), None, &[extension_path])
+                .await
+                .expect("enable fork veto extension");
+            let options =
+                rpc_fork_test_options(&runtime_handle, temp.path().join("fork-veto-auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+            let send_cx = asupersync::Cx::for_testing();
+            in_tx
+                .send(
+                    &send_cx,
+                    json!({"id": "1", "type": "fork", "entryId": entry_id.clone()}).to_string(),
+                )
+                .await
+                .expect("send fork");
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+
+            run(agent_session, options, in_rx, out_tx)
+                .await
+                .expect("rpc server loop");
+
+            let response = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+                .find(|value| value["type"] == "response" && value["command"] == "fork")
+                .expect("fork response");
+            assert_eq!(response["success"], true, "unexpected response: {response}");
+            assert_eq!(response["data"]["cancelled"], true);
+
+            let cx = AgentCx::for_request();
+            let inner = inner_session.lock(&cx).await.expect("source session lock");
+            assert_eq!(inner.header.id, source_session_id);
+            let veto_marker = inner
+                .entries_for_current_path()
+                .iter()
+                .find_map(|entry| match entry {
+                    SessionEntry::Custom(custom)
+                        if custom.custom_type == "rpc-fork-veto-source" =>
+                    {
+                        custom.data.as_ref()
+                    }
+                    _ => None,
+                })
+                .expect("session_before_fork source marker");
+            assert_eq!(veto_marker["entryId"], entry_id);
+            assert_eq!(veto_marker["sessionId"], source_session_id);
+            assert!(inner.entries_for_current_path().iter().all(|entry| {
+                !matches!(
+                    entry,
+                    SessionEntry::Custom(custom)
+                        if custom.custom_type == "rpc-fork-after-veto"
                 )
             }));
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -15236,6 +15647,212 @@ export default function init(pi) {
                     SessionEntry::Custom(custom) if custom.custom_type == "hook-action"
                 )
             }));
+        });
+    }
+
+    #[test]
+    fn session_transition_waits_for_outer_before_taking_action_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let bash_state = Arc::new(asupersync::sync::Mutex::new(None));
+            let setup_cx = AgentCx::for_request();
+            let baseline = rpc_session_transition_snapshot(&session, &setup_cx)
+                .await
+                .expect("transition baseline");
+            let session_action_admission = session
+                .lock(&setup_cx)
+                .await
+                .expect("agent session lock")
+                .session_action_admission_gate();
+            let held_session = session
+                .lock(&setup_cx)
+                .await
+                .expect("hold outer session lock");
+
+            let transition_cx = AgentCx::for_request();
+            let turn_in_progress = AtomicBool::new(false);
+            let prompt_or_tool_in_progress = AtomicBool::new(false);
+            let turn_phase_linearizer = std::sync::Mutex::new(());
+            let mut transition = Box::pin(acquire_rpc_session_transition(
+                &baseline,
+                &turn_in_progress,
+                &prompt_or_tool_in_progress,
+                &turn_phase_linearizer,
+                &session,
+                &shared_state,
+                &bash_state,
+                &transition_cx,
+            ));
+            assert!(matches!(
+                futures::poll!(transition.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(
+                session.waiters(),
+                1,
+                "the transition must block first on the outer AgentSession"
+            );
+
+            let action_permit = asupersync::time::timeout(
+                wall_now(),
+                Duration::from_secs(1),
+                Box::pin(session_action_admission.acquire(setup_cx.cx())),
+            )
+            .await
+            .expect("transition took session-action admission before the outer lock")
+            .expect("session-action admission lock");
+            drop(action_permit);
+            drop(held_session);
+
+            let authority =
+                asupersync::time::timeout(wall_now(), Duration::from_secs(5), transition)
+                    .await
+                    .expect("transition did not resume after the outer lock was released")
+                    .expect("transition authority");
+            drop(authority);
+        });
+    }
+
+    #[test]
+    fn session_transition_waits_for_provider_before_taking_action_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let bash_state = Arc::new(asupersync::sync::Mutex::new(None));
+            let setup_cx = AgentCx::for_request();
+            let baseline = rpc_session_transition_snapshot(&session, &setup_cx)
+                .await
+                .expect("transition baseline");
+            let (provider_admission, session_action_admission) = {
+                let guard = session.lock(&setup_cx).await.expect("agent session lock");
+                (
+                    guard.provider_admission_gate(),
+                    guard.session_action_admission_gate(),
+                )
+            };
+            let provider_permit = provider_admission
+                .acquire(setup_cx.cx())
+                .await
+                .expect("hold provider admission");
+
+            let transition_cx = AgentCx::for_request();
+            let turn_in_progress = AtomicBool::new(false);
+            let prompt_or_tool_in_progress = AtomicBool::new(false);
+            let turn_phase_linearizer = std::sync::Mutex::new(());
+            let mut transition = Box::pin(acquire_rpc_session_transition(
+                &baseline,
+                &turn_in_progress,
+                &prompt_or_tool_in_progress,
+                &turn_phase_linearizer,
+                &session,
+                &shared_state,
+                &bash_state,
+                &transition_cx,
+            ));
+            assert!(matches!(
+                futures::poll!(transition.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(
+                session.is_locked(),
+                "the transition must hold the outer AgentSession while awaiting provider admission"
+            );
+
+            let action_permit = asupersync::time::timeout(
+                wall_now(),
+                Duration::from_secs(1),
+                Box::pin(session_action_admission.acquire(setup_cx.cx())),
+            )
+            .await
+            .expect("transition took session-action admission before provider admission")
+            .expect("session-action admission lock");
+            drop(action_permit);
+            drop(provider_permit);
+
+            let authority =
+                asupersync::time::timeout(wall_now(), Duration::from_secs(5), transition)
+                    .await
+                    .expect("transition did not resume after provider admission was released")
+                    .expect("transition authority");
+            drop(authority);
+        });
+    }
+
+    #[test]
+    fn session_transition_checks_bash_before_taking_outer_authority() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let bash_state = Arc::new(asupersync::sync::Mutex::new(None));
+            let setup_cx = AgentCx::for_request();
+            let baseline = rpc_session_transition_snapshot(&session, &setup_cx)
+                .await
+                .expect("transition baseline");
+            let held_bash_state = bash_state
+                .lock(&setup_cx)
+                .await
+                .expect("hold bash state lock");
+
+            let transition_cx = AgentCx::for_request();
+            let turn_in_progress = AtomicBool::new(false);
+            let prompt_or_tool_in_progress = AtomicBool::new(false);
+            let turn_phase_linearizer = std::sync::Mutex::new(());
+            let mut transition = Box::pin(acquire_rpc_session_transition(
+                &baseline,
+                &turn_in_progress,
+                &prompt_or_tool_in_progress,
+                &turn_phase_linearizer,
+                &session,
+                &shared_state,
+                &bash_state,
+                &transition_cx,
+            ));
+            assert!(matches!(
+                futures::poll!(transition.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(
+                bash_state.waiters(),
+                1,
+                "the transition must block first on the bash-state precheck"
+            );
+            assert!(
+                !session.is_locked(),
+                "the transition must not take outer AgentSession authority while bash-state is unavailable"
+            );
+            drop(held_bash_state);
+
+            let authority =
+                asupersync::time::timeout(wall_now(), Duration::from_secs(5), transition)
+                    .await
+                    .expect("transition did not resume after bash-state was released")
+                    .expect("transition authority");
+            drop(authority);
         });
     }
 
