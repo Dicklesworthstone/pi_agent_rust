@@ -10,12 +10,44 @@ use crate::error::{Error, Result};
 use crate::package_manager::{
     PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolvedResource, ResourceOrigin,
 };
-use crate::theme::Theme;
+use crate::theme::{MAX_RESOURCE_FILE_BYTES, Theme};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use tracing::warn;
+
+pub(crate) fn read_resource_file_bounded(path: &Path, resource_label: &str) -> Result<String> {
+    let file = fs::File::open(path).map_err(|err| {
+        Error::config(format!(
+            "Failed to open {resource_label} file '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_RESOURCE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            Error::config(format!(
+                "Failed to read {resource_label} file '{}': {err}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > MAX_RESOURCE_FILE_BYTES {
+        return Err(Error::config(format!(
+            "{resource_label} file '{}' exceeds the {MAX_RESOURCE_FILE_BYTES}-byte resource limit",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|err| {
+        Error::config(format!(
+            "{resource_label} file '{}' is not valid UTF-8: {}",
+            path.display(),
+            err.utf8_error()
+        ))
+    })
+}
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
     payload.downcast::<String>().map_or_else(
@@ -142,6 +174,12 @@ pub struct LoadPromptTemplatesOptions {
     pub agent_dir: PathBuf,
     pub prompt_paths: Vec<PathBuf>,
     pub include_defaults: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoadPromptTemplatesResult {
+    pub(crate) templates: Vec<PromptTemplate>,
+    pub(crate) diagnostics: Vec<ResourceDiagnostic>,
 }
 
 // ============================================================================
@@ -371,7 +409,7 @@ impl ResourceLoader {
                 })
             });
             let prompts_handle = s.spawn(move || {
-                load_prompt_templates(LoadPromptTemplatesOptions {
+                load_prompt_templates_with_diagnostics(LoadPromptTemplatesOptions {
                     cwd: cwd_s.clone(),
                     agent_dir: agent_s.clone(),
                     prompt_paths,
@@ -398,7 +436,7 @@ impl ResourceLoader {
                 panic_payload_message(payload)
             ))
         })?;
-        let prompt_templates = prompts_join.map_err(|payload| {
+        let prompts_result = prompts_join.map_err(|payload| {
             Error::config(format!(
                 "Prompt loader thread panicked: {}",
                 panic_payload_message(payload)
@@ -410,7 +448,10 @@ impl ResourceLoader {
                 panic_payload_message(payload)
             ))
         })?;
-        let (prompts, prompt_diagnostics) = dedupe_prompts(prompt_templates);
+        let (prompts, prompt_collision_diagnostics) =
+            dedupe_prompts(prompts_result.templates);
+        let mut prompt_diagnostics = prompts_result.diagnostics;
+        prompt_diagnostics.extend(prompt_collision_diagnostics);
         let (themes, theme_diagnostics) = dedupe_themes(themes_result.themes);
         let mut theme_diags = themes_result.diagnostics;
         theme_diags.extend(theme_diagnostics);
@@ -424,7 +465,7 @@ impl ResourceLoader {
             &skills_result.diagnostics,
             ExplicitResourceKind::Skill,
         )?;
-        ensure_explicit_file_paths_loaded(
+        ensure_explicit_prompt_paths_loaded(
             &explicit_prompt_paths,
             prompts
                 .iter()
@@ -510,15 +551,18 @@ impl ResourceLoader {
         if !paths.prompt_paths.is_empty() {
             let prompt_paths = dedupe_paths(paths.prompt_paths.clone());
             if !prompt_paths.is_empty() {
-                let new_prompts = load_prompt_templates(LoadPromptTemplatesOptions {
-                    cwd: cwd_buf.clone(),
-                    agent_dir: agent_dir.clone(),
-                    prompt_paths,
-                    include_defaults: false,
-                });
-                if !new_prompts.is_empty() {
+                let new_prompts = load_prompt_templates_with_diagnostics(
+                    LoadPromptTemplatesOptions {
+                        cwd: cwd_buf.clone(),
+                        agent_dir: agent_dir.clone(),
+                        prompt_paths,
+                        include_defaults: false,
+                    },
+                );
+                self.prompt_diagnostics.extend(new_prompts.diagnostics);
+                if !new_prompts.templates.is_empty() {
                     let mut merged = self.prompts.clone();
-                    merged.extend(new_prompts);
+                    merged.extend(new_prompts.templates);
                     let (deduped, diagnostics) = dedupe_prompts(merged);
                     self.prompts = deduped;
                     self.prompt_diagnostics.extend(diagnostics);
@@ -1168,17 +1212,20 @@ struct LoadSkillFileResult {
 fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
     let mut diagnostics = Vec::new();
 
-    let Ok(raw) = fs::read_to_string(path) else {
-        diagnostics.push(ResourceDiagnostic {
-            kind: DiagnosticKind::Warning,
-            message: "failed to parse skill file".to_string(),
-            path: path.to_path_buf(),
-            collision: None,
-        });
-        return LoadSkillFileResult {
-            skill: None,
-            diagnostics,
-        };
+    let raw = match read_resource_file_bounded(path, "Skill") {
+        Ok(raw) => raw,
+        Err(err) => {
+            diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: err.to_string(),
+                path: path.to_path_buf(),
+                collision: None,
+            });
+            return LoadSkillFileResult {
+                skill: None,
+                diagnostics,
+            };
+        }
     };
 
     let parsed = parse_frontmatter(&raw);
@@ -1367,21 +1414,42 @@ fn escape_xml(input: &str) -> String {
 // ============================================================================
 
 pub fn load_prompt_templates(options: LoadPromptTemplatesOptions) -> Vec<PromptTemplate> {
+    let result = load_prompt_templates_with_diagnostics(options);
+    for diagnostic in &result.diagnostics {
+        warn!(
+            path = %diagnostic.path.display(),
+            message = %diagnostic.message,
+            "Prompt template was not loaded"
+        );
+    }
+    result.templates
+}
+
+pub(crate) fn load_prompt_templates_with_diagnostics(
+    options: LoadPromptTemplatesOptions,
+) -> LoadPromptTemplatesResult {
     let mut templates = Vec::new();
+    let mut diagnostics = Vec::new();
     let user_dir = options.agent_dir.join("prompts");
     let project_dir = options.cwd.join(Config::project_dir()).join("prompts");
 
     if options.include_defaults {
-        templates.extend(load_templates_from_dir(
-            &project_dir,
-            "project",
-            "(project)",
-        ));
-        templates.extend(load_templates_from_dir(&user_dir, "user", "(user)"));
+        let project = load_templates_from_dir(&project_dir, "project", "(project)");
+        templates.extend(project.templates);
+        diagnostics.extend(project.diagnostics);
+        let user = load_templates_from_dir(&user_dir, "user", "(user)");
+        templates.extend(user.templates);
+        diagnostics.extend(user.diagnostics);
     }
 
     for path in options.prompt_paths {
         if !path.exists() {
+            diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: "prompt template path does not exist".to_string(),
+                path,
+                collision: None,
+            });
             continue;
         }
 
@@ -1399,42 +1467,109 @@ pub fn load_prompt_templates(options: LoadPromptTemplatesOptions) -> Vec<PromptT
 
         match fs::metadata(&path) {
             Ok(meta) if meta.is_dir() => {
-                templates.extend(load_templates_from_dir(&path, source, &label));
+                let loaded = load_templates_from_dir(&path, source, &label);
+                templates.extend(loaded.templates);
+                diagnostics.extend(loaded.diagnostics);
             }
             Ok(meta) if meta.is_file() && path.extension().is_some_and(|ext| ext == "md") => {
-                if let Some(template) = load_template_from_file(&path, source, &label) {
-                    templates.push(template);
+                match load_template_from_file(&path, source, &label) {
+                    Ok(template) => templates.push(template),
+                    Err(err) => diagnostics.push(ResourceDiagnostic {
+                        kind: DiagnosticKind::Warning,
+                        message: err.to_string(),
+                        path,
+                        collision: None,
+                    }),
                 }
             }
-            _ => {}
+            Ok(_) => diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: "prompt template path is not a markdown file".to_string(),
+                path,
+                collision: None,
+            }),
+            Err(err) => diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: format!("failed to inspect prompt template path: {err}"),
+                path,
+                collision: None,
+            }),
         }
     }
 
-    templates
+    LoadPromptTemplatesResult {
+        templates,
+        diagnostics,
+    }
 }
 
-fn load_templates_from_dir(dir: &Path, source: &str, label: &str) -> Vec<PromptTemplate> {
+fn load_templates_from_dir(
+    dir: &Path,
+    source: &str,
+    label: &str,
+) -> LoadPromptTemplatesResult {
     let mut templates = Vec::new();
+    let mut diagnostics = Vec::new();
     if !dir.exists() {
-        return templates;
+        return LoadPromptTemplatesResult {
+            templates,
+            diagnostics,
+        };
     }
 
-    for full_path in read_dir_sorted_paths(dir) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: format!("failed to read prompt template directory: {err}"),
+                path: dir.to_path_buf(),
+                collision: None,
+            });
+            return LoadPromptTemplatesResult {
+                templates,
+                diagnostics,
+            };
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(err) => diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: format!("failed to inspect prompt template directory entry: {err}"),
+                path: dir.to_path_buf(),
+                collision: None,
+            }),
+        }
+    }
+    paths.sort();
+
+    for full_path in paths {
         let (_, is_file) = resolved_path_kind(&full_path);
 
-        if is_file
-            && full_path.extension().is_some_and(|ext| ext == "md")
-            && let Some(template) = load_template_from_file(&full_path, source, label)
-        {
-            templates.push(template);
+        if is_file && full_path.extension().is_some_and(|ext| ext == "md") {
+            match load_template_from_file(&full_path, source, label) {
+                Ok(template) => templates.push(template),
+                Err(err) => diagnostics.push(ResourceDiagnostic {
+                    kind: DiagnosticKind::Warning,
+                    message: err.to_string(),
+                    path: full_path,
+                    collision: None,
+                }),
+            }
         }
     }
 
-    templates
+    LoadPromptTemplatesResult {
+        templates,
+        diagnostics,
+    }
 }
 
-fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<PromptTemplate> {
-    let raw = fs::read_to_string(path).ok()?;
+fn load_template_from_file(path: &Path, source: &str, label: &str) -> Result<PromptTemplate> {
+    let raw = read_resource_file_bounded(path, "Prompt template")?;
     let parsed = parse_frontmatter(&raw);
     let mut description = parsed
         .frontmatter
@@ -1467,7 +1602,7 @@ fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<Pro
         .unwrap_or("template")
         .to_string();
 
-    Some(PromptTemplate {
+    Ok(PromptTemplate {
         name,
         description,
         content: parsed.body,
@@ -1617,7 +1752,7 @@ fn load_theme_from_file(
 }
 
 fn load_legacy_ini_theme(path: &Path) -> Result<Theme> {
-    let content = fs::read_to_string(path)?;
+    let content = read_resource_file_bounded(path, "Theme")?;
     let mut theme = Theme::dark();
     if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
         theme.name = name.to_string();
@@ -1848,7 +1983,7 @@ fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
         return text.to_string();
     };
 
-    match fs::read_to_string(&skill.file_path) {
+    match read_resource_file_bounded(&skill.file_path, "Skill") {
         Ok(content) => {
             let body = strip_frontmatter(&content).trim().to_string();
             let block = format!(
@@ -2325,6 +2460,51 @@ fn ensure_explicit_file_paths_loaded(
     Ok(())
 }
 
+fn ensure_explicit_prompt_paths_loaded(
+    explicit_paths: &[PathBuf],
+    loaded_paths: Vec<PathBuf>,
+    diagnostics: &[ResourceDiagnostic],
+    resource_kind: ExplicitResourceKind,
+) -> Result<()> {
+    ensure_explicit_file_paths_loaded(
+        explicit_paths,
+        loaded_paths,
+        diagnostics,
+        resource_kind,
+    )?;
+
+    for root in explicit_paths {
+        let metadata = fs::metadata(root).map_err(|err| {
+            Error::config(format!(
+                "Failed to inspect explicit {} path '{}': {err}",
+                resource_kind.label(),
+                root.display()
+            ))
+        })?;
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        if let Some(diagnostic) = diagnostics.iter().find(|diagnostic| {
+            diagnostic.kind == DiagnosticKind::Warning
+                && diagnostic.collision.is_none()
+                && (diagnostic.path == *root
+                    || diagnostic.path.starts_with(root)
+                    || is_under_path(&diagnostic.path, root))
+        }) {
+            return Err(Error::config(format!(
+                "Explicit {} directory '{}' could not load '{}': {}",
+                resource_kind.label(),
+                root.display(),
+                diagnostic.path.display(),
+                diagnostic.message
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn replace_regex<F>(input: &str, regex: &regex::Regex, mut replacer: F) -> String
 where
     F: FnMut(&regex::Captures<'_>) -> String,
@@ -2344,12 +2524,333 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use std::fs;
     use std::future::Future;
+    use std::io::Write;
+
+    fn write_resource_at_limit(path: &Path, prefix: &[u8]) {
+        assert!(prefix.len() <= MAX_RESOURCE_FILE_BYTES);
+        let mut file = fs::File::create(path).expect("create exact-limit resource");
+        file.write_all(prefix).expect("write resource prefix");
+        let padding = [b' '; 8192];
+        let mut remaining = MAX_RESOURCE_FILE_BYTES - prefix.len();
+        while remaining > 0 {
+            let count = remaining.min(padding.len());
+            file.write_all(&padding[..count])
+                .expect("write resource padding");
+            remaining -= count;
+        }
+    }
+
+    fn create_resource_over_limit(path: &Path) {
+        let file = fs::File::create(path).expect("create oversized sparse resource");
+        file.set_len((MAX_RESOURCE_FILE_BYTES + 1) as u64)
+            .expect("set oversized sparse resource length");
+    }
+
+    fn prompt_only_cli(path: &Path) -> ResourceCliOptions {
+        ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: true,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![path.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        }
+    }
+
+    fn load_explicit_prompt(temp_dir: &tempfile::TempDir, path: &Path) -> Result<ResourceLoader> {
+        run_async(async {
+            ResourceLoader::load(
+                &PackageManager::new(temp_dir.path().to_path_buf()),
+                temp_dir.path(),
+                &Config::default(),
+                &prompt_only_cli(path),
+            )
+            .await
+        })
+    }
 
     fn run_async<T>(future: impl Future<Output = T>) -> T {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
         runtime.block_on(future)
+    }
+
+    #[test]
+    fn test_skill_resource_limit_accepts_exact_and_rejects_plus_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let exact_dir = temp_dir.path().join("exact-skill");
+        let oversized_dir = temp_dir.path().join("oversized-skill");
+        fs::create_dir_all(&exact_dir).expect("create exact skill dir");
+        fs::create_dir_all(&oversized_dir).expect("create oversized skill dir");
+        let exact = exact_dir.join("SKILL.md");
+        let oversized = oversized_dir.join("SKILL.md");
+        write_resource_at_limit(
+            &exact,
+            b"---\nname: exact-skill\ndescription: Exact-limit skill\n---\nBody\n",
+        );
+        create_resource_over_limit(&oversized);
+
+        let result = load_skills(LoadSkillsOptions {
+            cwd: temp_dir.path().to_path_buf(),
+            agent_dir: temp_dir.path().join("agent"),
+            skill_paths: vec![exact.clone(), oversized.clone()],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].file_path, exact);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == oversized
+                && diagnostic
+                    .message
+                    .contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit"))
+        }));
+    }
+
+    #[test]
+    fn test_prompt_resource_limit_accepts_exact_and_rejects_plus_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompts_dir = temp_dir.path().join("prompts");
+        fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        let exact = prompts_dir.join("exact.md");
+        let oversized = prompts_dir.join("oversized.md");
+        write_resource_at_limit(
+            &exact,
+            b"---\ndescription: Exact-limit prompt\n---\nPrompt body\n",
+        );
+        create_resource_over_limit(&oversized);
+
+        let result = load_prompt_templates_with_diagnostics(LoadPromptTemplatesOptions {
+            cwd: temp_dir.path().to_path_buf(),
+            agent_dir: temp_dir.path().join("agent"),
+            prompt_paths: vec![prompts_dir],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.templates.len(), 1);
+        assert_eq!(result.templates[0].file_path, exact);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == oversized
+                && diagnostic
+                    .message
+                    .contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit"))
+        }));
+    }
+
+    #[test]
+    fn test_theme_resource_limit_accepts_exact_and_rejects_plus_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = temp_dir.path().join("themes");
+        fs::create_dir_all(&themes_dir).expect("create themes dir");
+        let exact = themes_dir.join("exact.ini");
+        let oversized = themes_dir.join("oversized.theme");
+        write_resource_at_limit(&exact, b"[styles]\nbrand.accent = #38bdf8\n");
+        create_resource_over_limit(&oversized);
+
+        let result = load_themes(LoadThemesOptions {
+            cwd: temp_dir.path().to_path_buf(),
+            agent_dir: temp_dir.path().join("agent"),
+            theme_paths: vec![themes_dir],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.themes.len(), 1);
+        assert_eq!(result.themes[0].file_path, exact);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == oversized
+                && diagnostic
+                    .message
+                    .contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit"))
+        }));
+    }
+
+    #[test]
+    fn test_json_theme_resource_limit_accepts_exact_and_rejects_plus_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let exact = temp_dir.path().join("exact.json");
+        let oversized = temp_dir.path().join("oversized.json");
+        let encoded = serde_json::to_vec(&Theme::dark()).expect("serialize theme");
+        write_resource_at_limit(&exact, &encoded);
+        create_resource_over_limit(&oversized);
+
+        Theme::load(&exact).expect("exact-limit JSON theme should load");
+        let error = Theme::load(&oversized).expect_err("plus-one JSON theme should fail");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_json_theme_rejects_invalid_utf8_without_lossy_decoding() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let invalid = temp_dir.path().join("invalid.json");
+        fs::write(&invalid, [0xff, 0xfe]).expect("write invalid JSON theme");
+
+        let error = Theme::load(&invalid).expect_err("invalid UTF-8 theme must fail");
+        let message = error.to_string();
+        assert!(message.contains(&invalid.display().to_string()), "{message}");
+        assert!(message.contains("not valid UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn test_configured_resource_failures_remain_visible_in_loader_diagnostics() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp_dir.path().join("oversized-skill");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let skill = skill_dir.join("SKILL.md");
+        let prompt = temp_dir.path().join("oversized-prompt.md");
+        let theme = temp_dir.path().join("oversized-theme.ini");
+        create_resource_over_limit(&skill);
+        create_resource_over_limit(&prompt);
+        create_resource_over_limit(&theme);
+
+        let mut loader = ResourceLoader::empty(true);
+        loader
+            .extend_with_paths(
+                temp_dir.path(),
+                &ExtensionResourcePaths {
+                    skill_paths: vec![skill.clone()],
+                    prompt_paths: vec![prompt.clone()],
+                    theme_paths: vec![theme.clone()],
+                },
+            )
+            .expect("configured resource failures should be diagnostics");
+
+        assert!(loader.skills().is_empty());
+        assert!(loader.prompts().is_empty());
+        assert!(loader.themes().is_empty());
+        assert!(loader.skill_diagnostics().iter().any(|d| d.path == skill));
+        assert!(loader.prompt_diagnostics().iter().any(|d| d.path == prompt));
+        assert!(loader.theme_diagnostics().iter().any(|d| d.path == theme));
+    }
+
+    #[test]
+    fn test_explicit_prompt_file_rejects_invalid_utf8_with_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompt = temp_dir.path().join("invalid.md");
+        fs::write(&prompt, [0xff, 0xfe]).expect("write invalid UTF-8 prompt");
+
+        let error = load_explicit_prompt(&temp_dir, &prompt)
+            .expect_err("explicit invalid UTF-8 prompt should fail");
+        let message = error.to_string();
+        assert!(message.contains(&prompt.display().to_string()), "{message}");
+        assert!(message.contains("not valid UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn test_explicit_prompt_file_rejects_oversize_with_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompt = temp_dir.path().join("oversized.md");
+        create_resource_over_limit(&prompt);
+
+        let error = load_explicit_prompt(&temp_dir, &prompt)
+            .expect_err("explicit oversized prompt should fail");
+        let message = error.to_string();
+        assert!(message.contains(&prompt.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_prompt_directory_rejects_invalid_utf8_child_with_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompts = temp_dir.path().join("prompts");
+        fs::create_dir_all(&prompts).expect("create prompts dir");
+        let prompt = prompts.join("invalid.md");
+        fs::write(&prompt, [0xff, 0xfe]).expect("write invalid UTF-8 prompt");
+
+        let error = load_explicit_prompt(&temp_dir, &prompts)
+            .expect_err("explicit prompt directory should fail on invalid UTF-8 child");
+        let message = error.to_string();
+        assert!(message.contains(&prompts.display().to_string()), "{message}");
+        assert!(message.contains(&prompt.display().to_string()), "{message}");
+        assert!(message.contains("not valid UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn test_explicit_prompt_directory_rejects_oversize_child_with_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompts = temp_dir.path().join("prompts");
+        fs::create_dir_all(&prompts).expect("create prompts dir");
+        let prompt = prompts.join("oversized.md");
+        create_resource_over_limit(&prompt);
+
+        let error = load_explicit_prompt(&temp_dir, &prompts)
+            .expect_err("explicit prompt directory should fail on oversized child");
+        let message = error.to_string();
+        assert!(message.contains(&prompts.display().to_string()), "{message}");
+        assert!(message.contains(&prompt.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit")),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_explicit_prompt_path_and_directory_reject_unreadable_file_with_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for use_directory in [false, true] {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let prompts = temp_dir.path().join("prompts");
+            fs::create_dir_all(&prompts).expect("create prompts dir");
+            let prompt = prompts.join("unreadable.md");
+            fs::write(&prompt, "Prompt body\n").expect("write prompt");
+            let original_permissions = fs::metadata(&prompt)
+                .expect("prompt metadata")
+                .permissions();
+            let mut unreadable = original_permissions.clone();
+            unreadable.set_mode(0);
+            fs::set_permissions(&prompt, unreadable).expect("make prompt unreadable");
+
+            let open_is_denied = fs::File::open(&prompt).is_err();
+            let selected = if use_directory { &prompts } else { &prompt };
+            let result = load_explicit_prompt(&temp_dir, selected);
+            fs::set_permissions(&prompt, original_permissions).expect("restore prompt permissions");
+
+            if !open_is_denied {
+                assert!(
+                    result.is_ok(),
+                    "privileged runner could open the permissionless fixture but loader disagreed"
+                );
+                continue;
+            }
+            let error = result.expect_err("unreadable explicit prompt should fail");
+            let message = error.to_string();
+            assert!(message.contains(&prompt.display().to_string()), "{message}");
+            assert!(message.contains("Failed to open"), "{message}");
+        }
+    }
+
+    #[test]
+    fn test_skill_command_reread_enforces_the_resource_limit() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let skill_path = temp_dir.path().join("SKILL.md");
+        create_resource_over_limit(&skill_path);
+        let skill = Skill {
+            name: "reread-limit".to_string(),
+            description: "reread limit probe".to_string(),
+            file_path: skill_path,
+            base_dir: temp_dir.path().to_path_buf(),
+            source: "test".to_string(),
+            disable_model_invocation: false,
+        };
+
+        let command = "/skill:reread-limit keep-these-args";
+        assert_eq!(
+            expand_skill_command(command, &[skill]),
+            command,
+            "an oversized /skill source must not expand through an unbounded reread"
+        );
     }
 
     #[test]

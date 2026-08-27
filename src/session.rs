@@ -114,6 +114,31 @@ fn discard_through_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Resu
     }
 }
 
+#[derive(Debug)]
+struct ConsumedJsonlLineError(String);
+
+impl std::fmt::Display for ConsumedJsonlLineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConsumedJsonlLineError {}
+
+fn consumed_jsonl_line_error(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        ConsumedJsonlLineError(message.into()),
+    )
+}
+
+fn is_consumed_jsonl_line_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ConsumedJsonlLineError>())
+        .is_some()
+}
+
 fn read_capped_utf8_line_with_limit<R: std::io::BufRead>(
     reader: &mut R,
     max_bytes: usize,
@@ -134,15 +159,14 @@ fn read_capped_utf8_line_with_limit<R: std::io::BufRead>(
         if !bytes.ends_with(b"\n") {
             discard_through_newline(reader)?;
         }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("JSONL line exceeds {max_bytes} bytes"),
-        ));
+        return Err(consumed_jsonl_line_error(format!(
+            "JSONL line exceeds {max_bytes} bytes"
+        )));
     }
 
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        .map_err(|err| consumed_jsonl_line_error(err.to_string()))
 }
 
 fn read_capped_utf8_line<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
@@ -1275,44 +1299,6 @@ fn jsonl_ends_with_newline(path: &Path) -> Result<bool> {
     Ok(final_byte[0] == b'\n')
 }
 
-fn unterminated_jsonl_line_number(path: &Path) -> Result<usize> {
-    let mut file = open_existing_session_file_for_read(path)?;
-    let mut line_number = 1usize;
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(line_number);
-        }
-        for byte in &buffer[..read] {
-            if *byte == b'\n' {
-                line_number = line_number
-                    .checked_add(1)
-                    .ok_or_else(|| Error::session("JSONL line number exceeds usize"))?;
-            }
-        }
-    }
-}
-
-fn validate_unterminated_jsonl_rewrite_scope(
-    path: &Path,
-    diagnostics: &SessionOpenDiagnostics,
-) -> Result<()> {
-    if diagnostics.skipped_entries.is_empty() {
-        return Ok(());
-    }
-    let terminal_line = unterminated_jsonl_line_number(path)?;
-    if diagnostics.skipped_entries.len() == 1
-        && diagnostics.skipped_entries[0].line_number == terminal_line
-    {
-        return Ok(());
-    }
-    Err(Error::session(format!(
-        "refusing to rewrite unterminated JSONL {} because corruption is not confined to its final line",
-        path.display()
-    )))
-}
-
 #[cfg(feature = "internal-persistence-fault-injection")]
 pub(crate) fn persistence_test_failpoint(
     point: &str,
@@ -1552,7 +1538,13 @@ fn append_jsonl_entries_blocking(
     let path = resolved_path.as_path();
     ensure_session_file_writable(path).map_err(|err| crate::Error::Io(Box::new(err)))?;
     let _lock = lock_session_persistence(path)?;
-    let (disk_session, diagnostics) = open_jsonl_blocking(path)?;
+    let (disk_session, _) = open_jsonl_blocking(path)?;
+    if disk_session.source_integrity_failed {
+        return Err(Error::session(format!(
+            "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to append to recovered session {}",
+            path.display()
+        )));
+    }
     if disk_session.header.id != expected_session_id {
         return Err(Error::session(
             "persisted session header ID does not match the in-memory session ID",
@@ -1574,12 +1566,11 @@ fn append_jsonl_entries_blocking(
         Some(begin_session_index_namespace_change(sessions_root)?)
     };
     let persisted_entries = if rewrite_unterminated {
-        // An interrupted append can leave either a complete JSON record without
-        // its delimiter or an invalid torn final record. Never concatenate the
-        // next object onto either case. A complete record is retained by
-        // `ordered_entries`; one diagnosed invalid final line is omitted. Any
-        // corruption elsewhere fails closed instead of being silently erased.
-        validate_unterminated_jsonl_rewrite_scope(path, &diagnostics)?;
+        // A complete final record can survive an interrupted delimiter write.
+        // Never concatenate the next object onto it: atomically rewrite the
+        // already-validated rows with their delimiters restored. An invalid
+        // torn record is diagnosed during open and rejected above so its bytes
+        // remain available for explicit recovery.
         persist_jsonl_snapshot_locked(path, &disk_session.header, &ordered_entries)?;
         ordered_entries
     } else {
@@ -1796,6 +1787,12 @@ fn prepare_jsonl_full_rewrite(
     let mut merged_entries =
         if session_path_try_exists(path).map_err(|e| crate::Error::Io(Box::new(e)))? {
             let (disk_session, _) = open_jsonl_blocking(path)?;
+            if disk_session.source_integrity_failed {
+                return Err(Error::session(format!(
+                    "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to rewrite recovered session {}",
+                    path.display()
+                )));
+            }
             if disk_session.header.id != header.id {
                 return Err(Error::session(
                     "persisted session header ID does not match the in-memory session ID",
@@ -1868,13 +1865,10 @@ fn ensure_session_parent_links_closed(entries: &[SessionEntry]) -> Result<()> {
     Ok(())
 }
 
-/// Validate the persisted session graph without changing authoritative row order.
-///
-/// Multiple roots and independent branches are valid, but every row must have a
-/// unique ID, every non-root parent must exist, and parent links must be acyclic.
-/// This is shared by persistence backends that do not otherwise run the JSONL
-/// topological rewrite path.
-pub(crate) fn validate_session_entry_graph(entries: &[SessionEntry]) -> Result<()> {
+fn validate_session_entry_graph_inner(
+    entries: &[SessionEntry],
+    allow_missing_parents: bool,
+) -> Result<()> {
     let mut positions = HashMap::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let id = entry
@@ -1894,6 +1888,9 @@ pub(crate) fn validate_session_entry_graph(entries: &[SessionEntry]) -> Result<(
             continue;
         };
         let Some(parent_index) = positions.get(parent_id).copied() else {
+            if allow_missing_parents {
+                continue;
+            }
             return Err(Error::session(format!(
                 "session entry {} references missing parent {parent_id}",
                 entry.base_id().map_or("<missing-id>", String::as_str)
@@ -1921,11 +1918,27 @@ pub(crate) fn validate_session_entry_graph(entries: &[SessionEntry]) -> Result<(
         }
     }
     if visited != entries.len() {
-        return Err(Error::session(
-            "session parent graph contains a cycle; refusing to persist it",
-        ));
+        return Err(Error::session("session parent graph contains a cycle"));
     }
     Ok(())
+}
+
+/// Validate the persisted session graph without changing authoritative row order.
+///
+/// Multiple roots and independent branches are valid, but every row must have a
+/// unique ID, every non-root parent must exist, and parent links must be acyclic.
+/// This is shared by persistence backends that do not otherwise run the JSONL
+/// topological rewrite path.
+pub(crate) fn validate_session_entry_graph(entries: &[SessionEntry]) -> Result<()> {
+    validate_session_entry_graph_inner(entries, false)
+}
+
+/// Validate graph properties that cannot be represented safely in the load
+/// caches while retaining the existing orphan diagnostics for read-only
+/// recovery. Sessions with missing parents are marked non-persistable by the
+/// caller; duplicate IDs and cycles fail before replay can observe them.
+fn validate_loaded_session_entry_graph(entries: &[SessionEntry]) -> Result<()> {
+    validate_session_entry_graph_inner(entries, true)
 }
 
 /// Restore parent-before-child order after reconciling disk and in-memory rows.
@@ -2668,6 +2681,10 @@ pub struct Session {
     /// its blocking writer reaches disk but before this mark advances, the next
     /// save reconciles entry IDs under the persistence lock before appending.
     persisted_entry_count: Arc<AtomicUsize>,
+    /// True when open recovered around malformed rows or missing parents.
+    /// Read-only replay and diagnostics remain available, but in-place save is
+    /// blocked so a later append/checkpoint cannot erase authoritative bytes.
+    source_integrity_failed: bool,
     /// True when header was modified since last save (forces full rewrite).
     header_dirty: bool,
     /// Incremental appends since last full rewrite (checkpoint counter).
@@ -2707,6 +2724,7 @@ impl Clone for Session {
             persisted_entry_count: Arc::new(AtomicUsize::new(
                 self.persisted_entry_count.load(Ordering::SeqCst),
             )),
+            source_integrity_failed: self.source_integrity_failed,
             header_dirty: self.header_dirty,
             appends_since_checkpoint: self.appends_since_checkpoint,
             v2_sidecar_root: self.v2_sidecar_root.clone(),
@@ -3411,6 +3429,7 @@ impl Session {
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
             persisted_entry_count: Arc::new(AtomicUsize::new(0)),
+            source_integrity_failed: false,
             header_dirty: false,
             appends_since_checkpoint: 0,
             v2_sidecar_root: None,
@@ -3451,6 +3470,7 @@ impl Session {
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
             persisted_entry_count: Arc::new(AtomicUsize::new(0)),
+            source_integrity_failed: false,
             header_dirty: false,
             appends_since_checkpoint: 0,
             v2_sidecar_root: None,
@@ -3939,6 +3959,8 @@ impl Session {
         let natural_leaf_id = finalized.leaf_id.clone();
         let leaf_id =
             resolve_loaded_leaf_id(&header, natural_leaf_id.clone(), &finalized.entry_index);
+        let source_integrity_failed =
+            !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty();
         Ok((
             Self {
                 header,
@@ -3957,6 +3979,7 @@ impl Session {
                 autosave_queue: AutosaveQueue::new(),
                 autosave_durability: AutosaveDurabilityMode::from_env(),
                 persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
+                source_integrity_failed,
                 header_dirty: normalized_header_dirty,
                 appends_since_checkpoint: 0,
                 v2_sidecar_root: None,
@@ -4025,6 +4048,7 @@ impl Session {
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
             persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
+            source_integrity_failed: false,
             header_dirty: normalized_header_dirty,
             appends_since_checkpoint: 0,
             v2_sidecar_root: None,
@@ -4410,6 +4434,11 @@ impl Session {
     /// Save the session to disk.
     #[allow(clippy::too_many_lines)]
     async fn save_inner(&mut self) -> Result<()> {
+        if self.source_integrity_failed {
+            return Err(Error::session(
+                "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to persist a session opened with skipped rows or missing parents",
+            ));
+        }
         self.ensure_entry_ids();
 
         if let Some(path) = self.path.clone() {
@@ -4654,6 +4683,7 @@ impl Session {
         self.is_linear = finalized.is_linear && self.leaf_id.eq(&finalized.leaf_id);
         self.persisted_entry_count
             .store(self.entries.len(), Ordering::SeqCst);
+        self.source_integrity_failed = false;
     }
 
     const fn enqueue_autosave_mutation(&mut self, kind: AutosaveMutationKind) {
@@ -7223,12 +7253,63 @@ const PARALLEL_THRESHOLD: usize = 512;
 /// Number of JSONL lines deserialized per batch in the blocking open path.
 const JSONL_PARSE_BATCH_SIZE: usize = 8192;
 
+fn read_jsonl_line_batch<R: std::io::BufRead>(
+    reader: &mut R,
+    current_line_num: &mut usize,
+    line_batch: &mut Vec<(usize, String)>,
+    diagnostics: &mut SessionOpenDiagnostics,
+) -> Result<bool> {
+    read_jsonl_line_batch_with_limit(
+        reader,
+        current_line_num,
+        line_batch,
+        diagnostics,
+        MAX_JSONL_LINE_BYTES,
+    )
+}
+
+fn read_jsonl_line_batch_with_limit<R: std::io::BufRead>(
+    reader: &mut R,
+    current_line_num: &mut usize,
+    line_batch: &mut Vec<(usize, String)>,
+    diagnostics: &mut SessionOpenDiagnostics,
+    max_line_bytes: usize,
+) -> Result<bool> {
+    for _ in 0..JSONL_PARSE_BATCH_SIZE {
+        match read_capped_utf8_line_with_limit(reader, max_line_bytes) {
+            Ok(None) => return Ok(true),
+            Ok(Some(line)) => {
+                if !line.trim().is_empty() {
+                    line_batch.push((*current_line_num, line));
+                }
+            }
+            Err(error) if is_consumed_jsonl_line_error(&error) => {
+                diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
+                    line_number: *current_line_num,
+                    error: format!("IO error reading line: {error}"),
+                });
+            }
+            Err(error) => return Err(Error::Io(Box::new(error))),
+        }
+        *current_line_num = (*current_line_num).saturating_add(1);
+    }
+    Ok(false)
+}
+
 /// Parse a JSONL session file on the current (blocking) thread.
 ///
 /// Combines Gap E (parallel deserialization) and Gap F (single-pass
 /// finalization) for the fastest possible open path.
 #[allow(clippy::too_many_lines)]
 fn open_jsonl_blocking(path: &Path) -> Result<(Session, SessionOpenDiagnostics)> {
+    open_jsonl_blocking_with_entry_limit(path, MAX_JSONL_LINE_BYTES)
+}
+
+#[allow(clippy::too_many_lines)]
+fn open_jsonl_blocking_with_entry_limit(
+    path: &Path,
+    max_entry_line_bytes: usize,
+) -> Result<(Session, SessionOpenDiagnostics)> {
     let path_buf = resolve_session_persistence_path(path)?;
     let file = open_existing_session_file_for_read(&path_buf)?;
     let mut reader = std::io::BufReader::new(file);
@@ -7262,28 +7343,13 @@ fn open_jsonl_blocking(path: &Path) -> Result<(Session, SessionOpenDiagnostics)>
 
     loop {
         line_batch.clear();
-        let mut batch_eof = false;
-
-        for _ in 0..JSONL_PARSE_BATCH_SIZE {
-            match read_capped_utf8_line(&mut reader) {
-                Ok(None) => {
-                    batch_eof = true;
-                    break;
-                }
-                Ok(Some(line)) => {
-                    if !line.trim().is_empty() {
-                        line_batch.push((current_line_num, line));
-                    }
-                }
-                Err(e) => {
-                    diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
-                        line_number: current_line_num,
-                        error: format!("IO error reading line: {e}"),
-                    });
-                }
-            }
-            current_line_num += 1;
-        }
+        let batch_eof = read_jsonl_line_batch_with_limit(
+            &mut reader,
+            &mut current_line_num,
+            &mut line_batch,
+            &mut diagnostics,
+            max_entry_line_bytes,
+        )?;
 
         if line_batch.is_empty() {
             if batch_eof {
@@ -7364,8 +7430,12 @@ fn open_jsonl_blocking(path: &Path) -> Result<(Session, SessionOpenDiagnostics)>
         }
     }
 
+    // Normalize legacy IDs before validation, but do not construct last-wins
+    // indexes or replay caches until the authoritative graph is known-safe.
+    normalize_loaded_entry_ids(&mut entries);
+    validate_loaded_session_entry_graph(&entries)?;
     // --- Single-pass load finalization (Gap F) ---
-    let finalized = finalize_loaded_entries(&mut entries);
+    let finalized = finalize_normalized_loaded_entries(&entries);
     for orphan in &finalized.orphans {
         diagnostics
             .orphaned_parent_links
@@ -7378,6 +7448,8 @@ fn open_jsonl_blocking(path: &Path) -> Result<(Session, SessionOpenDiagnostics)>
     let entry_count = entries.len();
     let natural_leaf_id = finalized.leaf_id.clone();
     let leaf_id = resolve_loaded_leaf_id(&header, natural_leaf_id.clone(), &finalized.entry_index);
+    let source_integrity_failed =
+        !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty();
 
     Ok((
         Session {
@@ -7395,6 +7467,7 @@ fn open_jsonl_blocking(path: &Path) -> Result<(Session, SessionOpenDiagnostics)>
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
             persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
+            source_integrity_failed,
             header_dirty: normalized_header_dirty,
             appends_since_checkpoint: 0,
             v2_sidecar_root: None,
@@ -8471,15 +8544,8 @@ struct LoadFinalization {
     orphans: Vec<(String, String)>,
 }
 
-/// Single-pass finalization of loaded entries.
-///
-/// 1. Assigns IDs to entries missing them (`ensure_entry_ids` work).
-/// 2. Builds `entry_ids` set and `entry_index` map.
-/// 3. Detects orphaned parent links.
-/// 4. Computes `session_entry_stats` (message count + name).
-/// 5. Determines `is_linear` (no branching, leaf == last entry).
-fn finalize_loaded_entries(entries: &mut [SessionEntry]) -> LoadFinalization {
-    // First pass: assign stable IDs to legacy rows that predate entry IDs.
+/// Assign stable IDs to legacy rows before graph validation or cache building.
+fn normalize_loaded_entry_ids(entries: &mut [SessionEntry]) {
     // Re-opening the same JSONL must synthesize the same IDs so a later
     // multi-writer merge recognizes the persisted prefix instead of duplicating it.
     let mut entry_ids: HashSet<String> = entries
@@ -8493,8 +8559,13 @@ fn finalize_loaded_entries(entries: &mut [SessionEntry]) -> LoadFinalization {
             entry_ids.insert(id);
         }
     }
+}
 
-    // Second (main) pass: build all caches in one scan.
+/// Build every derived load cache after legacy IDs and graph integrity have
+/// already been resolved by the caller.
+fn finalize_normalized_loaded_entries(entries: &[SessionEntry]) -> LoadFinalization {
+    let entry_ids = entry_id_set(entries);
+
     let mut entry_index = HashMap::with_capacity(entries.len());
     let mut message_count = 0u64;
     let mut name: Option<String> = None;
@@ -8562,6 +8633,17 @@ fn finalize_loaded_entries(entries: &mut [SessionEntry]) -> LoadFinalization {
         is_linear,
         orphans,
     }
+}
+
+/// Single-pass finalization of loaded entries outside the authoritative JSONL
+/// open boundary.
+///
+/// JSONL open deliberately calls [`normalize_loaded_entry_ids`], validates the
+/// graph, and only then calls [`finalize_normalized_loaded_entries`]. Other
+/// trusted/in-memory call sites can use this convenience wrapper directly.
+fn finalize_loaded_entries(entries: &mut [SessionEntry]) -> LoadFinalization {
+    normalize_loaded_entry_ids(entries);
+    finalize_normalized_loaded_entries(entries)
 }
 
 fn generate_loaded_entry_id(entry: &SessionEntry, existing: &HashSet<String>) -> String {
@@ -13017,6 +13099,76 @@ mod tests {
         assert!(err.to_string().contains("JSONL line exceeds 4 bytes"));
     }
 
+    struct HeaderThenPersistentReadError {
+        header: Vec<u8>,
+        offset: usize,
+        post_header_fill_buf_calls: usize,
+    }
+
+    impl std::io::Read for HeaderThenPersistentReadError {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let available = std::io::BufRead::fill_buf(self)?;
+            let read = available.len().min(output.len());
+            output[..read].copy_from_slice(&available[..read]);
+            std::io::BufRead::consume(self, read);
+            Ok(read)
+        }
+    }
+
+    impl std::io::BufRead for HeaderThenPersistentReadError {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.offset < self.header.len() {
+                return Ok(&self.header[self.offset..]);
+            }
+            self.post_header_fill_buf_calls =
+                self.post_header_fill_buf_calls.saturating_add(1);
+            Err(std::io::Error::other(
+                "injected persistent non-advancing read failure",
+            ))
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.offset = self.offset.saturating_add(amount).min(self.header.len());
+        }
+    }
+
+    #[test]
+    fn jsonl_entry_reader_returns_persistent_non_consuming_io_error_without_retry() {
+        let header = format!("{}\n", serde_json::to_string(&SessionHeader::new()).unwrap());
+        let mut reader = HeaderThenPersistentReadError {
+            header: header.into_bytes(),
+            offset: 0,
+            post_header_fill_buf_calls: 0,
+        };
+        assert!(
+            read_capped_utf8_line(&mut reader)
+                .expect("read injected header")
+                .is_some()
+        );
+
+        let mut current_line_num = 2;
+        let mut line_batch = Vec::new();
+        let mut diagnostics = SessionOpenDiagnostics::default();
+        let error = read_jsonl_line_batch(
+            &mut reader,
+            &mut current_line_num,
+            &mut line_batch,
+            &mut diagnostics,
+        )
+        .expect_err("underlying I/O errors must abort instead of being skipped");
+
+        match error {
+            Error::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::Other),
+            other => panic!("expected I/O error, got {other}"),
+        }
+        assert!(line_batch.is_empty());
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert_eq!(
+            reader.post_header_fill_buf_calls, 1,
+            "a persistent non-advancing I/O error must be returned immediately"
+        );
+    }
+
     #[test]
     fn jsonl_write_limit_accepts_exact_cap_and_rejects_cap_plus_one() {
         ensure_jsonl_line_len_within_limit(4, 4, "test line").expect("exact cap is readable");
@@ -13884,7 +14036,8 @@ mod tests {
         }
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
 
-        let (loaded, diagnostics) = run_async(async {
+        let corrupt_bytes = std::fs::read(&path).unwrap();
+        let (mut loaded, diagnostics) = run_async(async {
             Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
         })
         .unwrap();
@@ -13894,6 +14047,16 @@ mod tests {
         assert!(loaded.leaf_id.is_none());
         // Header should still be valid
         assert_eq!(loaded.header.id, session.header.id);
+
+        loaded.append_message(make_test_message("must not replace corrupt source"));
+        let error = run_async(async { loaded.save().await })
+            .expect_err("recovered all-corrupt source must be read-only");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt_bytes);
     }
 
     // ======================================================================
@@ -14805,7 +14968,7 @@ mod tests {
         }
 
         #[test]
-        fn duplicate_entry_ids_are_loaded_without_panic() {
+        fn duplicate_entry_ids_fail_before_replay_cache_construction() {
             let header = json!({
                 "type": "session",
                 "version": 3,
@@ -14837,13 +15000,50 @@ mod tests {
             let file_path = temp_dir.path().join("dup_ids.jsonl");
             std::fs::write(&file_path, &content).unwrap();
 
-            // Must not panic
-            let (session, _diagnostics) = run_async(async {
+            let error = run_async(async {
                 Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
             })
-            .unwrap();
+            .expect_err("duplicate entry IDs must fail closed");
 
-            assert_eq!(session.entries.len(), 2, "both entries should be loaded");
+            assert!(error.to_string().contains("duplicate entry ID"));
+        }
+
+        #[test]
+        fn cyclic_parent_graph_fails_before_replay_cache_construction() {
+            let header = json!({
+                "type": "session",
+                "version": 3,
+                "id": "testid01",
+                "timestamp": "2024-01-01T00:00:00.000Z",
+                "cwd": "/tmp/test"
+            })
+            .to_string();
+            let first = json!({
+                "type": "message",
+                "id": "cycle001",
+                "parentId": "cycle002",
+                "timestamp": "2024-01-01T00:00:00.000Z",
+                "message": {"role": "user", "content": "first"}
+            })
+            .to_string();
+            let second = json!({
+                "type": "message",
+                "id": "cycle002",
+                "parentId": "cycle001",
+                "timestamp": "2024-01-01T00:00:01.000Z",
+                "message": {"role": "user", "content": "second"}
+            })
+            .to_string();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let file_path = temp_dir.path().join("cycle.jsonl");
+            std::fs::write(&file_path, format!("{header}\n{first}\n{second}\n")).unwrap();
+
+            let error = run_async(async {
+                Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+            })
+            .expect_err("cyclic parent graph must fail closed");
+
+            assert!(error.to_string().contains("contains a cycle"));
         }
     }
 
@@ -15640,7 +15840,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_append_atomically_drops_only_invalid_torn_final_record() {
+    fn incremental_append_preserves_invalid_torn_final_record() {
         use std::io::Write as _;
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -15657,23 +15857,17 @@ mod tests {
         file.write_all(b"{\"type\":\"message\",\"id\":\"torn")
             .expect("write torn final record");
         drop(file);
+        let corrupt_bytes = std::fs::read(&path).expect("read torn JSONL");
 
         session.append_message(make_test_message("append after torn record"));
-        run_async(async { session.save().await })
-            .expect("append must atomically replace the diagnosed torn tail");
-
-        let repaired = std::fs::read(&path).expect("read repaired JSONL");
-        assert_eq!(repaired.last(), Some(&b'\n'));
-        let (reopened, diagnostics) = run_async(async {
-            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
-        })
-        .expect("reopen repaired JSONL");
-        assert!(diagnostics.skipped_entries.is_empty());
-        assert_eq!(reopened.entries.len(), 2);
+        let error = run_async(async { session.save().await })
+            .expect_err("append must not erase the diagnosed torn tail");
         assert!(
-            !String::from_utf8_lossy(&repaired).contains("\"id\":\"torn"),
-            "diagnosed torn tail survived the atomic rewrite"
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
         );
+        assert_eq!(std::fs::read(&path).expect("reread torn JSONL"), corrupt_bytes);
     }
 
     #[test]
@@ -16027,7 +16221,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_checkpoint_rewrite_cleans_corruption() {
+    fn crash_checkpoint_rewrite_rejects_external_corruption_without_resetting_cadence() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut session = Session::create();
         session.session_dir = Some(temp_dir.path().to_path_buf());
@@ -16046,50 +16240,33 @@ mod tests {
         let mut lines: Vec<String> = content.lines().map(String::from).collect();
         lines[3] = "CORRUPTED_ENTRY".to_string();
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let corrupt_bytes = std::fs::read(&path).unwrap();
 
-        // Force checkpoint: full rewrite replaces corrupted file with clean data.
+        // Force the full-rewrite path. It must re-open the authoritative file
+        // under the persistence lock and reject corruption without changing
+        // either the source bytes or the in-memory checkpoint bookkeeping.
         session.appends_since_checkpoint = compaction_checkpoint_interval();
+        let checkpoint_count_before = session.appends_since_checkpoint;
+        let persisted_count_before = session.persisted_entry_count.load(Ordering::SeqCst);
         session.append_message(make_test_message("post checkpoint"));
-        run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.appends_since_checkpoint, 0);
-
-        let (reloaded, diagnostics) = run_async(async {
-            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
-        })
-        .unwrap();
-        assert!(diagnostics.skipped_entries.is_empty());
-        assert_eq!(reloaded.entries.len(), 7);
-        let reloaded_texts = reloaded
-            .entries
-            .iter()
-            .map(|entry| match entry {
-                SessionEntry::Message(MessageEntry {
-                    message:
-                        SessionMessage::User {
-                            content: UserContent::Text(text),
-                            ..
-                        },
-                    ..
-                }) => text.as_str(),
-                _ => panic!("checkpoint fixture should contain only user text messages"),
-            })
-            .collect::<Vec<_>>();
+        let error = run_async(async { session.save().await })
+            .expect_err("checkpoint rewrite must not erase externally corrupted source rows");
         assert_eq!(
-            reloaded_texts,
-            vec![
-                "initial",
-                "msg 0",
-                "msg 1",
-                "msg 2",
-                "msg 3",
-                "msg 4",
-                "post checkpoint",
-            ],
-            "disk-first recovery must restore the missing ancestor before its descendants"
+            session.appends_since_checkpoint, checkpoint_count_before,
+            "a rejected checkpoint must remain pending"
         );
-        for pair in reloaded.entries.windows(2) {
-            assert_eq!(pair[1].base().parent_id.as_ref(), pair[0].base_id());
-        }
+        assert_eq!(
+            session.persisted_entry_count.load(Ordering::SeqCst),
+            persisted_count_before,
+            "a rejected checkpoint must not advance persisted-entry bookkeeping"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+            "unexpected checkpoint rejection: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt_bytes);
     }
 
     #[test]
@@ -16130,38 +16307,173 @@ mod tests {
     }
 
     #[test]
-    fn crash_corrupt_then_continue_operation() {
+    fn crash_corrupt_middle_refuses_lossy_continue() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut session = Session::create();
         session.session_dir = Some(temp_dir.path().to_path_buf());
 
         session.append_message(make_test_message("msg A"));
         session.append_message(make_test_message("msg B"));
+        session.append_message(make_test_message("msg C"));
         run_async(async { session.save().await }).unwrap();
         let path = session.path.clone().unwrap();
 
-        // Corrupt last entry.
+        // Corrupt the middle entry while retaining valid rows on both sides.
         let content = std::fs::read_to_string(&path).unwrap();
         let mut lines: Vec<String> = content.lines().map(String::from).collect();
-        *lines.last_mut().unwrap() = "BROKEN_JSON".to_string();
+        lines[2] = "BROKEN_JSON".to_string();
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let corrupt_bytes = std::fs::read(&path).unwrap();
 
         let (mut recovered, diagnostics) = run_async(async {
             Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
         })
         .unwrap();
         assert_eq!(diagnostics.skipped_entries.len(), 1);
-        assert_eq!(recovered.entries.len(), 1);
+        assert_eq!(diagnostics.orphaned_parent_links.len(), 1);
+        assert_eq!(recovered.entries.len(), 2);
 
-        // Continue: add and save.
-        recovered.path = Some(path.clone());
-        recovered.session_dir = Some(temp_dir.path().to_path_buf());
-        recovered.append_message(make_test_message("msg C"));
-        run_async(async { recovered.save().await }).unwrap();
+        recovered.append_message(make_test_message("must not overwrite missing B"));
+        let error = run_async(async { recovered.save().await })
+            .expect_err("valid-invalid-valid source must remain byte-preserved");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt_bytes);
+    }
 
-        let reloaded =
-            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
-        assert_eq!(reloaded.entries.len(), 2, "A and C present after recovery");
+    #[test]
+    fn crash_disk_corruption_after_clean_open_blocks_full_rewrite() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        session.append_message(make_test_message("msg B"));
+        session.append_message(make_test_message("msg C"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines = content.lines().map(String::from).collect::<Vec<_>>();
+        lines[2] = "BROKEN_AFTER_CLEAN_OPEN".to_string();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let corrupt_bytes = std::fs::read(&path).unwrap();
+
+        session.set_model_header(Some("must-not-persist".to_string()), None, None);
+        session.append_message(make_test_message("must not replace corrupt source"));
+        let error = run_async(async { session.save().await })
+            .expect_err("locked full rewrite must revalidate the current disk source");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt_bytes);
+    }
+
+    #[test]
+    fn crash_missing_parent_is_read_only_and_clone_preserves_integrity_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+        session.append_message(make_test_message("orphan fixture"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines = content.lines().map(String::from).collect::<Vec<_>>();
+        let mut entry = serde_json::from_str::<serde_json::Value>(&lines[1]).unwrap();
+        entry["parentId"] = serde_json::Value::String("missing01".to_string());
+        lines[1] = serde_json::to_string(&entry).unwrap();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let orphan_bytes = std::fs::read(&path).unwrap();
+
+        let (loaded, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert_eq!(diagnostics.orphaned_parent_links.len(), 1);
+        assert!(loaded.source_integrity_failed);
+
+        let mut cloned = loaded.clone();
+        assert!(cloned.source_integrity_failed);
+        cloned.append_message(make_test_message("clone must remain read-only"));
+        let error = run_async(async { cloned.save().await })
+            .expect_err("a cloned orphan recovery must remain non-persistable");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), orphan_bytes);
+    }
+
+    #[test]
+    fn crash_invalid_utf8_row_is_read_only_and_byte_preserved() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+        session.append_message(make_test_message("valid after invalid UTF-8"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let after_header = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("saved header delimiter")
+            .saturating_add(1);
+        drop(bytes.splice(after_header..after_header, [0xff, b'\n']));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (mut loaded, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+        assert_eq!(diagnostics.skipped_entries.len(), 1);
+        assert_eq!(loaded.entries.len(), 1);
+        loaded.append_message(make_test_message("must not erase invalid UTF-8"));
+        let error = run_async(async { loaded.save().await })
+            .expect_err("invalid UTF-8 recovery must remain non-persistable");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn crash_oversized_valid_row_is_read_only_and_byte_preserved() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("oversized-valid-row.jsonl");
+        let header = serde_json::to_string(&SessionHeader::new()).unwrap();
+        let entry = serde_json::json!({
+            "type": "message",
+            "id": "large001",
+            "timestamp": "2024-06-01T00:00:00.000Z",
+            "message": {"role": "user", "content": "x".repeat(512)}
+        });
+        let bytes = format!("{header}\n{entry}\n").into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (mut loaded, diagnostics) =
+            open_jsonl_blocking_with_entry_limit(&path, 128).unwrap();
+        assert_eq!(diagnostics.skipped_entries.len(), 1);
+        assert!(loaded.entries.is_empty());
+        loaded.append_message(make_test_message("must not erase oversized row"));
+        let error = run_async(async { loaded.save().await })
+            .expect_err("oversized-row recovery must remain non-persistable");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

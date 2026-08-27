@@ -322,13 +322,112 @@ impl ModelEntry {
 }
 
 /// OAuth configuration for extension-registered providers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthConfig {
     pub auth_url: String,
     pub token_url: String,
     pub client_id: String,
     pub scopes: Vec<String>,
     pub redirect_uri: Option<String>,
+}
+
+/// Provider-level runtime metadata registered by an extension independently
+/// of how many model rows that provider declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionProviderBinding {
+    pub provider: String,
+    pub oauth_config: Option<OAuthConfig>,
+}
+
+/// Extract exact extension-provider identities and OAuth metadata from the
+/// manager's authoritative provider snapshot.
+///
+/// # Errors
+/// Returns a configuration error when a provider snapshot has no usable ID,
+/// contains duplicate normalized extension identities, or attempts to attach
+/// declarative OAuth to a built-in provider identity.
+pub fn extension_provider_bindings(
+    provider_specs: &[serde_json::Value],
+) -> crate::error::Result<Vec<ExtensionProviderBinding>> {
+    let bindings = provider_specs
+        .iter()
+        .map(|provider_spec| {
+            let provider = provider_spec
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if provider.is_empty() {
+                return Err(Error::config(
+                    "extension provider identity must not be blank",
+                ));
+            }
+            let oauth_config = provider_spec
+                .get("oauth")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|oauth| {
+                    let auth_url = oauth.get("authUrl")?.as_str()?.to_string();
+                    let token_url = oauth.get("tokenUrl")?.as_str()?.to_string();
+                    let client_id = oauth.get("clientId")?.as_str()?.to_string();
+                    let scopes = oauth
+                        .get("scopes")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|scopes| {
+                            scopes
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(ToString::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let redirect_uri = oauth
+                        .get("redirectUri")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string);
+                    Some(OAuthConfig {
+                        auth_url,
+                        token_url,
+                        client_id,
+                        scopes,
+                        redirect_uri,
+                    })
+                });
+            Ok(ExtensionProviderBinding {
+                provider: provider.to_string(),
+                oauth_config,
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+
+    let mut providers = HashMap::new();
+    for binding in &bindings {
+        validate_extension_oauth_identity(binding)?;
+        let provider_key = extension_provider_key(&binding.provider);
+        if let Some((first_provider, oauth_config)) = providers.get(&provider_key) {
+            if first_provider != &binding.provider {
+                return Err(Error::config(format!(
+                    "extension providers {first_provider:?} and {:?} resolve to the same normalized extension provider identity {provider_key:?}",
+                    binding.provider
+                )));
+            }
+            if oauth_config != &binding.oauth_config {
+                return Err(Error::config(format!(
+                    "extension provider {:?} contains conflicting OAuth metadata",
+                    binding.provider
+                )));
+            }
+            return Err(Error::config(format!(
+                "extension provider {:?} is registered more than once",
+                binding.provider
+            )));
+        } else {
+            providers.insert(
+                provider_key,
+                (binding.provider.clone(), binding.oauth_config.clone()),
+            );
+        }
+    }
+    Ok(bindings)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -363,14 +462,51 @@ where
                     .unwrap_or_default()
                     .min(MAX_FETCHED_PROVIDERS),
             );
+            // Reject ambiguity while JSON document order is still available;
+            // a randomized HashMap must never decide which route wins.
+            let mut original_provider_sources = HashSet::new();
+            let mut canonical_provider_sources = HashMap::<String, String>::new();
             while let Some(provider) = entries.next_key::<String>()? {
-                if providers.contains_key(&provider) {
+                if !original_provider_sources.insert(provider.clone()) {
                     return Err(serde::de::Error::custom(format!(
                         "duplicate JSON object key {provider:?} in models.json providers"
                     )));
                 }
+                let canonical_provider = canonical_provider_key(&provider);
+                if canonical_provider.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "models.json provider identity must not be blank",
+                    ));
+                }
+                if let Some(first_provider) = canonical_provider_sources
+                    .insert(canonical_provider.clone(), provider.clone())
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "models.json providers {first_provider:?} and {provider:?} resolve to the same canonical provider identity {canonical_provider:?}"
+                    )));
+                }
                 let config = entries.next_value::<ProviderConfig>()?;
-                providers.insert(provider, config);
+
+                // Lookup is case-insensitive and trims IDs, with additional
+                // OpenRouter alias folding. Enforce that same identity here.
+                let mut canonical_model_sources = HashMap::new();
+                for model in config.models.as_deref().unwrap_or_default() {
+                    let canonical_identity =
+                        normalized_registry_key(&canonical_provider, &model.id);
+                    if let Some(first_model_id) =
+                        canonical_model_sources.insert(canonical_identity.clone(), model.id.clone())
+                    {
+                        return Err(serde::de::Error::custom(format!(
+                            "models.json provider {provider:?} contains model IDs {first_model_id:?} and {:?} with duplicate canonical model identity {canonical_identity:?}",
+                            model.id
+                        )));
+                    }
+                }
+                // Preserve the provider's configured spelling after trimming.
+                // Extension stream handlers index their runtime registration
+                // by this source identity; canonicalization remains the
+                // comparison key used above and throughout registry lookup.
+                providers.insert(provider.trim().to_string(), config);
             }
             Ok(providers)
         }
@@ -1561,6 +1697,7 @@ impl ModelRegistry {
     pub fn find(&self, provider: &str, id: &str) -> Option<ModelEntry> {
         let provider = provider.trim();
         let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+        let trimmed_id = id.trim();
         let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
         // Avoid Vec + String allocation for the common (non-OpenRouter) path.
         let openrouter_ids = if is_openrouter {
@@ -1568,7 +1705,36 @@ impl ModelRegistry {
         } else {
             Vec::new()
         };
-        let trimmed_id = id.trim();
+        let builtin_model_id_matches = |candidate: &str| {
+            if is_openrouter {
+                let canonical_candidate = canonicalize_openrouter_model_id(candidate);
+                openrouter_ids
+                    .iter()
+                    .any(|lookup_id| {
+                        candidate.eq_ignore_ascii_case(lookup_id)
+                            || canonical_candidate.eq_ignore_ascii_case(lookup_id)
+                    })
+            } else {
+                candidate.eq_ignore_ascii_case(trimmed_id)
+            }
+        };
+        // Declared provider IDs are authoritative when they match directly.
+        // Only fall back to built-in alias equivalence when no exact provider
+        // row exists, otherwise two distinct extension IDs such as `azure`
+        // and `azure-openai` become insertion-order dependent.
+        if let Some(entry) = self.models.iter().find(|entry| {
+            entry.model.provider.trim().eq_ignore_ascii_case(provider)
+                && builtin_model_id_matches(&entry.model.id)
+        }) {
+            return Some(entry.clone());
+        }
+        if self
+            .models
+            .iter()
+            .any(|entry| entry.model.provider.trim().eq_ignore_ascii_case(provider))
+        {
+            return None;
+        }
 
         self.models
             .iter()
@@ -1580,14 +1746,7 @@ impl ModelRegistry {
                     || model_provider.eq_ignore_ascii_case(canonical_provider)
                     || model_provider_canonical.eq_ignore_ascii_case(provider)
                     || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
-                provider_matches
-                    && if is_openrouter {
-                        openrouter_ids
-                            .iter()
-                            .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
-                    } else {
-                        m.model.id.eq_ignore_ascii_case(trimmed_id)
-                    }
+                provider_matches && builtin_model_id_matches(&m.model.id)
             })
             .cloned()
     }
@@ -1638,6 +1797,166 @@ impl ModelRegistry {
                 self.models.push(entry);
             }
         }
+    }
+
+    /// Merge extension-provided models while preserving the runtime provider
+    /// identity used by the extension's `streamSimple` registry.
+    ///
+    /// A hand-authored model retains authority over route and model metadata,
+    /// while every model under an equivalent provider adopts the exact runtime
+    /// spelling and OAuth configuration required by the extension. Normalized
+    /// declared-ID collisions within the extension batch fail closed instead
+    /// of becoming order-dependent; built-in aliases remain separate because
+    /// extension providers own their declared-ID semantics.
+    ///
+    /// # Errors
+    /// Returns a configuration error when two declared extension provider
+    /// identities normalize to the same key, or when any two extension models
+    /// normalize to the same provider/model key.
+    pub fn merge_extension_entries(
+        &mut self,
+        entries: Vec<ModelEntry>,
+    ) -> crate::error::Result<()> {
+        let mut bindings = Vec::<ExtensionProviderBinding>::new();
+        for entry in &entries {
+            let provider_key = extension_provider_key(&entry.model.provider);
+            if let Some(existing) = bindings
+                .iter()
+                .find(|binding| extension_provider_key(&binding.provider) == provider_key)
+            {
+                if existing.provider != entry.model.provider {
+                    return Err(Error::config(format!(
+                        "extension providers {:?} and {:?} resolve to the same normalized extension provider identity {provider_key:?}",
+                        existing.provider, entry.model.provider
+                    )));
+                }
+                if existing.oauth_config != entry.oauth_config {
+                    return Err(Error::config(format!(
+                        "extension provider {:?} contains conflicting OAuth metadata",
+                        entry.model.provider
+                    )));
+                }
+            } else {
+                bindings.push(ExtensionProviderBinding {
+                    provider: entry.model.provider.clone(),
+                    oauth_config: entry.oauth_config.clone(),
+                });
+            }
+        }
+        self.merge_extension_registry(&bindings, entries)
+    }
+
+    /// Atomically merge a complete extension-provider snapshot and its model
+    /// rows into the registry. Provider bindings are independent of model rows,
+    /// so zero-model providers still bind manual models and OAuth discovery.
+    ///
+    /// # Errors
+    /// Returns a configuration error for normalized provider collisions,
+    /// inconsistent provider metadata, built-in OAuth shadowing, unregistered
+    /// model providers, blank identities, or duplicate model identities.
+    pub fn merge_extension_registry(
+        &mut self,
+        bindings: &[ExtensionProviderBinding],
+        mut entries: Vec<ModelEntry>,
+    ) -> crate::error::Result<()> {
+        let mut extension_providers = HashMap::new();
+        let mut extension_models = HashMap::new();
+        for binding in bindings {
+            validate_extension_oauth_identity(binding)?;
+            let provider_key = extension_provider_key(&binding.provider);
+            if provider_key.is_empty() {
+                return Err(Error::config(
+                    "extension provider identity must not be blank",
+                ));
+            }
+            if let Some((first_provider, oauth_config)) =
+                extension_providers.get(&provider_key)
+            {
+                if first_provider != &binding.provider {
+                    return Err(Error::config(format!(
+                        "extension providers {first_provider:?} and {:?} resolve to the same normalized extension provider identity {provider_key:?}",
+                        binding.provider
+                    )));
+                }
+                if oauth_config != &binding.oauth_config {
+                    return Err(Error::config(format!(
+                        "extension provider {:?} contains conflicting OAuth metadata",
+                        binding.provider
+                    )));
+                }
+                return Err(Error::config(format!(
+                    "extension provider {:?} is registered more than once",
+                    binding.provider
+                )));
+            } else {
+                extension_providers.insert(
+                    provider_key.clone(),
+                    (binding.provider.clone(), binding.oauth_config.clone()),
+                );
+            }
+        }
+
+        for entry in &entries {
+            let model_key = extension_model_key(&entry.model.provider, &entry.model.id);
+            if model_key.1.is_empty() {
+                return Err(Error::config(
+                    "extension model identity must not be blank",
+                ));
+            }
+            let Some((registered_provider, oauth_config)) =
+                extension_providers.get(&model_key.0)
+            else {
+                return Err(Error::config(format!(
+                    "extension model provider {:?} is absent from the provider snapshot",
+                    entry.model.provider
+                )));
+            };
+            if oauth_config != &entry.oauth_config {
+                return Err(Error::config(format!(
+                    "extension model provider {registered_provider:?} contains conflicting OAuth metadata"
+                )));
+            }
+            let source = (entry.model.provider.clone(), entry.model.id.clone());
+            if let Some(first_source) = extension_models.insert(model_key.clone(), source.clone()) {
+                return Err(Error::config(format!(
+                    "extension model identities {first_source:?} and {source:?} resolve to the same canonical registry identity {model_key:?}"
+                )));
+            }
+        }
+
+        for entry in &mut entries {
+            let provider_key = extension_provider_key(&entry.model.provider);
+            let Some((extension_provider, oauth_config)) = extension_providers.get(&provider_key)
+            else {
+                return Err(Error::config(format!(
+                    "extension model provider {:?} disappeared during merge validation",
+                    entry.model.provider
+                )));
+            };
+            entry.model.provider.clone_from(extension_provider);
+            entry.oauth_config.clone_from(oauth_config);
+        }
+
+        for existing in &mut self.models {
+            let provider_key = extension_provider_key(&existing.model.provider);
+            if let Some((extension_provider, oauth_config)) =
+                extension_providers.get(&provider_key)
+            {
+                existing.model.provider.clone_from(extension_provider);
+                existing.oauth_config.clone_from(oauth_config);
+            }
+        }
+
+        for entry in entries {
+            let entry_key = extension_model_key(&entry.model.provider, &entry.model.id);
+            let exists = self.models.iter().any(|existing| {
+                extension_model_key(&existing.model.provider, &existing.model.id) == entry_key
+            });
+            if !exists {
+                self.models.push(entry);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2773,9 +3092,37 @@ fn built_in_models(
 }
 
 fn canonical_provider_key(provider: &str) -> String {
+    let provider = provider.trim();
     canonical_provider_id(provider)
         .unwrap_or(provider)
         .to_ascii_lowercase()
+}
+
+fn extension_provider_key(provider: &str) -> String {
+    provider.trim().to_ascii_lowercase()
+}
+
+fn extension_model_key(provider: &str, model_id: &str) -> (String, String) {
+    let canonical_provider = canonical_provider_key(provider);
+    let normalized_model = canonicalize_model_id_for_provider(&canonical_provider, model_id);
+    (
+        extension_provider_key(provider),
+        normalized_model.to_ascii_lowercase(),
+    )
+}
+
+fn validate_extension_oauth_identity(
+    binding: &ExtensionProviderBinding,
+) -> crate::error::Result<()> {
+    if binding.oauth_config.is_some()
+        && let Some(builtin_provider) = canonical_provider_id(&binding.provider)
+    {
+        return Err(Error::config(format!(
+            "extension provider {:?} cannot declare OAuth because it resolves to built-in provider {builtin_provider:?}",
+            binding.provider
+        )));
+    }
+    Ok(())
 }
 
 fn fetched_model_key(provider: &str, model_id: &str) -> (String, String) {
@@ -5469,6 +5816,70 @@ mod tests {
     }
 
     #[test]
+    fn model_registry_find_prefers_exact_declared_provider_in_both_insertion_orders() {
+        let (_dir, auth) = test_auth_storage();
+        let template = ModelRegistry::load(&auth, None)
+            .find("openai", "gpt-4o")
+            .expect("expected built-in model template");
+        let entry = |provider: &str, name: &str| {
+            let mut entry = template.clone();
+            entry.model.provider = provider.to_string();
+            entry.model.id = "shared-chat".to_string();
+            entry.model.name = name.to_string();
+            entry
+        };
+
+        for entries in [
+            vec![
+                entry("azure", "Declared Azure"),
+                entry("azure-openai", "Canonical Azure"),
+            ],
+            vec![
+                entry("azure-openai", "Canonical Azure"),
+                entry("azure", "Declared Azure"),
+            ],
+        ] {
+            let registry = ModelRegistry::from_entries_for_tests(entries);
+            let declared = registry
+                .find("azure", "shared-chat")
+                .expect("exact declared provider row");
+            assert_eq!(declared.model.provider, "azure");
+            assert_eq!(declared.model.name, "Declared Azure");
+
+            let canonical = registry
+                .find("azure-openai", "shared-chat")
+                .expect("exact canonical provider row");
+            assert_eq!(canonical.model.provider, "azure-openai");
+            assert_eq!(canonical.model.name, "Canonical Azure");
+        }
+    }
+
+    #[test]
+    fn model_registry_find_does_not_fall_through_an_exact_declared_provider() {
+        let (_dir, auth) = test_auth_storage();
+        let template = ModelRegistry::load(&auth, None)
+            .find("openai", "gpt-4o")
+            .expect("expected built-in model template");
+        let mut declared = template.clone();
+        declared.model.provider = "open-router".to_string();
+        declared.model.id = "extension-only".to_string();
+        let mut builtin = template;
+        builtin.model.provider = "openrouter".to_string();
+        builtin.model.id = "openai/gpt-4o-mini".to_string();
+
+        let registry = ModelRegistry::from_entries_for_tests(vec![builtin, declared]);
+        assert!(registry.find("open-router", "gpt-4o-mini").is_none());
+        assert_eq!(
+            registry
+                .find("openrouter", "gpt-4o-mini")
+                .expect("built-in OpenRouter alias lookup")
+                .model
+                .id,
+            "openai/gpt-4o-mini"
+        );
+    }
+
+    #[test]
     fn ad_hoc_model_entry_normalizes_openrouter_aliases() {
         let auto = ad_hoc_model_entry("openrouter", "auto").expect("openrouter auto ad-hoc");
         assert_eq!(auto.model.id, "openrouter/auto");
@@ -5535,6 +5946,376 @@ mod tests {
 
         registry.merge_entries(vec![alias_case_variant]);
         assert_eq!(registry.models().len(), before);
+    }
+
+    #[test]
+    fn extension_merge_rejects_provider_and_model_collisions_before_mutation() {
+        let (_dir, auth) = test_auth_storage();
+        let mut registry = ModelRegistry::load(&auth, None);
+        let template = registry
+            .find("openai", "gpt-4o")
+            .expect("expected built-in model template");
+        let extension_entry = |provider: &str, model_id: &str| {
+            let mut entry = template.clone();
+            entry.model.provider = provider.to_string();
+            entry.model.id = model_id.to_string();
+            entry
+        };
+        let sentinel_oauth = OAuthConfig {
+            auth_url: "https://sentinel.example.test/authorize".to_string(),
+            token_url: "https://sentinel.example.test/token".to_string(),
+            client_id: "sentinel-client".to_string(),
+            scopes: vec!["sentinel:scope".to_string()],
+            redirect_uri: Some("http://127.0.0.1/sentinel".to_string()),
+        };
+        let mut manual = extension_entry("acme", "manual-only");
+        manual.model.name = "Manual Only".to_string();
+        manual.model.base_url = "https://manual.example.test".to_string();
+        manual.oauth_config = Some(sentinel_oauth.clone());
+        registry.merge_entries(vec![manual]);
+        let before = registry.models().len();
+        let assert_manual_unchanged = |registry: &ModelRegistry| {
+            assert_eq!(registry.models().len(), before);
+            let unchanged = registry
+                .find("acme", "manual-only")
+                .expect("manual model must survive rejected extension batch");
+            assert_eq!(unchanged.model.provider, "acme");
+            assert_eq!(unchanged.model.name, "Manual Only");
+            assert_eq!(unchanged.model.base_url, "https://manual.example.test");
+            assert_eq!(unchanged.oauth_config.as_ref(), Some(&sentinel_oauth));
+        };
+
+        let exact_duplicate_error = registry
+            .merge_extension_registry(
+                &[
+                    ExtensionProviderBinding {
+                        provider: "Acme".to_string(),
+                        oauth_config: None,
+                    },
+                    ExtensionProviderBinding {
+                        provider: "Acme".to_string(),
+                        oauth_config: None,
+                    },
+                ],
+                Vec::new(),
+            )
+            .expect_err("exact duplicate extension provider must fail")
+            .to_string();
+        assert!(exact_duplicate_error.contains("registered more than once"));
+        assert_manual_unchanged(&registry);
+
+        let provider_error = registry
+            .merge_extension_registry(
+                &[
+                    ExtensionProviderBinding {
+                        provider: "Acme".to_string(),
+                        oauth_config: None,
+                    },
+                    ExtensionProviderBinding {
+                        provider: "acme".to_string(),
+                        oauth_config: None,
+                    },
+                ],
+                Vec::new(),
+            )
+            .expect_err("canonical extension-provider collision must fail")
+            .to_string();
+        assert!(provider_error.contains("normalized extension provider identity"));
+        assert!(provider_error.contains("\"Acme\""));
+        assert!(provider_error.contains("\"acme\""));
+        assert_manual_unchanged(&registry);
+
+        let first = extension_entry("Acme", "chat");
+        let mut duplicate = first.clone();
+        duplicate.model.name = "Conflicting Chat".to_string();
+        let model_error = registry
+            .merge_extension_registry(
+                &[ExtensionProviderBinding {
+                    provider: "Acme".to_string(),
+                    oauth_config: None,
+                }],
+                vec![first, duplicate],
+            )
+            .expect_err("duplicate extension model identity must fail")
+            .to_string();
+        assert!(model_error.contains("canonical registry identity"));
+        assert!(model_error.contains("(\"Acme\", \"chat\")"));
+        assert_manual_unchanged(&registry);
+
+        let oauth_error = registry
+            .merge_extension_registry(
+                &[
+                    ExtensionProviderBinding {
+                        provider: "Acme".to_string(),
+                        oauth_config: None,
+                    },
+                    ExtensionProviderBinding {
+                        provider: "Acme".to_string(),
+                        oauth_config: Some(OAuthConfig {
+                            auth_url: "https://auth.example.test".to_string(),
+                            token_url: "https://token.example.test".to_string(),
+                            client_id: "client".to_string(),
+                            scopes: Vec::new(),
+                            redirect_uri: None,
+                        }),
+                    },
+                ],
+                Vec::new(),
+            )
+            .expect_err("conflicting provider OAuth metadata must fail")
+            .to_string();
+        assert!(oauth_error.contains("conflicting OAuth metadata"));
+        assert_manual_unchanged(&registry);
+    }
+
+    #[test]
+    fn extension_provider_snapshot_rejects_canonical_collisions() {
+        let error = extension_provider_bindings(&[
+            serde_json::json!({
+                "id": "Acme",
+                "oauth": {
+                    "authUrl": "https://north.example.test/authorize",
+                    "tokenUrl": "https://north.example.test/token",
+                    "clientId": "north-client"
+                }
+            }),
+            serde_json::json!({
+                "id": "acme",
+                "oauth": {
+                    "authUrl": "https://south.example.test/authorize",
+                    "tokenUrl": "https://south.example.test/token",
+                    "clientId": "south-client"
+                }
+            }),
+        ])
+        .expect_err("canonical provider snapshot collision must fail")
+        .to_string();
+
+        assert!(
+            error.contains("normalized extension provider identity"),
+            "{error}"
+        );
+        assert!(error.contains("\"Acme\""), "{error}");
+        assert!(error.contains("\"acme\""), "{error}");
+        assert!(!error.contains("north-client"), "{error}");
+        assert!(!error.contains("south-client"), "{error}");
+
+        let exact_duplicate = extension_provider_bindings(&[
+            serde_json::json!({
+                "id": "Acme",
+                "baseUrl": "https://north.example.test",
+                "hasStreamSimple": false
+            }),
+            serde_json::json!({
+                "id": "Acme",
+                "baseUrl": "https://south.example.test",
+                "hasStreamSimple": true
+            }),
+        ])
+        .expect_err("exact duplicate provider records must fail")
+        .to_string();
+        assert!(exact_duplicate.contains("registered more than once"));
+        assert!(!exact_duplicate.contains("north.example.test"));
+        assert!(!exact_duplicate.contains("south.example.test"));
+
+        let builtin_oauth = extension_provider_bindings(&[serde_json::json!({
+            "id": "Anthropic",
+            "oauth": {
+                "authUrl": "https://extension.example.test/authorize",
+                "tokenUrl": "https://extension.example.test/token",
+                "clientId": "must-not-shadow-native-auth"
+            }
+        })])
+        .expect_err("extension OAuth must not shadow a built-in provider")
+        .to_string();
+        assert!(builtin_oauth.contains("built-in provider \"anthropic\""));
+        assert!(!builtin_oauth.contains("must-not-shadow-native-auth"));
+    }
+
+    #[test]
+    fn extension_merge_preserves_manual_models_and_grafts_provider_runtime_metadata() {
+        let (_dir, auth) = test_auth_storage();
+        let template = ModelRegistry::load(&auth, None)
+            .find("openai", "gpt-4o")
+            .expect("expected built-in model template");
+        let mut manual_chat = template.clone();
+        manual_chat.model.provider = "acme".to_string();
+        manual_chat.model.id = "chat".to_string();
+        manual_chat.model.name = "Manual Chat".to_string();
+        manual_chat.model.base_url = "https://manual.example.test".to_string();
+        let mut manual_only = manual_chat.clone();
+        manual_only.model.id = "manual-only".to_string();
+        let expected_manual_chat = manual_chat.clone();
+        let expected_manual_only = manual_only.clone();
+
+        let mut extension_chat = manual_chat.clone();
+        extension_chat.model.provider = "Acme".to_string();
+        extension_chat.model.name = "Extension Chat".to_string();
+        extension_chat.model.base_url = "https://extension.example.test".to_string();
+        extension_chat.oauth_config = Some(OAuthConfig {
+            auth_url: "https://auth.example.test/authorize".to_string(),
+            token_url: "https://auth.example.test/token".to_string(),
+            client_id: "extension-client".to_string(),
+            scopes: vec!["models:use".to_string()],
+            redirect_uri: Some("http://127.0.0.1/callback".to_string()),
+        });
+
+        let mut registry = ModelRegistry::from_entries_for_tests(vec![manual_chat, manual_only]);
+        let binding = ExtensionProviderBinding {
+            provider: extension_chat.model.provider.clone(),
+            oauth_config: extension_chat.oauth_config.clone(),
+        };
+        registry
+            .merge_extension_registry(&[binding], vec![extension_chat])
+            .expect("valid extension merge");
+
+        for (model_id, expected) in [
+            ("chat", &expected_manual_chat),
+            ("manual-only", &expected_manual_only),
+        ] {
+            let entry = registry
+                .find("acme", model_id)
+                .expect("manual model should remain present");
+            assert_eq!(entry.model.provider, "Acme");
+            assert_eq!(entry.model.id, expected.model.id);
+            assert_eq!(entry.model.name, expected.model.name);
+            assert_eq!(entry.model.api, expected.model.api);
+            assert_eq!(entry.model.base_url, expected.model.base_url);
+            assert_eq!(entry.model.reasoning, expected.model.reasoning);
+            assert_eq!(entry.model.input, expected.model.input);
+            assert_eq!(entry.model.cost, expected.model.cost);
+            assert_eq!(entry.model.context_window, expected.model.context_window);
+            assert_eq!(entry.model.max_tokens, expected.model.max_tokens);
+            assert_eq!(entry.model.headers, expected.model.headers);
+            assert_eq!(entry.api_key, expected.api_key);
+            assert_eq!(entry.headers, expected.headers);
+            assert_eq!(entry.auth_header, expected.auth_header);
+            assert_eq!(
+                serde_json::to_value(&entry.compat).expect("serialize merged compatibility"),
+                serde_json::to_value(&expected.compat).expect("serialize manual compatibility")
+            );
+            let oauth = entry
+                .oauth_config
+                .expect("extension OAuth metadata should apply provider-wide");
+            assert_eq!(oauth.client_id, "extension-client");
+        }
+    }
+
+    #[test]
+    fn extension_merge_keeps_declared_builtin_alias_separate_from_native_rows() {
+        let (_dir, auth) = test_auth_storage();
+        let template = ModelRegistry::load(&auth, None)
+            .find("openai", "gpt-4o")
+            .expect("expected built-in model template");
+        let mut native = template.clone();
+        native.model.provider = "openrouter".to_string();
+        native.model.id = "openai/gpt-4o-mini".to_string();
+        native.model.name = "Native OpenRouter".to_string();
+        let mut extension = template;
+        extension.model.provider = "open-router".to_string();
+        extension.model.id = "gpt-4o-mini".to_string();
+        extension.model.name = "Extension Open Router".to_string();
+
+        let mut registry = ModelRegistry::from_entries_for_tests(vec![native]);
+        registry
+            .merge_extension_registry(
+                &[ExtensionProviderBinding {
+                    provider: "open-router".to_string(),
+                    oauth_config: None,
+                }],
+                vec![extension],
+            )
+            .expect("declared extension alias should remain distinct");
+
+        assert_eq!(registry.models().len(), 2);
+        let extension = registry
+            .find("open-router", "gpt-4o-mini")
+            .expect("exact extension alias row");
+        assert_eq!(extension.model.provider, "open-router");
+        assert_eq!(extension.model.name, "Extension Open Router");
+        let extension_by_canonical_model_id = registry
+            .find("open-router", "openai/gpt-4o-mini")
+            .expect("canonical model ID should resolve to the exact extension alias row");
+        assert_eq!(
+            extension_by_canonical_model_id.model.provider,
+            "open-router"
+        );
+        assert_eq!(
+            extension_by_canonical_model_id.model.name,
+            "Extension Open Router"
+        );
+        let native = registry
+            .find("openrouter", "gpt-4o-mini")
+            .expect("native OpenRouter row");
+        assert_eq!(native.model.provider, "openrouter");
+        assert_eq!(native.model.name, "Native OpenRouter");
+    }
+
+    #[test]
+    fn legacy_extension_merge_deduplicates_bindings_and_rejects_ambiguity_atomically() {
+        let (_dir, auth) = test_auth_storage();
+        let template = ModelRegistry::load(&auth, None)
+            .find("openai", "gpt-4o")
+            .expect("expected built-in model template");
+        let oauth = OAuthConfig {
+            auth_url: "https://auth.example.test/authorize".to_string(),
+            token_url: "https://auth.example.test/token".to_string(),
+            client_id: "extension-client".to_string(),
+            scopes: vec!["models:use".to_string()],
+            redirect_uri: None,
+        };
+        let entry = |provider: &str, model_id: &str, oauth_config: Option<OAuthConfig>| {
+            let mut entry = template.clone();
+            entry.model.provider = provider.to_string();
+            entry.model.id = model_id.to_string();
+            entry.oauth_config = oauth_config;
+            entry
+        };
+
+        let mut valid = ModelRegistry::from_entries_for_tests(Vec::new());
+        valid
+            .merge_extension_entries(vec![
+                entry("Acme", "one", Some(oauth.clone())),
+                entry("Acme", "two", Some(oauth.clone())),
+            ])
+            .expect("multiple models may share one exact provider binding");
+        assert_eq!(valid.models().len(), 2);
+        assert!(valid.find("Acme", "one").is_some());
+        assert!(valid.find("Acme", "two").is_some());
+
+        let sentinel = entry("sentinel", "untouched", None);
+        let assert_sentinel_unchanged = |registry: &ModelRegistry| {
+            assert_eq!(registry.models().len(), 1);
+            let entry = registry
+                .find("sentinel", "untouched")
+                .expect("sentinel row must survive a rejected merge");
+            assert_eq!(entry.model.provider, sentinel.model.provider);
+            assert_eq!(entry.model.id, sentinel.model.id);
+            assert_eq!(entry.model.name, sentinel.model.name);
+            assert_eq!(entry.oauth_config, sentinel.oauth_config);
+        };
+        let mut provider_collision =
+            ModelRegistry::from_entries_for_tests(vec![sentinel.clone()]);
+        let error = provider_collision
+            .merge_extension_entries(vec![
+                entry("Acme", "one", None),
+                entry("acme", "two", None),
+            ])
+            .expect_err("case-variant provider bindings must fail")
+            .to_string();
+        assert!(error.contains("normalized extension provider identity"));
+        assert_sentinel_unchanged(&provider_collision);
+
+        let mut oauth_collision = ModelRegistry::from_entries_for_tests(vec![sentinel.clone()]);
+        let error = oauth_collision
+            .merge_extension_entries(vec![
+                entry("Acme", "one", Some(oauth.clone())),
+                entry("Acme", "two", None),
+            ])
+            .expect_err("conflicting provider OAuth metadata must fail")
+            .to_string();
+        assert!(error.contains("conflicting OAuth metadata"));
+        assert_sentinel_unchanged(&oauth_collision);
     }
 
     #[test]
@@ -5794,6 +6575,108 @@ mod tests {
     }
 
     #[test]
+    fn model_registry_normalizes_custom_provider_identity_before_routing() {
+        let dir = tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{
+                "providers": {
+                    " Acme ": {
+                        "baseUrl": "https://acme.example/v1",
+                        "api": "openai-completions",
+                        "models": [{"id": " chat ", "name": "Acme Chat"}]
+                    }
+                }
+            }"#,
+        )
+        .expect("write models.json");
+
+        let resolved_providers = std::cell::RefCell::new(Vec::new());
+        let registry =
+            ModelRegistry::load_with_credential_resolver(Some(models_path), |provider| {
+                resolved_providers.borrow_mut().push(provider.to_string());
+                None
+            });
+
+        assert!(registry.error().is_none(), "{:?}", registry.error());
+        let normalized = registry
+            .find("acme", "chat")
+            .expect("normalized custom provider must be routable");
+        assert_eq!(normalized.model.provider, "Acme");
+        assert_eq!(normalized.model.id, "chat");
+        assert!(
+            registry.find(" AcMe ", " chat ").is_some(),
+            "whitespace-bearing lookup must resolve through the same canonical identity"
+        );
+
+        let resolved_providers = resolved_providers.into_inner();
+        assert!(
+            resolved_providers.iter().any(|provider| provider == "Acme"),
+            "custom credential lookup must receive the trimmed source identity: {resolved_providers:?}"
+        );
+        assert!(
+            resolved_providers
+                .iter()
+                .all(|provider| provider.trim() == provider),
+            "credential lookup received an unnormalized provider: {resolved_providers:?}"
+        );
+    }
+
+    #[test]
+    fn model_registry_rejects_blank_provider_identity_before_routing() {
+        let dir = tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{
+                "providers": {
+                    "   ": {
+                        "baseUrl": "https://blank.example/v1",
+                        "api": "openai-completions",
+                        "apiKey": "blank-provider-secret",
+                        "models": [{"id": "blank-model"}]
+                    }
+                }
+            }"#,
+        )
+        .expect("write models.json");
+
+        let resolved_providers = std::cell::RefCell::new(Vec::new());
+        let registry =
+            ModelRegistry::load_with_credential_resolver(Some(models_path), |provider| {
+                resolved_providers.borrow_mut().push(provider.to_string());
+                None
+            });
+
+        let error = registry.error().expect("blank provider must fail loading");
+        assert!(error.contains("provider identity must not be blank"), "{error}");
+        assert!(!error.contains("blank-provider-secret"), "{error}");
+        assert!(registry.find("", "blank-model").is_none());
+        assert!(
+            resolved_providers
+                .into_inner()
+                .iter()
+                .all(|provider| !provider.is_empty()),
+            "blank provider must be rejected before credential resolution"
+        );
+
+        let invalid_value_error = serde_json::from_str::<ModelsConfig>(
+            r#"{"providers":{"   ":"blank-provider-value-secret"}}"#,
+        )
+        .expect_err("blank identity must win before provider-value deserialization")
+        .to_string();
+        assert!(
+            invalid_value_error.contains("provider identity must not be blank"),
+            "{invalid_value_error}"
+        );
+        assert!(
+            !invalid_value_error.contains("blank-provider-value-secret"),
+            "{invalid_value_error}"
+        );
+    }
+
+    #[test]
     fn model_catalog_discovery_uses_resolved_custom_provider_transport() {
         let dir = tempdir().expect("tempdir");
         let models_path = dir.path().join("models.json");
@@ -5979,10 +6862,10 @@ mod tests {
 
         let error = resolve_model_catalog_provider_config("openai", &models_path)
             .expect_err("ambiguous provider aliases must fail deterministically");
-        assert!(
-            error.to_string().contains("multiple provider aliases"),
-            "{error}"
-        );
+        let error = error.to_string();
+        assert!(error.contains("canonical provider identity"), "{error}");
+        assert!(error.contains("\"openai\""), "{error}");
+        assert!(error.contains("\"OpenAI\""), "{error}");
     }
 
     #[test]
@@ -8042,6 +8925,65 @@ mod tests {
     }
 
     #[test]
+    fn model_registry_rejects_canonical_provider_alias_collisions_before_routing() {
+        let dir = tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{
+                "providers": {
+                    "azure": {
+                        "api": "openai-completions",
+                        "baseUrl": "https://north.example/v1",
+                        "apiKey": "north-api-key-secret",
+                        "authHeader": true,
+                        "headers": {"x-route": "north-header-secret"},
+                        "models": [{"id": "north-only-model"}]
+                    },
+                    "azure-openai": {
+                        "api": "openai-responses",
+                        "baseUrl": "https://south.example/v2",
+                        "apiKey": "south-api-key-secret",
+                        "authHeader": false,
+                        "headers": {"x-route": "south-header-secret"},
+                        "models": [{"id": "south-only-model"}]
+                    }
+                }
+            }"#,
+        )
+        .expect("write ambiguous provider routes");
+
+        let mut first_error = None;
+        for _ in 0..16 {
+            let registry =
+                ModelRegistry::load_with_credential_resolver(Some(models_path.clone()), |_| None);
+            let error = registry
+                .error()
+                .expect("canonical provider alias collision must fail")
+                .to_string();
+            assert!(error.contains("canonical provider identity"), "{error}");
+            assert!(error.contains("\"azure\""), "{error}");
+            assert!(error.contains("\"azure-openai\""), "{error}");
+            for secret in [
+                "north-api-key-secret",
+                "north-header-secret",
+                "south-api-key-secret",
+                "south-header-secret",
+            ] {
+                assert!(!error.contains(secret), "error leaked route data: {error}");
+            }
+            assert!(registry.find("azure-openai", "north-only-model").is_none());
+            assert!(registry.find("azure-openai", "south-only-model").is_none());
+
+            if let Some(expected) = &first_error {
+                assert_eq!(&error, expected, "repeated loads must fail identically");
+            } else {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    #[test]
     fn model_registry_load_missing_models_json_is_fine() {
         let dir = tempdir().expect("tempdir");
         let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
@@ -8097,6 +9039,46 @@ mod tests {
         let json = r#"{"providers": {}}"#;
         let config: ModelsConfig = serde_json::from_str(json).expect("parse");
         assert!(config.providers.is_empty());
+    }
+
+    #[test]
+    fn models_config_rejects_duplicate_canonical_model_identities_for_every_provider() {
+        for (label, json, first_id, second_id, canonical_identity) in [
+            (
+                "non-OpenRouter case and whitespace variants",
+                r#"{"providers":{"acme":{"models":[{"id":" Example-Model "},{"id":"example-model"}]}}}"#,
+                " Example-Model ",
+                "example-model",
+                ("acme", "example-model"),
+            ),
+            (
+                "OpenRouter aliases",
+                r#"{"providers":{"openrouter":{"models":[{"id":"gpt-4o-mini"},{"id":"openai/gpt-4o-mini"}]}}}"#,
+                "gpt-4o-mini",
+                "openai/gpt-4o-mini",
+                ("openrouter", "openai/gpt-4o-mini"),
+            ),
+        ] {
+            let error = serde_json::from_str::<ModelsConfig>(json)
+                .expect_err("duplicate canonical model identities must fail");
+            let error = error.to_string();
+            assert!(
+                error.contains("duplicate canonical model identity"),
+                "{label}: {error}"
+            );
+            assert!(
+                error.contains(&format!("{first_id:?}")),
+                "{label}: {error}"
+            );
+            assert!(
+                error.contains(&format!("{second_id:?}")),
+                "{label}: {error}"
+            );
+            assert!(
+                error.contains(&format!("{canonical_identity:?}")),
+                "{label}: {error}"
+            );
+        }
     }
 
     #[test]

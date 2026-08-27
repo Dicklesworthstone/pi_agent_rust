@@ -106,8 +106,8 @@ pub fn resolve_with(path: &str, cwd: &Path, options: &ResolveOptions) -> Result<
         ));
     };
     match scheme {
-        "skill" => resolve_skill(rest),
-        "prompt" => resolve_prompt(rest),
+        "skill" => resolve_skill(rest, cwd),
+        "prompt" => resolve_prompt(rest, cwd),
         "local" => resolve_local(rest),
         "conflict" => resolve_conflict(rest, cwd),
         "pr" | "issue" => resolve_github(scheme, rest, cwd, options),
@@ -148,14 +148,64 @@ fn doc(
 // skill:// and prompt:// via the resources loader
 // ---------------------------------------------------------------------------
 
-fn resolve_skill(name: &str) -> Result<ResolvedDoc> {
+fn diagnostic_matches_named_resource(
+    diagnostic: &crate::resources::ResourceDiagnostic,
+    name: &str,
+    roots: &[PathBuf],
+) -> bool {
+    if diagnostic.kind != crate::resources::DiagnosticKind::Warning
+        || diagnostic.collision.is_some()
+    {
+        return false;
+    }
+    let path = &diagnostic.path;
+    let file_stem_matches = path.file_stem().and_then(|part| part.to_str()) == Some(name);
+    let skill_parent_matches = path.file_name().and_then(|part| part.to_str()) == Some("SKILL.md")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|part| part.to_str())
+            == Some(name);
+    file_stem_matches
+        || skill_parent_matches
+        || roots.iter().any(|root| path == root)
+}
+
+fn resource_diagnostic_error(
+    resource_kind: &str,
+    name: &str,
+    diagnostic: &crate::resources::ResourceDiagnostic,
+) -> Error {
+    Error::tool(
+        "read",
+        format!(
+            "PI_URL_RESOURCE_INVALID: {resource_kind} '{name}' could not be loaded from '{}': {}",
+            diagnostic.path.display(),
+            diagnostic.message
+        ),
+    )
+}
+
+fn resolve_skill(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
+    let agent_dir = crate::config::Config::global_dir();
+    let roots = [
+        cwd.join(crate::config::Config::project_dir()).join("skills"),
+        agent_dir.join("skills"),
+    ];
     let skills = crate::resources::load_skills(crate::resources::LoadSkillsOptions {
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        agent_dir: crate::config::Config::global_dir(),
+        cwd: cwd.to_path_buf(),
+        agent_dir,
         skill_paths: Vec::new(),
         include_defaults: true,
     });
     let Some(skill) = skills.skills.iter().find(|skill| skill.name == name) else {
+        if let Some(diagnostic) = skills
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic_matches_named_resource(diagnostic, name, &roots))
+        {
+            return Err(resource_diagnostic_error("skill", name, diagnostic));
+        }
         let known: Vec<&str> = skills.skills.iter().map(|s| s.name.as_str()).collect();
         return Err(Error::tool(
             "read",
@@ -169,8 +219,17 @@ fn resolve_skill(name: &str) -> Result<ResolvedDoc> {
             ),
         ));
     };
-    let content = std::fs::read_to_string(&skill.file_path)
-        .map_err(|e| Error::tool("read", format!("Failed to read skill '{name}': {e}")))?;
+    resolve_skill_document(name, skill)
+}
+
+fn resolve_skill_document(name: &str, skill: &crate::resources::Skill) -> Result<ResolvedDoc> {
+    let content = crate::resources::read_resource_file_bounded(&skill.file_path, "Skill")
+        .map_err(|error| {
+            Error::tool(
+                "read",
+                format!("PI_URL_RESOURCE_INVALID: failed to read skill '{name}': {error}"),
+            )
+        })?;
     Ok(doc(
         "skill",
         name,
@@ -184,16 +243,37 @@ fn resolve_skill(name: &str) -> Result<ResolvedDoc> {
     ))
 }
 
-fn resolve_prompt(name: &str) -> Result<ResolvedDoc> {
-    let templates =
-        crate::resources::load_prompt_templates(crate::resources::LoadPromptTemplatesOptions {
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            agent_dir: crate::config::Config::global_dir(),
+fn resolve_prompt(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
+    let agent_dir = crate::config::Config::global_dir();
+    let roots = [
+        cwd.join(crate::config::Config::project_dir()).join("prompts"),
+        agent_dir.join("prompts"),
+    ];
+    let result = crate::resources::load_prompt_templates_with_diagnostics(
+        crate::resources::LoadPromptTemplatesOptions {
+            cwd: cwd.to_path_buf(),
+            agent_dir,
             prompt_paths: Vec::new(),
             include_defaults: true,
-        });
-    let Some(template) = templates.iter().find(|t| t.name == name) else {
-        let known: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+        },
+    );
+    let Some(template) = result.templates.iter().find(|template| template.name == name) else {
+        if let Some(diagnostic) = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic_matches_named_resource(diagnostic, name, &roots))
+        {
+            return Err(resource_diagnostic_error(
+                "prompt template",
+                name,
+                diagnostic,
+            ));
+        }
+        let known: Vec<&str> = result
+            .templates
+            .iter()
+            .map(|template| template.name.as_str())
+            .collect();
         return Err(Error::tool(
             "read",
             format!(
@@ -617,22 +697,50 @@ fn resolve_github(
 // ssh://host/path (read-only cat, size-capped)
 // ---------------------------------------------------------------------------
 
+/// A parsed `ssh://host/path` target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    pub host: String,
+    pub path: String,
+}
+
+fn parse_ssh_reference(rest: &str) -> Result<SshTarget> {
+    let (host, tail) = rest.split_once('/').ok_or_else(|| {
+        Error::validation(format!(
+            "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
+        ))
+    })?;
+    if host.is_empty() || tail.is_empty() {
+        return Err(Error::validation(format!(
+            "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
+        )));
+    }
+    if host.starts_with('-') || host.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(Error::validation(format!(
+            "PI_SSH_HOST_INVALID: ssh host must not begin with '-' or contain whitespace/control characters: {host:?}"
+        )));
+    }
+
+    let remote_path = format!("/{tail}");
+    if remote_path.split('/').any(|segment| segment == "..") {
+        return Err(Error::validation(format!(
+            "PI_SSH_TRAVERSAL: ssh:// paths must not contain '..' segments: '{rest}'"
+        )));
+    }
+    Ok(SshTarget {
+        host: host.to_string(),
+        path: remote_path,
+    })
+}
+
 fn resolve_ssh(rest: &str) -> Result<ResolvedDoc> {
     // split_once consumes the separator, so re-anchor to an absolute path:
     // `ssh://host/var/www` must cat `/var/www`, not `~/var/www`.
-    let (host, tail) = rest.split_once('/').ok_or_else(|| {
-        Error::validation(format!("ssh:// reference must be host/path, got '{rest}'"))
-    })?;
-    let remote_path = format!("/{tail}");
-    if host.is_empty() || tail.is_empty() {
-        return Err(Error::validation(format!(
-            "ssh:// reference must be host/path, got '{rest}'"
-        )));
-    }
+    let target = parse_ssh_reference(rest)?;
     let output = std::process::Command::new("ssh")
         .args(ssh_command_flags())
-        .arg(host)
-        .arg(format!("head -c {SSH_MAX_BYTES} -- '{remote_path}'"))
+        .arg(&target.host)
+        .arg(ssh_capped_read_script(&target.path))
         .output()
         .map_err(|e| Error::tool("read", format!("PI_URL_BACKEND: failed to run ssh: {e}")))?;
     if !output.status.success() {
@@ -640,7 +748,9 @@ fn resolve_ssh(rest: &str) -> Result<ResolvedDoc> {
         return Err(Error::tool(
             "read",
             format!(
-                "PI_URL_UNRESOLVABLE: ssh {host} cat '{remote_path}' failed: {}",
+                "PI_URL_UNRESOLVABLE: ssh {} cat '{}' failed: {}",
+                target.host,
+                target.path,
                 stderr.trim()
             ),
         ));
@@ -652,8 +762,8 @@ fn resolve_ssh(rest: &str) -> Result<ResolvedDoc> {
         content,
         "text/plain",
         serde_json::json!({
-            "host": host,
-            "path": remote_path,
+            "host": target.host,
+            "path": target.path,
             "cappedAt": SSH_MAX_BYTES,
         }),
     ))
@@ -664,17 +774,11 @@ fn resolve_ssh(rest: &str) -> Result<ResolvedDoc> {
 // accept-new-then-strict host keys, atomic remote staging.
 // ---------------------------------------------------------------------------
 
-/// A parsed `ssh://host/path` write target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SshTarget {
-    pub host: String,
-    pub path: String,
-}
-
 /// Parse and validate an `ssh://host/path` URL for a write-side tool.
 ///
-/// Rejects non-ssh schemes, empty components, and any `..` path segment so
-/// remote staging can never escape the intended directory.
+/// Rejects non-ssh schemes, empty components, option-shaped or whitespace/
+/// control-bearing hosts, and any `..` path segment so remote staging can
+/// never escape the intended directory or reinterpret a host as an ssh option.
 ///
 /// # Errors
 /// Named `PI_SSH_*` validation errors.
@@ -684,27 +788,7 @@ pub fn parse_ssh_target(url: &str) -> Result<SshTarget> {
             "PI_SSH_TARGET: '{url}' is not an ssh://host/path URL"
         )));
     };
-    // Absolute by construction — split_once eats the leading slash.
-    let (host, tail) = rest.split_once('/').ok_or_else(|| {
-        Error::validation(format!(
-            "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
-        ))
-    })?;
-    let remote_path = format!("/{tail}");
-    if host.is_empty() || tail.is_empty() {
-        return Err(Error::validation(format!(
-            "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
-        )));
-    }
-    if remote_path.split('/').any(|segment| segment == "..") {
-        return Err(Error::validation(format!(
-            "PI_SSH_TRAVERSAL: ssh:// paths must not contain '..' segments: '{rest}'"
-        )));
-    }
-    Ok(SshTarget {
-        host: host.to_string(),
-        path: remote_path,
-    })
+    parse_ssh_reference(rest)
 }
 
 /// Literal host tokens from ssh_config text. Wildcard (`*`, `?`) and
@@ -833,6 +917,10 @@ pub fn classify_ssh_failure(stderr: &str) -> SshFailureKind {
 /// Quote a single argument for consumption by the *remote* POSIX shell.
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn ssh_capped_read_script(remote_path: &str) -> String {
+    format!("head -c {SSH_MAX_BYTES} -- {}", sh_quote(remote_path))
 }
 
 /// POSIX sh snippet writing stdin into `remote_path` atomically.
@@ -1305,6 +1393,94 @@ mod tests {
     }
 
     #[test]
+    fn resource_schemes_resolve_against_the_supplied_cwd() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let project_dir = root.path().join(crate::config::Config::project_dir());
+        let skill_dir = project_dir.join("skills/router-cwd-skill");
+        let prompt_dir = project_dir.join("prompts");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::create_dir_all(&prompt_dir).expect("create prompt dir");
+        let skill_path = skill_dir.join("SKILL.md");
+        let prompt_path = prompt_dir.join("router-cwd-prompt.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: router-cwd-skill\ndescription: cwd routing probe\n---\nproject skill\n",
+        )
+        .expect("write project skill");
+        std::fs::write(&prompt_path, "project prompt\n").expect("write project prompt");
+
+        let skill = resolve("skill://router-cwd-skill", root.path()).expect("resolve skill");
+        assert!(skill.content.contains("project skill"));
+        let expected_skill_path = skill_path.display().to_string();
+        assert_eq!(skill.metadata["path"].as_str(), Some(expected_skill_path.as_str()));
+        let prompt =
+            resolve("prompt://router-cwd-prompt", root.path()).expect("resolve prompt");
+        assert_eq!(prompt.content, "project prompt\n");
+        let expected_prompt_path = prompt_path.display().to_string();
+        assert_eq!(
+            prompt.metadata["path"].as_str(),
+            Some(expected_prompt_path.as_str())
+        );
+    }
+
+    #[test]
+    fn resource_schemes_preserve_matching_load_diagnostics() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let project_dir = root.path().join(crate::config::Config::project_dir());
+        let skill_dir = project_dir.join("skills/broken-router-skill");
+        let prompt_dir = project_dir.join("prompts");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::create_dir_all(&prompt_dir).expect("create prompt dir");
+        let skill_path = skill_dir.join("SKILL.md");
+        let prompt_path = prompt_dir.join("broken-router-prompt.md");
+        std::fs::write(&skill_path, [0xff, 0xfe]).expect("write invalid skill");
+        std::fs::write(&prompt_path, [0xff, 0xfe]).expect("write invalid prompt");
+
+        for (url, offending_path) in [
+            ("skill://broken-router-skill", &skill_path),
+            ("prompt://broken-router-prompt", &prompt_path),
+        ] {
+            let error = resolve(url, root.path()).expect_err("invalid resource must fail");
+            let message = error.to_string();
+            assert!(message.contains("PI_URL_RESOURCE_INVALID"), "{message}");
+            assert!(message.contains("not valid UTF-8"), "{message}");
+            assert!(
+                message.contains(&offending_path.display().to_string()),
+                "{message}"
+            );
+            assert!(!message.contains("no skill named"), "{message}");
+            assert!(!message.contains("no prompt template named"), "{message}");
+        }
+    }
+
+    #[test]
+    fn skill_document_reread_enforces_the_resource_limit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let skill_path = root.path().join("SKILL.md");
+        let file = std::fs::File::create(&skill_path).expect("create skill");
+        file.set_len((crate::theme::MAX_RESOURCE_FILE_BYTES + 1) as u64)
+            .expect("extend skill");
+        let skill = crate::resources::Skill {
+            name: "reread-limit".to_string(),
+            description: "reread limit probe".to_string(),
+            file_path: skill_path,
+            base_dir: root.path().to_path_buf(),
+            source: "test".to_string(),
+            disable_model_invocation: false,
+        };
+
+        let error = resolve_skill_document("reread-limit", &skill)
+            .expect_err("skill:// reread must reject plus-one source");
+        assert!(
+            error.to_string().contains(&format!(
+                "{}-byte resource limit",
+                crate::theme::MAX_RESOURCE_FILE_BYTES
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn conflict_regions_parse_and_select() {
         let repo = init_repo_with_conflict("parse");
         let regions = conflict_regions(&repo).expect("regions");
@@ -1364,6 +1540,39 @@ mod tests {
         assert!(parse_ssh_target("ssh://hostonly").is_err());
         assert!(parse_ssh_target("ssh://h/").is_err());
         assert!(parse_ssh_target("ssh://h/a/../b").is_err());
+
+        for invalid in [
+            "ssh://-oProxyCommand=id/tmp/file",
+            "ssh://bad host/tmp/file",
+            "ssh://bad\thost/tmp/file",
+            "ssh://bad\nhost/tmp/file",
+            "ssh://bad\0host/tmp/file",
+        ] {
+            let error = parse_ssh_target(invalid).expect_err("unsafe host token must fail closed");
+            assert!(
+                error.to_string().contains("PI_SSH_HOST_INVALID"),
+                "unexpected error for {invalid:?}: {error}"
+            );
+            let rest = invalid
+                .strip_prefix("ssh://")
+                .expect("test target has ssh scheme");
+            let read_error = resolve_ssh(rest).expect_err("unsafe read host must fail before ssh");
+            assert!(
+                read_error.to_string().contains("PI_SSH_HOST_INVALID"),
+                "unexpected read error for {invalid:?}: {read_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_capped_read_script_quotes_one_remote_path_argument() {
+        let script = ssh_capped_read_script("/tmp/it's; $(touch /tmp/pwned)");
+        assert_eq!(
+            script,
+            format!(
+                "head -c {SSH_MAX_BYTES} -- '/tmp/it'\\''s; $(touch /tmp/pwned)'"
+            )
+        );
     }
 
     #[test]

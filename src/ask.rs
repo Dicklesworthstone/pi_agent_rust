@@ -358,6 +358,20 @@ type PendingAskReplies = Arc<
     >,
 >;
 
+struct PendingAskReplyLease {
+    pending: PendingAskReplies,
+    id: String,
+}
+
+impl Drop for PendingAskReplyLease {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
 /// The `ask` tool. Logic-only: rendering is the installed handler's job.
 ///
 /// Cloning shares the handler slot, so the host can keep one clone to
@@ -366,6 +380,7 @@ type PendingAskReplies = Arc<
 pub struct AskTool {
     handler: Arc<std::sync::RwLock<Option<AskHandler>>>,
     pending_ui: PendingAskReplies,
+    channel_ui_open: Arc<std::sync::atomic::AtomicBool>,
     policy: AskPolicy,
 }
 
@@ -375,6 +390,7 @@ impl AskTool {
         Self {
             handler: Arc::new(std::sync::RwLock::new(None)),
             pending_ui: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            channel_ui_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             policy,
         }
     }
@@ -393,28 +409,42 @@ impl AskTool {
     /// bridge, including the wait budget.
     pub fn install_channel_ui(&self, sender: asupersync::channel::mpsc::Sender<AskUiRequest>) {
         let pending = Arc::clone(&self.pending_ui);
-        self.set_handler(Arc::new(move |request: AskRequest| {
+        let channel_ui_open = Arc::clone(&self.channel_ui_open);
+        let handler: AskHandler = Arc::new(move |request: AskRequest| {
             let sender = sender.clone();
             let pending = Arc::clone(&pending);
+            let channel_ui_open = Arc::clone(&channel_ui_open);
             Box::pin(async move {
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                if !channel_ui_open.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(Error::tool("ask", "picker surface closed"));
+                }
                 let id = uuid::Uuid::new_v4().to_string();
                 let (reply_tx, mut reply_rx) = asupersync::channel::oneshot::channel();
-                pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id.clone(), reply_tx);
                 let ui_request = AskUiRequest {
                     id: id.clone(),
                     request,
                 };
-                if sender.send(cx.cx(), ui_request).await.is_err() {
-                    pending
+                {
+                    let mut pending = pending
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&id);
-                    return Err(Error::tool("ask", "picker surface unavailable"));
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !channel_ui_open.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(Error::tool("ask", "picker surface closed"));
+                    }
+                    pending.insert(id.clone(), reply_tx);
+                    if sender.try_send(ui_request).is_err() {
+                        pending.remove(&id);
+                        return Err(Error::tool("ask", "picker surface unavailable"));
+                    }
                 }
+                // Cancellation can drop this future without entering any of
+                // the result branches below. Keep removal tied to ownership
+                // of the pending wait rather than to selected exit paths.
+                let _pending_reply = PendingAskReplyLease {
+                    pending: Arc::clone(&pending),
+                    id: id.clone(),
+                };
                 let waited = asupersync::time::timeout(
                     asupersync::time::wall_now(),
                     std::time::Duration::from_millis(ASK_UI_TIMEOUT_MS),
@@ -442,7 +472,14 @@ impl AskTool {
                     }
                 }
             })
-        }));
+        });
+        let _pending_guard = self
+            .pending_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.channel_ui_open
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.set_handler(handler);
     }
 
     /// Deliver the host's answer for a pending picker request.
@@ -454,6 +491,94 @@ impl AskTool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(id);
         sender.is_some_and(|sender| sender.send(cx.cx(), response).is_ok())
+    }
+
+    /// Forward one queued picker request only while its reply surface remains
+    /// open and the request is still pending.
+    ///
+    /// The nonblocking emitter runs under the same mutex as [`Self::close_channel_ui`],
+    /// so a host either publishes the request before close linearizes or drops
+    /// it after close. If host backpressure rejects the frame, the waiter is
+    /// dismissed immediately rather than becoming unreachable. `emit` must be
+    /// nonblocking and must not re-enter this `AskTool`.
+    pub(crate) fn try_forward_channel_ui_request(
+        &self,
+        id: &str,
+        emit: impl FnOnce() -> bool,
+    ) -> bool {
+        let failed_sender = {
+            let mut pending = self
+                .pending_ui
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self
+                .channel_ui_open
+                .load(std::sync::atomic::Ordering::Acquire)
+                || !pending.contains_key(id)
+            {
+                return false;
+            }
+            if emit() {
+                return true;
+            }
+            pending.remove(id)
+        };
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        if let Some(sender) = failed_sender {
+            let _ = sender.send(
+                cx.cx(),
+                AskResponse {
+                    answers: Vec::new(),
+                    dismissed: true,
+                },
+            );
+        }
+        false
+    }
+
+    /// Whether this exact channel request still owns a reachable reply sender.
+    /// UI consumers recheck after queueing so a card dismissed by terminal
+    /// close cannot become visible later from a buffered host event.
+    pub(crate) fn channel_ui_request_is_pending(&self, id: &str) -> bool {
+        self.channel_ui_open
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .pending_ui
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(id)
+    }
+
+    /// Close the installed channel UI and dismiss every outstanding card.
+    ///
+    /// Hosts call this when their reply surface disconnects so an agent turn
+    /// blocked in `ask` cannot outlive the UI by the full picker timeout.
+    pub fn close_channel_ui(&self) -> usize {
+        let pending = {
+            let mut pending = self
+                .pending_ui
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.channel_ui_open
+                .store(false, std::sync::atomic::Ordering::Release);
+            let closed_handler: AskHandler = Arc::new(|_request: AskRequest| {
+                Box::pin(async { Err(Error::tool("ask", "picker surface closed")) })
+            });
+            self.set_handler(closed_handler);
+            std::mem::take(&mut *pending)
+        };
+        let count = pending.len();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        for (_, sender) in pending {
+            let _ = sender.send(
+                cx.cx(),
+                AskResponse {
+                    answers: Vec::new(),
+                    dismissed: true,
+                },
+            );
+        }
+        count
     }
 
     fn handler(&self) -> Option<AskHandler> {
@@ -519,7 +644,10 @@ impl crate::tools::Tool for AskTool {
     }
 
     fn effects(&self) -> crate::tools::ToolEffects {
-        crate::tools::ToolEffects::read()
+        // A host exposes one modal picker at a time. Treat user interaction as
+        // a scheduling barrier so one model turn cannot strand concurrent Ask
+        // requests behind a single active-card slot.
+        crate::tools::ToolEffects::write()
     }
 
     async fn execute(
@@ -657,6 +785,13 @@ mod tests {
             AskPolicy::from_config(Some("bogus")),
             AskPolicy::Recommended
         );
+    }
+
+    #[test]
+    fn ask_tool_is_a_parallel_scheduling_barrier() {
+        let effects = AskTool::new(AskPolicy::Error).effects();
+        assert!(effects.writes());
+        assert!(!effects.parallel_safe());
     }
 
     /// Acceptance 3: no handler + recommended policy auto-answers with a
@@ -813,6 +948,180 @@ mod tests {
                     dismissed: true
                 }
             ));
+        });
+    }
+
+    /// Closing the host reply surface dismisses cards already in flight and
+    /// rejects later cards before they can enter the five-minute wait path.
+    #[test]
+    fn channel_ui_close_drains_pending_and_rejects_late_requests() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = AskTool::new(AskPolicy::Error);
+            let (tx, mut rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(4);
+            tool.install_channel_ui(tx);
+
+            let closer_tool = tool.clone();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let closer = async {
+                let _request = rx.recv(cx.cx()).await.expect("ui request arrives");
+                assert_eq!(closer_tool.close_channel_ui(), 1);
+            };
+            let execute = tool.execute(
+                "ask-close",
+                serde_json::json!({
+                    "questions": [{
+                        "question": "Pick?",
+                        "options": [{"label": "A"}, {"label": "B"}]
+                    }]
+                }),
+                None,
+            );
+            let (result, ()) = futures::join!(execute, closer);
+            let error = result.expect_err("closing the picker dismisses the pending card");
+            assert!(error.to_string().contains("dismissed"), "{error}");
+
+            let late_error = tool
+                .execute(
+                    "ask-after-close",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Too late?",
+                            "options": [{"label": "A"}, {"label": "B"}]
+                        }]
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("a closed picker must reject later cards immediately");
+            assert!(
+                late_error.to_string().contains("picker surface closed"),
+                "{late_error}"
+            );
+        });
+    }
+
+    #[test]
+    fn channel_ui_full_outbound_queue_fails_without_pending_waiter() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = AskTool::new(AskPolicy::Error);
+            let (tx, _rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(1);
+            tx.try_send(AskUiRequest {
+                id: String::from("occupy-capacity"),
+                request: question(serde_json::json!({
+                    "questions": [{
+                        "question": "Occupied?",
+                        "options": [{"label": "A"}, {"label": "B"}]
+                    }]
+                })),
+            })
+            .expect("occupy the single outbound slot");
+            tool.install_channel_ui(tx);
+
+            let execution = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(20),
+                tool.execute(
+                    "ask-full",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Pick?",
+                            "options": [{"label": "A"}, {"label": "B"}]
+                        }]
+                    }),
+                    None,
+                ),
+            )
+                .await
+                .expect("a full picker queue must fail before the outer guard expires");
+            let error = execution
+                .expect_err("a full picker queue must fail without waiting");
+            assert!(
+                error.to_string().contains("picker surface unavailable"),
+                "{error}"
+            );
+            assert_eq!(
+                tool.close_channel_ui(),
+                0,
+                "failed outbound dispatch must remove its pending waiter"
+            );
+        });
+    }
+
+    #[test]
+    fn channel_ui_close_prevents_forwarding_an_already_queued_card() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = AskTool::new(AskPolicy::Error);
+            let (tx, mut rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(1);
+            tool.install_channel_ui(tx);
+
+            let forwarder_tool = tool.clone();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let forwarded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let forwarded_for_task = std::sync::Arc::clone(&forwarded);
+            let forwarder = async move {
+                let request = rx.recv(cx.cx()).await.expect("queued UI request");
+                assert_eq!(forwarder_tool.close_channel_ui(), 1);
+                assert!(!forwarder_tool.try_forward_channel_ui_request(&request.id, || {
+                    forwarded_for_task.store(true, std::sync::atomic::Ordering::Release);
+                    true
+                }));
+                let closed = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_millis(20),
+                    rx.recv(cx.cx()),
+                )
+                .await
+                .expect("close must release the installed channel sender");
+                assert!(closed.is_err(), "closed picker channel must disconnect");
+            };
+            let execute = tool.execute(
+                "ask-close-before-forward",
+                serde_json::json!({
+                    "questions": [{
+                        "question": "Pick?",
+                        "options": [{"label": "A"}, {"label": "B"}]
+                    }]
+                }),
+                None,
+            );
+            let (result, ()) = futures::join!(execute, forwarder);
+            let error = result.expect_err("close dismisses the queued card");
+            assert!(error.to_string().contains("dismissed"), "{error}");
+            assert!(
+                !forwarded.load(std::sync::atomic::Ordering::Acquire),
+                "a card dismissed by close must not be forwarded afterward"
+            );
+        });
+    }
+
+    #[test]
+    fn dropping_channel_ui_execution_removes_its_pending_reply() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = AskTool::new(AskPolicy::Error);
+            let (tx, mut rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(1);
+            tool.install_channel_ui(tx);
+
+            let mut execution = Box::pin(tool.execute(
+                "ask-cancelled",
+                serde_json::json!({
+                    "questions": [{
+                        "question": "Pick?",
+                        "options": [{"label": "A"}, {"label": "B"}]
+                    }]
+                }),
+                None,
+            ));
+            assert!(futures::poll!(execution.as_mut()).is_pending());
+            let cx = crate::agent_cx::AgentCx::for_request();
+            rx.recv(cx.cx()).await.expect("UI request was published");
+
+            drop(execution);
+
+            assert_eq!(
+                tool.close_channel_ui(),
+                0,
+                "dropping the execution future must release its pending reply lease"
+            );
         });
     }
 

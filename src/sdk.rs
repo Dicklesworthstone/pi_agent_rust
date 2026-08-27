@@ -1106,6 +1106,7 @@ impl RpcTransportClient {
     pub async fn extension_ui_response(
         &mut self,
         request_id: &str,
+        request_generation: u64,
         response: RpcExtensionUiResponse,
     ) -> Result<bool> {
         #[derive(Deserialize)]
@@ -1117,6 +1118,10 @@ impl RpcTransportClient {
         payload.insert(
             "requestId".to_string(),
             Value::String(request_id.to_string()),
+        );
+        payload.insert(
+            "requestGeneration".to_string(),
+            Value::from(request_generation),
         );
 
         match response {
@@ -1287,6 +1292,64 @@ fn rpc_error_from_response(response: &Value, command: &str) -> Error {
     Error::api(format!("RPC {command} failed: {error}"))
 }
 
+/// Proof that replacement preflight completed without mutating runtime
+/// resources. The caller must install the prepared candidate before consuming
+/// the old handle with `commit_resource_shutdown`.
+pub(crate) struct PreparedSessionShutdown {
+    owner_session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum McpShutdownOutcome {
+    #[default]
+    NotOwned,
+    Released,
+    Indeterminate,
+}
+
+/// Outcome of exhaustively stopping resources owned by one SDK session handle.
+#[derive(Debug, Default)]
+pub(crate) struct SessionResourceShutdown {
+    failures: Vec<String>,
+    mcp: McpShutdownOutcome,
+}
+
+const SESSION_MCP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl SessionResourceShutdown {
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn completed_cleanly(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// A replacement may start its MCP manager only after the previous
+    /// manager's absence or complete release has been established.
+    #[must_use]
+    pub(crate) fn permits_replacement_mcp_activation(&self) -> bool {
+        matches!(
+            self.mcp,
+            McpShutdownOutcome::NotOwned | McpShutdownOutcome::Released
+        )
+    }
+
+    pub(crate) fn failures(&self) -> impl Iterator<Item = &str> {
+        self.failures.iter().map(String::as_str)
+    }
+
+    pub(crate) fn messages(&self) -> impl Iterator<Item = &str> {
+        self.failures.iter().map(String::as_str)
+    }
+
+    pub(crate) fn fail(&mut self, message: String) {
+        self.failures.push(message);
+    }
+}
+
 impl AgentSessionHandle {
     /// Create a handle from a pre-built `AgentSession` with custom listeners.
     ///
@@ -1324,6 +1387,165 @@ impl AgentSessionHandle {
     #[must_use]
     pub fn mcp_manager(&self) -> Option<Arc<crate::mcp::McpManager>> {
         self.mcp_manager.clone()
+    }
+
+    /// Permanently remove this deferred session's MCP manager when the
+    /// predecessor's singleton transports were not proven released.
+    pub(crate) fn disable_mcp(&mut self) {
+        self.mcp_manager = None;
+    }
+
+    /// Flush durable state and capture session ownership without stopping any
+    /// runtime resource. On success the caller can synchronously install its
+    /// prepared replacement before cleanup reaches an irreversible step.
+    pub(crate) async fn preflight_replacement(
+        &mut self,
+    ) -> std::result::Result<PreparedSessionShutdown, SessionResourceShutdown> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = match asupersync::sync::OwnedMutexGuard::lock(
+            Arc::clone(&self.session.session),
+            cx.cx(),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                let warning = format!("failed to lock session for resource shutdown: {err}");
+                tracing::warn!(event = "sdk.session.shutdown.jobs_owner_failed", "{warning}");
+                let mut report = SessionResourceShutdown::default();
+                report.fail(warning);
+                return Err(report);
+            }
+        };
+        let owner_session_id = session.header.id.clone();
+        if self.session.save_enabled()
+            && let Err(err) = session.flush_autosave_on_shutdown().await
+        {
+            let warning = format!("failed to flush session autosave: {err}");
+            tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+            let mut report = SessionResourceShutdown::default();
+            report.fail(warning);
+            return Err(report);
+        }
+        Ok(PreparedSessionShutdown { owner_session_id })
+    }
+
+    async fn shutdown_runtime_resources(
+        self,
+        owner_session_id: Option<&str>,
+        mut report: SessionResourceShutdown,
+    ) -> SessionResourceShutdown {
+        if let Some(owner_session_id) = owner_session_id {
+            if let Err(err) = crate::jobs::kill_session(owner_session_id).await {
+                let warning = format!("failed to stop session-owned background jobs: {err}");
+                tracing::warn!(event = "sdk.session.shutdown.jobs_failed", "{warning}");
+                report.fail(warning);
+            }
+        }
+
+        if let Some(region) = self.session.extensions.as_ref() {
+            if !region.shutdown().await {
+                let warning =
+                    "extension runtime did not stop within its shutdown budget".to_string();
+                tracing::warn!(event = "sdk.session.shutdown.extension_timeout", "{warning}");
+                report.fail(warning);
+            }
+        }
+
+        if let Some(manager) = self.mcp_manager.clone() {
+            report.mcp = McpShutdownOutcome::Indeterminate;
+            if asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                SESSION_MCP_SHUTDOWN_TIMEOUT,
+                manager.shutdown_all(),
+            )
+            .await
+            .is_ok()
+            {
+                report.mcp = McpShutdownOutcome::Released;
+            } else {
+                let warning = format!(
+                    "MCP manager did not stop within {} seconds",
+                    SESSION_MCP_SHUTDOWN_TIMEOUT.as_secs()
+                );
+                tracing::warn!(event = "sdk.session.shutdown.mcp_timeout", "{warning}");
+                report.fail(warning);
+            }
+        }
+
+        report
+    }
+
+    /// Consume an old handle after its prepared replacement has become current,
+    /// attempting every independent runtime resource family even after errors.
+    pub(crate) async fn commit_resource_shutdown(
+        self,
+        prepared: PreparedSessionShutdown,
+    ) -> SessionResourceShutdown {
+        self.shutdown_runtime_resources(
+            Some(prepared.owner_session_id.as_str()),
+            SessionResourceShutdown::default(),
+        )
+        .await
+    }
+
+    /// Exhaustively discard a newly prepared handle that was never committed.
+    /// Its session state is intentionally not autosaved, but every owner-scoped
+    /// runtime family is still attempted without process-wide job cleanup.
+    pub(crate) async fn discard_uncommitted_resources(self) -> SessionResourceShutdown {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut report = SessionResourceShutdown::default();
+        let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
+            Arc::clone(&self.session.session),
+            cx.cx(),
+        )
+        .await
+        {
+            Ok(session) => Some(session.header.id.clone()),
+            Err(err) => {
+                let warning = format!("failed to resolve discarded session ownership: {err}");
+                tracing::warn!(event = "sdk.session.discard.owner_failed", "{warning}");
+                report.fail(warning);
+                None
+            }
+        };
+        self.shutdown_runtime_resources(owner_session_id.as_deref(), report)
+            .await
+    }
+
+    /// Await shutdown of every runtime resource owned by this session.
+    ///
+    /// Final driver exit uses this exhaustive seam: persistence or ownership
+    /// failures are reported, but they never skip later independent cleanup.
+    pub(crate) async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
+        let mut report = SessionResourceShutdown::default();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
+            Arc::clone(&self.session.session),
+            cx.cx(),
+        )
+        .await
+        {
+            Ok(mut session) => {
+                let owner_session_id = session.header.id.clone();
+                if self.session.save_enabled()
+                    && let Err(err) = session.flush_autosave_on_shutdown().await
+                {
+                    let warning = format!("failed to flush session autosave: {err}");
+                    tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+                    report.fail(warning);
+                }
+                Some(owner_session_id)
+            }
+            Err(err) => {
+                let warning = format!("failed to lock session for resource shutdown: {err}");
+                tracing::warn!(event = "sdk.session.shutdown.jobs_owner_failed", "{warning}");
+                report.fail(warning);
+                None
+            }
+        };
+        self.shutdown_runtime_resources(owner_session_id.as_deref(), report)
+            .await
     }
 
     /// Mount cached tools for one MCP server, skipping exact names already
@@ -1918,9 +2140,9 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
 /// Build a session without starting acknowledged MCP transports.
 ///
 /// The default FTUI uses this only for atomic `/new` and `/resume` handoff:
-/// construct every fallible session component first, drop the old handle,
-/// then call [`AgentSessionHandle::activate_mcp`] so singleton MCP servers
-/// are never live in both sessions at once (bd-vjfol).
+/// construct every fallible session component first, await shutdown of the
+/// old handle, then call [`AgentSessionHandle::activate_mcp`] so singleton MCP
+/// servers are never live in both sessions at once (bd-vjfol).
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn create_agent_session_deferred_mcp(
     options: SessionOptions,
@@ -2163,26 +2385,13 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 Some(resolved_ext_policy.policy),
                 Some(resolved_repair_policy.effective_mode),
                 None,
+                crate::agent::ExtensionHostConfiguration {
+                    ui_handler: options.extension_ui_handler.clone(),
+                    persist_permission_decisions: options.persist_extension_permissions,
+                    cli_flags: options.extension_flags.clone(),
+                },
             )
             .await?;
-
-        // Bridge extension UI requests (capability prompts, pi.ui()) to the
-        // host application and apply the requested permission-persistence
-        // scope. Without a handler, extension UI requests keep failing
-        // closed exactly as before.
-        if let Some(manager) = agent_session
-            .extensions
-            .as_ref()
-            .map(ExtensionRegion::manager)
-        {
-            if let Some(handler) = options.extension_ui_handler.clone() {
-                manager.set_ui_handler(handler);
-            }
-            if !options.persist_extension_permissions {
-                manager.set_policy_prompt_persistence(false);
-            }
-            crate::extensions::apply_cli_flags(manager, &options.extension_flags).await?;
-        }
     }
 
     let mcp_manager = if let Some(mcp) = &options.mcp {
@@ -3188,6 +3397,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replacement_mcp_activation_requires_proven_predecessor_release() {
+        let no_predecessor_manager = SessionResourceShutdown::default();
+        assert!(no_predecessor_manager.permits_replacement_mcp_activation());
+
+        let mut released = SessionResourceShutdown::default();
+        released.mcp = McpShutdownOutcome::Released;
+        assert!(released.permits_replacement_mcp_activation());
+
+        let mut indeterminate = SessionResourceShutdown::default();
+        indeterminate.mcp = McpShutdownOutcome::Indeterminate;
+        indeterminate.fail(String::from("MCP shutdown timed out"));
+        assert!(!indeterminate.permits_replacement_mcp_activation());
+        assert!(!indeterminate.completed_cleanly());
+    }
+
+    #[test]
+    fn shutdown_skips_autosave_for_ephemeral_session() {
+        let tmp = tempdir().expect("tempdir");
+        let warnings = run_async(async {
+            let handle = create_agent_session(hermetic_session_options(tmp.path()))
+                .await
+                .expect("create session");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            {
+                let mut session = handle
+                    .session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("lock session");
+                session.set_autosave_durability_mode(
+                    crate::session::AutosaveDurabilityMode::Strict,
+                );
+                session.append_session_info(Some("ephemeral mutation".to_string()));
+            }
+            handle.shutdown_owned_resources().await
+        });
+
+        assert!(
+            warnings.is_empty(),
+            "ephemeral sessions have no persistence path and must not attempt autosave: {warnings:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_stops_background_jobs_owned_by_the_session() {
+        let tmp = tempdir().expect("tempdir");
+        let (warnings, session_id, job_id) = run_async(async {
+            let handle = create_agent_session(hermetic_session_options(tmp.path()))
+                .await
+                .expect("create session");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session_id = handle
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("lock session")
+                .header
+                .id
+                .clone();
+            let job = crate::jobs::spawn_background(
+                &session_id,
+                tmp.path(),
+                None,
+                None,
+                "sleep 300",
+                Some(300),
+                None,
+            )
+            .expect("spawn session-owned background job");
+            let warnings = handle.shutdown_owned_resources().await;
+            (warnings, session_id, job.id)
+        });
+
+        assert!(
+            warnings.is_empty(),
+            "clean session shutdown must not report warnings: {warnings:?}"
+        );
+        let jobs = crate::jobs::list(&session_id).expect("list session jobs");
+        assert!(jobs.iter().any(|job| {
+            job.id == job_id && job.status == crate::jobs::JobStatus::Killed.as_str()
+        }));
+        let _ = crate::jobs::take_completion_notices(&session_id);
+    }
+
     struct SdkRecordingUiHandler {
         prompts: Mutex<Vec<ExtensionUiRequest>>,
     }
@@ -3212,10 +3509,20 @@ mod tests {
     }
 
     #[test]
-    fn create_agent_session_wires_extension_ui_handler_and_permission_scope() {
+    fn create_agent_session_wires_extension_ui_handler_before_startup() {
         let tmp = tempdir().expect("tempdir");
         let ext_path = tmp.path().join("noop_ext.js");
-        std::fs::write(&ext_path, "export default function init() {}\n").expect("write extension");
+        std::fs::write(
+            &ext_path,
+            r#"
+export default function init(pi) {
+    pi.on("startup", async (_event, ctx) => {
+        await ctx.ui.confirm("Startup prompt", "Allow startup initialization?");
+    });
+}
+"#,
+        )
+        .expect("write extension");
 
         let handler = Arc::new(SdkRecordingUiHandler {
             prompts: Mutex::new(Vec::new()),
@@ -3234,6 +3541,20 @@ mod tests {
             "persist_extension_permissions: false must scope decisions to the session"
         );
 
+        {
+            let prompts = handler
+                .prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                prompts.len(),
+                1,
+                "the UI bridge must be installed before the startup hook runs"
+            );
+            assert_eq!(prompts[0].method, "confirm");
+            assert_eq!(prompts[0].payload["title"], "Startup prompt");
+        }
+
         let response = run_async(async {
             manager
                 .request_ui(ExtensionUiRequest::new(
@@ -3251,8 +3572,8 @@ mod tests {
             .prompts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(prompts.len(), 1, "handler must receive the UI request");
-        assert_eq!(prompts[0].method, "confirm");
+        assert_eq!(prompts.len(), 2, "handler must receive both UI requests");
+        assert_eq!(prompts[1].method, "confirm");
     }
 
     // =====================================================================

@@ -4,7 +4,9 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys, provider_metadata};
+use crate::provider_metadata::{
+    canonical_provider_id, provider_auth_env_keys, provider_ids_match, provider_metadata,
+};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -1269,6 +1271,26 @@ where
     Ok(())
 }
 
+fn extension_oauth_config_for_provider<'a>(
+    extension_configs: &'a HashMap<String, crate::models::OAuthConfig>,
+    provider: &str,
+) -> Result<Option<&'a crate::models::OAuthConfig>> {
+    let mut matches = extension_configs
+        .iter()
+        .filter(|(configured_provider, _)| provider_ids_match(configured_provider, provider));
+    let first = matches.next().map(|(_, config)| config);
+    if matches.next().is_some() {
+        return Err(Error::auth(format!(
+            "Multiple extension OAuth configurations resolve to provider {provider:?}"
+        )));
+    }
+    Ok(first)
+}
+
+fn oauth_refresh_provider_id(provider: &str) -> &str {
+    canonical_provider_id(provider).unwrap_or(provider)
+}
+
 impl AuthStorage {
     fn allow_external_provider_lookup(&self) -> bool {
         // External credential auto-detection is intended for Pi's global auth
@@ -1749,7 +1771,8 @@ impl AuthStorage {
 
         for (provider, access_token, refresh_token, stored_token_url, stored_client_id) in refreshes
         {
-            let result = match provider.as_str() {
+            let refresh_provider = oauth_refresh_provider_id(&provider);
+            let result = match refresh_provider {
                 "anthropic" => {
                     Box::pin(refresh_anthropic_oauth_token(client, &refresh_token)).await
                 }
@@ -1859,8 +1882,9 @@ impl AuthStorage {
             } = cred
             {
                 // Skip built-in providers (handled by refresh_expired_oauth_tokens_with_client).
+                let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
                 if matches!(
-                    provider.as_str(),
+                    canonical_provider,
                     "anthropic"
                         | "openai-codex"
                         | "google-gemini-cli"
@@ -1875,7 +1899,8 @@ impl AuthStorage {
                     continue;
                 }
                 if *expires <= proactive_deadline
-                    && let Some(config) = extension_configs.get(provider)
+                    && let Some(config) =
+                        extension_oauth_config_for_provider(extension_configs, provider)?
                 {
                     refreshes.push((provider.clone(), refresh_token.clone(), config.clone()));
                 }
@@ -7430,6 +7455,23 @@ mod tests {
     }
 
     #[test]
+    fn extension_oauth_config_lookup_normalizes_identity_and_rejects_ambiguity() {
+        assert_eq!(oauth_refresh_provider_id("Anthropic"), "anthropic");
+        assert_eq!(oauth_refresh_provider_id("KIMI-CODE"), "kimi-for-coding");
+
+        let mut configs = HashMap::from([("Acme".to_string(), sample_oauth_config())]);
+        let config = extension_oauth_config_for_provider(&configs, " acme ")
+            .expect("unambiguous lookup")
+            .expect("case-insensitive extension config");
+        assert_eq!(config.client_id, "ext-client-123");
+
+        configs.insert("acme".to_string(), sample_oauth_config());
+        let error = extension_oauth_config_for_provider(&configs, "ACME")
+            .expect_err("canonical duplicate configs must fail");
+        assert!(error.to_string().contains("Multiple extension OAuth"));
+    }
+
+    #[test]
     fn test_refresh_expired_extension_oauth_tokens_skips_anthropic() {
         // Verify that the extension refresh method skips "anthropic" (handled separately).
         let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
@@ -7444,7 +7486,7 @@ mod tests {
             let initial_access = next_token();
             let initial_refresh = next_token();
             auth.entries.insert(
-                "anthropic".to_string(),
+                "Anthropic".to_string(),
                 AuthCredential::OAuth {
                     extra: HashMap::new(),
                     access_token: initial_access.clone(),
@@ -7468,7 +7510,7 @@ mod tests {
             // Credential should remain unchanged.
             assert!(
                 matches!(
-                    auth.entries.get("anthropic"),
+                    auth.entries.get("Anthropic"),
                     Some(AuthCredential::OAuth { access_token, .. })
                         if access_token.eq(&initial_access)
                 ),
@@ -7581,7 +7623,7 @@ mod tests {
                 entries: HashMap::new(),
             };
             auth.entries.insert(
-                "my-ext".to_string(),
+                "acme".to_string(),
                 AuthCredential::OAuth {
                     extra: HashMap::new(),
                     // ubs:ignore test fixture credential, not live secret.
@@ -7602,7 +7644,7 @@ mod tests {
             config.token_url = token_url;
 
             let mut extension_configs = HashMap::new();
-            extension_configs.insert("my-ext".to_string(), config);
+            extension_configs.insert("Acme".to_string(), config);
 
             let client = crate::http::client::Client::new();
             auth.refresh_expired_extension_oauth_tokens(&client, &extension_configs)
@@ -7610,7 +7652,7 @@ mod tests {
                 .expect("refresh");
 
             let now = chrono::Utc::now().timestamp_millis();
-            match auth.entries.get("my-ext").expect("credential updated") {
+            match auth.entries.get("acme").expect("credential updated") {
                 AuthCredential::OAuth {
                     access_token,
                     refresh_token,
@@ -7627,7 +7669,7 @@ mod tests {
             }
 
             let reloaded = AuthStorage::load(auth_path).expect("reload");
-            match reloaded.get("my-ext").expect("persisted credential") {
+            match reloaded.get("acme").expect("persisted credential") {
                 AuthCredential::OAuth {
                     access_token,
                     refresh_token,
@@ -12195,6 +12237,55 @@ sso_region = us-east-1
     }
 
     // ── Lifecycle tests (bd-3uqg.7.6) ─────────────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn test_native_refresh_dispatches_mixed_case_alias_through_canonical_route() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let auth_path = dir.path().join("auth.json");
+            let token_response =
+                r#"{"access_token":"refreshed","refresh_token":"new-ref","expires_in":3600}"#;
+            let server_url = spawn_json_server(200, token_response);
+            let self_contained_client_id = "must-not-use-self-contained-route";
+
+            let mut auth = AuthStorage {
+                path: auth_path,
+                entries: HashMap::new(),
+            };
+            auth.entries.insert(
+                "KIMI-CODE".to_string(),
+                AuthCredential::OAuth {
+                    extra: HashMap::new(),
+                    // ubs:ignore test fixture credential, not live secret.
+                    access_token: "expired".to_string(),
+                    // ubs:ignore test fixture credential, not live secret.
+                    refresh_token: "old-ref".to_string(),
+                    expires: 0,
+                    token_url: Some(server_url),
+                    client_id: Some(self_contained_client_id.to_string()),
+                },
+            );
+
+            let client = crate::http::client::Client::new();
+            auth.refresh_expired_oauth_tokens_with_client(&client)
+                .await
+                .expect("canonical Kimi refresh route");
+
+            match auth.entries.get("KIMI-CODE").expect("credential updated") {
+                AuthCredential::OAuth {
+                    access_token,
+                    client_id,
+                    ..
+                } => {
+                    assert_eq!(access_token, "refreshed");
+                    assert_ne!(client_id.as_deref(), Some(self_contained_client_id));
+                }
+                other => unreachable!("unexpected credential variant: {other:?}"),
+            }
+        });
+    }
 
     #[test]
     fn test_proactive_refresh_triggers_within_window() {

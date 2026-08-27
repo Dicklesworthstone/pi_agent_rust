@@ -9,7 +9,7 @@ use crate::http::client::{Client, RequestBuilder};
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason, TextContent, Usage,
 };
-use crate::models::ModelEntry;
+use crate::models::{ModelEntry, extension_provider_bindings};
 use crate::provider::{Context, Provider, StreamEvent, StreamOptions};
 use crate::provider_metadata::{
     PROVIDER_METADATA, canonical_provider_id, provider_routing_defaults,
@@ -258,6 +258,62 @@ impl ProviderRouteKind {
             Self::ApiGoogleGenerativeAi => "api:google-generative-ai",
             Self::ApiGoogleGeminiCli => "api:google-gemini-cli",
         }
+    }
+}
+
+fn extension_provider_key(provider: &str) -> String {
+    provider.trim().to_ascii_lowercase()
+}
+
+fn extension_stream_simple_provider_id(
+    manager: &ExtensionManager,
+    requested_provider: &str,
+) -> Result<Option<String>> {
+    let requested_key = extension_provider_key(requested_provider);
+    if requested_key.is_empty() {
+        return Ok(None);
+    }
+
+    let provider_specs = manager.extension_providers();
+    extension_provider_bindings(&provider_specs)?;
+    let mut candidates = provider_specs
+        .into_iter()
+        .filter_map(|provider| {
+            let provider_id = provider.get("id")?.as_str()?.trim();
+            if extension_provider_key(provider_id) != requested_key {
+                return None;
+            }
+            let has_stream_simple = provider
+                .get("hasStreamSimple")
+                .and_then(Value::as_bool)
+                .or_else(|| provider.get("streamSimple").and_then(Value::as_bool))
+                .unwrap_or(false);
+            Some((provider_id.to_string(), has_stream_simple))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+
+    let mut provider_ids = candidates
+        .iter()
+        .map(|(provider_id, _)| provider_id.clone())
+        .collect::<Vec<_>>();
+    provider_ids.dedup();
+
+    match provider_ids.as_slice() {
+        [] => Ok(None),
+        [provider_id] => {
+            if candidates
+                .iter()
+                .any(|(_, has_stream_simple)| *has_stream_simple)
+            {
+                Ok(Some(provider_id.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Err(Error::config(format!(
+            "extension providers {provider_ids:?} resolve to the same normalized extension provider identity {requested_key:?}"
+        ))),
     }
 }
 
@@ -994,16 +1050,19 @@ pub fn create_provider(
     extensions: Option<&ExtensionManager>,
 ) -> Result<Arc<dyn Provider>> {
     if let Some(manager) = extensions
-        && manager.provider_has_stream_simple(&entry.model.provider)
+        && let Some(provider_id) =
+            extension_stream_simple_provider_id(manager, &entry.model.provider)?
     {
         let runtime = manager.runtime().ok_or_else(|| {
             Error::provider(
-                &entry.model.provider,
+                &provider_id,
                 "Extension runtime not configured for streamSimple provider",
             )
         })?;
+        let mut model = entry.model.clone();
+        model.provider = provider_id;
         return Ok(Arc::new(ExtensionStreamSimpleProvider::new(
-            entry.model.clone(),
+            model,
             runtime,
         )));
     }
@@ -1387,6 +1446,7 @@ mod tests {
     use crate::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
     use crate::extensions_js::PiJsRuntimeConfig;
     use crate::model::{ContentBlock, Message, UserContent, UserMessage};
+    use crate::models::{ModelRegistry, extension_provider_bindings};
     use crate::tools::ToolRegistry;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::time::{sleep, wall_now};
@@ -1587,6 +1647,27 @@ export default function init(pi) {
 }
 "#;
 
+    const MIXED_CASE_STREAM_SIMPLE_EXTENSION: &str = r#"
+export default function init(pi) {
+  pi.registerProvider("Acme", {
+    baseUrl: "https://extension.example.test",
+    api: "extension-mixed-case-api",
+    oauth: {
+      authUrl: "https://auth.example.test/authorize",
+      tokenUrl: "https://auth.example.test/token",
+      clientId: "mixed-case-client",
+      scopes: ["models:use"],
+      redirectUri: "http://127.0.0.1/oauth/callback",
+      clientSecret: "must-not-cross-the-provider-snapshot"
+    },
+    models: [],
+    streamSimple: async function* () {
+      yield "mixed-case-handler";
+    }
+  });
+}
+"#;
+
     const API_REGISTERED_PROVIDER_EXTENSION: &str = r#"
 import { createAssistantMessageEventStream, registerApiProvider } from "@earendil-works/pi-ai/compat";
 
@@ -1731,6 +1812,173 @@ export default function init(pi) {
             assert!(saw_start, "expected a Start event");
             assert!(saw_text_delta, "expected a TextDelta event");
         });
+    }
+
+    #[test]
+    fn manual_model_override_keeps_mixed_case_extension_stream_handler_reachable() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let (dir, manager) = load_extension(MIXED_CASE_STREAM_SIMPLE_EXTENSION, false).await;
+            let models_path = dir.path().join("models.json");
+            std::fs::write(
+                &models_path,
+                r#"{
+                    "providers": {
+                        " acme ": {
+                            "baseUrl": "https://manual.example.test",
+                            "api": "extension-mixed-case-api",
+                            "models": [{
+                                "id": " manual-chat ",
+                                "name": "Manual Chat",
+                                "contextWindow": 100,
+                                "maxTokens": 10,
+                                "input": ["text"]
+                            }]
+                        }
+                    }
+                }"#,
+            )
+            .expect("write models.json");
+
+            let mut registry =
+                ModelRegistry::load_with_credential_resolver(Some(models_path), |_| None);
+            assert!(registry.error().is_none(), "{:?}", registry.error());
+            let unmerged = registry
+                .find("acme", "manual-chat")
+                .expect("unmerged mixed-case model");
+            assert_eq!(unmerged.model.provider, "acme");
+            assert!(!manager.provider_has_stream_simple(&unmerged.model.provider));
+            let canonical_provider = create_provider(&unmerged, Some(&manager))
+                .expect("normalized provider identity should reach the extension handler");
+            assert_eq!(canonical_provider.name(), "Acme");
+
+            let provider_specs = manager.extension_providers();
+            let oauth_snapshot = provider_specs
+                .first()
+                .and_then(|provider| provider.get("oauth"))
+                .and_then(Value::as_object)
+                .expect("registered provider OAuth snapshot");
+            assert!(!oauth_snapshot.contains_key("clientSecret"));
+            let extension_bindings = extension_provider_bindings(&provider_specs)
+                .expect("parse extension provider bindings");
+            let extension_oauth = extension_bindings
+                .first()
+                .expect("registered extension provider")
+                .oauth_config
+                .as_ref()
+                .expect("JS provider OAuth metadata should reach the manager snapshot");
+            assert_eq!(
+                extension_oauth.auth_url,
+                "https://auth.example.test/authorize"
+            );
+            assert_eq!(
+                extension_oauth.token_url,
+                "https://auth.example.test/token"
+            );
+            assert_eq!(extension_oauth.client_id, "mixed-case-client");
+            assert_eq!(extension_oauth.scopes.len(), 1);
+            assert_eq!(
+                extension_oauth.scopes.first().map(String::as_str),
+                Some("models:use")
+            );
+            assert_eq!(
+                extension_oauth.redirect_uri.as_deref(),
+                Some("http://127.0.0.1/oauth/callback")
+            );
+            let extension_entries = manager.extension_model_entries();
+            assert!(extension_entries.is_empty());
+            registry
+                .merge_extension_registry(&extension_bindings, extension_entries)
+                .expect("merge extension models");
+
+            let entry = registry
+                .find("acme", "manual-chat")
+                .expect("merged mixed-case model");
+            assert_eq!(entry.model.provider, "Acme");
+            assert_eq!(entry.model.name, "Manual Chat");
+            assert_eq!(entry.model.base_url, "https://manual.example.test");
+            assert_eq!(
+                entry
+                    .oauth_config
+                    .as_ref()
+                    .expect("extension OAuth metadata should survive manual precedence")
+                    .client_id,
+                "mixed-case-client"
+            );
+            assert!(manager.provider_has_stream_simple(&entry.model.provider));
+
+            let provider = create_provider(&entry, Some(&manager)).expect("create provider");
+            let context = basic_context();
+            let options = basic_options();
+            let mut stream = provider
+                .stream(&context, &options)
+                .await
+                .expect("start extension stream");
+            let mut text = String::new();
+            while let Some(event) = stream.next().await {
+                if let StreamEvent::TextDelta { delta, .. } = event.expect("stream event") {
+                    text.push_str(&delta);
+                }
+            }
+            assert_eq!(text, "mixed-case-handler");
+        });
+    }
+
+    #[test]
+    fn provider_factory_rejects_canonical_extension_stream_handler_collisions() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(serde_json::json!({
+            "id": "Acme",
+            "hasStreamSimple": true,
+        }));
+        manager.register_provider(serde_json::json!({
+            "id": "acme",
+            "hasStreamSimple": true,
+        }));
+
+        let mut entry = ModelRegistry::load_with_credential_resolver(None, |_| None)
+            .find("openai", "gpt-4o")
+            .expect("built-in model template");
+        entry.model.provider = "acme".to_string();
+        let error = match create_provider(&entry, Some(&manager)) {
+            Ok(_) => panic!("canonical extension provider collision must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("normalized extension provider identity"),
+            "{error}"
+        );
+        assert!(error.contains("\"Acme\""), "{error}");
+        assert!(error.contains("\"acme\""), "{error}");
+    }
+
+    #[test]
+    fn extension_stream_handler_selection_preserves_declared_builtin_aliases() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(serde_json::json!({
+            "id": "azure",
+            "hasStreamSimple": true,
+        }));
+        manager.register_provider(serde_json::json!({
+            "id": "azure-openai",
+            "hasStreamSimple": true,
+        }));
+
+        assert_eq!(
+            extension_stream_simple_provider_id(&manager, "azure")
+                .expect("valid extension provider snapshot")
+                .as_deref(),
+            Some("azure")
+        );
+        assert_eq!(
+            extension_stream_simple_provider_id(&manager, "azure-openai")
+                .expect("valid extension provider snapshot")
+                .as_deref(),
+            Some("azure-openai")
+        );
     }
 
     #[test]
