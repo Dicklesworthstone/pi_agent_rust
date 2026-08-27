@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
 use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
-use fs4::FileExt as _;
+use fs4::fs_std::FileExt as _;
 use fsqlite::SqliteValue as Value;
 use serde::Deserialize;
 use std::borrow::Borrow;
@@ -350,8 +350,7 @@ impl SessionIndex {
         let Ok(current_generation) = load_session_namespace_generation(self.sessions_root()) else {
             return true;
         };
-        current_generation != last_scan_generation
-            || epoch_ms_is_stale(last_sync_epoch_ms, max_age)
+        current_generation != last_scan_generation || epoch_ms_is_stale(last_sync_epoch_ms, max_age)
     }
 
     /// Reindex the session database if the index is stale.
@@ -551,13 +550,7 @@ impl SessionIndex {
         let generation = load_session_namespace_generation(self.sessions_root())?;
         self.with_lock(|conn| {
             init_schema(conn)?;
-            apply_refresh_changes_on_conn(
-                conn,
-                refreshed,
-                pruned_paths,
-                scan_complete,
-                generation,
-            )
+            apply_refresh_changes_on_conn(conn, refreshed, pruned_paths, scan_complete, generation)
         })
     }
 
@@ -627,13 +620,7 @@ pub(crate) fn enqueue_session_index_snapshot_update(
 
     let index = SessionIndex::for_sessions_root(&sessions_root);
     let result = if let Some(generation) = generation {
-        index.index_session_snapshot_at_generation(
-            &path,
-            &header,
-            message_count,
-            name,
-            generation,
-        )
+        index.index_session_snapshot_at_generation(&path, &header, message_count, name, generation)
     } else {
         let meta = session_file_stats(&path).map(|(last_modified_ms, size_bytes)| SessionMeta {
             path: path.display().to_string(),
@@ -736,10 +723,7 @@ fn store_scan_generation(conn: &SqliteConnection, generation: u64) -> Result<()>
     Ok(())
 }
 
-fn accept_namespace_generation_if_complete(
-    conn: &SqliteConnection,
-    generation: u64,
-) -> Result<()> {
+fn accept_namespace_generation_if_complete(conn: &SqliteConnection, generation: u64) -> Result<()> {
     if load_last_sync_epoch_ms(conn)?.is_some() {
         let Some(current) = load_last_scan_generation(conn)? else {
             return record_scan_completeness(conn, false, generation);
@@ -789,7 +773,10 @@ fn note_session_namespace_change(sessions_root: &Path) -> Result<u64> {
     generation.lock_exclusive()?;
     generation.write_all(b"\n")?;
     generation.sync_data()?;
-    generation.metadata().map(|metadata| metadata.len()).map_err(Into::into)
+    generation
+        .metadata()
+        .map(|metadata| metadata.len())
+        .map_err(Into::into)
 }
 
 fn sqlite_i64_from_u64(field: &str, value: u64) -> Result<i64> {
@@ -849,9 +836,7 @@ fn row_to_meta(row: &fsqlite::Row) -> Result<SessionMeta> {
     })
 }
 
-fn load_indexed_sessions_by_path(
-    conn: &SqliteConnection,
-) -> Result<HashMap<PathBuf, SessionMeta>> {
+fn load_indexed_sessions_by_path(conn: &SqliteConnection) -> Result<HashMap<PathBuf, SessionMeta>> {
     let rows = conn
         .query_sync(
             "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
@@ -1602,8 +1587,7 @@ mod tests {
 
     #[test]
     fn reindex_all_holds_index_lock_across_scan_and_replacement() {
-        let harness =
-            TestHarness::new("reindex_all_holds_index_lock_across_scan_and_replacement");
+        let harness = TestHarness::new("reindex_all_holds_index_lock_across_scan_and_replacement");
         let root = harness.temp_path("sessions");
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create dirs");
@@ -1759,8 +1743,7 @@ mod tests {
             &make_header("id-good", "cwd-good"),
             &[make_user_entry(None, "m1", "valid")],
         );
-        fs::write(project_dir.join("bad.jsonl"), "not-json\n")
-            .expect("write invalid session");
+        fs::write(project_dir.join("bad.jsonl"), "not-json\n").expect("write invalid session");
 
         index.reindex_all().expect("partial metadata rebuild");
         let listed = index.list_sessions(None).expect("list rebuilt sessions");
@@ -2465,10 +2448,8 @@ mod tests {
         assert_eq!(first.refreshed_files, 1);
         assert_eq!(first.reused_files, 0);
 
-        let indexed_mtime = index
-            .list_sessions(None)
-            .expect("list indexed session")[0]
-            .last_modified_ms;
+        let indexed_mtime =
+            index.list_sessions(None).expect("list indexed session")[0].last_modified_ms;
         index
             .with_lock(move |conn| {
                 conn.execute_sync(
@@ -2532,7 +2513,10 @@ mod tests {
         assert_eq!(refreshed.failed_files, 1);
         assert_eq!(refreshed.pruned_rows, 1);
         assert!(
-            index.list_sessions(None).expect("list after failure").is_empty(),
+            index
+                .list_sessions(None)
+                .expect("list after failure")
+                .is_empty(),
             "derived metadata from the old header must not survive corruption"
         );
         assert!(
@@ -2574,11 +2558,7 @@ mod tests {
 
         let path = project_dir.join("session.jsonl");
         let header = make_header("id-direct-repair", "cwd-direct-repair");
-        write_session_jsonl(
-            &path,
-            &header,
-            &[make_user_entry(None, "m1", "initial")],
-        );
+        write_session_jsonl(&path, &header, &[make_user_entry(None, "m1", "initial")]);
         index.refresh_incremental().expect("complete initial scan");
         assert!(!index.should_reindex(Duration::from_secs(3600)));
 
@@ -2593,8 +2573,7 @@ mod tests {
 
     #[test]
     fn later_success_cannot_acknowledge_past_a_failed_generation() {
-        let harness =
-            TestHarness::new("later_success_cannot_acknowledge_past_a_failed_generation");
+        let harness = TestHarness::new("later_success_cannot_acknowledge_past_a_failed_generation");
         let root = harness.temp_path("sessions");
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create dirs");
@@ -2679,7 +2658,12 @@ mod tests {
         assert_eq!(summary.reused_files, 0);
         assert_eq!(summary.failed_files, 1);
         assert_eq!(summary.pruned_rows, 1);
-        assert!(index.list_sessions(None).expect("list after rewrite").is_empty());
+        assert!(
+            index
+                .list_sessions(None)
+                .expect("list after rewrite")
+                .is_empty()
+        );
         assert!(index.should_reindex(Duration::from_secs(3600)));
     }
 
@@ -2751,7 +2735,10 @@ mod tests {
         assert_eq!(refreshed.failed_files, 1);
         assert_eq!(refreshed.pruned_rows, 1);
         assert!(
-            index.list_sessions(None).expect("list after failure").is_empty(),
+            index
+                .list_sessions(None)
+                .expect("list after failure")
+                .is_empty(),
             "metadata that can no longer be tied to the current file must not remain selectable"
         );
         assert!(

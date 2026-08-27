@@ -20,15 +20,16 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(test, unix))]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use asupersync::sync::Notify;
+use asupersync::types::Time;
+use fs4::fs_std::FileExt as _;
 use futures::FutureExt;
-use fs4::FileExt as _;
 use serde::Serialize;
 
 use crate::error::{Error, Result};
@@ -655,8 +656,7 @@ fn monitor_panic_requested(owner_session_id: &str) -> bool {
     let hooks = spawn_background_test_hooks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    hooks.owner_session_id.as_deref() == Some(owner_session_id)
-        && hooks.panic_monitor_after_start
+    hooks.owner_session_id.as_deref() == Some(owner_session_id) && hooks.panic_monitor_after_start
 }
 
 fn now_ms() -> i64 {
@@ -732,9 +732,10 @@ fn ensure_session_accepting_jobs(owner_session_id: &str) -> Result<()> {
         return Ok(());
     };
     let can_reopen = state.active_attempts == 0
-        && !reg.jobs.values().any(|job| {
-            job.owner_session_id == owner_session_id && !job.status.settled()
-        });
+        && !reg
+            .jobs
+            .values()
+            .any(|job| job.owner_session_id == owner_session_id && !job.status.settled());
     if can_reopen {
         reg.closing_owners.remove(owner_session_id);
         remove_quiescent_owner_generation(&mut reg, owner_session_id);
@@ -760,15 +761,13 @@ impl Drop for SessionSpawnAttempt {
         let mut reg = registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let remove_counter = if let Some(count) = reg
-            .owner_spawns_in_flight
-            .get_mut(&self.owner_session_id)
-        {
-            *count = count.saturating_sub(1);
-            *count == 0
-        } else {
-            false
-        };
+        let remove_counter =
+            if let Some(count) = reg.owner_spawns_in_flight.get_mut(&self.owner_session_id) {
+                *count = count.saturating_sub(1);
+                *count == 0
+            } else {
+                false
+            };
         if remove_counter {
             reg.owner_spawns_in_flight.remove(&self.owner_session_id);
         }
@@ -952,9 +951,7 @@ fn is_managed_job_artifact_name(name: &OsStr) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn artifact_cleanup_candidates(
-    jobs_dir: &Path,
-) -> std::io::Result<Vec<ArtifactCleanupCandidate>> {
+fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactCleanupCandidate>> {
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir(jobs_dir)? {
         let entry = entry?;
@@ -984,7 +981,7 @@ fn artifact_cleanup_candidates(
         let current = match std::fs::symlink_metadata(&path) {
             Ok(current) => current,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                fs4::FileExt::unlock(&artifact)?;
+                fs4::fs_std::FileExt::unlock(&artifact)?;
                 continue;
             }
             Err(err) => return Err(err),
@@ -993,10 +990,10 @@ fn artifact_cleanup_candidates(
             || !same_file_identity(&opened, &current)
             || !same_file_identity(&metadata, &current)
         {
-            fs4::FileExt::unlock(&artifact)?;
+            fs4::fs_std::FileExt::unlock(&artifact)?;
             continue;
         }
-        fs4::FileExt::unlock(&artifact)?;
+        fs4::fs_std::FileExt::unlock(&artifact)?;
         let modified = opened.modified()?;
         candidates.push(ArtifactCleanupCandidate {
             path,
@@ -1040,7 +1037,7 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
     let current = match std::fs::symlink_metadata(&candidate.path) {
         Ok(current) => current,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs4::FileExt::unlock(&artifact)?;
+            fs4::fs_std::FileExt::unlock(&artifact)?;
             return Ok(None);
         }
         Err(err) => return Err(err),
@@ -1049,12 +1046,12 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         || !same_file_identity(&before, &current)
         || !same_file_identity(&opened, &current)
     {
-        fs4::FileExt::unlock(&artifact)?;
+        fs4::fs_std::FileExt::unlock(&artifact)?;
         return Ok(None);
     }
     let removed_bytes = opened.len();
     let remove_result = std::fs::remove_file(&candidate.path);
-    fs4::FileExt::unlock(&artifact)?;
+    fs4::fs_std::FileExt::unlock(&artifact)?;
     remove_result?;
     Ok(Some(removed_bytes))
 }
@@ -1089,7 +1086,7 @@ fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
                     )));
                 }
                 match artifact.try_lock_exclusive() {
-                    Ok(()) => fs4::FileExt::unlock(&artifact)?,
+                    Ok(()) => fs4::fs_std::FileExt::unlock(&artifact)?,
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         bytes = bytes.saturating_add(
                             u64::try_from(MAX_ARTIFACT_BYTES)
@@ -1122,8 +1119,13 @@ fn enforce_artifact_retention(
     max_entries: usize,
     min_retained: usize,
 ) -> Result<ArtifactCleanupOutcome> {
-    let (mut stored_bytes, mut stored_entries) = artifact_directory_usage(jobs_dir)
-        .map_err(|err| Error::tool("bash", format!("Failed to inspect jobs artifact dir: {err}")))?;
+    let (mut stored_bytes, mut stored_entries) =
+        artifact_directory_usage(jobs_dir).map_err(|err| {
+            Error::tool(
+                "bash",
+                format!("Failed to inspect jobs artifact dir: {err}"),
+            )
+        })?;
     let mut outcome = ArtifactCleanupOutcome {
         policy: policy.as_str().to_string(),
         removed_files: 0,
@@ -1158,8 +1160,7 @@ fn enforce_artifact_retention(
                 stored_bytes = stored_bytes.saturating_sub(removed_bytes);
                 stored_entries = stored_entries.saturating_sub(1);
                 outcome.removed_files = outcome.removed_files.saturating_add(1);
-                outcome.reclaimed_bytes =
-                    outcome.reclaimed_bytes.saturating_add(removed_bytes);
+                outcome.reclaimed_bytes = outcome.reclaimed_bytes.saturating_add(removed_bytes);
             }
         }
     }
@@ -1182,11 +1183,7 @@ fn enforce_artifact_retention(
 }
 
 #[cfg(test)]
-fn ensure_artifact_budget(
-    jobs_dir: &Path,
-    max_bytes: u64,
-    max_entries: usize,
-) -> Result<()> {
+fn ensure_artifact_budget(jobs_dir: &Path, max_bytes: u64, max_entries: usize) -> Result<()> {
     enforce_artifact_retention(
         jobs_dir,
         ArtifactRetentionPolicy::Preserve,
@@ -1487,18 +1484,14 @@ pub fn spawn_background(
         MIN_RETAINED_ARTIFACT_FILES,
     )?;
     let cleanup_failure_context = artifact_cleanup.setup_failure_context();
-    let (artifact_path, artifact) = create_job_artifact(&jobs_dir, &id)
-        .map_err(|e| {
-            Error::tool(
-                "bash",
-                format!("Failed to create job artifact: {e}{cleanup_failure_context}"),
-            )
-        })?;
+    let (artifact_path, artifact) = create_job_artifact(&jobs_dir, &id).map_err(|e| {
+        Error::tool(
+            "bash",
+            format!("Failed to create job artifact: {e}{cleanup_failure_context}"),
+        )
+    })?;
     drop(artifact_budget_lock);
-    let artifact = Arc::new(Mutex::new(ArtifactSink::new(
-        artifact,
-        MAX_ARTIFACT_BYTES,
-    )));
+    let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact, MAX_ARTIFACT_BYTES)));
     let tail = Arc::new(Mutex::new(TailBuffer::new(OUTPUT_TAIL_BYTES)));
     let output_sealed = Arc::new(AtomicBool::new(false));
     let settled_snapshot = Arc::new(Mutex::new(None));
@@ -1512,20 +1505,14 @@ pub fn spawn_background(
     // path cannot create a child after its session begins closing.
     #[cfg(test)]
     invoke_before_os_spawn_hook(owner_session_id);
-    ensure_session_spawn_generation(owner_session_id, spawn_generation).map_err(|err| {
+    ensure_session_spawn_generation(owner_session_id, spawn_generation)
+        .map_err(|err| Error::tool("jobs", format!("{err}{cleanup_failure_context}")))?;
+    let mut child = cmd.spawn().map_err(|e| {
         Error::tool(
-            "jobs",
-            format!("{err}{cleanup_failure_context}"),
+            "bash",
+            format!("Failed to spawn shell: {e}{cleanup_failure_context}"),
         )
     })?;
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| {
-            Error::tool(
-                "bash",
-                format!("Failed to spawn shell: {e}{cleanup_failure_context}"),
-            )
-        })?;
     if !crate::tools::attach_child_job_discipline(&child) {
         crate::tools::kill_process_group_tree(Some(child.id()));
         let _ = child.kill();
@@ -1543,22 +1530,12 @@ pub fn spawn_background(
         .child
         .as_mut()
         .and_then(|child| child.stdout.take())
-        .ok_or_else(|| {
-            Error::tool(
-                "bash",
-                format!("Missing stdout{cleanup_failure_context}"),
-            )
-        })?;
+        .ok_or_else(|| Error::tool("bash", format!("Missing stdout{cleanup_failure_context}")))?;
     let stderr = child
         .child
         .as_mut()
         .and_then(|child| child.stderr.take())
-        .ok_or_else(|| {
-            Error::tool(
-                "bash",
-                format!("Missing stderr{cleanup_failure_context}"),
-            )
-        })?;
+        .ok_or_else(|| Error::tool("bash", format!("Missing stderr{cleanup_failure_context}")))?;
     prepare_job_stream(&stdout).map_err(|err| {
         Error::tool(
             "bash",
@@ -1580,14 +1557,7 @@ pub fn spawn_background(
     let stdout_sealed = Arc::clone(&output_sealed);
     let stdout_pump = std::thread::Builder::new()
         .name(format!("pi-job-{id}-stdout"))
-        .spawn(move || {
-            pump_job_stream(
-                stdout,
-                &stdout_artifact,
-                &stdout_tail,
-                &stdout_sealed,
-            )
-        })
+        .spawn(move || pump_job_stream(stdout, &stdout_artifact, &stdout_tail, &stdout_sealed))
         .map_err(|err| {
             Error::tool(
                 "bash",
@@ -1599,24 +1569,14 @@ pub fn spawn_background(
     let stderr_sealed = Arc::clone(&output_sealed);
     let stderr_pump = match std::thread::Builder::new()
         .name(format!("pi-job-{id}-stderr"))
-        .spawn(move || {
-            pump_job_stream(
-                stderr,
-                &stderr_artifact,
-                &stderr_tail,
-                &stderr_sealed,
-            )
-        })
+        .spawn(move || pump_job_stream(stderr, &stderr_artifact, &stderr_tail, &stderr_sealed))
     {
         Ok(handle) => handle,
         Err(err) => {
             child.kill_and_wait();
             output_sealed.store(true, Ordering::Release);
             let mut stdout_pump = Some(stdout_pump);
-            let _ = finish_pump(
-                &mut stdout_pump,
-                Instant::now() + OUTPUT_DRAIN_GRACE,
-            );
+            let _ = finish_pump(&mut stdout_pump, Instant::now() + OUTPUT_DRAIN_GRACE);
             return Err(Error::tool(
                 "bash",
                 format!("Failed to start job stderr pump: {err}{cleanup_failure_context}"),
@@ -1883,9 +1843,7 @@ impl Drop for MonitorResources {
 
 fn last_chars(text: &str, cap: usize) -> String {
     let char_count = text.chars().count();
-    text.chars()
-        .skip(char_count.saturating_sub(cap))
-        .collect()
+    text.chars().skip(char_count.saturating_sub(cap)).collect()
 }
 
 fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
@@ -2001,9 +1959,8 @@ fn monitor_job(
         && let Ok(mut artifact) = resources.artifact.try_lock()
         && artifact.write_error.is_none()
     {
-        artifact.write_error = Some(
-            "output pump did not stop after the bounded cancellation deadline".to_string(),
-        );
+        artifact.write_error =
+            Some("output pump did not stop after the bounded cancellation deadline".to_string());
     }
     if output_complete {
         resources
@@ -2076,14 +2033,17 @@ fn settle_job(
         let reg = registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reg.jobs.get(id).filter(|job| !job.status.settled()).map(|job| {
-            let mut source = JobSnapshotSource::from_entry(job);
-            source.status = status;
-            source.exit_code = exit_code;
-            source.pid = None;
-            source.output_complete = output_complete;
-            source
-        })
+        reg.jobs
+            .get(id)
+            .filter(|job| !job.status.settled())
+            .map(|job| {
+                let mut source = JobSnapshotSource::from_entry(job);
+                source.status = status;
+                source.exit_code = exit_code;
+                source.pid = None;
+                source.output_complete = output_complete;
+                source
+            })
     };
     let Some(source) = source else {
         return;
@@ -2126,8 +2086,7 @@ fn settle_job(
         job.process_live = false;
         job.output_complete = output_complete;
         job.settled_sequence = Some(settled_sequence);
-        *job
-            .settled_snapshot
+        *job.settled_snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
         let notify = Arc::clone(&job.settled_notify);
@@ -2159,12 +2118,7 @@ fn prune_settled_jobs(reg: &mut JobRegistry) {
         let remove_count = settled
             .len()
             .saturating_sub(MAX_RETAINED_SETTLED_JOBS_PER_SESSION);
-        remove_ids.extend(
-            settled
-                .iter()
-                .take(remove_count)
-                .map(|(_, id)| id.clone()),
-        );
+        remove_ids.extend(settled.iter().take(remove_count).map(|(_, id)| id.clone()));
     }
     for id in remove_ids {
         reg.jobs.remove(&id);
@@ -2206,11 +2160,7 @@ pub fn list(owner_session_id: &str) -> Result<Vec<JobSnapshot>> {
                 .try_lock()
                 .ok()
                 .and_then(|snapshot| snapshot.clone());
-            (
-                job.sequence,
-                settled,
-                JobSnapshotSource::from_entry(job),
-            )
+            (job.sequence, settled, JobSnapshotSource::from_entry(job))
         })
         .collect();
     sources.sort_by_key(|(sequence, _, _)| *sequence);
@@ -2341,7 +2291,7 @@ async fn wait_async_with_slice(
         .cx()
         .timer_driver()
         .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-    let deadline = now.checked_add(timeout);
+    let deadline = now.saturating_add_nanos(timeout.as_nanos() as u64);
     loop {
         if let Some(snapshot) = settled_snapshot(&handle) {
             return Ok(snapshot);
@@ -2350,7 +2300,7 @@ async fn wait_async_with_slice(
             .cx()
             .timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        let Some(sleep_for) = remaining_wait_slice(now, deadline)
+        let Some(sleep_for) = remaining_wait_slice_at(now, Some(deadline))
             .map(|sleep_for| sleep_for.min(max_wait_slice))
         else {
             return snapshot_now_best_effort(&handle);
@@ -2368,6 +2318,19 @@ async fn wait_async_with_slice(
                     return Ok(snapshot);
                 }
             }
+        }
+    }
+
+    /// Time-based variant of [`remaining_wait_slice`] for timer-driver
+    /// deadlines (bd-9zmyf wave fix-forward): asupersync `Time` has no
+    /// `checked_add`, and `duration_since` yields nanoseconds directly.
+    fn remaining_wait_slice_at(now: Time, deadline: Option<Time>) -> Option<Duration> {
+        match deadline {
+            Some(deadline) if now >= deadline => None,
+            Some(deadline) => {
+                Some(Duration::from_nanos(deadline.duration_since(now)).min(MAX_ASYNC_WAIT_SLICE))
+            }
+            None => Some(MAX_ASYNC_WAIT_SLICE),
         }
     }
 }
@@ -2700,9 +2663,10 @@ fn finish_session_shutdown_attempt(owner_session_id: &str, clear_when_safe: bool
         )
     })?;
     let last_attempt = state.active_attempts == 0;
-    let all_jobs_settled = !reg.jobs.values().any(|job| {
-        job.owner_session_id == owner_session_id && !job.status.settled()
-    });
+    let all_jobs_settled = !reg
+        .jobs
+        .values()
+        .any(|job| job.owner_session_id == owner_session_id && !job.status.settled());
     if clear_when_safe && last_attempt && all_jobs_settled {
         reg.closing_owners.remove(owner_session_id);
         remove_quiescent_owner_generation(&mut reg, owner_session_id);
@@ -3090,13 +3054,10 @@ mod tests {
     }
 
     fn temp_root() -> PathBuf {
-        static NEXT_ROOT: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "pi-jobs-test-{}-{sequence}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pi-jobs-test-{}-{sequence}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp root");
         dir
     }
@@ -3219,8 +3180,8 @@ mod tests {
             .expect("pipe-holder child");
         let stdout = child.stdout.take().expect("child stdout");
         prepare_job_stream(&stdout).expect("nonblocking child pipe");
-        let artifact_file = std::fs::File::create(temp.path().join("pump.log"))
-            .expect("pump artifact");
+        let artifact_file =
+            std::fs::File::create(temp.path().join("pump.log")).expect("pump artifact");
         let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact_file, 64)));
         let tail = Arc::new(Mutex::new(TailBuffer::new(64)));
         let sealed = Arc::new(AtomicBool::new(false));
@@ -3300,7 +3261,11 @@ mod tests {
         std::fs::write(temp.path().join("one.log"), b"12345").expect("first artifact");
         let bytes_error = ensure_artifact_budget(temp.path(), 4, 10)
             .expect_err("stored bytes above the budget must refuse new jobs");
-        assert!(bytes_error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
+        assert!(
+            bytes_error
+                .to_string()
+                .contains("PI_JOBS_ARTIFACT_CAPACITY")
+        );
 
         std::fs::write(temp.path().join("two.log"), b"").expect("second artifact");
         let entries_error = ensure_artifact_budget(temp.path(), u64::MAX, 2)
@@ -3331,7 +3296,7 @@ mod tests {
         let error = ensure_artifact_budget(temp.path(), two_job_budget - 1, 10)
             .expect_err("live artifact plus prospective job must reserve two full caps");
         assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
-        fs4::FileExt::unlock(&live).expect("release live artifact reservation");
+        fs4::fs_std::FileExt::unlock(&live).expect("release live artifact reservation");
     }
 
     #[test]
@@ -3346,8 +3311,7 @@ mod tests {
             ArtifactRetentionPolicy::Preserve
         );
         assert_eq!(
-            ArtifactRetentionPolicy::from_value(Some(OsStr::new("ROTATE")))
-                .expect("rotate policy"),
+            ArtifactRetentionPolicy::from_value(Some(OsStr::new("ROTATE"))).expect("rotate policy"),
             ArtifactRetentionPolicy::Rotate
         );
         let error = ArtifactRetentionPolicy::from_value(Some(OsStr::new("delete-all")))
@@ -3396,9 +3360,7 @@ mod tests {
     fn artifact_preservation_policy_never_removes_managed_files() {
         let _guard = process_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp
-            .path()
-            .join("job-00000000000000000000000000000000.log");
+        let path = temp.path().join("job-00000000000000000000000000000000.log");
         std::fs::write(&path, b"preserve-me").expect("artifact fixture");
         let error = enforce_artifact_retention(
             temp.path(),
@@ -3419,9 +3381,7 @@ mod tests {
     fn artifact_cleanup_candidate_identity_rejects_same_name_replacement() {
         let _guard = process_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp
-            .path()
-            .join("job-00000000000000000000000000000000.log");
+        let path = temp.path().join("job-00000000000000000000000000000000.log");
         std::fs::write(&path, b"old!").expect("old artifact");
         let candidate = artifact_cleanup_candidates(temp.path())
             .expect("candidate inventory")
@@ -3570,8 +3530,11 @@ mod tests {
         assert_eq!(outcome.reclaimed_bytes, 4);
         assert!(paths[0].exists(), "active artifact must be preserved");
         assert!(!paths[1].exists(), "oldest settled artifact rotates first");
-        assert!(paths[2].exists(), "newest settled artifact must be preserved");
-        fs4::FileExt::unlock(&active).expect("release active artifact");
+        assert!(
+            paths[2].exists(),
+            "newest settled artifact must be preserved"
+        );
+        fs4::fs_std::FileExt::unlock(&active).expect("release active artifact");
     }
 
     #[cfg(unix)]
@@ -3583,9 +3546,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let victim = temp.path().join("victim.txt");
         std::fs::write(&victim, b"preserve-me").expect("victim fixture");
-        let planted = temp
-            .path()
-            .join("job-00000000000000000000000000000000.log");
+        let planted = temp.path().join("job-00000000000000000000000000000000.log");
         symlink(&victim, &planted).expect("planted artifact symlink");
 
         let error = enforce_artifact_retention(
@@ -3621,8 +3582,7 @@ mod tests {
         let _lock = acquire_artifact_budget_lock(&jobs_dir).expect("child budget lock");
         match mode.as_str() {
             "holder" => {
-                std::fs::write(marker_dir.join("holder-acquired"), b"")
-                    .expect("holder marker");
+                std::fs::write(marker_dir.join("holder-acquired"), b"").expect("holder marker");
                 wait_for_path(&marker_dir.join("release-holder"), Duration::from_secs(5));
             }
             "probe" => {
@@ -3653,15 +3613,9 @@ mod tests {
         };
 
         let mut holder = spawn_child("holder");
-        wait_for_path(
-            &marker_dir.join("holder-acquired"),
-            Duration::from_secs(2),
-        );
+        wait_for_path(&marker_dir.join("holder-acquired"), Duration::from_secs(2));
         let mut probe = spawn_child("probe");
-        wait_for_path(
-            &marker_dir.join("probe-attempted"),
-            Duration::from_secs(2),
-        );
+        wait_for_path(&marker_dir.join("probe-attempted"), Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(100));
         let probe_was_blocked = !marker_dir.join("probe-acquired").exists();
         std::fs::write(marker_dir.join("release-holder"), b"").expect("release holder");
@@ -4087,7 +4041,10 @@ mod tests {
         gate.wait_until_entered();
         let pid = spawned_pid.load(Ordering::Acquire);
         assert_ne!(pid, 0, "post-spawn hook must observe the child pid");
-        assert!(process_exists(pid), "test child must be live before fencing");
+        assert!(
+            process_exists(pid),
+            "test child must be live before fencing"
+        );
         let attempt = SessionShutdownAttempt::begin(&owner).expect("publish shutdown fence");
         gate.release();
         let error = match spawn.join().expect("background spawn thread") {
@@ -4104,9 +4061,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
-            reg.jobs
-                .values()
-                .all(|job| job.owner_session_id != owner),
+            reg.jobs.values().all(|job| job.owner_session_id != owner),
             "rejected child must never enter the registry"
         );
         assert_eq!(reg.starting_jobs, starting_jobs_before);
@@ -4355,8 +4310,8 @@ mod tests {
             .jobs
             .insert(id.clone(), entry);
 
-        let error = request_cancel(TEST_SESSION_ID, &id)
-            .expect_err("reaped process must not be signalled");
+        let error =
+            request_cancel(TEST_SESSION_ID, &id).expect_err("reaped process must not be signalled");
         assert!(error.to_string().contains("PI_JOBS_NOT_RUNNING"));
         registry()
             .lock()
@@ -4371,8 +4326,8 @@ mod tests {
         let mut reg = JobRegistry::default();
         for index in 0..(MAX_RETAINED_SETTLED_JOBS_PER_SESSION + 3) {
             let id = format!("job-{index:03}");
-            let file = std::fs::File::create(temp.path().join(format!("{id}.log")))
-                .expect("artifact");
+            let file =
+                std::fs::File::create(temp.path().join(format!("{id}.log"))).expect("artifact");
             let mut artifact = ArtifactSink::new(file, 16);
             artifact.seal();
             reg.jobs.insert(
@@ -4419,12 +4374,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut reg = JobRegistry::default();
         let owner_a_id = "owner-a-job".to_string();
-        let mut owner_a = synthetic_entry(
-            &owner_a_id,
-            temp.path().join("owner-a.log"),
-            0,
-            false,
-        );
+        let mut owner_a = synthetic_entry(&owner_a_id, temp.path().join("owner-a.log"), 0, false);
         owner_a.owner_session_id = "owner-a".to_string();
         owner_a.status = JobStatus::Exited;
         owner_a.settled_sequence = Some(0);
@@ -4527,11 +4477,7 @@ mod tests {
         let mut reg = JobRegistry::default();
         enqueue_completion_notice(&mut reg, "owner-a", "owner-a-notice".to_string());
         for index in 0..=MAX_COMPLETION_NOTICES_PER_SESSION {
-            enqueue_completion_notice(
-                &mut reg,
-                "owner-b",
-                format!("owner-b-notice-{index}"),
-            );
+            enqueue_completion_notice(&mut reg, "owner-b", format!("owner-b-notice-{index}"));
         }
 
         assert_eq!(
@@ -4549,10 +4495,11 @@ mod tests {
                 .count(),
             MAX_COMPLETION_NOTICES_PER_SESSION
         );
-        assert!(reg
-            .notices
-            .iter()
-            .all(|notice| notice.text != "owner-b-notice-0"));
+        assert!(
+            reg.notices
+                .iter()
+                .all(|notice| notice.text != "owner-b-notice-0")
+        );
     }
 
     #[test]
@@ -4568,10 +4515,11 @@ mod tests {
 
         assert_eq!(reg.notices.len(), MAX_TOTAL_COMPLETION_NOTICES);
         assert!(reg.notices.iter().all(|notice| notice.text != "notice-0"));
-        assert!(reg
-            .notices
-            .iter()
-            .any(|notice| notice.text == format!("notice-{MAX_TOTAL_COMPLETION_NOTICES}")));
+        assert!(
+            reg.notices
+                .iter()
+                .any(|notice| notice.text == format!("notice-{MAX_TOTAL_COMPLETION_NOTICES}"))
+        );
     }
 
     #[test]
@@ -4599,8 +4547,8 @@ mod tests {
     #[test]
     fn saturated_restore_keeps_the_newest_per_owner_batch() {
         let mut reg = JobRegistry::default();
-        for index in MAX_COMPLETION_NOTICES_PER_SESSION
-            ..MAX_COMPLETION_NOTICES_PER_SESSION.saturating_mul(2)
+        for index in
+            MAX_COMPLETION_NOTICES_PER_SESSION..MAX_COMPLETION_NOTICES_PER_SESSION.saturating_mul(2)
         {
             enqueue_completion_notice(&mut reg, "owner-a", format!("notice-{index}"));
         }
@@ -4617,9 +4565,7 @@ mod tests {
         );
         assert_eq!(reg.notices.len(), MAX_COMPLETION_NOTICES_PER_SESSION);
         assert_eq!(
-            reg.notices
-                .front()
-                .map(|notice| notice.text.as_str()),
+            reg.notices.front().map(|notice| notice.text.as_str()),
             Some("notice-64")
         );
         assert_eq!(
@@ -4725,8 +4671,7 @@ mod tests {
             "the production spawn path must make both pipe readers cancellation-aware"
         );
         assert_eq!(snapshot.status, "running");
-        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
-            .expect("wait");
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10)).expect("wait");
         assert_eq!(settled.status, "exited");
         assert_eq!(settled.exit_code, Some(0));
         assert!(settled.output_tail.contains("job-output-marker"));
@@ -4845,8 +4790,7 @@ mod tests {
             .block_on(wait_async(TEST_SESSION_ID, &id, Duration::MAX))
             .expect("async settled wait");
         assert_eq!(async_snapshot.status, "exited");
-        let sync_snapshot =
-            wait(TEST_SESSION_ID, &id, Duration::MAX).expect("sync settled wait");
+        let sync_snapshot = wait(TEST_SESSION_ID, &id, Duration::MAX).expect("sync settled wait");
         assert_eq!(sync_snapshot.status, "exited");
 
         registry()
@@ -4911,8 +4855,7 @@ mod tests {
                 Duration::from_millis(5),
             )
             .fuse();
-            let observation =
-                asupersync::time::sleep(now, Duration::from_millis(30)).fuse();
+            let observation = asupersync::time::sleep(now, Duration::from_millis(30)).fuse();
             futures::pin_mut!(waiting, observation);
             matches!(
                 futures::future::select(waiting, observation).await,
@@ -4991,8 +4934,7 @@ mod tests {
     fn artifact_creation_failure_happens_before_process_spawn() {
         let _guard = process_test_guard();
         let root = temp_root();
-        std::fs::write(root.join("jobs"), "not a directory")
-            .expect("conflicting jobs path");
+        std::fs::write(root.join("jobs"), "not a directory").expect("conflicting jobs path");
         let marker = root.join("spawned-marker");
         let command = format!("printf ran > '{}'", marker.display());
 
@@ -5006,9 +4948,15 @@ mod tests {
             Some(&root),
         )
         .expect_err("artifact creation must fail");
-        assert!(err.to_string().contains("Failed to create jobs artifact dir"));
+        assert!(
+            err.to_string()
+                .contains("Failed to create jobs artifact dir")
+        );
         std::thread::sleep(Duration::from_millis(100));
-        assert!(!marker.exists(), "process must not spawn before artifact setup");
+        assert!(
+            !marker.exists(),
+            "process must not spawn before artifact setup"
+        );
         assert_eq!(registry().lock().expect("registry").starting_jobs, 0);
     }
 
@@ -5028,8 +4976,8 @@ mod tests {
         .expect("spawn");
         wait_for_output(&snapshot.id, "timeout-ready", Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(1200));
-        let during_grace = wait(TEST_SESSION_ID, &snapshot.id, Duration::ZERO)
-            .expect("snapshot during grace");
+        let during_grace =
+            wait(TEST_SESSION_ID, &snapshot.id, Duration::ZERO).expect("snapshot during grace");
         assert_eq!(during_grace.status, "running");
 
         let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(8))
@@ -5245,9 +5193,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
-            reg.jobs
-                .values()
-                .all(|job| job.owner_session_id != owner),
+            reg.jobs.values().all(|job| job.owner_session_id != owner),
             "a rejected monitor handoff must remove its published registry entry"
         );
         drop(reg);
@@ -5267,7 +5213,7 @@ mod tests {
         artifact
             .try_lock_exclusive()
             .expect("rejected job artifact lock must be released");
-        fs4::FileExt::unlock(&artifact).expect("release test artifact lock");
+        fs4::fs_std::FileExt::unlock(&artifact).expect("release test artifact lock");
 
         drop(descendant_cleanup);
     }
@@ -5335,8 +5281,8 @@ mod tests {
             0,
             "terminal publication must not leave detached pipe workers"
         );
-        let artifact_before = std::fs::read(&settled.artifact_path)
-            .expect("read artifact at terminal publication");
+        let artifact_before =
+            std::fs::read(&settled.artifact_path).expect("read artifact at terminal publication");
         std::fs::write(&late_write_trigger, b"").expect("release escaped late writer");
         std::thread::sleep(Duration::from_millis(200));
         let after_late_write = wait(TEST_SESSION_ID, &snapshot.id, Duration::ZERO)
@@ -5389,8 +5335,14 @@ mod tests {
             .into_iter()
             .map(|caller| caller.join().expect("spawn caller"))
             .collect();
-        let succeeded: Vec<_> = results.iter().filter_map(|result| result.as_ref().ok()).collect();
-        let rejected: Vec<_> = results.iter().filter_map(|result| result.as_ref().err()).collect();
+        let succeeded: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .collect();
+        let rejected: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
         assert_eq!(succeeded.len(), MAX_CONCURRENT_JOBS);
         assert_eq!(rejected.len(), 1);
         assert!(rejected[0].to_string().contains("PI_JOBS_AT_CAPACITY"));

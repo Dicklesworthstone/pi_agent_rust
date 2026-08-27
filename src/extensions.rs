@@ -18945,10 +18945,9 @@ async fn dispatch_hostcall_events_ref(
                 .or_else(|| payload.get("model_id").and_then(Value::as_str))
                 .map(ToString::to_string);
 
-            // Update in-memory cache on manager.
-            manager.set_current_model(provider.clone(), model_id.clone());
-
-            // Persist via session (creates ModelChangeEntry + updates header).
+            // Persist before updating the manager cache. The session bridge owns
+            // transition admission, so a stale action must not update cache state
+            // for a replacement Session after its durable mutation is rejected.
             let p = provider.unwrap_or_default();
             let m = model_id.unwrap_or_default();
             if let Some(session) = manager.session_handle()
@@ -18961,6 +18960,7 @@ async fn dispatch_hostcall_events_ref(
                     message: format!("setModel: session update failed: {err}"),
                 };
             }
+            manager.set_current_model((!p.is_empty()).then_some(p), (!m.is_empty()).then_some(m));
             HostcallOutcome::Success(Value::Null)
         }
         EventsHostcallOp::GetThinkingLevel => {
@@ -18980,10 +18980,8 @@ async fn dispatch_hostcall_events_ref(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
-            // Update in-memory cache on manager.
-            manager.set_current_thinking_level(level.clone());
-
-            // Persist via session (creates ThinkingLevelChangeEntry + updates header).
+            // As with model changes, update the cache only after the fenced
+            // session mutation succeeds.
             if let Some(session) = manager.session_handle()
                 && let Some(ref lvl) = level
                 && let Err(err) = session.set_thinking_level(lvl.clone()).await
@@ -18993,6 +18991,7 @@ async fn dispatch_hostcall_events_ref(
                     message: format!("setThinkingLevel: session update failed: {err}"),
                 };
             }
+            manager.set_current_thinking_level(level);
             HostcallOutcome::Success(Value::Null)
         }
         EventsHostcallOp::RegisterFlag => {

@@ -1039,7 +1039,7 @@ impl McpManager {
             Self::lock(&entry.tools_cache).take();
             return Err(err);
         }
-        if let Err(err) = Arc::clone(&transport).activate() {
+        if let Err(err) = Arc::clone(&transport).activate().await {
             transport.close().await;
             Self::record_failure(entry, &err);
             return Err(err);

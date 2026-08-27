@@ -34,14 +34,10 @@ impl ExcludedBashPersistenceOutcome {
             return None;
         };
 
-        let pending = pending_mutations.map_or_else(
-            || "unavailable".to_string(),
-            |count| count.to_string(),
-        );
-        let failed = failed_flushes.map_or_else(
-            || "unavailable".to_string(),
-            |count| count.to_string(),
-        );
+        let pending =
+            pending_mutations.map_or_else(|| "unavailable".to_string(), |count| count.to_string());
+        let failed =
+            failed_flushes.map_or_else(|| "unavailable".to_string(), |count| count.to_string());
         Some(format!(
             "[Persistence warning]\n\
 - Execution ended and may have performed side effects; do not rerun it to repair this save problem.\n\
@@ -2431,8 +2427,7 @@ impl PiApp {
                         let (initial_selected_id, branch_count, entry_count) =
                             match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                                 Ok(session_guard) => {
-                                    if session_guard.header.id.as_str()
-                                        != owner_session_id.as_str()
+                                    if session_guard.header.id.as_str() != owner_session_id.as_str()
                                     {
                                         return;
                                     }
@@ -2756,9 +2751,8 @@ impl PiApp {
                 match registered_extension_provider_bindings(self.extensions.as_ref()) {
                     Ok(bindings) => bindings,
                     Err(err) => {
-                        self.status_message = Some(format!(
-                            "Unable to load extension login providers: {err}"
-                        ));
+                        self.status_message =
+                            Some(format!("Unable to load extension login providers: {err}"));
                         return None;
                     }
                 };
@@ -3524,14 +3518,18 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 (String::new(), question)
             }
         };
-        let owner_session_id = match self.session.try_lock() {
-            Ok(session) => session.header.id.clone(),
-            Err(_) => {
-                self.status_message = Some("/btw unavailable: session is busy".to_string());
-                self.scroll_to_bottom();
-                return None;
-            }
+        // asupersync TryLockError carries the guard, so the match temporary
+        // would pin the immutable borrow across self mutations (bd-9x70g
+        // unblock). Extract an owned decision first, mutate after.
+        let (owner_session_id, session_busy) = match self.session.try_lock() {
+            Ok(session) => (session.header.id.clone(), false),
+            Err(_) => (String::new(), true),
         };
+        if session_busy {
+            self.status_message = Some("/btw unavailable: session is busy".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
             content: format!("(/btw) {question}"),
@@ -3566,14 +3564,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         owner_session_id: String,
         completion: pi::subagents::TanCompletion,
     ) -> PiMsg {
-        let card = pi::jobs::push_completion_notice(
-            &owner_session_id,
-            completion.follow_up_text(),
-        )
-        .map_or_else(
-            |err| format!("(/tan failed to queue follow-up)\n{err}"),
-            |()| completion.card_text(),
-        );
+        let card = pi::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
+            .map_or_else(
+                |err| format!("(/tan failed to queue follow-up)\n{err}"),
+                |()| completion.card_text(),
+            );
         PiMsg::SessionSystemNote {
             owner_session_id,
             message: card,
@@ -3623,14 +3618,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             TanGate::Enabled => {}
         }
 
-        let owner_session_id = match self.session.try_lock() {
-            Ok(session) => session.header.id.clone(),
-            Err(_) => {
-                self.status_message = Some("/tan unavailable: session is busy".to_string());
-                self.scroll_to_bottom();
-                return None;
-            }
+        // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
+        let (owner_session_id, session_busy) = match self.session.try_lock() {
+            Ok(session) => (session.header.id.clone(), false),
+            Err(_) => (String::new(), true),
         };
+        if session_busy {
+            self.status_message = Some("/tan unavailable: session is busy".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
 
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
             .with_role_model_spec(pi::app::subagent_role_spec(&self.config));
@@ -4665,23 +4662,21 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
 #[cfg(test)]
 mod tests {
+    use super::{AgentState, PendingInput, PendingLoginKind, PiApp, SlashCommand};
     use super::{
         ExcludedBashPersistenceOutcome, PiMsg, parse_bash_command, parse_extension_command,
         persist_excluded_bash_execution, should_show_startup_oauth_hint, spawn_bash_completion,
     };
-    use super::{AgentState, PendingInput, PendingLoginKind, PiApp, SlashCommand};
     use crate::agent::{Agent, AgentConfig, QueuedAgentMessage};
     use crate::auth::{AuthCredential, AuthStorage};
     use crate::config::Config;
     use crate::extensions::ExtensionManager;
     use crate::keybindings::KeyBindings;
-    use crate::model::{
-        Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage,
-    };
+    use crate::model::{Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage};
     use crate::models::{ExtensionProviderBinding, ModelEntry};
     use crate::package_manager::PackageManager;
-    use crate::provider::{InputType, Model, ModelCost};
     use crate::provider::{Context, Provider, StreamOptions};
+    use crate::provider::{InputType, Model, ModelCost};
     use crate::resources::{ResourceCliOptions, ResourceLoader};
     use crate::session::{Session, SessionEntry, SessionMessage};
     use crate::tools::ToolRegistry;
@@ -4785,16 +4780,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 1, "exactly one bash record must exist");
-        let (
-            command,
-            output,
-            exit_code,
-            cancelled,
-            truncated,
-            full_output_path,
-            timestamp,
-            extra,
-        ) = records[0];
+        let (command, output, exit_code, cancelled, truncated, full_output_path, timestamp, extra) =
+            records[0];
         assert_eq!(command, expected_command);
         assert_eq!(output, expected_output);
         assert_eq!(*exit_code, 0);
@@ -4803,7 +4790,9 @@ mod tests {
         assert!(full_output_path.is_none());
         match expected_timestamp_range {
             Some(range) => assert!(
-                timestamp.as_ref().is_some_and(|value| range.contains(value)),
+                timestamp
+                    .as_ref()
+                    .is_some_and(|value| range.contains(value)),
                 "bash timestamp {timestamp:?} must fall inside the submission window {range:?}"
             ),
             None => assert!(timestamp.is_none()),
@@ -4844,12 +4833,7 @@ mod tests {
         let reopened = runtime()
             .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
             .expect("reopen saved session");
-        assert_exact_excluded_bash_record(
-            &reopened,
-            "create-once",
-            "side effect completed",
-            None,
-        );
+        assert_exact_excluded_bash_record(&reopened, "create-once", "side effect completed", None);
     }
 
     #[test]
@@ -5143,7 +5127,10 @@ mod tests {
         };
         for expected in ["explicit-only", "project-only"] {
             assert!(
-                resources.skills().iter().any(|skill| skill.name == expected),
+                resources
+                    .skills()
+                    .iter()
+                    .any(|skill| skill.name == expected),
                 "trusted reload should include {expected}"
             );
         }
@@ -5185,10 +5172,7 @@ mod tests {
         };
         let expected_card = completion.card_text();
         let expected_follow_up = completion.follow_up_text();
-        let event = PiApp::completed_tan_event(
-            origin_session_id.clone(),
-            completion,
-        );
+        let event = PiApp::completed_tan_event(origin_session_id.clone(), completion);
         assert!(matches!(
             &event,
             PiMsg::SessionSystemNote {
@@ -5477,11 +5461,7 @@ mod tests {
 
         let command = "printf side-effect-output";
         let submitted_at = chrono::Utc::now().timestamp_millis();
-        let _ = app.submit_bash_command(
-            &format!("! {command}"),
-            command.to_string(),
-            true,
-        );
+        let _ = app.submit_bash_command(&format!("! {command}"), command.to_string(), true);
         assert!(
             app.bash_running,
             "command should be marked running until its result is handled"

@@ -1071,6 +1071,9 @@ struct RpcSessionTransitionSnapshot {
     session_id: String,
     leaf_id: Option<String>,
     entry_count: usize,
+    provider: Option<String>,
+    model_id: Option<String>,
+    thinking_level: Option<String>,
 }
 
 struct RpcSessionTransitionPermits {
@@ -1101,6 +1104,9 @@ async fn rpc_session_transition_snapshot(
         session_id: inner.header.id.clone(),
         leaf_id: inner.leaf_id().map(str::to_string),
         entry_count: inner.entries.len(),
+        provider: inner.header.provider.clone(),
+        model_id: inner.header.model_id.clone(),
+        thinking_level: inner.header.thinking_level.clone(),
     })
 }
 
@@ -1215,7 +1221,7 @@ async fn acquire_rpc_session_transition(
     let current = rpc_session_transition_snapshot(session, cx).await?;
     if current != *baseline {
         return Err(Error::session(
-            "session_before_switch modified the source Session; the transition was rejected so the accepted action remains owned by that Session",
+            "an accepted action modified the source Session while the transition was pending; the transition was rejected so the action remains owned by that Session",
         ));
     }
     Ok(RpcSessionTransitionPermits {
@@ -3792,6 +3798,7 @@ pub async fn run(
                                 Error::session(format!("inner session lock failed: {err}"))
                             })?;
                         *inner_session = new_session;
+                        session_transition_permit.commit_session_change();
                     }
                     guard.agent.clear_messages();
                     guard.agent.stream_options_mut().session_id = Some(session_id.clone());
@@ -3801,7 +3808,6 @@ pub async fn run(
                     guard.refresh_extension_completion_host_state();
                     state.clear_all_pending();
                     state.clear_failover_lifecycle();
-                    session_transition_permit.commit_session_change();
 
                     Ok((session_id, previous_session_file))
                 }
@@ -4009,6 +4015,7 @@ pub async fn run(
                             let previous_session_file =
                                 inner_session.path.as_ref().map(|p| p.display().to_string());
                             *inner_session = new_session;
+                            session_transition_permit.commit_session_change();
                             guard.agent.replace_messages(messages);
                             guard.agent.stream_options_mut().session_id = Some(session_id.clone());
                             guard.agent.reset_session_scoped_state(target_plan_mode);
@@ -4042,7 +4049,6 @@ pub async fn run(
                             }
                             state.clear_all_pending();
                             state.clear_failover_lifecycle();
-                            session_transition_permit.commit_session_change();
                             Ok((previous_session_file, session_id))
                         }
                         .await;
@@ -4249,6 +4255,7 @@ pub async fn run(
                             ));
                         }
                         *inner = new_session;
+                        session_transition_permit.commit_session_change();
                         drop(inner);
                         guard.agent.replace_messages(messages);
                         guard.agent.stream_options_mut().session_id = Some(session_id);
@@ -4280,7 +4287,6 @@ pub async fn run(
                         }
                         state.clear_all_pending();
                         state.clear_failover_lifecycle();
-                        session_transition_permit.commit_session_change();
                     }
 
                     Ok(selected_text)
@@ -9321,7 +9327,7 @@ mod retry_tests {
     }
 
     #[test]
-    fn rpc_new_session_rejects_real_js_hook_message_without_losing_source_action() {
+    fn rpc_new_session_rejects_real_js_hook_actions_without_cross_session_delivery() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -9335,11 +9341,26 @@ mod retry_tests {
                 r#"
                 export default function init(pi) {
                   pi.on("session_before_switch", async () => {
-                    await pi.sendMessage({
-                      customType: "hook-note",
-                      content: "belongs to source session",
+                    await pi.session("appendEntry", {
+                      customType: "direct-source-entry",
+                      data: { owner: "source" }
+                    });
+                    pi.sendMessage({
+                      customType: "immediate-note",
+                      content: "immediate source action",
                       display: true
                     }, {});
+                    pi.sendMessage({
+                      customType: "trigger-note",
+                      content: "queued trigger action",
+                      display: true
+                    }, { triggerTurn: true });
+                    pi.sendMessage({
+                      customType: "next-turn-note",
+                      content: "durable next-turn source action",
+                      display: true
+                    }, { deliverAs: "nextTurn" });
+                    pi.sendUserMessage("queued user action", {});
                   });
                 }
                 "#,
@@ -9348,7 +9369,7 @@ mod retry_tests {
 
             let provider = Arc::new(FlakyProvider::new());
             let agent = Agent::new(
-                provider,
+                Arc::clone(&provider),
                 ToolRegistry::new(&[], temp.path(), None),
                 AgentConfig::default(),
             );
@@ -9374,10 +9395,7 @@ mod retry_tests {
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
             let send_cx = asupersync::Cx::for_testing();
             in_tx
-                .send(
-                    &send_cx,
-                    r#"{"id":"1","type":"new_session"}"#.to_string(),
-                )
+                .send(&send_cx, r#"{"id":"1","type":"new_session"}"#.to_string())
                 .await
                 .expect("send new_session");
             drop(in_tx);
@@ -9392,31 +9410,162 @@ mod retry_tests {
                 .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
                 .find(|value| value["type"] == "response" && value["command"] == "new_session")
                 .expect("new_session response");
-            assert_eq!(response["success"], false, "unexpected response: {response}");
+            assert_eq!(
+                response["success"], false,
+                "unexpected response: {response}"
+            );
             assert!(
                 response["error"]
                     .as_str()
-                    .is_some_and(|error| error.contains("modified the source Session")),
+                    .is_some_and(|error| error.contains("extension-triggered action")),
                 "unexpected transition error: {response}"
             );
 
             let cx = AgentCx::for_request();
             let inner = inner_session.lock(&cx).await.expect("source session lock");
             assert_eq!(inner.header.id, original_session_id);
+            let durable_custom_types = inner
+                .entries_for_current_path()
+                .iter()
+                .filter_map(|entry| match entry {
+                    SessionEntry::Message(message) => match &message.message {
+                        SessionMessage::Custom { custom_type, .. } => Some(custom_type.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(durable_custom_types.len(), 2);
+            assert!(durable_custom_types.contains(&"immediate-note"));
+            assert!(durable_custom_types.contains(&"next-turn-note"));
+            assert!(!durable_custom_types.contains(&"trigger-note"));
             assert!(inner.entries_for_current_path().iter().any(|entry| {
                 matches!(
                     entry,
-                    SessionEntry::Message(message)
-                        if matches!(
-                            &message.message,
-                            SessionMessage::Custom {
-                                custom_type,
-                                content,
-                                ..
-                            } if custom_type == "hook-note" && content == "belongs to source session"
-                        )
+                    SessionEntry::Custom(custom)
+                        if custom.custom_type == "direct-source-entry"
+                            && custom.data == Some(json!({"owner": "source"}))
                 )
             }));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn rpc_new_session_cancelled_real_js_hook_keeps_actions_on_source_session() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let extension_path = temp.path().join("cancel-switch-owner.mjs");
+            std::fs::write(
+                &extension_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("session_before_switch", async () => {
+                    await pi.session("appendEntry", {
+                      customType: "cancel-direct-source-entry",
+                      data: { owner: "source" }
+                    });
+                    pi.sendMessage({
+                      customType: "cancel-immediate-note",
+                      content: "immediate cancelled action",
+                      display: true
+                    }, {});
+                    pi.sendMessage({
+                      customType: "cancel-trigger-note",
+                      content: "queued cancelled trigger action",
+                      display: true
+                    }, { triggerTurn: true });
+                    pi.sendMessage({
+                      customType: "cancel-next-turn-note",
+                      content: "durable cancelled next-turn action",
+                      display: true
+                    }, { deliverAs: "nextTurn" });
+                    pi.sendUserMessage("queued cancelled user action", {});
+                    return { cancelled: true };
+                  });
+                }
+                "#,
+            )
+            .expect("write cancelling transition extension");
+
+            let provider = Arc::new(FlakyProvider::new());
+            let agent = Agent::new(
+                Arc::clone(&provider),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+            let original_session_id = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("initial session lock")
+                .header
+                .id
+                .clone();
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            agent_session
+                .enable_extensions(&[], temp.path(), None, &[extension_path])
+                .await
+                .expect("enable cancelling transition extension");
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+            let send_cx = asupersync::Cx::for_testing();
+            in_tx
+                .send(&send_cx, r#"{"id":"1","type":"new_session"}"#.to_string())
+                .await
+                .expect("send cancelled new_session");
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+
+            run(agent_session, options, in_rx, out_tx)
+                .await
+                .expect("rpc server loop");
+
+            let response = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+                .find(|value| value["type"] == "response" && value["command"] == "new_session")
+                .expect("new_session response");
+            assert_eq!(response["success"], true, "unexpected response: {response}");
+            assert_eq!(response["data"]["cancelled"], true);
+
+            let cx = AgentCx::for_request();
+            let inner = inner_session.lock(&cx).await.expect("source session lock");
+            assert_eq!(inner.header.id, original_session_id);
+            let durable_custom_types = inner
+                .entries_for_current_path()
+                .iter()
+                .filter_map(|entry| match entry {
+                    SessionEntry::Message(message) => match &message.message {
+                        SessionMessage::Custom { custom_type, .. } => Some(custom_type.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(durable_custom_types.len(), 2);
+            assert!(durable_custom_types.contains(&"cancel-immediate-note"));
+            assert!(durable_custom_types.contains(&"cancel-next-turn-note"));
+            assert!(!durable_custom_types.contains(&"cancel-trigger-note"));
+            assert!(inner.entries_for_current_path().iter().any(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Custom(custom)
+                        if custom.custom_type == "cancel-direct-source-entry"
+                            && custom.data == Some(json!({"owner": "source"}))
+                )
+            }));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         });
     }
 
@@ -15017,6 +15166,65 @@ export default function init(pi) {
                     SessionEntry::Custom(custom) if custom.custom_type == "hook-action"
                 )
             }));
+        });
+    }
+
+    #[test]
+    fn post_hook_transition_recheck_rejects_header_only_source_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let mut source = Session::in_memory();
+            source.append_model_change("test-provider".to_string(), "test-model".to_string());
+            source.set_model_header(
+                Some("stale-provider".to_string()),
+                Some("stale-model".to_string()),
+                None,
+            );
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                source,
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let bash_state = Arc::new(asupersync::sync::Mutex::new(None));
+            let cx = AgentCx::for_request();
+            let baseline = rpc_session_transition_snapshot(&session, &cx)
+                .await
+                .expect("transition baseline");
+            {
+                let guard = session.lock(&cx).await.expect("agent session lock");
+                let mut inner = guard.session.lock(&cx).await.expect("inner session lock");
+                inner.set_model_header(
+                    Some("test-provider".to_string()),
+                    Some("test-model".to_string()),
+                    None,
+                );
+                assert_eq!(inner.entries.len(), baseline.entry_count);
+                assert_eq!(inner.leaf_id(), baseline.leaf_id.as_deref());
+            }
+
+            let err = match acquire_rpc_session_transition(
+                &baseline,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                &std::sync::Mutex::new(()),
+                &session,
+                &shared_state,
+                &bash_state,
+                &cx,
+            )
+            .await
+            {
+                Ok(_) => panic!("header-only source mutation must reject the transition"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("modified the source Session"),
+                "unexpected transition error: {err}"
+            );
         });
     }
 

@@ -19,6 +19,11 @@ pub struct SseEvent {
     pub data: String,
     /// Last event ID (from "id:" field).
     pub id: Option<String>,
+    /// Whether this event itself contained an `id:` field. The SSE protocol
+    /// carries the last ID forward to later events, so consumers that use IDs
+    /// as replay checkpoints must distinguish an explicit checkpoint from an
+    /// inherited value.
+    pub id_was_explicit: bool,
     /// Retry interval hint in milliseconds (from "retry:" field).
     pub retry: Option<u64>,
 }
@@ -29,6 +34,7 @@ impl Default for SseEvent {
             event: Cow::Borrowed("message"),
             data: String::new(),
             id: None,
+            id_was_explicit: false,
             retry: None,
         }
     }
@@ -173,6 +179,7 @@ impl SseParser {
                 "data" => Self::append_data_line(current, value, has_data, max_event_data_bytes),
                 "id" if !value.contains('\0') => {
                     current.id = Some(value.to_string());
+                    current.id_was_explicit = true;
                 }
                 "retry" => current.retry = Self::parse_retry(value),
                 _ => {} // Unknown field - ignore
@@ -182,7 +189,10 @@ impl SseParser {
             match line {
                 "event" => current.event = Cow::Borrowed(""),
                 "data" => Self::append_data_line(current, "", has_data, max_event_data_bytes),
-                "id" => current.id = Some(String::new()),
+                "id" => {
+                    current.id = Some(String::new());
+                    current.id_was_explicit = true;
+                }
                 _ => {}
             }
         }
@@ -192,6 +202,7 @@ impl SseParser {
     fn reset_current_for_next_event(current: &mut SseEvent) {
         current.event = Cow::Borrowed("message");
         current.data.clear();
+        current.id_was_explicit = false;
     }
 
     #[inline]
@@ -969,6 +980,7 @@ mod tests {
         let events = parser.feed("id: 123\ndata: test\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, Some("123".to_string()));
+        assert!(events[0].id_was_explicit);
         assert_eq!(events[0].data, "test");
     }
 
@@ -979,7 +991,19 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].id.as_deref(), Some("123"));
         assert_eq!(events[1].id.as_deref(), Some("123"));
+        assert!(events[0].id_was_explicit);
+        assert!(!events[1].id_was_explicit);
         assert_eq!(events[1].data, "second");
+    }
+
+    #[test]
+    fn test_id_only_block_is_inherited_but_not_explicit_on_next_event() {
+        let mut parser = SseParser::new();
+        let events = parser.feed("id: 123\n\ndata: later\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id.as_deref(), Some("123"));
+        assert!(!events[0].id_was_explicit);
+        assert_eq!(events[0].data, "later");
     }
 
     #[test]

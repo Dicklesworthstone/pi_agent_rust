@@ -8,7 +8,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use chrono::{DateTime, Utc};
-use fs4::FileExt;
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;

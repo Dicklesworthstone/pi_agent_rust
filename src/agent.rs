@@ -5329,6 +5329,14 @@ impl SessionActionAdmissionGate {
             .map_err(|err| Error::session(format!("session action admission lock failed: {err}")))
     }
 
+    async fn acquire_current_generation(&self) -> Result<OwnedMutexGuard<()>> {
+        let generation = self.generation();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let permit = self.acquire(cx.cx()).await?;
+        self.ensure_generation(generation)?;
+        Ok(permit)
+    }
+
     pub(crate) fn ensure_generation(&self, expected: u64) -> Result<()> {
         if self.generation() != expected {
             return Err(Error::session(
@@ -5472,12 +5480,9 @@ impl AgentSessionHostActions {
     }
 
     async fn acquire_session_action_admission(&self) -> Result<OwnedMutexGuard<()>> {
-        let generation = self.session_action_admission.generation();
-        let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let permit = self.session_action_admission.acquire(cx.cx()).await?;
         self.session_action_admission
-            .ensure_generation(generation)?;
-        Ok(permit)
+            .acquire_current_generation()
+            .await
     }
 
     fn enqueue(&self, deliver_as: Option<ExtensionDeliverAs>, message: Message) {
@@ -7608,7 +7613,7 @@ mod extensions_integration_tests {
     }
 
     #[test]
-    fn agent_host_actions_send_message_waits_for_session_transition_admission() {
+    fn agent_host_actions_reject_message_delayed_across_session_transition() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -7637,8 +7642,9 @@ mod extensions_integration_tests {
                 .await
                 .expect("transition admission");
 
+            let delayed_actions = actions.clone();
             let hostcall = runtime_handle.spawn(async move {
-                actions
+                delayed_actions
                     .send_message(ExtensionSendMessage {
                         extension_id: Some("ext".to_string()),
                         custom_type: "note".to_string(),
@@ -7660,19 +7666,39 @@ mod extensions_integration_tests {
                 );
             }
 
+            session_action_admission.advance_generation();
             drop(transition_permit);
-            hostcall
+            let err = hostcall
                 .await
-                .expect("host action after transition release");
+                .expect_err("action from the previous Session generation must be rejected");
+            assert!(
+                err.to_string().contains("active Session changed"),
+                "unexpected delayed-action error: {err}"
+            );
+
+            actions
+                .send_message(ExtensionSendMessage {
+                    extension_id: Some("ext".to_string()),
+                    custom_type: "note".to_string(),
+                    content: "belongs to the new session".to_string(),
+                    display: false,
+                    details: None,
+                    deliver_as: Some(ExtensionDeliverAs::NextTurn),
+                    trigger_turn: false,
+                })
+                .await
+                .expect("new-generation action");
             let cx = crate::agent_cx::AgentCx::for_request();
             let guard = session.lock(cx.cx()).await.expect("session lock");
-            assert!(guard.to_messages_for_current_path().iter().any(|message| {
-                matches!(
-                    message,
-                    Message::Custom(CustomMessage { content, .. })
-                        if content == "must wait for transition"
-                )
-            }));
+            let custom_contents = guard
+                .to_messages_for_current_path()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Custom(CustomMessage { content, .. }) => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(custom_contents, vec!["belongs to the new session"]);
         });
     }
 
@@ -8246,6 +8272,7 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
+                session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(true)),
                 is_compacting: Arc::new(AtomicBool::new(true)),
                 queue_modes: Arc::new(StdMutex::new(ExtensionQueueModeState::new(
@@ -8306,6 +8333,7 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
+                session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 queue_modes: Arc::new(StdMutex::new(ExtensionQueueModeState::new(
@@ -8323,6 +8351,180 @@ mod extensions_integration_tests {
             assert_eq!(state["model"]["provider"], "openai");
             assert_eq!(state["model"]["id"], "gpt-4o");
             assert_eq!(state["thinkingLevel"], "low");
+        });
+    }
+
+    #[test]
+    fn agent_extension_session_rejects_mutation_delayed_across_session_transition() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let session_action_admission = SessionActionAdmissionGate::default();
+            let extension_session = AgentExtensionSession {
+                handle: SessionHandle(Arc::clone(&session)),
+                session_action_admission: session_action_admission.clone(),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_compacting: Arc::new(AtomicBool::new(false)),
+                queue_modes: Arc::new(StdMutex::new(ExtensionQueueModeState::new(
+                    QueueMode::OneAtATime,
+                    QueueMode::OneAtATime,
+                ))),
+                auto_compaction_enabled: false,
+            };
+            let transition_cx = crate::agent_cx::AgentCx::for_request();
+            let transition_permit = session_action_admission
+                .acquire(transition_cx.cx())
+                .await
+                .expect("transition admission");
+
+            let delayed_session = extension_session.clone();
+            let hostcall = runtime_handle.spawn(async move {
+                <AgentExtensionSession as crate::extensions::ExtensionSession>::append_custom_entry(
+                    &delayed_session,
+                    "stale-note".to_string(),
+                    Some(json!({"owner": "source"})),
+                )
+                .await
+            });
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(25)).await;
+
+            let replacement_session_id = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut guard = session.lock(cx.cx()).await.expect("session lock");
+                *guard = Session::in_memory();
+                guard.header.id.clone()
+            };
+            session_action_admission.advance_generation();
+            drop(transition_permit);
+
+            let err = hostcall
+                .await
+                .expect_err("mutation from the previous Session generation must be rejected");
+            assert!(
+                err.to_string().contains("active Session changed"),
+                "unexpected delayed-mutation error: {err}"
+            );
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let guard = session
+                .lock(cx.cx())
+                .await
+                .expect("replacement session lock");
+            assert_eq!(guard.header.id, replacement_session_id);
+            assert!(
+                guard.entries_for_current_path().iter().all(|entry| {
+                    !matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "stale-note"
+                    )
+                }),
+                "stale extension mutation crossed into the replacement Session"
+            );
+        });
+    }
+
+    #[test]
+    fn extension_command_rejects_real_js_session_mutation_delayed_across_transition() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("delayed-session-mutation.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerCommand("append-late", {
+                    description: "append a custom Session entry",
+                    handler: async () => {
+                      await pi.session("appendEntry", {
+                        customType: "stale-js-note",
+                        data: { owner: "source" }
+                      });
+                      return "appended";
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::new(&[], temp_dir.path(), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable transition extension");
+
+            let session_action_admission = agent_session.session_action_admission_gate();
+            let extension_manager = agent_session
+                .extensions
+                .as_ref()
+                .expect("extension region")
+                .manager()
+                .clone();
+            let transition_cx = crate::agent_cx::AgentCx::for_request();
+            let transition_permit = session_action_admission
+                .acquire(transition_cx.cx())
+                .await
+                .expect("transition admission");
+
+            let hostcall = runtime_handle.spawn(async move {
+                extension_manager
+                    .execute_command("append-late", "", 5_000)
+                    .await
+            });
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(25)).await;
+
+            let replacement_session_id = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut guard = session.lock(cx.cx()).await.expect("session lock");
+                *guard = Session::in_memory();
+                guard.header.id.clone()
+            };
+            session_action_admission.advance_generation();
+            drop(transition_permit);
+
+            let err = hostcall
+                .await
+                .expect_err("stale real-JS Session mutation must be rejected");
+            assert!(
+                err.to_string().contains("active Session changed"),
+                "unexpected real-JS mutation error: {err}"
+            );
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let guard = session
+                .lock(cx.cx())
+                .await
+                .expect("replacement session lock");
+            assert_eq!(guard.header.id, replacement_session_id);
+            assert!(
+                guard.entries_for_current_path().iter().all(|entry| {
+                    !matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "stale-js-note"
+                    )
+                }),
+                "stale real-JS mutation crossed into the replacement Session"
+            );
         });
     }
 
@@ -10939,6 +11141,7 @@ mod turn_event_tests {
 #[derive(Clone)]
 struct AgentExtensionSession {
     handle: SessionHandle,
+    session_action_admission: SessionActionAdmissionGate,
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
     queue_modes: Arc<StdMutex<ExtensionQueueModeState>>,
@@ -10946,6 +11149,12 @@ struct AgentExtensionSession {
 }
 
 impl AgentExtensionSession {
+    async fn acquire_session_action_admission(&self) -> Result<OwnedMutexGuard<()>> {
+        self.session_action_admission
+            .acquire_current_generation()
+            .await
+    }
+
     fn current_queue_modes(&self) -> (QueueMode, QueueMode) {
         self.queue_modes
             .lock()
@@ -11021,6 +11230,7 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
     }
 
     async fn set_name(&self, name: String) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission().await?;
         <SessionHandle as crate::extensions::ExtensionSession>::set_name(&self.handle, name).await
     }
 
@@ -11028,6 +11238,7 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         &self,
         message: crate::session::SessionMessage,
     ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission().await?;
         <SessionHandle as crate::extensions::ExtensionSession>::append_message(
             &self.handle,
             message,
@@ -11040,6 +11251,7 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         custom_type: String,
         data: Option<Value>,
     ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission().await?;
         <SessionHandle as crate::extensions::ExtensionSession>::append_custom_entry(
             &self.handle,
             custom_type,
@@ -11049,6 +11261,7 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
     }
 
     async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission().await?;
         <SessionHandle as crate::extensions::ExtensionSession>::set_model(
             &self.handle,
             provider,
@@ -11062,6 +11275,7 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
     }
 
     async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission().await?;
         <SessionHandle as crate::extensions::ExtensionSession>::set_thinking_level(
             &self.handle,
             level,
@@ -11079,6 +11293,7 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         target_id: String,
         label: Option<String>,
     ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission().await?;
         <SessionHandle as crate::extensions::ExtensionSession>::set_label(
             &self.handle,
             target_id,
@@ -12830,6 +13045,7 @@ impl AgentSession {
         )));
         manager.set_session(Arc::new(AgentExtensionSession {
             handle: SessionHandle(self.session.clone()),
+            session_action_admission: self.session_action_admission.clone(),
             is_streaming: Arc::clone(&self.extensions_is_streaming),
             is_compacting: Arc::clone(&self.extensions_is_compacting),
             queue_modes: Arc::clone(&queue_modes),

@@ -57,7 +57,7 @@ pub trait McpTransport: Send + Sync {
     /// Activate transport-owned background work after the MCP handshake.
     /// Stdio has no separate receive channel; Streamable HTTP uses this for
     /// its optional server-message GET stream.
-    fn activate(self: std::sync::Arc<Self>) -> Result<()> {
+    async fn activate(self: std::sync::Arc<Self>) -> Result<()> {
         Ok(())
     }
     /// Close the transport (best effort).
@@ -1185,12 +1185,14 @@ pub struct HttpTransport {
     next_id: AtomicU64,
     alive: std::sync::atomic::AtomicBool,
     listener_started: AtomicBool,
+    session_changed: asupersync::sync::Notify,
     abort_notify: asupersync::sync::Notify,
     lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
 struct HttpSessionState {
+    generation: u64,
     session_id: Option<String>,
     protocol_version: Option<String>,
     initialize_params: Option<Value>,
@@ -1198,6 +1200,7 @@ struct HttpSessionState {
 
 #[derive(Clone)]
 struct HttpWireState {
+    generation: u64,
     session_id: Option<String>,
     protocol_version: Option<String>,
 }
@@ -1269,16 +1272,19 @@ struct PendingHttpRequest<'a> {
     transport: &'a HttpTransport,
     cancellation: Option<HttpCancellationDispatch>,
     runtime: Option<asupersync::runtime::RuntimeHandle>,
+    armed: bool,
 }
 
 impl PendingHttpRequest<'_> {
     fn disarm(&mut self) {
+        self.armed = false;
         self.cancellation = None;
     }
 
     async fn cancel_and_abort(&mut self) {
         let cancellation = self.cancellation.take();
         self.transport.abort();
+        self.armed = false;
         if let Some(cancellation) = cancellation {
             let _ = cancellation.send().await;
         }
@@ -1287,11 +1293,13 @@ impl PendingHttpRequest<'_> {
 
 impl Drop for PendingHttpRequest<'_> {
     fn drop(&mut self) {
-        let Some(cancellation) = self.cancellation.take() else {
+        if !self.armed {
             return;
-        };
+        }
+        let cancellation = self.cancellation.take();
+        self.armed = false;
         self.transport.abort();
-        if let Some(runtime) = self.runtime.take() {
+        if let (Some(runtime), Some(cancellation)) = (self.runtime.take(), cancellation) {
             let _ = runtime.try_spawn(async move {
                 let _ = cancellation.send().await;
             });
@@ -1303,11 +1311,16 @@ impl Drop for PendingHttpRequest<'_> {
 struct HttpSseCursor {
     seen_ids: HashSet<String>,
     last_event_id: Option<String>,
+    resume_safe: bool,
 }
 
 impl HttpSseCursor {
     fn accept(&mut self, event: &crate::sse::SseEvent) -> Result<bool> {
-        let Some(event_id) = event.id.as_deref() else {
+        let Some(event_id) = event.id.as_deref().filter(|_| event.id_was_explicit) else {
+            // Without an id there is no checkpoint beyond this event. If it
+            // contains a server request, resuming from an earlier id could
+            // repeat the response side effect.
+            self.resume_safe = false;
             return Ok(true);
         };
         if event_id.is_empty() {
@@ -1331,7 +1344,14 @@ impl HttpSseCursor {
         }
         self.seen_ids.insert(event_id.to_string());
         self.last_event_id = Some(event_id.to_string());
+        self.resume_safe = true;
         Ok(true)
+    }
+
+    fn resume_id(&self) -> Option<&str> {
+        self.resume_safe
+            .then(|| self.last_event_id.as_deref())
+            .flatten()
     }
 }
 
@@ -1458,6 +1478,7 @@ impl HttpTransport {
             next_id: AtomicU64::new(1),
             alive: std::sync::atomic::AtomicBool::new(true),
             listener_started: AtomicBool::new(false),
+            session_changed: asupersync::sync::Notify::new(),
             abort_notify: asupersync::sync::Notify::new(),
             lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
         })
@@ -1478,9 +1499,14 @@ impl HttpTransport {
     fn wire_state(&self) -> HttpWireState {
         let session = Self::lock(&self.session);
         HttpWireState {
+            generation: session.generation,
             session_id: session.session_id.clone(),
             protocol_version: session.protocol_version.clone(),
         }
+    }
+
+    fn session_generation(&self) -> u64 {
+        Self::lock(&self.session).generation
     }
 
     fn cancellation_dispatch(&self, request_id: u64) -> HttpCancellationDispatch {
@@ -1493,14 +1519,27 @@ impl HttpTransport {
         }
     }
 
-    fn clear_negotiated_state(&self) {
+    fn expire_session_if_current(&self, generation: u64) {
         let mut session = Self::lock(&self.session);
+        if session.generation != generation {
+            return;
+        }
+        session.generation = session.generation.wrapping_add(1);
         session.session_id = None;
         session.protocol_version = None;
+        drop(session);
+        self.session_changed.notify_waiters();
     }
 
     fn reset_session_state(&self) {
-        *Self::lock(&self.session) = HttpSessionState::default();
+        let mut session = Self::lock(&self.session);
+        let generation = session.generation.wrapping_add(1);
+        *session = HttpSessionState {
+            generation,
+            ..HttpSessionState::default()
+        };
+        drop(session);
+        self.session_changed.notify_waiters();
     }
 
     fn begin_provisional_session(
@@ -1511,7 +1550,11 @@ impl HttpTransport {
             return Ok(None);
         };
         validate_http_session_id(session_id)?;
-        Self::lock(&self.session).session_id = Some(session_id.to_string());
+        let mut session = Self::lock(&self.session);
+        session.generation = session.generation.wrapping_add(1);
+        session.session_id = Some(session_id.to_string());
+        drop(session);
+        self.session_changed.notify_waiters();
         Ok(Some(ProvisionalHttpSession {
             transport: self,
             active: true,
@@ -1543,6 +1586,52 @@ impl HttpTransport {
         }
     }
 
+    async fn run_until_session_change<F, T>(
+        &self,
+        generation: u64,
+        operation: F,
+    ) -> Result<Option<T>>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        if self.session_generation() != generation {
+            return Ok(None);
+        }
+        let operation = operation.fuse();
+        let changed = self
+            .session_changed
+            .wait_until(|| self.session_generation() != generation)
+            .fuse();
+        futures::pin_mut!(operation, changed);
+        match futures::future::select(operation, changed).await {
+            futures::future::Either::Left((result, _)) => result.map(Some),
+            futures::future::Either::Right(((), _)) => Ok(None),
+        }
+    }
+
+    async fn run_with_deadline<F, T>(
+        operation: F,
+        timeout: Duration,
+        description: &'static str,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let now = asupersync::Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let operation = operation.fuse();
+        let deadline = asupersync::time::sleep(now, timeout).fuse();
+        futures::pin_mut!(operation, deadline);
+        match futures::future::select(operation, deadline).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(((), _)) => Err(tool_err(
+                "MCP_TRANSPORT_IO",
+                format!("{description} exceeded the absolute {timeout:?} deadline"),
+            )),
+        }
+    }
+
     /// One POST round-trip, returning a validated JSON-RPC response value.
     async fn round_trip(
         &self,
@@ -1550,8 +1639,23 @@ impl HttpTransport {
         timeout: Duration,
         kind: HttpRoundTripKind<'_>,
     ) -> Result<Value> {
-        self.run_until_abort(self.round_trip_inner(frame, timeout, kind))
+        self.round_trip_with_wire_state(frame, timeout, kind, None)
             .await
+    }
+
+    async fn round_trip_with_wire_state(
+        &self,
+        frame: &Value,
+        timeout: Duration,
+        kind: HttpRoundTripKind<'_>,
+        wire_state: Option<&HttpWireState>,
+    ) -> Result<Value> {
+        self.run_until_abort(Self::run_with_deadline(
+            self.round_trip_inner(frame, timeout, kind, wire_state),
+            timeout,
+            "HTTP JSON-RPC round trip",
+        ))
+        .await
     }
 
     async fn round_trip_inner(
@@ -1559,6 +1663,7 @@ impl HttpTransport {
         frame: &Value,
         timeout: Duration,
         kind: HttpRoundTripKind<'_>,
+        wire_state_override: Option<&HttpWireState>,
     ) -> Result<Value> {
         let mut request = self
             .client
@@ -1569,18 +1674,17 @@ impl HttpTransport {
             // ubs:ignore names and values validated at HttpTransport::new
             request = request.header(name.clone(), value.clone());
         }
-        let (assigned_session, protocol_version) = {
-            let session = Self::lock(&self.session);
-            (session.session_id.clone(), session.protocol_version.clone())
-        };
-        let had_assigned_session = assigned_session.is_some();
-        if let Some(session) = assigned_session {
+        let wire_state = wire_state_override
+            .cloned()
+            .unwrap_or_else(|| self.wire_state());
+        let had_assigned_session = wire_state.session_id.is_some();
+        if let Some(session) = wire_state.session_id.as_deref() {
             // ubs:ignore CR/LF-filtered at capture (hostile-server guard above)
-            request = request.header("Mcp-Session-Id", session);
+            request = request.header("Mcp-Session-Id", session.to_string());
         }
-        if let Some(protocol_version) = protocol_version {
+        if let Some(protocol_version) = wire_state.protocol_version.as_deref() {
             // ubs:ignore validated at initialize-state capture below
-            request = request.header("Mcp-Protocol-Version", protocol_version);
+            request = request.header("Mcp-Protocol-Version", protocol_version.to_string());
         }
         let response = request
             .json(frame)
@@ -1603,7 +1707,7 @@ impl HttpTransport {
             .map(|(_, value)| value.clone())
             .unwrap_or_default();
         if status == 404 && had_assigned_session {
-            self.clear_negotiated_state();
+            self.expire_session_if_current(wire_state.generation);
             return Err(tool_err(
                 "MCP_SESSION_EXPIRED",
                 "server rejected the active Mcp-Session-Id with HTTP 404",
@@ -1661,9 +1765,14 @@ impl HttpTransport {
             } else {
                 None
             };
+        let response_wire_state = if method == "initialize" {
+            self.wire_state()
+        } else {
+            wire_state
+        };
         let result = match media_type {
             HttpResponseMediaType::EventStream => {
-                self.receive_sse_response(response, expected_id, timeout)
+                self.receive_sse_response(response, expected_id, timeout, &response_wire_state)
                     .await?
             }
             HttpResponseMediaType::Json => {
@@ -1745,7 +1854,10 @@ impl HttpTransport {
         if let Some(session_id) = candidate_session_id.as_deref() {
             validate_http_session_id(session_id)?;
         }
-        *Self::lock(&self.session) = HttpSessionState {
+        let mut session = Self::lock(&self.session);
+        let generation = session.generation.wrapping_add(1);
+        *session = HttpSessionState {
+            generation,
             session_id: candidate_session_id,
             protocol_version: Some(protocol_version.to_string()),
             initialize_params: Some(
@@ -1755,6 +1867,8 @@ impl HttpTransport {
                     .unwrap_or(Value::Null),
             ),
         };
+        drop(session);
+        self.session_changed.notify_waiters();
         Ok(())
     }
 
@@ -1774,6 +1888,7 @@ impl HttpTransport {
             transport: self,
             cancellation,
             runtime: asupersync::runtime::Runtime::current_handle(),
+            armed: true,
         };
         let result = self
             .round_trip(
@@ -1813,26 +1928,45 @@ impl HttpTransport {
         if !params.is_null() {
             frame["params"] = params.clone();
         }
-        self.round_trip(
-            &frame,
-            DEFAULT_MCP_TIMEOUT,
-            HttpRoundTripKind::AcceptedMessage {
-                description: "JSON-RPC notification",
-            },
-        )
-        .await
-        .map(|_| ())
+        let mut pending_notification = PendingHttpRequest {
+            transport: self,
+            cancellation: None,
+            runtime: None,
+            armed: true,
+        };
+        let result = self
+            .round_trip(
+                &frame,
+                DEFAULT_MCP_TIMEOUT,
+                HttpRoundTripKind::AcceptedMessage {
+                    description: "JSON-RPC notification",
+                },
+            )
+            .await
+            .map(|_| ());
+        pending_notification.disarm();
+        if let Err(error) = &result
+            && !is_session_expired(error)
+            && !is_server_error(error)
+        {
+            // The notification's delivery or framing is ambiguous. Retiring
+            // the connection is safer than sending later side effects on a
+            // stream whose protocol state may already have advanced.
+            self.abort();
+        }
+        result
     }
 
-    async fn send_server_response(&self, frame: &Value) -> Result<()> {
+    async fn send_server_response(&self, frame: &Value, wire_state: &HttpWireState) -> Result<()> {
         // Box the nested POST edge: an SSE response can contain a server
         // request, whose client response is another HTTP round-trip.
-        let result = Box::pin(self.round_trip(
+        let result = Box::pin(self.round_trip_with_wire_state(
             frame,
             DEFAULT_MCP_TIMEOUT,
             HttpRoundTripKind::AcceptedMessage {
                 description: "JSON-RPC response",
             },
+            Some(wire_state),
         ))
         .await;
         match result {
@@ -1846,10 +1980,10 @@ impl HttpTransport {
 
     async fn open_event_stream(
         &self,
+        wire_state: &HttpWireState,
         last_event_id: Option<&str>,
         timeout: Option<Duration>,
     ) -> Result<HttpEventStreamOpen> {
-        let wire_state = self.wire_state();
         let had_session = wire_state.session_id.is_some();
         let mut request = self
             .client
@@ -1858,11 +1992,11 @@ impl HttpTransport {
         for (name, value) in &self.headers {
             request = request.header(name.clone(), value.clone());
         }
-        if let Some(session_id) = wire_state.session_id {
-            request = request.header("Mcp-Session-Id", session_id);
+        if let Some(session_id) = wire_state.session_id.as_deref() {
+            request = request.header("Mcp-Session-Id", session_id.to_string());
         }
-        if let Some(protocol_version) = wire_state.protocol_version {
-            request = request.header("Mcp-Protocol-Version", protocol_version);
+        if let Some(protocol_version) = wire_state.protocol_version.as_deref() {
+            request = request.header("Mcp-Protocol-Version", protocol_version.to_string());
         }
         if let Some(last_event_id) = last_event_id {
             super::config::validate_http_header_value(last_event_id).map_err(|err| {
@@ -1873,17 +2007,20 @@ impl HttpTransport {
             })?;
             request = request.header("Last-Event-ID", last_event_id.to_string());
         }
-        request = if let Some(timeout) = timeout {
-            request.timeout(timeout)
-        } else {
-            request.no_timeout()
-        };
-        let response = request.send().await.map_err(|err| {
-            tool_err(
-                "MCP_TRANSPORT_IO",
-                format!("open server event stream: {err}"),
-            )
-        })?;
+        let header_timeout = timeout.unwrap_or(DEFAULT_MCP_TIMEOUT);
+        let response = Self::run_with_deadline(
+            async move {
+                request.no_timeout().send().await.map_err(|err| {
+                    tool_err(
+                        "MCP_TRANSPORT_IO",
+                        format!("open server event stream: {err}"),
+                    )
+                })
+            },
+            header_timeout,
+            "HTTP server-event stream establishment",
+        )
+        .await?;
         let status = response.status();
         if status == 405 {
             let _ = response.bytes_limited(4096).await;
@@ -1955,7 +2092,12 @@ impl HttpTransport {
         }
     }
 
-    async fn handle_sse_message(&self, value: Value, expected_id: u64) -> Result<Option<Value>> {
+    async fn handle_sse_message(
+        &self,
+        value: Value,
+        expected_id: u64,
+        wire_state: &HttpWireState,
+    ) -> Result<Option<Value>> {
         let object = value
             .as_object()
             .ok_or_else(|| tool_err("MCP_PROTOCOL", "SSE JSON-RPC message must be an object"))?;
@@ -2008,7 +2150,7 @@ impl HttpTransport {
                     }
                 })
             };
-            self.send_server_response(&response).await?;
+            self.send_server_response(&response, wire_state).await?;
             return Ok(None);
         }
         validate_jsonrpc_response(&value, expected_id).map(Some)
@@ -2018,6 +2160,7 @@ impl HttpTransport {
         &self,
         event: crate::sse::SseEvent,
         expected_id: u64,
+        wire_state: &HttpWireState,
     ) -> Result<Option<Value>> {
         let data = event.data.trim();
         if data.is_empty() {
@@ -2029,10 +2172,15 @@ impl HttpTransport {
                 format!("SSE event data is not a JSON-RPC message: {err}"),
             )
         })?;
-        self.handle_sse_message(value, expected_id).await
+        self.handle_sse_message(value, expected_id, wire_state)
+            .await
     }
 
-    async fn handle_server_stream_event(&self, event: crate::sse::SseEvent) -> Result<()> {
+    async fn handle_server_stream_event(
+        &self,
+        event: crate::sse::SseEvent,
+        wire_state: &HttpWireState,
+    ) -> Result<()> {
         let data = event.data.trim();
         if data.is_empty() {
             return Ok(());
@@ -2049,7 +2197,7 @@ impl HttpTransport {
                 "unsolicited HTTP GET stream must not contain a JSON-RPC response",
             ));
         }
-        let unexpected_response = self.handle_sse_message(value, 0).await?;
+        let unexpected_response = self.handle_sse_message(value, 0, wire_state).await?;
         debug_assert!(unexpected_response.is_none());
         Ok(())
     }
@@ -2059,6 +2207,7 @@ impl HttpTransport {
         response: crate::http::client::Response,
         expected_id: u64,
         cursor: &mut HttpSseCursor,
+        wire_state: &HttpWireState,
     ) -> Result<Option<Value>> {
         let mut stream = response.bytes_stream();
         let mut decoder = BoundedHttpSseDecoder::new();
@@ -2069,7 +2218,10 @@ impl HttpTransport {
                 if !cursor.accept(&event)? {
                     continue;
                 }
-                if let Some(result) = self.handle_sse_event(event, expected_id).await? {
+                if let Some(result) = self
+                    .handle_sse_event(event, expected_id, wire_state)
+                    .await?
+                {
                     return Ok(Some(result));
                 }
             }
@@ -2078,7 +2230,10 @@ impl HttpTransport {
             if !cursor.accept(&event)? {
                 continue;
             }
-            if let Some(result) = self.handle_sse_event(event, expected_id).await? {
+            if let Some(result) = self
+                .handle_sse_event(event, expected_id, wire_state)
+                .await?
+            {
                 return Ok(Some(result));
             }
         }
@@ -2090,25 +2245,26 @@ impl HttpTransport {
         response: crate::http::client::Response,
         expected_id: u64,
         timeout: Duration,
+        wire_state: &HttpWireState,
     ) -> Result<Value> {
         let mut cursor = HttpSseCursor::default();
         match self
-            .receive_request_sse_stream(response, expected_id, &mut cursor)
+            .receive_request_sse_stream(response, expected_id, &mut cursor, wire_state)
             .await
         {
             Ok(Some(result)) => return Ok(result),
             Ok(None) => {}
-            Err(error) if is_transport_io(&error) && cursor.last_event_id.is_some() => {}
+            Err(error) if is_transport_io(&error) && cursor.resume_id().is_some() => {}
             Err(error) => return Err(error),
         }
-        let Some(last_event_id) = cursor.last_event_id.clone() else {
+        let Some(last_event_id) = cursor.resume_id().map(str::to_string) else {
             return Err(tool_err(
                 "MCP_DELIVERY_INDETERMINATE",
                 "SSE request stream ended before its JSON-RPC response and supplied no resumable event id",
             ));
         };
         let resumed = match self
-            .open_event_stream(Some(&last_event_id), Some(timeout))
+            .open_event_stream(wire_state, Some(&last_event_id), Some(timeout))
             .await?
         {
             HttpEventStreamOpen::Stream(response) => response,
@@ -2126,7 +2282,7 @@ impl HttpTransport {
             }
         };
         match self
-            .receive_request_sse_stream(resumed, expected_id, &mut cursor)
+            .receive_request_sse_stream(resumed, expected_id, &mut cursor, wire_state)
             .await?
         {
             Some(result) => Ok(result),
@@ -2141,6 +2297,7 @@ impl HttpTransport {
         &self,
         response: crate::http::client::Response,
         cursor: &mut HttpSseCursor,
+        wire_state: &HttpWireState,
     ) -> Result<()> {
         let mut stream = response.bytes_stream();
         let mut decoder = BoundedHttpSseDecoder::new();
@@ -2153,40 +2310,122 @@ impl HttpTransport {
             })?;
             for event in decoder.feed(&chunk)? {
                 if cursor.accept(&event)? {
-                    self.handle_server_stream_event(event).await?;
+                    self.handle_server_stream_event(event, wire_state).await?;
                 }
             }
         }
         for event in decoder.finish()? {
             if cursor.accept(&event)? {
-                self.handle_server_stream_event(event).await?;
+                self.handle_server_stream_event(event, wire_state).await?;
             }
         }
         Ok(())
     }
 
-    async fn run_server_event_listener(&self) -> Result<()> {
+    async fn run_server_event_listener(
+        &self,
+        wire_state: &HttpWireState,
+        first: crate::http::client::Response,
+    ) -> Result<()> {
         let mut cursor = HttpSseCursor::default();
-        let first = match self.open_event_stream(None, None).await? {
-            HttpEventStreamOpen::Unsupported | HttpEventStreamOpen::SessionExpired => return Ok(()),
-            HttpEventStreamOpen::Stream(response) => response,
-        };
-        let first_result = self.receive_server_event_stream(first, &mut cursor).await;
+        let first_result = self
+            .receive_server_event_stream(first, &mut cursor, wire_state)
+            .await;
         if let Err(error) = first_result {
-            if !is_transport_io(&error) || cursor.last_event_id.is_none() {
+            if !is_transport_io(&error) || cursor.resume_id().is_none() {
                 return Err(error);
             }
         }
-        let Some(last_event_id) = cursor.last_event_id.clone() else {
+        let Some(last_event_id) = cursor.resume_id().map(str::to_string) else {
             return Ok(());
         };
-        let resumed = match self.open_event_stream(Some(&last_event_id), None).await? {
-            HttpEventStreamOpen::Unsupported | HttpEventStreamOpen::SessionExpired => return Ok(()),
+        let resumed = match self
+            .open_event_stream(wire_state, Some(&last_event_id), None)
+            .await?
+        {
+            HttpEventStreamOpen::Unsupported => return Ok(()),
+            HttpEventStreamOpen::SessionExpired => {
+                return Err(tool_err(
+                    "MCP_SESSION_EXPIRED",
+                    "server rejected the active GET stream session during resumption",
+                ));
+            }
             HttpEventStreamOpen::Stream(response) => response,
         };
         // Exactly one resume attempt per logical GET stream. A second
         // disconnect ends this optional receive channel instead of looping.
-        self.receive_server_event_stream(resumed, &mut cursor).await
+        self.receive_server_event_stream(resumed, &mut cursor, wire_state)
+            .await
+    }
+
+    async fn run_server_event_supervisor(
+        &self,
+        mut wire_state: HttpWireState,
+        first: crate::http::client::Response,
+    ) -> Result<()> {
+        let mut next_stream = Some(first);
+        loop {
+            if let Some(stream) = next_stream.take() {
+                match self
+                    .run_until_session_change(
+                        wire_state.generation,
+                        self.run_server_event_listener(&wire_state, stream),
+                    )
+                    .await?
+                {
+                    Some(()) => {
+                        // The optional channel ended or exhausted its single
+                        // resume. Stay dormant until a newly initialized
+                        // session supplies a fresh, cursor-free stream.
+                        let _ = self
+                            .run_until_session_change(
+                                wire_state.generation,
+                                futures::future::pending::<Result<()>>(),
+                            )
+                            .await?;
+                    }
+                    None => {}
+                }
+            }
+
+            wire_state = self.wire_state();
+            if wire_state.protocol_version.is_none() {
+                let _ = self
+                    .run_until_session_change(
+                        wire_state.generation,
+                        futures::future::pending::<Result<()>>(),
+                    )
+                    .await?;
+                continue;
+            }
+
+            let opened = self
+                .run_until_session_change(
+                    wire_state.generation,
+                    self.open_event_stream(&wire_state, None, None),
+                )
+                .await?;
+            let Some(opened) = opened else {
+                continue;
+            };
+            match opened {
+                HttpEventStreamOpen::Stream(stream) => next_stream = Some(stream),
+                HttpEventStreamOpen::Unsupported => {
+                    let _ = self
+                        .run_until_session_change(
+                            wire_state.generation,
+                            futures::future::pending::<Result<()>>(),
+                        )
+                        .await?;
+                }
+                HttpEventStreamOpen::SessionExpired => {
+                    return Err(tool_err(
+                        "MCP_SESSION_EXPIRED",
+                        "server rejected the active GET stream session with HTTP 404",
+                    ));
+                }
+            }
+        }
     }
 
     async fn renew_session(&self) -> Result<()> {
@@ -2436,7 +2675,7 @@ impl McpTransport for HttpTransport {
         self.abort_notify.notify_waiters();
     }
 
-    fn activate(self: std::sync::Arc<Self>) -> Result<()> {
+    async fn activate(self: std::sync::Arc<Self>) -> Result<()> {
         if !self.alive.load(Ordering::SeqCst) {
             return Err(tool_err(
                 "MCP_TRANSPORT_UNAVAILABLE",
@@ -2457,10 +2696,36 @@ impl McpTransport for HttpTransport {
                 "cannot start the HTTP server-event listener outside an active runtime",
             ));
         };
+        let wire_state = self.wire_state();
+        let first = match self
+            .run_until_abort(self.open_event_stream(&wire_state, None, None))
+            .await
+        {
+            Ok(HttpEventStreamOpen::Stream(response)) => response,
+            Ok(HttpEventStreamOpen::Unsupported) => return Ok(()),
+            Ok(HttpEventStreamOpen::SessionExpired) => {
+                self.abort();
+                return Err(tool_err(
+                    "MCP_SESSION_EXPIRED",
+                    "server rejected the active GET stream session during activation",
+                ));
+            }
+            Err(error) => {
+                self.abort();
+                return Err(error);
+            }
+        };
+        if self.session_generation() != wire_state.generation {
+            self.abort();
+            return Err(tool_err(
+                "MCP_SESSION_CHANGED",
+                "HTTP session changed while activating its GET stream",
+            ));
+        }
         let listener_transport = std::sync::Arc::clone(&self);
         if let Err(error) = runtime.try_spawn(async move {
             let result = listener_transport
-                .run_until_abort(listener_transport.run_server_event_listener())
+                .run_until_abort(listener_transport.run_server_event_supervisor(wire_state, first))
                 .await;
             if let Err(error) = result
                 && listener_transport.is_alive()
@@ -3134,7 +3399,7 @@ mod tests {
                     .expect("capture slow request")
                     .push(slow_request);
                 slow.write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: 1\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n",
                 )
                 .expect("write slow response head");
                 slow.flush().expect("flush slow response head");
@@ -3143,6 +3408,12 @@ mod tests {
                 let holder = std::thread::spawn(move || {
                     for _ in 0..500 {
                         if cancellation_for_holder.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // Keep producing legal SSE comment bytes. An idle-only
+                        // timeout would be postponed forever by this activity;
+                        // the MCP request's absolute deadline must still fire.
+                        if slow.write_all(b"2\r\n:\n\r\n").is_err() || slow.flush().is_err() {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -3507,6 +3778,7 @@ mod tests {
                 .expect("initialized notification");
             std::sync::Arc::clone(&transport)
                 .activate()
+                .await
                 .expect("activate GET listener");
             wait_for_requests(&server, 6).await;
             transport.abort();
@@ -3578,6 +3850,7 @@ mod tests {
                 .expect("initialized notification");
             std::sync::Arc::clone(&transport)
                 .activate()
+                .await
                 .expect("activate GET listener");
             wait_for_requests(&server, 3).await;
             transport.close().await;
@@ -3610,7 +3883,110 @@ mod tests {
         );
     }
 
-    /// Once an HTTP request has reached a response stream, an idle timeout
+    #[test]
+    fn streamable_http_idless_event_blocks_unsafe_resume_until_checkpoint() {
+        let mut cursor = HttpSseCursor::default();
+        let identified = crate::sse::SseEvent {
+            id: Some("checkpoint-1".to_string()),
+            id_was_explicit: true,
+            data: "{}".to_string(),
+            ..crate::sse::SseEvent::default()
+        };
+        assert!(cursor.accept(&identified).expect("identified event"));
+        assert_eq!(cursor.resume_id(), Some("checkpoint-1"));
+
+        let idless_request = crate::sse::SseEvent {
+            data: r#"{"jsonrpc":"2.0","id":"ping-1","method":"ping"}"#.to_string(),
+            ..crate::sse::SseEvent::default()
+        };
+        assert!(cursor.accept(&idless_request).expect("idless event"));
+        assert_eq!(
+            cursor.resume_id(),
+            None,
+            "an earlier checkpoint cannot safely resume past an idless side effect"
+        );
+
+        let next_checkpoint = crate::sse::SseEvent {
+            id: Some("checkpoint-2".to_string()),
+            id_was_explicit: true,
+            data: "{}".to_string(),
+            ..crate::sse::SseEvent::default()
+        };
+        assert!(cursor.accept(&next_checkpoint).expect("new checkpoint"));
+        assert_eq!(cursor.resume_id(), Some("checkpoint-2"));
+    }
+
+    #[test]
+    fn streamable_http_stale_generation_cannot_expire_new_session() {
+        let transport =
+            HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new()).expect("HTTP transport");
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-old".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture old session");
+        let old = transport.wire_state();
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-new".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture new session");
+
+        transport.expire_session_if_current(old.generation);
+        let current = transport.wire_state();
+        assert_eq!(current.session_id.as_deref(), Some("sid-new"));
+        assert_ne!(current.generation, old.generation);
+    }
+
+    #[test]
+    fn streamable_http_get_404_fails_activation_and_retires_transport() {
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-expired"),
+            http_empty(202, "Accepted"),
+            http_empty(404, "Not Found"),
+        ]);
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        let runtime = runtime_for_tests();
+        let error = runtime.block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized notification");
+            std::sync::Arc::clone(&transport)
+                .activate()
+                .await
+                .expect_err("session-bearing GET 404 must fail activation")
+        });
+        assert!(error.to_string().contains("MCP_SESSION_EXPIRED"), "{error}");
+        assert!(!transport.is_alive());
+        assert_eq!(server.request_lines().len(), 3);
+    }
+
+    #[test]
+    fn streamable_http_unfinished_initialize_guard_aborts_without_cancellation() {
+        let transport =
+            HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new()).expect("HTTP transport");
+        {
+            let _unfinished_initialize = PendingHttpRequest {
+                transport: &transport,
+                cancellation: None,
+                runtime: None,
+                armed: true,
+            };
+        }
+        assert!(!transport.is_alive());
+    }
+
+    /// Once an HTTP request has reached a response stream, its absolute timeout
     /// sends notifications/cancelled with the exact request id and retires
     /// the indeterminate session instead of allowing another call.
     #[test]

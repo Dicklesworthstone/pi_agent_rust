@@ -8,7 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::session::SessionEntry;
-use fs4::FileExt;
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
