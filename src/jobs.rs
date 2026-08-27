@@ -18,9 +18,13 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use asupersync::sync::Notify;
+use futures::FutureExt;
+use fs4::FileExt as _;
 use serde::Serialize;
 
 use crate::error::{Error, Result};
@@ -43,10 +47,35 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 /// Bounded in-memory output tail kept per job for notices and `wait`.
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 
+/// Hard cap for one job's on-disk artifact. The in-memory tail continues to
+/// update after this point, while the snapshot reports truncation explicitly.
+const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Background-job artifacts are never deleted automatically. Refuse
+/// new jobs before the dedicated directory can exceed this aggregate budget.
+const MAX_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Bound inode consumption independently from bytes (for example, jobs that
+/// produce no output still create an artifact).
+const MAX_ARTIFACT_FILES: usize = 4096;
+
+/// Pipes normally reach EOF immediately after the process tree is reaped. A
+/// bounded drain prevents an escaped descendant that retained a descriptor
+/// from blocking terminal publication forever.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Very large async waits are represented as repeated bounded timer sleeps so
+/// `Instant` overflow never turns a valid request into a panic.
+const MAX_ASYNC_WAIT_SLICE: Duration = Duration::from_secs(60 * 60);
+
 /// Maximum undelivered completion notices across background job and `/tan`
 /// producers. The oldest notice is discarded first if a session never
 /// reaches another delivery boundary.
 const MAX_COMPLETION_NOTICES: usize = 64;
+
+/// Settled descriptors remain queryable for recent history, but the process
+/// must not retain every command/tail forever during a long-lived RPC session.
+const MAX_RETAINED_SETTLED_JOBS: usize = 128;
 
 /// How a background job settled (or is settling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,12 +109,20 @@ struct JobEntry {
     id: String,
     command: String,
     started_at_ms: i64,
+    sequence: u64,
+    settled_sequence: Option<u64>,
     status: JobStatus,
     exit_code: Option<i32>,
     pid: Option<u32>,
     artifact_path: PathBuf,
-    tail: std::sync::Arc<Mutex<TailBuffer>>,
+    tail: Arc<Mutex<TailBuffer>>,
+    artifact: Arc<Mutex<ArtifactSink>>,
+    output_complete: bool,
     cancel_requested: bool,
+    process_live: bool,
+    settled_snapshot: Arc<Mutex<Option<JobSnapshot>>>,
+    settled_notify: Arc<Notify>,
+    cancel_deadline: Arc<CancelDeadline>,
 }
 
 /// Serializable snapshot handed to tool results and notices.
@@ -101,26 +138,215 @@ pub struct JobSnapshot {
     pub pid: Option<u32>,
     pub artifact_path: String,
     pub output_tail: String,
+    pub artifact_truncated: bool,
+    pub artifact_error: Option<String>,
+    pub output_complete: bool,
 }
 
 impl JobSnapshot {
-    fn from_entry(entry: &JobEntry) -> Self {
-        let output_tail = entry
+    fn from_source_best_effort(source: &JobSnapshotSource) -> Self {
+        let output_tail = source
             .tail
-            .lock()
+            .try_lock()
             .map(|tail| tail.text())
             .unwrap_or_default();
+        let (artifact_truncated, artifact_error) = source.artifact.try_lock().map_or_else(
+            |_| {
+                (
+                    true,
+                    Some("artifact state unavailable while snapshotting".to_string()),
+                )
+            },
+            |artifact| (artifact.truncated, artifact.write_error.clone()),
+        );
+        Self::from_source_fields(source, output_tail, artifact_truncated, artifact_error)
+    }
+
+    fn from_source_fields(
+        source: &JobSnapshotSource,
+        output_tail: String,
+        artifact_truncated: bool,
+        artifact_error: Option<String>,
+    ) -> Self {
         Self {
             schema: JOB_SCHEMA.to_string(),
+            id: source.id.clone(),
+            command: source.command.clone(),
+            started_at_ms: source.started_at_ms,
+            status: source.status.as_str().to_string(),
+            exit_code: source.exit_code,
+            pid: source.pid,
+            artifact_path: source.artifact_path.display().to_string(),
+            output_tail,
+            artifact_truncated,
+            artifact_error,
+            output_complete: source.output_complete,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct JobSnapshotSource {
+    id: String,
+    command: String,
+    started_at_ms: i64,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    pid: Option<u32>,
+    artifact_path: PathBuf,
+    tail: Arc<Mutex<TailBuffer>>,
+    artifact: Arc<Mutex<ArtifactSink>>,
+    output_complete: bool,
+}
+
+impl JobSnapshotSource {
+    fn from_entry(entry: &JobEntry) -> Self {
+        Self {
             id: entry.id.clone(),
             command: entry.command.clone(),
             started_at_ms: entry.started_at_ms,
-            status: entry.status.as_str().to_string(),
+            status: entry.status,
             exit_code: entry.exit_code,
             pid: entry.pid,
-            artifact_path: entry.artifact_path.display().to_string(),
-            output_tail,
+            artifact_path: entry.artifact_path.clone(),
+            tail: Arc::clone(&entry.tail),
+            artifact: Arc::clone(&entry.artifact),
+            output_complete: entry.output_complete,
         }
+    }
+}
+
+#[derive(Clone)]
+struct JobWaitHandle {
+    id: String,
+    settled_snapshot: Arc<Mutex<Option<JobSnapshot>>>,
+    settled_notify: Arc<Notify>,
+    cancel_deadline: Arc<CancelDeadline>,
+}
+
+struct CancelDeadline {
+    started: Mutex<bool>,
+    expired: AtomicBool,
+    settlement: Arc<(Mutex<bool>, Condvar)>,
+    notify: Notify,
+}
+
+impl CancelDeadline {
+    fn new() -> Self {
+        Self {
+            started: Mutex::new(false),
+            expired: AtomicBool::new(false),
+            settlement: Arc::new((Mutex::new(false), Condvar::new())),
+            notify: Notify::new(),
+        }
+    }
+
+    fn start(self: &Arc<Self>, timeout: Duration) -> Result<bool> {
+        self.start_with(timeout, |deadline, timeout| {
+            std::thread::Builder::new()
+                .name("pi-job-cancel-deadline".to_string())
+                .spawn(move || deadline.run(timeout))
+                .map(|_| ())
+        })
+    }
+
+    fn start_with<F>(self: &Arc<Self>, timeout: Duration, spawn: F) -> Result<bool>
+    where
+        F: FnOnce(Arc<Self>, Duration) -> std::io::Result<()>,
+    {
+        // Serialize the state transition through successful thread creation.
+        // A duplicate caller must never observe `started=true` while the first
+        // caller can still fail to create the only deadline monitor.
+        let mut started = self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *started {
+            return Ok(false);
+        }
+        let deadline = Arc::clone(self);
+        spawn(deadline, timeout).map_err(|err| {
+            Error::tool(
+                "jobs",
+                format!("Failed to start cancellation deadline monitor: {err}"),
+            )
+        })?;
+        *started = true;
+        Ok(true)
+    }
+
+    fn run(&self, timeout: Duration) {
+        let (lock, wake) = &*self.settlement;
+        let settled = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (settled, _) = wake
+            .wait_timeout_while(settled, timeout, |settled| !*settled)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expired = !*settled;
+        drop(settled);
+        if expired {
+            self.expired.store(true, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn finish(&self) {
+        let (lock, wake) = &*self.settlement;
+        let mut settled = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *settled = true;
+        wake.notify_one();
+    }
+}
+
+struct ArtifactSink {
+    file: Option<std::fs::File>,
+    bytes_written: usize,
+    cap: usize,
+    truncated: bool,
+    write_error: Option<String>,
+}
+
+impl ArtifactSink {
+    const fn new(file: std::fs::File, cap: usize) -> Self {
+        Self {
+            file: Some(file),
+            bytes_written: 0,
+            cap,
+            truncated: false,
+            write_error: None,
+        }
+    }
+
+    fn write(&mut self, data: &[u8]) {
+        if self.write_error.is_some() || self.file.is_none() {
+            return;
+        }
+        let remaining = self.cap.saturating_sub(self.bytes_written);
+        let to_write = data.len().min(remaining);
+        if to_write < data.len() {
+            self.truncated = true;
+        }
+        if to_write == 0 {
+            return;
+        }
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if let Err(err) = file.write_all(&data[..to_write]) {
+            self.write_error = Some(err.to_string());
+            return;
+        }
+        self.bytes_written = self.bytes_written.saturating_add(to_write);
+    }
+
+    fn seal(&mut self) {
+        // Dropping the file closes it and releases its live-budget lock. Do
+        // not put an unbounded filesystem flush on the process-reap and
+        // terminal-publication critical path.
+        drop(self.file.take());
     }
 }
 
@@ -128,6 +354,7 @@ impl JobSnapshot {
 struct TailBuffer {
     buf: std::collections::VecDeque<u8>,
     cap: usize,
+    sealed: bool,
 }
 
 impl TailBuffer {
@@ -135,10 +362,14 @@ impl TailBuffer {
         Self {
             buf: std::collections::VecDeque::with_capacity(cap.min(8192)),
             cap,
+            sealed: false,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
+        if self.sealed {
+            return;
+        }
         if chunk.len() >= self.cap {
             self.buf.clear();
             self.buf.extend(&chunk[chunk.len() - self.cap..]);
@@ -158,12 +389,18 @@ impl TailBuffer {
         bytes.extend_from_slice(second);
         String::from_utf8_lossy(&bytes).into_owned()
     }
+
+    fn seal(&mut self) {
+        self.sealed = true;
+    }
 }
 
 #[derive(Default)]
 struct JobRegistry {
     jobs: HashMap<String, JobEntry>,
-    next_id: u64,
+    starting_jobs: usize,
+    next_job_sequence: u64,
+    next_settled_sequence: u64,
     notices: Vec<String>,
 }
 
@@ -171,6 +408,11 @@ fn registry() -> &'static Mutex<JobRegistry> {
     static REGISTRY: std::sync::LazyLock<Mutex<JobRegistry>> =
         std::sync::LazyLock::new(|| Mutex::new(JobRegistry::default()));
     &REGISTRY
+}
+
+fn lifecycle_lock() -> &'static Mutex<()> {
+    static LIFECYCLE: Mutex<()> = Mutex::new(());
+    &LIFECYCLE
 }
 
 fn now_ms() -> i64 {
@@ -184,6 +426,185 @@ fn running_count(reg: &JobRegistry) -> usize {
         .values()
         .filter(|job| job.status == JobStatus::Running)
         .count()
+}
+
+struct StartingJobSlot {
+    active: bool,
+}
+
+impl StartingJobSlot {
+    fn commit(mut self, reg: &mut JobRegistry) {
+        reg.starting_jobs = reg.starting_jobs.saturating_sub(1);
+        self.active = false;
+    }
+}
+
+impl Drop for StartingJobSlot {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.starting_jobs = reg.starting_jobs.saturating_sub(1);
+    }
+}
+
+fn reserve_job_slot() -> Result<(String, u64, StartingJobSlot)> {
+    let mut reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    if running_count(&reg).saturating_add(reg.starting_jobs) >= MAX_CONCURRENT_JOBS {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "PI_JOBS_AT_CAPACITY: {MAX_CONCURRENT_JOBS} background jobs already running; \
+                 cancel one with the jobs tool or wait for a completion before starting more."
+            ),
+        ));
+    }
+    reg.starting_jobs = reg.starting_jobs.saturating_add(1);
+    let sequence = reg.next_job_sequence;
+    reg.next_job_sequence = reg.next_job_sequence.saturating_add(1);
+    let id = format!("job-{}", uuid::Uuid::new_v4().simple());
+    Ok((id, sequence, StartingJobSlot { active: true }))
+}
+
+fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
+    let mut bytes = 0u64;
+    let mut entries = 0usize;
+    for entry in std::fs::read_dir(jobs_dir)? {
+        let entry = entry?;
+        if entry.file_name() == ".artifact-budget.lock" {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_file() {
+            bytes = bytes.saturating_add(metadata.len());
+            if path.extension().is_some_and(|extension| extension == "log") {
+                let artifact = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)?;
+                match artifact.try_lock_exclusive() {
+                    Ok(()) => fs4::FileExt::unlock(&artifact)?,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        bytes = bytes.saturating_add(
+                            u64::try_from(MAX_ARTIFACT_BYTES)
+                                .unwrap_or(u64::MAX)
+                                .saturating_sub(metadata.len()),
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+    Ok((bytes, entries))
+}
+
+fn ensure_artifact_budget(
+    jobs_dir: &Path,
+    max_bytes: u64,
+    max_entries: usize,
+) -> Result<()> {
+    let (stored_bytes, stored_entries) = artifact_directory_usage(jobs_dir)
+        .map_err(|err| Error::tool("bash", format!("Failed to inspect jobs artifact dir: {err}")))?;
+    let reserved_bytes = u64::try_from(MAX_ARTIFACT_BYTES).unwrap_or(u64::MAX);
+    if stored_entries >= max_entries
+        || stored_bytes.saturating_add(reserved_bytes) > max_bytes
+    {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "PI_JOBS_ARTIFACT_CAPACITY: refusing a new background job because {} accounts for {stored_entries} entries and {stored_bytes} bytes (limits: {max_entries} entries, {max_bytes} bytes including live-job reservations)",
+                jobs_dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
+    let lock_path = jobs_dir.join(".artifact-budget.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            Error::tool(
+                "bash",
+                format!("Failed to open jobs artifact budget lock: {err}"),
+            )
+        })?;
+    lock.lock_exclusive().map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to acquire jobs artifact budget lock: {err}"),
+        )
+    })?;
+    Ok(lock)
+}
+
+fn create_job_artifact(jobs_dir: &Path, id: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let artifact_path = jobs_dir.join(format!("{id}.log"));
+    let artifact = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&artifact_path)?;
+    artifact.lock_exclusive()?;
+    Ok((artifact_path, artifact))
+}
+
+struct BackgroundChild {
+    child: Option<std::process::Child>,
+}
+
+impl BackgroundChild {
+    const fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child
+            .as_mut()
+            .map_or(Ok(None), std::process::Child::try_wait)
+    }
+
+    fn kill_and_wait(&mut self) -> Option<i32> {
+        let mut child = self.child.take()?;
+        crate::tools::kill_process_group_tree(Some(child.id()));
+        let _ = child.kill();
+        child.wait().ok().and_then(|status| status.code())
+    }
+
+    fn disarm(&mut self) {
+        let _ = self.child.take();
+    }
+}
+
+impl Drop for BackgroundChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        crate::tools::kill_process_group_tree(Some(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Spawn a command as a background job. The mediation gate in the bash tool
@@ -201,6 +622,12 @@ pub fn spawn_background(
     timeout_secs: Option<u64>,
     artifact_root: Option<&Path>,
 ) -> Result<JobSnapshot> {
+    // Serialize the fallible spawn-to-monitor ownership transfer with
+    // `kill_all`, so shutdown cannot miss a child between OS spawn and
+    // registry publication.
+    let _lifecycle = lifecycle_lock()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned".to_string()))?;
     if !cwd.exists() {
         return Err(Error::tool(
             "bash",
@@ -250,45 +677,93 @@ pub fn spawn_background(
     std::fs::create_dir_all(&jobs_dir)
         .map_err(|e| Error::tool("bash", format!("Failed to create jobs artifact dir: {e}")))?;
 
-    let id = {
-        let mut reg = registry()
-            .lock()
-            .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-        if running_count(&reg) >= MAX_CONCURRENT_JOBS {
-            return Err(Error::tool(
-                "bash",
-                format!(
-                    "PI_JOBS_AT_CAPACITY: {MAX_CONCURRENT_JOBS} background jobs already running; \
-                     cancel one with the jobs tool or wait for a completion before starting more."
-                ),
-            ));
-        }
-        reg.next_id = reg.next_id.saturating_add(1);
-        let next = reg.next_id;
-        drop(reg);
-        format!("job-{next}")
-    };
+    let (id, sequence, slot) = reserve_job_slot()?;
+    let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir)?;
+    ensure_artifact_budget(
+        &jobs_dir,
+        MAX_TOTAL_ARTIFACT_BYTES,
+        MAX_ARTIFACT_FILES,
+    )?;
+    let (artifact_path, artifact) = create_job_artifact(&jobs_dir, &id)
+        .map_err(|e| Error::tool("bash", format!("Failed to create job artifact: {e}")))?;
+    drop(artifact_budget_lock);
+    let artifact = Arc::new(Mutex::new(ArtifactSink::new(
+        artifact,
+        MAX_ARTIFACT_BYTES,
+    )));
+    let tail = Arc::new(Mutex::new(TailBuffer::new(OUTPUT_TAIL_BYTES)));
+    let output_sealed = Arc::new(AtomicBool::new(false));
+    let settled_snapshot = Arc::new(Mutex::new(None));
+    let settled_notify = Arc::new(Notify::new());
+    let cancel_deadline = Arc::new(CancelDeadline::new());
 
-    let mut child = cmd
+    let started_at = Instant::now();
+    let started_at_ms = now_ms();
+    let child = cmd
         .spawn()
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
     crate::tools::attach_child_job_discipline(&child);
     let pid = child.id();
+    let mut child = BackgroundChild::new(child);
     let stdout = child
-        .stdout
-        .take()
+        .child
+        .as_mut()
+        .and_then(|child| child.stdout.take())
         .ok_or_else(|| Error::tool("bash", "Missing stdout".to_string()))?;
     let stderr = child
-        .stderr
-        .take()
+        .child
+        .as_mut()
+        .and_then(|child| child.stderr.take())
         .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
 
-    let artifact_path = jobs_dir.join(format!("{id}.log"));
-    let artifact = std::fs::File::create(&artifact_path)
-        .map_err(|e| Error::tool("bash", format!("Failed to create job artifact: {e}")))?;
-    let tail = std::sync::Arc::new(Mutex::new(TailBuffer::new(OUTPUT_TAIL_BYTES)));
-
+    // Pump threads: dedicated OS threads for the same reason as the
+    // foreground path (unbounded blocking reads must not starve the
+    // runtime's blocking pool).
+    let stdout_tail = Arc::clone(&tail);
+    let stdout_artifact = Arc::clone(&artifact);
+    let stdout_sealed = Arc::clone(&output_sealed);
+    let stdout_pump = std::thread::Builder::new()
+        .name(format!("pi-job-{id}-stdout"))
+        .spawn(move || {
+            pump_job_stream(
+                stdout,
+                &stdout_artifact,
+                &stdout_tail,
+                &stdout_sealed,
+            )
+        })
+        .map_err(|err| {
+            Error::tool(
+                "bash",
+                format!("Failed to start job stdout pump: {err}"),
+            )
+        })?;
+    let stderr_tail = Arc::clone(&tail);
+    let stderr_artifact = Arc::clone(&artifact);
+    let stderr_sealed = Arc::clone(&output_sealed);
+    let stderr_pump = match std::thread::Builder::new()
+        .name(format!("pi-job-{id}-stderr"))
+        .spawn(move || {
+            pump_job_stream(
+                stderr,
+                &stderr_artifact,
+                &stderr_tail,
+                &stderr_sealed,
+            )
+        })
     {
+        Ok(handle) => handle,
+        Err(err) => {
+            child.kill_and_wait();
+            let _ = stdout_pump.join();
+            return Err(Error::tool(
+                "bash",
+                format!("Failed to start job stderr pump: {err}"),
+            ));
+        }
+    };
+
+    let snapshot_source = {
         let mut reg = registry()
             .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
@@ -297,53 +772,90 @@ pub fn spawn_background(
             JobEntry {
                 id: id.clone(),
                 command,
-                started_at_ms: now_ms(),
+                started_at_ms,
+                sequence,
+                settled_sequence: None,
                 status: JobStatus::Running,
                 exit_code: None,
                 pid: Some(pid),
                 artifact_path,
-                tail: std::sync::Arc::clone(&tail),
+                tail: Arc::clone(&tail),
+                artifact: Arc::clone(&artifact),
+                output_complete: false,
                 cancel_requested: false,
+                process_live: true,
+                settled_snapshot,
+                settled_notify,
+                cancel_deadline,
             },
         );
-    }
-
-    // Pump threads: dedicated OS threads for the same reason as the
-    // foreground path (unbounded blocking reads must not starve the
-    // runtime's blocking pool).
-    let artifact_stdout = artifact
-        .try_clone()
-        .map_err(|e| Error::tool("bash", format!("Failed to clone job artifact handle: {e}")))?;
-    let tail_stdout = std::sync::Arc::clone(&tail);
-    std::thread::spawn(move || pump_job_stream(stdout, artifact_stdout, &tail_stdout));
-    let tail_stderr = std::sync::Arc::clone(&tail);
-    std::thread::spawn(move || pump_job_stream(stderr, artifact, &tail_stderr));
-
-    // Monitor thread: wait with the timeout/kill escalation, then record the
-    // final status and push a completion notice for the follow-up queue.
-    let monitor_id = id.clone();
-    std::thread::spawn(move || monitor_job(&monitor_id, child, timeout_secs));
-
-    let snapshot = {
-        let reg = registry()
-            .lock()
-            .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+        slot.commit(&mut reg);
         reg.jobs
             .get(&id)
-            .map(JobSnapshot::from_entry)
+            .map(JobSnapshotSource::from_entry)
             .ok_or_else(|| Error::tool("jobs", "job vanished after spawn".to_string()))?
     };
-    Ok(snapshot)
+
+    // The monitor is the sole process owner from this point through reap and
+    // bounded output drain. If thread creation fails, dropping the captured
+    // child guard kills and reaps the process before this function returns.
+    let monitor_id = id.clone();
+    let monitor_artifact = Arc::clone(&artifact);
+    let monitor_tail = Arc::clone(&tail);
+    if let Err(err) = std::thread::Builder::new()
+        .name(format!("pi-job-{id}-monitor"))
+        .spawn(move || {
+            monitor_job(
+                &monitor_id,
+                child,
+                started_at,
+                timeout_secs,
+                stdout_pump,
+                stderr_pump,
+                output_sealed,
+                monitor_artifact,
+                monitor_tail,
+            );
+        })
+    {
+        if let Ok(mut reg) = registry().lock() {
+            reg.jobs.remove(&id);
+        }
+        return Err(Error::tool(
+            "bash",
+            format!("Failed to start job monitor: {err}"),
+        ));
+    }
+
+    // Ownership has reached the monitor before inspecting I/O-owned state.
+    // A pump stalled in filesystem I/O must not strand the child, lifecycle
+    // lock, and cancellation path inside this spawn call.
+    Ok(JobSnapshot::from_source_best_effort(&snapshot_source))
 }
 
-fn pump_job_stream<R: Read>(mut reader: R, mut artifact: std::fs::File, tail: &Mutex<TailBuffer>) {
+fn pump_job_stream<R: Read>(
+    mut reader: R,
+    artifact: &Mutex<ArtifactSink>,
+    tail: &Mutex<TailBuffer>,
+    output_sealed: &AtomicBool,
+) -> std::io::Result<()> {
     let mut chunk = [0u8; 8192];
     loop {
+        if output_sealed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return Ok(()),
+            Err(err) => return Err(err),
             Ok(n) => {
+                if output_sealed.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 let data = &chunk[..n];
-                let _ = artifact.write_all(data);
+                artifact
+                    .lock()
+                    .map_err(|_| std::io::Error::other("job artifact state poisoned"))?
+                    .write(data);
                 if let Ok(mut tail) = tail.lock() {
                     tail.push(data);
                 }
@@ -352,114 +864,242 @@ fn pump_job_stream<R: Read>(mut reader: R, mut artifact: std::fs::File, tail: &M
     }
 }
 
-fn monitor_job(id: &str, mut child: std::process::Child, timeout_secs: Option<u64>) {
-    let start = Instant::now();
+fn finish_pump(
+    handle: std::thread::JoinHandle<std::io::Result<()>>,
+    deadline: Instant,
+) -> bool {
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !handle.is_finished() {
+        return false;
+    }
+    matches!(handle.join(), Ok(Ok(())))
+}
+
+fn last_chars(text: &str, cap: usize) -> String {
+    let char_count = text.chars().count();
+    text.chars()
+        .skip(char_count.saturating_sub(cap))
+        .collect()
+}
+
+fn monitor_job(
+    id: &str,
+    mut child: BackgroundChild,
+    started_at: Instant,
+    timeout_secs: Option<u64>,
+    stdout_pump: std::thread::JoinHandle<std::io::Result<()>>,
+    stderr_pump: std::thread::JoinHandle<std::io::Result<()>>,
+    output_sealed: Arc<AtomicBool>,
+    artifact: Arc<Mutex<ArtifactSink>>,
+    tail: Arc<Mutex<TailBuffer>>,
+) {
     let timeout = timeout_secs.map(Duration::from_secs);
     let mut terminate_at: Option<Instant> = None;
+    let mut termination_status: Option<JobStatus> = None;
 
     let exit_code = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(-1),
+        // Keep the nonblocking reap observation and `process_live` transition
+        // under the same registry lock used by cancellation. Once wait reports
+        // an exit, no concurrent caller can relabel that natural exit as a
+        // cancellation of a recycled numeric PID.
+        let wait_result = {
+            let mut reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let result = child.try_wait();
+            if matches!(result, Ok(Some(_)))
+                && let Some(job) = reg.jobs.get_mut(id)
+            {
+                job.pid = None;
+                job.process_live = false;
+            }
+            result
+        };
+        match wait_result {
+            Ok(Some(status)) => {
+                child.disarm();
+                break status.code();
+            }
             Ok(None) => {}
-            Err(_) => break -1,
+            Err(_) => break child.kill_and_wait(),
         }
 
         let now = Instant::now();
         if let Some(deadline) = terminate_at {
             if now >= deadline {
-                crate::tools::kill_process_group_tree(Some(child.id()));
-                let _ = child.kill();
-                let _ = child.wait();
-                break -1;
+                break child.kill_and_wait();
             }
-        } else if let Some(timeout) = timeout
-            && now.duration_since(start) >= timeout
-        {
-            // TERM first, KILL after the grace window (same escalation as
-            // the foreground bash path).
-            crate::tools::terminate_process_group_tree(Some(child.id()));
-            mark_status(id, JobStatus::TimedOut, None);
-            terminate_at = Some(now + TERMINATE_GRACE);
+        } else {
+            let cancel_requested = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .jobs
+                .get(id)
+                .map(|job| job.cancel_requested)
+                .unwrap_or(false);
+            if cancel_requested {
+                termination_status = Some(JobStatus::Killed);
+                crate::tools::terminate_process_group_tree(child.id());
+                terminate_at = Some(now + TERMINATE_GRACE);
+            } else if let Some(timeout) = timeout
+                && now.duration_since(started_at) >= timeout
+            {
+                termination_status = Some(JobStatus::TimedOut);
+                crate::tools::terminate_process_group_tree(child.id());
+                terminate_at = Some(now + TERMINATE_GRACE);
+            }
         }
 
         std::thread::sleep(Duration::from_millis(25));
     };
 
-    // Settle: cancelled beats timed-out beats natural exit.
-    let (status, code) = {
-        let cancelled = registry()
+    // KILL/wait and error-recovery paths reap outside the nonblocking seam
+    // above. Clear their process identity before draining output too.
+    {
+        let mut reg = registry()
             .lock()
-            .ok()
-            .and_then(|reg| reg.jobs.get(id).map(|job| job.cancel_requested))
-            .unwrap_or(false);
-        let timed_out = registry()
-            .lock()
-            .ok()
-            .and_then(|reg| {
-                reg.jobs
-                    .get(id)
-                    .map(|job| job.status == JobStatus::TimedOut)
-            })
-            .unwrap_or(false);
-        if cancelled {
-            (JobStatus::Killed, None)
-        } else if timed_out {
-            (JobStatus::TimedOut, Some(exit_code))
-        } else {
-            (
-                if exit_code == 0 {
-                    JobStatus::Exited
-                } else {
-                    JobStatus::Failed
-                },
-                Some(exit_code),
-            )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(job) = reg.jobs.get_mut(id) {
+            job.pid = None;
+            job.process_live = false;
         }
-    };
-    mark_status(id, status, code);
-
-    // Completion notice → follow-up queue (agent sees it next turn boundary).
-    let notice = {
-        let Ok(reg) = registry().lock() else {
-            return;
-        };
-        reg.jobs.get(id).map(|job| {
-            let snapshot = JobSnapshot::from_entry(job);
-            let tail_excerpt: String = snapshot.output_tail.chars().take(4096).collect();
-            format!(
-                "[background job {} settled: {} (exit {})]\ncommand: {}\nartifact: {}\noutput tail:\n{}",
-                snapshot.id,
-                snapshot.status,
-                snapshot
-                    .exit_code
-                    .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
-                snapshot.command.lines().nth(1).unwrap_or(&snapshot.command),
-                snapshot.artifact_path,
-                if tail_excerpt.is_empty() {
-                    "(no output)"
-                } else {
-                    &tail_excerpt
-                }
-            )
-        })
-    };
-    if let Some(notice) = notice {
-        push_completion_notice(notice);
     }
+
+    let drain_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+    let stdout_complete = finish_pump(stdout_pump, drain_deadline);
+    let stderr_complete = finish_pump(stderr_pump, drain_deadline);
+    let output_complete = stdout_complete && stderr_complete;
+    output_sealed.store(true, Ordering::Release);
+    if output_complete {
+        artifact
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seal();
+        tail.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seal();
+    } else {
+        if let Ok(mut artifact) = artifact.try_lock() {
+            artifact.seal();
+        }
+        if let Ok(mut tail) = tail.try_lock() {
+            tail.seal();
+        }
+    }
+
+    // Settle only after reap and bounded pipe drain. Classify by the action
+    // that actually initiated termination, not by a cancellation request that
+    // may have arrived after the OS process exited but before reap observation.
+    let (status, code) = match termination_status {
+        Some(JobStatus::Killed) => (JobStatus::Killed, None),
+        Some(JobStatus::TimedOut) => (JobStatus::TimedOut, exit_code),
+        _ => (
+            if exit_code == Some(0) {
+                JobStatus::Exited
+            } else {
+                JobStatus::Failed
+            },
+            exit_code,
+        ),
+    };
+    settle_job_and_enqueue_notice(id, status, code, output_complete);
 }
 
-fn mark_status(id: &str, status: JobStatus, exit_code: Option<i32>) {
-    if let Ok(mut reg) = registry().lock()
-        && let Some(job) = reg.jobs.get_mut(id)
-    {
-        if job.status.settled() && status == JobStatus::TimedOut {
-            // Already settled (e.g. cancel raced the timeout); keep it.
+fn settle_job_and_enqueue_notice(
+    id: &str,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    output_complete: bool,
+) {
+    // Build the potentially I/O-contended snapshot without holding the global
+    // registry. The best-effort mode prevents a blocked artifact write from
+    // stalling settlement or unrelated job operations.
+    let source = {
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.jobs.get(id).map(|job| {
+            let mut source = JobSnapshotSource::from_entry(job);
+            source.status = status;
+            source.exit_code = exit_code;
+            source.pid = None;
+            source.output_complete = output_complete;
+            source
+        })
+    };
+    let Some(source) = source else {
+        return;
+    };
+    let snapshot = JobSnapshot::from_source_best_effort(&source);
+    let tail_excerpt = last_chars(&snapshot.output_tail, 4096);
+    let notice = format!(
+            "[background job {} settled: {} (exit {}; outputComplete={}; artifactTruncated={})]\ncommand: {}\nartifact: {}\noutput tail:\n{}",
+            snapshot.id,
+            snapshot.status,
+            snapshot
+                .exit_code
+                .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
+            snapshot.output_complete,
+            snapshot.artifact_truncated,
+            snapshot.command.lines().nth(1).unwrap_or(&snapshot.command),
+            snapshot.artifact_path,
+            if tail_excerpt.is_empty() {
+                "(no output)"
+            } else {
+                &tail_excerpt
+            }
+        );
+
+    let notify = {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let settled_sequence = reg.next_settled_sequence;
+        reg.next_settled_sequence = reg.next_settled_sequence.saturating_add(1);
+        let Some(job) = reg.jobs.get_mut(id) else {
             return;
-        }
+        };
         job.status = status;
-        if exit_code.is_some() {
-            job.exit_code = exit_code;
+        job.exit_code = exit_code;
+        job.pid = None;
+        job.process_live = false;
+        job.output_complete = output_complete;
+        job.settled_sequence = Some(settled_sequence);
+        *job
+            .settled_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        let notify = Arc::clone(&job.settled_notify);
+        job.cancel_deadline.finish();
+        if reg.notices.len() >= MAX_COMPLETION_NOTICES {
+            reg.notices.remove(0);
         }
+        reg.notices.push(notice);
+        prune_settled_jobs(&mut reg);
+        notify
+    };
+    notify.notify_waiters();
+}
+
+fn prune_settled_jobs(reg: &mut JobRegistry) {
+    let mut settled: Vec<_> = reg
+        .jobs
+        .values()
+        .filter(|job| job.status.settled())
+        .filter_map(|job| {
+            job.settled_sequence
+                .map(|sequence| (sequence, job.id.clone()))
+        })
+        .collect();
+    if settled.len() <= MAX_RETAINED_SETTLED_JOBS {
+        return;
+    }
+    settled.sort();
+    let remove_count = settled.len() - MAX_RETAINED_SETTLED_JOBS;
+    for (_, id) in settled.into_iter().take(remove_count) {
+        reg.jobs.remove(&id);
     }
 }
 
@@ -471,7 +1111,105 @@ pub fn list() -> Result<Vec<JobSnapshot>> {
     let reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-    Ok(reg.jobs.values().map(JobSnapshot::from_entry).collect())
+    let mut sources: Vec<_> = reg
+        .jobs
+        .values()
+        .map(|job| {
+            let settled = job
+                .settled_snapshot
+                .try_lock()
+                .ok()
+                .and_then(|snapshot| snapshot.clone());
+            (
+                job.sequence,
+                settled,
+                JobSnapshotSource::from_entry(job),
+            )
+        })
+        .collect();
+    sources.sort_by_key(|(sequence, _, _)| *sequence);
+    drop(reg);
+    Ok(sources
+        .iter()
+        .map(|(_, settled, source)| {
+            settled
+                .clone()
+                .unwrap_or_else(|| JobSnapshot::from_source_best_effort(source))
+        })
+        .collect())
+}
+
+fn wait_handle(id: &str) -> Result<JobWaitHandle> {
+    let reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let job = reg.jobs.get(id).ok_or_else(|| {
+        Error::tool(
+            "jobs",
+            format!("PI_JOBS_UNKNOWN_ID: no background job named '{id}'"),
+        )
+    })?;
+    Ok(JobWaitHandle {
+        id: id.to_string(),
+        settled_snapshot: Arc::clone(&job.settled_snapshot),
+        settled_notify: Arc::clone(&job.settled_notify),
+        cancel_deadline: Arc::clone(&job.cancel_deadline),
+    })
+}
+
+fn settled_snapshot(handle: &JobWaitHandle) -> Option<JobSnapshot> {
+    handle
+        .settled_snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn snapshot_now_best_effort(handle: &JobWaitHandle) -> Result<JobSnapshot> {
+    if let Some(snapshot) = settled_snapshot(handle) {
+        return Ok(snapshot);
+    }
+    let reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    if let Some(job) = reg.jobs.get(&handle.id) {
+        let source = JobSnapshotSource::from_entry(job);
+        drop(reg);
+        return Ok(JobSnapshot::from_source_best_effort(&source));
+    }
+    drop(reg);
+    if let Some(snapshot) = settled_snapshot(handle) {
+        return Ok(snapshot);
+    }
+    Err(Error::tool(
+        "jobs",
+        format!("PI_JOBS_UNKNOWN_ID: no background job named '{}'", handle.id),
+    ))
+}
+
+fn wait_with_handle(handle: &JobWaitHandle, timeout: Duration) -> Result<JobSnapshot> {
+    let started = Instant::now();
+    loop {
+        if let Some(snapshot) = settled_snapshot(handle) {
+            return Ok(snapshot);
+        }
+        if started.elapsed() >= timeout {
+            return snapshot_now_best_effort(handle);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn remaining_wait_slice(now: Instant, deadline: Option<Instant>) -> Option<Duration> {
+    match deadline {
+        Some(deadline) if now >= deadline => None,
+        Some(deadline) => Some(
+            deadline
+                .saturating_duration_since(now)
+                .min(MAX_ASYNC_WAIT_SLICE),
+        ),
+        None => Some(MAX_ASYNC_WAIT_SLICE),
+    }
 }
 
 /// Wait for a job to settle (bounded), returning its snapshot either way.
@@ -480,42 +1218,102 @@ pub fn list() -> Result<Vec<JobSnapshot>> {
 /// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids.
 #[allow(clippy::significant_drop_tightening)]
 pub fn wait(id: &str, timeout: Duration) -> Result<JobSnapshot> {
-    let deadline = Instant::now() + timeout;
+    let handle = wait_handle(id)?;
+    wait_with_handle(&handle, timeout)
+}
+
+/// Async variant used by tool execution so a long wait continues yielding to
+/// abort/steering and unrelated sessions.
+///
+/// # Errors
+/// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids.
+pub async fn wait_async(id: &str, timeout: Duration) -> Result<JobSnapshot> {
+    let handle = wait_handle(id)?;
+    let cx = crate::agent_cx::AgentCx::for_current_or_request();
+    let now = cx
+        .cx()
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+    let deadline = now.checked_add(timeout);
     loop {
-        let settled_snapshot = {
-            let reg = registry()
-                .lock()
-                .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-            let Some(job) = reg.jobs.get(id) else {
-                return Err(Error::tool(
-                    "jobs",
-                    format!("PI_JOBS_UNKNOWN_ID: no background job named '{id}'"),
-                ));
-            };
-            if job.status.settled() {
-                Some(JobSnapshot::from_entry(job))
-            } else {
-                None
-            }
+        if let Some(snapshot) = settled_snapshot(&handle) {
+            return Ok(snapshot);
+        }
+        let now = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let Some(sleep_for) = remaining_wait_slice(now, deadline) else {
+            return snapshot_now_best_effort(&handle);
         };
-        if let Some(snapshot) = settled_snapshot {
-            return Ok(snapshot);
+        let notified = handle
+            .settled_notify
+            .wait_until(|| settled_snapshot(&handle).is_some())
+            .fuse();
+        let deadline_sleep = asupersync::time::sleep(now, sleep_for).fuse();
+        futures::pin_mut!(notified, deadline_sleep);
+        match futures::future::select(notified, deadline_sleep).await {
+            futures::future::Either::Left(((), _)) => {}
+            futures::future::Either::Right(((), _)) => {
+                if let Some(snapshot) = settled_snapshot(&handle) {
+                    return Ok(snapshot);
+                }
+            }
         }
-        if Instant::now() >= deadline {
-            let snapshot = {
-                let reg = registry()
-                    .lock()
-                    .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-                let job = reg
-                    .jobs
-                    .get(id)
-                    .ok_or_else(|| Error::tool("jobs", "job vanished".to_string()))?;
-                JobSnapshot::from_entry(job)
-            };
-            return Ok(snapshot);
-        }
-        std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+async fn wait_for_settlement_wall(
+    handle: &JobWaitHandle,
+    timeout: Duration,
+) -> Result<JobSnapshot> {
+    if let Some(snapshot) = settled_snapshot(handle) {
+        return Ok(snapshot);
+    }
+    let _started_deadline = handle.cancel_deadline.start(timeout)?;
+    let settlement = handle
+        .settled_notify
+        .wait_until(|| settled_snapshot(handle).is_some())
+        .fuse();
+    let deadline = handle
+        .cancel_deadline
+        .notify
+        .wait_until(|| handle.cancel_deadline.expired.load(Ordering::Acquire))
+        .fuse();
+    futures::pin_mut!(settlement, deadline);
+    match futures::future::select(settlement, deadline).await {
+        futures::future::Either::Left(((), _)) => settled_snapshot(handle)
+            .ok_or_else(|| Error::tool("jobs", "job settlement notification lost".to_string())),
+        futures::future::Either::Right(((), _)) => snapshot_now_best_effort(handle),
+    }
+}
+
+fn request_cancel(id: &str) -> Result<JobWaitHandle> {
+    let mut reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let Some(job) = reg.jobs.get_mut(id) else {
+        return Err(Error::tool(
+            "jobs",
+            format!("PI_JOBS_UNKNOWN_ID: no background job named '{id}'"),
+        ));
+    };
+    if job.status.settled() || !job.process_live {
+        return Err(Error::tool(
+            "jobs",
+            format!(
+                "PI_JOBS_NOT_RUNNING: job '{id}' no longer owns a live process ({})",
+                job.status.as_str()
+            ),
+        ));
+    }
+    job.cancel_requested = true;
+    Ok(JobWaitHandle {
+        id: id.to_string(),
+        settled_snapshot: Arc::clone(&job.settled_snapshot),
+        settled_notify: Arc::clone(&job.settled_notify),
+        cancel_deadline: Arc::clone(&job.cancel_deadline),
+    })
 }
 
 /// Cancel a running job with the bash timeout escalation (TERM → grace →
@@ -526,41 +1324,45 @@ pub fn wait(id: &str, timeout: Duration) -> Result<JobSnapshot> {
 /// when the job already settled.
 #[allow(clippy::significant_drop_tightening)]
 pub fn cancel(id: &str) -> Result<JobSnapshot> {
-    let pid = {
-        let mut reg = registry()
-            .lock()
-            .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-        let Some(job) = reg.jobs.get_mut(id) else {
-            return Err(Error::tool(
-                "jobs",
-                format!("PI_JOBS_UNKNOWN_ID: no background job named '{id}'"),
-            ));
-        };
-        if job.status.settled() {
-            return Err(Error::tool(
-                "jobs",
-                format!(
-                    "PI_JOBS_NOT_RUNNING: job '{id}' already settled ({})",
-                    job.status.as_str()
-                ),
-            ));
-        }
-        job.cancel_requested = true;
-        job.pid
-    };
-    crate::tools::terminate_process_group_tree(pid);
+    let handle = request_cancel(id)?;
     // The monitor thread applies the KILL escalation and records the final
     // status; wait briefly so the snapshot reflects the settle.
-    wait(id, Duration::from_secs(10))
+    let snapshot = wait_with_handle(&handle, Duration::from_secs(10))?;
+    if snapshot.status == JobStatus::Running.as_str() {
+        return Err(Error::tool(
+            "jobs",
+            format!("PI_JOBS_CANCEL_TIMEOUT: job '{id}' did not settle after cancellation"),
+        ));
+    }
+    Ok(snapshot)
+}
+
+/// Async cancellation variant for tool entry points. The process monitor owns
+/// TERM → KILL escalation; this wait yields to the runtime instead of pinning an
+/// executor worker for the grace period.
+///
+/// # Errors
+/// Same named errors as [`cancel`], plus `PI_JOBS_CANCEL_TIMEOUT` if the monitor
+/// cannot publish a terminal state within the bounded cleanup window.
+pub async fn cancel_async(id: &str) -> Result<JobSnapshot> {
+    let handle = request_cancel(id)?;
+    let snapshot = wait_for_settlement_wall(&handle, Duration::from_secs(10)).await?;
+    if snapshot.status == JobStatus::Running.as_str() {
+        return Err(Error::tool(
+            "jobs",
+            format!("PI_JOBS_CANCEL_TIMEOUT: job '{id}' did not settle after cancellation"),
+        ));
+    }
+    Ok(snapshot)
 }
 
 /// Drain pending completion notices as follow-up messages for the agent.
 /// The fetcher registered with the agent calls this on every poll.
 #[must_use]
 pub fn take_completion_notices() -> Vec<Message> {
-    let Ok(mut reg) = registry().lock() else {
-        return Vec::new();
-    };
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     reg.notices
         .drain(..)
         .map(completion_notice_message)
@@ -580,10 +1382,9 @@ fn completion_notice_message(text: String) -> Message {
 /// modes, persistence, RPC behavior, and turn-boundary semantics stay
 /// identical.
 pub fn push_completion_notice(text: impl Into<String>) {
-    let Ok(mut reg) = registry().lock() else {
-        tracing::error!("jobs registry poisoned; dropping completion notice");
-        return;
-    };
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if reg.notices.len() >= MAX_COMPLETION_NOTICES {
         reg.notices.remove(0);
     }
@@ -607,23 +1408,29 @@ pub fn follow_up_fetcher() -> crate::agent::MessageFetcher {
 /// Kill every running job (session exit). Called once from the main
 /// shutdown chokepoint; documented behavior — no orphan daemons.
 pub fn kill_all() {
-    let pids: Vec<Option<u32>> = {
-        let Ok(mut reg) = registry().lock() else {
-            return;
-        };
+    let _lifecycle = lifecycle_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let jobs: Vec<String> = {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for job in reg.jobs.values_mut() {
-            if !job.status.settled() {
+            if !job.status.settled() && job.process_live {
                 job.cancel_requested = true;
             }
         }
         reg.jobs
             .values()
             .filter(|job| !job.status.settled())
-            .map(|job| job.pid)
+            .map(|job| job.id.clone())
             .collect()
     };
-    for pid in pids {
-        crate::tools::kill_process_group_tree(pid);
+    for id in jobs {
+        let _ = wait(
+            &id,
+            TERMINATE_GRACE + OUTPUT_DRAIN_GRACE + Duration::from_secs(1),
+        );
     }
 }
 
@@ -631,10 +1438,83 @@ pub fn kill_all() {
 mod tests {
     use super::*;
 
+    fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn temp_root() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-jobs-test-{}", std::process::id()));
+        static NEXT_ROOT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "pi-jobs-test-{}-{sequence}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("temp root");
         dir
+    }
+
+    fn synthetic_entry(
+        id: &str,
+        artifact_path: PathBuf,
+        sequence: u64,
+        process_live: bool,
+    ) -> JobEntry {
+        let file = std::fs::File::create(&artifact_path).expect("synthetic artifact");
+        JobEntry {
+            id: id.to_string(),
+            command: "true".to_string(),
+            started_at_ms: 1,
+            sequence,
+            settled_sequence: None,
+            status: JobStatus::Running,
+            exit_code: None,
+            pid: process_live.then_some(123_456),
+            artifact_path,
+            tail: Arc::new(Mutex::new(TailBuffer::new(8))),
+            artifact: Arc::new(Mutex::new(ArtifactSink::new(file, 16))),
+            output_complete: false,
+            cancel_requested: false,
+            process_live,
+            settled_snapshot: Arc::new(Mutex::new(None)),
+            settled_notify: Arc::new(Notify::new()),
+            cancel_deadline: Arc::new(CancelDeadline::new()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn wait_for_output(id: &str, marker: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snapshot = wait(id, Duration::ZERO).expect("job snapshot");
+            if snapshot.output_tail.contains(marker) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "job never emitted {marker:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_path(path: &Path, timeout: Duration) {
+        let started = Instant::now();
+        while !path.exists() {
+            assert!(
+                started.elapsed() < timeout,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -644,6 +1524,373 @@ mod tests {
         tail.push(b"world!");
         // "hello world!" is 12 bytes; the tail retains the last 8.
         assert_eq!(tail.text(), "o world!");
+    }
+
+    #[test]
+    fn completion_excerpt_keeps_most_recent_characters() {
+        let text = format!("{}LATEST", "x".repeat(5000));
+        let excerpt = last_chars(&text, 4096);
+        assert_eq!(excerpt.chars().count(), 4096);
+        assert!(excerpt.ends_with("LATEST"));
+    }
+
+    #[test]
+    fn artifact_sink_caps_bytes_and_reports_write_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("artifact.log");
+        let file = std::fs::File::create(&path).expect("create artifact");
+        let mut sink = ArtifactSink::new(file, 4);
+        sink.write(b"abcdef");
+        assert_eq!(sink.bytes_written, 4);
+        assert!(sink.truncated);
+        assert!(sink.write_error.is_none());
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 4);
+
+        let read_only = std::fs::File::open(&path).expect("open read-only");
+        let mut failing = ArtifactSink::new(read_only, 8);
+        failing.write(b"x");
+        assert!(failing.write_error.is_some());
+        failing.write(b"ignored after first failure");
+        assert_eq!(failing.bytes_written, 0);
+
+        sink.seal();
+        assert!(sink.file.is_none(), "settlement must close the artifact fd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_creation_is_exclusive_and_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = temp.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, "preserve-me").expect("victim");
+        symlink(&victim, jobs_dir.join("job-planted.log")).expect("planted symlink");
+
+        let error = create_job_artifact(&jobs_dir, "job-planted")
+            .expect_err("create_new must refuse an existing symlink");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim remains readable"),
+            "preserve-me"
+        );
+    }
+
+    #[test]
+    fn aggregate_artifact_budget_refuses_bytes_and_entries() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("one.log"), b"12345").expect("first artifact");
+        let bytes_error = ensure_artifact_budget(temp.path(), 4, 10)
+            .expect_err("stored bytes above the budget must refuse new jobs");
+        assert!(bytes_error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
+
+        std::fs::write(temp.path().join("two.log"), b"").expect("second artifact");
+        let entries_error = ensure_artifact_budget(temp.path(), u64::MAX, 2)
+            .expect_err("entry count at the budget must refuse new jobs");
+        assert!(
+            entries_error
+                .to_string()
+                .contains("PI_JOBS_ARTIFACT_CAPACITY")
+        );
+    }
+
+    #[test]
+    fn aggregate_artifact_budget_reserves_locked_live_files_at_full_cap() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let live_path = temp.path().join("job-live.log");
+        let live = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&live_path)
+            .expect("live artifact");
+        live.lock_exclusive().expect("reserve live artifact");
+
+        let two_job_budget = u64::try_from(MAX_ARTIFACT_BYTES)
+            .expect("artifact cap fits")
+            .saturating_mul(2);
+        let error = ensure_artifact_budget(temp.path(), two_job_budget - 1, 10)
+            .expect_err("live artifact plus prospective job must reserve two full caps");
+        assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
+        fs4::FileExt::unlock(&live).expect("release live artifact reservation");
+    }
+
+    #[test]
+    fn artifact_budget_lock_child() {
+        let Ok(mode) = std::env::var("PI_JOBS_BUDGET_LOCK_CHILD") else {
+            return;
+        };
+        let jobs_dir = PathBuf::from(
+            std::env::var_os("PI_JOBS_BUDGET_LOCK_DIR").expect("child lock directory"),
+        );
+        let marker_dir = PathBuf::from(
+            std::env::var_os("PI_JOBS_BUDGET_MARKER_DIR").expect("child marker directory"),
+        );
+        if mode == "probe" {
+            std::fs::write(marker_dir.join("probe-attempted"), b"").expect("probe marker");
+        }
+        let _lock = acquire_artifact_budget_lock(&jobs_dir).expect("child budget lock");
+        match mode.as_str() {
+            "holder" => {
+                std::fs::write(marker_dir.join("holder-acquired"), b"")
+                    .expect("holder marker");
+                wait_for_path(&marker_dir.join("release-holder"), Duration::from_secs(5));
+            }
+            "probe" => {
+                std::fs::write(marker_dir.join("probe-acquired"), b"")
+                    .expect("probe acquired marker");
+            }
+            other => panic!("unknown child mode {other:?}"),
+        }
+    }
+
+    #[test]
+    fn artifact_budget_lock_serializes_independent_processes() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = temp.path().join("jobs");
+        let marker_dir = temp.path().join("markers");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs directory");
+        std::fs::create_dir_all(&marker_dir).expect("marker directory");
+        let test_binary = std::env::current_exe().expect("current test binary");
+        let spawn_child = |mode: &str| {
+            std::process::Command::new(&test_binary)
+                .args(["--exact", "jobs::tests::artifact_budget_lock_child"])
+                .env("PI_JOBS_BUDGET_LOCK_CHILD", mode)
+                .env("PI_JOBS_BUDGET_LOCK_DIR", &jobs_dir)
+                .env("PI_JOBS_BUDGET_MARKER_DIR", &marker_dir)
+                .spawn()
+                .expect("spawn budget-lock child")
+        };
+
+        let mut holder = spawn_child("holder");
+        wait_for_path(
+            &marker_dir.join("holder-acquired"),
+            Duration::from_secs(2),
+        );
+        let mut probe = spawn_child("probe");
+        wait_for_path(
+            &marker_dir.join("probe-attempted"),
+            Duration::from_secs(2),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let probe_was_blocked = !marker_dir.join("probe-acquired").exists();
+        std::fs::write(marker_dir.join("release-holder"), b"").expect("release holder");
+        assert!(holder.wait().expect("wait for holder").success());
+        assert!(probe.wait().expect("wait for probe").success());
+        assert!(
+            probe_was_blocked,
+            "the second process acquired the artifact budget lock concurrently"
+        );
+        assert!(marker_dir.join("probe-acquired").exists());
+    }
+
+    #[test]
+    fn cancellation_deadline_monitor_is_coalesced_per_job() {
+        let deadline = Arc::new(CancelDeadline::new());
+        assert!(
+            deadline
+                .start(Duration::from_secs(2))
+                .expect("start first deadline")
+        );
+        assert!(
+            !deadline
+                .start(Duration::from_secs(2))
+                .expect("reuse first deadline"),
+            "a duplicate cancellation must not create another OS deadline thread"
+        );
+        deadline.finish();
+    }
+
+    #[test]
+    fn cancellation_deadline_spawn_failure_cannot_fool_a_duplicate_starter() {
+        let deadline = Arc::new(CancelDeadline::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_deadline = Arc::clone(&deadline);
+        let first = std::thread::spawn(move || {
+            first_deadline.start_with(Duration::from_secs(2), move |_, _| {
+                entered_tx.send(()).expect("announce injected spawn");
+                release_rx.recv().expect("release injected spawn");
+                Err(std::io::Error::other("injected thread spawn failure"))
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first starter reached injected spawn");
+
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let second_deadline = Arc::clone(&deadline);
+        let second = std::thread::spawn(move || {
+            let result = second_deadline.start(Duration::from_secs(2));
+            second_tx.send(result).expect("return second start result");
+        });
+        assert!(
+            second_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "duplicate starter must wait until the in-flight spawn succeeds or fails"
+        );
+
+        release_tx.send(()).expect("release first starter");
+        assert!(
+            first.join().expect("first starter thread").is_err(),
+            "the injected spawn must fail"
+        );
+        assert!(
+            second_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second starter result")
+                .expect("second starter must retry successfully"),
+            "the second starter must create the deadline thread after the failure"
+        );
+        deadline.finish();
+        second.join().expect("second starter thread");
+    }
+
+    #[test]
+    fn settlement_is_bounded_when_artifact_state_is_busy() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-busy-artifact-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        let artifact = Arc::clone(&entry.artifact);
+        let handle = JobWaitHandle {
+            id: id.clone(),
+            settled_snapshot: Arc::clone(&entry.settled_snapshot),
+            settled_notify: Arc::clone(&entry.settled_notify),
+            cancel_deadline: Arc::clone(&entry.cancel_deadline),
+        };
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let artifact_guard = artifact.lock().expect("artifact lock");
+        settle_job_and_enqueue_notice(&id, JobStatus::Exited, Some(0), false);
+        let snapshot = settled_snapshot(&handle).expect("terminal snapshot");
+        assert_eq!(snapshot.status, "exited");
+        assert!(
+            snapshot.artifact_truncated,
+            "unavailable artifact state must be reported conservatively"
+        );
+        assert_eq!(
+            snapshot.artifact_error.as_deref(),
+            Some("artifact state unavailable while snapshotting")
+        );
+        drop(artifact_guard);
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+        let _ = take_completion_notices();
+    }
+
+    #[test]
+    fn list_is_bounded_when_artifact_state_is_busy() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-busy-list-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        let artifact = Arc::clone(&entry.artifact);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let artifact_guard = artifact.lock().expect("artifact lock");
+        let (listed_tx, listed_rx) = std::sync::mpsc::channel();
+        let listing = std::thread::spawn(move || {
+            listed_tx.send(list()).expect("return list result");
+        });
+        let prompt_result = listed_rx.recv_timeout(Duration::from_secs(2));
+        drop(artifact_guard);
+        listing.join().expect("listing thread");
+        let snapshots = prompt_result
+            .expect("list must not wait for a busy artifact")
+            .expect("list result");
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == id)
+            .expect("busy job remains listed");
+        assert!(snapshot.artifact_truncated);
+        assert!(snapshot.artifact_error.is_some());
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn cancellation_refuses_a_reaped_process_identity() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-reaped-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let error = request_cancel(&id).expect_err("reaped process must not be signalled");
+        assert!(error.to_string().contains("PI_JOBS_NOT_RUNNING"));
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn settled_job_retention_is_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut reg = JobRegistry::default();
+        for index in 0..(MAX_RETAINED_SETTLED_JOBS + 3) {
+            let id = format!("job-{index:03}");
+            let file = std::fs::File::create(temp.path().join(format!("{id}.log")))
+                .expect("artifact");
+            let mut artifact = ArtifactSink::new(file, 16);
+            artifact.seal();
+            reg.jobs.insert(
+                id.clone(),
+                JobEntry {
+                    id,
+                    command: "true".to_string(),
+                    started_at_ms: i64::try_from(index).expect("index fits"),
+                    sequence: u64::try_from(index).expect("index fits"),
+                    settled_sequence: Some(u64::try_from(index).expect("index fits")),
+                    status: JobStatus::Exited,
+                    exit_code: Some(0),
+                    pid: None,
+                    artifact_path: temp.path().join(format!("job-{index:03}.log")),
+                    tail: Arc::new(Mutex::new(TailBuffer::new(8))),
+                    artifact: Arc::new(Mutex::new(artifact)),
+                    output_complete: true,
+                    cancel_requested: false,
+                    process_live: false,
+                    settled_snapshot: Arc::new(Mutex::new(None)),
+                    settled_notify: Arc::new(Notify::new()),
+                    cancel_deadline: Arc::new(CancelDeadline::new()),
+                },
+            );
+        }
+
+        prune_settled_jobs(&mut reg);
+        assert_eq!(reg.jobs.len(), MAX_RETAINED_SETTLED_JOBS);
+        assert!(!reg.jobs.contains_key("job-000"));
+        assert!(reg.jobs.contains_key(&format!(
+            "job-{:03}",
+            MAX_RETAINED_SETTLED_JOBS + 2
+        )));
     }
 
     #[test]
@@ -661,6 +1908,7 @@ mod tests {
 
     #[test]
     fn spawn_list_wait_cycle() {
+        let _guard = process_test_guard();
         let root = temp_root();
         let snapshot = spawn_background(
             &root,
@@ -676,23 +1924,113 @@ mod tests {
         assert_eq!(settled.status, "exited");
         assert_eq!(settled.exit_code, Some(0));
         assert!(settled.output_tail.contains("job-output-marker"));
+        assert!(settled.output_complete);
+        assert!(!settled.artifact_truncated);
+        assert!(settled.artifact_error.is_none());
         assert!(std::path::Path::new(&settled.artifact_path).exists());
         let listed = list().expect("list");
         assert!(listed.iter().any(|job| job.id == settled.id));
         let notices = take_completion_notices();
         assert!(
-            notices.is_empty() || notices.iter().any(|_| true),
-            "notice drain must not panic"
+            notices.iter().any(|message| matches!(
+                message,
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) if text.contains(&settled.id) && text.contains("job-output-marker")
+            )),
+            "settled publication and its completion notice must be atomic"
+        );
+    }
+
+    #[test]
+    fn settled_waits_accept_extreme_durations_without_overflow() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-huge-wait-{}", uuid::Uuid::new_v4().simple());
+        let mut entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        entry.status = JobStatus::Exited;
+        entry.exit_code = Some(0);
+        entry.output_complete = true;
+        let snapshot = JobSnapshot::from_source_best_effort(&JobSnapshotSource::from_entry(&entry));
+        *entry
+            .settled_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let async_snapshot = runtime
+            .block_on(wait_async(&id, Duration::MAX))
+            .expect("async settled wait");
+        assert_eq!(async_snapshot.status, "exited");
+        let sync_snapshot = wait(&id, Duration::MAX).expect("sync settled wait");
+        assert_eq!(sync_snapshot.status, "exited");
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn async_wait_slices_do_not_become_premature_deadlines() {
+        let now = Instant::now();
+        let deadline = now.checked_add(Duration::from_secs(3 * 60 * 60));
+        assert_eq!(
+            remaining_wait_slice(now, deadline),
+            Some(MAX_ASYNC_WAIT_SLICE)
+        );
+        let after_one_slice = now
+            .checked_add(MAX_ASYNC_WAIT_SLICE)
+            .expect("one-hour instant");
+        assert_eq!(
+            remaining_wait_slice(after_one_slice, deadline),
+            Some(MAX_ASYNC_WAIT_SLICE),
+            "an intermediate timer wake must continue waiting"
+        );
+        assert_eq!(
+            remaining_wait_slice(deadline.expect("representable deadline"), deadline),
+            None
+        );
+        assert_eq!(
+            remaining_wait_slice(now, now.checked_add(Duration::MAX)),
+            Some(MAX_ASYNC_WAIT_SLICE),
+            "an unrepresentable deadline must remain a bounded infinite wait"
         );
     }
 
     #[test]
     fn cancel_kills_running_job() {
+        let _guard = process_test_guard();
         let root = temp_root();
-        let snapshot =
-            spawn_background(&root, None, None, "sleep 60", Some(120), Some(&root)).expect("spawn");
+        let snapshot = spawn_background(
+            &root,
+            None,
+            None,
+            "trap '' TERM; echo cancel-ready; while :; do sleep 1; done",
+            Some(120),
+            Some(&root),
+        )
+        .expect("spawn");
+        wait_for_output(&snapshot.id, "cancel-ready", Duration::from_secs(2));
+        let started = Instant::now();
         let cancelled = cancel(&snapshot.id).expect("cancel");
         assert_eq!(cancelled.status, "killed");
+        assert!(
+            started.elapsed() >= TERMINATE_GRACE,
+            "TERM-ignoring job must reach KILL escalation"
+        );
+        assert!(cancelled.output_complete);
+        #[cfg(unix)]
+        assert!(!process_exists(snapshot.pid.expect("pid")));
         // Drain the completion notice (pushed asynchronously by the monitor
         // thread) so it cannot leak into concurrently running agent-loop
         // tests through the process-global follow-up queue.
@@ -717,5 +2055,84 @@ mod tests {
     fn wait_rejects_unknown_id() {
         let err = wait("job-does-not-exist", Duration::from_millis(10)).unwrap_err();
         assert!(err.to_string().contains("PI_JOBS_UNKNOWN_ID"));
+    }
+
+    #[test]
+    fn artifact_creation_failure_happens_before_process_spawn() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        std::fs::write(root.join("jobs"), "not a directory")
+            .expect("conflicting jobs path");
+        let marker = root.join("spawned-marker");
+        let command = format!("printf ran > '{}'", marker.display());
+
+        let err = spawn_background(&root, None, None, &command, Some(30), Some(&root))
+            .expect_err("artifact creation must fail");
+        assert!(err.to_string().contains("Failed to create jobs artifact dir"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "process must not spawn before artifact setup");
+        assert_eq!(registry().lock().expect("registry").starting_jobs, 0);
+    }
+
+    #[test]
+    fn timeout_remains_running_until_term_ignoring_process_is_reaped() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let snapshot = spawn_background(
+            &root,
+            None,
+            None,
+            "trap '' TERM; echo timeout-ready; while :; do sleep 1; done",
+            Some(1),
+            Some(&root),
+        )
+        .expect("spawn");
+        wait_for_output(&snapshot.id, "timeout-ready", Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(1200));
+        let during_grace = wait(&snapshot.id, Duration::ZERO).expect("snapshot during grace");
+        assert_eq!(during_grace.status, "running");
+
+        let settled = wait(&snapshot.id, Duration::from_secs(8)).expect("timed out job settles");
+        assert_eq!(settled.status, "timedOut");
+        assert!(settled.output_complete);
+        #[cfg(unix)]
+        assert!(!process_exists(snapshot.pid.expect("pid")));
+    }
+
+    #[test]
+    fn concurrent_spawns_respect_capacity() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let barrier = Arc::new(std::sync::Barrier::new(MAX_CONCURRENT_JOBS + 2));
+        let mut callers = Vec::new();
+        for _ in 0..=MAX_CONCURRENT_JOBS {
+            let caller_root = root.clone();
+            let caller_barrier = Arc::clone(&barrier);
+            callers.push(std::thread::spawn(move || {
+                caller_barrier.wait();
+                spawn_background(
+                    &caller_root,
+                    None,
+                    None,
+                    "sleep 60",
+                    Some(120),
+                    Some(&caller_root),
+                )
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("spawn caller"))
+            .collect();
+        let succeeded: Vec<_> = results.iter().filter_map(|result| result.as_ref().ok()).collect();
+        let rejected: Vec<_> = results.iter().filter_map(|result| result.as_ref().err()).collect();
+        assert_eq!(succeeded.len(), MAX_CONCURRENT_JOBS);
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].to_string().contains("PI_JOBS_AT_CAPACITY"));
+
+        for snapshot in succeeded {
+            cancel(&snapshot.id).expect("cleanup capacity test job");
+        }
     }
 }

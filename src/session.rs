@@ -14,8 +14,8 @@ use crate::model::{
 };
 use crate::provider_metadata::{canonical_provider_id, provider_ids_match};
 use crate::session_index::{
-    SessionIndex, SessionIndexRefreshSummary, enqueue_session_index_snapshot_update,
-    is_session_file_path, session_file_stats,
+    SessionIndex, SessionIndexRefreshSummary, begin_session_index_namespace_change,
+    enqueue_session_index_snapshot_update, is_session_file_path, session_file_stats,
 };
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
@@ -42,6 +42,8 @@ use tracing::warn;
 /// Current session file format version.
 pub const SESSION_VERSION: u8 = 3;
 const MAX_JSONL_LINE_BYTES: usize = 100 * 1024 * 1024;
+const SHARE_SESSION_INPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SHARE_SESSION_HTML_MAX_BYTES: usize = 16 * 1024 * 1024;
 const V2_CHAIN_HASH_GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 const V2_SOURCE_STATE_SCHEMA: &str = "pi.session_store_v2.source_state.v1";
@@ -1428,6 +1430,7 @@ fn save_jsonl_full_rewrite_blocking(
     let _lock = lock_session_persistence(path)?;
     let (header_to_write, entries_to_write) =
         prepare_jsonl_full_rewrite(path, header, entries, header_dirty)?;
+    let index_generation = begin_session_index_namespace_change(sessions_root)?;
     persist_jsonl_snapshot_locked(path, &header_to_write, &entries_to_write)?;
     let mut entries_for_stats = entries_to_write.clone();
     let finalized = finalize_loaded_entries(&mut entries_for_stats);
@@ -1439,6 +1442,7 @@ fn save_jsonl_full_rewrite_blocking(
         &header_to_write,
         message_count,
         session_name,
+        Some(index_generation),
     );
     Ok((header_to_write, entries_to_write))
 }
@@ -1564,6 +1568,11 @@ fn append_jsonl_entries_blocking(
     } = plan_jsonl_incremental_append(&disk_session, new_entries)?;
 
     let rewrite_unterminated = !serialized_entries.is_empty() && !jsonl_ends_with_newline(path)?;
+    let index_generation = if serialized_entries.is_empty() {
+        None
+    } else {
+        Some(begin_session_index_namespace_change(sessions_root)?)
+    };
     let persisted_entries = if rewrite_unterminated {
         // An interrupted append can leave either a complete JSON record without
         // its delimiter or an invalid torn final record. Never concatenate the
@@ -1591,6 +1600,7 @@ fn append_jsonl_entries_blocking(
         &disk_session.header,
         message_count,
         session_name,
+        index_generation,
     );
     Ok((disk_session.header, persisted_entries))
 }
@@ -4576,8 +4586,11 @@ impl Session {
             }
             #[cfg(feature = "sqlite-sessions")]
             SessionStoreKind::Sqlite => {
+                let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
+                let mut index_generation = None;
                 if self.should_full_rewrite() {
                     // === Full rewrite path (first save, header change, checkpoint) ===
+                    index_generation = Some(begin_session_index_namespace_change(&sessions_root)?);
                     let (persisted_header, persisted_entries) =
                         crate::session_sqlite::save_session(
                             &path_clone,
@@ -4593,6 +4606,8 @@ impl Session {
                     // === Incremental append path ===
                     let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
                     if new_start < self.entries.len() {
+                        index_generation =
+                            Some(begin_session_index_namespace_change(&sessions_root)?);
                         let (persisted_header, persisted_entries) =
                             crate::session_sqlite::append_entries(
                                 &path_clone,
@@ -4607,7 +4622,6 @@ impl Session {
                     // No new entries → no-op, nothing to write.
                 }
 
-                let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
                 let message_count = self.cached_message_count;
                 let session_name = self.cached_name.clone();
                 enqueue_session_index_snapshot_update(
@@ -4616,6 +4630,7 @@ impl Session {
                     &self.header,
                     message_count,
                     session_name,
+                    index_generation,
                 );
             }
         }
@@ -5002,6 +5017,10 @@ impl Session {
         self.cached_name.clone()
     }
 
+    pub(crate) fn get_name_ref(&self) -> Option<&str> {
+        self.cached_name.as_deref()
+    }
+
     /// Set the session name by appending a `SessionInfo` entry.
     pub fn set_name(&mut self, name: &str) -> String {
         self.append_session_info(Some(name.to_string()))
@@ -5104,6 +5123,39 @@ impl Session {
     /// cloning internal caches.
     pub fn to_html(&self) -> String {
         render_session_html(&self.header, &self.entries)
+    }
+
+    /// Render the selected conversation branch for secret-gist link sharing.
+    ///
+    /// Unlike a local HTML export, a shared transcript excludes abandoned
+    /// sibling branches and local filesystem metadata such as the session cwd.
+    ///
+    /// # Errors
+    /// Returns a session error when the selected branch exceeds the bounded
+    /// share-input or rendered-HTML limits, or cannot be measured safely.
+    pub fn to_share_html(&self) -> Result<String> {
+        let entries = self.entries_for_current_path();
+        validate_share_entries_size(entries.iter().copied())?;
+        let redacted_entries = redact_share_entries(entries, &self.header.cwd)?;
+        let mut html = render_session_html_entries(&self.header, redacted_entries.iter(), false);
+        if html.len() > SHARE_SESSION_HTML_MAX_BYTES {
+            return Err(Error::session(format!(
+                "Shared transcript exceeds the {}-byte HTML limit",
+                SHARE_SESSION_HTML_MAX_BYTES
+            )));
+        }
+
+        // Screen the final serialization as defense in depth. Exact cwd
+        // replacement happens in entry values before rendering so a cwd such
+        // as `/style` can never rewrite HTML syntax.
+        html = crate::memory::screen_secrets(&html);
+        if html.len() > SHARE_SESSION_HTML_MAX_BYTES {
+            return Err(Error::session(format!(
+                "Redacted shared transcript exceeds the {}-byte HTML limit",
+                SHARE_SESSION_HTML_MAX_BYTES
+            )));
+        }
+        Ok(html)
     }
 
     /// Update header model info.
@@ -6671,14 +6723,212 @@ pub(crate) fn bash_execution_to_text(
     text
 }
 
+/// Counting writer used to reject oversized share payloads before HTML
+/// rendering duplicates or expands their contents in memory.
+struct ShareSizeProbe {
+    bytes: usize,
+    cap: usize,
+}
+
+impl Write for ShareSizeProbe {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let next = self.bytes.checked_add(data.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shared transcript size overflow",
+            )
+        })?;
+        if next > self.cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shared transcript input limit exceeded",
+            ));
+        }
+        self.bytes = next;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_share_entries_size<'a>(
+    entries: impl IntoIterator<Item = &'a SessionEntry>,
+) -> Result<()> {
+    validate_share_entries_size_with_cap(entries, SHARE_SESSION_INPUT_MAX_BYTES)
+}
+
+fn validate_share_entries_size_with_cap<'a>(
+    entries: impl IntoIterator<Item = &'a SessionEntry>,
+    cap: usize,
+) -> Result<()> {
+    let mut probe = ShareSizeProbe {
+        bytes: 0,
+        cap,
+    };
+    for entry in entries {
+        serde_json::to_writer(&mut probe, entry).map_err(|err| {
+            Error::session(format!(
+                "Shared transcript exceeds the {}-byte input limit or cannot be measured: {err}",
+                cap
+            ))
+        })?;
+        probe.write_all(b"\n").map_err(|err| {
+            Error::session(format!("Failed to measure shared transcript: {err}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn redact_share_entries(
+    entries: Vec<&SessionEntry>,
+    workspace_cwd: &str,
+) -> Result<Vec<SessionEntry>> {
+    let redact_cwd = !workspace_cwd.is_empty() && workspace_cwd != "/";
+    let mut redacted = Vec::with_capacity(entries.len());
+    let mut redacted_string_bytes = 0_usize;
+    for entry in entries {
+        let mut value = serde_json::to_value(entry)
+            .map_err(|err| Error::session(format!("Failed to prepare shared entry: {err}")))?;
+        redact_share_value(
+            &mut value,
+            redact_cwd.then_some(workspace_cwd),
+            &mut redacted_string_bytes,
+        )?;
+        redacted.push(serde_json::from_value(value).map_err(|err| {
+            Error::session(format!("Failed to reconstruct redacted shared entry: {err}"))
+        })?);
+    }
+    Ok(redacted)
+}
+
+fn redact_share_value(
+    value: &mut Value,
+    workspace_cwd: Option<&str>,
+    redacted_string_bytes: &mut usize,
+) -> Result<()> {
+    match value {
+        Value::String(text) => {
+            *text = redact_share_string(text, workspace_cwd, redacted_string_bytes)?;
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_share_value(value, workspace_cwd, redacted_string_bytes)?;
+            }
+        }
+        Value::Object(values) => {
+            let original_values = std::mem::take(values);
+            let mut next_duplicate_by_key = HashMap::<String, u64>::new();
+            for (key, mut value) in original_values {
+                let redacted_key =
+                    redact_share_string(&key, workspace_cwd, redacted_string_bytes)?;
+                redact_share_value(&mut value, workspace_cwd, redacted_string_bytes)?;
+
+                let mut candidate = redacted_key.clone();
+                if values.contains_key(&candidate) {
+                    let duplicate_index = next_duplicate_by_key
+                        .entry(redacted_key.clone())
+                        .or_insert(2);
+                    loop {
+                        candidate =
+                            format!("{redacted_key} [redacted duplicate {duplicate_index}]");
+                        *duplicate_index = duplicate_index.checked_add(1).ok_or_else(|| {
+                            Error::session("Shared transcript redaction key count overflow")
+                        })?;
+                        if !values.contains_key(&candidate) {
+                            break;
+                        }
+                    }
+                }
+                if candidate.len() > redacted_key.len() {
+                    account_redacted_share_bytes(
+                        redacted_string_bytes,
+                        candidate.len() - redacted_key.len(),
+                    )?;
+                }
+                values.insert(candidate, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn redact_share_string(
+    raw: &str,
+    workspace_cwd: Option<&str>,
+    redacted_string_bytes: &mut usize,
+) -> Result<String> {
+    let cwd_redacted = if let Some(cwd) = workspace_cwd {
+        replace_share_string_bounded(raw, cwd, "[REDACTED_CWD]")?
+    } else {
+        raw.to_string()
+    };
+    let screened = crate::memory::screen_secrets(&cwd_redacted);
+    account_redacted_share_bytes(redacted_string_bytes, screened.len())?;
+    Ok(screened)
+}
+
+fn account_redacted_share_bytes(total: &mut usize, additional: usize) -> Result<()> {
+    *total = total
+        .checked_add(additional)
+        .ok_or_else(|| Error::session("Shared transcript redaction size overflow"))?;
+    if *total > SHARE_SESSION_HTML_MAX_BYTES {
+        return Err(Error::session(format!(
+            "Redacted shared transcript exceeds the {}-byte HTML limit",
+            SHARE_SESSION_HTML_MAX_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn replace_share_string_bounded(raw: &str, needle: &str, replacement: &str) -> Result<String> {
+    if needle.is_empty() || !raw.contains(needle) {
+        return Ok(raw.to_string());
+    }
+    let occurrences = raw.matches(needle).count();
+    let removed = needle
+        .len()
+        .checked_mul(occurrences)
+        .ok_or_else(|| Error::session("Shared transcript redaction size overflow"))?;
+    let added = replacement
+        .len()
+        .checked_mul(occurrences)
+        .ok_or_else(|| Error::session("Shared transcript redaction size overflow"))?;
+    let projected = raw
+        .len()
+        .checked_sub(removed)
+        .and_then(|size| size.checked_add(added))
+        .ok_or_else(|| Error::session("Shared transcript redaction size overflow"))?;
+    if projected > SHARE_SESSION_HTML_MAX_BYTES {
+        return Err(Error::session(format!(
+            "Redacted shared transcript exceeds the {}-byte HTML limit",
+            SHARE_SESSION_HTML_MAX_BYTES
+        )));
+    }
+    Ok(raw.replace(needle, replacement))
+}
+
 /// Render session header and entries as a standalone HTML document.
 ///
 /// Shared implementation used by both `Session::to_html()` and
 /// `ExportSnapshot::to_html()`.
-#[allow(clippy::too_many_lines)]
 fn render_session_html(header: &SessionHeader, entries: &[SessionEntry]) -> String {
+    render_session_html_entries(header, entries.iter(), true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_session_html_entries<'a>(
+    header: &SessionHeader,
+    entries: impl IntoIterator<Item = &'a SessionEntry>,
+    include_cwd: bool,
+) -> String {
     let mut html = String::new();
     html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
+    html.push_str(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">",
+    );
     html.push_str("<title>Pi Session</title>");
     html.push_str("<style>");
     html.push_str(
@@ -6699,13 +6949,22 @@ fn render_session_html(header: &SessionHeader, entries: &[SessionEntry]) -> Stri
     );
     html.push_str("</style></head><body>");
 
-    let _ = write!(
-        html,
-        "<h1>Pi Session</h1><div class=\"meta\">Session {} • {} • cwd: {}</div>",
-        escape_html(&header.id),
-        escape_html(&header.timestamp),
-        escape_html(&header.cwd)
-    );
+    if include_cwd {
+        let _ = write!(
+            html,
+            "<h1>Pi Session</h1><div class=\"meta\">Session {} • {} • cwd: {}</div>",
+            escape_html(&header.id),
+            escape_html(&header.timestamp),
+            escape_html(&header.cwd)
+        );
+    } else {
+        let _ = write!(
+            html,
+            "<h1>Pi Session</h1><div class=\"meta\">Session {} • {}</div>",
+            escape_html(&header.id),
+            escape_html(&header.timestamp)
+        );
+    }
 
     for entry in entries {
         match entry {
@@ -12329,6 +12588,104 @@ mod tests {
         assert!(html.contains("assistant answer"));
         assert!(html.contains("anthropic"));
         assert!(html.contains("test-session-html"));
+    }
+
+    #[test]
+    fn share_html_contains_only_current_branch_and_omits_local_cwd() {
+        let mut session = Session::in_memory();
+        session.header.cwd = "/private/workspaces/customer-secret".to_string();
+
+        let root = session.append_message(make_test_message("shared-root-sentinel"));
+        session.append_message(make_test_message("abandoned-branch-sentinel"));
+        assert!(session.navigate_to(&root));
+        session.append_message(make_test_message("selected-branch-sentinel"));
+        session.append_message(make_test_message(
+            "tool-like output: /private/workspaces/customer-secret ghp_abcdefghijklmnopqrstuvwxyz",
+        ));
+
+        let html = session.to_share_html().expect("bounded share HTML");
+        assert!(html.contains("shared-root-sentinel"));
+        assert!(html.contains("selected-branch-sentinel"));
+        assert!(!html.contains("abandoned-branch-sentinel"));
+        assert!(!html.contains("/private/workspaces/customer-secret"));
+        assert!(!html.contains("ghp_abcdefghijklmnopqrstuvwxyz"));
+        assert!(html.contains("[REDACTED_CWD]"));
+        assert!(html.contains("[REDACTED_GITHUB_PAT]"));
+        assert!(!html.contains("cwd:"));
+        assert!(html.contains(
+            "Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+        ));
+
+        let local_html = session.to_html();
+        assert!(local_html.contains("abandoned-branch-sentinel"));
+        assert!(local_html.contains("/private/workspaces/customer-secret"));
+        assert!(local_html.contains("cwd:"));
+    }
+
+    #[test]
+    fn share_html_preflight_rejects_oversized_branch_before_rendering() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("payload"));
+        let error = validate_share_entries_size_with_cap([&session.entries[0]], 16)
+            .expect_err("tiny share cap must reject the serialized entry");
+        assert!(error.to_string().contains("16-byte input limit"));
+    }
+
+    #[test]
+    fn share_html_with_root_cwd_preserves_document_structure() {
+        let mut session = Session::in_memory();
+        session.header.cwd = "/".to_string();
+        session.append_message(make_test_message("root workspace transcript"));
+
+        let html = session.to_share_html().expect("share HTML for root cwd");
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("</body></html>"));
+        assert!(html.contains("root workspace transcript"));
+    }
+
+    #[test]
+    fn share_html_redacts_tag_like_cwd_without_rewriting_markup() {
+        let mut session = Session::in_memory();
+        session.header.cwd = "/style".to_string();
+        session.append_message(make_test_message("workspace is /style"));
+
+        let html = session.to_share_html().expect("share HTML for tag-like cwd");
+        assert!(html.contains("</style>"));
+        assert!(html.contains("</body></html>"));
+        assert!(html.contains("workspace is [REDACTED_CWD]"));
+        assert!(!html.contains("workspace is /style"));
+    }
+
+    #[test]
+    fn share_html_redacts_cwd_from_structured_object_keys() {
+        let mut session = Session::in_memory();
+        session.header.cwd = "/private/workspaces/customer-secret".to_string();
+        let mut details = serde_json::Map::new();
+        details.insert(
+            "/private/workspaces/customer-secret/output.log".to_string(),
+            Value::String("safe value".to_string()),
+        );
+        details.insert(
+            "[REDACTED_CWD]/output.log".to_string(),
+            Value::String("pre-redacted value".to_string()),
+        );
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "share-redaction".to_string(),
+            tool_name: "read".to_string(),
+            content: Vec::new(),
+            is_error: false,
+            details: Some(Value::Object(details)),
+            timestamp: Some(0),
+        });
+
+        let html = session
+            .to_share_html()
+            .expect("share HTML with structured details");
+        assert!(!html.contains("/private/workspaces/customer-secret"));
+        assert!(html.contains("[REDACTED_CWD]/output.log"));
+        assert!(html.contains("redacted duplicate 2"));
+        assert!(html.contains("safe value"));
+        assert!(html.contains("pre-redacted value"));
     }
 
     // ======================================================================

@@ -531,12 +531,13 @@ fn should_reindex_false_for_fresh_db() {
 
         let index = SessionIndex::for_sessions_root(&sessions_root);
 
-        // Create and index a session to initialize the database
+        // Create a session, then establish freshness with a complete scan.
+        // Row-local repair APIs deliberately cannot claim global freshness.
         let mut session = Session::create_with_dir(Some(sessions_root.clone()));
         session.append_message(make_user_message("Hello"));
         session.path = Some(sessions_root.join("session.jsonl"));
         session.save().await.expect("save session");
-        index.index_session(&session).expect("index session");
+        index.reindex_all().expect("complete session reindex");
 
         // Database was just modified, so should_reindex should return false
         assert!(
