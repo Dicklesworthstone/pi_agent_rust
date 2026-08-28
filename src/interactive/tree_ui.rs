@@ -13,6 +13,7 @@ impl TreeNavigationPersistenceOutcome {
     }
 }
 
+#[derive(Debug)]
 struct TreeNavigationCommit {
     messages_for_agent: Vec<crate::model::Message>,
     messages_for_ui: Vec<ConversationMessage>,
