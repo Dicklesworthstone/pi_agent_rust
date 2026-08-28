@@ -12,6 +12,8 @@ use asupersync::io::ext::AsyncWriteExt;
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::net::tcp::stream::TcpStream;
 use asupersync::tls::{TlsConnector, TlsConnectorBuilder, TlsError};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -549,7 +551,17 @@ async fn send_parts(
     let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
     let mut transport = connect_transport(&parsed, client).await?;
 
-    let request_bytes = build_request_bytes(method, &parsed, &client.user_agent, headers, body);
+    // Only plain HTTP needs the absolute-form request-target when proxied: an HTTPS request
+    // tunnels through CONNECT (see `connect_transport_once`) and then talks origin-form HTTP/1.1
+    // to the real host same as a direct connection, since the proxy is no longer in the loop
+    // once the tunnel is up.
+    let proxied_http =
+        matches!(parsed.scheme, Scheme::Http) && resolve_proxy(parsed.scheme, &parsed.host, parsed.port).is_some();
+    let request_bytes = if proxied_http {
+        build_request_bytes_proxied(method, url, &parsed, &client.user_agent, headers, body)
+    } else {
+        build_request_bytes(method, &parsed, &client.user_agent, headers, body)
+    };
     write_all_with_retry(&mut transport, &request_bytes).await?;
     if !body.is_empty() {
         write_all_with_retry(&mut transport, body).await?;
@@ -827,6 +839,216 @@ fn is_retryable_not_connected_tls(err: &TlsError) -> bool {
     false
 }
 
+/// A proxy to connect the TCP socket to instead of the request's own host, resolved from the
+/// standard `HTTP_PROXY`/`HTTPS_PROXY` environment variables. See [`resolve_proxy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProxyTarget {
+    host: String,
+    port: u16,
+    /// Pre-encoded `Basic <base64>` value for a `Proxy-Authorization` header, present when the
+    /// proxy URL carried `user:pass@` credentials.
+    proxy_authorization: Option<String>,
+}
+
+/// Decode `%XX` escapes. Used for proxy-URL userinfo, which conventionally percent-encodes
+/// reserved characters (a literal `:` or `@` in a password, say) rather than expecting the
+/// containing URL to be re-parsed some other way.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse a proxy URL (`[scheme://][user:pass@]host[:port]`) from an env var value.
+///
+/// The scheme prefix, if present, is accepted and ignored - the connection to the proxy itself
+/// is always plain TCP here (proxies speaking TLS on the client-facing leg are not supported).
+/// Defaults to port 8080 when unspecified, matching curl and most other tooling's convention
+/// for these variables. Returns `None` for an empty or unparseable value.
+fn parse_proxy_url(value: &str) -> Option<ProxyTarget> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let without_scheme = value.split_once("://").map_or(value, |(_, rest)| rest);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    let (userinfo, host_port) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(u, h)| (Some(u), h));
+
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let (h, tail) = rest.split_once(']')?;
+        (h.to_string(), tail.strip_prefix(':').and_then(|p| p.parse().ok()))
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() => (h.to_string(), p.parse().ok()),
+            _ => (host_port.to_string(), None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+
+    Some(ProxyTarget {
+        host,
+        port: port.unwrap_or(8080),
+        proxy_authorization: userinfo
+            .map(|creds| format!("Basic {}", BASE64_STANDARD.encode(percent_decode(creds)))),
+    })
+}
+
+/// True when `host`/`port` matches an entry in `no_proxy` and should bypass any proxy.
+///
+/// There is no RFC for this variable, only a long-standing de-facto convention shared (with
+/// minor variations) by curl, Python's `urllib`, Go's `httpproxy` package, and effectively every
+/// other tool that honors it:
+/// - entries are comma- or whitespace-separated;
+/// - a bare `*` disables proxying for every host;
+/// - an entry matches `host` exactly or as a domain suffix (`example.com` also matches
+///   `api.example.com`), with an optional leading `.` accepted but not required for the suffix
+///   form - both spellings are in common use;
+/// - an entry may pin a specific port (`example.com:8080`), in which case it only bypasses
+///   requests to that port; without one it bypasses the host on any port. A bare `host:port`
+///   pair (exactly one colon) is treated this way; anything else (zero colons, or 2+ as in an
+///   unbracketed IPv6 literal) is matched as a plain host with no port restriction.
+fn bypasses_proxy(host: &str, port: u16, no_proxy: &str) -> bool {
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    no_proxy
+        .split([',', ' ', '\t'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            if entry == "*" {
+                return true;
+            }
+            let (name, entry_port) = if entry.matches(':').count() == 1 {
+                entry
+                    .rsplit_once(':')
+                    .map_or((entry, None), |(h, p)| (h, p.parse::<u16>().ok()))
+            } else {
+                (entry, None)
+            };
+            if entry_port.is_some_and(|entry_port| entry_port != port) {
+                return false;
+            }
+            host_matches_suffix(host, name.trim_start_matches('.'))
+        })
+}
+
+fn host_matches_suffix(host: &str, suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return false;
+    }
+    host.eq_ignore_ascii_case(suffix) || {
+        host.len() > suffix.len()
+            && host[..host.len() - suffix.len()].ends_with('.')
+            && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+}
+
+/// Resolve the proxy to use for a request to `host` over `scheme`, given an environment-variable
+/// lookup function - both the exact variable name and, as a fallback, its lowercase spelling are
+/// tried, since both are in common use.
+///
+/// Precedence: `NO_PROXY`/`no_proxy` bypasses everything below when `host` matches. Otherwise
+/// `HTTPS_PROXY`/`https_proxy` for HTTPS requests or `HTTP_PROXY`/`http_proxy` for HTTP
+/// requests, falling back to `ALL_PROXY`/`all_proxy` for either scheme if the scheme-specific
+/// variable is not set.
+fn resolve_proxy_with(
+    scheme: Scheme,
+    host: &str,
+    port: u16,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Option<ProxyTarget> {
+    let lookup_either = |upper: &str, lower: &str| env_lookup(upper).or_else(|| env_lookup(lower));
+
+    if let Some(no_proxy) = lookup_either("NO_PROXY", "no_proxy")
+        && bypasses_proxy(host, port, &no_proxy)
+    {
+        return None;
+    }
+
+    let scheme_specific = match scheme {
+        Scheme::Https => lookup_either("HTTPS_PROXY", "https_proxy"),
+        Scheme::Http => lookup_either("HTTP_PROXY", "http_proxy"),
+    };
+    let value = scheme_specific.or_else(|| lookup_either("ALL_PROXY", "all_proxy"))?;
+    parse_proxy_url(&value)
+}
+
+/// [`resolve_proxy_with`], reading from the real process environment.
+fn resolve_proxy(scheme: Scheme, host: &str, port: u16) -> Option<ProxyTarget> {
+    resolve_proxy_with(scheme, host, port, |name| std::env::var(name).ok())
+}
+
+/// Send `CONNECT host:port HTTP/1.1` over `tcp` and wait for the proxy's response, returning the
+/// same TCP stream (now tunneled to `target_host`/`target_port`) once the proxy answers 2xx.
+///
+/// This is the standard way to reach an HTTPS origin through an HTTP proxy: the proxy blindly
+/// relays bytes in both directions from here on, so the TLS handshake that follows happens
+/// end-to-end with the origin, not with the proxy.
+async fn establish_connect_tunnel(
+    tcp: TcpStream,
+    target_host: &str,
+    target_port: u16,
+    proxy_authorization: Option<&str>,
+) -> Result<TcpStream> {
+    let authority = if target_host.contains(':') && !target_host.starts_with('[') {
+        format!("[{target_host}]:{target_port}")
+    } else {
+        format!("{target_host}:{target_port}")
+    };
+
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if let Some(auth) = proxy_authorization {
+        let _ = std::fmt::Write::write_fmt(
+            &mut request,
+            format_args!("Proxy-Authorization: {auth}\r\n"),
+        );
+    }
+    request.push_str("\r\n");
+
+    let mut transport = Transport::Tcp(tcp);
+    write_all_with_retry(&mut transport, request.as_bytes()).await?;
+    transport.flush().await?;
+
+    let (status, _headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
+    if !(200..300).contains(&status) {
+        return Err(Error::api(format!(
+            "Proxy CONNECT to {authority} failed with status {status}"
+        )));
+    }
+    if !leftover.is_empty() {
+        // The proxy should not send anything past the CONNECT response's blank line until the
+        // tunneled TLS handshake starts; if it does, treat it as a misbehaving proxy rather than
+        // silently discarding what would otherwise be the first bytes of that handshake.
+        return Err(Error::api(
+            "Proxy sent unexpected data before the CONNECT tunnel was established",
+        ));
+    }
+
+    match transport {
+        Transport::Tcp(tcp) => Ok(tcp),
+        Transport::Tls(_) => unreachable!("establish_connect_tunnel only ever wraps a Transport::Tcp"),
+    }
+}
+
 /// A failed connect attempt: the user-facing error plus whether it is a
 /// retryable "socket not connected" failure (classified on the typed error
 /// *before* it is flattened into a message string).
@@ -842,13 +1064,36 @@ async fn connect_transport_once(
     parsed: &ParsedUrl,
     client: &Client,
 ) -> std::result::Result<Transport, ConnectAttemptError> {
-    let addr = (parsed.host.clone(), parsed.port);
+    let proxy = resolve_proxy(parsed.scheme, &parsed.host, parsed.port);
+    let addr = proxy.as_ref().map_or_else(
+        || (parsed.host.clone(), parsed.port),
+        |p| (p.host.clone(), p.port),
+    );
     let tcp = TcpStream::connect(addr)
         .await
         .map_err(|e| ConnectAttemptError {
             retryable_not_connected: is_retryable_not_connected(&e),
             error: Error::from(e),
         })?;
+    // A plain-HTTP request through a proxy needs no tunnel - the proxy reads the request
+    // directly (see the absolute-form request-target chosen in `send_parts`) and relays it
+    // itself. Only HTTPS needs a CONNECT tunnel first, so the TLS handshake below still reaches
+    // the origin end-to-end rather than terminating at the proxy.
+    let tcp = if let (Scheme::Https, Some(proxy)) = (parsed.scheme, proxy.as_ref()) {
+        Box::pin(establish_connect_tunnel(
+            tcp,
+            &parsed.host,
+            parsed.port,
+            proxy.proxy_authorization.as_deref(),
+        ))
+        .await
+        .map_err(|error| ConnectAttemptError {
+            error,
+            retryable_not_connected: false,
+        })?
+    } else {
+        tcp
+    };
     match parsed.scheme {
         Scheme::Http => Ok(Transport::Tcp(tcp)),
         Scheme::Https => {
@@ -963,13 +1208,40 @@ fn build_request_bytes(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Vec<u8> {
+    build_request_bytes_with_target(method, &parsed.path, parsed, user_agent, headers, body)
+}
+
+/// Like [`build_request_bytes`], but with an explicit request-target instead of `parsed.path`.
+///
+/// Used when proxying a plain HTTP request: RFC 9112 §3.2.2 requires the absolute-form URI (the
+/// full `http://host/path` string) as the request-target when talking to a proxy, rather than
+/// the origin-form path used for a direct connection.
+fn build_request_bytes_proxied(
+    method: Method,
+    absolute_url: &str,
+    parsed: &ParsedUrl,
+    user_agent: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Vec<u8> {
+    build_request_bytes_with_target(method, absolute_url, parsed, user_agent, headers, body)
+}
+
+fn build_request_bytes_with_target(
+    method: Method,
+    request_target: &str,
+    parsed: &ParsedUrl,
+    user_agent: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Vec<u8> {
     let mut out = String::new();
     let effective_user_agent =
         sanitize_header_value(header_value(headers, "user-agent").unwrap_or(user_agent));
     let host_header = host_header_value(parsed);
     let _ = std::fmt::Write::write_fmt(
         &mut out,
-        format_args!("{} {} HTTP/1.1\r\n", method.as_str(), parsed.path),
+        format_args!("{} {} HTTP/1.1\r\n", method.as_str(), request_target),
     );
     let _ = std::fmt::Write::write_fmt(&mut out, format_args!("Host: {host_header}\r\n"));
     let _ = std::fmt::Write::write_fmt(
@@ -2730,5 +3002,189 @@ mod tests {
         let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[]);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(&format!("User-Agent: {ua}\r\n")));
+    }
+
+    // ── HTTP_PROXY / HTTPS_PROXY / NO_PROXY ────────────────────────────
+
+    #[test]
+    fn parse_proxy_url_host_only() {
+        let proxy = parse_proxy_url("proxy.example.com").unwrap();
+        assert_eq!(proxy.host, "proxy.example.com");
+        assert_eq!(proxy.port, 8080);
+        assert!(proxy.proxy_authorization.is_none());
+    }
+
+    #[test]
+    fn parse_proxy_url_with_scheme_and_port() {
+        let proxy = parse_proxy_url("http://proxy.example.com:3128").unwrap();
+        assert_eq!(proxy.host, "proxy.example.com");
+        assert_eq!(proxy.port, 3128);
+    }
+
+    #[test]
+    fn parse_proxy_url_with_credentials() {
+        let proxy = parse_proxy_url("http://alice:s3cret@proxy.example.com:3128").unwrap();
+        assert_eq!(proxy.host, "proxy.example.com");
+        assert_eq!(proxy.port, 3128);
+        let auth = proxy.proxy_authorization.unwrap();
+        assert!(auth.starts_with("Basic "));
+        let decoded = BASE64_STANDARD
+            .decode(auth.strip_prefix("Basic ").unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "alice:s3cret");
+    }
+
+    #[test]
+    fn parse_proxy_url_percent_encoded_credentials() {
+        // A `:` or `@` inside the password must be percent-encoded to parse as part of the
+        // userinfo at all; verify it round-trips back to the literal character.
+        let proxy = parse_proxy_url("http://alice:p%40ss%3Aword@proxy.example.com").unwrap();
+        let auth = proxy.proxy_authorization.unwrap();
+        let decoded = BASE64_STANDARD
+            .decode(auth.strip_prefix("Basic ").unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "alice:p@ss:word");
+    }
+
+    #[test]
+    fn parse_proxy_url_ipv6_literal() {
+        let proxy = parse_proxy_url("http://[::1]:8888").unwrap();
+        assert_eq!(proxy.host, "::1");
+        assert_eq!(proxy.port, 8888);
+    }
+
+    #[test]
+    fn parse_proxy_url_ignores_path() {
+        let proxy = parse_proxy_url("http://proxy.example.com:8080/ignored").unwrap();
+        assert_eq!(proxy.host, "proxy.example.com");
+        assert_eq!(proxy.port, 8080);
+    }
+
+    #[test]
+    fn parse_proxy_url_empty_is_none() {
+        assert!(parse_proxy_url("").is_none());
+        assert!(parse_proxy_url("   ").is_none());
+    }
+
+    #[test]
+    fn bypasses_proxy_wildcard() {
+        assert!(bypasses_proxy("anything.example.com", 443, "*"));
+    }
+
+    #[test]
+    fn bypasses_proxy_exact_match() {
+        assert!(bypasses_proxy("localhost", 80, "localhost,127.0.0.1"));
+        assert!(!bypasses_proxy("example.com", 80, "localhost,127.0.0.1"));
+    }
+
+    #[test]
+    fn bypasses_proxy_domain_suffix_without_leading_dot() {
+        assert!(bypasses_proxy("api.internal.example.com", 443, "example.com"));
+        assert!(bypasses_proxy("example.com", 443, "example.com"));
+        // Must be a genuine label boundary, not just a string suffix.
+        assert!(!bypasses_proxy("notexample.com", 443, "example.com"));
+    }
+
+    #[test]
+    fn bypasses_proxy_domain_suffix_with_leading_dot() {
+        assert!(bypasses_proxy("api.internal.example.com", 443, ".example.com"));
+        assert!(bypasses_proxy("example.com", 443, ".example.com"));
+    }
+
+    #[test]
+    fn bypasses_proxy_is_case_insensitive() {
+        assert!(bypasses_proxy("Example.COM", 443, "example.com"));
+    }
+
+    #[test]
+    fn bypasses_proxy_port_specific_entry() {
+        assert!(bypasses_proxy("internal.example.com", 8080, "internal.example.com:8080"));
+        assert!(!bypasses_proxy("internal.example.com", 443, "internal.example.com:8080"));
+    }
+
+    #[test]
+    fn bypasses_proxy_unbracketed_ipv6_entry_has_no_port_restriction() {
+        // Two-plus colons: treated as a plain (unparseable-as-port) host, not host:port.
+        assert!(bypasses_proxy("::1", 443, "::1"));
+    }
+
+    #[test]
+    fn bypasses_proxy_no_match() {
+        assert!(!bypasses_proxy("example.com", 443, "other.com,another.org"));
+    }
+
+    #[test]
+    fn resolve_proxy_uses_scheme_specific_var() {
+        let env = |name: &str| match name {
+            "HTTPS_PROXY" => Some("https-proxy.example.com:9000".to_string()),
+            "HTTP_PROXY" => Some("http-proxy.example.com:9001".to_string()),
+            _ => None,
+        };
+        let proxy = resolve_proxy_with(Scheme::Https, "api.example.com", 443, env).unwrap();
+        assert_eq!(proxy.host, "https-proxy.example.com");
+        assert_eq!(proxy.port, 9000);
+
+        let proxy = resolve_proxy_with(Scheme::Http, "api.example.com", 80, env).unwrap();
+        assert_eq!(proxy.host, "http-proxy.example.com");
+        assert_eq!(proxy.port, 9001);
+    }
+
+    #[test]
+    fn resolve_proxy_falls_back_to_lowercase_var() {
+        let env = |name: &str| (name == "https_proxy").then(|| "proxy.example.com".to_string());
+        let proxy = resolve_proxy_with(Scheme::Https, "api.example.com", 443, env).unwrap();
+        assert_eq!(proxy.host, "proxy.example.com");
+    }
+
+    #[test]
+    fn resolve_proxy_falls_back_to_all_proxy() {
+        let env = |name: &str| (name == "ALL_PROXY").then(|| "proxy.example.com".to_string());
+        assert!(resolve_proxy_with(Scheme::Https, "api.example.com", 443, env).is_some());
+        assert!(resolve_proxy_with(Scheme::Http, "api.example.com", 80, env).is_some());
+    }
+
+    #[test]
+    fn resolve_proxy_honors_no_proxy() {
+        let env = |name: &str| match name {
+            "HTTPS_PROXY" => Some("proxy.example.com".to_string()),
+            "NO_PROXY" => Some("api.example.com".to_string()),
+            _ => None,
+        };
+        assert!(resolve_proxy_with(Scheme::Https, "api.example.com", 443, env).is_none());
+        assert!(resolve_proxy_with(Scheme::Https, "other.example.com", 443, env).is_some());
+    }
+
+    #[test]
+    fn resolve_proxy_none_when_unset() {
+        assert!(resolve_proxy_with(Scheme::Https, "api.example.com", 443, |_| None).is_none());
+    }
+
+    // ── build_request_bytes_proxied (absolute-form request-target) ─────
+
+    #[test]
+    fn build_request_bytes_proxied_uses_absolute_uri() {
+        let parsed = ParsedUrl::parse("http://example.com/v1/models").unwrap();
+        let bytes = build_request_bytes_proxied(
+            Method::Get,
+            "http://example.com/v1/models",
+            &parsed,
+            "agent",
+            &[],
+            &[],
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("GET http://example.com/v1/models HTTP/1.1\r\n"));
+        // The Host header is still the origin's, same as a direct request.
+        assert!(text.contains("Host: example.com\r\n"));
+    }
+
+    #[test]
+    fn build_request_bytes_direct_still_uses_origin_form_path() {
+        // Unmodified `build_request_bytes` must keep using `parsed.path`, not the absolute URI -
+        // this is the direct-connection (non-proxied) code path.
+        let parsed = ParsedUrl::parse("http://example.com/v1/models").unwrap();
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[]);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("GET /v1/models HTTP/1.1\r\n"));
     }
 }

@@ -16,6 +16,15 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Added
 
+- **`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` support**: the HTTP client now
+  routes requests through a proxy when `HTTP_PROXY`/`http_proxy` (plain HTTP)
+  or `HTTPS_PROXY`/`https_proxy` (HTTPS, via a `CONNECT` tunnel) is set,
+  falling back to `ALL_PROXY`/`all_proxy` for either scheme. `NO_PROXY`/
+  `no_proxy` bypasses this per the usual de-facto convention: exact host or
+  domain-suffix match, an optional `:port` restriction per entry, and a bare
+  `*` to disable proxying entirely. Proxy URLs may carry `user:pass@`
+  credentials, sent as `Proxy-Authorization: Basic …`.
+
 - **Host-mediated native-Responses compaction bridge** (gh
   [#167](https://github.com/Dicklesworthstone/pi_agent_rust/issues/167)):
   `ctx.compact(preparation, { strategy: "openai-responses-native", request })`
