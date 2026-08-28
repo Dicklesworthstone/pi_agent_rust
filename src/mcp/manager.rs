@@ -2107,6 +2107,40 @@ mod tests {
         }
     }
 
+    fn injected_transport_command(temp: &tempfile::TempDir) -> String {
+        let command = temp.path().join("injected-mcp-transport");
+        std::fs::write(&command, b"injected transport fixture")
+            .expect("write injected transport fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mut permissions = std::fs::metadata(&command)
+                .expect("injected transport metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&command, permissions)
+                .expect("make injected transport executable");
+        }
+        command
+            .to_str()
+            .expect("injected transport path must be UTF-8")
+            .to_string()
+    }
+
+    fn acknowledge_test_stdio_server(manager: &McpManager, entry: &Arc<ServerEntry>) {
+        let fingerprint = manager.trust_fingerprint_for(entry);
+        let execution = entry
+            .config
+            .execution_identity(&entry.effective_cwd(&manager.inner.cwd))
+            .expect("resolve injected transport executable")
+            .expect("stdio fixture must have an execution identity");
+        TrustStore::load(&manager.inner.trust_path)
+            .expect("load trust")
+            .acknowledge_execution(&entry.config.name, &fingerprint, "operator", execution)
+            .expect("acknowledge fixture execution");
+    }
+
     fn trusted_fixture_manager(temp: &tempfile::TempDir) -> (McpManager, Arc<ServerEntry>) {
         let cwd = temp.path().join("project");
         let global = temp.path().join("global");
@@ -2114,7 +2148,7 @@ mod tests {
         std::fs::create_dir_all(&global).expect("global directory");
         let config = ConfiguredServer {
             name: "fixture".to_string(),
-            command: Some("unused-fixture".to_string()),
+            command: Some(injected_transport_command(temp)),
             args: Vec::new(),
             env: Vec::new(),
             url: None,
@@ -2132,11 +2166,7 @@ mod tests {
             },
         );
         let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint_for(&entry);
-        TrustStore::load(&global.join("mcp-trust.json"))
-            .expect("load trust")
-            .acknowledge("fixture", &fingerprint, "operator")
-            .expect("acknowledge fixture");
+        acknowledge_test_stdio_server(&manager, &entry);
         (manager, entry)
     }
 
@@ -2344,12 +2374,12 @@ mod tests {
         std::fs::create_dir_all(&global).expect("global directory");
         let config = ConfiguredServer {
             name: "fixture".to_string(),
-            command: Some("unused-fixture".to_string()),
+            command: None,
             args: Vec::new(),
             env: Vec::new(),
-            url: None,
+            url: Some("https://fixture.invalid/mcp".to_string()),
             headers: Vec::new(),
-            transport_hint: Some("stdio".to_string()),
+            transport_hint: Some("http".to_string()),
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -2424,35 +2454,7 @@ mod tests {
     #[test]
     fn repeated_runtime_crashes_back_off_and_exhaust_the_restart_budget() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let cwd = temp.path().join("project");
-        let global = temp.path().join("global");
-        std::fs::create_dir_all(&cwd).expect("project directory");
-        std::fs::create_dir_all(&global).expect("global directory");
-        let config = ConfiguredServer {
-            name: "fixture".to_string(),
-            command: Some("unused-fixture".to_string()),
-            args: Vec::new(),
-            env: Vec::new(),
-            url: None,
-            headers: Vec::new(),
-            transport_hint: Some("stdio".to_string()),
-            provenance: Provenance::ProjectPi,
-            source_file: cwd.join(".pi/mcp.json"),
-        };
-        let manager = McpManager::new(
-            &cwd,
-            &global,
-            McpDiscovery {
-                servers: vec![config],
-                warnings: Vec::new(),
-            },
-        );
-        let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint_for(&entry);
-        let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
-        trust
-            .acknowledge("fixture", &fingerprint, "operator")
-            .expect("acknowledge fixture");
+        let (manager, entry) = trusted_fixture_manager(&temp);
 
         let constructions = Arc::new(AtomicUsize::new(0));
         let factory_constructions = Arc::clone(&constructions);
@@ -2794,35 +2796,7 @@ mod tests {
     #[test]
     fn startup_budget_aborts_a_private_transport_stalled_in_initialize() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let cwd = temp.path().join("project");
-        let global = temp.path().join("global");
-        std::fs::create_dir_all(&cwd).expect("project directory");
-        std::fs::create_dir_all(&global).expect("global directory");
-        let config = ConfiguredServer {
-            name: "fixture".to_string(),
-            command: Some("injected-fixture".to_string()),
-            args: Vec::new(),
-            env: Vec::new(),
-            url: None,
-            headers: Vec::new(),
-            transport_hint: Some("stdio".to_string()),
-            provenance: Provenance::ProjectPi,
-            source_file: cwd.join(".pi/mcp.json"),
-        };
-        let manager = McpManager::new(
-            &cwd,
-            &global,
-            McpDiscovery {
-                servers: vec![config],
-                warnings: Vec::new(),
-            },
-        );
-        let entry = manager.entry("fixture").expect("fixture entry");
-        let fingerprint = manager.trust_fingerprint_for(&entry);
-        let mut trust = TrustStore::load(&global.join("mcp-trust.json")).expect("load trust");
-        trust
-            .acknowledge("fixture", &fingerprint, "operator")
-            .expect("acknowledge fixture");
+        let (manager, entry) = trusted_fixture_manager(&temp);
 
         let (started_tx, started_rx) = mpsc::channel();
         let state = Arc::new(HangingInitializeState {
@@ -3497,23 +3471,24 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, fixture_entry) = trusted_fixture_manager(&temp);
         let manager = Arc::new(manager);
+        let fixture_command = fixture_entry
+            .config
+            .command
+            .clone()
+            .expect("fixture command");
 
         manager.register_extension_server(
             "ext-srv",
             &serde_json::json!({
-                "command": "unused-ext",
+                "command": fixture_command,
                 "type": "stdio",
                 "trust": "acknowledged"
             }),
         );
         let ext_entry = manager.entry("ext-srv").expect("ext entry");
-        let fingerprint = manager.trust_fingerprint_for(&ext_entry);
         // Extension-provided definitions reach the SAME trust gate; a spec
         // acknowledged up front participates in the startup pass.
-        TrustStore::load(&manager.inner.trust_path)
-            .expect("load trust")
-            .acknowledge("ext-srv", &fingerprint, "operator")
-            .expect("acknowledge ext server");
+        acknowledge_test_stdio_server(&manager, &ext_entry);
 
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_factory = Arc::clone(&factory_calls);

@@ -3370,6 +3370,30 @@ mod tests {
 
     // ===== bd-zz6yo: streamable HTTP protocol contract =====
 
+    /// Render a scripted response after substituting the request id.
+    ///
+    /// The placeholder and the decimal id can have different byte lengths, so
+    /// a response template with `Content-Length` must be reframed after the
+    /// substitution. Chunked responses have no such header and pass through.
+    fn render_scripted_response(response: &str, request_id: &str) -> String {
+        let mut rendered = response.replace("__ECHO_ID__", request_id);
+        let Some(headers_end) = rendered.find("\r\n\r\n") else {
+            return rendered;
+        };
+        let body_len = rendered.len().saturating_sub(headers_end + 4);
+        let lowercase_headers = rendered[..headers_end].to_ascii_lowercase();
+        let marker = "\r\ncontent-length:";
+        let Some(marker_start) = lowercase_headers.find(marker) else {
+            return rendered;
+        };
+        let value_start = marker_start + marker.len();
+        let value_end = rendered[value_start..headers_end]
+            .find("\r\n")
+            .map_or(headers_end, |offset| value_start + offset);
+        rendered.replace_range(value_start..value_end, &format!(" {body_len}"));
+        rendered
+    }
+
     /// One-connection-per-request HTTP fixture: serves scripted responses in
     /// order, captures each request's headers/body, and replaces the
     /// __ECHO_ID__ token with the captured request's JSON-RPC id so scripted
@@ -3379,6 +3403,7 @@ mod tests {
         addr: std::net::SocketAddr,
         captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>>,
         request_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stopping: std::sync::Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -3392,12 +3417,20 @@ mod tests {
             let captured_for_thread = std::sync::Arc::clone(&captured);
             let request_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let request_lines_for_thread = std::sync::Arc::clone(&request_lines);
+            let stopping = std::sync::Arc::new(AtomicBool::new(false));
+            let stopping_for_thread = std::sync::Arc::clone(&stopping);
             let handle = std::thread::spawn(move || {
                 for response in responses {
+                    if stopping_for_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let (mut stream, _) = match listener.accept() {
                         Ok(pair) => pair,
                         Err(_) => break,
                     };
+                    if stopping_for_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
                     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                     let mut reader =
                         std::io::BufReader::new(stream.try_clone().expect("clone stream"));
@@ -3453,7 +3486,7 @@ mod tests {
                     let id_text = request_body_id
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| "null".to_string());
-                    let response = response.replace("__ECHO_ID__", &id_text);
+                    let response = render_scripted_response(&response, &id_text);
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
                 }
@@ -3462,6 +3495,7 @@ mod tests {
                 addr,
                 captured,
                 request_lines,
+                stopping,
                 handle: Some(handle),
             }
         }
@@ -3484,6 +3518,8 @@ mod tests {
 
     impl Drop for ScriptedHttpServer {
         fn drop(&mut self) {
+            self.stopping.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.addr);
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
             }
@@ -4123,9 +4159,11 @@ mod tests {
             http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-old"),
             "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string(),
             http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-new"),
+            http_empty(202, "Accepted"),
             http_ok_plain("__ECHO_ID__", serde_json::json!({"tools": []})),
             "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string(),
             http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-new2"),
+            http_empty(202, "Accepted"),
             "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string(),
         ]);
         let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
@@ -4159,9 +4197,9 @@ mod tests {
         let captured = server.captured();
         assert_eq!(
             captured.len(),
-            7,
-            "first expiry: init, list-404, renewal-init, list-ok; \
-             second expiry: list-404, renewal-init, list-404; got {captured:#?}"
+            9,
+            "first expiry: init, list-404, renewal-init, initialized, list-ok; \
+             second expiry: list-404, renewal-init, initialized, list-404; got {captured:#?}"
         );
         assert_eq!(
             captured

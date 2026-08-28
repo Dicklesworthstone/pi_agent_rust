@@ -184,9 +184,8 @@ fn main() {
         .and_then(|v| v.parse::<u64>().ok());
     let response_mode = std::env::var("PI_MCP_FIXTURE_RESPONSE_MODE").unwrap_or_default();
     let _descendant = if std::env::var_os("PI_MCP_FIXTURE_SPAWN_DESCENDANT").is_some() {
-        let mut descendant = std::process::Command::new(
-            std::env::current_exe().expect("fixture executable path"),
-        );
+        let mut descendant =
+            std::process::Command::new(std::env::current_exe().expect("fixture executable path"));
         descendant
             .env("PI_MCP_FIXTURE_CHILD_SENTINEL", "1")
             .stdin(std::process::Stdio::null());
@@ -234,7 +233,9 @@ fn main() {
         if id.is_none() {
             if method == "notifications/cancelled"
                 && cancellation_target.as_ref()
-                    == frame.get("params").and_then(|params| params.get("requestId"))
+                    == frame
+                        .get("params")
+                        .and_then(|params| params.get("requestId"))
             {
                 eprintln!("pi_mcp_fixture: observed cancellation for pending request");
                 cancellation_target = None;

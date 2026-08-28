@@ -279,7 +279,10 @@ fn mcp_pending_and_list_surfaces_do_not_expose_target_credentials() {
         "password",
         "query-secret",
     ] {
-        assert!(!error.contains(secret), "pending error leaked {secret:?}: {error}");
+        assert!(
+            !error.contains(secret),
+            "pending error leaked {secret:?}: {error}"
+        );
     }
     assert!(error.contains("/mcp trust stdio-secret"), "{error}");
     finish_case(&harness, case);
@@ -402,7 +405,10 @@ fn mcp_env_command_change_re_pends_before_resolution() {
     let err = block_on_local(manager.call_tool("guarded", "anything", json!({})))
         .expect_err("changed env definition must re-pend");
     assert!(err.to_string().contains("MCP_TRUST_PENDING"), "{err}");
-    assert!(!marker.exists(), "pending trust must win before $CMD resolution");
+    assert!(
+        !marker.exists(),
+        "pending trust must win before $CMD resolution"
+    );
     finish_case(&harness, case);
 }
 
@@ -444,7 +450,10 @@ fn mcp_header_command_change_re_pends_before_resolution() {
     let err = block_on_local(manager.call_tool("remote", "anything", json!({})))
         .expect_err("changed header definition must re-pend");
     assert!(err.to_string().contains("MCP_TRUST_PENDING"), "{err}");
-    assert!(!marker.exists(), "pending trust must win before $CMD resolution");
+    assert!(
+        !marker.exists(),
+        "pending trust must win before $CMD resolution"
+    );
     finish_case(&harness, case);
 }
 
@@ -469,12 +478,10 @@ fn mcp_relative_stdio_trust_is_scoped_to_project_cwd() {
     )
     .expect("write shared global config");
 
-    let manager_a =
-        McpManager::bootstrap(&project_a, &global, &[]).expect("bootstrap project A");
+    let manager_a = McpManager::bootstrap(&project_a, &global, &[]).expect("bootstrap project A");
     block_on_local(manager_a.trust("local")).expect_err("missing project A server");
 
-    let manager_b =
-        McpManager::bootstrap(&project_b, &global, &[]).expect("bootstrap project B");
+    let manager_b = McpManager::bootstrap(&project_b, &global, &[]).expect("bootstrap project B");
     let row = manager_b
         .list()
         .into_iter()
@@ -508,8 +515,7 @@ fn mcp_http_command_reference_trust_is_scoped_to_project_cwd() {
     )
     .expect("write shared global config");
 
-    let manager_a =
-        McpManager::bootstrap(&project_a, &global, &[]).expect("bootstrap project A");
+    let manager_a = McpManager::bootstrap(&project_a, &global, &[]).expect("bootstrap project A");
     let row_a = manager_a
         .list()
         .into_iter()
@@ -518,8 +524,7 @@ fn mcp_http_command_reference_trust_is_scoped_to_project_cwd() {
     assert_eq!(row_a.trust, "pending");
     block_on_local(manager_a.deny("remote")).expect("persist project A decision");
 
-    let manager_b =
-        McpManager::bootstrap(&project_b, &global, &[]).expect("bootstrap project B");
+    let manager_b = McpManager::bootstrap(&project_b, &global, &[]).expect("bootstrap project B");
     let row_b = manager_b
         .list()
         .into_iter()
@@ -713,11 +718,9 @@ fn mcp_http_transport_handles_ping_before_streamed_response() {
             },
         ],
     );
-    let transport = pi::mcp::transport::HttpTransport::new(
-        &format!("{}/sse-ping", server.base_url()),
-        vec![],
-    )
-    .expect("transport construction");
+    let transport =
+        pi::mcp::transport::HttpTransport::new(&format!("{}/sse-ping", server.base_url()), vec![])
+            .expect("transport construction");
     let result = block_on_local(transport.request(
         "tools/list",
         json!({}),
@@ -853,10 +856,7 @@ fn mcp_http_transport_never_replays_after_nested_response_session_404() {
             },
             MockHttpResponse {
                 status: 200,
-                headers: vec![(
-                    "Content-Type".to_string(),
-                    "text/event-stream".to_string(),
-                )],
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
                 body: sse_body.as_bytes().to_vec(),
             },
             MockHttpResponse::text(404, "session expired while answering ping"),
@@ -937,10 +937,7 @@ fn mcp_http_transport_rejects_malformed_streamed_server_params() {
         "/sse-invalid-params",
         MockHttpResponse {
             status: 200,
-            headers: vec![(
-                "Content-Type".to_string(),
-                "text/event-stream".to_string(),
-            )],
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
             body: sse_body.as_bytes().to_vec(),
         },
     );
@@ -955,7 +952,10 @@ fn mcp_http_transport_rejects_malformed_streamed_server_params() {
         std::time::Duration::from_secs(10),
     ))
     .expect_err("non-object MCP params must fail before a streamed response is accepted");
-    assert!(error.to_string().contains("params must be an object"), "{error}");
+    assert!(
+        error.to_string().contains("params must be an object"),
+        "{error}"
+    );
     assert_eq!(
         server.requests().len(),
         1,
@@ -1007,7 +1007,9 @@ fn mcp_http_transport_rejects_result_or_error_on_streamed_method_envelopes() {
         ))
         .expect_err(label);
         assert!(
-            error.to_string().contains("must not contain result or error"),
+            error
+                .to_string()
+                .contains("must not contain result or error"),
             "unexpected {label} error: {error}"
         );
     }
@@ -1039,11 +1041,9 @@ fn mcp_http_transport_rejects_non_object_outgoing_params_before_dispatch() {
             ),
         ],
     );
-    let transport = pi::mcp::transport::HttpTransport::new(
-        &format!("{}/params", server.base_url()),
-        vec![],
-    )
-    .expect("transport construction");
+    let transport =
+        pi::mcp::transport::HttpTransport::new(&format!("{}/params", server.base_url()), vec![])
+            .expect("transport construction");
 
     let request_error = block_on_local(transport.request(
         "tools/list",
@@ -1073,7 +1073,10 @@ fn mcp_http_transport_rejects_non_object_outgoing_params_before_dispatch() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
     let frame: Value = serde_json::from_slice(&requests[1].body).expect("request frame JSON");
-    assert_eq!(frame["id"], 1, "invalid params must not consume request ids");
+    assert_eq!(
+        frame["id"], 1,
+        "invalid params must not consume request ids"
+    );
     assert!(
         frame.get("params").is_none(),
         "null request sentinel must omit params from the wire frame"
@@ -1102,11 +1105,9 @@ fn mcp_http_transport_distinguishes_request_and_notification_202() {
             },
         ],
     );
-    let transport = pi::mcp::transport::HttpTransport::new(
-        &format!("{}/accepted", server.base_url()),
-        vec![],
-    )
-    .expect("transport construction");
+    let transport =
+        pi::mcp::transport::HttpTransport::new(&format!("{}/accepted", server.base_url()), vec![])
+            .expect("transport construction");
 
     let request_error = block_on_local(transport.request(
         "tools/list",
@@ -1141,10 +1142,7 @@ fn mcp_http_transport_rejects_wrong_media_type_and_nonempty_202() {
     server.add_route(
         "POST",
         "/wrong-media",
-        MockHttpResponse::text(
-            200,
-            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#,
-        ),
+        MockHttpResponse::text(200, r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#),
     );
     server.add_route(
         "POST",
@@ -1204,13 +1202,11 @@ fn mcp_http_transport_rejects_wrong_media_type_and_nonempty_202() {
         vec![],
     )
     .expect("nonempty-accepted transport construction");
-    let body_error = block_on_local(
-        nonempty_accepted.notify("notifications/initialized", json!({})),
-    )
-    .expect_err("HTTP 202 acknowledgement must not carry a body");
+    let body_error =
+        block_on_local(nonempty_accepted.notify("notifications/initialized", json!({})))
+            .expect_err("HTTP 202 acknowledgement must not carry a body");
     assert!(
-        body_error.to_string().contains("no body")
-            || body_error.to_string().contains("not empty"),
+        body_error.to_string().contains("no body") || body_error.to_string().contains("not empty"),
         "unexpected 202-body error: {body_error}"
     );
     finish_case(&harness, case);
@@ -1244,11 +1240,9 @@ fn mcp_http_transport_rejects_mismatched_jsonrpc_envelopes() {
             },
         ],
     );
-    let transport = pi::mcp::transport::HttpTransport::new(
-        &format!("{}/mismatch", server.base_url()),
-        vec![],
-    )
-    .expect("transport construction");
+    let transport =
+        pi::mcp::transport::HttpTransport::new(&format!("{}/mismatch", server.base_url()), vec![])
+            .expect("transport construction");
 
     for reason in ["JSON version", "JSON id", "SSE id"] {
         let error = block_on_local(transport.request(
@@ -1493,11 +1487,9 @@ fn mcp_http_transport_renews_expired_session_once() {
             ),
         ],
     );
-    let transport = pi::mcp::transport::HttpTransport::new(
-        &format!("{}/renew", server.base_url()),
-        vec![],
-    )
-    .expect("transport construction");
+    let transport =
+        pi::mcp::transport::HttpTransport::new(&format!("{}/renew", server.base_url()), vec![])
+            .expect("transport construction");
     let initialize_params = json!({
         "protocolVersion": "2025-06-18",
         "capabilities": {"sampling": {}},
@@ -1521,7 +1513,11 @@ fn mcp_http_transport_renews_expired_session_once() {
     assert_eq!(tools["tools"], json!([]));
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 6, "renewal must perform exactly three posts");
+    assert_eq!(
+        requests.len(),
+        6,
+        "renewal must perform exactly three posts"
+    );
     let frames: Vec<Value> = requests
         .iter()
         .map(|request| serde_json::from_slice(&request.body).expect("request frame JSON"))
@@ -1854,7 +1850,10 @@ mod fixture_lanes {
             "targeted mounting must not re-append another server's wrappers"
         );
         let mounted = handle.mount_mcp_server_tools_if_absent("extension-pending");
-        assert!(mounted > 0, "the first runtime mount must add the selected server");
+        assert!(
+            mounted > 0,
+            "the first runtime mount must add the selected server"
+        );
         assert!(
             handle
                 .session()
@@ -1903,8 +1902,13 @@ mod fixture_lanes {
         write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write LSP header");
         stdin.write_all(body).expect("write LSP body");
         drop(stdin);
-        let output = child.wait_with_output().expect("wait for fixture rejection");
-        assert!(output.stdout.is_empty(), "fixture must not answer LSP framing");
+        let output = child
+            .wait_with_output()
+            .expect("wait for fixture rejection");
+        assert!(
+            output.stdout.is_empty(),
+            "fixture must not answer LSP framing"
+        );
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("protocol input rejected"),
             "fixture did not report rejecting LSP framing: {}",
@@ -1923,10 +1927,7 @@ mod fixture_lanes {
         ] {
             let case = format!("mcp_stdio_fixture_rejects_{mode}");
             let harness = TestHarness::new(&case);
-            let manager = fixture_manager(
-                &harness,
-                &[("PI_MCP_FIXTURE_RESPONSE_MODE", mode)],
-            );
+            let manager = fixture_manager(&harness, &[("PI_MCP_FIXTURE_RESPONSE_MODE", mode)]);
             let error = block_on_local(manager.trust("fixture"))
                 .expect_err("hostile fixture response must fail connection");
             assert!(
@@ -2000,10 +2001,7 @@ mod fixture_lanes {
         let case = "mcp_stdio_close_and_drop_reap_descendant_trees";
         let harness = TestHarness::new(case);
 
-        let closing = fixture_transport(
-            &harness,
-            &[("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1")],
-        );
+        let closing = fixture_transport(&harness, &[("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1")]);
         let closing_descendant = fixture_descendant_pid(&closing);
         block_on_local(closing.close());
         assert!(
@@ -2032,10 +2030,7 @@ mod fixture_lanes {
         let case = "mcp_stdio_dropped_request_and_close_futures_reap_descendant_trees";
         let harness = TestHarness::new(case);
 
-        let requesting = fixture_transport(
-            &harness,
-            &[("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1")],
-        );
+        let requesting = fixture_transport(&harness, &[("PI_MCP_FIXTURE_SPAWN_DESCENDANT", "1")]);
         let requesting_descendant = fixture_descendant_pid(&requesting);
         block_on_local(async {
             let request = Box::pin(requesting.request(
@@ -2064,10 +2059,7 @@ mod fixture_lanes {
             }
         });
         assert!(
-            wait_for_process_exit(
-                requesting_descendant,
-                std::time::Duration::from_secs(2),
-            ),
+            wait_for_process_exit(requesting_descendant, std::time::Duration::from_secs(2),),
             "descendant process {requesting_descendant} survived request-future cancellation"
         );
 
@@ -2086,8 +2078,10 @@ mod fixture_lanes {
                 .cx()
                 .timer_driver()
                 .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-            let observed_pending =
-                Box::pin(asupersync::time::sleep(now, std::time::Duration::from_millis(20)));
+            let observed_pending = Box::pin(asupersync::time::sleep(
+                now,
+                std::time::Duration::from_millis(20),
+            ));
             match futures::future::select(close, observed_pending).await {
                 futures::future::Either::Left(((), _)) => {
                     panic!("close unexpectedly finished before its grace period");
@@ -2177,8 +2171,7 @@ mod fixture_lanes {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .contains(ENV_ALLOWLIST_CHILD_ATTESTATION),
+                String::from_utf8_lossy(&output.stdout).contains(ENV_ALLOWLIST_CHILD_ATTESTATION),
                 "controlled child exited without executing the env-allowlist assertions"
             );
             return;
@@ -2309,11 +2302,8 @@ mod fixture_lanes {
         block_on_local(manager.trust("fixture")).expect("trust");
         // The fixture wrote its startup marker to stderr; the stdio
         // transport retains it for /mcp diagnostics.
-        let tail = wait_for_manager_diagnostics(
-            &manager,
-            "7f3a9c-v2",
-            std::time::Duration::from_secs(1),
-        );
+        let tail =
+            wait_for_manager_diagnostics(&manager, "7f3a9c-v2", std::time::Duration::from_secs(1));
         harness.log().info("verify", format!("stderr tail: {tail}"));
         assert!(
             tail.contains("7f3a9c-v2"),

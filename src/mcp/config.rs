@@ -1451,7 +1451,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("cwd");
         write(
             &cwd.join(".pi/mcp.json"),
-            r#"{"mcpServers": {"s": {"command": "a", "args": ["one"], "env": {"B": "$ENV:TOKEN", "A": "literal"}, "headers": {"X-Token": "$CMD:token-helper", "X-Accept-Mode": "application/json"}}}}"#,
+            r#"{"mcpServers": {"s": {"command": "a", "args": ["one"], "env": {"B": "$ENV:TOKEN", "A": "literal"}}}}"#,
         );
         let server = discover(&cwd, &temp.path().join("g"), &[])
             .servers
@@ -1460,10 +1460,9 @@ mod tests {
         assert_eq!(fingerprint.len(), 64);
         assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
 
-        let mut reordered = server.clone();
-        reordered.env.reverse();
-        reordered.headers.reverse();
-        assert_eq!(fingerprint, reordered.fingerprint(&cwd));
+        let mut reordered_env = server.clone();
+        reordered_env.env.reverse();
+        assert_eq!(fingerprint, reordered_env.fingerprint(&cwd));
 
         let mut changed_env = server.clone();
         changed_env
@@ -1486,17 +1485,30 @@ mod tests {
         changed_args.args.push("two".to_string());
         assert_ne!(fingerprint, changed_args.fingerprint(&cwd));
 
-        let mut changed_header = server.clone();
+        write(
+            &cwd.join(".pi/mcp.json"),
+            r#"{"mcpServers": {"s": {"url": "https://mcp.example.test", "headers": {"X-Token": "$CMD:token-helper", "X-Accept-Mode": "application/json"}}}}"#,
+        );
+        let http_server = discover(&cwd, &temp.path().join("g"), &[])
+            .servers
+            .remove(0);
+        let http_fingerprint = http_server.fingerprint(&cwd);
+
+        let mut reordered_headers = http_server.clone();
+        reordered_headers.headers.reverse();
+        assert_eq!(http_fingerprint, reordered_headers.fingerprint(&cwd));
+
+        let mut changed_header = http_server.clone();
         changed_header
             .headers
             .first_mut()
             .expect("header definition")
             .1 = "$ENV:OTHER_TOKEN".to_string();
-        assert_ne!(fingerprint, changed_header.fingerprint(&cwd));
+        assert_ne!(http_fingerprint, changed_header.fingerprint(&cwd));
 
-        let mut changed_url = server.clone();
-        changed_url.url = Some("https://mcp.example.test".to_string());
-        assert_ne!(fingerprint, changed_url.fingerprint(&cwd));
+        let mut changed_url = http_server;
+        changed_url.url = Some("https://other.example.test".to_string());
+        assert_ne!(http_fingerprint, changed_url.fingerprint(&cwd));
 
         let mut changed_transport = server.clone();
         changed_transport.transport_hint = Some("stdio".to_string());

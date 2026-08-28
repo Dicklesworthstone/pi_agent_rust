@@ -67,9 +67,7 @@ pub fn mounted_name(server: &str, tool: &str) -> String {
         .as_bytes()
         .get(full.len().saturating_sub(25)..)
         .is_some_and(|suffix| {
-            suffix.len() == 25
-                && suffix[0] == b'_'
-                && suffix[1..].iter().all(u8::is_ascii_hexdigit)
+            suffix.len() == 25 && suffix[0] == b'_' && suffix[1..].iter().all(u8::is_ascii_hexdigit)
         });
     // `__` is the component delimiter. Hash any raw component containing it,
     // and reserve the generated suffix shape, so a literal tool name cannot
@@ -85,11 +83,7 @@ pub fn mounted_name(server: &str, tool: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"pi_agent_rust:mcp-mounted-tool:v1\0");
     for part in [server, tool] {
-        hasher.update(
-            u64::try_from(part.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
+        hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(part.as_bytes());
     }
     let digest = crate::package_manager::hex_encode(&hasher.finalize());
