@@ -327,7 +327,10 @@ fn e2e_read_url_raw_preserves_wire_html() {
     let body = String::from_utf8_lossy(&second.body);
     assert!(body.contains("<!DOCTYPE html>"), "doctype is preserved");
     assert!(body.contains("analytics()"), "script source is preserved");
-    assert!(body.contains("Home | Docs | About"), "nav source is preserved");
+    assert!(
+        body.contains("Home | Docs | About"),
+        "nav source is preserved"
+    );
 
     let path = harness.temp_path("e2e_url_raw.jsonl");
     harness.write_jsonl_logs(&path).expect("write logs");

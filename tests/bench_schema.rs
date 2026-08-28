@@ -4905,7 +4905,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 ));
             }
             observed_missing_swarm_reasons_by_key
-                .insert(partition_size_key.clone(), missing_reason_set);
+                .insert(partition_size_key.clone(), missing_reason_set.clone());
         }
 
         let primary = cell_obj

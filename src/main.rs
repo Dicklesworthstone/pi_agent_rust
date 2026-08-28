@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::{Mutex, OwnedMutexGuard};
@@ -830,12 +830,7 @@ fn main_impl() -> Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let handle = runtime.handle();
-    let result = runtime.block_on(run(
-        cli,
-        extension_flags,
-        handle,
-        package_subcommand_trust,
-    ));
+    let result = runtime.block_on(run(cli, extension_flags, handle, package_subcommand_trust));
     // `run()` owns graceful application shutdown. Exiting here avoids waiting on
     // runtime-owned background tasks after the CLI/TUI has already finished.
     // Background bash jobs are session-scoped (bd-cv653.3.10): kill any
@@ -2081,6 +2076,12 @@ async fn run(
         }
     }
 
+    #[cfg(feature = "ftui")]
+    let ftui_enabled_tools = enabled_tools
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+
     if has_extensions {
         let session_snapshot = {
             let cx = pi::agent_cx::AgentCx::for_request();
@@ -2257,12 +2258,7 @@ async fn run(
                 // behavior as the default stack.
                 system_prompt: cli.system_prompt.clone(),
                 append_system_prompt: cli.append_system_prompt.clone(),
-                enabled_tools: Some(
-                    enabled_tools
-                        .iter()
-                        .map(|name| (*name).to_string())
-                        .collect(),
-                ),
+                enabled_tools: Some(ftui_enabled_tools),
                 thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
                 include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
                 max_tool_iterations,
@@ -2473,8 +2469,7 @@ async fn handle_subcommand(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<()> {
-    let manager =
-        PackageManager::new(cwd.to_path_buf()).with_project_trust(project_trusted);
+    let manager = PackageManager::new(cwd.to_path_buf()).with_project_trust(project_trusted);
     match command {
         cli::Commands::Install { source, local } => {
             handle_package_install(&manager, &source, local).await?;
@@ -8713,11 +8708,11 @@ async fn restore_print_retry_tail(
         && let Err(first_err) = candidate.save().await
         && let Err(retry_err) = candidate.save().await
     {
-        return Err(anyhow::Error::new(
-            pi::error::Error::session_persistence(format!(
+        return Err(anyhow::Error::new(pi::error::Error::session_persistence(
+            format!(
                 "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            )),
-        ));
+            ),
+        )));
     }
 
     *inner = candidate;
@@ -8759,7 +8754,11 @@ async fn try_print_failover(
     let Some(class) = pi::failover::classify_failover(error_text) else {
         return Ok(None);
     };
-    let Some(chains) = config.retry.as_ref().and_then(|retry| retry.fallback_chains.as_ref()) else {
+    let Some(chains) = config
+        .retry
+        .as_ref()
+        .and_then(|retry| retry.fallback_chains.as_ref())
+    else {
         return Ok(None);
     };
 
@@ -8768,7 +8767,8 @@ async fn try_print_failover(
         current_provider.name().to_string(),
         current_provider.model_id().to_string(),
     );
-    let Some(chain) = pi::failover::chain_for(chains, "default", &from_provider, &from_model) else {
+    let Some(chain) = pi::failover::chain_for(chains, "default", &from_provider, &from_model)
+    else {
         return Ok(None);
     };
     let cap = config.max_failovers_per_turn() as usize;
@@ -8827,7 +8827,9 @@ async fn try_print_failover(
                 .unwrap_or_default(),
         );
         let target_thinking_text = target_thinking.to_string();
-        let thinking_changed = candidate.effective_thinking_level_for_current_path().as_deref()
+        let thinking_changed = candidate
+            .effective_thinking_level_for_current_path()
+            .as_deref()
             != Some(target_thinking_text.as_str());
         candidate.set_model_header(
             Some(to_provider.clone()),
@@ -8855,11 +8857,11 @@ async fn try_print_failover(
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
         {
-            return Err(anyhow::Error::new(
-                pi::error::Error::session_persistence(format!(
+            return Err(anyhow::Error::new(pi::error::Error::session_persistence(
+                format!(
                     "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                )),
-            ));
+                ),
+            )));
         }
 
         // No fallible operation remains after installing the candidate.
@@ -8869,7 +8871,9 @@ async fn try_print_failover(
         session.agent.set_keyword_max_thinking_level(
             entry.clamp_thinking_level(pi::model::ThinkingLevel::Max),
         );
-        session.agent.set_tool_call_dialect(entry.tool_call_dialect());
+        session
+            .agent
+            .set_tool_call_dialect(entry.tool_call_dialect());
         session
             .agent
             .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
@@ -8883,10 +8887,9 @@ async fn try_print_failover(
         session.set_compaction_context_window(context_window_tokens_for_entry(&entry));
         session.refresh_extension_completion_host_state();
         if let Some(region) = &session.extensions {
-            region.manager().set_current_model(
-                Some(to_provider.clone()),
-                Some(to_model.clone()),
-            );
+            region
+                .manager()
+                .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
         }
         *position = cursor;
         drop(inner);
@@ -9107,15 +9110,14 @@ where
                     return Err(anyhow::Error::new(err));
                 }
                 let err_str = err.to_string();
-                let quota_credential =
-                    (pi::failover::classify_failover(&err_str)
-                        == Some(pi::failover::FailoverClass::Quota))
-                    .then(|| {
-                        (
-                            session.agent.provider().name().to_string(),
-                            session.agent.stream_options().api_key.clone(),
-                        )
-                    });
+                let quota_credential = (pi::failover::classify_failover(&err_str)
+                    == Some(pi::failover::FailoverClass::Quota))
+                .then(|| {
+                    (
+                        session.agent.provider().name().to_string(),
+                        session.agent.stream_options().api_key.clone(),
+                    )
+                });
                 // Classify from the TYPED error first (transient io::ErrorKind
                 // via the source chain), then fall back to message-text matching
                 // for prose-only errors (pi_agent_rust#118).
@@ -9534,8 +9536,6 @@ mod tests {
 
     #[test]
     fn error_renderer_preserves_outer_recovery_context_and_typed_hints() {
-        use anyhow::Context as _;
-
         let error = anyhow::Error::new(pi::error::Error::auth("provider unavailable"))
             .context("retry restoration failed before provider re-entry");
         let rendered = format_error_with_hints(&error);
@@ -9564,13 +9564,11 @@ mod tests {
             paths: false,
             json: true,
         }));
-        assert!(!subcommand_uses_package_manager(
-            &cli::Commands::Config {
-                show: false,
-                paths: true,
-                json: false,
-            }
-        ));
+        assert!(!subcommand_uses_package_manager(&cli::Commands::Config {
+            show: false,
+            paths: true,
+            json: false,
+        }));
     }
 
     #[test]
@@ -10106,13 +10104,9 @@ mod tests {
             }),
         };
 
-        let registry = reload_model_registry_with_extra_entries(
-            &auth,
-            &models_path,
-            &[binding],
-            &[],
-        )
-        .expect("reload with zero-model extension binding");
+        let registry =
+            reload_model_registry_with_extra_entries(&auth, &models_path, &[binding], &[])
+                .expect("reload with zero-model extension binding");
         let acme_rows = registry
             .models()
             .iter()
@@ -10125,7 +10119,10 @@ mod tests {
         assert_eq!(entry.model.name, "Manual Only");
         assert_eq!(entry.model.base_url, "https://manual.example.test/v1");
         assert_eq!(
-            entry.oauth_config.as_ref().map(|oauth| oauth.client_id.as_str()),
+            entry
+                .oauth_config
+                .as_ref()
+                .map(|oauth| oauth.client_id.as_str()),
             Some("acme-client")
         );
     }
@@ -11048,7 +11045,10 @@ mod tests {
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let mut agent = Agent::new(provider, tools, AgentConfig::default());
             agent.stream_options_mut().api_key = Some("primary-key".to_string());
-            agent.stream_options_mut().headers.clone_from(&primary.headers);
+            agent
+                .stream_options_mut()
+                .headers
+                .clone_from(&primary.headers);
             agent.stream_options_mut().max_tokens = Some(primary.model.max_tokens);
             agent.stream_options_mut().thinking_level = Some(pi::model::ThinkingLevel::High);
             agent.set_model_accepts_images(true);
@@ -11098,28 +11098,38 @@ mod tests {
                     serde_json::to_value(inner.to_messages_for_current_path())
                         .expect("serialize Session messages")
                 );
-                assert!(inner.entries_for_current_path().iter().all(|entry| !matches!(
-                    entry,
-                    pi::session::SessionEntry::Message(message)
-                        if matches!(
-                            &message.message,
-                            pi::session::SessionMessage::Assistant { message }
-                                if message.stop_reason == StopReason::Error
-                        )
-                )));
+                assert!(
+                    inner
+                        .entries_for_current_path()
+                        .iter()
+                        .all(|entry| !matches!(
+                            entry,
+                            pi::session::SessionEntry::Message(message)
+                                if matches!(
+                                    &message.message,
+                                    pi::session::SessionMessage::Assistant { message }
+                                        if message.stop_reason == StopReason::Error
+                                )
+                        ))
+                );
             }
             let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
                 .await
                 .expect("reopen restored Session");
-            assert!(reopened.entries_for_current_path().iter().all(|entry| !matches!(
-                entry,
-                pi::session::SessionEntry::Message(message)
-                    if matches!(
-                        &message.message,
-                        pi::session::SessionMessage::Assistant { message }
-                            if message.stop_reason == StopReason::Error
-                    )
-            )));
+            assert!(
+                reopened
+                    .entries_for_current_path()
+                    .iter()
+                    .all(|entry| !matches!(
+                        entry,
+                        pi::session::SessionEntry::Message(message)
+                            if matches!(
+                                &message.message,
+                                pi::session::SessionMessage::Assistant { message }
+                                    if message.stop_reason == StopReason::Error
+                            )
+                    ))
+            );
 
             let mut config = Config::default();
             config.retry = Some(pi::config::RetrySettings {
@@ -11208,10 +11218,7 @@ mod tests {
                     .map(String::as_str),
                 Some("true")
             );
-            assert_eq!(
-                agent_session.agent.stream_options().max_tokens,
-                Some(2_048)
-            );
+            assert_eq!(agent_session.agent.stream_options().max_tokens, Some(2_048));
             assert_eq!(
                 agent_session.agent.tool_call_dialect(),
                 pi::dialects::Dialect::Xmlish
@@ -11245,28 +11252,38 @@ mod tests {
             let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
                 .await
                 .expect("reopen failover Session");
-            assert!(reopened.entries_for_current_path().iter().any(|entry| matches!(
-                entry,
-                pi::session::SessionEntry::ModelChange(change)
-                    if change.provider == "anthropic"
-                        && change.model_id == "fallback-model"
-                        && change.role.as_deref() == Some("failover")
-            )));
+            assert!(
+                reopened
+                    .entries_for_current_path()
+                    .iter()
+                    .any(|entry| matches!(
+                        entry,
+                        pi::session::SessionEntry::ModelChange(change)
+                            if change.provider == "anthropic"
+                                && change.model_id == "fallback-model"
+                                && change.role.as_deref() == Some("failover")
+                    ))
+            );
             assert_eq!(
                 reopened
                     .effective_thinking_level_for_current_path()
                     .as_deref(),
                 Some("off")
             );
-            assert!(reopened.entries_for_current_path().iter().all(|entry| !matches!(
-                entry,
-                pi::session::SessionEntry::Message(message)
-                    if matches!(
-                        &message.message,
-                        pi::session::SessionMessage::Assistant { message }
-                            if message.stop_reason == StopReason::Error
-                    )
-            )));
+            assert!(
+                reopened
+                    .entries_for_current_path()
+                    .iter()
+                    .all(|entry| !matches!(
+                        entry,
+                        pi::session::SessionEntry::Message(message)
+                            if matches!(
+                                &message.message,
+                                pi::session::SessionMessage::Assistant { message }
+                                    if message.stop_reason == StopReason::Error
+                            )
+                    ))
+            );
         });
     }
 
@@ -11375,10 +11392,8 @@ mod tests {
             fallback.model.context_window = 4_096;
             fallback.model.max_tokens = 2_048;
             fallback.api_key = Some("fallback-key".to_string());
-            fallback.headers = std::collections::HashMap::from([(
-                "x-fallback".to_string(),
-                "true".to_string(),
-            )]);
+            fallback.headers =
+                std::collections::HashMap::from([("x-fallback".to_string(), "true".to_string())]);
             fallback.compat = Some(pi::models::CompatConfig {
                 tool_call_dialect: Some(pi::dialects::Dialect::Xmlish),
                 ..Default::default()
@@ -11419,7 +11434,10 @@ mod tests {
                     .to_string()
                     .contains("PI_SESSION_PERSISTENCE_FAILED")
             );
-            assert_eq!(position, 0, "failed persistence must not consume the fallback");
+            assert_eq!(
+                position, 0,
+                "failed persistence must not consume the fallback"
+            );
             assert_eq!(agent_session.agent.provider().name(), "openai");
             assert_eq!(agent_session.agent.provider().model_id(), "primary-model");
             assert_eq!(

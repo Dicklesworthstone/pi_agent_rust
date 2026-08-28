@@ -4990,10 +4990,9 @@ mod tests {
         };
 
         let trusted = PackageManager::new(cwd.clone());
-        let trusted_packages = PackageManager::list_packages_with_roots(
-            &trusted.apply_project_trust(roots.clone()),
-        )
-        .expect("list trusted packages");
+        let trusted_packages =
+            PackageManager::list_packages_with_roots(&trusted.apply_project_trust(roots.clone()))
+                .expect("list trusted packages");
         assert_eq!(trusted_packages.len(), 2);
         assert!(
             trusted_packages
@@ -5002,10 +5001,9 @@ mod tests {
         );
 
         let untrusted = PackageManager::new(cwd).with_project_trust(false);
-        let untrusted_packages = PackageManager::list_packages_with_roots(
-            &untrusted.apply_project_trust(roots),
-        )
-        .expect("list untrusted packages");
+        let untrusted_packages =
+            PackageManager::list_packages_with_roots(&untrusted.apply_project_trust(roots))
+                .expect("list untrusted packages");
         assert_eq!(untrusted_packages.len(), 1);
         assert_eq!(untrusted_packages[0].source, "npm:global-pkg");
         assert_eq!(untrusted_packages[0].scope, PackageScope::User);

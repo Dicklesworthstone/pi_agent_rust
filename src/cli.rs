@@ -1253,7 +1253,10 @@ mod tests {
         assert!(parsed.cli.plan_yolo);
         assert_eq!(parsed.cli.approval_mode.as_deref(), Some("write"));
         assert!(parsed.cli.yolo);
-        assert_eq!(parsed.cli.mcp_config, vec![PathBuf::from("project.mcp.json")]);
+        assert_eq!(
+            parsed.cli.mcp_config,
+            vec![PathBuf::from("project.mcp.json")]
+        );
         assert_eq!(parsed.cli.max_time, Some(37));
         assert_eq!(
             parsed.extension_flags,

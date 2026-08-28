@@ -826,6 +826,10 @@ fn run_tool_roundtrip_native_runtime(runtime: &ExtensionRuntimeHandle) -> Result
 }
 
 #[cfg(test)]
+// Cargo also compiles this file as a harness-free bench target. In that mode
+// the `#[test]` bodies are stripped after cfg expansion, leaving their imports
+// apparently unused even though the ordinary example test target uses them.
+#[allow(unused_imports)]
 mod tests {
     use super::*;
     use pi::perf_build::profile_from_target_path;

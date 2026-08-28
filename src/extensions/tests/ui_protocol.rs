@@ -1768,7 +1768,9 @@ fn extension_ui_deadline_is_bound_once_and_never_restarted() {
     request.timeout_ms = Some(5_000);
 
     request.bind_deadline(base);
-    let bound = request.deadline().expect("relative timeout binds a deadline");
+    let bound = request
+        .deadline()
+        .expect("relative timeout binds a deadline");
     assert_eq!(bound, base + std::time::Duration::from_secs(5));
 
     request.bind_deadline(base + std::time::Duration::from_secs(2));
@@ -1782,8 +1784,7 @@ fn extension_ui_deadline_is_bound_once_and_never_restarted() {
         Some(std::time::Duration::from_secs(3))
     );
 
-    let first = ExtensionUiRequest::new("deadline-2", "confirm", json!({}))
-        .with_timeout_ms(5_000);
+    let first = ExtensionUiRequest::new("deadline-2", "confirm", json!({})).with_timeout_ms(5_000);
     let first_deadline = first.deadline().expect("builder binds its timeout");
     let replaced = first.with_timeout_ms(1_000);
     assert_eq!(replaced.timeout_ms, Some(1_000));
@@ -2055,12 +2056,8 @@ fn closing_ui_sender_cancels_pending_and_rejects_late_requests() {
 
         let late = manager
             .request_ui(
-                ExtensionUiRequest::new(
-                    "after-close",
-                    "confirm",
-                    json!({"title": "Too late"}),
-                )
-                .with_timeout_ms(20),
+                ExtensionUiRequest::new("after-close", "confirm", json!({"title": "Too late"}))
+                    .with_timeout_ms(20),
             )
             .await
             .expect_err("closed UI rejects later requests");

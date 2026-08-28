@@ -7683,7 +7683,7 @@ mod retry_tests {
         let entry_id = session
             .entries_for_current_path()
             .last()
-            .and_then(SessionEntry::base_id)
+            .and_then(|entry| entry.base_id())
             .cloned()
             .expect("fork source entry id");
         (session, entry_id)

@@ -4516,8 +4516,14 @@ fn unavailable_prompt_denies_current_call_without_caching_a_user_decision() {
     };
 
     let first = run_async(async { resolve_shared_policy_prompt(&ctx, "exec").await });
-    assert_eq!(first, (PolicyDecision::Deny, "prompt_unavailable".to_string()));
-    assert_eq!(manager.cached_policy_prompt_decision("ext.recover", "exec"), None);
+    assert_eq!(
+        first,
+        (PolicyDecision::Deny, "prompt_unavailable".to_string())
+    );
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.recover", "exec"),
+        None
+    );
 
     manager.set_ui_handler(Arc::new(RecordingUiHandler {
         prompts: std::sync::Mutex::new(Vec::new()),
@@ -4575,7 +4581,10 @@ fn one_shot_prompt_decision_is_not_reused_by_the_next_hostcall() {
             (PolicyDecision::Allow, "prompt_user_allow".to_string())
         );
     }
-    assert_eq!(manager.cached_policy_prompt_decision("ext.once", "exec"), None);
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.once", "exec"),
+        None
+    );
     assert_eq!(
         handler
             .prompts
@@ -4630,7 +4639,10 @@ fn only_remembered_persistent_prompt_decisions_survive_store_reopen() {
     }));
     let once = run_async(async { resolve_shared_policy_prompt(&ctx, "exec").await });
     assert_eq!(once.0, PolicyDecision::Allow);
-    assert_eq!(manager.cached_policy_prompt_decision("ext.scope", "exec"), None);
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.scope", "exec"),
+        None
+    );
     assert_eq!(
         PermissionStore::open(&permissions_path)
             .expect("reopen after once")

@@ -1061,10 +1061,7 @@ pub fn create_provider(
         })?;
         let mut model = entry.model.clone();
         model.provider = provider_id;
-        return Ok(Arc::new(ExtensionStreamSimpleProvider::new(
-            model,
-            runtime,
-        )));
+        return Ok(Arc::new(ExtensionStreamSimpleProvider::new(model, runtime)));
     }
 
     let (route, canonical_provider, effective_api) = resolve_provider_route(entry)?;
@@ -1874,10 +1871,7 @@ export default function init(pi) {
                 extension_oauth.auth_url,
                 "https://auth.example.test/authorize"
             );
-            assert_eq!(
-                extension_oauth.token_url,
-                "https://auth.example.test/token"
-            );
+            assert_eq!(extension_oauth.token_url, "https://auth.example.test/token");
             assert_eq!(extension_oauth.client_id, "mixed-case-client");
             assert_eq!(extension_oauth.scopes.len(), 1);
             assert_eq!(

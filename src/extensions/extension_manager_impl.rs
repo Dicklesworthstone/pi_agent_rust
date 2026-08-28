@@ -4215,13 +4215,7 @@ impl ExtensionManager {
                 .is_capability_prompt()
                 .then(|| request.auto_deny_response());
             let response = if let Some(remaining) = remaining {
-                match timeout(
-                    wall_now(),
-                    remaining,
-                    handler.request_ui(request),
-                )
-                .await
-                {
+                match timeout(wall_now(), remaining, handler.request_ui(request)).await {
                     Ok(response) => response,
                     Err(_) => timeout_response.map_or_else(
                         || Err(Error::extension("Extension UI request timed out")),

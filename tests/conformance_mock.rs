@@ -639,11 +639,7 @@ fn mock_session_captures_mutations() {
             s.set_thinking_level("high".to_string(), None)
                 .await
                 .unwrap();
-            s.set_label(
-                "msg-123".to_string(),
-                Some("important".to_string()),
-                None,
-            )
+            s.set_label("msg-123".to_string(), Some("important".to_string()), None)
                 .await
                 .unwrap();
         }

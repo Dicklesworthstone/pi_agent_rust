@@ -4831,7 +4831,7 @@ impl HostcallTracker {
 
 fn enqueue_hostcall_request_with_backpressure<C: SchedulerClock>(
     queue: &HostcallQueue,
-    tracker: &Rc<RefCell<HostcallTracker>>,
+    _tracker: &Rc<RefCell<HostcallTracker>>,
     scheduler: &Rc<RefCell<Scheduler<C>>>,
     request: HostcallRequest,
 ) {

@@ -267,10 +267,7 @@ fn redacted_gitlab_error_body(
     escape_untrusted_diagnostic(&redacted, MAX_GITLAB_ERROR_DIAGNOSTIC_BYTES)
 }
 
-async fn apply_overall_deadline<T, F>(
-    operation: F,
-    timeout: Option<Duration>,
-) -> Result<T>
+async fn apply_overall_deadline<T, F>(operation: F, timeout: Option<Duration>) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
@@ -466,9 +463,7 @@ impl GitLabProvider {
                     None
                 }
             })
-            .ok_or_else(|| {
-                Error::provider("gitlab", "GitLab Chat requires a user text message")
-            })?;
+            .ok_or_else(|| Error::provider("gitlab", "GitLab Chat requires a user text message"))?;
         if let UserContent::Blocks(blocks) = &primary_user.content
             && blocks
                 .iter()
@@ -502,11 +497,14 @@ impl GitLabProvider {
                 &mut request_text_bytes,
                 "[System]: ".len().saturating_add(system.len()),
             )?;
-            push_context_item(&mut additional_context, GitLabContextItem {
-                category: "file".to_string(),
-                id: "system-prompt".to_string(),
-                content: format!("[System]: {system}"),
-            })?;
+            push_context_item(
+                &mut additional_context,
+                GitLabContextItem {
+                    category: "file".to_string(),
+                    id: "system-prompt".to_string(),
+                    content: format!("[System]: {system}"),
+                },
+            )?;
         }
 
         for (i, msg) in context.messages[..primary_index].iter().enumerate() {
@@ -520,20 +518,23 @@ impl GitLabProvider {
                     )?;
                     let text = user_content_text(&user_msg.content);
                     if !text.trim().is_empty() {
-                        push_context_item(&mut additional_context, GitLabContextItem {
-                            category: "file".to_string(),
-                            id: format!("message-{i}"),
-                            content: format!("[User]: {text}"),
-                        })?;
+                        push_context_item(
+                            &mut additional_context,
+                            GitLabContextItem {
+                                category: "file".to_string(),
+                                id: format!("message-{i}"),
+                                content: format!("[User]: {text}"),
+                            },
+                        )?;
                     }
                 }
                 Message::Assistant(asst_msg) => {
                     // Include prior assistant responses as context.
                     charge_request_text(
                         &mut request_text_bytes,
-                        "[Assistant]: ".len().saturating_add(text_block_bytes(
-                            asst_msg.content.iter(),
-                        )),
+                        "[Assistant]: "
+                            .len()
+                            .saturating_add(text_block_bytes(asst_msg.content.iter())),
                     )?;
                     let text: String = asst_msg
                         .content
@@ -548,11 +549,14 @@ impl GitLabProvider {
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !text.trim().is_empty() {
-                        push_context_item(&mut additional_context, GitLabContextItem {
-                            category: "file".to_string(),
-                            id: format!("message-{i}"),
-                            content: format!("[Assistant]: {text}"),
-                        })?;
+                        push_context_item(
+                            &mut additional_context,
+                            GitLabContextItem {
+                                category: "file".to_string(),
+                                id: format!("message-{i}"),
+                                content: format!("[Assistant]: {text}"),
+                            },
+                        )?;
                     }
                 }
                 _ => {}
@@ -750,11 +754,7 @@ mod tests {
                 .build()
                 .expect("runtime");
             let result = runtime
-                .block_on(provider.stream_with_timeout(
-                    &context,
-                    &options,
-                    overall_timeout,
-                ))
+                .block_on(provider.stream_with_timeout(&context, &options, overall_timeout))
                 .map(|_| ())
                 .map_err(|err| err.to_string());
             let _ = result_tx.send(result);
@@ -933,10 +933,7 @@ mod tests {
         let encoded = serde_json::to_value(&req).expect("serialize gitlab request");
 
         assert_eq!(req.content, "Call echo with hello.");
-        assert_eq!(
-            encoded["with_clean_history"],
-            serde_json::Value::Bool(true)
-        );
+        assert_eq!(encoded["with_clean_history"], serde_json::Value::Bool(true));
         assert_eq!(context.tools.len(), 1);
         assert!(encoded.get("tools").is_none());
         assert!(encoded.get("tool_choice").is_none());
@@ -1112,18 +1109,24 @@ mod tests {
                 content: String::new(),
             })
             .collect::<Vec<_>>();
-        push_context_item(&mut context, GitLabContextItem {
-            category: "file".to_string(),
-            id: "exact-limit".to_string(),
-            content: String::new(),
-        })
+        push_context_item(
+            &mut context,
+            GitLabContextItem {
+                category: "file".to_string(),
+                id: "exact-limit".to_string(),
+                content: String::new(),
+            },
+        )
         .expect("the exact context-item limit must be accepted");
         assert_eq!(context.len(), MAX_GITLAB_CONTEXT_ITEMS);
-        let error = push_context_item(&mut context, GitLabContextItem {
-            category: "file".to_string(),
-            id: "one-too-many".to_string(),
-            content: String::new(),
-        })
+        let error = push_context_item(
+            &mut context,
+            GitLabContextItem {
+                category: "file".to_string(),
+                id: "one-too-many".to_string(),
+                content: String::new(),
+            },
+        )
         .expect_err("context beyond the exact item limit must fail");
         assert!(error.to_string().contains("item context limit"));
     }
@@ -1141,14 +1144,12 @@ mod tests {
         );
         let options = StreamOptions {
             api_key: Some("test-token".to_string()),
-            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
-                |_| {
-                    Box::pin(futures::future::ready(Some(serde_json::json!({
-                        "content": "x".repeat(MAX_GITLAB_REQUEST_BODY_BYTES),
-                        "with_clean_history": true
-                    }))))
-                },
-            )),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(|_| {
+                Box::pin(futures::future::ready(Some(serde_json::json!({
+                    "content": "x".repeat(MAX_GITLAB_REQUEST_BODY_BYTES),
+                    "with_clean_history": true
+                }))))
+            })),
             ..StreamOptions::default()
         };
         let error = run_stream_bounded(provider, context, options, None)
@@ -1169,18 +1170,13 @@ mod tests {
         );
         let options = StreamOptions {
             api_key: Some("test-token".to_string()),
-            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
-                |_| Box::pin(futures::future::pending()),
-            )),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(|_| {
+                Box::pin(futures::future::pending())
+            })),
             ..StreamOptions::default()
         };
-        let error = run_stream_bounded(
-            provider,
-            context,
-            options,
-            Some(Duration::from_millis(25)),
-        )
-        .expect_err("stalled rewrite hook must hit the overall deadline");
+        let error = run_stream_bounded(provider, context, options, Some(Duration::from_millis(25)))
+            .expect_err("stalled rewrite hook must hit the overall deadline");
         assert!(error.contains("overall deadline"), "{error}");
     }
 
@@ -1202,8 +1198,7 @@ mod tests {
             );
         });
 
-        let provider =
-            GitLabProvider::new("model").with_base_url(format!("http://{address}"));
+        let provider = GitLabProvider::new("model").with_base_url(format!("http://{address}"));
         let context = Context::owned(
             None,
             vec![Message::User(UserMessage {
@@ -1216,13 +1211,8 @@ mod tests {
             api_key: Some("test-token".to_string()),
             ..StreamOptions::default()
         };
-        let error = run_stream_bounded(
-            provider,
-            context,
-            options,
-            Some(Duration::from_secs(3)),
-        )
-        .expect_err("oversized error response must fail closed");
+        let error = run_stream_bounded(provider, context, options, Some(Duration::from_secs(3)))
+            .expect_err("oversized error response must fail closed");
         server.join().expect("test server");
         assert!(error.contains("response body too large"), "{error}");
         assert!(!error.contains("test-token"));
@@ -1249,8 +1239,7 @@ mod tests {
             }
         });
 
-        let provider =
-            GitLabProvider::new("model").with_base_url(format!("http://{address}"));
+        let provider = GitLabProvider::new("model").with_base_url(format!("http://{address}"));
         let context = Context::owned(
             None,
             vec![Message::User(UserMessage {
@@ -1264,13 +1253,9 @@ mod tests {
             ..StreamOptions::default()
         };
         let started = Instant::now();
-        let error = run_stream_bounded(
-            provider,
-            context,
-            options,
-            Some(Duration::from_millis(125)),
-        )
-        .expect_err("slow-drip response must hit the overall deadline");
+        let error =
+            run_stream_bounded(provider, context, options, Some(Duration::from_millis(125)))
+                .expect_err("slow-drip response must hit the overall deadline");
         let request_elapsed = started.elapsed();
         server.join().expect("test server");
         assert!(error.contains("overall deadline"), "{error}");
@@ -1345,8 +1330,7 @@ mod tests {
                 .expect("write truncated response");
         });
 
-        let provider =
-            GitLabProvider::new("model").with_base_url(format!("http://{address}"));
+        let provider = GitLabProvider::new("model").with_base_url(format!("http://{address}"));
         let context = Context::owned(
             None,
             vec![Message::User(UserMessage {

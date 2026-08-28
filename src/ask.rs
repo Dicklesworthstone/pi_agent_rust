@@ -1031,10 +1031,9 @@ mod tests {
                     None,
                 ),
             )
-                .await
-                .expect("a full picker queue must fail before the outer guard expires");
-            let error = execution
-                .expect_err("a full picker queue must fail without waiting");
+            .await
+            .expect("a full picker queue must fail before the outer guard expires");
+            let error = execution.expect_err("a full picker queue must fail without waiting");
             assert!(
                 error.to_string().contains("picker surface unavailable"),
                 "{error}"
@@ -1061,10 +1060,12 @@ mod tests {
             let forwarder = async move {
                 let request = rx.recv(cx.cx()).await.expect("queued UI request");
                 assert_eq!(forwarder_tool.close_channel_ui(), 1);
-                assert!(!forwarder_tool.try_forward_channel_ui_request(&request.id, || {
-                    forwarded_for_task.store(true, std::sync::atomic::Ordering::Release);
-                    true
-                }));
+                assert!(
+                    !forwarder_tool.try_forward_channel_ui_request(&request.id, || {
+                        forwarded_for_task.store(true, std::sync::atomic::Ordering::Release);
+                        true
+                    })
+                );
                 let closed = asupersync::time::timeout(
                     asupersync::time::wall_now(),
                     std::time::Duration::from_millis(20),

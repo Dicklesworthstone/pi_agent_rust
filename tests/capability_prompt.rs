@@ -1034,10 +1034,12 @@ mod prompt_persistence_integration {
         let (ui_tx, mut ui_rx) = mpsc::channel(16);
         manager.set_ui_sender(ui_tx);
         let mut app = build_app(&harness, Some(manager.clone()));
-        let mut request = Box::pin(manager.request_ui(
-            cap_prompt_request(request_id, "test-ext", "exec", "Run commands")
-                .with_timeout_ms(1_000),
-        ));
+        let mut request = Box::pin(
+            manager.request_ui(
+                cap_prompt_request(request_id, "test-ext", "exec", "Run commands")
+                    .with_timeout_ms(1_000),
+            ),
+        );
         let delivered = runtime.block_on(async {
             assert!(futures::poll!(request.as_mut()).is_pending());
             let cx = Cx::for_request();
@@ -1058,10 +1060,8 @@ mod prompt_persistence_integration {
 
     #[test]
     fn allow_always_action_dismisses_prompt() {
-        let (response, view) = run_capability_action(
-            "scope-allow-always",
-            &[KeyType::Right, KeyType::Enter],
-        );
+        let (response, view) =
+            run_capability_action("scope-allow-always", &[KeyType::Right, KeyType::Enter]);
         assert!(!response.cancelled);
         assert_eq!(
             response.value,

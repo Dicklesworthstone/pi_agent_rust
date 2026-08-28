@@ -182,7 +182,11 @@ fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
         COMMAND_TIMEOUT,
     );
 
-    log_test_event(test_name, "share_initiated", &json!({"visibility": "secret"}));
+    log_test_event(
+        test_name,
+        "share_initiated",
+        &json!({"visibility": "secret"}),
+    );
 
     // Issue /share command (secret/unlisted, but not access-controlled).
     let pane = session.send_text_and_wait(

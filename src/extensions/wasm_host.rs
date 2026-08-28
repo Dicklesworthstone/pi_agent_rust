@@ -433,9 +433,7 @@ impl HostState {
             CapabilityPromptOutcome::InvalidResponse => {
                 (PolicyDecision::Deny, "prompt_invalid_response")
             }
-            CapabilityPromptOutcome::Unavailable => {
-                (PolicyDecision::Deny, "prompt_unavailable")
-            }
+            CapabilityPromptOutcome::Unavailable => (PolicyDecision::Deny, "prompt_unavailable"),
         };
         (decision, reason.to_string(), capability)
     }

@@ -7255,15 +7255,13 @@ impl Tool for BashTool {
                                 // result instead of blocking on foreground
                                 // output.
                                 let job = crate::jobs::spawn_background(
-                                    background_session_id
-                                        .as_deref()
-                                        .ok_or_else(|| {
-                                            Error::tool(
-                                                "bash",
-                                                "background job session scope was not resolved"
-                                                    .to_string(),
-                                            )
-                                        })?,
+                                    background_session_id.as_deref().ok_or_else(|| {
+                                        Error::tool(
+                                            "bash",
+                                            "background job session scope was not resolved"
+                                                .to_string(),
+                                        )
+                                    })?,
                                     &self.cwd,
                                     self.shell_path.as_deref(),
                                     self.command_prefix.as_deref(),
@@ -7351,14 +7349,12 @@ impl Tool for BashTool {
         // timeout/tree-kill discipline via the jobs registry.
         if input.background.unwrap_or(false) {
             let job = match crate::jobs::spawn_background(
-                background_session_id
-                    .as_deref()
-                    .ok_or_else(|| {
-                        Error::tool(
-                            "bash",
-                            "background job session scope was not resolved".to_string(),
-                        )
-                    })?,
+                background_session_id.as_deref().ok_or_else(|| {
+                    Error::tool(
+                        "bash",
+                        "background job session scope was not resolved".to_string(),
+                    )
+                })?,
                 &self.cwd,
                 self.shell_path.as_deref(),
                 self.command_prefix.as_deref(),

@@ -193,15 +193,12 @@ fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Option<Vec
         )));
     }
 
-    let file = File::open(path).map_err(|err| {
-        Error::config(format!("Failed to read {}: {err}", escaped_path(path)))
-    })?;
+    let file = File::open(path)
+        .map_err(|err| Error::config(format!("Failed to read {}: {err}", escaped_path(path))))?;
     let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
     file.take(max_bytes as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|err| {
-            Error::config(format!("Failed to read {}: {err}", escaped_path(path)))
-        })?;
+        .map_err(|err| Error::config(format!("Failed to read {}: {err}", escaped_path(path))))?;
     if bytes.len() > max_bytes {
         return Err(Error::config(format!(
             "Trust surface exceeds {max_bytes} bytes: {}",
@@ -696,8 +693,7 @@ mod tests {
 
         let device = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(device.path().join(".pi")).expect("create project dir");
-        symlink("/dev/zero", device.path().join(".pi/mcp.json"))
-            .expect("create device symlink");
+        symlink("/dev/zero", device.path().join(".pi/mcp.json")).expect("create device symlink");
         let err = WorkspaceTrustSurface::scan(device.path())
             .expect_err("device symlinks must be rejected before opening");
         assert!(err.to_string().contains("not a regular file"));
@@ -827,11 +823,7 @@ mod tests {
         assert!(!state.trusted);
         assert_eq!(state.source, TrustSource::NonInteractive);
         assert_eq!(
-            state
-                .surface
-                .as_ref()
-                .expect("surface")
-                .mcp_config_entries,
+            state.surface.as_ref().expect("surface").mcp_config_entries,
             vec![".agents/mcp.json"]
         );
         assert!(!store_path.exists());

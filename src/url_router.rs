@@ -166,9 +166,7 @@ fn diagnostic_matches_named_resource(
             .and_then(Path::file_name)
             .and_then(|part| part.to_str())
             == Some(name);
-    file_stem_matches
-        || skill_parent_matches
-        || roots.iter().any(|root| path == root)
+    file_stem_matches || skill_parent_matches || roots.iter().any(|root| path == root)
 }
 
 fn resource_diagnostic_error(
@@ -189,7 +187,8 @@ fn resource_diagnostic_error(
 fn resolve_skill(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
     let agent_dir = crate::config::Config::global_dir();
     let roots = [
-        cwd.join(crate::config::Config::project_dir()).join("skills"),
+        cwd.join(crate::config::Config::project_dir())
+            .join("skills"),
         agent_dir.join("skills"),
     ];
     let skills = crate::resources::load_skills(crate::resources::LoadSkillsOptions {
@@ -223,13 +222,14 @@ fn resolve_skill(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
 }
 
 fn resolve_skill_document(name: &str, skill: &crate::resources::Skill) -> Result<ResolvedDoc> {
-    let content = crate::resources::read_resource_file_bounded(&skill.file_path, "Skill")
-        .map_err(|error| {
+    let content = crate::resources::read_resource_file_bounded(&skill.file_path, "Skill").map_err(
+        |error| {
             Error::tool(
                 "read",
                 format!("PI_URL_RESOURCE_INVALID: failed to read skill '{name}': {error}"),
             )
-        })?;
+        },
+    )?;
     Ok(doc(
         "skill",
         name,
@@ -246,7 +246,8 @@ fn resolve_skill_document(name: &str, skill: &crate::resources::Skill) -> Result
 fn resolve_prompt(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
     let agent_dir = crate::config::Config::global_dir();
     let roots = [
-        cwd.join(crate::config::Config::project_dir()).join("prompts"),
+        cwd.join(crate::config::Config::project_dir())
+            .join("prompts"),
         agent_dir.join("prompts"),
     ];
     let result = crate::resources::load_prompt_templates_with_diagnostics(
@@ -257,7 +258,11 @@ fn resolve_prompt(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
             include_defaults: true,
         },
     );
-    let Some(template) = result.templates.iter().find(|template| template.name == name) else {
+    let Some(template) = result
+        .templates
+        .iter()
+        .find(|template| template.name == name)
+    else {
         if let Some(diagnostic) = result
             .diagnostics
             .iter()
@@ -1412,9 +1417,11 @@ mod tests {
         let skill = resolve("skill://router-cwd-skill", root.path()).expect("resolve skill");
         assert!(skill.content.contains("project skill"));
         let expected_skill_path = skill_path.display().to_string();
-        assert_eq!(skill.metadata["path"].as_str(), Some(expected_skill_path.as_str()));
-        let prompt =
-            resolve("prompt://router-cwd-prompt", root.path()).expect("resolve prompt");
+        assert_eq!(
+            skill.metadata["path"].as_str(),
+            Some(expected_skill_path.as_str())
+        );
+        let prompt = resolve("prompt://router-cwd-prompt", root.path()).expect("resolve prompt");
         assert_eq!(prompt.content, "project prompt\n");
         let expected_prompt_path = prompt_path.display().to_string();
         assert_eq!(
@@ -1569,9 +1576,7 @@ mod tests {
         let script = ssh_capped_read_script("/tmp/it's; $(touch /tmp/pwned)");
         assert_eq!(
             script,
-            format!(
-                "head -c {SSH_MAX_BYTES} -- '/tmp/it'\\''s; $(touch /tmp/pwned)'"
-            )
+            format!("head -c {SSH_MAX_BYTES} -- '/tmp/it'\\''s; $(touch /tmp/pwned)'")
         );
     }
 

@@ -1411,7 +1411,10 @@ impl AgentSessionHandle {
             Ok(session) => session,
             Err(err) => {
                 let warning = format!("failed to lock session for resource shutdown: {err}");
-                tracing::warn!(event = "sdk.session.shutdown.jobs_owner_failed", "{warning}");
+                tracing::warn!(
+                    event = "sdk.session.shutdown.jobs_owner_failed",
+                    "{warning}"
+                );
                 let mut report = SessionResourceShutdown::default();
                 report.fail(warning);
                 return Err(report);
@@ -1447,7 +1450,10 @@ impl AgentSessionHandle {
             if !region.shutdown().await {
                 let warning =
                     "extension runtime did not stop within its shutdown budget".to_string();
-                tracing::warn!(event = "sdk.session.shutdown.extension_timeout", "{warning}");
+                tracing::warn!(
+                    event = "sdk.session.shutdown.extension_timeout",
+                    "{warning}"
+                );
                 report.fail(warning);
             }
         }
@@ -1539,7 +1545,10 @@ impl AgentSessionHandle {
             }
             Err(err) => {
                 let warning = format!("failed to lock session for resource shutdown: {err}");
-                tracing::warn!(event = "sdk.session.shutdown.jobs_owner_failed", "{warning}");
+                tracing::warn!(
+                    event = "sdk.session.shutdown.jobs_owner_failed",
+                    "{warning}"
+                );
                 report.fail(warning);
                 None
             }
@@ -2079,12 +2088,7 @@ fn load_session_config(
     config_override: Option<&Path>,
     workspace_trusted: bool,
 ) -> Result<Config> {
-    Config::load_with_roots_and_project_trust(
-        config_override,
-        global_dir,
-        cwd,
-        workspace_trusted,
-    )
+    Config::load_with_roots_and_project_trust(config_override, global_dir, cwd, workspace_trusted)
 }
 
 fn build_stream_options_with_optional_key(
@@ -2408,10 +2412,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             .map(ExtensionRegion::manager)
         {
             for spec in extension_manager.extension_mcp_servers() {
-                let name = spec
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let name = spec.get("name").and_then(Value::as_str).unwrap_or_default();
                 if !name.is_empty() {
                     manager.register_extension_server(name, &spec);
                 }
@@ -2526,8 +2527,8 @@ mod tests {
         )
         .expect("write project settings");
 
-        let untrusted = load_session_config(&cwd, &global_dir, None, false)
-            .expect("load untrusted config");
+        let untrusted =
+            load_session_config(&cwd, &global_dir, None, false).expect("load untrusted config");
         assert_eq!(untrusted.default_thinking_level.as_deref(), Some("low"));
 
         let trusted =
@@ -3428,9 +3429,8 @@ mod tests {
                     .lock(cx.cx())
                     .await
                     .expect("lock session");
-                session.set_autosave_durability_mode(
-                    crate::session::AutosaveDurabilityMode::Strict,
-                );
+                session
+                    .set_autosave_durability_mode(crate::session::AutosaveDurabilityMode::Strict);
                 session.append_session_info(Some("ephemeral mutation".to_string()));
             }
             handle.shutdown_owned_resources().await

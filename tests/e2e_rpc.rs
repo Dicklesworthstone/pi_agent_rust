@@ -3900,8 +3900,7 @@ async fn assert_no_ui_request_with_id(
         match recv_result {
             Ok(line) => {
                 if let Ok(value) = serde_json::from_str::<Value>(&line)
-                    && value.get("type").and_then(Value::as_str)
-                        == Some("extension_ui_request")
+                    && value.get("type").and_then(Value::as_str) == Some("extension_ui_request")
                     && value.get("id").and_then(Value::as_str) == Some(request_id)
                 {
                     panic!("unexpected stale extension UI request: {value}");
@@ -4255,13 +4254,7 @@ fn rpc_extension_ui_confirm_roundtrip() {
             "confirmed": true,
         })
         .to_string();
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &response,
-            "confirm_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &response, "confirm_response").await;
         assert_ok(&resp, "extension_ui_response");
         assert_eq!(resp["data"]["resolved"], true);
 
@@ -4324,13 +4317,7 @@ fn rpc_extension_ui_confirm_denied() {
             ui_request_generation(&ui_event),
             json!({"value": false}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &response,
-            "confirm_denied_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &response, "confirm_denied_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -4402,13 +4389,7 @@ fn rpc_extension_ui_select_roundtrip() {
             ui_request_generation(&ui_event),
             json!({"value": "gpt-4o"}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &response,
-            "select_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &response, "select_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -4478,13 +4459,7 @@ fn rpc_extension_ui_input_roundtrip() {
             ui_request_generation(&ui_event),
             json!({"value": "sk-test-12345"}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &response,
-            "input_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &response, "input_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -4553,13 +4528,7 @@ fn rpc_extension_ui_editor_roundtrip() {
             ui_request_generation(&ui_event),
             json!({"value": "key: new_value"}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &response,
-            "editor_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &response, "editor_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -4623,13 +4592,7 @@ fn rpc_extension_ui_cancel_response() {
             ui_request_generation(&ui_event),
             json!({"cancelled": true}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &response,
-            "cancel_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &response, "cancel_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -4738,13 +4701,7 @@ fn rpc_extension_ui_mismatched_request_id() {
             request_generation,
             json!({"confirmed": true}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &wrong_response,
-            "wrong_id_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &wrong_response, "wrong_id_response").await;
         assert_err(&resp, "extension_ui_response");
         let error_msg = resp["error"].as_str().unwrap_or("");
         assert!(
@@ -4759,13 +4716,7 @@ fn rpc_extension_ui_mismatched_request_id() {
             request_generation,
             json!({"confirmed": true}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &correct_response,
-            "correct_id_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &correct_response, "correct_id_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         drop(in_tx);
@@ -4877,13 +4828,7 @@ fn rpc_extension_ui_id_alias_roundtrip() {
             "confirmed": true,
         })
         .to_string();
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &response,
-            "id_alias_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &response, "id_alias_response").await;
         assert_ok(&resp, "extension_ui_response");
         assert_eq!(resp["id"], "req-legacy-1");
         assert_eq!(resp["data"]["resolved"], true);
@@ -4901,7 +4846,8 @@ fn rpc_extension_ui_id_alias_roundtrip() {
 
 #[test]
 fn rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse() {
-    let _harness = TestHarness::new("rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse");
+    let _harness =
+        TestHarness::new("rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse");
     let cassette_dir = cassette_root();
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
@@ -4927,12 +4873,8 @@ fn rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse() {
         let first_task = handle.spawn(async move {
             first_manager
                 .request_ui(
-                    ExtensionUiRequest::new(
-                        "reused-id",
-                        "confirm",
-                        json!({"title": "first"}),
-                    )
-                    .with_timeout_ms(40),
+                    ExtensionUiRequest::new("reused-id", "confirm", json!({"title": "first"}))
+                        .with_timeout_ms(40),
                 )
                 .await
         });
@@ -4945,12 +4887,8 @@ fn rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse() {
         let second_task = handle.spawn(async move {
             second_manager
                 .request_ui(
-                    ExtensionUiRequest::new(
-                        "reused-id",
-                        "confirm",
-                        json!({"title": "second"}),
-                    )
-                    .with_timeout_ms(5_000),
+                    ExtensionUiRequest::new("reused-id", "confirm", json!({"title": "second"}))
+                        .with_timeout_ms(5_000),
                 )
                 .await
         });
@@ -5000,7 +4938,8 @@ fn rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse() {
 
 #[test]
 fn rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves() {
-    let _harness = TestHarness::new("rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves");
+    let _harness =
+        TestHarness::new("rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves");
     let cassette_dir = cassette_root();
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
@@ -5080,12 +5019,7 @@ fn rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves() {
         assert_ok(&accepted, "extension_ui_response");
         let _ = active_task.await;
 
-        assert_no_ui_request_with_id(
-            &out_rx,
-            "bounded-queued",
-            Duration::from_millis(100),
-        )
-        .await;
+        assert_no_ui_request_with_id(&out_rx, "bounded-queued", Duration::from_millis(100)).await;
 
         drop(in_tx);
         let _ = server.await;
@@ -5161,13 +5095,7 @@ fn rpc_extension_ui_sequential_ordering() {
             first_generation,
             json!({"confirmed": true}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &first_response,
-            "seq_first_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &first_response, "seq_first_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let r1 = ui_task_1
@@ -5189,13 +5117,7 @@ fn rpc_extension_ui_sequential_ordering() {
             second_generation,
             json!({"value": "hello"}),
         );
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            &second_response,
-            "seq_second_response",
-        )
-        .await;
+        let resp = send_recv(&in_tx, &out_rx, &second_response, "seq_second_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let r2 = ui_task_2

@@ -448,8 +448,7 @@ impl ResourceLoader {
                 panic_payload_message(payload)
             ))
         })?;
-        let (prompts, prompt_collision_diagnostics) =
-            dedupe_prompts(prompts_result.templates);
+        let (prompts, prompt_collision_diagnostics) = dedupe_prompts(prompts_result.templates);
         let mut prompt_diagnostics = prompts_result.diagnostics;
         prompt_diagnostics.extend(prompt_collision_diagnostics);
         let (themes, theme_diagnostics) = dedupe_themes(themes_result.themes);
@@ -551,14 +550,13 @@ impl ResourceLoader {
         if !paths.prompt_paths.is_empty() {
             let prompt_paths = dedupe_paths(paths.prompt_paths.clone());
             if !prompt_paths.is_empty() {
-                let new_prompts = load_prompt_templates_with_diagnostics(
-                    LoadPromptTemplatesOptions {
+                let new_prompts =
+                    load_prompt_templates_with_diagnostics(LoadPromptTemplatesOptions {
                         cwd: cwd_buf.clone(),
                         agent_dir: agent_dir.clone(),
                         prompt_paths,
                         include_defaults: false,
-                    },
-                );
+                    });
                 self.prompt_diagnostics.extend(new_prompts.diagnostics);
                 if !new_prompts.templates.is_empty() {
                     let mut merged = self.prompts.clone();
@@ -1503,11 +1501,7 @@ pub(crate) fn load_prompt_templates_with_diagnostics(
     }
 }
 
-fn load_templates_from_dir(
-    dir: &Path,
-    source: &str,
-    label: &str,
-) -> LoadPromptTemplatesResult {
+fn load_templates_from_dir(dir: &Path, source: &str, label: &str) -> LoadPromptTemplatesResult {
     let mut templates = Vec::new();
     let mut diagnostics = Vec::new();
     if !dir.exists() {
@@ -2466,12 +2460,7 @@ fn ensure_explicit_prompt_paths_loaded(
     diagnostics: &[ResourceDiagnostic],
     resource_kind: ExplicitResourceKind,
 ) -> Result<()> {
-    ensure_explicit_file_paths_loaded(
-        explicit_paths,
-        loaded_paths,
-        diagnostics,
-        resource_kind,
-    )?;
+    ensure_explicit_file_paths_loaded(explicit_paths, loaded_paths, diagnostics, resource_kind)?;
 
     for root in explicit_paths {
         let metadata = fs::metadata(root).map_err(|err| {
@@ -2694,7 +2683,10 @@ mod tests {
 
         let error = Theme::load(&invalid).expect_err("invalid UTF-8 theme must fail");
         let message = error.to_string();
-        assert!(message.contains(&invalid.display().to_string()), "{message}");
+        assert!(
+            message.contains(&invalid.display().to_string()),
+            "{message}"
+        );
         assert!(message.contains("not valid UTF-8"), "{message}");
     }
 
@@ -2770,7 +2762,10 @@ mod tests {
         let error = load_explicit_prompt(&temp_dir, &prompts)
             .expect_err("explicit prompt directory should fail on invalid UTF-8 child");
         let message = error.to_string();
-        assert!(message.contains(&prompts.display().to_string()), "{message}");
+        assert!(
+            message.contains(&prompts.display().to_string()),
+            "{message}"
+        );
         assert!(message.contains(&prompt.display().to_string()), "{message}");
         assert!(message.contains("not valid UTF-8"), "{message}");
     }
@@ -2786,7 +2781,10 @@ mod tests {
         let error = load_explicit_prompt(&temp_dir, &prompts)
             .expect_err("explicit prompt directory should fail on oversized child");
         let message = error.to_string();
-        assert!(message.contains(&prompts.display().to_string()), "{message}");
+        assert!(
+            message.contains(&prompts.display().to_string()),
+            "{message}"
+        );
         assert!(message.contains(&prompt.display().to_string()), "{message}");
         assert!(
             message.contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit")),

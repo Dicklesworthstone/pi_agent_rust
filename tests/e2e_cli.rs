@@ -2053,7 +2053,9 @@ fn e2e_cli_startup_surfaces_configured_resource_failures() {
         assert_contains(
             &harness.harness,
             &result.stderr,
-            path.file_name().and_then(OsStr::to_str).expect("UTF-8 fixture"),
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .expect("UTF-8 fixture"),
         );
     }
     assert_contains(&harness.harness, &result.stderr, "resource limit");
@@ -4967,8 +4969,7 @@ fn e2e_cli_handoff_defaults_to_newest_session_and_preserves_explicit_session() {
     assert_contains(&harness.harness, &default_result.stdout, newer_id);
     assert_contains(&harness.harness, &default_result.stdout, newer_marker);
     assert!(
-        !default_result.stdout.contains(older_id)
-            && !default_result.stdout.contains(older_marker),
+        !default_result.stdout.contains(older_id) && !default_result.stdout.contains(older_marker),
         "default handoff must not select the older session\nstdout:\n{}\nstderr:\n{}",
         default_result.stdout,
         default_result.stderr

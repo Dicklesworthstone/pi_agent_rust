@@ -15341,8 +15341,7 @@ async fn prompt_capability_once(
         // consumers and RPC surfaces observe the identical deadline budget.
         "timeout_ms": CAPABILITY_PROMPT_TIMEOUT_MS,
     });
-    let request =
-        ExtensionUiRequest::new_capability_prompt("", extension_id, capability, payload)
+    let request = ExtensionUiRequest::new_capability_prompt("", extension_id, capability, payload)
         .with_timeout_ms(CAPABILITY_PROMPT_TIMEOUT_MS);
 
     match manager.request_ui(request).await {
@@ -15462,10 +15461,9 @@ async fn resolve_js_hostcall_policy_decision(
         CapabilityPromptOutcome::AutoDenied => {
             (PolicyDecision::Deny, "prompt_auto_deny".to_string())
         }
-        CapabilityPromptOutcome::InvalidResponse => (
-            PolicyDecision::Deny,
-            "prompt_invalid_response".to_string(),
-        ),
+        CapabilityPromptOutcome::InvalidResponse => {
+            (PolicyDecision::Deny, "prompt_invalid_response".to_string())
+        }
         CapabilityPromptOutcome::Unavailable => {
             (PolicyDecision::Deny, "prompt_unavailable".to_string())
         }

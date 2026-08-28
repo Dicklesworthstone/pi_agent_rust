@@ -968,11 +968,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                s.set_label(
-                    "entry-1".to_string(),
-                    Some("important".to_string()),
-                    None,
-                )
+                s.set_label("entry-1".to_string(), Some("important".to_string()), None)
                     .await
                     .unwrap();
             }

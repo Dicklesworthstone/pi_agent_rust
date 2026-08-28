@@ -230,9 +230,9 @@ fn validated_service_name(name: &str) -> Result<&str> {
         && name.len() <= MAX_SERVICE_NAME_BYTES
         && name != "."
         && name != ".."
-        && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
-        });
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
     if !is_portable {
         return Err(Error::validation(format!(
             "PI_HUB_INVALID_NAME: service names must be 1-{MAX_SERVICE_NAME_BYTES} ASCII bytes containing only letters, digits, '.', '-', or '_'"

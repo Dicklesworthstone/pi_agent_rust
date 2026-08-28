@@ -486,10 +486,7 @@ fn g05_extension_ui_differential_fixture_validation() {
             scenario.get("expected_patterns").is_some(),
             "{id} missing expected_patterns"
         );
-        for request in scenario["requests"]
-            .as_array()
-            .expect("scenario requests")
-        {
+        for request in scenario["requests"].as_array().expect("scenario requests") {
             if request["type"] == "extension_ui_response"
                 && (request.get("requestId").is_some() || request.get("id").is_some())
             {

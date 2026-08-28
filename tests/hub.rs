@@ -68,11 +68,7 @@ fn hub_exec(cwd: &std::path::Path, input: Value) -> ToolOutput {
     hub_exec_for_session(cwd, "hub-integration-session", input)
 }
 
-fn hub_exec_for_session(
-    cwd: &std::path::Path,
-    session_id: &str,
-    input: Value,
-) -> ToolOutput {
+fn hub_exec_for_session(cwd: &std::path::Path, session_id: &str, input: Value) -> ToolOutput {
     let mut tool = pi::tools::HubTool::new(cwd);
     tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
     block_on_local(tool.execute("call-1", input, None)).expect("hub execute")
@@ -430,11 +426,8 @@ fn hub_jobs_group_hides_foreign_session_jobs() {
         .expect("job id")
         .to_string();
 
-    let foreign_list = hub_exec_for_session(
-        &root,
-        &foreign,
-        json!({"op": "jobs", "action": "list"}),
-    );
+    let foreign_list =
+        hub_exec_for_session(&root, &foreign, json!({"op": "jobs", "action": "list"}));
     assert!(!first_text(&foreign_list).contains(&job_id));
     let foreign_wait = hub_exec_for_session(
         &root,

@@ -478,8 +478,8 @@ where
                         "models.json provider identity must not be blank",
                     ));
                 }
-                if let Some(first_provider) = canonical_provider_sources
-                    .insert(canonical_provider.clone(), provider.clone())
+                if let Some(first_provider) =
+                    canonical_provider_sources.insert(canonical_provider.clone(), provider.clone())
                 {
                     return Err(serde::de::Error::custom(format!(
                         "models.json providers {first_provider:?} and {provider:?} resolve to the same canonical provider identity {canonical_provider:?}"
@@ -1708,12 +1708,10 @@ impl ModelRegistry {
         let builtin_model_id_matches = |candidate: &str| {
             if is_openrouter {
                 let canonical_candidate = canonicalize_openrouter_model_id(candidate);
-                openrouter_ids
-                    .iter()
-                    .any(|lookup_id| {
-                        candidate.eq_ignore_ascii_case(lookup_id)
-                            || canonical_candidate.eq_ignore_ascii_case(lookup_id)
-                    })
+                openrouter_ids.iter().any(|lookup_id| {
+                    candidate.eq_ignore_ascii_case(lookup_id)
+                        || canonical_candidate.eq_ignore_ascii_case(lookup_id)
+                })
             } else {
                 candidate.eq_ignore_ascii_case(trimmed_id)
             }
@@ -1869,9 +1867,7 @@ impl ModelRegistry {
                     "extension provider identity must not be blank",
                 ));
             }
-            if let Some((first_provider, oauth_config)) =
-                extension_providers.get(&provider_key)
-            {
+            if let Some((first_provider, oauth_config)) = extension_providers.get(&provider_key) {
                 if first_provider != &binding.provider {
                     return Err(Error::config(format!(
                         "extension providers {first_provider:?} and {:?} resolve to the same normalized extension provider identity {provider_key:?}",
@@ -1899,12 +1895,9 @@ impl ModelRegistry {
         for entry in &entries {
             let model_key = extension_model_key(&entry.model.provider, &entry.model.id);
             if model_key.1.is_empty() {
-                return Err(Error::config(
-                    "extension model identity must not be blank",
-                ));
+                return Err(Error::config("extension model identity must not be blank"));
             }
-            let Some((registered_provider, oauth_config)) =
-                extension_providers.get(&model_key.0)
+            let Some((registered_provider, oauth_config)) = extension_providers.get(&model_key.0)
             else {
                 return Err(Error::config(format!(
                     "extension model provider {:?} is absent from the provider snapshot",
@@ -1939,8 +1932,7 @@ impl ModelRegistry {
 
         for existing in &mut self.models {
             let provider_key = extension_provider_key(&existing.model.provider);
-            if let Some((extension_provider, oauth_config)) =
-                extension_providers.get(&provider_key)
+            if let Some((extension_provider, oauth_config)) = extension_providers.get(&provider_key)
             {
                 existing.model.provider.clone_from(extension_provider);
                 existing.oauth_config.clone_from(oauth_config);
@@ -6294,13 +6286,9 @@ mod tests {
             assert_eq!(entry.model.name, sentinel.model.name);
             assert_eq!(entry.oauth_config, sentinel.oauth_config);
         };
-        let mut provider_collision =
-            ModelRegistry::from_entries_for_tests(vec![sentinel.clone()]);
+        let mut provider_collision = ModelRegistry::from_entries_for_tests(vec![sentinel.clone()]);
         let error = provider_collision
-            .merge_extension_entries(vec![
-                entry("Acme", "one", None),
-                entry("acme", "two", None),
-            ])
+            .merge_extension_entries(vec![entry("Acme", "one", None), entry("acme", "two", None)])
             .expect_err("case-variant provider bindings must fail")
             .to_string();
         assert!(error.contains("normalized extension provider identity"));
@@ -6650,7 +6638,10 @@ mod tests {
             });
 
         let error = registry.error().expect("blank provider must fail loading");
-        assert!(error.contains("provider identity must not be blank"), "{error}");
+        assert!(
+            error.contains("provider identity must not be blank"),
+            "{error}"
+        );
         assert!(!error.contains("blank-provider-secret"), "{error}");
         assert!(registry.find("", "blank-model").is_none());
         assert!(
@@ -9066,10 +9057,7 @@ mod tests {
                 error.contains("duplicate canonical model identity"),
                 "{label}: {error}"
             );
-            assert!(
-                error.contains(&format!("{first_id:?}")),
-                "{label}: {error}"
-            );
+            assert!(error.contains(&format!("{first_id:?}")), "{label}: {error}");
             assert!(
                 error.contains(&format!("{second_id:?}")),
                 "{label}: {error}"
