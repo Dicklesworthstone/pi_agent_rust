@@ -13,6 +13,73 @@
     "suite_evidence",
     "aggregate_artifacts"
   ],
+  "perf_schema_registry": {
+    "description": "Registry of all performance evidence schemas referenced by the DSR perf recipe. Each entry pins a schema identifier to its required fields, providing machine-checkable contracts for the preflight harness.",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "budget_summary": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.budget_summary.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 5, "maxItems": 5,
+            "items": { "type": "string", "enum": ["schema", "generated_at", "git_commit", "correlation_id", "claim_readiness"] }
+          }
+        }
+      },
+      "budget_preflight": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.budget_preflight.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 4, "maxItems": 4,
+            "items": { "type": "string", "enum": ["schema", "missing_inputs", "expected_artifact_paths", "rch_commands"] }
+          }
+        }
+      },
+      "evidence_cache": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.evidence_cache.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 5, "maxItems": 5,
+            "items": { "type": "string", "enum": ["schema", "ttl_hours", "entries", "git_commit", "build_profile"] }
+          }
+        }
+      },
+      "phase1_matrix_validation": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.phase1_matrix_validation.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 6, "maxItems": 6,
+            "items": { "type": "string", "enum": ["schema", "generated_at", "correlation_id", "scale_points", "weighted_attribution", "confidence_intervals_95"] }
+          }
+        }
+      },
+      "host_topology_fingerprint": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.host_topology_fingerprint.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 7, "maxItems": 7,
+            "items": { "type": "string", "enum": ["schema", "generated_at", "cgroup_v2_cpu_quota", "cpuset_size", "numa_node_count", "memory_limit_bytes", "budget_profile"] }
+          }
+        }
+      }
+    }
+  },
   "additionalProperties": false,
   "properties": {
     "schema": {

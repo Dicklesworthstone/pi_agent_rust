@@ -1,0 +1,95 @@
+{
+  "schema": "pi.evidence.ri_phase1_recipe_audit_runpack.v1",
+  "generated_at": "2026-08-28T04:57:27.3NZ",
+  "workdir": "/Users/jemanuel/projects/pi_agent_rust",
+  "dsr": "/Users/jemanuel/projects/doodlestein_self_releaser/dsr",
+  "git_commit": "c4bcd9c65a4c95a6bfd566576b807b3dcf27f641",
+  "git_dirty": true,
+  "ok_count": 14,
+  "fail_count": 0,
+  "warn_count": 2,
+  "verdict": "ready_with_warnings",
+  "findings": [
+    {
+      "contract": "DSR_BINARY_PRESENT",
+      "status": "pass",
+      "detail": "/Users/jemanuel/projects/doodlestein_self_releaser/dsr"
+    },
+    {
+      "contract": "DSR_VERSION_KNOWN",
+      "status": "pass",
+      "detail": "dsr version 0.1.2"
+    },
+    {
+      "contract": "WORKDIR_IS_PI_AGENT_RUST",
+      "status": "pass",
+      "detail": "/Users/jemanuel/projects/pi_agent_rust"
+    },
+    {
+      "contract": "AGENTS_DSR_GOVERNANCE_PRESENT",
+      "status": "pass",
+      "detail": "AGENTS.md mandates dsr quality"
+    },
+    {
+      "contract": "DSR_REPOS_YAML_HAS_PI_AGENT_RUST",
+      "status": "pass",
+      "detail": "/Users/jemanuel/.config/dsr/repos.yaml"
+    },
+    {
+      "contract": "DSR_DRY_RUN_PLANS_6_CHECKS",
+      "status": "pass",
+      "detail": "dsr plans 6 checks"
+    },
+    {
+      "contract": "DSR_TMP_TARGET_DIR_USED",
+      "status": "warn",
+      "detail": "repos.yaml hardcodes CARGO_TARGET_DIR=/tmp/pi-agent-rust-dsr; this is the AGENTS.md anti-pattern. Either set RCH_TARGET_BASE and patch, or accept and clean up post-run with sbh check."
+    },
+    {
+      "contract": "RCH_ON_PATH",
+      "status": "pass",
+      "detail": "/Users/jemanuel/.local/bin/rch"
+    },
+    {
+      "contract": "RCH_DIAGNOSE_FAILED",
+      "status": "warn",
+      "detail": "rch diagnose failed; DSR may fall back to local cargo"
+    },
+    {
+      "contract": "RCHIGNORE_PRESENT",
+      "status": "pass",
+      "detail": "/Users/jemanuel/projects/pi_agent_rust/.rchignore (      54 lines)"
+    },
+    {
+      "contract": "PREFLIGHT_BUDGET_INPUTS_PRESENT",
+      "status": "pass",
+      "detail": "/Users/jemanuel/projects/pi_agent_rust/scripts/perf/preflight_budget_inputs.py"
+    },
+    {
+      "contract": "CHECK_MODULE_REACHABILITY_PRESENT",
+      "status": "pass",
+      "detail": "/Users/jemanuel/projects/pi_agent_rust/scripts/check_module_reachability.py"
+    },
+    {
+      "contract": "INSTALLER_REGRESSION_PRESENT",
+      "status": "pass",
+      "detail": "/Users/jemanuel/projects/pi_agent_rust/tests/installer_regression.sh"
+    },
+    {
+      "contract": "EVIDENCE_SCHEMAS_PRESENT",
+      "status": "pass",
+      "detail": "all 5 required schemas in /Users/jemanuel/projects/pi_agent_rust/docs/evidence-contract-schema.json"
+    },
+    {
+      "contract": "CLOSEOUT_EVIDENCE_REGISTRY_PRESENT",
+      "status": "pass",
+      "detail": "/Users/jemanuel/projects/pi_agent_rust/docs/contracts/closeout-evidence-registry.json"
+    },
+    {
+      "contract": "BUDGET_SUMMARY_PARSEABLE",
+      "status": "pass",
+      "detail": "claim_readiness.status=blocked"
+    }
+  ],
+  "rch_diagnose_head": "error: the following required arguments were not provided:\n  <COMMAND>...\n\nUsage: rch diagnose <COMMAND>...\n\nFor more information, try '--help'.\nrch diagnose failed"
+}
