@@ -8772,14 +8772,19 @@ mod extensions_integration_tests {
                 let delayed_manager = extension_manager.clone();
                 let hostcall = runtime_handle.spawn(async move {
                     delayed_manager
-                        .execute_command("deadline-held", "", 75)
+                        .execute_command("deadline-held", "", 500)
                         .await
                 });
                 wait_for_session_action_generation_capture(&session_action_admission).await;
 
-                let err = hostcall
-                    .await
-                    .expect_err("blocked Session hostcalls must obey the root command deadline");
+                let err = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    Box::pin(hostcall),
+                )
+                .await
+                .expect("blocked Session hostcall deadline watchdog expired")
+                .expect_err("blocked Session hostcalls must obey the root command deadline");
                 let error_message = err.to_string();
                 assert!(
                     error_message.contains("timeout") || error_message.contains("timed out"),

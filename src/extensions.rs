@@ -11698,6 +11698,7 @@ impl JsExtensionRuntimeHandle {
                                     &host,
                                     &specs,
                                     origin.as_ref(),
+                                    deadline,
                                 )),
                             )
                             .await;
@@ -11987,16 +11988,13 @@ impl JsExtensionRuntimeHandle {
                             if reply.is_closed() {
                                 continue;
                             }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(
+                            if let Err(err) = js_runtime_remaining_timeout_ms(
                                 deadline,
                                 "provider stream start",
                             ) {
-                                Ok(timeout_ms) => timeout_ms,
-                                Err(err) => {
-                                    let _ = reply.send(&cx, Err(err));
-                                    continue;
-                                }
-                            };
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
                             let result = async {
                                 let shard_index = shard_set.shard_index_for_route(
                                     &shard_set.provider_owner,
@@ -12018,19 +12016,18 @@ impl JsExtensionRuntimeHandle {
                                         },
                                     )
                                     .await?;
-                                let continuation_timeout_ms = match js_runtime_remaining_timeout_ms(
+                                if let Err(err) = js_runtime_remaining_timeout_ms(
                                     deadline,
                                     "provider stream start",
                                 ) {
-                                    Ok(timeout_ms) if !reply.is_closed() => timeout_ms,
-                                    Ok(timeout_ms) => {
+                                    if reply.is_closed() {
                                         if let Err(cleanup_err) =
                                             cancel_extension_provider_stream_simple_best_effort(
                                                 &mut shard_set,
                                                 &host,
                                                 shard_index,
                                                 &inner_stream_id,
-                                                timeout_ms,
+                                                deadline,
                                                 origin.as_ref(),
                                             )
                                             .await
@@ -12047,29 +12044,51 @@ impl JsExtensionRuntimeHandle {
                                             "Provider stream start caller closed before route publication",
                                         ));
                                     }
-                                    Err(err) => {
-                                        if let Err(cleanup_err) =
-                                            cancel_extension_provider_stream_simple_best_effort(
-                                                &mut shard_set,
-                                                &host,
-                                                shard_index,
-                                                &inner_stream_id,
-                                                1,
-                                                origin.as_ref(),
-                                            )
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                event = "extension_runtime.provider_stream.expired_start_cleanup_failed",
-                                                shard_index,
-                                                inner_stream_id,
-                                                error = %cleanup_err,
-                                                "Failed to cancel inner provider stream after start deadline expired"
-                                            );
-                                        }
-                                        return Err(err);
+                                    if let Err(cleanup_err) =
+                                        cancel_extension_provider_stream_simple_best_effort(
+                                            &mut shard_set,
+                                            &host,
+                                            shard_index,
+                                            &inner_stream_id,
+                                            deadline,
+                                            origin.as_ref(),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            event = "extension_runtime.provider_stream.expired_start_cleanup_failed",
+                                            shard_index,
+                                            inner_stream_id,
+                                            error = %cleanup_err,
+                                            "Failed to cancel inner provider stream after start deadline expired"
+                                        );
                                     }
-                                };
+                                    return Err(err);
+                                }
+                                if reply.is_closed() {
+                                    if let Err(cleanup_err) =
+                                        cancel_extension_provider_stream_simple_best_effort(
+                                            &mut shard_set,
+                                            &host,
+                                            shard_index,
+                                            &inner_stream_id,
+                                            deadline,
+                                            origin.as_ref(),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            event = "extension_runtime.provider_stream.closed_reply_cleanup_failed",
+                                            shard_index,
+                                            inner_stream_id,
+                                            error = %cleanup_err,
+                                            "Failed to cancel inner provider stream after caller abandoned start"
+                                        );
+                                    }
+                                    return Err(Error::extension(
+                                        "Provider stream start caller closed before route publication",
+                                    ));
+                                }
                                 let Some(sequence) =
                                     shard_set.next_provider_stream_id.checked_add(1)
                                 else {
@@ -12079,7 +12098,7 @@ impl JsExtensionRuntimeHandle {
                                             &host,
                                             shard_index,
                                             &inner_stream_id,
-                                            continuation_timeout_ms,
+                                            deadline,
                                             origin.as_ref(),
                                         )
                                         .await
@@ -12116,20 +12135,13 @@ impl JsExtensionRuntimeHandle {
                                         .get(outer_stream_id)
                                         .cloned()
                                 {
-                                    let cleanup_timeout_ms = deadline
-                                        .checked_duration_since(Instant::now())
-                                        .map_or(1, |remaining| {
-                                            u64::try_from(remaining.as_millis())
-                                                .unwrap_or(u64::MAX)
-                                                .max(1)
-                                        });
                                     let cleanup_result =
                                         cancel_extension_provider_stream_simple_best_effort(
                                             &mut shard_set,
                                             &host,
                                             route.shard_index,
                                             &route.inner_stream_id,
-                                            cleanup_timeout_ms,
+                                            deadline,
                                             route.origin.as_ref(),
                                         )
                                         .await;
@@ -12197,20 +12209,13 @@ impl JsExtensionRuntimeHandle {
                                         Ok(None)
                                     }
                                     Err(err) => {
-                                        let cleanup_timeout_ms = deadline
-                                            .checked_duration_since(Instant::now())
-                                            .map_or(1, |remaining| {
-                                                u64::try_from(remaining.as_millis())
-                                                    .unwrap_or(u64::MAX)
-                                                    .max(1)
-                                            });
                                         let cleanup_result =
                                             cancel_extension_provider_stream_simple_best_effort(
                                                 &mut shard_set,
                                                 &host,
                                                 route.shard_index,
                                                 &route.inner_stream_id,
-                                                cleanup_timeout_ms,
+                                                deadline,
                                                 route.origin.as_ref(),
                                             )
                                             .await;
@@ -12239,20 +12244,13 @@ impl JsExtensionRuntimeHandle {
                                     .get(&stream_id)
                                     .cloned()
                                 {
-                                    let cleanup_timeout_ms = deadline
-                                        .checked_duration_since(Instant::now())
-                                        .map_or(1, |remaining| {
-                                            u64::try_from(remaining.as_millis())
-                                                .unwrap_or(u64::MAX)
-                                                .max(1)
-                                        });
                                     let cleanup_result =
                                         cancel_extension_provider_stream_simple_best_effort(
                                             &mut shard_set,
                                             &host,
                                             route.shard_index,
                                             &route.inner_stream_id,
-                                            cleanup_timeout_ms,
+                                            deadline,
                                             route.origin.as_ref(),
                                         )
                                         .await;
@@ -12288,23 +12286,15 @@ impl JsExtensionRuntimeHandle {
                             if reply.as_ref().is_some_and(oneshot::Sender::is_closed) {
                                 reply = None;
                             }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(
+                            if let Err(err) = js_runtime_remaining_timeout_ms(
                                 deadline,
                                 "provider stream cancel",
                             ) {
-                                Ok(timeout_ms) => timeout_ms,
-                                Err(err) => {
-                                    if let Some(reply) = reply.take() {
-                                        let _ = reply.send(&cx, Err(err));
-                                        continue;
-                                    }
-                                    // Fire-and-forget cancellation remains a cleanup
-                                    // command even when it waited in the queue. Give it
-                                    // a minimal bounded attempt rather than turning a
-                                    // caller timeout into a permanent resource leak.
-                                    1
+                                if let Some(reply) = reply.take() {
+                                    let _ = reply.send(&cx, Err(err));
                                 }
-                            };
+                                continue;
+                            }
                             let result = async {
                                 let route = shard_set
                                     .provider_stream_routes
@@ -12320,7 +12310,7 @@ impl JsExtensionRuntimeHandle {
                                     &host,
                                     route.shard_index,
                                     &route.inner_stream_id,
-                                    timeout_ms,
+                                    deadline,
                                     route.origin.as_ref(),
                                 )
                                 .await;
@@ -13570,6 +13560,7 @@ async fn build_js_runtime_shards(
     host: &JsRuntimeHost,
     specs: &[JsExtensionLoadSpec],
     origin: Option<&SessionActionOrigin>,
+    root_deadline: Instant,
 ) -> Result<JsRuntimeShardSet> {
     let explicit_entry_paths = specs
         .iter()
@@ -13609,7 +13600,7 @@ async fn build_js_runtime_shards(
         }
 
         for (spec, entry_paths) in extension_specs {
-            load_one_extension(&runtime, host, spec, &entry_paths, origin).await?;
+            load_one_extension(&runtime, host, spec, &entry_paths, origin, root_deadline).await?;
         }
 
         let snapshot =
@@ -13729,6 +13720,7 @@ async fn load_one_extension(
     spec: &JsExtensionLoadSpec,
     entry_paths: &[PathBuf],
     origin: Option<&SessionActionOrigin>,
+    root_deadline: Instant,
 ) -> Result<()> {
     if entry_paths.len() > 1 {
         tracing::info!(
@@ -13755,6 +13747,8 @@ async fn load_one_extension(
     });
 
     for (entry_index, entry_path) in entry_paths.iter().enumerate() {
+        let entry_deadline = root_deadline.min(js_runtime_request_deadline(10_000));
+        let entry_timeout = remaining_js_task_timeout(entry_deadline, "extension load")?;
         // QuickJS module resolver requires forward-slash paths.
         let entry_specifier = entry_path.display().to_string().replace('\\', "/");
         let task_id = next_runtime_task_id("task-load");
@@ -13785,7 +13779,8 @@ async fn load_one_extension(
                 host,
                 Some(spec.extension_id.as_str()),
                 &task_id,
-                Duration::from_secs(10),
+                entry_timeout,
+                entry_deadline,
             )
             .await
             .map(|_| ()),
@@ -14796,20 +14791,12 @@ async fn start_extension_provider_stream_simple_sharded(
         .ok_or_else(|| Error::extension("provider stream start: expected stream id".to_string()))?;
 
     if let Err(refresh_err) = refresh_runtime_shard_snapshot(shards, shard_index).await {
-        let cleanup_timeout_ms =
-            deadline
-                .checked_duration_since(Instant::now())
-                .map_or(1, |remaining| {
-                    u64::try_from(remaining.as_millis())
-                        .unwrap_or(u64::MAX)
-                        .max(1)
-                });
         if let Err(cleanup_err) = cancel_extension_provider_stream_simple_best_effort(
             shards,
             host,
             shard_index,
             &inner_stream_id,
-            cleanup_timeout_ms,
+            deadline,
             origin,
         )
         .await
@@ -14929,7 +14916,7 @@ async fn cancel_extension_provider_stream_simple_best_effort(
     host: &JsRuntimeHost,
     shard_index: usize,
     stream_id: &str,
-    timeout_ms: u64,
+    deadline: Instant,
     origin: Option<&SessionActionOrigin>,
 ) -> Result<()> {
     // Cleanup is the sole operation allowed to enter a quarantined realm. A
@@ -14940,7 +14927,6 @@ async fn cancel_extension_provider_stream_simple_best_effort(
         .shards
         .get_mut(shard_index)
         .and_then(|shard| shard.pump_fault.take());
-    let deadline = js_runtime_request_deadline(timeout_ms);
     let result = cancel_extension_provider_stream_simple_sharded(
         shards,
         host,
@@ -14974,9 +14960,7 @@ async fn cancel_active_provider_streams_for_replacement(
     let mut failures = 0usize;
 
     for (outer_stream_id, route) in routes {
-        let Some(remaining) =
-            deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
-        else {
+        let Some(deadline) = deadline.filter(|deadline| *deadline > Instant::now()) else {
             tracing::warn!(
                 event = "extension_runtime.provider_stream.reload_cleanup_budget_exhausted",
                 total,
@@ -14987,16 +14971,13 @@ async fn cancel_active_provider_streams_for_replacement(
             );
             break;
         };
-        let timeout_ms = u64::try_from(remaining.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
         attempted = attempted.saturating_add(1);
         if let Err(err) = cancel_extension_provider_stream_simple_best_effort(
             shards,
             host,
             route.shard_index,
             &route.inner_stream_id,
-            timeout_ms,
+            deadline,
             route.origin.as_ref(),
         )
         .await
@@ -15954,9 +15935,6 @@ pub async fn dispatch_host_call_shared(
         }
     }
 
-    // SEC-4.1: track whether we need subprocess lifecycle recording.
-    let is_exec = capability == "exec";
-
     let mut runtime_risk_decision = None;
     let mut lane_execution: Option<HostcallLaneExecution> = None;
     let outcome = if decision == PolicyDecision::Allow {
@@ -16002,35 +15980,6 @@ pub async fn dispatch_host_call_shared(
             let cfg = m.runtime_risk_config();
             cfg.enabled && !cfg.enforce
         });
-
-        let will_dispatch = if shadow_mode {
-            true
-        } else {
-            match runtime_risk_decision
-                .as_ref()
-                .map_or(RuntimeRiskAction::Allow, |d| d.action)
-            {
-                RuntimeRiskAction::Allow => true,
-                RuntimeRiskAction::Harden => runtime_risk_decision
-                    .as_ref()
-                    .is_none_or(|decision| !runtime_risk_harden_should_block_dangerous(decision)),
-                RuntimeRiskAction::Deny | RuntimeRiskAction::Terminate => false,
-            }
-        };
-
-        // SEC-4.1: record subprocess spawn before exec dispatch.
-        let _subprocess_accounting = if is_exec
-            && will_dispatch
-            && let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id)
-        {
-            manager.record_subprocess_spawn(ext_id);
-            Some(SubprocessAccountingGuard {
-                manager: manager.clone(),
-                extension_id: ext_id.to_string(),
-            })
-        } else {
-            None
-        };
 
         let dispatched = if shadow_mode {
             // SEC-7.1: Shadow mode — score is recorded but call is always allowed.
@@ -17624,7 +17573,25 @@ async fn dispatch_shared_allowed_legacy(
                 ExecMediationResult::Allow => {}
             }
 
-            dispatch_hostcall_exec_ref(ctx.js_runtime, &call.call_id, cmd, &call.params).await
+            let subprocess_accounting = if let (Some(manager), Some(extension_id)) =
+                (ctx.manager.as_ref(), ctx.extension_id)
+            {
+                manager.record_subprocess_spawn(extension_id);
+                Some(SubprocessAccountingGuard {
+                    manager: manager.clone(),
+                    extension_id: extension_id.to_string(),
+                })
+            } else {
+                None
+            };
+            dispatch_hostcall_exec_ref(
+                ctx.js_runtime,
+                &call.call_id,
+                cmd,
+                &call.params,
+                subprocess_accounting,
+            )
+            .await
         }
         "http" => dispatch_hostcall_http(&call.call_id, ctx.http, call.params.clone()).await,
         "session" => {
@@ -17868,7 +17835,7 @@ async fn dispatch_hostcall_exec(
     cmd: &str,
     payload: Value,
 ) -> HostcallOutcome {
-    dispatch_hostcall_exec_ref(runtime, call_id, cmd, &payload).await
+    dispatch_hostcall_exec_ref(runtime, call_id, cmd, &payload, None).await
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -17877,6 +17844,7 @@ async fn dispatch_hostcall_exec_ref(
     call_id: &str,
     cmd: &str,
     payload: &Value,
+    subprocess_accounting: Option<SubprocessAccountingGuard>,
 ) -> HostcallOutcome {
     dispatch_hostcall_exec_ref_with_limit(
         runtime,
@@ -17884,6 +17852,7 @@ async fn dispatch_hostcall_exec_ref(
         cmd,
         payload,
         crate::tools::READ_TOOL_MAX_BYTES,
+        subprocess_accounting,
     )
     .await
 }
@@ -17895,6 +17864,7 @@ async fn dispatch_hostcall_exec_ref_with_limit(
     cmd: &str,
     payload: &Value,
     max_capture_bytes: u64,
+    mut subprocess_accounting: Option<SubprocessAccountingGuard>,
 ) -> HostcallOutcome {
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::mpsc;
@@ -18117,7 +18087,9 @@ async fn dispatch_hostcall_exec_ref_with_limit(
         let cancel_worker = Arc::clone(&cancel);
         let call_id_for_error = call_id.to_string();
 
+        let worker_accounting = subprocess_accounting.take();
         thread::spawn(move || {
+            let _worker_accounting = worker_accounting;
             let result = (|| -> std::result::Result<(), String> {
                 let mut command = Command::new(&cmd);
                 command
@@ -18285,7 +18257,9 @@ async fn dispatch_hostcall_exec_ref_with_limit(
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
 
+    let worker_accounting = subprocess_accounting.take();
     thread::spawn(move || {
+        let _worker_accounting = worker_accounting;
         let result: std::result::Result<Value, String> = (|| {
             let mut command = Command::new(&cmd);
             command
@@ -19700,22 +19674,26 @@ async fn await_js_task(
     expected_owner: Option<&str>,
     task_id: &str,
     timeout: Duration,
+    root_deadline: Instant,
 ) -> Result<Value> {
     let start = extension_wait_now();
     let started_at = Instant::now();
 
     loop {
-        if js_task_timed_out(start, started_at, timeout) {
+        let timed_out =
+            Instant::now() >= root_deadline || js_task_timed_out(start, started_at, timeout);
+
+        let _has_pending =
+            pump_js_runtime_once_for_owner(runtime, host, expected_owner, Some(root_deadline))
+                .await?;
+        if let Some(value) = finish_js_task_take(take_js_task_state(runtime, task_id).await?)? {
+            return Ok(value);
+        }
+        if timed_out || Instant::now() >= root_deadline {
             return Err(Error::extension(format!(
                 "JS task timed out after {}ms",
                 timeout.as_millis()
             )));
-        }
-
-        let _has_pending =
-            pump_js_runtime_once_for_owner(runtime, host, expected_owner, None).await?;
-        if let Some(value) = finish_js_task_take(take_js_task_state(runtime, task_id).await?)? {
-            return Ok(value);
         }
         if !runtime.has_pending() {
             extension_wait_short_blocking_pause(Duration::from_millis(1));
