@@ -22,7 +22,7 @@ use crate::tui::PiConsole;
 use asupersync::channel::oneshot;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -3982,8 +3982,8 @@ impl Session {
         let natural_leaf_id = finalized.leaf_id.clone();
         let leaf_id =
             resolve_loaded_leaf_id(&header, natural_leaf_id.clone(), &finalized.entry_index);
-        let source_integrity_failed =
-            !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty();
+        let source_integrity_failed = !diagnostics.skipped_entries.is_empty()
+            || !diagnostics.orphaned_parent_links.is_empty();
         Ok((
             Self {
                 header,
@@ -6825,10 +6825,7 @@ fn validate_share_entries_size_with_cap<'a>(
     entries: impl IntoIterator<Item = &'a SessionEntry>,
     cap: usize,
 ) -> Result<()> {
-    let mut probe = ShareSizeProbe {
-        bytes: 0,
-        cap,
-    };
+    let mut probe = ShareSizeProbe { bytes: 0, cap };
     for entry in entries {
         serde_json::to_writer(&mut probe, entry).map_err(|err| {
             Error::session(format!(
@@ -6836,9 +6833,9 @@ fn validate_share_entries_size_with_cap<'a>(
                 cap
             ))
         })?;
-        probe.write_all(b"\n").map_err(|err| {
-            Error::session(format!("Failed to measure shared transcript: {err}"))
-        })?;
+        probe
+            .write_all(b"\n")
+            .map_err(|err| Error::session(format!("Failed to measure shared transcript: {err}")))?;
     }
     Ok(())
 }
@@ -6859,7 +6856,9 @@ fn redact_share_entries(
             &mut redacted_string_bytes,
         )?;
         redacted.push(serde_json::from_value(value).map_err(|err| {
-            Error::session(format!("Failed to reconstruct redacted shared entry: {err}"))
+            Error::session(format!(
+                "Failed to reconstruct redacted shared entry: {err}"
+            ))
         })?);
     }
     Ok(redacted)
@@ -6883,8 +6882,7 @@ fn redact_share_value(
             let original_values = std::mem::take(values);
             let mut next_duplicate_by_key = HashMap::<String, u64>::new();
             for (key, mut value) in original_values {
-                let redacted_key =
-                    redact_share_string(&key, workspace_cwd, redacted_string_bytes)?;
+                let redacted_key = redact_share_string(&key, workspace_cwd, redacted_string_bytes)?;
                 redact_share_value(&mut value, workspace_cwd, redacted_string_bytes)?;
 
                 let mut candidate = redacted_key.clone();
@@ -12807,7 +12805,9 @@ mod tests {
         session.header.cwd = "/style".to_string();
         session.append_message(make_test_message("workspace is /style"));
 
-        let html = session.to_share_html().expect("share HTML for tag-like cwd");
+        let html = session
+            .to_share_html()
+            .expect("share HTML for tag-like cwd");
         assert!(html.contains("</style>"));
         assert!(html.contains("</body></html>"));
         assert!(html.contains("workspace is [REDACTED_CWD]"));
@@ -13196,8 +13196,7 @@ mod tests {
             if self.offset < self.header.len() {
                 return Ok(&self.header[self.offset..]);
             }
-            self.post_header_fill_buf_calls =
-                self.post_header_fill_buf_calls.saturating_add(1);
+            self.post_header_fill_buf_calls = self.post_header_fill_buf_calls.saturating_add(1);
             Err(std::io::Error::other(
                 "injected persistent non-advancing read failure",
             ))
@@ -13210,7 +13209,10 @@ mod tests {
 
     #[test]
     fn jsonl_entry_reader_returns_persistent_non_consuming_io_error_without_retry() {
-        let header = format!("{}\n", serde_json::to_string(&SessionHeader::new()).unwrap());
+        let header = format!(
+            "{}\n",
+            serde_json::to_string(&SessionHeader::new()).unwrap()
+        );
         let mut reader = HeaderThenPersistentReadError {
             header: header.into_bytes(),
             offset: 0,
@@ -15943,7 +15945,10 @@ mod tests {
                 .to_string()
                 .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
         );
-        assert_eq!(std::fs::read(&path).expect("reread torn JSONL"), corrupt_bytes);
+        assert_eq!(
+            std::fs::read(&path).expect("reread torn JSONL"),
+            corrupt_bytes
+        );
     }
 
     #[test]
@@ -16537,8 +16542,7 @@ mod tests {
         let bytes = format!("{header}\n{entry}\n").into_bytes();
         std::fs::write(&path, &bytes).unwrap();
 
-        let (mut loaded, diagnostics) =
-            open_jsonl_blocking_with_entry_limit(&path, 128).unwrap();
+        let (mut loaded, diagnostics) = open_jsonl_blocking_with_entry_limit(&path, 128).unwrap();
         assert_eq!(diagnostics.skipped_entries.len(), 1);
         assert!(loaded.entries.is_empty());
         loaded.append_message(make_test_message("must not erase oversized row"));

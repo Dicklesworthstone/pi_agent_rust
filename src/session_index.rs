@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
 use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
-use fs4::fs_std::FileExt as _;
 use fsqlite::SqliteValue as Value;
 use serde::Deserialize;
 use std::borrow::Borrow;
@@ -770,7 +769,7 @@ fn note_session_namespace_change(sessions_root: &Path) -> Result<u64> {
     fs::create_dir_all(sessions_root)?;
     let path = session_namespace_generation_path(sessions_root);
     let mut generation = OpenOptions::new().create(true).append(true).open(&path)?;
-    generation.lock_exclusive()?;
+    fs4::FileExt::lock(&generation)?;
     generation.write_all(b"\n")?;
     generation.sync_data()?;
     generation

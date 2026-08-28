@@ -71,10 +71,6 @@ fn bash_tool_for_session(root: &std::path::Path, session_id: &str) -> pi::tools:
     tool
 }
 
-fn jobs_tool() -> pi::tools::JobsTool {
-    jobs_tool_for_session(TEST_SESSION_ID)
-}
-
 fn jobs_tool_for_session(session_id: &str) -> pi::tools::JobsTool {
     let mut tool = pi::tools::JobsTool::new();
     tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
@@ -330,13 +326,17 @@ fn owner_scoped_session_shutdown_preserves_foreign_jobs() {
         "foreign owner B job {second_id} was terminated by owner A shutdown"
     );
     let owner_a_jobs = pi::jobs::list(&owner_a).expect("owner A list");
-    assert!(owner_a_jobs.iter().any(|job| {
-        job.id == first_id && job.status == pi::jobs::JobStatus::Killed.as_str()
-    }));
+    assert!(
+        owner_a_jobs.iter().any(|job| {
+            job.id == first_id && job.status == pi::jobs::JobStatus::Killed.as_str()
+        })
+    );
     let owner_b_jobs = pi::jobs::list(&owner_b).expect("owner B list");
-    assert!(owner_b_jobs.iter().any(|job| {
-        job.id == second_id && job.status == pi::jobs::JobStatus::Running.as_str()
-    }));
+    assert!(
+        owner_b_jobs.iter().any(|job| {
+            job.id == second_id && job.status == pi::jobs::JobStatus::Running.as_str()
+        })
+    );
 
     block_on_local(pi::jobs::kill_session(&owner_b)).expect("owner B cleanup");
     let _ = pi::jobs::take_completion_notices(&owner_a);

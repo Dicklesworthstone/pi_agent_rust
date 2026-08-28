@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 
 use asupersync::sync::Notify;
 use asupersync::types::Time;
-use fs4::fs_std::FileExt as _;
 use futures::FutureExt;
 use serde::Serialize;
 
@@ -972,16 +971,16 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
-        match artifact.try_lock_exclusive() {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(err) => return Err(err),
+        match fs4::FileExt::try_lock(&artifact) {
+            Ok(()) => {}
+            Err(fs4::TryLockError::WouldBlock) => continue,
+            Err(fs4::TryLockError::Error(err)) => return Err(err),
         }
         let opened = artifact.metadata()?;
         let current = match std::fs::symlink_metadata(&path) {
             Ok(current) => current,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                fs4::fs_std::FileExt::unlock(&artifact)?;
+                fs4::FileExt::unlock(&artifact)?;
                 continue;
             }
             Err(err) => return Err(err),
@@ -990,10 +989,10 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             || !same_file_identity(&opened, &current)
             || !same_file_identity(&metadata, &current)
         {
-            fs4::fs_std::FileExt::unlock(&artifact)?;
+            fs4::FileExt::unlock(&artifact)?;
             continue;
         }
-        fs4::fs_std::FileExt::unlock(&artifact)?;
+        fs4::FileExt::unlock(&artifact)?;
         let modified = opened.modified()?;
         candidates.push(ArtifactCleanupCandidate {
             path,
@@ -1028,16 +1027,16 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    match artifact.try_lock_exclusive() {
-        Ok(true) => {}
-        Ok(false) => return Ok(None),
-        Err(err) => return Err(err),
+    match fs4::FileExt::try_lock(&artifact) {
+        Ok(()) => {}
+        Err(fs4::TryLockError::WouldBlock) => return Ok(None),
+        Err(fs4::TryLockError::Error(err)) => return Err(err),
     }
     let opened = artifact.metadata()?;
     let current = match std::fs::symlink_metadata(&candidate.path) {
         Ok(current) => current,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs4::fs_std::FileExt::unlock(&artifact)?;
+            fs4::FileExt::unlock(&artifact)?;
             return Ok(None);
         }
         Err(err) => return Err(err),
@@ -1046,12 +1045,12 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         || !same_file_identity(&before, &current)
         || !same_file_identity(&opened, &current)
     {
-        fs4::fs_std::FileExt::unlock(&artifact)?;
+        fs4::FileExt::unlock(&artifact)?;
         return Ok(None);
     }
     let removed_bytes = opened.len();
     let remove_result = std::fs::remove_file(&candidate.path);
-    fs4::fs_std::FileExt::unlock(&artifact)?;
+    fs4::FileExt::unlock(&artifact)?;
     remove_result?;
     Ok(Some(removed_bytes))
 }
@@ -1085,16 +1084,16 @@ fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
                         path.display()
                     )));
                 }
-                match artifact.try_lock_exclusive() {
-                    Ok(true) => fs4::fs_std::FileExt::unlock(&artifact)?,
-                    Ok(false) => {
+                match fs4::FileExt::try_lock(&artifact) {
+                    Ok(()) => fs4::FileExt::unlock(&artifact)?,
+                    Err(fs4::TryLockError::WouldBlock) => {
                         bytes = bytes.saturating_add(
                             u64::try_from(MAX_ARTIFACT_BYTES)
                                 .unwrap_or(u64::MAX)
                                 .saturating_sub(metadata.len()),
                         );
                     }
-                    Err(err) => return Err(err),
+                    Err(fs4::TryLockError::Error(err)) => return Err(err),
                 }
             }
         }
@@ -1224,7 +1223,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             "Failed to open jobs artifact budget lock: path is not a regular file".to_string(),
         ));
     }
-    lock.lock_exclusive().map_err(|err| {
+    fs4::FileExt::lock(&lock).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to acquire jobs artifact budget lock: {err}"),
@@ -1300,7 +1299,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             "Failed to open jobs artifact budget lock: path identity changed".to_string(),
         ));
     }
-    lock.lock_exclusive().map_err(|err| {
+    fs4::FileExt::lock(&lock).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to acquire jobs artifact budget lock: {err}"),
@@ -1335,7 +1334,7 @@ fn create_job_artifact(jobs_dir: &Path, id: &str) -> std::io::Result<(PathBuf, s
         .write(true)
         .create_new(true)
         .open(&artifact_path)?;
-    artifact.lock_exclusive()?;
+    fs4::FileExt::lock(&artifact)?;
     Ok((artifact_path, artifact))
 }
 
@@ -3288,7 +3287,7 @@ mod tests {
             .create_new(true)
             .open(&live_path)
             .expect("live artifact");
-        live.lock_exclusive().expect("reserve live artifact");
+        fs4::FileExt::lock(&live).expect("reserve live artifact");
 
         let two_job_budget = u64::try_from(MAX_ARTIFACT_BYTES)
             .expect("artifact cap fits")
@@ -3296,7 +3295,7 @@ mod tests {
         let error = ensure_artifact_budget(temp.path(), two_job_budget - 1, 10)
             .expect_err("live artifact plus prospective job must reserve two full caps");
         assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
-        fs4::fs_std::FileExt::unlock(&live).expect("release live artifact reservation");
+        fs4::FileExt::unlock(&live).expect("release live artifact reservation");
     }
 
     #[test]
@@ -3515,7 +3514,7 @@ mod tests {
             .write(true)
             .open(&paths[0])
             .expect("active artifact");
-        active.lock_exclusive().expect("active artifact lock");
+        fs4::FileExt::lock(&active).expect("active artifact lock");
 
         let reserved = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
         let outcome = enforce_artifact_retention(
@@ -3534,7 +3533,7 @@ mod tests {
             paths[2].exists(),
             "newest settled artifact must be preserved"
         );
-        fs4::fs_std::FileExt::unlock(&active).expect("release active artifact");
+        fs4::FileExt::unlock(&active).expect("release active artifact");
     }
 
     #[cfg(unix)]
@@ -5213,13 +5212,8 @@ mod tests {
             .write(true)
             .open(artifacts[0].path())
             .expect("rejected job artifact remains inspectable");
-        assert!(
-            artifact
-                .try_lock_exclusive()
-                .expect("inspect rejected job artifact lock"),
-            "rejected job artifact lock must be released"
-        );
-        fs4::fs_std::FileExt::unlock(&artifact).expect("release test artifact lock");
+        fs4::FileExt::try_lock(&artifact).expect("rejected job artifact lock must be released");
+        fs4::FileExt::unlock(&artifact).expect("release test artifact lock");
 
         drop(descendant_cleanup);
     }

@@ -8,7 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::session::SessionEntry;
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -2618,7 +2618,7 @@ impl SessionStoreV2 {
             true,
             ArtifactWriteMode::Preserve,
         )?;
-        FileExt::lock_exclusive(&file)?;
+        FileExt::lock(&file)?;
         Ok(StoreMutationLockGuard { file })
     }
 
