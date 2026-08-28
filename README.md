@@ -202,9 +202,9 @@ If you want full details, see:
 
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
-| **Startup** | Native single-binary path (~5-7ms p95 version, ~12-15ms help) | Runtime-dependent |
-| **Binary size** | Size-budgeted release profile (23-32 MB, <48MB target) | Runtime-dependent |
-| **Memory (idle)** | Bounded-resource design (~4.9 MB RSS interactive idle, <50MB target) | Runtime-dependent |
+| **Startup** | Native single-binary path (Fresh `v0.3.0` measurement pending; pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
+| **Binary size** | Size-budgeted release profile (Fresh `v0.3.0` measurement pending; pre-v0.3.0 target: 23-32 MB, <48MB budget; see `tests/perf/reports/budget_summary.json` `binary_size_release` and `docs/perf-budgets-recipe.md`) | Runtime-dependent |
+| **Memory (idle)** | Bounded-resource design (Fresh `v0.3.0` measurement pending; pre-v0.3.0 claim: ~4.9 MB RSS interactive idle, <50MB target; see `tests/perf/reports/budget_summary.json` `idle_memory_rss` and `docs/perf-budgets-recipe.md` for the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
 | **Tool execution** | Process tree management | Basic subprocess |
 | **Sessions** | JSONL with branching | Varies |
@@ -3026,3 +3026,45 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 <p align="center">
   <sub>Built with Rust, for developers who live in the terminal.</sub>
 </p>
+
+---
+
+## Current Evidence State (auto-generated)
+
+> **STATUS: BLOCKED** — `claim_readiness.status = "blocked"`, `performance_claims_authorized = false`.
+> The performance numbers in this README are **not currently backed by a fresh v0.3.0 measurement**.
+> See [`tests/perf/reports/budget_summary.json`](tests/perf/reports/budget_summary.json) for the current budget state and [`docs/perf-budgets-recipe.md`](docs/perf-budgets-recipe.md) for the recipe to regenerate.
+
+| Budget | Status | Notes |
+|---|---|---|
+| `binary_size_release` | **FAIL** | Harness fix landed; re-measurement pending |
+| `idle_memory_rss` | **FAIL** | Methodology was test-harness RSS; canonical recipe at `scripts/perf/measure_idle_memory.py` |
+| `tool_call_latency_mean` | **FAIL** | `pijs_workload` data missing; generator at `scripts/perf/run_pijs_workload.py` |
+| `tool_call_throughput_min` | **FAIL** | same as above |
+| `ext_cold_load_simple_p95` | **FAIL** | over budget (11.9ms vs 5.0ms); profile-driven optimization pending |
+| `ext_cold_load_complex_p95` | **NO_DATA** | no criterion data; generator at `scripts/perf/run_ext_cold_load_complex.py` |
+| `event_dispatch_p99` | **NO_DATA** | no scenario data; generator at `scripts/perf/run_event_dispatch_scenario.py` |
+| `ext_must_pass` | **fail** | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
+| `evidence_bundle` | **partial** (was `insufficient`) | 0 invalid sections now; 17 present, 13 missing (optional) |
+
+To regenerate the evidence state once RCH and a built `target/release/pi` are available:
+
+```bash
+# 1. Verify the DSR perf recipe is ready
+bash scripts/perf/preflight_dsr_recipe.sh
+
+# 2. Build the release binary via DSR
+/Users/jemanuel/projects/doodlestein_self_releaser/dsr build pi_agent_rust
+
+# 3. Generate the canonical evidence artifacts
+python3 scripts/perf/measure_idle_memory.py
+python3 scripts/perf/measure_binary_size.py --no-build
+python3 scripts/perf/run_ext_cold_load_complex.py
+python3 scripts/perf/run_event_dispatch_scenario.py
+
+# 4. Regenerate the evidence bundle and the markdown
+python3 scripts/perf/rebuild_evidence_bundle.py
+python3 scripts/perf/render_perf_budgets_md.py
+```
+
+When `claim_readiness.status` flips from `blocked` to `ready` (or `ready_with_advisories`), the `Current Evidence State` section above will be re-rendered and the `Why Pi?` table numbers can be re-promoted to current.
