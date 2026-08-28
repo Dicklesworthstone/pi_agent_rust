@@ -255,18 +255,17 @@ async fn run_with_retry_driver(
 }
 
 fn run_case(mode: FailMode) -> DriverOutcome {
-    let tmp = std::env::temp_dir().join(format!(
-        "pi_retry_resume_{}_{}",
-        std::process::id(),
-        u8::from(matches!(mode, FailMode::MidStream))
-    ));
-    std::fs::create_dir_all(&tmp).unwrap();
-    let cwd = tmp;
+    let tmp = tempfile::Builder::new()
+        .prefix("pi-retry-resume-")
+        .tempdir_in("/tmp")
+        .expect("tempdir in /tmp");
+    let cwd = tmp.path().to_path_buf();
+    let write_path = cwd.join("out.txt");
 
     let provider = Arc::new(StepThenTransientProvider {
         tool_call_emissions: AtomicUsize::new(0),
         failed_once: AtomicBool::new(false),
-        path: "out.txt".to_string(),
+        path: write_path.to_string_lossy().into_owned(),
         mode,
     });
     let tool_starts = Arc::new(AtomicUsize::new(0));
@@ -274,10 +273,12 @@ fn run_case(mode: FailMode) -> DriverOutcome {
     run_async({
         let provider = Arc::clone(&provider);
         let tool_starts = Arc::clone(&tool_starts);
+        let cwd = cwd.clone();
         async move {
-            let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
-                Some(cwd.clone()),
-            )));
+            let mut stored = Session::create_with_dir(Some(cwd.clone()));
+            stored.path = Some(cwd.join("session.jsonl"));
+            stored.save().await.expect("pin session path");
+            let session = Arc::new(asupersync::sync::Mutex::new(stored));
             let mut sess =
                 make_agent_session(&cwd, Arc::clone(&provider) as Arc<dyn Provider>, session);
             run_with_retry_driver(
