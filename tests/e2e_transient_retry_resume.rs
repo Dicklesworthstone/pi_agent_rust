@@ -200,7 +200,7 @@ struct DriverOutcome {
 async fn run_with_retry_driver(
     sess: &mut AgentSession,
     prompt: &str,
-    provider: &StepThenTransientProvider,
+    tool_call_emissions: &AtomicUsize,
     tool_starts: &Arc<AtomicUsize>,
 ) -> DriverOutcome {
     let max_retries: u32 = 4;
@@ -220,11 +220,16 @@ async fn run_with_retry_driver(
             Err(err) => {
                 let s = err.to_string();
                 retries < max_retries
+                    && !err.is_session_persistence()
                     && (err.is_transient() || pi::error::is_retryable_error(&s, None, None))
             }
             Ok(msg) => {
                 matches!(msg.stop_reason, StopReason::Error)
                     && retries < max_retries
+                    && !msg
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|message| message.contains(Error::SESSION_PERSISTENCE_PREFIX))
                     && pi::error::is_retryable_error(
                         msg.error_message.as_deref().unwrap_or(""),
                         Some(msg.usage.input),
@@ -242,7 +247,7 @@ async fn run_with_retry_driver(
     }
 
     DriverOutcome {
-        tool_call_emissions: provider.tool_call_emissions.load(Ordering::SeqCst),
+        tool_call_emissions: tool_call_emissions.load(Ordering::SeqCst),
         tool_execution_starts: tool_starts.load(Ordering::SeqCst),
         retries,
         final_ok: matches!(&result, Ok(m) if matches!(m.stop_reason, StopReason::Stop)),
@@ -275,7 +280,13 @@ fn run_case(mode: FailMode) -> DriverOutcome {
             )));
             let mut sess =
                 make_agent_session(&cwd, Arc::clone(&provider) as Arc<dyn Provider>, session);
-            run_with_retry_driver(&mut sess, prompt_ref(), &provider, &tool_starts).await
+            run_with_retry_driver(
+                &mut sess,
+                prompt_ref(),
+                &provider.tool_call_emissions,
+                &tool_starts,
+            )
+            .await
         }
     })
 }
@@ -315,5 +326,117 @@ fn transient_error_midstream_resumes_without_reexecuting_tools() {
     assert_eq!(
         out.tool_execution_starts, 1,
         "the tool must execute exactly ONCE; a transient retry must not duplicate side effects"
+    );
+}
+
+struct PersistencePoisonProvider {
+    session: Arc<asupersync::sync::Mutex<Session>>,
+    poison_path: std::path::PathBuf,
+    tool_call_emissions: AtomicUsize,
+    stream_calls: AtomicUsize,
+    path: String,
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Provider for PersistencePoisonProvider {
+    fn name(&self) -> &str {
+        "repro"
+    }
+    fn api(&self) -> &str {
+        "test-api"
+    }
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+    async fn stream(
+        &self,
+        context: &Context<'_>,
+        _options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        let have_tool_result = context
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::ToolResult(r) if r.tool_call_id == "step1"));
+        if !have_tool_result {
+            self.tool_call_emissions.fetch_add(1, Ordering::SeqCst);
+            let msg = make_assistant(
+                StopReason::ToolUse,
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "step1".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({ "path": self.path, "content": "hello" }),
+                    thought_signature: None,
+                })],
+            );
+            return Ok(stream_done(msg));
+        }
+
+        let cx = asupersync::Cx::for_request();
+        if let Ok(mut guard) = self.session.lock(&cx).await {
+            guard.path = Some(self.poison_path.clone());
+        }
+        Err(Error::api("provider connection reset after tool result"))
+    }
+}
+
+/// bd-8188r: a typed session-persistence failure after a tool side effect
+/// must not re-enter the provider even when the wrapped prose looks transient.
+#[test]
+fn session_persistence_after_tool_does_not_retry() {
+    let tmp = tempfile::Builder::new()
+        .prefix("pi-persist-retry-")
+        .tempdir_in("/tmp")
+        .expect("tempdir in /tmp");
+    let cwd = tmp.path().to_path_buf();
+    let poison = cwd.join("connection reset while saving");
+    std::fs::create_dir(&poison).expect("poison path is a directory");
+    let write_path = cwd.join("out.txt");
+
+    let out = run_async({
+        let cwd = cwd.clone();
+        let poison = poison.clone();
+        let write_path = write_path.clone();
+        async move {
+            let mut stored = Session::create_with_dir(Some(cwd.clone()));
+            stored.path = Some(cwd.join("session.jsonl"));
+            stored.save().await.expect("pin session path");
+            let session = Arc::new(asupersync::sync::Mutex::new(stored));
+            let provider = Arc::new(PersistencePoisonProvider {
+                session: Arc::clone(&session),
+                poison_path: poison,
+                tool_call_emissions: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+                path: write_path.to_string_lossy().into_owned(),
+            });
+            let tool_starts = Arc::new(AtomicUsize::new(0));
+            let mut sess =
+                make_agent_session(&cwd, Arc::clone(&provider) as Arc<dyn Provider>, session);
+            let outcome = run_with_retry_driver(
+                &mut sess,
+                prompt_ref(),
+                &provider.tool_call_emissions,
+                &tool_starts,
+            )
+            .await;
+            assert_eq!(
+                provider.stream_calls.load(Ordering::SeqCst),
+                2,
+                "provider is called for the tool request and the poisoned follow-up, never a third retry"
+            );
+            outcome
+        }
+    });
+
+    assert!(!out.final_ok, "persistence failure must remain terminal");
+    assert_eq!(out.retries, 0, "typed persistence failure must not retry");
+    assert_eq!(
+        out.tool_call_emissions, 1,
+        "write tool must be requested once"
+    );
+    assert_eq!(
+        out.tool_execution_starts, 1,
+        "write tool must execute once; retry would repeat the side effect"
     );
 }

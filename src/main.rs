@@ -11013,6 +11013,331 @@ mod tests {
         ));
     }
 
+    struct PersistencePoisonProvider {
+        session: Arc<Mutex<Session>>,
+        poison_path: PathBuf,
+        tool_call_emissions: std::sync::atomic::AtomicUsize,
+        stream_calls: std::sync::atomic::AtomicUsize,
+        write_path: String,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl pi::provider::Provider for PersistencePoisonProvider {
+        fn name(&self) -> &str {
+            "persist-poison"
+        }
+        fn api(&self) -> &str {
+            "test-api"
+        }
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+        async fn stream(
+            &self,
+            context: &pi::provider::Context<'_>,
+            _options: &pi::provider::StreamOptions,
+        ) -> pi::error::Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
+            >,
+        > {
+            use std::sync::atomic::Ordering;
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            let have_tool_result = context.messages.iter().any(|message| {
+                matches!(
+                    message,
+                    pi::model::Message::ToolResult(result) if result.tool_call_id == "step1"
+                )
+            });
+            if !have_tool_result {
+                self.tool_call_emissions.fetch_add(1, Ordering::SeqCst);
+                let message = AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(pi::model::ToolCall {
+                        id: "step1".to_string(),
+                        name: "write".to_string(),
+                        arguments: json!({ "path": self.write_path, "content": "hello" }),
+                        thought_signature: None,
+                    })],
+                    api: self.api().to_string(),
+                    provider: self.name().to_string(),
+                    model: self.model_id().to_string(),
+                    usage: pi::model::Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    stop_details: None,
+                    error_message: None,
+                    timestamp: 0,
+                };
+                let partial = AssistantMessage {
+                    content: Vec::new(),
+                    api: message.api.clone(),
+                    provider: message.provider.clone(),
+                    model: message.model.clone(),
+                    usage: pi::model::Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    stop_details: None,
+                    error_message: None,
+                    timestamp: 0,
+                };
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(pi::model::StreamEvent::Start { partial }),
+                    Ok(pi::model::StreamEvent::Done {
+                        reason: message.stop_reason,
+                        message,
+                    }),
+                ])));
+            }
+
+            let cx = asupersync::Cx::for_request();
+            if let Ok(mut guard) = self.session.lock(&cx).await {
+                guard.path = Some(self.poison_path.clone());
+            }
+            Err(pi::error::Error::api(
+                "provider connection reset after tool result",
+            ))
+        }
+    }
+
+    /// bd-8188r: `run_print_prompt_with_retry` must not re-enter the provider
+    /// after a typed session-persistence failure, even when the wrapped prose
+    /// looks like a transient connection reset.
+    #[test]
+    fn run_print_prompt_with_retry_rejects_session_persistence_after_tool() {
+        use std::sync::atomic::Ordering;
+
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let temp = tempfile::Builder::new()
+                .prefix("pi-print-persist-")
+                .tempdir_in("/tmp")
+                .expect("tempdir in /tmp");
+            let cwd = temp.path().to_path_buf();
+            let poison = cwd.join("connection reset while saving");
+            std::fs::create_dir(&poison).expect("poison directory");
+            let write_path = cwd.join("out.txt");
+
+            let mut stored = Session::create_with_dir(Some(cwd.clone()));
+            stored.path = Some(cwd.join("session.jsonl"));
+            stored.save().await.expect("pin session path");
+            let session_store = Arc::new(Mutex::new(stored));
+            let provider = Arc::new(PersistencePoisonProvider {
+                session: Arc::clone(&session_store),
+                poison_path: poison,
+                tool_call_emissions: std::sync::atomic::AtomicUsize::new(0),
+                stream_calls: std::sync::atomic::AtomicUsize::new(0),
+                write_path: write_path.to_string_lossy().into_owned(),
+            });
+            let agent = Agent::new(
+                Arc::clone(&provider) as Arc<dyn pi::provider::Provider>,
+                ToolRegistry::new(&["write"], &cwd, None),
+                AgentConfig {
+                    max_tool_iterations: 8,
+                    stream_options: pi::provider::StreamOptions {
+                        api_key: Some("test-key".to_string()),
+                        ..pi::provider::StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session_store),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            let config = Config {
+                retry: Some(pi::config::RetrySettings {
+                    enabled: Some(true),
+                    max_retries: Some(3),
+                    base_delay_ms: Some(0),
+                    max_delay_ms: Some(0),
+                    ..pi::config::RetrySettings::default()
+                }),
+                ..Config::default()
+            };
+            let (_abort_handle, abort_signal) = AbortHandle::new();
+            let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
+            let error = run_print_prompt_with_retry(
+                &mut agent_session,
+                &config,
+                &abort_signal,
+                &|| |_| {},
+                true,
+                3,
+                true,
+                &text_stream_state,
+                PromptInput::Text {
+                    text: "please write the file".to_string(),
+                    keyword_scan_source: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("typed persistence failure must remain terminal");
+            let message = error.to_string();
+            assert!(
+                message.contains(pi::error::Error::SESSION_PERSISTENCE_PREFIX),
+                "must keep the typed persistence marker: {message}"
+            );
+            assert!(
+                message.contains("connection reset"),
+                "must retain the transient-looking wrapped prose: {message}"
+            );
+            assert_eq!(
+                provider.tool_call_emissions.load(Ordering::SeqCst),
+                1,
+                "write tool must be requested once"
+            );
+            assert_eq!(
+                provider.stream_calls.load(Ordering::SeqCst),
+                2,
+                "removing the Err-arm veto would issue a third provider call"
+            );
+            assert!(
+                write_path.is_file(),
+                "the write tool must have executed before persistence failed"
+            );
+        });
+    }
+
+    /// bd-8188r: an Ok(Error) assistant whose flattened message carries the
+    /// persistence marker must not walk retry or failover even if the prose
+    /// looks like a transient 500/connection reset.
+    #[test]
+    fn run_print_prompt_with_retry_rejects_ok_error_persistence_marker() {
+        struct MarkerProvider {
+            stream_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        #[allow(clippy::unnecessary_literal_bound)]
+        impl pi::provider::Provider for MarkerProvider {
+            fn name(&self) -> &str {
+                "persist-marker"
+            }
+            fn api(&self) -> &str {
+                "test-api"
+            }
+            fn model_id(&self) -> &str {
+                "test-model"
+            }
+            async fn stream(
+                &self,
+                _context: &pi::provider::Context<'_>,
+                _options: &pi::provider::StreamOptions,
+            ) -> pi::error::Result<
+                std::pin::Pin<
+                    Box<
+                        dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>>
+                            + Send,
+                    >,
+                >,
+            > {
+                use std::sync::atomic::Ordering;
+                self.stream_calls.fetch_add(1, Ordering::SeqCst);
+                let message = AssistantMessage {
+                    content: Vec::new(),
+                    api: self.api().to_string(),
+                    provider: self.name().to_string(),
+                    model: self.model_id().to_string(),
+                    usage: pi::model::Usage::default(),
+                    stop_reason: StopReason::Error,
+                    stop_details: None,
+                    error_message: Some(format!(
+                        "{}connection reset while saving",
+                        pi::error::Error::SESSION_PERSISTENCE_PREFIX
+                    )),
+                    timestamp: 0,
+                };
+                let partial = AssistantMessage {
+                    content: Vec::new(),
+                    api: message.api.clone(),
+                    provider: message.provider.clone(),
+                    model: message.model.clone(),
+                    usage: pi::model::Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    stop_details: None,
+                    error_message: None,
+                    timestamp: 0,
+                };
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(pi::model::StreamEvent::Start { partial }),
+                    Ok(pi::model::StreamEvent::Done {
+                        reason: message.stop_reason,
+                        message,
+                    }),
+                ])))
+            }
+        }
+
+        use std::sync::atomic::Ordering;
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let provider = Arc::new(MarkerProvider {
+                stream_calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let agent = Agent::new(
+                Arc::clone(&provider) as Arc<dyn pi::provider::Provider>,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            let session_store = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(
+                agent,
+                session_store,
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            let config = Config {
+                retry: Some(pi::config::RetrySettings {
+                    enabled: Some(true),
+                    max_retries: Some(3),
+                    base_delay_ms: Some(0),
+                    max_delay_ms: Some(0),
+                    ..pi::config::RetrySettings::default()
+                }),
+                ..Config::default()
+            };
+            let (_abort_handle, abort_signal) = AbortHandle::new();
+            let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
+            let message = run_print_prompt_with_retry(
+                &mut agent_session,
+                &config,
+                &abort_signal,
+                &|| |_| {},
+                true,
+                3,
+                true,
+                &text_stream_state,
+                PromptInput::Text {
+                    text: "hello".to_string(),
+                    keyword_scan_source: None,
+                },
+                None,
+            )
+            .await
+            .expect("Ok(Error) persistence marker returns the original assistant");
+            assert_eq!(message.stop_reason, StopReason::Error);
+            assert!(
+                message
+                    .error_message
+                    .as_deref()
+                    .is_some_and(message_marks_session_persistence)
+            );
+            assert_eq!(
+                provider.stream_calls.load(Ordering::SeqCst),
+                1,
+                "removing the Ok-arm persistence veto would retry the provider"
+            );
+        });
+    }
+
     #[test]
     fn print_retry_and_failover_persist_restored_candidates() {
         let runtime = RuntimeBuilder::new()
