@@ -6963,6 +6963,17 @@ mod extensions_integration_tests {
         }
     }
 
+    async fn wait_for_session_action_generation_release(gate: &SessionActionAdmissionGate) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.pending_generation_check_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled Session action did not release its pending admission before the deadline"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(1)).await;
+        }
+    }
+
     /// bd-cv653.6.2: a glob-scoped imported rule is queued as steering the
     /// first time a tool call touches a matching path — exactly once — and
     /// non-matching tool calls queue nothing.
@@ -8660,6 +8671,173 @@ mod extensions_integration_tests {
                 1,
                 "the provenance fence must admit the current generation exactly once"
             );
+        });
+    }
+
+    #[test]
+    fn extension_command_deadline_cancels_blocked_session_hostcalls_and_reuses_shard() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            for amac_enabled in [false, true] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let entry_path = temp_dir.path().join("deadline-session-mutation.mjs");
+                std::fs::write(
+                    &entry_path,
+                    r#"
+                    export default function init(pi) {
+                      const state = {
+                        resolved: 0,
+                        rejected: 0,
+                        finallyCount: 0,
+                        code: null
+                      };
+
+                      pi.registerCommand("deadline-held", {
+                        description: "attempt two Session mutations under one deadline",
+                        handler: async () => {
+                          try {
+                            await Promise.all([
+                              pi.session("appendEntry", {
+                                customType: "deadline-note",
+                                data: { slot: 1 }
+                              }),
+                              pi.session("appendEntry", {
+                                customType: "deadline-note",
+                                data: { slot: 2 }
+                              })
+                            ]);
+                            state.resolved += 1;
+                          } catch (error) {
+                            state.rejected += 1;
+                            state.code = error && error.code ? error.code : null;
+                            throw error;
+                          } finally {
+                            state.finallyCount += 1;
+                          }
+                        }
+                      });
+
+                      pi.registerCommand("deadline-probe", {
+                        description: "report deadline command settlement counts",
+                        handler: async () => ({ ...state })
+                      });
+
+                      pi.registerCommand("reuse-probe", {
+                        description: "prove the same shard remains usable",
+                        handler: async () => "reused"
+                      });
+                    }
+                    "#,
+                )
+                .expect("write extension entry");
+
+                let provider = Arc::new(NoopProvider);
+                let tools = ToolRegistry::new(&[], temp_dir.path(), None);
+                let agent = Agent::new(provider, tools, AgentConfig::default());
+                let session = Arc::new(Mutex::new(Session::in_memory()));
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&session),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                agent_session
+                    .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                    .await
+                    .expect("enable deadline extension");
+
+                let session_action_admission = agent_session.session_action_admission_gate();
+                let extension_manager = agent_session
+                    .extensions
+                    .as_ref()
+                    .expect("extension region")
+                    .manager()
+                    .clone();
+                let js_runtime = extension_manager.js_runtime().expect("QuickJS runtime");
+                js_runtime
+                    .set_hostcall_amac_enabled_for_tests(amac_enabled)
+                    .await
+                    .expect("set hostcall AMAC mode");
+
+                let transition_cx = crate::agent_cx::AgentCx::for_request();
+                let transition_permit = session_action_admission
+                    .acquire(transition_cx.cx())
+                    .await
+                    .expect("hold Session action admission");
+
+                let delayed_manager = extension_manager.clone();
+                let hostcall = runtime_handle.spawn(async move {
+                    delayed_manager
+                        .execute_command("deadline-held", "", 75)
+                        .await
+                });
+                wait_for_session_action_generation_capture(&session_action_admission).await;
+
+                let err = hostcall
+                    .await
+                    .expect_err("blocked Session hostcalls must obey the root command deadline");
+                let error_message = err.to_string();
+                assert!(
+                    error_message.contains("timeout") || error_message.contains("timed out"),
+                    "unexpected deadline error with AMAC {amac_enabled}: {err}"
+                );
+                wait_for_session_action_generation_release(&session_action_admission).await;
+                drop(transition_permit);
+
+                let expected_state = json!({
+                    "resolved": 0,
+                    "rejected": 1,
+                    "finallyCount": 1,
+                    "code": "timeout"
+                });
+                let first_probe = extension_manager
+                    .execute_command("deadline-probe", "", 5_000)
+                    .await
+                    .expect("first settlement probe");
+                assert_eq!(
+                    first_probe, expected_state,
+                    "deadline Promise must settle exactly once with AMAC {amac_enabled}"
+                );
+                let second_probe = extension_manager
+                    .execute_command("deadline-probe", "", 5_000)
+                    .await
+                    .expect("second settlement probe");
+                assert_eq!(
+                    second_probe, expected_state,
+                    "late work changed settlement state with AMAC {amac_enabled}"
+                );
+
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let guard = session.lock(cx.cx()).await.expect("session lock");
+                assert_eq!(
+                    guard
+                        .entries_for_current_path()
+                        .iter()
+                        .filter(|entry| matches!(
+                            entry,
+                            crate::session::SessionEntry::Custom(custom)
+                                if custom.custom_type == "deadline-note"
+                        ))
+                        .count(),
+                    0,
+                    "cancelled hostcalls mutated the Session with AMAC {amac_enabled}"
+                );
+                drop(guard);
+
+                let reuse = extension_manager
+                    .execute_command("reuse-probe", "", 5_000)
+                    .await
+                    .expect("reuse command on the same shard");
+                assert_eq!(reuse, Value::String("reused".to_string()));
+                assert!(
+                    js_runtime.shutdown(Duration::from_secs(1)).await,
+                    "deadline test runtime did not shut down with AMAC {amac_enabled}"
+                );
+            }
         });
     }
 

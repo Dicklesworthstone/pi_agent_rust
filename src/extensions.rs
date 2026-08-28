@@ -14,6 +14,8 @@ use crate::extensions_js::{
     PiJsRuntimeConfig, js_to_json, json_to_js,
 };
 use crate::hostcall_amac::AmacBatchExecutor;
+#[cfg(test)]
+use crate::hostcall_amac::AmacBatchExecutorConfig;
 use crate::hostcall_rewrite::{
     HostcallRewriteEngine, HostcallRewritePlan, HostcallRewritePlanKind,
 };
@@ -1604,6 +1606,30 @@ struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct ReactorCompletionGuard {
+    manager: ExtensionManager,
+    shard_id: usize,
+    global_seq: u64,
+}
+
+impl Drop for ReactorCompletionGuard {
+    fn drop(&mut self) {
+        self.manager
+            .reactor_record_completion(self.shard_id, self.global_seq);
+    }
+}
+
+struct SubprocessAccountingGuard {
+    manager: ExtensionManager,
+    extension_id: String,
+}
+
+impl Drop for SubprocessAccountingGuard {
+    fn drop(&mut self) {
+        self.manager.record_subprocess_exit(&self.extension_id);
     }
 }
 
@@ -9918,6 +9944,12 @@ fn js_runtime_remaining_timeout_ms(deadline: Instant, operation: &str) -> Result
         .max(1))
 }
 
+fn js_runtime_remaining_timeout(deadline: Instant) -> Duration {
+    deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::ZERO)
+}
+
 /// Event names for the extension lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionEventName {
@@ -11055,6 +11087,11 @@ enum JsRuntimeCommand {
         deadline: Instant,
         reply: oneshot::Sender<Result<()>>,
     },
+    #[cfg(test)]
+    SetHostcallAmacEnabled {
+        enabled: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Request the runtime thread to shut down gracefully.
     Shutdown,
 }
@@ -11743,7 +11780,12 @@ impl JsExtensionRuntimeHandle {
                                 let _ = reply.send(&cx, Err(err));
                                 continue;
                             }
-                            let result = pump_js_runtime_shards_once(&mut shard_set, &host).await;
+                            let result = pump_js_runtime_shards_once(
+                                &mut shard_set,
+                                &host,
+                                Some(deadline),
+                            )
+                            .await;
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::DispatchEvent {
@@ -11758,13 +11800,10 @@ impl JsExtensionRuntimeHandle {
                             if reply.is_closed() {
                                 continue;
                             }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "event") {
-                                Ok(timeout_ms) => timeout_ms,
-                                Err(err) => {
-                                    let _ = reply.send(&cx, Err(err));
-                                    continue;
-                                }
-                            };
+                            if let Err(err) = js_runtime_remaining_timeout_ms(deadline, "event") {
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
                             let result = dispatch_extension_event_across_shards(
                                 &mut shard_set,
                                 &host,
@@ -11772,7 +11811,7 @@ impl JsExtensionRuntimeHandle {
                                 event_payload,
                                 ctx_payload.as_ref(),
                                 origin.as_ref(),
-                                timeout_ms,
+                                deadline,
                             )
                             .await;
                             let _ = reply.send(&cx, result);
@@ -11788,20 +11827,19 @@ impl JsExtensionRuntimeHandle {
                             if reply.is_closed() {
                                 continue;
                             }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "event batch") {
-                                Ok(timeout_ms) => timeout_ms,
-                                Err(err) => {
-                                    let _ = reply.send(&cx, Err(err));
-                                    continue;
-                                }
-                            };
+                            if let Err(err) =
+                                js_runtime_remaining_timeout_ms(deadline, "event batch")
+                            {
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
                             let result = dispatch_extension_event_batch_across_shards(
                                 &mut shard_set,
                                 &host,
                                 events,
                                 ctx_payload.as_ref(),
                                 origin.as_ref(),
-                                timeout_ms,
+                                deadline,
                             )
                             .await;
                             let _ = reply.send(&cx, result);
@@ -11843,6 +11881,7 @@ impl JsExtensionRuntimeHandle {
                                             ctx_payload: ctx_payload.as_ref(),
                                             origin: origin.as_ref(),
                                             timeout_ms,
+                                            deadline,
                                         },
                                     )
                                     .await
@@ -11886,6 +11925,7 @@ impl JsExtensionRuntimeHandle {
                                         ctx_payload.as_ref(),
                                         origin.as_ref(),
                                         timeout_ms,
+                                        deadline,
                                     )
                                     .await
                                 }
@@ -11926,6 +11966,7 @@ impl JsExtensionRuntimeHandle {
                                         ctx_payload.as_ref(),
                                         origin.as_ref(),
                                         timeout_ms,
+                                        deadline,
                                     )
                                     .await
                                 }
@@ -11973,7 +12014,7 @@ impl JsExtensionRuntimeHandle {
                                             context,
                                             options,
                                             origin: origin.as_ref(),
-                                            timeout_ms,
+                                            deadline,
                                         },
                                     )
                                     .await?;
@@ -12120,16 +12161,13 @@ impl JsExtensionRuntimeHandle {
                             if reply.is_closed() {
                                 continue;
                             }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(
+                            if let Err(err) = js_runtime_remaining_timeout_ms(
                                 deadline,
                                 "provider stream next",
                             ) {
-                                Ok(timeout_ms) => timeout_ms,
-                                Err(err) => {
-                                    let _ = reply.send(&cx, Err(err));
-                                    continue;
-                                }
-                            };
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
                             let result = async {
                                 let Some(route) = shard_set
                                     .provider_stream_routes
@@ -12148,7 +12186,7 @@ impl JsExtensionRuntimeHandle {
                                     &host,
                                     route.shard_index,
                                     &route.inner_stream_id,
-                                    timeout_ms,
+                                    deadline,
                                     route.origin.as_ref(),
                                 )
                                 .await;
@@ -12394,6 +12432,15 @@ impl JsExtensionRuntimeHandle {
                             let result = scrub_and_drop_runtime_shards(&mut shard_set, &warm_pool).await;
                             let _ = reply.send(&cx, result);
                         }
+                        #[cfg(test)]
+                        JsRuntimeCommand::SetHostcallAmacEnabled { enabled, reply } => {
+                            AMAC_EXECUTOR.with(|cell| {
+                                *cell.borrow_mut() = AmacBatchExecutor::new(
+                                    AmacBatchExecutorConfig::new(enabled, 2, 16),
+                                );
+                            });
+                            let _ = reply.send(&cx, Ok(()));
+                        }
                     }
                 }
                 // Signal that the runtime thread has exited its event loop.
@@ -12421,6 +12468,23 @@ impl JsExtensionRuntimeHandle {
 
     pub(crate) const fn compat_scan_mode(&self) -> bool {
         self.compat_scan_mode
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_hostcall_amac_enabled_for_tests(&self, enabled: bool) -> Result<()> {
+        let cx = Cx::for_request();
+        let (reply, mut result) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::SetHostcallAmacEnabled { enabled, reply },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        result
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
     }
 
     fn capture_session_action_origin(&self) -> Option<SessionActionOrigin> {
@@ -12548,7 +12612,7 @@ impl JsExtensionRuntimeHandle {
     pub async fn pump_once(&self) -> Result<bool> {
         let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::PumpOnce {
             deadline,
@@ -12565,13 +12629,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime pump timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime pump timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn dispatch_event(
@@ -12582,7 +12650,7 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
     ) -> Result<Value> {
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::DispatchEvent {
             event_name,
@@ -12604,13 +12672,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime event timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime event timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     /// Dispatch multiple events in a single JS bridge call with shared context.
@@ -12624,7 +12696,7 @@ impl JsExtensionRuntimeHandle {
             return Ok(Vec::new());
         }
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::DispatchEventBatch {
             events,
@@ -12645,13 +12717,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime batch event timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime batch event timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn execute_tool(
@@ -12663,7 +12739,7 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
     ) -> Result<Value> {
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteTool {
             tool_name,
@@ -12686,13 +12762,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime tool timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime tool timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn execute_command(
@@ -12703,7 +12783,7 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
     ) -> Result<Value> {
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteCommand {
             command_name,
@@ -12725,13 +12805,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime command timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime command timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn execute_shortcut(
@@ -12741,7 +12825,7 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
     ) -> Result<Value> {
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteShortcut {
             key_id,
@@ -12762,13 +12846,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime shortcut timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime shortcut timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn set_flag_value(
@@ -12894,7 +12982,7 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
     ) -> Result<String> {
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ProviderStreamSimpleStart {
             provider_id,
@@ -12917,13 +13005,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime provider stream start timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime provider stream start timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn provider_stream_simple_next(
@@ -12932,7 +13024,7 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
     ) -> Result<Option<Value>> {
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ProviderStreamSimpleNext {
             stream_id,
@@ -12951,13 +13043,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime provider stream next timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime provider stream next timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn provider_stream_simple_cancel(
@@ -12966,7 +13062,7 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
     ) -> Result<()> {
         let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = cx_with_deadline(timeout_ms);
+        let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ProviderStreamSimpleCancel {
             stream_id,
@@ -12985,13 +13081,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime provider stream cancel timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            js_runtime_remaining_timeout(deadline),
+            Box::pin(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime provider stream cancel timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub fn provider_stream_simple_cancel_best_effort(&self, stream_id: String) {
@@ -13921,6 +14021,7 @@ async fn dispatch_extension_event_phase_sharded(
         deadline,
     } = dispatch;
     shards.ensure_shard_healthy(shard_index)?;
+    let timeout = remaining_js_task_timeout(deadline, "event")?;
     let task_id = next_runtime_task_id("task-event-phase");
     let origin_guard = {
         let runtime = &shards
@@ -13965,14 +14066,9 @@ async fn dispatch_extension_event_phase_sharded(
         origin_guard
     };
 
-    let raw = await_js_task_in_shards_and_refresh(
-        shards,
-        host,
-        shard_index,
-        &task_id,
-        remaining_js_task_timeout(deadline, "event")?,
-    )
-    .await?;
+    let raw =
+        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
+            .await?;
     drop(origin_guard);
     let envelope: JsEventPhaseEnvelope = serde_json::from_value(raw)
         .map_err(|err| Error::extension(format!("event phase envelope: {err}")))?;
@@ -14270,11 +14366,8 @@ async fn dispatch_extension_event_across_shards(
     event_payload: Value,
     ctx_payload: &Value,
     origin: Option<&SessionActionOrigin>,
-    timeout_ms: u64,
+    deadline: Instant,
 ) -> Result<Value> {
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(timeout_ms))
-        .ok_or_else(|| Error::extension("JS extension event deadline overflow"))?;
     dispatch_extension_event_across_shards_until(
         shards,
         host,
@@ -14367,28 +14460,53 @@ async fn dispatch_extension_event_batch_across_shards(
     events: Vec<(String, Value)>,
     ctx_payload: &Value,
     origin: Option<&SessionActionOrigin>,
-    timeout_ms: u64,
+    deadline: Instant,
 ) -> Result<Vec<Result<Value>>> {
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(timeout_ms))
-        .ok_or_else(|| Error::extension("JS extension batch event deadline overflow"))?;
     let batch_id = next_runtime_task_id("event-batch-context");
     let created_contexts = create_event_batch_contexts(shards, &batch_id, ctx_payload).await?;
     let mut results = Vec::with_capacity(events.len());
     for (event_name, event_payload) in events {
-        results.push(
-            dispatch_extension_event_across_shards_until(
-                shards,
-                host,
-                &event_name,
-                event_payload,
-                ctx_payload,
-                Some(batch_id.as_str()),
-                origin,
-                deadline,
-            )
-            .await,
-        );
+        if Instant::now() >= deadline {
+            let err = Error::extension("JS extension event batch deadline elapsed");
+            if let Err(cleanup_err) =
+                delete_event_batch_contexts(shards, &created_contexts, &batch_id).await
+            {
+                tracing::warn!(
+                    event = "extension_runtime.event_batch.timeout_cleanup_failed",
+                    batch_id,
+                    error = %cleanup_err,
+                    "Failed to clean up extension event batch contexts after timeout"
+                );
+            }
+            return Err(err);
+        }
+        let result = dispatch_extension_event_across_shards_until(
+            shards,
+            host,
+            &event_name,
+            event_payload,
+            ctx_payload,
+            Some(batch_id.as_str()),
+            origin,
+            deadline,
+        )
+        .await;
+        match result {
+            Err(err) if Instant::now() >= deadline => {
+                if let Err(cleanup_err) =
+                    delete_event_batch_contexts(shards, &created_contexts, &batch_id).await
+                {
+                    tracing::warn!(
+                        event = "extension_runtime.event_batch.timeout_cleanup_failed",
+                        batch_id,
+                        error = %cleanup_err,
+                        "Failed to clean up extension event batch contexts after timeout"
+                    );
+                }
+                return Err(err);
+            }
+            result => results.push(result),
+        }
     }
     delete_event_batch_contexts(shards, &created_contexts, &batch_id).await?;
     Ok(results)
@@ -14402,6 +14520,7 @@ struct JsToolExecution<'a> {
     ctx_payload: &'a Value,
     origin: Option<&'a SessionActionOrigin>,
     timeout_ms: u64,
+    deadline: Instant,
 }
 
 #[allow(clippy::future_not_send)]
@@ -14418,8 +14537,10 @@ async fn execute_extension_tool_sharded(
         ctx_payload,
         origin,
         timeout_ms,
+        deadline,
     } = execution;
     shards.ensure_shard_healthy(shard_index)?;
+    let timeout = remaining_js_task_timeout(deadline, "tool")?;
     let started_at = Instant::now();
     tracing::info!(
         event = "ext.tool.start",
@@ -14459,14 +14580,9 @@ async fn execute_extension_tool_sharded(
         origin_guard
     };
 
-    let result = await_js_task_in_shards_and_refresh(
-        shards,
-        host,
-        shard_index,
-        &task_id,
-        Duration::from_millis(timeout_ms),
-    )
-    .await;
+    let result =
+        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
+            .await;
     drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
@@ -14491,8 +14607,10 @@ async fn execute_extension_command_sharded(
     ctx_payload: &Value,
     origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
+    deadline: Instant,
 ) -> Result<Value> {
     shards.ensure_shard_healthy(shard_index)?;
+    let timeout = remaining_js_task_timeout(deadline, "command")?;
     let started_at = Instant::now();
     tracing::info!(
         event = "ext.command.start",
@@ -14525,14 +14643,9 @@ async fn execute_extension_command_sharded(
         origin_guard
     };
 
-    let result = await_js_task_in_shards_and_refresh(
-        shards,
-        host,
-        shard_index,
-        &task_id,
-        Duration::from_millis(timeout_ms),
-    )
-    .await;
+    let result =
+        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
+            .await;
     drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
@@ -14555,8 +14668,10 @@ async fn execute_extension_shortcut_sharded(
     ctx_payload: &Value,
     origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
+    deadline: Instant,
 ) -> Result<Value> {
     shards.ensure_shard_healthy(shard_index)?;
+    let timeout = remaining_js_task_timeout(deadline, "shortcut")?;
     let started_at = Instant::now();
     tracing::info!(
         event = "ext.shortcut.start",
@@ -14589,14 +14704,9 @@ async fn execute_extension_shortcut_sharded(
         origin_guard
     };
 
-    let result = await_js_task_in_shards_and_refresh(
-        shards,
-        host,
-        shard_index,
-        &task_id,
-        Duration::from_millis(timeout_ms),
-    )
-    .await;
+    let result =
+        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
+            .await;
     drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
@@ -14624,7 +14734,7 @@ struct JsProviderStreamStart<'a> {
     context: Value,
     options: Value,
     origin: Option<&'a SessionActionOrigin>,
-    timeout_ms: u64,
+    deadline: Instant,
 }
 
 #[allow(clippy::future_not_send)]
@@ -14640,11 +14750,10 @@ async fn start_extension_provider_stream_simple_sharded(
         context,
         options,
         origin,
-        timeout_ms,
+        deadline,
     } = start;
     shards.ensure_shard_healthy(shard_index)?;
-    let timeout = Duration::from_millis(timeout_ms);
-    let deadline = Instant::now().checked_add(timeout);
+    let timeout = remaining_js_task_timeout(deadline, "provider stream start")?;
     let task_id = next_runtime_task_id("task-provider-stream-start");
     let origin_guard = {
         let runtime = &shards
@@ -14678,7 +14787,8 @@ async fn start_extension_provider_stream_simple_sharded(
         origin_guard
     };
 
-    let value = await_js_task_in_shards(shards, host, shard_index, &task_id, timeout).await?;
+    let value =
+        await_js_task_in_shards(shards, host, shard_index, &task_id, timeout, deadline).await?;
     drop(origin_guard);
     let inner_stream_id = value
         .as_str()
@@ -14686,13 +14796,14 @@ async fn start_extension_provider_stream_simple_sharded(
         .ok_or_else(|| Error::extension("provider stream start: expected stream id".to_string()))?;
 
     if let Err(refresh_err) = refresh_runtime_shard_snapshot(shards, shard_index).await {
-        let cleanup_timeout_ms = deadline
-            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
-            .map_or(1, |remaining| {
-                u64::try_from(remaining.as_millis())
-                    .unwrap_or(u64::MAX)
-                    .max(1)
-            });
+        let cleanup_timeout_ms =
+            deadline
+                .checked_duration_since(Instant::now())
+                .map_or(1, |remaining| {
+                    u64::try_from(remaining.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .max(1)
+                });
         if let Err(cleanup_err) = cancel_extension_provider_stream_simple_best_effort(
             shards,
             host,
@@ -14723,10 +14834,11 @@ async fn next_extension_provider_stream_simple_sharded(
     host: &JsRuntimeHost,
     shard_index: usize,
     stream_id: &str,
-    timeout_ms: u64,
+    deadline: Instant,
     origin: Option<&SessionActionOrigin>,
 ) -> Result<Option<Value>> {
     shards.ensure_shard_healthy(shard_index)?;
+    let timeout = remaining_js_task_timeout(deadline, "provider stream next")?;
     let task_id = next_runtime_task_id("task-provider-stream-next");
     let origin_guard = {
         let runtime = &shards
@@ -14752,14 +14864,9 @@ async fn next_extension_provider_stream_simple_sharded(
         origin_guard
     };
 
-    let value = await_js_task_in_shards_and_refresh(
-        shards,
-        host,
-        shard_index,
-        &task_id,
-        Duration::from_millis(timeout_ms),
-    )
-    .await?;
+    let value =
+        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
+            .await?;
     drop(origin_guard);
     let result: JsProviderStreamNext = serde_json::from_value(value)
         .map_err(|err| Error::extension(format!("provider stream next: {err}")))?;
@@ -14780,9 +14887,10 @@ async fn cancel_extension_provider_stream_simple_sharded(
     host: &JsRuntimeHost,
     shard_index: usize,
     stream_id: &str,
-    timeout_ms: u64,
+    deadline: Instant,
     origin: Option<&SessionActionOrigin>,
 ) -> Result<()> {
+    let timeout = remaining_js_task_timeout(deadline, "provider stream cancel")?;
     let task_id = next_runtime_task_id("task-provider-stream-cancel");
     let origin_guard = {
         let runtime = &shards
@@ -14808,14 +14916,9 @@ async fn cancel_extension_provider_stream_simple_sharded(
         origin_guard
     };
 
-    let _ = await_js_task_in_shards_and_refresh(
-        shards,
-        host,
-        shard_index,
-        &task_id,
-        Duration::from_millis(timeout_ms),
-    )
-    .await?;
+    let _ =
+        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
+            .await?;
     drop(origin_guard);
     Ok(())
 }
@@ -14837,12 +14940,13 @@ async fn cancel_extension_provider_stream_simple_best_effort(
         .shards
         .get_mut(shard_index)
         .and_then(|shard| shard.pump_fault.take());
+    let deadline = js_runtime_request_deadline(timeout_ms);
     let result = cancel_extension_provider_stream_simple_sharded(
         shards,
         host,
         shard_index,
         stream_id,
-        timeout_ms,
+        deadline,
         origin,
     )
     .await;
@@ -14925,6 +15029,7 @@ async fn pump_js_runtime_once_for_owner(
     runtime: &PiJsRuntime,
     host: &JsRuntimeHost,
     expected_owner: Option<&str>,
+    root_deadline: Option<Instant>,
 ) -> Result<bool> {
     fn drain_requests(runtime: &PiJsRuntime) -> std::collections::VecDeque<HostcallRequest> {
         runtime.drain_hostcall_requests()
@@ -14936,6 +15041,7 @@ async fn pump_js_runtime_once_for_owner(
         runtime: &PiJsRuntime,
         host: &JsRuntimeHost,
         expected_owner: Option<&str>,
+        root_deadline: Option<Instant>,
         req: HostcallRequest,
     ) -> Option<(String, HostcallOutcome, u64)> {
         let call_id = req.call_id.clone();
@@ -14967,6 +15073,32 @@ async fn pump_js_runtime_once_for_owner(
                     req.extension_id
                 ),
             }
+        } else if let Some(deadline) = root_deadline {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Some((
+                    call_id,
+                    HostcallOutcome::Error {
+                        code: "timeout".to_string(),
+                        message: "Root JavaScript task deadline elapsed before hostcall dispatch"
+                            .to_string(),
+                    },
+                    0,
+                ));
+            };
+            match timeout(
+                wall_now(),
+                remaining,
+                Box::pin(dispatch_hostcall_with_runtime(Some(runtime), host, req)),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => HostcallOutcome::Error {
+                    code: "timeout".to_string(),
+                    message: "Root JavaScript task deadline elapsed during hostcall dispatch"
+                        .to_string(),
+                },
+            }
         } else {
             dispatch_hostcall_with_runtime(Some(runtime), host, req).await
         };
@@ -14994,6 +15126,7 @@ async fn pump_js_runtime_once_for_owner(
         runtime: &PiJsRuntime,
         host: &JsRuntimeHost,
         expected_owner: Option<&str>,
+        root_deadline: Option<Instant>,
         pending: std::collections::VecDeque<HostcallRequest>,
     ) {
         if pending.is_empty() {
@@ -15010,9 +15143,10 @@ async fn pump_js_runtime_once_for_owner(
             .is_some_and(|mgr| mgr.any_safety_envelope_vetoing());
 
         if amac_enabled && !safety_vetoed {
-            dispatch_requests_amac(runtime, host, expected_owner, pending).await;
+            dispatch_requests_amac(runtime, host, expected_owner, root_deadline, pending).await;
         } else {
-            dispatch_requests_sequential(runtime, host, expected_owner, pending).await;
+            dispatch_requests_sequential(runtime, host, expected_owner, root_deadline, pending)
+                .await;
         }
     }
 
@@ -15021,12 +15155,13 @@ async fn pump_js_runtime_once_for_owner(
         runtime: &PiJsRuntime,
         host: &JsRuntimeHost,
         expected_owner: Option<&str>,
+        root_deadline: Option<Instant>,
         pending: std::collections::VecDeque<HostcallRequest>,
     ) {
         let mut completions = Vec::with_capacity(pending.len());
         for req in pending {
             if let Some((call_id, outcome, elapsed_ns)) =
-                dispatch_one(runtime, host, expected_owner, req).await
+                dispatch_one(runtime, host, expected_owner, root_deadline, req).await
             {
                 // Feed timing to AMAC even when disabled, so telemetry
                 // is ready if toggled on later.
@@ -15045,6 +15180,7 @@ async fn pump_js_runtime_once_for_owner(
         runtime: &PiJsRuntime,
         host: &JsRuntimeHost,
         expected_owner: Option<&str>,
+        root_deadline: Option<Instant>,
         pending: std::collections::VecDeque<HostcallRequest>,
     ) {
         let requests: Vec<HostcallRequest> = pending.into_iter().collect();
@@ -15076,7 +15212,7 @@ async fn pump_js_runtime_once_for_owner(
 
             for req in group.requests {
                 if let Some((call_id, outcome, elapsed_ns)) =
-                    dispatch_one(runtime, host, expected_owner, req).await
+                    dispatch_one(runtime, host, expected_owner, root_deadline, req).await
                 {
                     AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
                     completions.push((call_id, outcome));
@@ -15103,7 +15239,14 @@ async fn pump_js_runtime_once_for_owner(
     let _ = runtime.drain_microtasks().await?;
 
     // Process any hostcalls already queued before we advance the event loop.
-    dispatch_requests(runtime, host, expected_owner, drain_requests(runtime)).await;
+    dispatch_requests(
+        runtime,
+        host,
+        expected_owner,
+        root_deadline,
+        drain_requests(runtime),
+    )
+    .await;
 
     // Advance the event loop (may schedule hostcalls while running a task's microtasks).
     let _ = runtime.tick().await?;
@@ -15113,7 +15256,7 @@ async fn pump_js_runtime_once_for_owner(
     // calls (e.g. `pi.sendMessage()` without `await`) can be lost when a JS task resolves quickly.
     let after_tick = drain_requests(runtime);
     let has_after_tick = !after_tick.is_empty();
-    dispatch_requests(runtime, host, expected_owner, after_tick).await;
+    dispatch_requests(runtime, host, expected_owner, root_deadline, after_tick).await;
 
     // If we dispatched any hostcalls, run another tick so their completions are delivered and
     // microtasks reach a fixpoint before the caller observes the outcome.
@@ -15127,15 +15270,16 @@ async fn pump_js_runtime_once_for_owner(
 
 #[allow(clippy::future_not_send)]
 async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Result<bool> {
-    pump_js_runtime_once_for_owner(runtime, host, None).await
+    pump_js_runtime_once_for_owner(runtime, host, None, None).await
 }
 
 #[allow(clippy::future_not_send)]
 async fn pump_js_runtime_shards_once(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
+    root_deadline: Option<Instant>,
 ) -> Result<bool> {
-    pump_js_runtime_shards_once_for_target(shards, host, None).await
+    pump_js_runtime_shards_once_for_target(shards, host, None, root_deadline).await
 }
 
 #[allow(clippy::future_not_send)]
@@ -15143,6 +15287,7 @@ async fn pump_js_runtime_shards_once_for_target(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
     target_shard_index: Option<usize>,
+    root_deadline: Option<Instant>,
 ) -> Result<bool> {
     let shard_count = shards.shards.len();
     if shard_count == 0 {
@@ -15158,7 +15303,13 @@ async fn pump_js_runtime_shards_once_for_target(
         shards.ensure_shard_healthy(shard_index)?;
         let pending = {
             let shard = &shards.shards[shard_index];
-            pump_js_runtime_once_for_owner(&shard.runtime, host, Some(&shard.extension_id)).await
+            pump_js_runtime_once_for_owner(
+                &shard.runtime,
+                host,
+                Some(&shard.extension_id),
+                root_deadline,
+            )
+            .await
         };
         return match pending {
             Ok(pending) => {
@@ -15186,8 +15337,13 @@ async fn pump_js_runtime_shards_once_for_target(
         }
         let pump_result = {
             let shard = &shards.shards[shard_index];
-            pump_js_runtime_once_for_owner(&shard.runtime, host, Some(shard.extension_id.as_str()))
-                .await
+            pump_js_runtime_once_for_owner(
+                &shard.runtime,
+                host,
+                Some(shard.extension_id.as_str()),
+                root_deadline,
+            )
+            .await
         };
         match pump_result {
             Ok(pending) => has_pending |= pending,
@@ -15863,12 +16019,18 @@ pub async fn dispatch_host_call_shared(
         };
 
         // SEC-4.1: record subprocess spawn before exec dispatch.
-        if is_exec
+        let _subprocess_accounting = if is_exec
             && will_dispatch
             && let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id)
         {
             manager.record_subprocess_spawn(ext_id);
-        }
+            Some(SubprocessAccountingGuard {
+                manager: manager.clone(),
+                extension_id: ext_id.to_string(),
+            })
+        } else {
+            None
+        };
 
         let dispatched = if shadow_mode {
             // SEC-7.1: Shadow mode — score is recorded but call is always allowed.
@@ -16012,14 +16174,6 @@ pub async fn dispatch_host_call_shared(
                 }
             }
         };
-
-        // SEC-4.1: record subprocess exit after exec dispatch completes.
-        if is_exec
-            && will_dispatch
-            && let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id)
-        {
-            manager.record_subprocess_exit(ext_id);
-        }
 
         dispatched
     } else {
@@ -16641,7 +16795,7 @@ async fn dispatch_shared_allowed(
             // Record reactor mesh routing for shard telemetry (bd-3ar8v.4.20).
             // The reactor mesh assigns a shard for this opcode and uses completions
             // to keep queue-depth and dispatch-latency telemetry tied to real work.
-            let mut reactor_completion: Option<(usize, u64)> = None;
+            let mut _reactor_completion = None;
             if let Some(ref manager) = ctx.manager {
                 match manager.reactor_submit(
                     call.call_id.clone(),
@@ -16658,7 +16812,11 @@ async fn dispatch_shared_allowed(
                             opcode = opcode.code(),
                             "Hostcall routed through reactor mesh"
                         );
-                        reactor_completion = Some((reactor_req.shard_id, reactor_req.global_seq));
+                        _reactor_completion = Some(ReactorCompletionGuard {
+                            manager: manager.clone(),
+                            shard_id: reactor_req.shard_id,
+                            global_seq: reactor_req.global_seq,
+                        });
                     }
                     Some(Err(backpressure)) => {
                         tracing::warn!(
@@ -16695,13 +16853,7 @@ async fn dispatch_shared_allowed(
                     None => {}
                 }
             }
-            let outcome = dispatch_shared_allowed_fast(ctx, call, opcode).await;
-            if let (Some(manager), Some((shard_id, global_seq))) =
-                (ctx.manager.as_ref(), reactor_completion.as_ref())
-            {
-                manager.reactor_record_completion(*shard_id, *global_seq);
-            }
-            outcome
+            dispatch_shared_allowed_fast(ctx, call, opcode).await
         }
         HostcallDispatchLane::Compat => dispatch_shared_allowed_legacy(ctx, call).await,
     };
@@ -18048,6 +18200,8 @@ async fn dispatch_hostcall_exec_ref_with_limit(
                 );
             }
         });
+
+        let _guard = CancelGuard(Arc::clone(&cancel));
 
         let mut sequence = 0_u64;
         let mut processed_in_turn = 0_u32;
@@ -19558,7 +19712,8 @@ async fn await_js_task(
             )));
         }
 
-        let _has_pending = pump_js_runtime_once_for_owner(runtime, host, expected_owner).await?;
+        let _has_pending =
+            pump_js_runtime_once_for_owner(runtime, host, expected_owner, None).await?;
         if let Some(value) = finish_js_task_take(take_js_task_state(runtime, task_id).await?)? {
             return Ok(value);
         }
@@ -19575,12 +19730,31 @@ async fn await_js_task_in_shards(
     shard_index: usize,
     task_id: &str,
     timeout: Duration,
+    root_deadline: Instant,
 ) -> Result<Value> {
     let start = extension_wait_now();
     let started_at = Instant::now();
 
     loop {
-        if js_task_timed_out(start, started_at, timeout) {
+        let timed_out =
+            Instant::now() >= root_deadline || js_task_timed_out(start, started_at, timeout);
+
+        let _has_pending = pump_js_runtime_shards_once_for_target(
+            shards,
+            host,
+            Some(shard_index),
+            Some(root_deadline),
+        )
+        .await?;
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        if let Some(value) = finish_js_task_take(take_js_task_state(runtime, task_id).await?)? {
+            return Ok(value);
+        }
+        if timed_out || Instant::now() >= root_deadline {
             return Err(quarantine_runtime_shard(
                 shards,
                 shard_index,
@@ -19589,17 +19763,6 @@ async fn await_js_task_in_shards(
                     timeout.as_millis()
                 ),
             ));
-        }
-
-        let _has_pending =
-            pump_js_runtime_shards_once_for_target(shards, host, Some(shard_index)).await?;
-        let runtime = &shards
-            .shards
-            .get(shard_index)
-            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
-            .runtime;
-        if let Some(value) = finish_js_task_take(take_js_task_state(runtime, task_id).await?)? {
-            return Ok(value);
         }
         if !shards.shards[shard_index].runtime.has_pending() {
             extension_wait_short_blocking_pause(Duration::from_millis(1));
@@ -19614,8 +19777,10 @@ async fn await_js_task_in_shards_and_refresh(
     shard_index: usize,
     task_id: &str,
     timeout: Duration,
+    root_deadline: Instant,
 ) -> Result<Value> {
-    let task_result = await_js_task_in_shards(shards, host, shard_index, task_id, timeout).await;
+    let task_result =
+        await_js_task_in_shards(shards, host, shard_index, task_id, timeout, root_deadline).await;
     let refresh_result = refresh_runtime_shard_snapshot(shards, shard_index).await;
     match task_result {
         Ok(value) => {
