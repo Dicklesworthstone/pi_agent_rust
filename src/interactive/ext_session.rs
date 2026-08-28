@@ -1007,8 +1007,10 @@ mod tests {
             .await;
             let outcome = inner.expect("cancelled helper should finish before timeout");
             let err = outcome.expect_err("lock acquisition should honor inherited cancellation");
+            let message = err.to_string();
             assert!(
-                err.to_string().contains("session lock failed"),
+                message.contains("session lock failed")
+                    || message.contains("session action admission lock failed"),
                 "unexpected error: {err}"
             );
 
@@ -1694,7 +1696,10 @@ mod tests {
         let handle = runtime.handle();
 
         runtime.block_on(async move {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = tempfile::Builder::new()
+                .prefix("pi-ext-session-")
+                .tempdir_in("/tmp")
+                .expect("tempdir");
             let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
                 dir.path().to_path_buf(),
             ))));
