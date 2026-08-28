@@ -124,8 +124,6 @@ tests/evidence_bundle/*
 !tests/evidence_bundle/index.json
 !tests/evidence_bundle/events.jsonl
 !tests/evidence_bundle/bundle_report.md
-tests/edit_repro.rs
-
 # Build artifacts (concurrent agent output)
 artifacts/
 release_artifacts/

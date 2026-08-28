@@ -5797,6 +5797,97 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn shake_compact_save_failure_does_not_claim_success() {
+        let (mut app, mut event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        app.save_enabled = true;
+        app.extensions = None;
+        app.config.compaction = Some(crate::config::CompactionSettings {
+            enabled: Some(true),
+            reserve_tokens: Some(128_000),
+            keep_recent_tokens: Some(1),
+            mode: None,
+        });
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let bulky = "history ".repeat(200);
+        let expected_entries = runtime().block_on(async {
+            let cx = Cx::for_request();
+            let mut session_guard =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
+                    .await
+                    .expect("lock session");
+            for i in 0..4 {
+                session_guard.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(format!("user-{i} {bulky}")),
+                    timestamp: Some(i),
+                });
+                session_guard.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new(format!(
+                            "assistant-{i} {bulky}"
+                        )))],
+                        api: "test".to_string(),
+                        provider: "continue-probe".to_string(),
+                        model: "continue-probe-model".to_string(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        stop_details: None,
+                        error_message: None,
+                        timestamp: i,
+                    },
+                });
+            }
+            session_guard.path = Some(blocked_path);
+            serde_json::to_value(&session_guard.entries).expect("serialize entries")
+        });
+
+        let _ = app.handle_slash_compact("shake");
+        let terminal = runtime().block_on(async {
+            let recv_cx = Cx::for_testing();
+            let wait = async {
+                loop {
+                    match event_rx.recv(&recv_cx).await {
+                        Ok(PiMsg::AgentError(message)) => break format!("error:{message}"),
+                        Ok(PiMsg::ConversationReset { status, .. }) => {
+                            break format!("reset:{status:?}");
+                        }
+                        Ok(PiMsg::System(message)) => break format!("system:{message}"),
+                        Ok(_) => {}
+                        Err(err) => break format!("event receive failed: {err}"),
+                    }
+                }
+            };
+            futures::pin_mut!(wait);
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                wait,
+            )
+            .await
+            .expect("shake compaction should finish before timeout")
+        });
+        assert!(
+            terminal.starts_with("error:") && terminal.contains("could not be confirmed"),
+            "compaction save failure must not emit success: {terminal}"
+        );
+
+        let session_guard = app.session.try_lock().expect("lock session");
+        assert_eq!(
+            serde_json::to_value(&session_guard.entries).expect("serialize live entries"),
+            expected_entries
+        );
+        assert!(
+            !session_guard
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
+            "failed compaction must not land on the live session"
+        );
+    }
+
+    #[test]
     fn empty_custom_overlay_frame_keeps_overlay_visible() {
         let mut app = build_test_app();
         let poll_request = ExtensionUiRequest::new(
