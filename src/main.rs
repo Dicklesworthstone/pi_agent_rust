@@ -9882,7 +9882,7 @@ mod tests {
             "pi".to_string(),
             "--model".to_string(),
             "gpt-4o".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "--dry-run".to_string(),
             "--print".to_string(),
@@ -9893,10 +9893,50 @@ mod tests {
 
         assert_eq!(parsed.0.model.as_deref(), Some("gpt-4o"));
         assert!(parsed.0.print);
+        assert!(parsed.0.plan.is_none());
         assert_eq!(parsed.1.len(), 2);
-        assert_eq!(parsed.1[0].name, "plan");
+        assert_eq!(parsed.1[0].name, "extension-plan");
         assert_eq!(parsed.1[0].value.as_deref(), Some("ship-it"));
         assert_eq!(parsed.1[1].name, "dry-run");
+        assert!(parsed.1[1].value.is_none());
+    }
+
+    /// bd-oqm4z: production `parse_cli_args` must keep formerly omitted
+    /// built-in flags (including `--plan` as the plan-role model spec and
+    /// `--plan-mode`) instead of diverting them to extension-flag extraction.
+    #[test]
+    fn parse_cli_args_binds_plan_mode_role_and_yolo_alias() {
+        let parsed = parse_cli_args(vec![
+            "pi".to_string(),
+            "--plan".to_string(),
+            "openai/plan".to_string(),
+            "--plan-mode".to_string(),
+            "--auto-approve".to_string(),
+            "--mcp-config".to_string(),
+            "project.mcp.json".to_string(),
+            "--max-time".to_string(),
+            "12".to_string(),
+            "--ext-after".to_string(),
+            "1".to_string(),
+            "hello".to_string(),
+            "--ext-before-end".to_string(),
+        ])
+        .expect("parse args")
+        .expect("parsed cli payload");
+
+        assert_eq!(parsed.0.plan.as_deref(), Some("openai/plan"));
+        assert!(parsed.0.plan_mode);
+        assert!(parsed.0.yolo);
+        assert_eq!(
+            parsed.0.mcp_config,
+            vec![std::path::PathBuf::from("project.mcp.json")]
+        );
+        assert_eq!(parsed.0.max_time, Some(12));
+        assert_eq!(parsed.0.message_args(), vec!["hello"]);
+        assert_eq!(parsed.1.len(), 2);
+        assert_eq!(parsed.1[0].name, "ext-after");
+        assert_eq!(parsed.1[0].value.as_deref(), Some("1"));
+        assert_eq!(parsed.1[1].name, "ext-before-end");
         assert!(parsed.1[1].value.is_none());
     }
 
