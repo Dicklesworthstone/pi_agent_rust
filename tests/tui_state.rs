@@ -3578,7 +3578,11 @@ fn tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file() {
         .expect("expected share result");
     let step = apply_pi(&harness, &mut app, "PiMsg share result", msg);
     assert_after_contains(&harness, &step, "Created secret gist");
-    assert_after_contains(&harness, &step, "not private; anyone with the URL can view it");
+    assert_after_contains(
+        &harness,
+        &step,
+        "not private; anyone with the URL can view it",
+    );
     assert_after_contains(&harness, &step, "Share URL:");
     assert_after_contains(
         &harness,
@@ -4965,13 +4969,8 @@ fn tui_state_capability_prompt_shows_auto_deny_timer() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = typed_capability_prompt(
-        "cap-timer",
-        "timer-ext",
-        "fs",
-        "File system access",
-    )
-    .with_timeout_ms(30_000);
+    let request = typed_capability_prompt("cap-timer", "timer-ext", "fs", "File system access")
+        .with_timeout_ms(30_000);
     let step = apply_pi(
         &harness,
         &mut app,

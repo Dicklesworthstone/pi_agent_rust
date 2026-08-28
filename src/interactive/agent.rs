@@ -5560,6 +5560,7 @@ mod stream_delta_batcher_tests {
             )
         });
 
+        app.save_enabled = false;
         let switched = app.start_tree_navigation(
             super::super::tree::PendingTreeNavigation {
                 session_id,
@@ -5646,6 +5647,7 @@ mod stream_delta_batcher_tests {
         let agent_before =
             serde_json::to_value(agent_guard.messages()).expect("serialize agent history");
 
+        app.save_enabled = false;
         let switched = app.start_tree_navigation(
             super::super::tree::PendingTreeNavigation {
                 session_id,
@@ -5684,6 +5686,114 @@ mod stream_delta_batcher_tests {
             .map(|message| (message.role, message.content.clone()))
             .collect::<Vec<_>>();
         assert_eq!(ui_after, ui_before);
+    }
+
+    #[test]
+    fn persisted_tree_navigation_save_failure_does_not_claim_success() {
+        let (mut app, mut event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        app.save_enabled = true;
+        app.extensions = None;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let (session_id, current_leaf_id, target_leaf_id, session_before) =
+            runtime().block_on(async {
+                let cx = Cx::for_request();
+                let mut session_guard =
+                    asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
+                        .await
+                        .expect("lock session");
+                let root_id = session_guard.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text("root".to_string()),
+                    timestamp: Some(0),
+                });
+                let current_leaf_id =
+                    session_guard.append_message(crate::session::SessionMessage::User {
+                        content: crate::model::UserContent::Text("current".to_string()),
+                        timestamp: Some(0),
+                    });
+                assert!(session_guard.create_branch_from(&root_id));
+                let target_leaf_id =
+                    session_guard.append_message(crate::session::SessionMessage::User {
+                        content: crate::model::UserContent::Text("target".to_string()),
+                        timestamp: Some(0),
+                    });
+                assert!(session_guard.navigate_to(&current_leaf_id));
+                session_guard.path = Some(blocked_path);
+                (
+                    session_guard.header.id.clone(),
+                    Some(current_leaf_id),
+                    Some(target_leaf_id),
+                    serde_json::to_value(session_guard.to_messages_for_current_path())
+                        .expect("serialize session history"),
+                )
+            });
+
+        let switched = app.start_tree_navigation(
+            super::super::tree::PendingTreeNavigation {
+                session_id,
+                old_leaf_id: current_leaf_id.clone(),
+                new_leaf_id: target_leaf_id,
+                editor_text: None,
+                entries_to_summarize: Vec::new(),
+                summary_from_id: String::new(),
+                api_key_present: false,
+            },
+            super::super::tree::TreeSummaryChoice::NoSummary,
+            None,
+        );
+        assert!(
+            switched,
+            "persistence-enabled navigation should be admitted then fail closed"
+        );
+
+        let error = runtime().block_on(async {
+            let recv_cx = Cx::for_testing();
+            let wait_for_error = async {
+                loop {
+                    match event_rx.recv(&recv_cx).await {
+                        Ok(PiMsg::AgentError(message))
+                            if message.contains("could not be confirmed") =>
+                        {
+                            break message;
+                        }
+                        Ok(PiMsg::ConversationReset { .. }) => {
+                            break "unexpected ConversationReset".to_string();
+                        }
+                        Ok(_) => {}
+                        Err(err) => break format!("event receive failed: {err}"),
+                    }
+                }
+            };
+            futures::pin_mut!(wait_for_error);
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                wait_for_error,
+            )
+            .await
+            .expect("save-failure tree navigation should finish before timeout")
+        });
+        assert!(
+            error.contains("could not be confirmed"),
+            "unexpected terminal event: {error}"
+        );
+
+        let session_guard = app.session.try_lock().expect("lock session");
+        assert_eq!(session_guard.leaf_id(), current_leaf_id.as_deref());
+        assert_eq!(
+            serde_json::to_value(session_guard.to_messages_for_current_path())
+                .expect("serialize session history"),
+            session_before
+        );
+        drop(session_guard);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_none_or(|msg| !msg.starts_with("Switched to ")),
+            "UI must not claim a durable switch after a failed save"
+        );
     }
 
     #[test]
