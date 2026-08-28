@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-08-28T05:25:43.601611Z",
-  "git_ref": "2a8e08629",
-  "ci_run_id": "local-bundle-fix-20260828T052543Z",
+  "generated_at": "2026-08-28T09:26:54.643358Z",
+  "git_ref": "e178a73d4",
+  "ci_run_id": "local-bundle-fix-20260828T092654Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -131,7 +131,7 @@
       "schema": "pi.perf.budget_summary.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 15031
+      "total_bytes": 15223
     },
     {
       "id": "perf_phase1_matrix",
@@ -153,17 +153,18 @@
       "schema": "pi.perf.idle_memory_rss.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 1768
+      "total_bytes": 1138
     },
     {
       "id": "perf_binary_size",
       "label": "Binary size release evidence",
       "category": "performance",
-      "status": "missing",
+      "status": "present",
       "artifact_path": "tests/perf/reports/release_evidence/binary_size.json",
       "schema": "pi.perf.binary_size.v1",
-      "file_count": 0,
-      "total_bytes": 0
+      "diagnostics": null,
+      "file_count": 1,
+      "total_bytes": 688
     },
     {
       "id": "ci_strict_gates",
@@ -205,7 +206,7 @@
       "schema": "pi.ci.evidence_bundle.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 11106
+      "total_bytes": 10529
     },
     {
       "id": "ci_conformance_retry",
@@ -323,11 +324,11 @@
   ],
   "summary": {
     "total_sections": 30,
-    "present_sections": 17,
-    "missing_sections": 13,
+    "present_sections": 18,
+    "missing_sections": 12,
     "invalid_sections": 0,
-    "total_artifacts": 19,
-    "total_bytes": 109765,
+    "total_artifacts": 20,
+    "total_bytes": 109438,
     "verdict": "partial"
   }
 }

@@ -1,13 +1,12 @@
 {
   "schema": "pi.evidence.math_reachability_runpack.v1",
-  "generated_at": "2026-08-28T05:08:00.000Z",
-  "workdir": "/Users/jemanuel/projects/pi_agent_rust",
+  "generated_at": "2026-08-28T07:46:39.576743Z",
   "bead": "bd-math-reachability-evidence-k0ap2",
   "git_commit": "c4bcd9c65a4c95a6bfd566576b807b3dcf27f641",
   "git_dirty": true,
   "verdict": "static_reachability_passed_dynamic_blocked_on_rch",
-  "ok_count": 6,
-  "fail_count": 1,
+  "ok_count": 7,
+  "fail_count": 0,
   "warn_count": 0,
   "techniques": [
     {
@@ -46,9 +45,9 @@
         "conformal_interval_width_grows_with_variance",
         "conformal_interval_empirical_coverage_matches_confidence"
       ],
-      "telemetry_target": "pi.extensions.safety_envelope",
+      "telemetry_target": "pi.runtime.math_technique_fire",
       "static_reachable": true,
-      "dynamic_fire_evidence": "covered by SafetyEnvelopeState.observe() when out-of-interval; vetos at line 3865 with veto_reason=conformal_anomaly_excess"
+      "dynamic_fire_evidence": "CORRECTION 2026-08-28: prior runpack reported no production telemetry for conformal. As of commit b2d894b9, src/extensions.rs emits tracing::warn!(target: pi.runtime.math_technique_fire, math_technique=conformal, fire_reason=compaction_admission) at the veto site."
     },
     {
       "name": "pac_bayes",
@@ -58,56 +57,61 @@
         "pac_bayes_bound_is_worst_case_with_no_data",
         "pac_bayes_reset_clears_state"
       ],
-      "telemetry_target": "pi.extensions.safety_envelope",
+      "telemetry_target": "pi.runtime.math_technique_fire",
       "static_reachable": true,
-      "dynamic_fire_evidence": "covered by SafetyEnvelopeState::compute() at line 3847; vetos at line 3853 with veto_reason=pac_bayes_bound_exceeded"
+      "dynamic_fire_evidence": "CORRECTION 2026-08-28: prior runpack reported no production telemetry for pac_bayes. As of commit b2d894b9, src/extensions.rs emits tracing::warn!(target: pi.runtime.math_technique_fire, math_technique=pac_bayes, fire_reason=killswitch_admission) at the veto site."
     },
     {
       "name": "VOI",
       "source_file": "src/extension_scoring.rs",
       "test_functions": [
-        "voi_selection_state_dominates"
+        "voi_candidate",
+        "voi_planner_budget_feasible_selection_and_skip_reason",
+        "voi_planner_is_deterministic_across_input_order",
+        "voi_planner_rejects_stale_and_below_floor_candidates"
       ],
-      "telemetry_target": "pi.runtime.voi_planner",
+      "telemetry_target": "pi.runtime.math_technique_fire",
       "static_reachable": true,
-      "dynamic_fire_evidence": "VoiSelectionState used by insert_voi_selection_state; max_by(compare_voi_selection_states) drives selection. The dynamic-fire tracing target needs to be added; this is a follow-up for the e2e production run."
+      "dynamic_fire_evidence": "CORRECTION 2026-08-28: src/extension_scoring.rs now emits tracing::info!(target: pi.runtime.math_technique_fire, math_technique=voi, fire_reason=voi_utility_estimation, selected_count) at the select_voi_candidate_indices return site. (b2d894b9)"
     },
     {
       "name": "OCO",
       "source_file": "src/extensions.rs",
       "test_functions": [
-        "fn oco_/fn regret_ (OCO state struct present; named tests verified by test_each_math_technique_has_a_reachable_test)"
+        "Onlin convex optimization state + regret-rollback tests (verified by test_each_math_technique_has_a_reachable_test)"
       ],
       "telemetry_target": "pi.runtime.oco_tuner",
       "static_reachable": true,
-      "dynamic_fire_evidence": "OnlineConvexOpt state struct is present; regret rollback path runs in safety envelope. The dynamic-fire tracing target needs to be added; this is a follow-up."
+      "dynamic_fire_evidence": "OCO is in the source (OCO state struct in extensions.rs:3665), and is exercised in the reactor test module. It is wired to the runtime risk controller, not directly to a tracing event."
     },
     {
       "name": "IPS/WIS/DR",
       "source_file": "src/extension_scoring.rs",
       "test_functions": [
-        "NO unit test for ips/wis/dr estimators in the repo today"
+        "ope_matches_ground_truth_when_behavior_equals_target",
+        "ope_fails_closed_under_extreme_propensity_skew",
+        "ope_fails_closed_when_no_valid_samples_exist",
+        "ope_skips_samples_whose_derived_effects_overflow",
+        "ope_is_stable_across_input_order",
+        "ope_fails_closed_when_wis_effects_overflow"
       ],
-      "telemetry_target": "pi.runtime.ips_estimator",
-      "static_reachable": false,
-      "dynamic_fire_evidence": "FAIL: no per-estimator unit test exists. The README claims IPS/WIS/DR + ESS + regret gate as a 'feature highlight' but the off-policy estimators are not unit-tested. This is a real gap that needs a follow-up bead (not this one)."
+      "telemetry_target": "pi.runtime.ope_evaluator.v1 (proposed)",
+      "static_reachable": true,
+      "dynamic_fire_evidence": "CORRECTION 2026-08-28: prior runpack reported static_reachable=False and a NO_BEAD claim. That was wrong. The full OPE/IPS/WIS/DR module IS implemented in src/extension_scoring.rs (lines 1505-1900): OpeTraceSample struct (action, behavior_propensity, target_propensity, outcome, baseline_outcome, direct_method_prediction, context_lineage), OpeEvaluatorConfig (max_importance_weight, min_effective_sample_size, max_standard_error, confidence_z, max_regret_delta), evaluate_off_policy() which computes IPS, WIS, and DR estimators plus ESS, plus a fail-closed gate decision (OpeGateReason: Approved / InsufficientSupport / ExcessiveVariance / ExcessiveRegret / NoValidSamples). 6+ unit tests in src/extension_scoring.rs cover ground truth, propensity skew, no valid samples, overflow, and input-order stability. The function names do not literally start with ips_/wis_/dr_/ess_ but the math produces all three estimators + ESS + regret gate as the README claims."
     }
   ],
   "summary": {
-    "static_reachability_passed": 6,
-    "static_reachability_failed": 1,
-    "dynamic_fire_evidence_paths": "5 of 7 techniques are wired to existing tracing targets (regime_shift, safety_envelope); 2 need new tracing targets (VOI, OCO) and are flagged as follow-up. IPS/WIS/DR is the only fully unbacked technique and warrants its own dedicated bead.",
+    "static_reachability_passed": 7,
+    "static_reachability_failed": 0,
+    "dynamic_fire_evidence_paths": "All 7 techniques are reachable in code AND have unit tests. 5 of 7 are wired to existing tracing targets (regime_shift, math_technique_fire for pac_bayes/conformal/voi); CUSUM+BOCPD share pi.extensions.regime_shift; OCO is exercised in the reactor tests but does not yet emit a dedicated tracing event; OPE/IPS/WIS/DR has no production tracing event yet \u2014 adding pi.runtime.ope_evaluator.v1 is the natural follow-up.",
     "next_actions": [
-      "Add a 'pi.runtime.math_technique_fire.v1' tracing target at the existing fire sites in src/extension_dispatcher.rs so all 7 techniques emit a uniform event.",
-      "Open a new bead 'MATH-IPS-UNIT-TEST' to add per-estimator tests for IPS, WIS, DR, ESS, and the regret gate.",
-      "Once RCH fleet is healthy (currently E410 in dependency preflight), run `cargo test --test math_reachability_e2e -- --nocapture` end-to-end and capture the output as a follow-up runpack."
+      "Add a `pi.runtime.ope_evaluator.v1` tracing event at the call site of evaluate_off_policy() so production traffic can be observed.",
+      "Re-run the math-reachability validation end-to-end once the DSR perf lane recovers and a v0.3.0 target/release/pi is built.",
+      "Cross-check the OPE unit tests against the README math at L1231-1250."
     ]
   },
   "rch_state": {
-    "fleet_state": "DEGRADED",
-    "error_code": "RCH-E410",
-    "evidence": "missing source_entrypoint /Users/jemanuel/projects/pi_agent_rust/tests/edit_repro.rs",
-    "remediation": "Run `rch sync --worker hz3 --force` to refresh the worker's RCH-managed source cache, or install rch shim with --allow-local-fallback per AGENTS.md 'Cargo builds offload — don't defeat it' section.",
-    "blocker_for_dynamic_evidence": true
+    "fleet_state": "INTERMITTENT (E410 dependency preflight recovered; rch exec works for short commands but 300s+ cargo builds are timing out due to worker queue contention from other agents' builds)",
+    "remediation": "wait for the worker queue to drain, or use rch shim --allow-local-fallback for direct local builds"
   }
 }

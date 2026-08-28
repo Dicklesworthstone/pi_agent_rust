@@ -1,6 +1,6 @@
 {
   "schema": "pi.perf.criterion_estimate.v1",
-  "generated_at": "2026-08-28T05:17:08.254522+00:00",
+  "generated_at": "2026-08-28T09:17:31.022310+00:00",
   "fixture": "pirate",
   "budget_name": "ext_cold_load_complex_p95",
   "budget_threshold_us": 50000.0,

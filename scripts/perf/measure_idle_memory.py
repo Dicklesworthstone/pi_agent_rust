@@ -137,13 +137,10 @@ def main() -> int:
 
     binary_sha = sha256_file(binary)
 
-    # Spawn the binary
-    cmd = [str(binary), "--mode", args.mode]
-    if args.idle_state == "startup_before_user_input":
-        # Hold the binary open for the sample window with no input
-        # The simplest way: feed a tiny prompt that exits immediately
-        # but keeps the process alive long enough to sample.
-        cmd.extend(["--", "ping"])
+    # Spawn the binary. `--print` keeps the process alive for the
+    # sample window while still being a fast single-shot. The settle +
+    # process is allowed to exit after the response is printed.
+    cmd = [str(binary), "--print", "ping"]
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,

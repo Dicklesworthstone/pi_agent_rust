@@ -1,6 +1,6 @@
 {
   "schema": "pi.perf.scenario_runner.v1",
-  "generated_at": "2026-08-28T05:17:08.341411+00:00",
+  "generated_at": "2026-08-28T09:17:31.158536+00:00",
   "scenario": "event_dispatch",
   "event_count": 10000,
   "type_counts": {

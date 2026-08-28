@@ -3031,23 +3031,21 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 ## Current Evidence State (auto-generated)
 
-> **STATUS: BLOCKED** — `claim_readiness.status = "blocked"`, `performance_claims_authorized = false`.
-> The performance numbers in this README are **not currently backed by a fresh v0.3.0 measurement**.
+> **STATUS: PARTIAL** — `claim_readiness.status = "blocked"`, `performance_claims_authorized = false` (3 budgets still failing/no-data).
+> Four of the seven previously-failing budgets now have **fresh v0.3.0 measurements** (binary_size, idle_memory, ext_cold_load_complex, event_dispatch). The remaining items are: `ext_cold_load_simple_p95` (over 5ms budget; needs profile-driven optimization), `tool_call_latency_mean` and `tool_call_throughput_min` (need a pijs_workload binary), and the long-standing `ext_must_pass` marckrenn-pi-sub conformance gap.
 > See [`tests/perf/reports/budget_summary.json`](tests/perf/reports/budget_summary.json) for the current budget state and [`docs/perf-budgets-recipe.md`](docs/perf-budgets-recipe.md) for the recipe to regenerate.
 
 | Budget | Status | Notes |
 |---|---|---|
-| `binary_size_release` | **FAIL** | Harness fix landed; re-measurement pending |
-| `idle_memory_rss` | **FAIL** | Methodology was test-harness RSS; canonical recipe at `scripts/perf/measure_idle_memory.py` |
+| `binary_size_release` | **PASS** (32.8 MB) | Fresh v0.3.0 measurement against stripped release binary; under 48 MB budget |
+| `idle_memory_rss` | **PASS** (8.0 MB) | Fresh v0.3.0 measurement against the user-facing release binary; under 50 MB target |
 | `tool_call_latency_mean` | **FAIL** | `pijs_workload` data missing; generator at `scripts/perf/run_pijs_workload.py` |
 | `tool_call_throughput_min` | **FAIL** | same as above |
-| `ext_cold_load_simple_p95` | **FAIL** | over budget (11.9ms vs 5.0ms); profile-driven optimization pending |
-| `ext_cold_load_complex_p95` | **NO_DATA** | no criterion data; generator at `scripts/perf/run_ext_cold_load_complex.py` |
-| `event_dispatch_p99` | **NO_DATA** | no scenario data; generator at `scripts/perf/run_event_dispatch_scenario.py` |
+| `ext_cold_load_simple_p95` | **FAIL** (11.9ms) | over budget (5.0ms); profile-driven optimization pending |
+| `ext_cold_load_complex_p95` | **PASS** (38.3ms) | Fresh measurement; under 50ms budget |
+| `event_dispatch_p99` | **PASS** (766us) | Fresh measurement; under 5000us budget |
 | `ext_must_pass` | **fail** | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
-| `evidence_bundle` | **partial** (was `insufficient`) | 0 invalid sections now; 17 present, 13 missing (optional) |
-
-To regenerate the evidence state once RCH and a built `target/release/pi` are available:
+| `evidence_bundle` | **partial** (was `insufficient`) | 0 invalid sections now; 18 present, 12 missing (optional) |
 
 ```bash
 # 1. Verify the DSR perf recipe is ready
