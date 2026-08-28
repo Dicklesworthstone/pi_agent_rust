@@ -242,6 +242,9 @@ pub(super) fn classify_fork_bomb(lower: &str) -> bool {
             && lower.contains('&'));
     classic || lang_fork_bomb
 }
+
+pub(super) fn classify_disk_wipe(lower: &str) -> bool {
+    let shred = lower.starts_with("shred") || lower.contains(" shred ") || lower.contains(";shred");
     let wipefs =
         lower.starts_with("wipefs") || lower.contains(" wipefs") || lower.contains(";wipefs");
     let dd_zero = lower.contains("dd ") && lower.contains("if=/dev/zero");

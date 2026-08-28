@@ -271,7 +271,7 @@ pub fn assess(
     // Honour the user's `mediation_dcg` opt-out: when `Some(false)`,
     // never call dcg; use only the in-tree classifier.
     let dcg_enabled = settings.mediation_dcg.unwrap_or(true);
-    let mut hits: Vec<RuleHit> = if dcg_enabled {
+    let hits: Vec<RuleHit> = if dcg_enabled {
         match dcg_verdict(command, cwd) {
             Some(dcg_hits) => dcg_hits,
             None => fallback_verdict(command),
