@@ -68,14 +68,10 @@ async fn confirm_exact_compaction_after_save_error(
     expected_entry: &[u8],
 ) -> Option<()> {
     let path = candidate.path.as_ref()?;
-    let (reopened, diagnostics) = Session::open_with_diagnostics(
-        path.to_string_lossy().as_ref(),
-    )
-    .await
-    .ok()?;
-    if !diagnostics.skipped_entries.is_empty()
-        || !diagnostics.orphaned_parent_links.is_empty()
-    {
+    let (reopened, diagnostics) = Session::open_with_diagnostics(path.to_string_lossy().as_ref())
+        .await
+        .ok()?;
+    if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
         return None;
     }
     if reopened.header.id != candidate.header.id || reopened.leaf_id() != Some(entry_id) {
@@ -148,13 +144,9 @@ async fn stage_and_commit_compaction_session(
                 entry_id,
                 "compaction save failed; reconciling the exact operation against current disk state"
             );
-            if confirm_exact_compaction_after_save_error(
-                &candidate,
-                &entry_id,
-                &expected_entry,
-            )
-            .await
-            .is_none()
+            if confirm_exact_compaction_after_save_error(&candidate, &entry_id, &expected_entry)
+                .await
+                .is_none()
             {
                 return Err(crate::error::Error::session(
                     "Compaction persistence was not confirmed, current disk state could not be reconciled, and the active in-memory session was left unchanged"
@@ -1791,8 +1783,8 @@ mod tests {
     use crate::interactive::state::MessageRole;
     use asupersync::runtime::RuntimeBuilder;
     use std::collections::VecDeque;
-    use std::sync::{Arc, OnceLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
     use tempfile::TempDir;
 
     fn runtime() -> &'static asupersync::runtime::Runtime {

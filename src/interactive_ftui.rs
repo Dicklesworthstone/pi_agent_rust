@@ -3124,10 +3124,7 @@ fn report_replacement_shutdown_failure(
     shutdown: &crate::sdk::SessionResourceShutdown,
     agent_tx: &Sender<PiMsg>,
 ) {
-    let summary = shutdown
-        .failures()
-        .collect::<Vec<_>>()
-        .join("; ");
+    let summary = shutdown.failures().collect::<Vec<_>>().join("; ");
     let _ = agent_tx.send(PiMsg::AgentError(format!(
         "session replacement cancelled because previous-session shutdown preflight failed: {summary}"
     )));
@@ -3674,9 +3671,7 @@ fn terminal_replacement_error(
     let detail = if cleanup_issues.is_empty() {
         replacement_failure
     } else {
-        format!(
-            "{replacement_failure}; replacement cleanup was also incomplete: {cleanup_issues}"
-        )
+        format!("{replacement_failure}; replacement cleanup was also incomplete: {cleanup_issues}")
     };
     std::io::Error::other(format!(
         "FTUI session replacement failed terminally: {detail}"
@@ -3772,13 +3767,8 @@ pub fn run(
                             run_usage_command(refresh, &agent_tx).await;
                         }
                         Ok(UiCommand::Mcp { subcommand, name }) => {
-                            run_mcp_command(
-                                &mut handle,
-                                &subcommand,
-                                name.as_deref(),
-                                &agent_tx,
-                            )
-                            .await;
+                            run_mcp_command(&mut handle, &subcommand, name.as_deref(), &agent_tx)
+                                .await;
                         }
                         Ok(UiCommand::ExtensionCommand { name, args }) => {
                             run_extension_command(&handle, &bash_cwd, &name, &args, &agent_tx)
@@ -3960,7 +3950,11 @@ mod tests {
             Ok(Err(std::io::Error::other("autosave was not flushed"))),
         )
         .expect_err("driver shutdown failure must make FTUI exit fail");
-        assert!(shutdown_error.to_string().contains("autosave was not flushed"));
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("autosave was not flushed")
+        );
 
         let panic_error = finish_ftui_run(Ok(()), Err(Box::new("driver panic")))
             .expect_err("driver panic must make FTUI exit fail");
@@ -4668,7 +4662,10 @@ mod tests {
         ))));
 
         assert_eq!(
-            sim.model().active_ext.as_ref().map(|request| request.id.as_str()),
+            sim.model()
+                .active_ext
+                .as_ref()
+                .map(|request| request.id.as_str()),
             Some("ext-active")
         );
         assert!(sim.model().active_ask.is_none());
@@ -5046,7 +5043,10 @@ mod tests {
         type_str(&mut sim, "1");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
-            sim.model().active_ext.as_ref().map(|request| request.id.as_str()),
+            sim.model()
+                .active_ext
+                .as_ref()
+                .map(|request| request.id.as_str()),
             Some("ext-second")
         );
         assert!(
@@ -5171,9 +5171,9 @@ mod tests {
             stop_reason: StopReason::Stop,
             error_message: None,
         });
-        assert_terminal_event_dismisses_ask_and_queued_extension(PiMsg::AgentError(
-            String::from("turn failed"),
-        ));
+        assert_terminal_event_dismisses_ask_and_queued_extension(PiMsg::AgentError(String::from(
+            "turn failed",
+        )));
         assert_terminal_event_dismisses_ask_and_queued_extension(PiMsg::ConversationReset {
             session_id: String::from("replacement"),
             messages: Vec::new(),
@@ -5804,8 +5804,7 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|entry| entry.role == EntryRole::Error
-                    && entry.text.contains("usage: /mcp"))
+                .any(|entry| entry.role == EntryRole::Error && entry.text.contains("usage: /mcp"))
         );
     }
 

@@ -530,10 +530,7 @@ mod tests {
 
     #[test]
     fn sanitizes_single_codepoint_c1_sequences() {
-        assert_eq!(
-            sanitize_terminal_text("\u{009b}31mred\u{009b}0m"),
-            "red"
-        );
+        assert_eq!(sanitize_terminal_text("\u{009b}31mred\u{009b}0m"), "red");
         assert_eq!(
             sanitize_terminal_text("a\u{009d}0;forged title\u{009c}b"),
             "ab"

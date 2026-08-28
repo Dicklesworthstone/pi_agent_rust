@@ -2162,6 +2162,7 @@ impl PiApp {
                     agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
                     drop(session_guard);
                     drop(agent_guard);
+                    self.session_action_admission.advance_generation();
 
                     self.messages.clear();
                     self.message_render_cache.clear();
@@ -2199,6 +2200,7 @@ impl PiApp {
                 let event_tx = self.event_tx.clone();
                 let session = Arc::clone(&self.session);
                 let agent = Arc::clone(&self.agent);
+                let admission = self.session_action_admission.clone();
                 let runtime_handle = self.runtime_handle.clone();
 
                 let (session_dir, previous_session_file) = {
@@ -2243,10 +2245,13 @@ impl PiApp {
                     if let Err(err) = PiApp::try_install_session(
                         &session,
                         &agent,
+                        &admission,
                         new_session,
                         Vec::new(),
                         Some(ThinkingLevel::Off),
-                    ) {
+                    )
+                    .await
+                    {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &task_cx,
@@ -5388,13 +5393,14 @@ mod tests {
             timestamp: 0,
         });
 
-        let result = PiApp::try_install_session(
+        let result = runtime().block_on(PiApp::try_install_session(
             &session,
             &app.agent,
+            &app.session_action_admission,
             Session::in_memory(),
             vec![replacement_message],
             None,
-        );
+        ));
 
         assert!(result.is_err());
         drop(held_session);

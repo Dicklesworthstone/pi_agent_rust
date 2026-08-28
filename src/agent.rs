@@ -2718,7 +2718,6 @@ impl Agent {
                         // job notice belonged to the previous owner. Reach the
                         // normal idle restaging boundary without emitting a
                         // lifecycle start or invoking the provider empty.
-                        has_more_tool_calls = false;
                         break;
                     }
                     // Follow-ups are new logical user turns. Restore the
@@ -7783,12 +7782,9 @@ mod extensions_integration_tests {
             let foreign_gate = SessionActionAdmissionGate::default();
             assert_eq!(gate.generation(), foreign_gate.generation());
 
-            let err = match gate
-                .acquire_origin(&foreign_gate.capture_origin())
-                .await
-            {
-                Ok(unexpected) => {
-                    panic!("a same-counter token from another Session gate must be rejected; got {unexpected:?}")
+            let err = match gate.acquire_origin(&foreign_gate.capture_origin()).await {
+                Ok(_) => {
+                    panic!("a same-counter token from another Session gate must be rejected")
                 }
                 Err(error) => error,
             };
@@ -8534,7 +8530,7 @@ mod extensions_integration_tests {
     }
 
     #[test]
-    fn extension_command_rejects_real_js_session_mutation_delayed_across_transition() {
+    fn extension_command_rejects_real_js_timer_promise_mutation_delayed_across_transition() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -8550,9 +8546,15 @@ mod extensions_integration_tests {
                   pi.registerCommand("append-late", {
                     description: "append a custom Session entry",
                     handler: async () => {
-                      await pi.session("appendEntry", {
-                        customType: "stale-js-note",
-                        data: { owner: "source" }
+                      await new Promise((resolve, reject) => {
+                        setTimeout(() => {
+                          Promise.resolve()
+                            .then(() => pi.session("appendEntry", {
+                              customType: "stale-js-note",
+                              data: { owner: "source" }
+                            }))
+                            .then(resolve, reject);
+                        }, 0);
                       });
                       return "appended";
                     }
@@ -8593,7 +8595,7 @@ mod extensions_integration_tests {
             let delayed_manager = extension_manager.clone();
             let hostcall = runtime_handle.spawn(async move {
                 delayed_manager
-                    .execute_command("append-late", "", 5_000)
+                    .execute_command("append-late", "", 15_000)
                     .await
             });
             wait_for_session_action_generation_capture(&session_action_admission).await;
@@ -8609,10 +8611,10 @@ mod extensions_integration_tests {
 
             let err = hostcall
                 .await
-                .expect_err("stale real-JS Session mutation must be rejected");
+                .expect_err("stale real-JS timer/Promise Session mutation must be rejected");
             assert!(
                 err.to_string().contains("active Session changed"),
-                "unexpected real-JS mutation error: {err}"
+                "unexpected real-JS timer/Promise mutation error: {err}"
             );
 
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -18831,7 +18833,11 @@ mod tests {
                 summary: "Compacted before provider re-entry".to_string(),
                 first_kept_entry_id: "entry-5".to_string(),
                 tokens_before: 12_000,
-                details: compaction::CompactionDetails::default(),
+                details: compaction::CompactionDetails {
+                    read_files: Vec::new(),
+                    modified_files: Vec::new(),
+                    mode: None,
+                },
                 snap_payload: None,
             };
             let provider_admission = agent_session
@@ -18910,7 +18916,11 @@ mod tests {
                 summary: "private candidate must not leak".to_string(),
                 first_kept_entry_id: "entry-5".to_string(),
                 tokens_before: 12_000,
-                details: compaction::CompactionDetails::default(),
+                details: compaction::CompactionDetails {
+                    read_files: Vec::new(),
+                    modified_files: Vec::new(),
+                    mode: None,
+                },
                 snap_payload: None,
             };
             let provider_admission = agent_session

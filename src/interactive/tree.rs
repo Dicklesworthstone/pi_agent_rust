@@ -345,6 +345,7 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
+        let admission = self.session_action_admission.clone();
         let extensions = self.extensions.clone();
         let model_provider = self.model_entry.model.provider.clone();
         let model_id = self.model_entry.model.id.clone();
@@ -443,10 +444,13 @@ impl PiApp {
             if let Err(err) = PiApp::try_install_session(
                 &session,
                 &agent,
+                &admission,
                 new_session,
                 messages_for_agent,
                 None,
-            ) {
+            )
+            .await
+            {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &cx,

@@ -1004,7 +1004,9 @@ fn normal_card_resolution_restores_only_the_preexisting_draft() {
     app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
     app.input.set_value("keep this draft");
 
-    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e-normal", "Env?")));
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card(
+        "e-normal", "Env?",
+    )));
     let request: crate::ask::AskRequest = serde_json::from_value(json!({
         "questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}]
     }))
@@ -1050,7 +1052,9 @@ fn escape_advances_one_card_at_a_time_across_ask_ask_extension() {
             request,
         }));
     }
-    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e-third", "Third?")));
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card(
+        "e-third", "Third?",
+    )));
 
     let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
     assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
@@ -1065,7 +1069,9 @@ fn escape_advances_one_card_at_a_time_across_ask_ask_extension() {
     let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
     assert_eq!(app.active_input_card_kind, Some(InputCardKind::Extension));
     assert_eq!(
-        app.active_extension_ui.as_ref().map(|request| request.id.as_str()),
+        app.active_extension_ui
+            .as_ref()
+            .map(|request| request.id.as_str()),
         Some("e-third")
     );
 

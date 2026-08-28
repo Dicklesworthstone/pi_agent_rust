@@ -18,6 +18,10 @@ fn create_test_session() -> SessionHandle {
     SessionHandle(Arc::new(asupersync::sync::Mutex::new(Session::create())))
 }
 
+fn assert_session_action_ok(result: pi::error::Result<()>, operation: &str) {
+    assert!(result.is_ok(), "{operation} failed: {result:?}");
+}
+
 fn empty_payload(name: &str) -> RegisterPayload {
     RegisterPayload {
         name: name.to_string(),
@@ -190,10 +194,10 @@ fn session_set_name_persists() {
     asupersync::test_utils::run_test(|| {
         let session = mgr.session_handle().expect("session attached");
         async move {
-            session
-                .set_name("My Test Session".to_string())
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session.set_name("My Test Session".to_string(), None).await,
+                "set_name",
+            );
             let state = session.get_state().await;
             assert_eq!(state["sessionName"], "My Test Session");
         }
@@ -209,13 +213,16 @@ fn session_append_custom_entry() {
     asupersync::test_utils::run_test(|| {
         let session = mgr.session_handle().expect("session attached");
         async move {
-            session
-                .append_custom_entry(
-                    "ext.note".to_string(),
-                    Some(json!({"text": "Hello from extension"})),
-                )
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session
+                    .append_custom_entry(
+                        "ext.note".to_string(),
+                        Some(json!({"text": "Hello from extension"})),
+                        None,
+                    )
+                    .await,
+                "append_custom_entry",
+            );
 
             let entries = session.get_entries().await;
             let custom = entries
@@ -238,10 +245,12 @@ fn session_set_model_persists() {
     asupersync::test_utils::run_test(|| {
         let session = mgr.session_handle().expect("session attached");
         async move {
-            session
-                .set_model("openai".to_string(), "gpt-4o".to_string())
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session
+                    .set_model("openai".to_string(), "gpt-4o".to_string(), None)
+                    .await,
+                "set_model",
+            );
 
             let (provider, model_id) = session.get_model().await;
             assert_eq!(provider.as_deref(), Some("openai"));
@@ -260,13 +269,16 @@ fn session_get_model_returns_stored_value() {
         let session = mgr.session_handle().expect("session attached");
         async move {
             // Set model via the real session path, then verify read-back
-            session
-                .set_model(
-                    "anthropic".to_string(),
-                    "claude-opus-4-5-20251101".to_string(),
-                )
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session
+                    .set_model(
+                        "anthropic".to_string(),
+                        "claude-opus-4-5-20251101".to_string(),
+                        None,
+                    )
+                    .await,
+                "set_model",
+            );
 
             let (provider, model_id) = session.get_model().await;
             assert_eq!(provider.as_deref(), Some("anthropic"));
@@ -284,10 +296,10 @@ fn session_set_thinking_level_persists() {
     asupersync::test_utils::run_test(|| {
         let session = mgr.session_handle().expect("session attached");
         async move {
-            session
-                .set_thinking_level("high".to_string())
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session.set_thinking_level("high".to_string(), None).await,
+                "set_thinking_level",
+            );
             let level = session.get_thinking_level().await;
             assert_eq!(level.as_deref(), Some("high"));
         }
@@ -304,10 +316,10 @@ fn session_get_thinking_level_returns_stored_value() {
         let session = mgr.session_handle().expect("session attached");
         async move {
             // Set thinking level via the real session path, then verify read-back
-            session
-                .set_thinking_level("medium".to_string())
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session.set_thinking_level("medium".to_string(), None).await,
+                "set_thinking_level",
+            );
             let level = session.get_thinking_level().await;
             assert_eq!(level.as_deref(), Some("medium"));
         }
@@ -324,10 +336,12 @@ fn session_set_label_records_mutation() {
         let session = mgr.session_handle().expect("session attached");
         async move {
             // First create a custom entry so we have a valid target ID for the label
-            session
-                .append_custom_entry("note".to_string(), Some(json!({"text": "target"})))
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session
+                    .append_custom_entry("note".to_string(), Some(json!({"text": "target"})), None)
+                    .await,
+                "append_custom_entry",
+            );
 
             // Find the custom entry's ID
             let entries = session.get_entries().await;
@@ -339,10 +353,12 @@ fn session_set_label_records_mutation() {
                 .to_string();
 
             // Set label on that entry
-            session
-                .set_label(target_id.clone(), Some("important".to_string()))
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session
+                    .set_label(target_id.clone(), Some("important".to_string()), None)
+                    .await,
+                "set_label",
+            );
 
             // Verify via entries
             let entries = session.get_entries().await;
@@ -367,10 +383,12 @@ fn session_set_label_can_remove_label() {
         let session = mgr.session_handle().expect("session attached");
         async move {
             // Create a target entry
-            session
-                .append_custom_entry("note".to_string(), Some(json!({"text": "target"})))
-                .await
-                .unwrap();
+            assert_session_action_ok(
+                session
+                    .append_custom_entry("note".to_string(), Some(json!({"text": "target"})), None)
+                    .await,
+                "append_custom_entry",
+            );
 
             let entries = session.get_entries().await;
             let target_id = entries
@@ -381,7 +399,10 @@ fn session_set_label_can_remove_label() {
                 .to_string();
 
             // Set label = None (remove)
-            session.set_label(target_id.clone(), None).await.unwrap();
+            assert_session_action_ok(
+                session.set_label(target_id.clone(), None, None).await,
+                "set_label",
+            );
 
             let entries = session.get_entries().await;
             let label_entry = entries
@@ -439,7 +460,10 @@ fn multiple_sessions_can_be_swapped() {
     asupersync::test_utils::run_test(|| {
         let session = mgr.session_handle().expect("session attached");
         async move {
-            session.set_name("Session A".to_string()).await.unwrap();
+            assert_session_action_ok(
+                session.set_name("Session A".to_string(), None).await,
+                "set_name",
+            );
         }
     });
 
@@ -451,7 +475,10 @@ fn multiple_sessions_can_be_swapped() {
     asupersync::test_utils::run_test(|| {
         let session = mgr.session_handle().expect("session attached");
         async move {
-            session.set_name("Session B".to_string()).await.unwrap();
+            assert_session_action_ok(
+                session.set_name("Session B".to_string(), None).await,
+                "set_name",
+            );
         }
     });
 

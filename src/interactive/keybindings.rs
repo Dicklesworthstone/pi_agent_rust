@@ -1692,16 +1692,22 @@ mod tests {
         app.extensions = Some(manager.clone());
 
         let mut run_action = |app: &mut PiApp, persistent: bool| {
-            let request_id = if persistent { "scope-always" } else { "scope-once" };
-            let mut attempt = Box::pin(manager.request_ui(
-                ExtensionUiRequest::new_capability_prompt(
-                    request_id,
-                    "scope-extension",
-                    "exec",
-                    serde_json::json!({"message": "Scope?"}),
-                )
-                .with_timeout_ms(50),
-            ));
+            let request_id = if persistent {
+                "scope-always"
+            } else {
+                "scope-once"
+            };
+            let mut attempt = Box::pin(
+                manager.request_ui(
+                    ExtensionUiRequest::new_capability_prompt(
+                        request_id,
+                        "scope-extension",
+                        "exec",
+                        serde_json::json!({"message": "Scope?"}),
+                    )
+                    .with_timeout_ms(50),
+                ),
+            );
             let delivered = runtime().block_on(async {
                 assert!(futures::poll!(attempt.as_mut()).is_pending());
                 let cx = Cx::for_request();
@@ -1822,6 +1828,9 @@ mod tests {
             serde_json::json!({"message": "too late"}),
         )));
         let error = late_request.expect_err("quit must terminally close the manager UI sender");
-        assert!(error.to_string().contains("sender not configured"), "{error}");
+        assert!(
+            error.to_string().contains("sender not configured"),
+            "{error}"
+        );
     }
 }

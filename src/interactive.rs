@@ -38,7 +38,9 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode, QueuedAgentMessage};
+use crate::agent::{
+    AbortHandle, Agent, AgentEvent, QueueMode, QueuedAgentMessage, SessionActionAdmissionGate,
+};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
 use crate::config::{Config, ExtensionPolicyConfig, SettingsScope, parse_queue_mode_or_default};
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
@@ -639,13 +641,19 @@ impl PiApp {
         )
     }
 
-    fn try_install_session(
+    async fn try_install_session(
         session: &Arc<Mutex<Session>>,
         agent: &Arc<Mutex<Agent>>,
+        admission: &SessionActionAdmissionGate,
         new_session: Session,
         messages_for_agent: Vec<ModelMessage>,
         thinking_level: Option<ThinkingLevel>,
     ) -> std::result::Result<(), &'static str> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let _permit = admission
+            .acquire(cx.cx())
+            .await
+            .map_err(|_| "Session busy; session change was not applied")?;
         let Ok(mut agent_guard) = agent.try_lock() else {
             return Err("Agent busy; session change was not applied");
         };
@@ -658,6 +666,7 @@ impl PiApp {
         if let Some(level) = thinking_level {
             agent_guard.stream_options_mut().thinking_level = Some(level);
         }
+        admission.advance_generation();
         Ok(())
     }
 
@@ -1562,6 +1571,7 @@ impl PiApp {
         let path = path.to_string();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
+        let admission = self.session_action_admission.clone();
         let extensions = self.extensions.clone();
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
@@ -1625,10 +1635,13 @@ impl PiApp {
             if let Err(err) = PiApp::try_install_session(
                 &session,
                 &agent,
+                &admission,
                 loaded_session,
                 messages_for_agent,
                 None,
-            ) {
+            )
+            .await
+            {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &task_cx,
@@ -2051,13 +2064,9 @@ pub enum PiMsg {
 /// sleeps. Scheduler and queue delays are outside this budget, so this bounds
 /// retry work rather than wall-clock age; exhaustion remains observable.
 pub(super) const SESSION_EVENT_LOCK_RETRY_ATTEMPTS: u8 = 80;
-const SESSION_EVENT_LOCK_RETRY_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(25);
+const SESSION_EVENT_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
-pub(super) fn session_event_retry_cmd(
-    event: PiMsg,
-    attempts_remaining: u8,
-) -> Option<Cmd> {
+pub(super) fn session_event_retry_cmd(event: PiMsg, attempts_remaining: u8) -> Option<Cmd> {
     let next_attempts = attempts_remaining.checked_sub(1)?;
     Some(Cmd::blocking(move || {
         std::thread::sleep(SESSION_EVENT_LOCK_RETRY_DELAY);
@@ -2518,6 +2527,10 @@ pub struct PiApp {
 
     // Session and config
     session: Arc<Mutex<Session>>,
+    /// Shared generation source for extension Session actions. Advanced exactly
+    /// when a new/resume/fork replacement commits so stale JS continuations
+    /// cannot mutate the replacement Session.
+    session_action_admission: SessionActionAdmissionGate,
     /// Session whose state is currently rendered by this `PiApp`. This is UI
     /// transition bookkeeping only; security-sensitive event ownership still
     /// verifies the authoritative Session mutex and fails closed on contention.
@@ -2941,6 +2954,7 @@ impl PiApp {
             pending_tool_output: None,
             todo_summary: None,
             session,
+            session_action_admission: SessionActionAdmissionGate::default(),
             displayed_session_id,
             config,
             theme,
@@ -3007,6 +3021,7 @@ impl PiApp {
         };
 
         if let Some(manager) = app.extensions.clone() {
+            manager.set_session_action_origin_source(app.session_action_admission.origin_source());
             let session_handle = Arc::new(InteractiveExtensionSession {
                 session: Arc::clone(&app.session),
                 model_entry: model_entry_shared,
@@ -3014,6 +3029,7 @@ impl PiApp {
                 is_compacting: extension_compacting,
                 config: app.config.clone(),
                 save_enabled: app.save_enabled,
+                session_action_admission: app.session_action_admission.clone(),
             });
             manager.set_session(session_handle);
 
@@ -3024,6 +3040,7 @@ impl PiApp {
                 extension_streaming: Arc::clone(&app.extension_streaming),
                 user_queue: Arc::clone(&app.message_queue),
                 injected_queue,
+                session_action_admission: app.session_action_admission.clone(),
             }));
         }
 

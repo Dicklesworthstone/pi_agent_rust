@@ -19,6 +19,10 @@ fn session_handle() -> SessionHandle {
     SessionHandle(Arc::new(asupersync::sync::Mutex::new(Session::create())))
 }
 
+fn assert_session_action_ok(result: pi::error::Result<()>, operation: &str) {
+    assert!(result.is_ok(), "{operation} failed: {result:?}");
+}
+
 /// Create an `ExtensionManager` with a real `SessionHandle` attached.
 fn manager_with_session() -> (ExtensionManager, SessionHandle) {
     let mgr = ExtensionManager::new();
@@ -88,10 +92,10 @@ fn get_state_defaults_for_fresh_session() {
 fn set_name_then_get_name_round_trip() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle
-            .set_name("My Session".to_string())
-            .await
-            .expect("set_name should succeed");
+        assert_session_action_ok(
+            handle.set_name("My Session".to_string(), None).await,
+            "set_name",
+        );
 
         let state = handle.get_state().await;
         assert_eq!(state["sessionName"], "My Session");
@@ -102,11 +106,14 @@ fn set_name_then_get_name_round_trip() {
 fn set_name_empty_string_clears_name() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle
-            .set_name("Before".to_string())
-            .await
-            .expect("set initial name");
-        handle.set_name(String::new()).await.expect("clear name");
+        assert_session_action_ok(
+            handle.set_name("Before".to_string(), None).await,
+            "set_name initial value",
+        );
+        assert_session_action_ok(
+            handle.set_name(String::new(), None).await,
+            "set_name clear value",
+        );
 
         let state = handle.get_state().await;
         // Empty string sets the name to empty, which may appear as "" or null.
@@ -124,10 +131,16 @@ fn set_name_empty_string_clears_name() {
 fn set_model_then_get_model_round_trip() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle
-            .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
-            .await
-            .expect("set_model should succeed");
+        assert_session_action_ok(
+            handle
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    None,
+                )
+                .await,
+            "set_model",
+        );
 
         let (provider, model_id) = handle.get_model().await;
         assert_eq!(provider.as_deref(), Some("anthropic"));
@@ -149,14 +162,18 @@ fn get_model_defaults_to_none() {
 fn set_model_overwrites_previous() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle
-            .set_model("openai".to_string(), "gpt-4o".to_string())
-            .await
-            .expect("first set_model");
-        handle
-            .set_model("anthropic".to_string(), "claude-opus-4".to_string())
-            .await
-            .expect("second set_model");
+        assert_session_action_ok(
+            handle
+                .set_model("openai".to_string(), "gpt-4o".to_string(), None)
+                .await,
+            "set_model initial value",
+        );
+        assert_session_action_ok(
+            handle
+                .set_model("anthropic".to_string(), "claude-opus-4".to_string(), None)
+                .await,
+            "set_model replacement value",
+        );
 
         let (provider, model_id) = handle.get_model().await;
         assert_eq!(provider.as_deref(), Some("anthropic"));
@@ -170,10 +187,10 @@ fn set_model_overwrites_previous() {
 fn set_thinking_level_then_get_round_trip() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle
-            .set_thinking_level("high".to_string())
-            .await
-            .expect("set_thinking_level should succeed");
+        assert_session_action_ok(
+            handle.set_thinking_level("high".to_string(), None).await,
+            "set_thinking_level",
+        );
 
         let level = handle.get_thinking_level().await;
         assert_eq!(level.as_deref(), Some("high"));
@@ -193,8 +210,14 @@ fn get_thinking_level_defaults_to_none() {
 fn set_thinking_level_overwrites_previous() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle.set_thinking_level("low".to_string()).await.unwrap();
-        handle.set_thinking_level("high".to_string()).await.unwrap();
+        assert_session_action_ok(
+            handle.set_thinking_level("low".to_string(), None).await,
+            "set_thinking_level initial value",
+        );
+        assert_session_action_ok(
+            handle.set_thinking_level("high".to_string(), None).await,
+            "set_thinking_level replacement value",
+        );
 
         let level = handle.get_thinking_level().await;
         assert_eq!(level.as_deref(), Some("high"));
@@ -211,13 +234,18 @@ fn append_message_increases_message_count() {
         let state_before = handle.get_state().await;
         assert_eq!(state_before["messageCount"], 0);
 
-        handle
-            .append_message(SessionMessage::User {
-                content: UserContent::Text("Hello".to_string()),
-                timestamp: None,
-            })
-            .await
-            .expect("append_message should succeed");
+        assert_session_action_ok(
+            handle
+                .append_message(
+                    SessionMessage::User {
+                        content: UserContent::Text("Hello".to_string()),
+                        timestamp: None,
+                    },
+                    None,
+                )
+                .await,
+            "append_message",
+        );
 
         let state_after = handle.get_state().await;
         assert_eq!(state_after["messageCount"], 1);
@@ -228,13 +256,18 @@ fn append_message_increases_message_count() {
 fn append_message_appears_in_get_messages() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle
-            .append_message(SessionMessage::User {
-                content: UserContent::Text("Hi there".to_string()),
-                timestamp: None,
-            })
-            .await
-            .expect("append");
+        assert_session_action_ok(
+            handle
+                .append_message(
+                    SessionMessage::User {
+                        content: UserContent::Text("Hi there".to_string()),
+                        timestamp: None,
+                    },
+                    None,
+                )
+                .await,
+            "append_message",
+        );
 
         let messages = handle.get_messages().await;
         assert_eq!(messages.len(), 1);
@@ -254,10 +287,16 @@ fn append_message_appears_in_get_messages() {
 fn append_custom_entry_succeeds_with_valid_type() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle
-            .append_custom_entry("annotation".to_string(), Some(json!({ "note": "test" })))
-            .await
-            .expect("append_custom_entry should succeed");
+        assert_session_action_ok(
+            handle
+                .append_custom_entry(
+                    "annotation".to_string(),
+                    Some(json!({ "note": "test" })),
+                    None,
+                )
+                .await,
+            "append_custom_entry",
+        );
     });
 }
 
@@ -266,7 +305,7 @@ fn append_custom_entry_rejects_empty_type() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
         let result = handle
-            .append_custom_entry(String::new(), Some(json!({})))
+            .append_custom_entry(String::new(), Some(json!({})), None)
             .await;
         assert!(result.is_err(), "empty customType should fail");
         let err = result.unwrap_err();
@@ -281,7 +320,9 @@ fn append_custom_entry_rejects_empty_type() {
 fn append_custom_entry_rejects_whitespace_only_type() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        let result = handle.append_custom_entry("   ".to_string(), None).await;
+        let result = handle
+            .append_custom_entry("   ".to_string(), None, None)
+            .await;
         assert!(result.is_err(), "whitespace-only customType should fail");
     });
 }
@@ -293,7 +334,11 @@ fn set_label_on_nonexistent_entry_returns_validation_error() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
         let result = handle
-            .set_label("nonexistent-id".to_string(), Some("important".to_string()))
+            .set_label(
+                "nonexistent-id".to_string(),
+                Some("important".to_string()),
+                None,
+            )
             .await;
         assert!(result.is_err(), "labeling nonexistent entry should fail");
         let err = result.unwrap_err();
@@ -355,7 +400,7 @@ async fn dispatch_via_manager(mgr: &ExtensionManager, op: &str, payload: Value) 
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            session.set_name(name).await.map(|()| Value::Null)
+            session.set_name(name, None).await.map(|()| Value::Null)
         }
         "set_model" | "setmodel" => {
             let provider = payload
@@ -372,7 +417,7 @@ async fn dispatch_via_manager(mgr: &ExtensionManager, op: &str, payload: Value) 
                 return (false, "invalid_request".to_string());
             }
             session
-                .set_model(provider, model_id)
+                .set_model(provider, model_id, None)
                 .await
                 .map(|()| Value::Bool(true))
         }
@@ -390,7 +435,7 @@ async fn dispatch_via_manager(mgr: &ExtensionManager, op: &str, payload: Value) 
                 return (false, "invalid_request".to_string());
             }
             session
-                .set_thinking_level(level)
+                .set_thinking_level(level, None)
                 .await
                 .map(|()| Value::Null)
         }
@@ -412,7 +457,7 @@ async fn dispatch_via_manager(mgr: &ExtensionManager, op: &str, payload: Value) 
                 .and_then(Value::as_str)
                 .map(String::from);
             session
-                .set_label(target_id, label)
+                .set_label(target_id, label, None)
                 .await
                 .map(|()| Value::Null)
         }
@@ -424,7 +469,7 @@ async fn dispatch_via_manager(mgr: &ExtensionManager, op: &str, payload: Value) 
                 .to_string();
             let data = payload.get("data").cloned();
             session
-                .append_custom_entry(custom_type, data)
+                .append_custom_entry(custom_type, data, None)
                 .await
                 .map(|()| Value::Null)
         }
@@ -617,13 +662,18 @@ fn full_session_lifecycle_via_dispatch() {
         assert!(ok, "append_entry should succeed");
 
         // 8. Append message.
-        handle
-            .append_message(SessionMessage::User {
-                content: UserContent::Text("Hello from lifecycle test".to_string()),
-                timestamp: None,
-            })
-            .await
-            .expect("append_message");
+        assert_session_action_ok(
+            handle
+                .append_message(
+                    SessionMessage::User {
+                        content: UserContent::Text("Hello from lifecycle test".to_string()),
+                        timestamp: None,
+                    },
+                    None,
+                )
+                .await,
+            "append_message lifecycle",
+        );
 
         // 9. Verify message count.
         let state = handle.get_state().await;
@@ -640,10 +690,12 @@ fn full_session_lifecycle_via_dispatch() {
 fn get_model_response_shape_matches_spec() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle
-            .set_model("anthropic".to_string(), "claude-opus-4".to_string())
-            .await
-            .unwrap();
+        assert_session_action_ok(
+            handle
+                .set_model("anthropic".to_string(), "claude-opus-4".to_string(), None)
+                .await,
+            "set_model response shape",
+        );
 
         let (provider, model_id) = handle.get_model().await;
         // Spec: get_model returns (Option<String>, Option<String>).
@@ -658,11 +710,15 @@ fn get_model_response_shape_matches_spec() {
 fn multiple_set_name_calls_keep_last_value() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        for i in 0..5 {
-            handle
-                .set_name(format!("Session {i}"))
-                .await
-                .expect("set_name");
+        let names = [
+            "Session 0".to_string(),
+            "Session 1".to_string(),
+            "Session 2".to_string(),
+            "Session 3".to_string(),
+            "Session 4".to_string(),
+        ];
+        for name in names {
+            assert_session_action_ok(handle.set_name(name, None).await, "set_name sequence");
         }
         let state = handle.get_state().await;
         assert_eq!(state["sessionName"], "Session 4");
@@ -674,15 +730,15 @@ fn multiple_model_switches_keep_last_value() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
         let models = [
-            ("openai", "gpt-4o"),
-            ("anthropic", "claude-sonnet-4-5"),
-            ("google", "gemini-pro"),
+            ("openai".to_string(), "gpt-4o".to_string()),
+            ("anthropic".to_string(), "claude-sonnet-4-5".to_string()),
+            ("google".to_string(), "gemini-pro".to_string()),
         ];
-        for (p, m) in &models {
-            handle
-                .set_model(p.to_string(), m.to_string())
-                .await
-                .expect("set_model");
+        for (provider, model_id) in models {
+            assert_session_action_ok(
+                handle.set_model(provider, model_id, None).await,
+                "set_model sequence",
+            );
         }
         let (provider, model_id) = handle.get_model().await;
         assert_eq!(provider.as_deref(), Some("google"));

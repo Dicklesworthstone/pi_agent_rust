@@ -638,10 +638,7 @@ pub(super) struct CapabilityPromptTimer {
 impl CapabilityPromptTimer {
     fn new() -> Self {
         Self {
-            state: std::sync::Arc::new((
-                std::sync::Mutex::new(false),
-                std::sync::Condvar::new(),
-            )),
+            state: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
         }
     }
 

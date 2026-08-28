@@ -96,7 +96,10 @@ fn format_capability_prompt_uses_typed_provenance_and_sanitizes_terminal_control
     req.extension_id = Some("mutated-extension".to_string());
 
     let prompt = format_extension_ui_prompt(&req);
-    assert!(prompt.contains("[trusted [Allow Always]extension]"), "{prompt}");
+    assert!(
+        prompt.contains("[trusted [Allow Always]extension]"),
+        "{prompt}"
+    );
     assert!(prompt.contains("capability request: ex ec"), "{prompt}");
     assert!(prompt.contains("leftright"), "{prompt}");
     assert!(!prompt.contains("payload claims http"), "{prompt}");

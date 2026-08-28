@@ -17,6 +17,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use futures::executor::block_on;
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    SessionActionOrigin,
 };
 use pi::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig};
 use pi::scheduler::HostcallOutcome;
@@ -69,11 +70,19 @@ impl pi::extensions::ExtensionSession for BenchSession {
         Vec::new()
     }
 
-    async fn set_name(&self, _name: String) -> pi::error::Result<()> {
+    async fn set_name(
+        &self,
+        _name: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
-    async fn append_message(&self, _message: pi::session::SessionMessage) -> pi::error::Result<()> {
+    async fn append_message(
+        &self,
+        _message: pi::session::SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -81,11 +90,17 @@ impl pi::extensions::ExtensionSession for BenchSession {
         &self,
         _custom_type: String,
         _data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
     ) -> pi::error::Result<()> {
         Ok(())
     }
 
-    async fn set_model(&self, _provider: String, _model_id: String) -> pi::error::Result<()> {
+    async fn set_model(
+        &self,
+        _provider: String,
+        _model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -93,7 +108,11 @@ impl pi::extensions::ExtensionSession for BenchSession {
         (None, None)
     }
 
-    async fn set_thinking_level(&self, _level: String) -> pi::error::Result<()> {
+    async fn set_thinking_level(
+        &self,
+        _level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -101,7 +120,12 @@ impl pi::extensions::ExtensionSession for BenchSession {
         None
     }
 
-    async fn set_label(&self, _target_id: String, _label: Option<String>) -> pi::error::Result<()> {
+    async fn set_label(
+        &self,
+        _target_id: String,
+        _label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 }
@@ -936,6 +960,7 @@ fn bench_dispatch_shared_session(c: &mut Criterion) {
             manager: Some(manager.clone()),
             policy: &policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
         let call = call.clone();
@@ -1018,6 +1043,7 @@ fn bench_dispatch_shared_events(c: &mut Criterion) {
             manager: Some(manager.clone()),
             policy: &policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
         let call = call.clone();
@@ -1168,6 +1194,7 @@ fn bench_dispatch_overhead_breakdown(c: &mut Criterion) {
             manager: None,
             policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
         let call = call.clone();
@@ -1195,6 +1222,7 @@ fn bench_dispatch_overhead_breakdown(c: &mut Criterion) {
             manager: Some(manager.clone()),
             policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
         let call = call.clone();
