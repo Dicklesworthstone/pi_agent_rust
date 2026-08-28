@@ -126,10 +126,9 @@ async fn stage_and_commit_tree_navigation(
             .await
             .is_none()
             {
-                return Err(crate::error::Error::session(
-                    "Branch switch persistence was not confirmed, current disk state could not be reconciled, and the active in-memory session was left unchanged"
-                        .to_string(),
-                ));
+                return Err(crate::error::Error::session(format!(
+                    "Branch switch persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
+                )));
             }
             persistence = TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed;
         }
@@ -854,9 +853,16 @@ mod tests {
 
     #[test]
     fn staged_tree_navigation_success_reopens_at_target_leaf() {
-        let temp = TempDir::new().expect("tempdir");
-        let (raw_session, current_leaf_id, target_leaf_id) =
-            branched_session(Some(temp.path().join("sessions")));
+        let temp = tempfile::Builder::new()
+            .prefix("pi-tree-nav-")
+            .tempdir_in("/tmp")
+            .expect("tempdir in /tmp");
+        let (mut raw_session, current_leaf_id, target_leaf_id) =
+            branched_session(Some(temp.path().to_path_buf()));
+        raw_session.path = Some(temp.path().join("session.jsonl"));
+        runtime()
+            .block_on(raw_session.save())
+            .unwrap_or_else(|err| panic!("baseline save must pin a path: {err}"));
         let expected_session_id = raw_session.header.id.clone();
         let session = Arc::new(Mutex::new(raw_session));
         let cx = Cx::for_testing();
