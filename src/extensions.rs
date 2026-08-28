@@ -3851,6 +3851,14 @@ impl SafetyEnvelopeState {
             }
             self.vetoing = true;
             self.veto_reason = Some("pac_bayes_bound_exceeded");
+            tracing::warn!(
+                target: "pi.runtime.math_technique_fire",
+                math_technique = "pac_bayes",
+                fire_reason = "killswitch_admission",
+                bound,
+                threshold = config.safety_error_threshold,
+                "PAC-Bayes bound exceeded; vetoing safety envelope"
+            );
             return true;
         }
 
@@ -3863,6 +3871,14 @@ impl SafetyEnvelopeState {
             }
             self.vetoing = true;
             self.veto_reason = Some("conformal_anomaly_excess");
+            tracing::warn!(
+                target: "pi.runtime.math_technique_fire",
+                math_technique = "conformal",
+                fire_reason = "compaction_admission",
+                anomaly_rate,
+                expected_anomaly,
+                "Conformal anomaly rate exceeds 3x expected; vetoing safety envelope"
+            );
             return true;
         }
 

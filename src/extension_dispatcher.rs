@@ -1738,7 +1738,16 @@ impl RegimeShiftDetector {
                 } else {
                     self.confirmation_streak = self.confirmation_streak.saturating_add(1);
                     if self.confirmation_streak >= REGIME_CONFIRMATION_STREAK {
+                        let prev_mode = self.mode;
                         self.mode = desired_mode;
+                        tracing::info!(
+                            target: "pi.runtime.dispatch_mode_switch",
+                            from_mode = prev_mode.as_str(),
+                            to_mode = desired_mode.as_str(),
+                            trigger = "rollout_gate_decision",
+                            confirmation_streak = self.confirmation_streak,
+                            "Hostcall dispatch mode switched"
+                        );
                         transition = Some(match desired_mode {
                             RegimeAdaptationMode::InterleavedBatching => {
                                 RegimeTransition::EnterInterleavedBatching

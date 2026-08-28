@@ -995,7 +995,16 @@ fn select_voi_candidate_indices(
         .into_iter()
         .flat_map(BTreeMap::into_values)
         .max_by(compare_voi_selection_states)
-        .map(|state| state.selected_indices.into_iter().collect())
+        .map(|state| {
+            tracing::info!(
+                target: "pi.runtime.math_technique_fire",
+                math_technique = "voi",
+                fire_reason = "voi_utility_estimation",
+                selected_count = state.selected_indices.len(),
+                "VOI planner selected candidate set"
+            );
+            state.selected_indices.into_iter().collect()
+        })
         .unwrap_or_default()
 }
 
