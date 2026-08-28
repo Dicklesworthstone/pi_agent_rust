@@ -48,7 +48,6 @@ exclude_patterns = [
   "perf_hsmm.data",
   "perf_hsmm.data.old",
   "tests/artifacts/",
-  "tests/edit_repro.rs",
   ".cargo/credentials",
   ".cargo/credentials.toml",
   ".env",

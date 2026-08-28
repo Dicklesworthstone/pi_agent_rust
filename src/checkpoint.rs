@@ -528,7 +528,10 @@ pub fn plan_retry(session: &Session) -> Option<RetryPlan> {
 
 /// Move the leaf to the planned parent after revalidating the original leaf,
 /// abandoned entry, and expected parent. Does not persist.
-pub fn apply_retry_plan(session: &mut Session, plan: &RetryPlan) -> Result<(), RetryApplyError> {
+pub fn apply_retry_plan(
+    session: &mut Session,
+    plan: &RetryPlan,
+) -> std::result::Result<(), RetryApplyError> {
     if session.leaf_id() != plan.original_leaf_id.as_deref() {
         return Err(RetryApplyError::LeafChanged);
     }
@@ -756,8 +759,14 @@ mod tests {
     #[test]
     fn plan_retry_treats_compaction_summary_without_later_user_as_barrier() {
         let mut session = Session::in_memory();
-        let kept = session.append_message(session_user("kept"));
-        session.append_compaction("summary".to_string(), kept, 10, None, None);
+        session.append_message(session_user("compacted away"));
+        session.append_compaction(
+            "summary".to_string(),
+            "missing-kept-entry".to_string(),
+            10,
+            None,
+            None,
+        );
         assert!(plan_retry(&session).is_none());
     }
 
