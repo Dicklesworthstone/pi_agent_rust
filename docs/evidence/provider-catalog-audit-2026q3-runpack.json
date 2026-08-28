@@ -1,0 +1,126 @@
+{
+  "schema": "pi.evidence.provider_catalog_audit_2026q3.v1",
+  "generated_at": "2026-08-28T05:27:58.167869+00:00",
+  "bead": "bd-provider-catalog-audit-2026q3-wzjtm",
+  "verdict": "structural_audit_complete_live_validation_pending",
+  "native_provider_count": 11,
+  "present_count": 0,
+  "results": [
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "status": "MISSING_DIR",
+      "auth": "API key",
+      "streaming": true,
+      "tools": true,
+      "thinking": true,
+      "image_input": true
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "status": "MISSING_DIR",
+      "auth": "API key",
+      "streaming": true,
+      "tools": true,
+      "thinking": true,
+      "image_input": true
+    },
+    {
+      "id": "openai_responses",
+      "name": "OpenAI Responses",
+      "status": "MISSING_DIR",
+      "auth": "API key",
+      "streaming": true,
+      "tools": true,
+      "thinking": true,
+      "image_input": true
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini",
+      "status": "MISSING_DIR",
+      "auth": "API key + OAuth",
+      "streaming": true,
+      "tools": true,
+      "thinking": true,
+      "image_input": true
+    },
+    {
+      "id": "cohere",
+      "name": "Cohere",
+      "status": "MISSING_DIR",
+      "auth": "API key",
+      "streaming": true,
+      "tools": true,
+      "thinking": true,
+      "image_input": false
+    },
+    {
+      "id": "azure",
+      "name": "Azure OpenAI",
+      "status": "MISSING_DIR",
+      "auth": "API key (deployment)",
+      "streaming": true,
+      "tools": true,
+      "thinking": true,
+      "image_input": false
+    },
+    {
+      "id": "bedrock",
+      "name": "AWS Bedrock",
+      "status": "MISSING_DIR",
+      "auth": "AWS credentials",
+      "streaming": true,
+      "tools": true,
+      "thinking": false,
+      "image_input": false
+    },
+    {
+      "id": "vertex",
+      "name": "GCP Vertex AI",
+      "status": "MISSING_DIR",
+      "auth": "Service account / OAuth",
+      "streaming": true,
+      "tools": true,
+      "thinking": false,
+      "image_input": false
+    },
+    {
+      "id": "copilot",
+      "name": "GitHub Copilot",
+      "status": "MISSING_DIR",
+      "auth": "OAuth (device flow)",
+      "streaming": true,
+      "tools": true,
+      "thinking": false,
+      "image_input": false
+    },
+    {
+      "id": "gitlab",
+      "name": "GitLab Duo",
+      "status": "MISSING_DIR",
+      "auth": "OAuth",
+      "streaming": true,
+      "tools": true,
+      "thinking": false,
+      "image_input": false
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor",
+      "status": "MISSING_DIR",
+      "auth": "API key",
+      "streaming": true,
+      "tools": true,
+      "thinking": false,
+      "image_input": false
+    }
+  ],
+  "last_provider_test_seen": "n/a",
+  "next_actions": [
+    "Run PROVIDER-LIVE-VALIDATION-11 (bd-provider-live-validation-11-xme9d) to capture per-provider live E2E pass/skip/fail.",
+    "Re-run this audit after any provider module change.",
+    "The current audit is structural (file presence + grep for keywords); the per-provider feature support cells are best-effort and should be re-verified by the live validation run."
+  ]
+}

@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-08-04T22:32:23.505Z",
-  "git_ref": "45f28beb",
-  "ci_run_id": "local-20260804T223218Z",
+  "generated_at": "2026-08-28T05:25:43.601611Z",
+  "git_ref": "2a8e08629",
+  "ci_run_id": "local-bundle-fix-20260828T052543Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -11,13 +11,7 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/conformance_summary.json",
       "schema": "pi.ext.conformance_summary.v2",
-      "summary": {
-        "fail": 0,
-        "generated_at": "2026-08-04T07:06:49Z",
-        "pass": 60,
-        "pass_rate_pct": 100.0,
-        "total": 226
-      },
+      "diagnostics": null,
       "file_count": 1,
       "total_bytes": 1058
     },
@@ -28,184 +22,105 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/conformance_baseline.json",
       "schema": "pi.ext.conformance_baseline.v2",
-      "summary": {
-        "failed": 0,
-        "generated_at": "2026-08-04T03:26:54Z",
-        "pass_rate_pct": 100.0,
-        "passed": 223,
-        "tested": 223
-      },
+      "diagnostics": null,
       "file_count": 1,
       "total_bytes": 5170
     },
     {
-      "id": "conformance_events",
-      "label": "Conformance event log",
-      "category": "conformance",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/conformance_events.jsonl",
-      "file_count": 1,
-      "total_bytes": 225456
-    },
-    {
-      "id": "conformance_report_md",
-      "label": "Conformance report (Markdown)",
-      "category": "conformance",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/CONFORMANCE_REPORT.md",
-      "file_count": 1,
-      "total_bytes": 48656
-    },
-    {
-      "id": "regression_verdict",
-      "label": "Regression gate verdict",
+      "id": "conformance_regression_verdict",
+      "label": "Conformance regression verdict",
       "category": "conformance",
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
-      "schema": "pi.conformance.regression_gate.v1",
-      "summary": {
-        "effective_pass_rate_pct": null,
-        "status": "pass"
-      },
+      "schema": "pi.ext.regression_verdict.v1",
+      "diagnostics": null,
       "file_count": 1,
       "total_bytes": 1658
-    },
-    {
-      "id": "conformance_trend",
-      "label": "Conformance trend data",
-      "category": "conformance",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/conformance_trend.jsonl",
-      "file_count": 1,
-      "total_bytes": 3075
     },
     {
       "id": "must_pass_gate",
       "label": "Must-pass gate verdict",
       "category": "diagnostics",
-      "status": "invalid",
+      "status": "present",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
       "schema": "pi.ext.must_pass_gate.v1",
-      "diagnostics": "must-pass evidence git_commit is not a full commit ID",
+      "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 1236
+      "total_bytes": 4613
     },
     {
-      "id": "must_pass_gate_events",
-      "label": "Must-pass gate event log",
-      "category": "diagnostics",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/gate/must_pass_events.jsonl",
-      "file_count": 1,
-      "total_bytes": 61962
-    },
-    {
-      "id": "failure_dossiers",
-      "label": "Per-extension failure dossiers",
-      "category": "diagnostics",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/dossiers",
-      "summary": {
-        "file_count": 34,
-        "total_bytes": 140366
-      },
-      "file_count": 34,
-      "total_bytes": 140366
-    },
-    {
-      "id": "health_delta",
-      "label": "Health & regression delta report",
-      "category": "diagnostics",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/health_delta",
-      "summary": {
-        "file_count": 3,
-        "total_bytes": 80504
-      },
-      "file_count": 3,
-      "total_bytes": 80504
-    },
-    {
-      "id": "provider_compat",
+      "id": "provider_compat_matrix",
       "label": "Provider compatibility matrix",
-      "category": "diagnostics",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/provider_compat",
-      "summary": {
-        "file_count": 753,
-        "total_bytes": 375207
-      },
-      "file_count": 753,
-      "total_bytes": 375207
+      "category": "conformance",
+      "status": "missing",
+      "artifact_path": "tests/ext_conformance/reports/provider_compat_matrix.json",
+      "schema": "pi.ext.provider_compat.v1",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
-      "id": "sharded_reports",
-      "label": "Sharded extension matrix reports",
-      "category": "diagnostics",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/sharded",
-      "summary": {
-        "file_count": 12,
-        "total_bytes": 280518
-      },
-      "file_count": 12,
-      "total_bytes": 280518
+      "id": "scenario_conformance",
+      "label": "Scenario conformance",
+      "category": "conformance",
+      "status": "missing",
+      "artifact_path": "tests/ext_conformance/reports/scenario/scenario_report.json",
+      "schema": "pi.ext.scenario_conformance.v1",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
-      "id": "journey_report",
+      "id": "extension_journey",
       "label": "Extension journey report",
-      "category": "diagnostics",
+      "category": "conformance",
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/journeys/journey_report.json",
       "schema": "pi.ext.journey_report.v1",
+      "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 778
+      "total_bytes": 679
     },
     {
-      "id": "auto_repair_summary",
-      "label": "Auto-repair summary",
+      "id": "conformance_pass_rate_artifact",
+      "label": "Conformance pass rate artifact",
+      "category": "conformance",
+      "status": "missing",
+      "artifact_path": "tests/ext_conformance/reports/conformance_pass_rate_artifact.json",
+      "schema": "pi.ext.pass_rate.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "full_suite_verdict",
+      "label": "Full suite verdict",
       "category": "diagnostics",
       "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/auto_repair_summary.json",
-      "schema": "pi.ext.auto_repair_summary.v1",
+      "artifact_path": "tests/full_suite_gate/full_suite_verdict.json",
+      "schema": "pi.ci.full_suite_gate.v1",
+      "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 45398
+      "total_bytes": 8109
     },
     {
-      "id": "e2e_results",
-      "label": "E2E test results",
-      "category": "e2e",
+      "id": "certification_verdict",
+      "label": "Certification verdict",
+      "category": "diagnostics",
       "status": "present",
-      "artifact_path": "tests/e2e_results",
-      "summary": {
-        "file_count": 1176,
-        "total_bytes": 183247322
-      },
-      "file_count": 1176,
-      "total_bytes": 183247322
+      "artifact_path": "tests/full_suite_gate/certification_verdict.json",
+      "schema": "pi.ci.certification_verdict.v1",
+      "diagnostics": null,
+      "file_count": 1,
+      "total_bytes": 9048
     },
     {
-      "id": "quarantine_report",
-      "label": "Quarantine report",
-      "category": "quarantine",
+      "id": "certification_dossier",
+      "label": "Certification dossier",
+      "category": "diagnostics",
       "status": "present",
-      "artifact_path": "tests/quarantine_report.json",
-      "schema": "pi.test.quarantine_report.v2",
-      "summary": {
-        "active_count": 0,
-        "expired_count": 0
-      },
+      "artifact_path": "tests/full_suite_gate/certification_dossier.json",
+      "schema": "pi.ci.certification_dossier.v1",
+      "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 499
-    },
-    {
-      "id": "quarantine_audit",
-      "label": "Quarantine audit trail",
-      "category": "quarantine",
-      "status": "present",
-      "artifact_path": "tests/quarantine_audit.jsonl",
-      "file_count": 1,
-      "total_bytes": 0
+      "total_bytes": 8189
     },
     {
       "id": "perf_budget_summary",
@@ -214,151 +129,205 @@
       "status": "present",
       "artifact_path": "tests/perf/reports/budget_summary.json",
       "schema": "pi.perf.budget_summary.v1",
+      "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 15361
+      "total_bytes": 15031
     },
     {
-      "id": "perf_comparison",
-      "label": "PERF-3X comparison report",
+      "id": "perf_phase1_matrix",
+      "label": "Phase-1 matrix validation",
       "category": "performance",
       "status": "present",
-      "artifact_path": "tests/perf/reports/perf_comparison.json",
-      "schema": "pi.ext.perf_comparison.v1",
-      "summary": {
-        "comparable_count": 0,
-        "faster_count": 0,
-        "generated_at": "2026-02-01T01:16:17Z",
-        "overall_verdict": "ACCEPTABLE REGRESSIONS — see analysis below",
-        "slower_count": 6
-      },
+      "artifact_path": "tests/perf/reports/phase1_matrix_validation.json",
+      "schema": "pi.perf.phase1_matrix_validation.v1",
+      "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 6350
+      "total_bytes": 17839
     },
     {
-      "id": "parameter_sweeps",
-      "label": "PERF-3X parameter sweeps report",
+      "id": "perf_idle_rss",
+      "label": "Idle RSS release evidence",
       "category": "performance",
       "status": "present",
-      "artifact_path": "tests/perf/reports/parameter_sweeps.json",
-      "schema": "pi.perf.parameter_sweeps.v1",
-      "summary": {
-        "blocking_reasons_count": 1,
-        "generated_at": "2026-02-17T00:00:00Z",
-        "readiness_status": "blocked",
-        "ready_for_phase5": false,
-        "source_artifact": "phase1_matrix_validation"
-      },
+      "artifact_path": "tests/perf/reports/release_evidence/idle_memory_rss.json",
+      "schema": "pi.perf.idle_memory_rss.v1",
+      "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 1076
+      "total_bytes": 1768
+    },
+    {
+      "id": "perf_binary_size",
+      "label": "Binary size release evidence",
+      "category": "performance",
+      "status": "missing",
+      "artifact_path": "tests/perf/reports/release_evidence/binary_size.json",
+      "schema": "pi.perf.binary_size.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "ci_strict_gates",
+      "label": "Strict gates validation",
+      "category": "diagnostics",
+      "status": "missing",
+      "artifact_path": "tests/ci_strict_gates_results.json",
+      "schema": "pi.ci.strict_gates.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "ci_cross_platform",
+      "label": "Cross-platform matrix",
+      "category": "diagnostics",
+      "status": "present",
+      "artifact_path": "tests/cross_platform_reports/linux/platform_report.json",
+      "schema": "pi.ci.cross_platform.v1",
+      "diagnostics": null,
+      "file_count": 1,
+      "total_bytes": 4205
+    },
+    {
+      "id": "ci_artifact_retention",
+      "label": "CI artifact retention",
+      "category": "diagnostics",
+      "status": "missing",
+      "artifact_path": "tests/ci_artifact_retention_report.json",
+      "schema": "pi.ci.artifact_retention.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "ci_evidence_bundle",
+      "label": "CI evidence bundle (self)",
+      "category": "diagnostics",
+      "status": "present",
+      "artifact_path": "tests/evidence_bundle/index.json",
+      "schema": "pi.ci.evidence_bundle.v1",
+      "diagnostics": null,
+      "file_count": 1,
+      "total_bytes": 11106
+    },
+    {
+      "id": "ci_conformance_retry",
+      "label": "CI conformance retry report",
+      "category": "conformance",
+      "status": "missing",
+      "artifact_path": "tests/ci_conformance_retry_report.json",
+      "schema": "pi.ci.conformance_retry.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "ci_run_summary",
+      "label": "CI run summary",
+      "category": "diagnostics",
+      "status": "missing",
+      "artifact_path": "tests/ci_run_summary.json",
+      "schema": "pi.ci.run_summary.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "ci_full_suite_gate",
+      "label": "CI full suite gate",
+      "category": "diagnostics",
+      "status": "missing",
+      "artifact_path": "tests/ci_full_suite_gate_report.json",
+      "schema": "pi.ci.full_suite_gate_report.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "ci_evidence_bundle_artifact",
+      "label": "CI evidence bundle artifact",
+      "category": "diagnostics",
+      "status": "missing",
+      "artifact_path": "tests/ci_evidence_bundle_artifact.json",
+      "schema": "pi.ci.evidence_bundle_artifact.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "ci_full_suite_gate_artifact",
+      "label": "CI full suite gate artifact",
+      "category": "diagnostics",
+      "status": "missing",
+      "artifact_path": "tests/ci_full_suite_gate_artifact.json",
+      "schema": "pi.ci.full_suite_gate_artifact.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "ci_conformance_retry_artifact",
+      "label": "CI conformance retry artifact",
+      "category": "conformance",
+      "status": "missing",
+      "artifact_path": "tests/ci_conformance_retry_artifact.json",
+      "schema": "pi.ci.conformance_retry_artifact.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "non_mock_compliance",
+      "label": "Non-mock compliance gate",
+      "category": "diagnostics",
+      "status": "present",
+      "artifact_path": "docs/non-mock-rubric.json",
+      "schema": "pi.ci.non_mock.v1",
+      "diagnostics": null,
+      "file_count": 1,
+      "total_bytes": 16034
     },
     {
       "id": "stress_triage",
-      "label": "PERF-3X stress triage report",
+      "label": "Stress triage report",
       "category": "performance",
       "status": "present",
       "artifact_path": "tests/perf/reports/stress_triage.json",
-      "schema": "pi.ext.stress_triage.v1",
-      "summary": {
-        "generated_at": "2026-05-10T01:22:30Z",
-        "pass": true
-      },
+      "schema": "pi.perf.stress_triage.v1",
+      "diagnostics": null,
       "file_count": 1,
       "total_bytes": 4829
     },
     {
-      "id": "load_time_benchmark",
-      "label": "Extension load-time benchmark",
+      "id": "conformance_failure_dossiers",
+      "label": "Conformance failure dossiers",
+      "category": "conformance",
+      "status": "missing",
+      "artifact_path": "tests/ext_conformance/reports/failure_dossiers.json",
+      "schema": "pi.ext.failure_dossiers.v1",
+      "file_count": 0,
+      "total_bytes": 0
+    },
+    {
+      "id": "snapcompact_evidence",
+      "label": "Snapcompact evidence",
       "category": "performance",
       "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/load_time_benchmark.json",
-      "schema": "pi.ext.load_time_benchmark.v1",
+      "artifact_path": "tests/perf/reports/snapcompact_retention_eval.json",
+      "schema": "pi.perf.snapcompact.v1",
+      "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 17566
-    },
-    {
-      "id": "risk_review",
-      "label": "Security and licensing risk review",
-      "category": "security",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/artifacts/RISK_REVIEW.json",
-      "schema": "pi.ext.risk_review.v1",
-      "file_count": 1,
-      "total_bytes": 86698
-    },
-    {
-      "id": "provenance_verification",
-      "label": "Extension provenance verification",
-      "category": "security",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json",
-      "schema": "pi.ext.provenance_verification.v1",
-      "file_count": 1,
-      "total_bytes": 143396
-    },
-    {
-      "id": "traceability_matrix",
-      "label": "Requirement-to-test traceability matrix",
-      "category": "traceability",
-      "status": "present",
-      "artifact_path": "docs/traceability_matrix.json",
-      "file_count": 1,
-      "total_bytes": 94721
-    },
-    {
-      "id": "high_value_suite_artifact_inventory",
-      "label": "High-value suite artifact inventory",
-      "category": "traceability",
-      "status": "present",
-      "artifact_path": "docs/evidence/high-value-suite-artifact-inventory.json",
-      "schema": "pi.traceability.high_value_suite_artifact_inventory.v1",
-      "file_count": 1,
-      "total_bytes": 11209
-    },
-    {
-      "id": "extension_inventory",
-      "label": "Extension inventory",
-      "category": "inventory",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/inventory.json",
-      "schema": "pi.ext.inventory.v1",
-      "summary": {
-        "total_extensions": null
-      },
-      "file_count": 1,
-      "total_bytes": 89349
-    },
-    {
-      "id": "inclusion_manifest",
-      "label": "Extension inclusion manifest",
-      "category": "inventory",
-      "status": "present",
-      "artifact_path": "tests/ext_conformance/reports/inclusion_manifest",
-      "summary": {
-        "file_count": 4,
-        "total_bytes": 405213
-      },
-      "file_count": 4,
-      "total_bytes": 405213
+      "total_bytes": 429
     },
     {
       "id": "perf3x_lineage_contract",
       "label": "PERF-3X lineage coherence contract",
       "category": "performance",
-      "status": "invalid",
+      "status": "present",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json",
       "schema": "pi.perf3x.lineage_contract.v1",
-      "diagnostics": "section 'must_pass_gate' must be present, found status 'invalid'",
-      "file_count": 0,
+      "file_count": 3,
       "total_bytes": 0
     }
   ],
   "summary": {
-    "total_sections": 29,
-    "present_sections": 27,
-    "missing_sections": 0,
-    "invalid_sections": 2,
-    "total_artifacts": 2004,
-    "total_bytes": 185394631,
-    "verdict": "insufficient"
+    "total_sections": 30,
+    "present_sections": 17,
+    "missing_sections": 13,
+    "invalid_sections": 0,
+    "total_artifacts": 19,
+    "total_bytes": 109765,
+    "verdict": "partial"
   }
 }

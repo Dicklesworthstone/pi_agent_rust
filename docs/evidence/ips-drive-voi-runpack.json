@@ -1,0 +1,11 @@
+{
+  "schema": "pi.evidence.ips-drive-voi_runpack.v1",
+  "generated_at": "2026-08-28T05:33:41.063820+00:00",
+  "bead": "bd-ips-drive-voi-runpack",
+  "verdict": "telemetry_event_added_compile_pending",
+  "summary": "VOI telemetry event added at the selection site in src/extension_scoring.rs. The .map(closure) that produces the final BTreeSet now emits tracing::info!(target: pi.runtime.math_technique_fire, math_technique=voi, fire_reason=voi_utility_estimation, selected_count) before returning. The IPS/WIS/DR estimators themselves are NOT implemented as named functions in extension_scoring.rs \u2014 only the VOI planner is concrete. A follow-up bead (MATH-IPS-UNIT-TEST) is needed to either implement IPS/WIS/DR or de-scope the README's 'IPS/WIS/DR + ESS + regret gate' claim.",
+  "next_actions": [
+    "Run cargo check --lib to confirm the change compiles",
+    "Add a regression test that drives the trigger and asserts the event fires"
+  ]
+}

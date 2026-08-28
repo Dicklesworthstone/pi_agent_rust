@@ -1,0 +1,11 @@
+{
+  "schema": "pi.evidence.pac-bayes-drive-killswitch_runpack.v1",
+  "generated_at": "2026-08-28T05:33:41.063031+00:00",
+  "bead": "bd-pac-bayes-drive-killswitch-runpack",
+  "verdict": "telemetry_event_added_compile_pending",
+  "summary": "Telemetry event added at the PAC-Bayes veto site in src/extensions.rs. The PAC-Bayes bound check already existed; this bead adds the missing tracing::warn!(target: pi.runtime.math_technique_fire, math_technique=pac_bayes, fire_reason=killswitch_admission, bound, threshold) event so production traffic can be observed. The math wiring (PAC-Bayes -> safety envelope veto) was already in code; this closes the observability gap.",
+  "next_actions": [
+    "Run cargo check --lib to confirm the change compiles",
+    "Add a regression test that drives the trigger and asserts the event fires"
+  ]
+}

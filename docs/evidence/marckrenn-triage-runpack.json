@@ -1,0 +1,78 @@
+{
+  "schema": "pi.evidence.marckrenn_triage_runpack.v1",
+  "generated_at": "2026-08-28T05:26:35.229788+00:00",
+  "bead": "bd-marckrenn-pi-sub-triage-xd3gh",
+  "verdict": "deferred_to_upstream_fork",
+  "decision_per_extension": {
+    "npm/marckrenn-pi-sub-bar": {
+      "decision": "DEFERRED",
+      "root_cause": "extension emits 9 of 15 manifest-declared event handlers; the other 6 (session_branch, session_switch, sub-core:action, sub-core:request, sub-core:settings:patch, sub-core:update-all, sub-core:update-current) are declared but not implemented",
+      "remediation_options": [
+        "Upstream fix: add the missing event handlers to the extension",
+        "Conformance relaxation: update docs/extension-inclusion-list.json to mark this extension as informational-stretch rather than must-pass"
+      ],
+      "chosen_remediation": "DEFERRED pending upstream fix; the marckrenn-pi-sub family is a third-party extension not in this repo's source tree",
+      "next_action": "open a follow-up bead to either land the upstream fix (if the team owns the extension) or formalize the de-scope via the inclusion-list"
+    },
+    "third-party/marckrenn-pi-sub": {
+      "decision": "DEFERRED",
+      "root_cause": "same as npm/marckrenn-pi-sub-bar; same family of extensions",
+      "remediation_options": [
+        "Upstream fix",
+        "Inclusion-list de-scope"
+      ],
+      "chosen_remediation": "DEFERRED",
+      "next_action": "see npm/marckrenn-pi-sub-bar"
+    }
+  },
+  "diagnostic_data": {
+    "source_artifact": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+    "extracted_dossier_detail_path": "docs/evidence/marckrenn-pi-sub-failure-detail.txt",
+    "manifest_declared_events_per_extension": [
+      "model_select",
+      "session_branch",
+      "session_shutdown",
+      "session_start",
+      "session_switch",
+      "sub-core:action",
+      "sub-core:ready",
+      "sub-core:request",
+      "sub-core:settings:patch",
+      "sub-core:settings:updated",
+      "sub-core:update-all",
+      "sub-core:update-current",
+      "tool_result",
+      "turn_end",
+      "turn_start"
+    ],
+    "actual_emitted_events": [
+      "model_select",
+      "session_shutdown",
+      "session_start",
+      "sub-core:ready",
+      "sub-core:settings:updated",
+      "tool_result",
+      "turn_end",
+      "turn_start"
+    ],
+    "missing_in_actual": [
+      "session_branch",
+      "session_switch",
+      "sub-core:action",
+      "sub-core:request",
+      "sub-core:settings:patch",
+      "sub-core:update-all",
+      "sub-core:update-current"
+    ]
+  },
+  "impact_on_release_gates": {
+    "ext_must_pass": "still fail (must_pass_failed=2); the conformance suite must-pass threshold requires 0 failures",
+    "full_suite_verdict": "still fail (cascade)",
+    "remediation_to_unblock": "either fix the extensions, or de-scope them from must-pass via docs/extension-inclusion-list.json"
+  },
+  "next_actions": [
+    "Open a follow-up bead for the upstream extension fix (if the team owns marckrenn-pi-sub)",
+    "OR open a follow-up bead to formalize the de-scope: edit docs/extension-inclusion-list.json to move marckrenn-pi-sub-{bar,*} from must-pass to informational-stretch, regenerate the inclusion list, and re-run the must-pass gate",
+    "The must-pass-gate verdict will remain 'fail' until one of the two is done; this is a known and documented gap, not a stealth regression"
+  ]
+}

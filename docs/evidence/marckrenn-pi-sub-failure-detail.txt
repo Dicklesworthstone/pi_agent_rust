@@ -1,0 +1,6 @@
+=== npm/marckrenn-pi-sub-bar ===
+Extension 'npm/marckrenn-pi-sub-bar': event-handler identities differ from the manifest; expected={"model_select", "session_branch", "session_shutdown", "session_start", "session_switch", "sub-core:action", "sub-core:ready", "sub-core:request", "sub-core:settings:patch", "sub-core:settings:updated", "sub-core:update-all", "sub-core:update-current", "tool_result", "turn_end", "turn_start"}, actual={"model_select", "session_shutdown", "session_start", "sub-core:ready", "sub-core:settings:updated", "sub-core:update-all", "sub-core:update-current"}
+
+=== third-party/marckrenn-pi-sub ===
+Extension 'third-party/marckrenn-pi-sub': event-handler identities differ from the manifest; expected={"model_select", "session_branch", "session_shutdown", "session_start", "session_switch", "sub-core:action", "sub-core:ready", "sub-core:request", "sub-core:settings:patch", "sub-core:settings:updated", "sub-core:update-all", "sub-core:update-current", "tool_result", "turn_end", "turn_start"}, actual={"model_select", "session_shutdown", "session_start", "sub-core:ready", "sub-core:settings:updated", "sub-core:update-all", "sub-core:update-current"}
+

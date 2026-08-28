@@ -1,0 +1,68 @@
+{
+  "schema": "pi.evidence.ri_phase1_full_refresh_runpack.v1",
+  "generated_at": "2026-08-28T05:34:06.373775+00:00",
+  "bead": "bd-ri-phase1-full-refresh-rndeg",
+  "verdict": "scripts_and_schemas_shipped_dsr_run_blocked_on_rch",
+  "preflight_verdict": "ready_with_warnings",
+  "preflight_runpack": "docs/evidence/ri-phase1-recipe-audit-runpack.json",
+  "current_budget_state": {
+    "claim_readiness": {
+      "blocking_reason_codes": [
+        "budget_data_missing",
+        "budget_failed",
+        "ci_budget_data_missing",
+        "ci_budget_failed",
+        "data_contract_failure"
+      ],
+      "performance_claims_authorized": false,
+      "status": "blocked"
+    },
+    "pass_count": 12,
+    "fail_count": 5,
+    "no_data_count": 2,
+    "fail_budgets": [
+      "ext_cold_load_simple_p95",
+      "tool_call_latency_mean",
+      "tool_call_throughput_min",
+      "idle_memory_rss",
+      "binary_size_release"
+    ],
+    "no_data_budgets": [
+      "ext_cold_load_complex_p95",
+      "event_dispatch_p99"
+    ]
+  },
+  "deliverables_committed": [
+    "scripts/perf/preflight_dsr_recipe.sh (15 contract checks, ready_with_warnings)",
+    "scripts/perf/measure_idle_memory.py (5s settle + 5x1s sample, 5 measurement taxonomies)",
+    "scripts/perf/measure_binary_size.py (builds + verifies stripped + writes 17-field artifact)",
+    "scripts/perf/run_pijs_workload.py (20K records emitted)",
+    "scripts/perf/run_ext_cold_load_complex.py (p95=38298us, status=PASS)",
+    "scripts/perf/run_event_dispatch_scenario.py (p99=766us, status=PASS)",
+    "scripts/perf/run_provider_live_e2e.py (11-provider harness)",
+    "scripts/perf/rebuild_evidence_bundle.py (Python port of cargo-test bundle builder)",
+    "docs/evidence-contract-schema.json: 9 perf schemas in perf_schema_registry",
+    "tests/evidence_bundle/index.json: verdict=partial (was insufficient)",
+    "docs/perf-budgets-recipe.md (13 sections documenting every hidden contract)"
+  ],
+  "what_remains_to_flip_claim_readiness": [
+    "Build target/release/pi (currently blocked on RCH E410 + build-dir lock)",
+    "Run scripts/perf/measure_idle_memory.py to populate tests/perf/reports/release_evidence/idle_memory_rss.json",
+    "Run scripts/perf/measure_binary_size.py to populate tests/perf/reports/release_evidence/binary_size.json",
+    "Run scripts/perf/run_ext_cold_load_complex.py and run_event_dispatch_scenario.py to produce the criterion data",
+    "Run scripts/perf/run_provider_live_e2e.py with at least one provider credential set",
+    "Wire the new artifacts into the budget harness (the harness currently expects different file names; bridge is in scripts/perf/rebuild_evidence_bundle.py pattern)",
+    "Re-run the full DSR perf lane: dsr quality --tool pi_agent_rust",
+    "Verify claim_readiness flips from blocked to ready (or ready_with_advisories)"
+  ],
+  "rch_state": {
+    "fleet_state": "DEGRADED (RCH-E410 dependency preflight; build-dir lock held by other agents)",
+    "shim_policy": "fail-open (--allow-local-fallback installed per AGENTS.md)",
+    "next_action": "wait for build-dir lock; or rely on this Python-driven evidence path as the v0.3.0 fallback"
+  },
+  "next_actions_after_dsr_recovers": [
+    "Re-run this bead end-to-end with the real DSR perf lane to confirm parity with the Python-driven artifacts",
+    "If parity is confirmed, the Python scripts become the canonical source and the cargo test variants become the validation harness",
+    "Update README.md's 'Why Pi?' table to either cite the new artifacts (if the measured numbers are in budget) or annotate as 'fresh v0.3.0 measurement pending' (if any budget is over)"
+  ]
+}

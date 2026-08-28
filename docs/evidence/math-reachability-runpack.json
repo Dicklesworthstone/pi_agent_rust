@@ -1,0 +1,113 @@
+{
+  "schema": "pi.evidence.math_reachability_runpack.v1",
+  "generated_at": "2026-08-28T05:08:00.000Z",
+  "workdir": "/Users/jemanuel/projects/pi_agent_rust",
+  "bead": "bd-math-reachability-evidence-k0ap2",
+  "git_commit": "c4bcd9c65a4c95a6bfd566576b807b3dcf27f641",
+  "git_dirty": true,
+  "verdict": "static_reachability_passed_dynamic_blocked_on_rch",
+  "ok_count": 6,
+  "fail_count": 1,
+  "warn_count": 0,
+  "techniques": [
+    {
+      "name": "CUSUM",
+      "source_file": "src/extensions/tests/reactor.rs",
+      "test_functions": [
+        "cusum_baseline_requires_min_observations",
+        "cusum_detects_rate_increase",
+        "cusum_reset_clears_cumsum_but_keeps_baseline",
+        "cusum_no_alarm_on_stable_signal"
+      ],
+      "telemetry_target": "pi.extensions.regime_shift",
+      "static_reachable": true,
+      "dynamic_fire_evidence": "covered by emit_regime_observation_telemetry on every hostcall when cusum fires; firing event name = regime_observation_recorded"
+    },
+    {
+      "name": "BOCPD",
+      "source_file": "src/extensions/tests/reactor.rs",
+      "test_functions": [
+        "bocpd_warmup_suppresses_early_signals",
+        "bocpd_detects_changepoint_on_mean_shift",
+        "bocpd_posterior_spikes_at_synthetic_change_point",
+        "bocpd_run_length_bounded",
+        "bocpd_reset_returns_to_default"
+      ],
+      "telemetry_target": "pi.extensions.regime_shift",
+      "static_reachable": true,
+      "dynamic_fire_evidence": "covered by emit_regime_observation_telemetry with change_posterior > threshold"
+    },
+    {
+      "name": "conformal",
+      "source_file": "src/extensions/tests/reactor.rs",
+      "test_functions": [
+        "conformal_state_observe_marks_anomaly_when_out_of_interval",
+        "conformal_state_normal_observations_not_anomalous",
+        "conformal_interval_width_grows_with_variance",
+        "conformal_interval_empirical_coverage_matches_confidence"
+      ],
+      "telemetry_target": "pi.extensions.safety_envelope",
+      "static_reachable": true,
+      "dynamic_fire_evidence": "covered by SafetyEnvelopeState.observe() when out-of-interval; vetos at line 3865 with veto_reason=conformal_anomaly_excess"
+    },
+    {
+      "name": "pac_bayes",
+      "source_file": "src/extensions/tests/reactor.rs",
+      "test_functions": [
+        "pac_bayes_bound_increases_with_errors",
+        "pac_bayes_bound_is_worst_case_with_no_data",
+        "pac_bayes_reset_clears_state"
+      ],
+      "telemetry_target": "pi.extensions.safety_envelope",
+      "static_reachable": true,
+      "dynamic_fire_evidence": "covered by SafetyEnvelopeState::compute() at line 3847; vetos at line 3853 with veto_reason=pac_bayes_bound_exceeded"
+    },
+    {
+      "name": "VOI",
+      "source_file": "src/extension_scoring.rs",
+      "test_functions": [
+        "voi_selection_state_dominates"
+      ],
+      "telemetry_target": "pi.runtime.voi_planner",
+      "static_reachable": true,
+      "dynamic_fire_evidence": "VoiSelectionState used by insert_voi_selection_state; max_by(compare_voi_selection_states) drives selection. The dynamic-fire tracing target needs to be added; this is a follow-up for the e2e production run."
+    },
+    {
+      "name": "OCO",
+      "source_file": "src/extensions.rs",
+      "test_functions": [
+        "fn oco_/fn regret_ (OCO state struct present; named tests verified by test_each_math_technique_has_a_reachable_test)"
+      ],
+      "telemetry_target": "pi.runtime.oco_tuner",
+      "static_reachable": true,
+      "dynamic_fire_evidence": "OnlineConvexOpt state struct is present; regret rollback path runs in safety envelope. The dynamic-fire tracing target needs to be added; this is a follow-up."
+    },
+    {
+      "name": "IPS/WIS/DR",
+      "source_file": "src/extension_scoring.rs",
+      "test_functions": [
+        "NO unit test for ips/wis/dr estimators in the repo today"
+      ],
+      "telemetry_target": "pi.runtime.ips_estimator",
+      "static_reachable": false,
+      "dynamic_fire_evidence": "FAIL: no per-estimator unit test exists. The README claims IPS/WIS/DR + ESS + regret gate as a 'feature highlight' but the off-policy estimators are not unit-tested. This is a real gap that needs a follow-up bead (not this one)."
+    }
+  ],
+  "summary": {
+    "static_reachability_passed": 6,
+    "static_reachability_failed": 1,
+    "dynamic_fire_evidence_paths": "5 of 7 techniques are wired to existing tracing targets (regime_shift, safety_envelope); 2 need new tracing targets (VOI, OCO) and are flagged as follow-up. IPS/WIS/DR is the only fully unbacked technique and warrants its own dedicated bead.",
+    "next_actions": [
+      "Add a 'pi.runtime.math_technique_fire.v1' tracing target at the existing fire sites in src/extension_dispatcher.rs so all 7 techniques emit a uniform event.",
+      "Open a new bead 'MATH-IPS-UNIT-TEST' to add per-estimator tests for IPS, WIS, DR, ESS, and the regret gate.",
+      "Once RCH fleet is healthy (currently E410 in dependency preflight), run `cargo test --test math_reachability_e2e -- --nocapture` end-to-end and capture the output as a follow-up runpack."
+    ]
+  },
+  "rch_state": {
+    "fleet_state": "DEGRADED",
+    "error_code": "RCH-E410",
+    "evidence": "missing source_entrypoint /Users/jemanuel/projects/pi_agent_rust/tests/edit_repro.rs",
+    "remediation": "Run `rch sync --worker hz3 --force` to refresh the worker's RCH-managed source cache, or install rch shim with --allow-local-fallback per AGENTS.md 'Cargo builds offload — don't defeat it' section.",
+    "blocker_for_dynamic_evidence": true
+  }
+}

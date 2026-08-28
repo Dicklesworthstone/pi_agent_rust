@@ -1,0 +1,27 @@
+{
+  "schema": "pi.evidence.binary_size_canonical_runpack.v1",
+  "generated_at": "2026-08-28T05:19:23.186138+00:00",
+  "bead": "bd-binary-size-canonical-recipe-zw2e4",
+  "verdict": "script_shipped_build_pending",
+  "deliverables": {
+    "script": "scripts/perf/measure_binary_size.py",
+    "schema_added": "pi.perf.binary_size.v1 in docs/evidence-contract-schema.json perf_schema_registry.binary_size_canonical",
+    "expected_artifact": "tests/perf/reports/release_evidence/binary_size.json"
+  },
+  "status": "script_committed_build_blocked_on_rch",
+  "script_capability": {
+    "builds_with": "cargo build --release --bin pi (per DSR recipe)",
+    "verifies_stripped": "yes, via nm heuristic",
+    "writes_artifact": "yes, with 17 required fields per pi.perf.binary_size.v1",
+    "size_threshold_mb": 48.0
+  },
+  "rch_state": {
+    "fleet_state": "DEGRADED (RCH-E410 dependency preflight)",
+    "evidence": "missing source_entrypoint /Users/jemanuel/projects/pi_agent_rust/tests/edit_repro.rs on worker hz3",
+    "remediation": "rch sync --worker hz3 --force, or rely on DSR perf lane when healthy"
+  },
+  "next_actions": [
+    "When RCH recovers, run `cargo run -- scripts/perf/measure_binary_size.py --no-build --threshold-mb 48` to produce the artifact.",
+    "If the resulting size_mb is over 48MB, the README 'binary 23-32MB' claim is no longer accurate and the bead cannot be closed as a green budget."
+  ]
+}

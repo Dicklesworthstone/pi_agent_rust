@@ -1,0 +1,22 @@
+{
+  "schema": "pi.evidence.read_tool_oom_streaming_runpack.v1",
+  "generated_at": "2026-08-28T05:36:43.323704+00:00",
+  "bead": "bd-read-tool-oom-streaming-fix-pdzl9",
+  "verdict": "plan_audited_implementation_blocked_on_rch",
+  "problem": "ReadTool::execute reads the entire file into memory with asupersync::fs::read before applying offset/limit filtering, causing OOM on large files.",
+  "source_plan": "PLAN_TO_FIX_READ_TOOL.md (37 lines, written prior to this bead)",
+  "audit": {
+    "plan_correctness": "Plan is sound: 8KB MIME peek, stream-in-chunks for text, continue-to-EOF for line counting, memchr::memchr_iter for newline finding, bounded collection buffer (DEFAULT_MAX_BYTES*2 safety limit).",
+    "missing_imports": "Plan correctly identifies asupersync::io::{AsyncReadExt, AsyncSeekExt, SeekFrom} as the required imports.",
+    "test_requirement": "Plan calls for `cargo test tools::tests::test_read_tool_large_file` with a 1GB synthetic file and bounded-RSS verification. This test does not yet exist; it must be added as part of implementation.",
+    "image_handling": "Plan preserves existing image auto-resize + defensive decode-limit behavior by branching on the 8KB MIME peek. Image path stays full-buffered (unchanged).",
+    "user_contract": "Plan preserves the public offset/limit semantics."
+  },
+  "blocked_on": "RCH is in E410 + build-dir lock held by other agents; cargo build --bin pi cannot produce a test binary in this session. The plan is a well-known streaming refactor pattern and the API is documented; implementing it requires (a) RCH healthy, (b) the build to complete, (c) the new test to be added and pass.",
+  "next_actions": [
+    "When RCH recovers, follow PLAN_TO_FIX_READ_TOOL.md exactly: refactor ReadTool::execute to stream in 64KB chunks with memchr for newline finding.",
+    "Add tests/tools_large_file_test.rs (or extend tests/tools.rs) with test_read_tool_large_file driving a 1GB file and asserting peak RSS is < 100MB.",
+    "Add a bench in benches/ that compares pre-fix and post-fix memory behavior on a 1GB file.",
+    "Close this bead when the test passes and peak-RSS is verified bounded."
+  ]
+}

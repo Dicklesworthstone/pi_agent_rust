@@ -1,0 +1,38 @@
+{
+  "schema": "pi.evidence.idle_memory_canonical_runpack.v1",
+  "generated_at": "2026-08-28T05:19:23.290967+00:00",
+  "bead": "bd-idle-memory-canonical-recipe-vrk8m",
+  "verdict": "script_shipped_build_pending",
+  "deliverables": {
+    "script": "scripts/perf/measure_idle_memory.py",
+    "schema_used": "pi.perf.idle_memory_rss.v1 (already in evidence-contract-schema.json)",
+    "expected_artifact": "tests/perf/reports/release_evidence/idle_memory_rss.json"
+  },
+  "status": "script_committed_build_blocked_on_rch",
+  "taxonomy_implemented": [
+    "startup_before_user_input (cold-start idle, no model loaded)",
+    "post_extension_warmup (after extension realm warmup)",
+    "post_conversation (after a model was used, then idle 30s)",
+    "post_compaction (after a compaction event)",
+    "post_tool_heavy (after a tool-heavy turn)"
+  ],
+  "script_capability": {
+    "settle_window_seconds": 5.0,
+    "sample_count": 5,
+    "sample_interval_seconds": 1.0,
+    "platform_support": [
+      "macOS (ps -o rss=)",
+      "Linux (/proc/<pid>/status)"
+    ],
+    "writes_artifact": "yes, with 18 required fields per pi.perf.idle_memory_rss.v1",
+    "process_name_validated": "yes, fails if process_name != 'pi'"
+  },
+  "rch_state": {
+    "fleet_state": "DEGRADED (RCH-E410 dependency preflight)",
+    "remediation": "build target/release/pi then run the script"
+  },
+  "next_actions": [
+    "When RCH recovers, run `cargo build --release --bin pi` then `python3 scripts/perf/measure_idle_memory.py`.",
+    "The script will fail with rc=2 if the binary does not stay idle long enough to collect 3+ samples \u2014 a real signal, not a script bug."
+  ]
+}

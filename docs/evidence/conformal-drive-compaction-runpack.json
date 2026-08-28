@@ -1,0 +1,11 @@
+{
+  "schema": "pi.evidence.conformal-drive-compaction_runpack.v1",
+  "generated_at": "2026-08-28T05:33:41.063440+00:00",
+  "bead": "bd-conformal-drive-compaction-runpack",
+  "verdict": "telemetry_event_added_compile_pending",
+  "summary": "Telemetry event added at the conformal veto site in src/extensions.rs. The conformal anomaly-rate check already existed; this bead adds the missing tracing::warn!(target: pi.runtime.math_technique_fire, math_technique=conformal, fire_reason=compaction_admission, anomaly_rate, expected_anomaly) event so production traffic can be observed. The math wiring (conformal -> safety envelope veto) was already in code; this closes the observability gap.",
+  "next_actions": [
+    "Run cargo check --lib to confirm the change compiles",
+    "Add a regression test that drives the trigger and asserts the event fires"
+  ]
+}

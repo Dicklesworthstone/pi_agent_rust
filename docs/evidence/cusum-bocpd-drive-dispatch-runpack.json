@@ -1,0 +1,15 @@
+{
+  "schema": "pi.evidence.cusum_bocpd_drive_dispatch_runpack.v1",
+  "generated_at": "2026-08-28T05:32:00.527263+00:00",
+  "bead": "bd-cusum-bocpd-drive-dispatch-br42p",
+  "verdict": "telemetry_event_added_compile_pending",
+  "deliverables": {
+    "code_change": "src/extension_dispatcher.rs around line 1740",
+    "change_summary": "Added `tracing::info!(target: \"pi.runtime.dispatch_mode_switch\", ...)` event emission at the regime-shift-driven dispatch mode switch point. The event captures from_mode, to_mode, trigger=rollout_gate_decision, and confirmation_streak. The wiring (CUSUM/BOCPD \u2192 rollout gate \u2192 dispatch mode) was already present; this bead adds the missing telemetry event so production traffic can be observed."
+  },
+  "next_actions": [
+    "Run `cargo check --lib` and the full test suite to confirm the change compiles.",
+    "Add a regression test that drives a synthetic CUSUM spike and asserts the dispatch_mode_switch event fires with from_mode=sequential_fast_path, to_mode=interleaved_batching."
+  ],
+  "compile_state": "in_flight_via_RCH"
+}

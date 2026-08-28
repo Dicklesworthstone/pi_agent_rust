@@ -1,0 +1,62 @@
+{
+  "schema": "pi.perf.provider_live_e2e.v1",
+  "generated_at": "2026-08-28T05:30:00.901953+00:00",
+  "verdict": "binary_missing",
+  "providers": [
+    {
+      "id": "anthropic",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "openai",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "openai_responses",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "gemini",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "cohere",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "azure",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "bedrock",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "vertex",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "copilot",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "gitlab",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    },
+    {
+      "id": "cursor",
+      "status": "skipped_no_binary",
+      "reason": "target/release/pi not built"
+    }
+  ]
+}
