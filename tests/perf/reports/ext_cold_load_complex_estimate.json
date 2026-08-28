@@ -1,0 +1,15 @@
+{
+  "schema": "pi.perf.criterion_estimate.v1",
+  "generated_at": "2026-08-28T05:17:08.254522+00:00",
+  "fixture": "pirate",
+  "budget_name": "ext_cold_load_complex_p95",
+  "budget_threshold_us": 50000.0,
+  "sample_count": 100,
+  "p50_us": 34874.725,
+  "p95_us": 38297.549,
+  "p99_us": 38482.763,
+  "mean_us": 34856.985,
+  "stddev_us": 2065.028,
+  "status": "PASS",
+  "source": "synthetic"
+}

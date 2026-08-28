@@ -77,6 +77,54 @@
             "items": { "type": "string", "enum": ["schema", "generated_at", "cgroup_v2_cpu_quota", "cpuset_size", "numa_node_count", "memory_limit_bytes", "budget_profile"] }
           }
         }
+      },
+      "pijs_workload_measurement": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.pijs_workload.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 9, "maxItems": 9,
+            "items": { "type": "string", "enum": ["embedded_timestamp", "source_commit", "source_dirty", "run_id", "correlation_id", "iteration", "tool_name", "latency_us", "throughput_calls_per_sec"] }
+          }
+        }
+      },
+      "binary_size_canonical": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.binary_size.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 8, "maxItems": 8,
+            "items": { "type": "string", "enum": ["schema", "generated_at", "binary_path", "binary_sha256", "size_bytes", "cargo_profile", "compiled_profile_family", "strip"] }
+          }
+        }
+      },
+      "ext_cold_load_complex_estimate": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.criterion_estimate.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 5, "maxItems": 5,
+            "items": { "type": "string", "enum": ["schema", "fixture", "budget_name", "p95_us", "status"] }
+          }
+        }
+      },
+      "event_dispatch_scenario": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.scenario_runner.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 6, "maxItems": 6,
+            "items": { "type": "string", "enum": ["schema", "scenario", "event_count", "latency_p99_us", "budget_p99_us", "status"] }
+          }
+        }
       }
     }
   },

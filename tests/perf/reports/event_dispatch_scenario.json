@@ -1,0 +1,21 @@
+{
+  "schema": "pi.perf.scenario_runner.v1",
+  "generated_at": "2026-08-28T05:17:08.341411+00:00",
+  "scenario": "event_dispatch",
+  "event_count": 10000,
+  "type_counts": {
+    "text_delta": 1429,
+    "tool_start": 1429,
+    "tool_end": 1429,
+    "agent_start": 1429,
+    "agent_end": 1428,
+    "message_update": 1428,
+    "ping": 1428
+  },
+  "latency_p50_us": 191.15,
+  "latency_p95_us": 676.51,
+  "latency_p99_us": 765.838,
+  "latency_mean_us": 257.961,
+  "budget_p99_us": 5000.0,
+  "status": "PASS"
+}
