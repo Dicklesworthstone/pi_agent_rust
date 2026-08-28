@@ -1533,7 +1533,8 @@ fn exec_hostcall_truncation_does_not_sigpipe_writer() {
         });
 
         let outcome =
-            dispatch_hostcall_exec_ref_with_limit(None, "call-dd", "dd", &payload, 1024).await;
+            dispatch_hostcall_exec_ref_with_limit(None, "call-dd", "dd", &payload, 1024, None)
+                .await;
         match outcome {
             HostcallOutcome::Success(value) => {
                 assert_eq!(
