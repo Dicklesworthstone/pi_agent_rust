@@ -1339,6 +1339,48 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.input.focus();
                 self.status_message = None;
             }
+            PiMsg::RetryCommitted {
+                session_id,
+                messages,
+                usage,
+                text,
+                status,
+            } => {
+                match self.session_event_ownership(&session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => return None,
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::RetryCommitted {
+                                session_id,
+                                messages,
+                                usage,
+                                text,
+                                status,
+                            },
+                            attempts_remaining,
+                        );
+                    }
+                }
+                let reset_cmd = self.handle_pi_message_with_session_retry(
+                    PiMsg::ConversationReset {
+                        session_id: session_id.clone(),
+                        messages,
+                        usage,
+                        status,
+                    },
+                    attempts_remaining,
+                );
+                if reset_cmd.is_some() {
+                    return reset_cmd;
+                }
+                if self.agent_state != AgentState::Idle {
+                    return None;
+                }
+                self.pending_inputs
+                    .push_back(PendingInput::GeneratedText(text));
+                return self.run_next_pending();
+            }
             PiMsg::ConversationReset {
                 session_id,
                 messages,
@@ -6663,6 +6705,296 @@ mod stream_delta_batcher_tests {
             wake.execute().is_none(),
             "the cancelled command must exit without publishing a stale tick"
         );
+    }
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CountingProvider {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        fn api(&self) -> &'static str {
+            "counting"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "counting-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn session_user(text: &str) -> crate::session::SessionMessage {
+        crate::session::SessionMessage::User {
+            content: crate::model::UserContent::Text(text.to_string()),
+            timestamp: Some(0),
+        }
+    }
+
+    fn session_assistant(text: &str) -> crate::session::SessionMessage {
+        crate::session::SessionMessage::from(crate::model::Message::Assistant(Arc::new(
+            AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                ..Default::default()
+            },
+        )))
+    }
+
+    fn seed_linear_retry_turn(app: &PiApp) -> (String, String, String) {
+        runtime().block_on(async {
+            let cx = Cx::for_request();
+            let mut session_guard =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
+                    .await
+                    .expect("lock session");
+            session_guard.append_message(session_user("first question"));
+            let first_answer = session_guard.append_message(session_assistant("first answer"));
+            let abandoned = session_guard.append_message(session_user("second question"));
+            session_guard.append_message(session_assistant("second answer"));
+            let messages = session_guard.to_messages_for_current_path();
+            let session_id = session_guard.header.id.clone();
+            drop(session_guard);
+            let mut agent_guard =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+                    .await
+                    .expect("lock agent");
+            agent_guard.replace_messages(messages);
+            (first_answer, abandoned, session_id)
+        })
+    }
+
+    fn wait_for_retry_terminal(event_rx: &mut mpsc::Receiver<PiMsg>) -> PiMsg {
+        runtime().block_on(async {
+            let recv_cx = Cx::for_testing();
+            let wait = async {
+                loop {
+                    match event_rx.recv(&recv_cx).await {
+                        Ok(
+                            msg @ (PiMsg::RetryCommitted { .. }
+                            | PiMsg::AgentError(_)
+                            | PiMsg::System(_)),
+                        ) => break msg,
+                        Ok(_) => {}
+                        Err(err) => panic!("retry event receive failed: {err}"),
+                    }
+                }
+            };
+            futures::pin_mut!(wait);
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                wait,
+            )
+            .await
+            .expect("retry should emit a terminal event before timeout")
+        })
+    }
+
+    #[test]
+    fn slash_retry_via_submit_message_commits_sibling_parent_without_reparse() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        });
+        let (mut app, mut event_rx) = build_test_app_with_provider(provider);
+        app.save_enabled = false;
+        app.extensions = None;
+        let (first_answer, abandoned, session_id) = seed_linear_retry_turn(&app);
+        let (ui_messages, usage) = {
+            let session_guard = app.session.try_lock().expect("lock session");
+            crate::interactive::conversation_from_session(&session_guard)
+        };
+        app.messages = ui_messages;
+        app.total_usage = usage;
+
+        let _ = app.submit_message("/retry");
+        let terminal = wait_for_retry_terminal(&mut event_rx);
+        let PiMsg::RetryCommitted {
+            session_id: committed_id,
+            text,
+            ..
+        } = terminal.clone()
+        else {
+            panic!("expected RetryCommitted, got {terminal:?}");
+        };
+        assert_eq!(committed_id, session_id);
+        assert_eq!(text, "second question");
+
+        {
+            let session_guard = app.session.try_lock().expect("lock session");
+            assert_eq!(session_guard.leaf_id(), Some(first_answer.as_str()));
+            let path_ids: Vec<String> = session_guard
+                .entries_for_current_path()
+                .iter()
+                .filter_map(|entry| entry.base().id.clone())
+                .collect();
+            assert!(!path_ids.contains(&abandoned));
+            assert!(session_guard.get_entry(&abandoned).is_some());
+        }
+
+        let _ = app.handle_pi_message(terminal);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let session_guard = app.session.try_lock().expect("lock session");
+        let retried = session_guard.leaf_id().expect("retried leaf").to_string();
+        let retried_parent = session_guard
+            .get_entry(&retried)
+            .and_then(|entry| entry.base().parent_id.clone());
+        assert_eq!(retried_parent.as_deref(), Some(first_answer.as_str()));
+        assert_ne!(retried, abandoned);
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains("second question")),
+            "UI should show the retried prompt"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .all(|message| !message.content.contains("second answer")),
+            "UI must drop the abandoned assistant turn: {:?}",
+            app.messages
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn slash_retry_refuses_pending_input_without_touching_session_or_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        });
+        let (mut app, mut event_rx) = build_test_app_with_provider(provider);
+        app.save_enabled = false;
+        let (_first_answer, _abandoned, _session_id) = seed_linear_retry_turn(&app);
+        let leaf_before = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .leaf_id()
+            .map(str::to_string);
+        app.pending_inputs
+            .push_back(PendingInput::Text("queued".to_string()));
+        let _ = app.submit_message("/retry");
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Queued input")),
+            "pending input must refuse retry: {:?}",
+            app.status_message
+        );
+        assert_eq!(
+            app.session
+                .try_lock()
+                .expect("lock session")
+                .leaf_id()
+                .map(str::to_string),
+            leaf_before
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_retry_refuses_user_blocks_barrier_without_provider_calls() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        });
+        let (mut app, mut event_rx) = build_test_app_with_provider(provider);
+        app.save_enabled = false;
+        runtime().block_on(async {
+            let cx = Cx::for_request();
+            let mut session_guard =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
+                    .await
+                    .expect("lock session");
+            session_guard.append_message(session_user("older prompt"));
+            session_guard.append_message(crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Blocks(vec![ContentBlock::Text(
+                    TextContent::new("image prompt"),
+                )]),
+                timestamp: Some(0),
+            });
+        });
+        let leaf_before = app
+            .session
+            .try_lock()
+            .expect("lock session")
+            .leaf_id()
+            .map(str::to_string);
+        let _ = app.submit_message("/retry");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No user turn to retry")
+        );
+        assert_eq!(
+            app.session
+                .try_lock()
+                .expect("lock session")
+                .leaf_id()
+                .map(str::to_string),
+            leaf_before
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_retry_save_failure_leaves_session_and_ui_untouched() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        });
+        let (mut app, mut event_rx) = build_test_app_with_provider(provider);
+        app.save_enabled = true;
+        app.extensions = None;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+        let (first_answer, abandoned, _session_id) = seed_linear_retry_turn(&app);
+        let (leaf_before, entries_before) = {
+            let mut session_guard = app.session.try_lock().expect("lock session");
+            session_guard.path = Some(blocked_path);
+            (
+                session_guard.leaf_id().map(str::to_string),
+                serde_json::to_value(&session_guard.entries).expect("serialize"),
+            )
+        };
+        let ui_before = app.messages.clone();
+
+        let _ = app.submit_message("/retry");
+        let terminal = wait_for_retry_terminal(&mut event_rx);
+        assert!(
+            matches!(terminal, PiMsg::AgentError(message) if message.contains("could not be confirmed")),
+            "save failure must be terminal: {terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let session_guard = app.session.try_lock().expect("lock session");
+        assert_eq!(session_guard.leaf_id().map(str::to_string), leaf_before);
+        assert_eq!(
+            serde_json::to_value(&session_guard.entries).expect("serialize live"),
+            entries_before
+        );
+        assert_eq!(session_guard.leaf_id(), leaf_before.as_deref());
+        assert!(session_guard.get_entry(&abandoned).is_some());
+        assert!(session_guard.get_entry(&first_answer).is_some());
+        assert_eq!(app.messages, ui_before);
     }
 }
 

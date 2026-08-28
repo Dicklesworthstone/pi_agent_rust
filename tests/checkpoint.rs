@@ -354,6 +354,52 @@ fn retry_preparation_without_user_turn_is_none() {
     finish_case(&harness, case);
 }
 
+#[test]
+fn retry_plan_save_reopen_keeps_abandoned_turn_as_sibling() {
+    let case = "retry_plan_save_reopen_keeps_abandoned_turn_as_sibling";
+    let harness = TestHarness::new(case);
+    let temp = tempfile::Builder::new()
+        .prefix("pi-r7icz-")
+        .tempdir_in("/tmp")
+        .unwrap_or_else(|_| tempfile::TempDir::new().expect("tempdir"));
+    let path = temp.path().join("session.jsonl");
+    let mut session = Session::create_with_dir(Some(temp.path().join("sessions")));
+    session.path = Some(path.clone());
+    session.append_message(pi::session::SessionMessage::from(user_text("first question")));
+    let first_answer = session.append_message(pi::session::SessionMessage::from(assistant_text(
+        "first answer",
+    )));
+    let abandoned = session.append_message(pi::session::SessionMessage::from(user_text(
+        "second question",
+    )));
+    session.append_message(pi::session::SessionMessage::from(assistant_text(
+        "second answer",
+    )));
+    block_on_local(session.save()).expect("baseline save");
+
+    let plan = pi::checkpoint::plan_retry(&session).expect("plan");
+    assert_eq!(plan.abandoned_entry_id, abandoned);
+    pi::checkpoint::apply_retry_plan(&mut session, &plan).expect("apply");
+    block_on_local(session.save()).expect("retry save");
+
+    let reopened = block_on_local(Session::open(path.to_string_lossy().as_ref())).expect("reopen");
+    assert_eq!(reopened.leaf_id(), Some(first_answer.as_str()));
+    let retried = {
+        let mut live = reopened;
+        let retried = live.append_message(pi::session::SessionMessage::from(user_text(
+            "second question, retried",
+        )));
+        let parent = live
+            .get_entry(&retried)
+            .and_then(|entry| entry.base().parent_id.clone());
+        assert_eq!(parent.as_deref(), Some(first_answer.as_str()));
+        assert!(live.get_entry(&abandoned).is_some());
+        retried
+    };
+    assert!(!retried.is_empty());
+    finish_case(&harness, case);
+}
+
 /// Slow provider: emits nothing for a beat so the cap check fires first.
 struct SlowProvider;
 #[async_trait::async_trait]

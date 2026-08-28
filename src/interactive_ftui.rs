@@ -1373,6 +1373,12 @@ impl PiFtuiModel {
                 messages,
                 status,
                 ..
+            }
+            | PiMsg::RetryCommitted {
+                session_id,
+                messages,
+                status,
+                ..
             } => {
                 self.dismiss_pending_interactions();
                 self.displayed_session_id = Some(session_id);

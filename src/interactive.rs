@@ -2014,6 +2014,15 @@ pub enum PiMsg {
         usage: Usage,
         status: Option<String>,
     },
+    /// Classic `/retry` committed the sibling leaf; reset UI from Session
+    /// and enqueue the abandoned prompt without slash-command reparse.
+    RetryCommitted {
+        session_id: String,
+        messages: Vec<ConversationMessage>,
+        usage: Usage,
+        text: String,
+        status: Option<String>,
+    },
     /// Set the editor contents (used by /tree selection of user/custom messages).
     SetEditorText {
         owner_session_id: String,
