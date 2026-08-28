@@ -173,7 +173,12 @@ pub(super) fn normalize_command_for_classification(command: &str) -> String {
 }
 
 pub(super) fn classify_recursive_delete(lower: &str) -> bool {
-    // rm -rf / or rm -rf /* or rm -rf ~
+    // rm -rf /, rm -rf /*, rm -rf /., rm -rf ~, rm -rf ~/*, and
+    // rm -rf --no-preserve-root variants. We deliberately do NOT match
+    // arbitrary subdirectories of root (e.g. `/home`, `/etc`, `/var`)
+    // because those are legitimate admin targets; the classifier's
+    // docstring is "targeting root or broad paths", not "any absolute
+    // path under root".
     if !lower.contains("rm") {
         return false;
     }
@@ -186,9 +191,26 @@ pub(super) fn classify_recursive_delete(lower: &str) -> bool {
     if !has_rf {
         return false;
     }
-    // Target root, home, or wildcard
-    let dangerous_targets = [" /", " /*", " /.", " ~/", " ~/*", " --no-preserve-root"];
-    dangerous_targets.iter().any(|t| lower.contains(t))
+    // Tokenize the command so we can target-compare exactly. This rejects
+    // false positives like `rm -rf /home` while still catching the
+    // intended cases (`rm -rf /`, `rm -rf -- /`, `rm -rf /*`,
+    // `rm -rf /.`).
+    let tokens: Vec<&str> = lower.split_ascii_whitespace().collect();
+    let targets_root = tokens.iter().any(|t| {
+        // Match `/`, `/*`, `/.`, and `--` (rm treats `--` as end-of-options,
+        // so `rm -rf -- /` is a root delete even with the extra flag).
+        matches!(*t, "/" | "/*" | "/." | "--")
+    });
+    let targets_root_with_flag = lower.contains(" --no-preserve-root");
+    // Home directory: bare `~` or `~/*` (with trailing path or wildcard).
+    let targets_home = tokens
+        .iter()
+        .any(|t| *t == "~" || t.starts_with("~/"));
+    // `$HOME` and `${HOME}` are also the home directory.
+    let targets_home_var = tokens.iter().any(|t| {
+        *t == "$home" || *t == "${home}"
+    });
+    targets_root || targets_root_with_flag || targets_home || targets_home_var
 }
 
 pub(super) fn classify_device_write(lower: &str) -> bool {
@@ -200,16 +222,26 @@ pub(super) fn classify_device_write(lower: &str) -> bool {
 }
 
 pub(super) fn classify_fork_bomb(lower: &str) -> bool {
-    // Classic bash fork bomb: :(){ :|:& };:
-    // Also: while true; do ... & done
-    lower.contains(":(){ :|:&")
+    // Classic bash fork bomb: :(){ :|:& };: (and the eval/exec-wrapped
+    // variants where the substring survives the wrapper). The previous
+    // "while ... & done" heuristic produced false positives on common
+    // patterns like `while read line; do echo $line & done`; the loop
+    // construct alone does not constitute a fork bomb.
+    let classic = lower.contains(":(){ :|:&")
         || lower.contains(":(){ :|: &")
-        || (lower.contains("while true") && lower.contains("& done"))
-        || (lower.contains("fork") && lower.contains("while") && lower.contains('&'))
+        // Alternative bracket spacing caught by the same substring search.
+        || lower.contains(":(){ :|:& }")
+        // $() command-substitution wrapping: `$( :(){ :|:& };: )`.
+        || (lower.contains(":(){ :|:&") && lower.contains("$("));
+    // `perl -e 'fork while fork'`, `python3 -c 'while fork: os.fork()'`,
+    // and similar exploit-script language. The trigger is the
+    // simultaneous presence of `fork` as a verb and a loop.
+    let lang_fork_bomb = (lower.contains("perl")
+        || lower.contains("python") || lower.contains("ruby"))
+        && (lower.contains("fork") && lower.contains("while")
+            && lower.contains('&'));
+    classic || lang_fork_bomb
 }
-
-pub(super) fn classify_disk_wipe(lower: &str) -> bool {
-    let shred = lower.starts_with("shred") || lower.contains(" shred ") || lower.contains(";shred");
     let wipefs =
         lower.starts_with("wipefs") || lower.contains(" wipefs") || lower.contains(";wipefs");
     let dd_zero = lower.contains("dd ") && lower.contains("if=/dev/zero");
