@@ -226,9 +226,8 @@ async fn stage_and_commit_retry(
             "Session changed while retry was preparing; retry was not applied".to_string(),
         ));
     }
-    let plan = crate::checkpoint::plan_retry(&live).ok_or_else(|| {
-        crate::error::Error::session("No user turn to retry".to_string())
-    })?;
+    let plan = crate::checkpoint::plan_retry(&live)
+        .ok_or_else(|| crate::error::Error::session("No user turn to retry".to_string()))?;
     let mut candidate = live.clone();
     crate::checkpoint::apply_retry_plan(&mut candidate, &plan).map_err(|err| {
         crate::error::Error::session(format!("Retry plan could not be applied: {err}"))
@@ -2349,11 +2348,11 @@ mod tests {
             .expect("memory-only retry");
         assert_eq!(commit.plan.abandoned_entry_id, abandoned);
         assert_eq!(commit.plan.text, "second question");
+        assert_eq!(commit.persistence, RetryPersistenceOutcome::Disabled);
         assert_eq!(
-            commit.persistence,
-            RetryPersistenceOutcome::Disabled
+            commit.plan.expected_parent_id.as_deref(),
+            Some(first_answer.as_str())
         );
-        assert_eq!(commit.plan.expected_parent_id.as_deref(), Some(first_answer.as_str()));
 
         runtime().block_on(async {
             let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)

@@ -365,7 +365,9 @@ fn retry_plan_save_reopen_keeps_abandoned_turn_as_sibling() {
     let path = temp.path().join("session.jsonl");
     let mut session = Session::create_with_dir(Some(temp.path().join("sessions")));
     session.path = Some(path.clone());
-    session.append_message(pi::session::SessionMessage::from(user_text("first question")));
+    session.append_message(pi::session::SessionMessage::from(user_text(
+        "first question",
+    )));
     let first_answer = session.append_message(pi::session::SessionMessage::from(assistant_text(
         "first answer",
     )));

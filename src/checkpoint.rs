@@ -461,18 +461,14 @@ fn project_retry_path(session: &Session) -> Vec<ProjectedPathMessage> {
     let mut projection = RetryPathProjection::with_capacity(path.len().saturating_add(1));
 
     if let Some(compaction_index) = last_compaction {
-        let SessionEntry::Compaction(compaction) = path[compaction_index] else {
+        let Some(SessionEntry::Compaction(compaction)) = path.get(compaction_index).copied() else {
             return Vec::new();
         };
-        projection
-            .projected
-            .push(ProjectedPathMessage::barrier());
+        projection.projected.push(ProjectedPathMessage::barrier());
         let first_kept_entry_id = compaction.first_kept_entry_id.clone();
-        let has_kept_entry = path.iter().any(|entry| {
-            entry
-                .base_id()
-                .is_some_and(|id| id == &first_kept_entry_id)
-        });
+        let has_kept_entry = path
+            .iter()
+            .any(|entry| entry.base_id().is_some_and(|id| id == &first_kept_entry_id));
         let mut keep = false;
         let mut past_compaction = false;
         for (index, entry) in path.iter().enumerate() {
@@ -481,10 +477,7 @@ fn project_retry_path(session: &Session) -> Vec<ProjectedPathMessage> {
             }
             if !keep {
                 if has_kept_entry {
-                    if entry
-                        .base_id()
-                        .is_some_and(|id| id == &first_kept_entry_id)
-                    {
+                    if entry.base_id().is_some_and(|id| id == &first_kept_entry_id) {
                         keep = true;
                     } else {
                         continue;
@@ -637,7 +630,10 @@ mod tests {
         assert_eq!(plan.text, "second question");
         assert_eq!(plan.abandoned_entry_id, abandoned);
         assert_eq!(plan.original_leaf_id, original_leaf);
-        assert_eq!(plan.expected_parent_id.as_deref(), Some(first_answer.as_str()));
+        assert_eq!(
+            plan.expected_parent_id.as_deref(),
+            Some(first_answer.as_str())
+        );
 
         apply_retry_plan(&mut session, &plan).expect("apply");
         assert_eq!(session.leaf_id(), Some(first_answer.as_str()));
@@ -738,7 +734,14 @@ mod tests {
     fn plan_retry_treats_bash_execution_as_barrier() {
         let mut session = Session::in_memory();
         session.append_message(session_user("older prompt"));
-        session.append_bash_execution("echo hi".to_string(), "hi".to_string(), 0, false, false, None);
+        session.append_bash_execution(
+            "echo hi".to_string(),
+            "hi".to_string(),
+            0,
+            false,
+            false,
+            None,
+        );
         assert!(plan_retry(&session).is_none());
     }
 
