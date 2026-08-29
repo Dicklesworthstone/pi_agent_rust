@@ -1189,7 +1189,10 @@ pub fn create_provider(
                 .with_compat(entry.compat.clone())
                 .with_client(client);
             if !entry.model.base_url.is_empty() {
-                provider = provider.with_github_api_base(&entry.model.base_url);
+                // `base_url` is a chat-completions endpoint hint here, same
+                // as every other provider - never the GitHub REST API host.
+                // OAuth token exchange always targets api.github.com.
+                provider = provider.with_chat_completions_endpoint_override(&entry.model.base_url);
             }
             Ok(Arc::new(provider))
         }

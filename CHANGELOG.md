@@ -31,6 +31,18 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   round-trip runs under the dedicated long-running compact event budget
   (gh #178).
 
+### Fixed
+
+- **GitHub Copilot OAuth token exchange no longer honors a configured chat
+  endpoint as the REST API host**: the per-model catalog `base_url` field
+  (e.g. `https://api.individual.githubcopilot.com`) is a chat-completions
+  endpoint hint, same as for every other provider — it was being passed to
+  `CopilotProvider::with_github_api_base`, redirecting the
+  `copilot_internal/v2/token` exchange away from `api.github.com`. Token
+  exchange now always targets `api.github.com`; a configured `base_url`
+  instead pins the chat-completions endpoint directly via the new
+  `with_chat_completions_endpoint_override`.
+
 ## [v0.3.0] — 2026-08-21 — Release
 
 First published release since [v0.1.23](https://github.com/Dicklesworthstone/pi_agent_rust/releases/tag/v0.1.23).

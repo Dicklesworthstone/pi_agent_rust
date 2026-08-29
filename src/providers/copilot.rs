@@ -62,6 +62,16 @@ fn github_api_version() -> String {
         .unwrap_or_else(|| GITHUB_API_VERSION.to_string())
 }
 
+/// Append `/chat/completions` to a base URL unless it's already there.
+fn normalize_chat_completions_endpoint(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    }
+}
+
 // ── Token exchange types ─────────────────────────────────────────
 
 /// Response from the Copilot token exchange endpoint.
@@ -103,7 +113,11 @@ pub struct CopilotProvider {
     /// The model ID to request (e.g., "gpt-4o", "claude-3.5-sonnet").
     model: String,
     /// GitHub API base URL (supports Enterprise: `https://github.example.com/api/v3`).
+    /// Used only for OAuth token exchange - never for chat completions.
     github_api_base: String,
+    /// Explicit chat-completions endpoint, when the caller wants to skip the
+    /// endpoint GitHub's token-exchange response would otherwise supply.
+    chat_endpoint_override: Option<String>,
     /// Provider name for event attribution.
     provider_name: String,
     /// Compatibility overrides passed to the underlying OpenAI provider.
@@ -120,16 +134,31 @@ impl CopilotProvider {
             github_token: github_token.into(),
             model: model.into(),
             github_api_base: GITHUB_API_BASE.to_string(),
+            chat_endpoint_override: None,
             provider_name: "github-copilot".to_string(),
             compat: None,
             cached_token: Mutex::new(None),
         }
     }
 
-    /// Set the GitHub API base URL (for Enterprise).
+    /// Set the GitHub API base URL (for Enterprise). This is the OAuth
+    /// token-exchange host and must never be fed from a chat-completions
+    /// endpoint hint - see `with_chat_completions_endpoint_override`.
     #[must_use]
     pub fn with_github_api_base(mut self, base: impl Into<String>) -> Self {
         self.github_api_base = base.into();
+        self
+    }
+
+    /// Pin the chat-completions endpoint directly, bypassing the one GitHub's
+    /// token-exchange response would otherwise supply. This is what the
+    /// model catalog's per-model `base_url` field means for Copilot: a hint
+    /// for where to send chat-completions requests, not a GitHub REST API
+    /// host. OAuth token exchange always targets `github_api_base` regardless
+    /// of this setting.
+    #[must_use]
+    pub fn with_chat_completions_endpoint_override(mut self, endpoint: impl Into<String>) -> Self {
+        self.chat_endpoint_override = Some(endpoint.into());
         self
     }
 
@@ -205,17 +234,15 @@ impl CopilotProvider {
         let token_response: CopilotTokenResponse = serde_json::from_str(&text)
             .map_err(|e| Error::auth(format!("Invalid Copilot token response: {e}")))?;
 
-        // Determine the API endpoint.
-        let api_endpoint = if token_response.endpoints.api.is_empty() {
-            // Fallback: use the standard Copilot proxy URL.
+        // Determine the API endpoint. An explicit override always wins;
+        // otherwise use what GitHub's token exchange supplied, falling back
+        // to the standard Copilot proxy URL.
+        let api_endpoint = if let Some(override_endpoint) = &self.chat_endpoint_override {
+            normalize_chat_completions_endpoint(override_endpoint)
+        } else if token_response.endpoints.api.is_empty() {
             "https://api.githubcopilot.com/chat/completions".to_string()
         } else {
-            let base = token_response.endpoints.api.trim_end_matches('/');
-            if base.ends_with("/chat/completions") {
-                base.to_string()
-            } else {
-                format!("{base}/chat/completions")
-            }
+            normalize_chat_completions_endpoint(&token_response.endpoints.api)
         };
 
         let cached = CachedToken {
@@ -319,6 +346,19 @@ mod tests {
 
         assert_eq!(p.name(), "copilot-enterprise");
         assert_eq!(p.github_api_base, "https://github.example.com/api/v3");
+    }
+
+    #[test]
+    fn test_chat_endpoint_override_leaves_github_api_base_untouched() {
+        // A model catalog `base_url` like "https://api.individual.githubcopilot.com"
+        // is a chat-completions hint, never an OAuth token-exchange host.
+        let p = CopilotProvider::new("gpt-4o", "ghp_test")
+            .with_chat_completions_endpoint_override("https://api.individual.githubcopilot.com");
+        assert_eq!(p.github_api_base, GITHUB_API_BASE);
+        assert_eq!(
+            p.chat_endpoint_override.as_deref(),
+            Some("https://api.individual.githubcopilot.com")
+        );
     }
 
     #[test]
@@ -535,6 +575,34 @@ mod tests {
             assert_eq!(
                 cached.api_endpoint,
                 "https://api.githubcopilot.com/chat/completions"
+            );
+        });
+    }
+
+    #[test]
+    fn test_chat_endpoint_override_wins_over_server_supplied_endpoint() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let far_future = chrono::Utc::now().timestamp() + 3600;
+            // The cassette only knows how to answer a request to
+            // https://api.github.com/copilot_internal/v2/token (the default
+            // github_api_base). If the override endpoint were ever used for
+            // token exchange instead, VCR playback would fail here.
+            let (client, _temp) = vcr_token_exchange_client(
+                "copilot_token_override",
+                "ghu_override",
+                far_future,
+                "https://server-supplied.example.com",
+            );
+            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy")
+                .with_client(client)
+                .with_chat_completions_endpoint_override("https://api.individual.githubcopilot.com");
+            let cached = provider.ensure_session_token().await.expect("token exchange");
+            assert_eq!(
+                cached.api_endpoint,
+                "https://api.individual.githubcopilot.com/chat/completions"
             );
         });
     }
