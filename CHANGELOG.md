@@ -16,6 +16,34 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Added
 
+- **System/custom CA certificate support** (gh
+  [#186](https://github.com/Dicklesworthstone/pi_agent_rust/issues/186)):
+  `PI_HTTP_USE_SYSTEM_CERTS=1` switches the HTTP client from the bundled
+  webpki roots to the OS trust store. Setting any of `SSL_CERT_FILE`,
+  `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, or `CURL_CA_BUNDLE` implies the same
+  opt-in (curl/requests semantics) and merges the referenced CA bundle in —
+  needed behind TLS-terminating corporate proxies. Webpki roots stay the
+  default: loading the macOS trust store is expensive at startup (gh #101),
+  and `PI_HTTP_USE_SYSTEM_CERTS=0` forces webpki even when an ambient
+  custom-CA var is present.
+
+- **`prompt_cache_key` on OpenAI-shaped requests** (gh
+  [#188](https://github.com/Dicklesworthstone/pi_agent_rust/issues/188)):
+  chat-completions, Azure, and Responses requests (codex mode included) now
+  carry a cache-affinity key, defaulting to the session id — matching the TS
+  `openai-responses` provider. Some stacks (observed: Azure OpenAI behind a
+  LiteLLM proxy) give streamed requests no prompt-cache affinity at all
+  without it. `PI_PROMPT_CACHE_KEY` overrides the key (`off`/`none` disables
+  it), and `PI_CACHE_RETENTION=none` suppresses it entirely (TS parity).
+  When the key is disabled/suppressed the field is omitted altogether, so
+  backends that reject unknown params can be restored to the previous wire
+  format with `PI_PROMPT_CACHE_KEY=off`.
+
+- **`PI_COPILOT_GITHUB_API_BASE`**: moves the GitHub Copilot OAuth token
+  exchange to a GitHub Enterprise / data-residency REST API host (e.g.
+  `https://github.example.com/api/v3`). Complements the gh #191 fix below,
+  which stops the catalog `base_url` from steering the exchange.
+
 - **Host-mediated native-Responses compaction bridge** (gh
   [#167](https://github.com/Dicklesworthstone/pi_agent_rust/issues/167)):
   `ctx.compact(preparation, { strategy: "openai-responses-native", request })`
@@ -30,6 +58,28 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   bridge failure rejects so the plugin fails open to default compaction. The
   round-trip runs under the dedicated long-running compact event budget
   (gh #178).
+
+### Fixed
+
+- **GitHub Copilot: a configured catalog `base_url` no longer redirects the
+  OAuth token exchange** (gh
+  [#191](https://github.com/Dicklesworthstone/pi_agent_rust/pull/191)): the
+  per-model `base_url` (e.g. `https://api.individual.githubcopilot.com`) is a
+  chat-completions endpoint hint, like every other provider, but it was fed
+  into the GitHub REST API base — so the `copilot_internal/v2/token` exchange
+  was sent to the chat endpoint and failed. `base_url` now pins the
+  chat-completions endpoint (winning over the endpoint the token-exchange
+  response supplies); the exchange itself stays on `api.github.com` unless
+  `PI_COPILOT_GITHUB_API_BASE` moves it (GHE/data residency).
+
+- **Bare model-id selection now warns when it skips an unready custom
+  provider** (gh
+  [#189](https://github.com/Dicklesworthstone/pi_agent_rust/issues/189)):
+  selecting a bare model id that also exists under a custom provider whose
+  credentials are missing silently routed to the built-in provider. Exact
+  `provider/model` selection was and remains custom-first (regression test
+  added); the bare-id fall-through now surfaces a startup warning naming the
+  skipped provider and how to select it explicitly.
 
 ## [v0.3.0] — 2026-08-21 — Release
 
