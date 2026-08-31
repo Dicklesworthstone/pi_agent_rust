@@ -205,6 +205,7 @@ impl OpenAIResponsesProvider {
             text,
             include,
             reasoning,
+            prompt_cache_key: options.prompt_cache_key.clone(),
         }
     }
 }
@@ -1662,6 +1663,12 @@ pub struct OpenAIResponsesRequest {
     include: Option<Vec<&'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<OpenAIResponsesReasoning>,
+    /// Cache-affinity key (`prompt_cache_key`, gh #188). Parity with the TS
+    /// `openai-responses` and `openai-codex-responses` providers, which both
+    /// send it. Omitted when unset so the wire format is unchanged. See
+    /// `StreamOptions::prompt_cache_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2284,6 +2291,44 @@ mod tests {
             assert!(
                 validate_rewritten_responses_request(invalid).is_err(),
                 "rewrite must be rejected: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_request_prompt_cache_key_serialize_and_omit() {
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+
+        // Set → serialized verbatim, on both the plain Responses path and the
+        // codex path (TS parity: both providers send prompt_cache_key,
+        // gh #188).
+        let options = StreamOptions {
+            prompt_cache_key: Some("sess-123".to_string()),
+            ..Default::default()
+        };
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-5.2").with_codex_mode(codex_mode);
+            let value = serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request");
+            assert_eq!(
+                value["prompt_cache_key"], "sess-123",
+                "codex_mode={codex_mode}"
+            );
+
+            // Unset → field absent, wire format byte-identical to before.
+            let value =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .expect("serialize request");
+            assert!(
+                value.get("prompt_cache_key").is_none(),
+                "codex_mode={codex_mode}"
             );
         }
     }

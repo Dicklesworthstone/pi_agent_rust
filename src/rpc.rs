@@ -3669,7 +3669,7 @@ pub async fn run(
                         }
                     }
                     *inner = candidate;
-                    guard.agent.stream_options_mut().session_id = Some(new_id.clone());
+                    crate::app::rebind_stream_options_session(guard.agent.stream_options_mut(), &new_id);
                     guard.refresh_extension_completion_host_state();
                     state.provider_admission.clear();
                     Ok(json!({ "schema": "pi.fresh.v1", "newSessionId": new_id }))
@@ -3894,7 +3894,10 @@ pub async fn run(
                         session_transition_permit.commit_session_change();
                     }
                     guard.agent.clear_messages();
-                    guard.agent.stream_options_mut().session_id = Some(session_id.clone());
+                    crate::app::rebind_stream_options_session(
+                        guard.agent.stream_options_mut(),
+                        &session_id,
+                    );
                     guard
                         .agent
                         .reset_session_scoped_state(crate::plan::PlanMode::Off);
@@ -4122,7 +4125,10 @@ pub async fn run(
                             session_transition_permit.commit_session_change();
                             drop(inner_session);
                             guard.agent.replace_messages(messages);
-                            guard.agent.stream_options_mut().session_id = Some(session_id.clone());
+                            crate::app::rebind_stream_options_session(
+                                guard.agent.stream_options_mut(),
+                                &session_id,
+                            );
                             guard.agent.reset_session_scoped_state(target_plan_mode);
 
                             guard.agent.set_provider(provider_impl);
@@ -4380,7 +4386,10 @@ pub async fn run(
                         session_transition_permit.commit_session_change();
                         drop(inner);
                         guard.agent.replace_messages(messages);
-                        guard.agent.stream_options_mut().session_id = Some(session_id.clone());
+                        crate::app::rebind_stream_options_session(
+                            guard.agent.stream_options_mut(),
+                            &session_id,
+                        );
                         guard.agent.reset_session_scoped_state(target_plan_mode);
                         guard.agent.set_provider(provider_impl);
                         guard.agent.set_keyword_max_thinking_level(

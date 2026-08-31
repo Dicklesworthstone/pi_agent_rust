@@ -2097,17 +2097,24 @@ fn build_stream_options_with_optional_key(
     selection: &app::ModelSelection,
     session: &Session,
 ) -> StreamOptions {
+    // Match the CLI path (`app::build_stream_options`): prompt caching
+    // defaults to short retention, so SDK embedders get the same
+    // Anthropic cache breakpoints instead of silently paying full input
+    // price. `PI_CACHE_RETENTION` overrides ("long"/"none").
+    let cache_retention =
+        app::cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref());
     let mut options = StreamOptions {
         api_key,
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
         thinking_level: Some(selection.thinking_level),
-        // Match the CLI path (`app::build_stream_options`): prompt caching
-        // defaults to short retention, so SDK embedders get the same
-        // Anthropic cache breakpoints instead of silently paying full input
-        // price. `PI_CACHE_RETENTION` overrides ("long"/"none").
-        cache_retention: app::cache_retention_from_env(
-            std::env::var("PI_CACHE_RETENTION").ok().as_deref(),
+        cache_retention,
+        // Session-scoped cache affinity for OpenAI-shaped requests (gh #188),
+        // matching the CLI path.
+        prompt_cache_key: app::resolve_prompt_cache_key(
+            std::env::var("PI_PROMPT_CACHE_KEY").ok().as_deref(),
+            cache_retention,
+            Some(session.header.id.as_str()),
         ),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so embedders inherit the configured limit by default; they can still

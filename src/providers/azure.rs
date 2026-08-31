@@ -187,6 +187,7 @@ impl AzureOpenAIProvider {
             stream_options: Some(AzureStreamOptions {
                 include_usage: true,
             }),
+            prompt_cache_key: options.prompt_cache_key.clone(),
         }
     }
 
@@ -694,6 +695,10 @@ pub struct AzureRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<AzureStreamOptions>,
+    /// Cache-affinity key (`prompt_cache_key`, gh #188). Omitted when unset
+    /// so the wire format is unchanged. See `StreamOptions::prompt_cache_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1103,6 +1108,35 @@ mod tests {
         assert_eq!(request_json["messages"][2]["role"], json!("assistant"));
         assert_eq!(request_json["tools"][0]["type"], json!("function"));
         assert_eq!(request_json["tools"][0]["function"]["name"], json!("echo"));
+    }
+
+    #[test]
+    fn test_azure_build_request_prompt_cache_key_serialize_and_omit() {
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Hello".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        // Set → serialized verbatim (gh #188).
+        let options = StreamOptions {
+            prompt_cache_key: Some("sess-123".to_string()),
+            ..Default::default()
+        };
+        let request_json = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert_eq!(request_json["prompt_cache_key"], json!("sess-123"));
+
+        // Unset → field absent, wire format byte-identical to before.
+        let request_json =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize request");
+        assert!(request_json.get("prompt_cache_key").is_none());
     }
 
     #[test]

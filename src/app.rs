@@ -1318,21 +1318,70 @@ pub fn cache_retention_from_env(value: Option<&str>) -> CacheRetention {
     }
 }
 
+/// Resolve the cache-affinity key sent as `prompt_cache_key` on OpenAI-shaped
+/// requests.
+///
+/// Parity with pi-mono (`packages/ai/src/providers/openai-responses.ts`):
+/// `prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId`
+/// — the key defaults to the session id so every request in a session lands on
+/// the same provider cache shard, and disabling caching (`PI_CACHE_RETENTION=none`)
+/// suppresses the key entirely.
+///
+/// `PI_PROMPT_CACHE_KEY` overrides the default: `off`/`none` disables the
+/// field; any other non-empty value is sent verbatim (a shared key across
+/// sessions). The retention gate still applies — with caching disabled no key
+/// is sent at all.
+pub fn resolve_prompt_cache_key(
+    env_value: Option<&str>,
+    cache_retention: CacheRetention,
+    session_id: Option<&str>,
+) -> Option<String> {
+    if cache_retention == CacheRetention::None {
+        return None;
+    }
+    match env_value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") => None,
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ => session_id.map(str::to_string),
+    }
+}
+
+/// Re-point live stream options at a different session (`/new`, RPC
+/// `switch-session`, …).
+///
+/// Updates `session_id` and re-derives the session-scoped `prompt_cache_key`
+/// (gh #188) so cache affinity tracks the *current* session — matching TS,
+/// which reads `options?.sessionId` at request-build time.
+pub fn rebind_stream_options_session(options: &mut StreamOptions, session_id: &str) {
+    options.session_id = Some(session_id.to_string());
+    options.prompt_cache_key = resolve_prompt_cache_key(
+        std::env::var("PI_PROMPT_CACHE_KEY").ok().as_deref(),
+        options.cache_retention,
+        Some(session_id),
+    );
+}
+
 pub fn build_stream_options(
     config: &Config,
     api_key: Option<String>,
     selection: &ModelSelection,
     session: &Session,
 ) -> StreamOptions {
+    // Enable prompt caching by default (matches pi-mono's "short" default).
+    // Without this, Anthropic requests never set cache_control and users pay
+    // full input-token price on every turn.
+    let cache_retention =
+        cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref());
     let mut options = StreamOptions {
         api_key,
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
-        // Enable prompt caching by default (matches pi-mono's "short"
-        // default). Without this, Anthropic requests never set cache_control
-        // and users pay full input-token price on every turn.
-        cache_retention: cache_retention_from_env(
-            std::env::var("PI_CACHE_RETENTION").ok().as_deref(),
+        cache_retention,
+        // Session-scoped cache affinity for OpenAI-shaped requests (gh #188).
+        prompt_cache_key: resolve_prompt_cache_key(
+            std::env::var("PI_PROMPT_CACHE_KEY").ok().as_deref(),
+            cache_retention,
+            Some(session.header.id.as_str()),
         ),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so the value users configure in `models.json` actually takes effect.
@@ -2338,6 +2387,53 @@ mod tests {
                 .expect("active branch thinking level should restore");
 
         assert_eq!(selection.thinking_level, model::ThinkingLevel::High);
+    }
+
+    #[test]
+    fn resolve_prompt_cache_key_resolution() {
+        // Default: the session id, so a session's requests share a cache shard.
+        assert_eq!(
+            resolve_prompt_cache_key(None, CacheRetention::Short, Some("sess-1")),
+            Some("sess-1".to_string())
+        );
+        assert_eq!(
+            resolve_prompt_cache_key(None, CacheRetention::Long, Some("sess-1")),
+            Some("sess-1".to_string())
+        );
+        // TS parity gate: cacheRetention "none" suppresses the key entirely,
+        // even when an explicit override is set.
+        assert_eq!(
+            resolve_prompt_cache_key(None, CacheRetention::None, Some("sess-1")),
+            None
+        );
+        assert_eq!(
+            resolve_prompt_cache_key(Some("shared"), CacheRetention::None, Some("sess-1")),
+            None
+        );
+        // Explicit env value wins verbatim (shared key across sessions).
+        assert_eq!(
+            resolve_prompt_cache_key(Some("shared"), CacheRetention::Short, Some("sess-1")),
+            Some("shared".to_string())
+        );
+        // "off"/"none" (any case) disable the field.
+        assert_eq!(
+            resolve_prompt_cache_key(Some("off"), CacheRetention::Short, Some("sess-1")),
+            None
+        );
+        assert_eq!(
+            resolve_prompt_cache_key(Some("NONE"), CacheRetention::Short, Some("sess-1")),
+            None
+        );
+        // Blank env falls back to the session id.
+        assert_eq!(
+            resolve_prompt_cache_key(Some("  "), CacheRetention::Short, Some("sess-1")),
+            Some("sess-1".to_string())
+        );
+        // No env, no session id: nothing to send.
+        assert_eq!(
+            resolve_prompt_cache_key(None, CacheRetention::Short, None),
+            None
+        );
     }
 
     #[test]

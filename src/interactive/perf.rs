@@ -1161,7 +1161,7 @@ impl PiApp {
                 .map_or(0, |d| d.as_millis()),
             uuid::Uuid::new_v4().simple()
         );
-        agent_guard.stream_options_mut().session_id = Some(new_id.clone());
+        crate::app::rebind_stream_options_session(agent_guard.stream_options_mut(), &new_id);
         let messages_len = agent_guard.messages().len();
         drop(agent_guard);
 
