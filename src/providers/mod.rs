@@ -1189,7 +1189,13 @@ pub fn create_provider(
                 .with_compat(entry.compat.clone())
                 .with_client(client);
             if !entry.model.base_url.is_empty() {
-                provider = provider.with_github_api_base(&entry.model.base_url);
+                // The catalog `base_url` is a chat-completions endpoint hint
+                // (as for every other provider), never the GitHub REST API
+                // host. Routing it into `with_github_api_base` sent the
+                // OAuth `copilot_internal/v2/token` exchange to the chat
+                // endpoint (gh #191). GHE / data-residency deployments move
+                // the exchange host via `PI_COPILOT_GITHUB_API_BASE`.
+                provider = provider.with_chat_completions_endpoint(&entry.model.base_url);
             }
             Ok(Arc::new(provider))
         }

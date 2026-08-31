@@ -62,6 +62,37 @@ fn github_api_version() -> String {
         .unwrap_or_else(|| GITHUB_API_VERSION.to_string())
 }
 
+/// Resolve the GitHub REST API base used for the OAuth token exchange.
+///
+/// Defaults to `https://api.github.com`. GitHub Enterprise / data-residency
+/// deployments can point the exchange elsewhere via
+/// `PI_COPILOT_GITHUB_API_BASE` (e.g. `https://github.example.com/api/v3`).
+/// This is deliberately separate from the model catalog's `base_url`, which
+/// is a chat-completions endpoint hint and must never steer the token
+/// exchange (gh #191).
+fn github_api_base_from_env(value: Option<&str>) -> String {
+    match value.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => GITHUB_API_BASE.to_string(),
+    }
+}
+
+/// The effective GitHub REST API base for Copilot OAuth/usage calls
+/// (`PI_COPILOT_GITHUB_API_BASE` or the `api.github.com` default).
+pub(crate) fn github_api_base() -> String {
+    github_api_base_from_env(std::env::var("PI_COPILOT_GITHUB_API_BASE").ok().as_deref())
+}
+
+/// Ensure a chat-completions URL ends with `/chat/completions` exactly once.
+fn ensure_chat_completions_path(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
 // ── Token exchange types ─────────────────────────────────────────
 
 /// Response from the Copilot token exchange endpoint.
@@ -102,8 +133,13 @@ pub struct CopilotProvider {
     github_token: String,
     /// The model ID to request (e.g., "gpt-4o", "claude-3.5-sonnet").
     model: String,
-    /// GitHub API base URL (supports Enterprise: `https://github.example.com/api/v3`).
+    /// GitHub API base URL for the OAuth token exchange only (supports
+    /// Enterprise: `https://github.example.com/api/v3`). Never used for
+    /// chat completions.
     github_api_base: String,
+    /// Optional chat-completions endpoint override. When set, it takes
+    /// precedence over the endpoint the token-exchange response supplies.
+    chat_completions_override: Option<String>,
     /// Provider name for event attribution.
     provider_name: String,
     /// Compatibility overrides passed to the underlying OpenAI provider.
@@ -119,17 +155,32 @@ impl CopilotProvider {
             client: Client::new(),
             github_token: github_token.into(),
             model: model.into(),
-            github_api_base: GITHUB_API_BASE.to_string(),
+            github_api_base: github_api_base(),
+            chat_completions_override: None,
             provider_name: "github-copilot".to_string(),
             compat: None,
             cached_token: Mutex::new(None),
         }
     }
 
-    /// Set the GitHub API base URL (for Enterprise).
+    /// Set the GitHub API base URL used for the OAuth token exchange (for
+    /// Enterprise / data-residency deployments). This must be a GitHub REST
+    /// API host — never a chat-completions endpoint; for that, use
+    /// [`Self::with_chat_completions_endpoint`] (gh #191).
     #[must_use]
     pub fn with_github_api_base(mut self, base: impl Into<String>) -> Self {
         self.github_api_base = base.into();
+        self
+    }
+
+    /// Pin the chat-completions endpoint, overriding whatever endpoint the
+    /// token-exchange response supplies. This is what a configured catalog
+    /// `base_url` means for Copilot (a chat endpoint hint, like every other
+    /// provider); it never affects where the OAuth token exchange goes
+    /// (gh #191).
+    #[must_use]
+    pub fn with_chat_completions_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.chat_completions_override = Some(endpoint.into());
         self
     }
 
@@ -205,17 +256,16 @@ impl CopilotProvider {
         let token_response: CopilotTokenResponse = serde_json::from_str(&text)
             .map_err(|e| Error::auth(format!("Invalid Copilot token response: {e}")))?;
 
-        // Determine the API endpoint.
-        let api_endpoint = if token_response.endpoints.api.is_empty() {
-            // Fallback: use the standard Copilot proxy URL.
+        // Determine the chat-completions endpoint. A configured override
+        // (catalog `base_url`) wins over the endpoint the token-exchange
+        // response supplied; with neither, fall back to the standard
+        // Copilot proxy URL.
+        let api_endpoint = if let Some(configured) = &self.chat_completions_override {
+            ensure_chat_completions_path(configured)
+        } else if token_response.endpoints.api.is_empty() {
             "https://api.githubcopilot.com/chat/completions".to_string()
         } else {
-            let base = token_response.endpoints.api.trim_end_matches('/');
-            if base.ends_with("/chat/completions") {
-                base.to_string()
-            } else {
-                format!("{base}/chat/completions")
-            }
+            ensure_chat_completions_path(&token_response.endpoints.api)
         };
 
         let cached = CachedToken {
@@ -319,6 +369,48 @@ mod tests {
 
         assert_eq!(p.name(), "copilot-enterprise");
         assert_eq!(p.github_api_base, "https://github.example.com/api/v3");
+    }
+
+    #[test]
+    fn test_chat_completions_endpoint_does_not_touch_github_api_base() {
+        // A catalog `base_url` (e.g. https://api.individual.githubcopilot.com)
+        // is a chat-completions hint; the OAuth exchange host must stay put.
+        let p = CopilotProvider::new("gpt-4o", "ghp_test")
+            .with_chat_completions_endpoint("https://api.individual.githubcopilot.com");
+        assert_eq!(p.github_api_base, GITHUB_API_BASE);
+        assert_eq!(
+            p.chat_completions_override.as_deref(),
+            Some("https://api.individual.githubcopilot.com")
+        );
+    }
+
+    #[test]
+    fn test_github_api_base_from_env_resolution() {
+        // Default: api.github.com.
+        assert_eq!(github_api_base_from_env(None), GITHUB_API_BASE);
+        assert_eq!(github_api_base_from_env(Some("")), GITHUB_API_BASE);
+        assert_eq!(github_api_base_from_env(Some("  ")), GITHUB_API_BASE);
+        // GHE escape hatch.
+        assert_eq!(
+            github_api_base_from_env(Some("https://github.example.com/api/v3")),
+            "https://github.example.com/api/v3"
+        );
+    }
+
+    #[test]
+    fn test_ensure_chat_completions_path() {
+        assert_eq!(
+            ensure_chat_completions_path("https://proxy.example.com/v1"),
+            "https://proxy.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            ensure_chat_completions_path("https://proxy.example.com/v1/"),
+            "https://proxy.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            ensure_chat_completions_path("https://proxy.example.com/chat/completions"),
+            "https://proxy.example.com/chat/completions"
+        );
     }
 
     #[test]
@@ -535,6 +627,39 @@ mod tests {
             assert_eq!(
                 cached.api_endpoint,
                 "https://api.githubcopilot.com/chat/completions"
+            );
+        });
+    }
+
+    #[test]
+    fn test_configured_endpoint_never_routes_token_exchange() {
+        // Tripwire: the cassette only answers a GET to
+        // https://api.github.com/copilot_internal/v2/token. If a configured
+        // chat endpoint ever leaked into the token-exchange URL again
+        // (gh #191), VCR playback would find no matching interaction and
+        // this test would fail. The override must still win for the
+        // chat-completions endpoint over the server-supplied one.
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let far_future = chrono::Utc::now().timestamp() + 3600;
+            let (client, _temp) = vcr_token_exchange_client(
+                "copilot_token_chat_override",
+                "ghu_override",
+                far_future,
+                "https://server-supplied.example.com/v1",
+            );
+            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy")
+                .with_client(client)
+                .with_chat_completions_endpoint("https://api.individual.githubcopilot.com");
+            let cached = provider
+                .ensure_session_token()
+                .await
+                .expect("token exchange must target api.github.com");
+            assert_eq!(
+                cached.api_endpoint,
+                "https://api.individual.githubcopilot.com/chat/completions"
             );
         });
     }

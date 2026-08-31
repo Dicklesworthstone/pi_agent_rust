@@ -216,7 +216,10 @@ pub struct CopilotUsageReader {
 impl CopilotUsageReader {
     #[must_use]
     pub fn new(github_token: String) -> Self {
-        Self::with_base_url(github_token, "https://api.github.com".to_string())
+        // Same resolution as the Copilot provider's token exchange:
+        // api.github.com unless `PI_COPILOT_GITHUB_API_BASE` moves it
+        // (GHE / data residency, gh #191).
+        Self::with_base_url(github_token, crate::providers::copilot::github_api_base())
     }
 
     #[must_use]
