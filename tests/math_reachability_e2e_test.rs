@@ -102,8 +102,7 @@ fn each_math_technique_has_a_reachable_test() {
             .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e));
         // The technique is "reachable" if (a) it has a unit test, AND
         // (b) the unit test is present in the expected source file.
-        let reachable = t.has_unit_test
-            && body.contains(&format!("fn {}_", t.test_marker))
+        let reachable = t.has_unit_test && body.contains(&format!("fn {}_", t.test_marker))
             || body.contains(&format!("fn {}", t.test_marker));
         summary.push((t.name.to_string(), reachable));
         if !reachable {
@@ -170,7 +169,7 @@ fn oco_state_present_in_extensions() {
         "extensions.rs missing OCO state struct"
     );
     // Check for at least one OCO-related test
-    let has_oco_test = body.contains("#[test]")
-        && (body.contains("fn oco_") || body.contains("fn regret_"));
+    let has_oco_test =
+        body.contains("#[test]") && (body.contains("fn oco_") || body.contains("fn regret_"));
     assert!(has_oco_test, "extensions.rs missing OCO/regret test");
 }

@@ -203,13 +203,9 @@ pub(super) fn classify_recursive_delete(lower: &str) -> bool {
     });
     let targets_root_with_flag = lower.contains(" --no-preserve-root");
     // Home directory: bare `~` or `~/*` (with trailing path or wildcard).
-    let targets_home = tokens
-        .iter()
-        .any(|t| *t == "~" || t.starts_with("~/"));
+    let targets_home = tokens.iter().any(|t| *t == "~" || t.starts_with("~/"));
     // `$HOME` and `${HOME}` are also the home directory.
-    let targets_home_var = tokens.iter().any(|t| {
-        *t == "$home" || *t == "${home}"
-    });
+    let targets_home_var = tokens.iter().any(|t| *t == "$home" || *t == "${home}");
     targets_root || targets_root_with_flag || targets_home || targets_home_var
 }
 
@@ -236,10 +232,9 @@ pub(super) fn classify_fork_bomb(lower: &str) -> bool {
     // `perl -e 'fork while fork'`, `python3 -c 'while fork: os.fork()'`,
     // and similar exploit-script language. The trigger is the
     // simultaneous presence of `fork` as a verb and a loop.
-    let lang_fork_bomb = (lower.contains("perl")
-        || lower.contains("python") || lower.contains("ruby"))
-        && (lower.contains("fork") && lower.contains("while")
-            && lower.contains('&'));
+    let lang_fork_bomb =
+        (lower.contains("perl") || lower.contains("python") || lower.contains("ruby"))
+            && (lower.contains("fork") && lower.contains("while") && lower.contains('&'));
     classic || lang_fork_bomb
 }
 

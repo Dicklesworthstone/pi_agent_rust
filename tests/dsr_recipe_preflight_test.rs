@@ -54,10 +54,9 @@ fn preflight_script_exists_and_is_executable() {
 
 #[test]
 fn preflight_script_documents_required_findings() {
-    let script = std::fs::read_to_string(
-        project_root().join("scripts/perf/preflight_dsr_recipe.sh"),
-    )
-    .expect("preflight script read");
+    let script =
+        std::fs::read_to_string(project_root().join("scripts/perf/preflight_dsr_recipe.sh"))
+            .expect("preflight script read");
 
     // The script MUST check for each of the load-bearing contracts
     // documented in docs/perf-budgets-recipe.md.
@@ -84,10 +83,9 @@ fn preflight_script_documents_required_findings() {
 
 #[test]
 fn preflight_runpack_schema_constant_matches_bead() {
-    let script = std::fs::read_to_string(
-        project_root().join("scripts/perf/preflight_dsr_recipe.sh"),
-    )
-    .expect("preflight script read");
+    let script =
+        std::fs::read_to_string(project_root().join("scripts/perf/preflight_dsr_recipe.sh"))
+            .expect("preflight script read");
     assert!(
         script.contains("pi.evidence.ri_phase1_recipe_audit_runpack.v1"),
         "preflight script must declare the runpack schema constant"
@@ -101,8 +99,12 @@ fn preflight_recipe_doc_exists() {
     let body = std::fs::read_to_string(&doc).expect("recipe doc read");
     // Must document every hidden contract the preflight checks
     for required in [
-        "DSR", "rch", "CARGO_TARGET_DIR", "evidence cache",
-        "env_fingerprint", "closeout-evidence-registry",
+        "DSR",
+        "rch",
+        "CARGO_TARGET_DIR",
+        "evidence cache",
+        "env_fingerprint",
+        "closeout-evidence-registry",
         "phase1_matrix_validation",
     ] {
         assert!(
@@ -116,21 +118,25 @@ fn preflight_recipe_doc_exists() {
 fn preflight_runpack_artifact_when_present_validates() {
     // If a real run has been done, the runpack must parse and contain
     // the expected top-level fields. If not present, the test is a no-op.
-    let runpack = project_root()
-        .join("docs/evidence/ri-phase1-recipe-audit-runpack.json");
+    let runpack = project_root().join("docs/evidence/ri-phase1-recipe-audit-runpack.json");
     if !runpack.exists() {
         eprintln!("runpack not present yet; skipping JSON parse check");
         return;
     }
     let body = std::fs::read_to_string(&runpack).expect("runpack read");
-    let json: serde_json::Value =
-        serde_json::from_str(&body).expect("runpack parseable JSON");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("runpack parseable JSON");
     assert_eq!(
         json["schema"].as_str(),
         Some("pi.evidence.ri_phase1_recipe_audit_runpack.v1"),
         "runpack schema mismatch"
     );
-    for field in ["verdict", "ok_count", "fail_count", "warn_count", "findings"] {
+    for field in [
+        "verdict",
+        "ok_count",
+        "fail_count",
+        "warn_count",
+        "findings",
+    ] {
         assert!(
             json.get(field).is_some(),
             "runpack missing top-level field: {field}"
