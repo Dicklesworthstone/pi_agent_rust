@@ -231,18 +231,72 @@ pub struct Client {
 static TLS_CONNECTOR: std::sync::OnceLock<std::result::Result<TlsConnector, String>> =
     std::sync::OnceLock::new();
 
-/// Build (or fetch the cached) TLS connector backed by the bundled webpki
-/// root certificates.
+/// Explicit opt-in env var for the OS trust store instead of the bundled
+/// webpki roots (gh #186).
+pub const USE_SYSTEM_CERTS_ENV: &str = "PI_HTTP_USE_SYSTEM_CERTS";
+
+/// Custom-CA env vars that also imply the system-trust opt-in, matching
+/// curl/requests/OpenSSL semantics: exporting one of these *is* the signal
+/// that a custom trust anchor (e.g. a TLS-terminating corporate proxy CA)
+/// should be honored.
+const CA_BUNDLE_ENV_VARS: [&str; 4] = [
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+];
+
+/// Whether the operator opted in to the OS trust store (plus any custom CA
+/// bundle the standard env vars point at) instead of the bundled webpki
+/// roots (gh #186).
 ///
-/// Using webpki roots avoids hitting the OS trust store, which on macOS calls
-/// into Security.framework (`SecTrustSettingsCopyTrustSettings`) and can spend
-/// many seconds at high CPU parsing the system cert trust plist on startup.
-/// See pi_agent_rust#101.
+/// `PI_HTTP_USE_SYSTEM_CERTS` decides explicitly when set to a non-empty
+/// value: truthy values opt in, and `0`/`false`/`off`/`no` force webpki roots
+/// even when a custom-CA var is present (the escape hatch back to gh #101's
+/// cheap startup for users with an ambient `SSL_CERT_FILE`). When it is unset
+/// or empty, setting any of the OpenSSL-style custom-CA vars opts in
+/// implicitly, since a custom bundle is useless unless it is actually loaded.
+fn want_system_certs(explicit: Option<&str>, ca_env_set: impl Fn(&str) -> bool) -> bool {
+    if let Some(v) = explicit.map(str::trim).filter(|v| !v.is_empty()) {
+        let disabled = v == "0"
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off")
+            || v.eq_ignore_ascii_case("no");
+        return !disabled;
+    }
+    CA_BUNDLE_ENV_VARS.iter().any(|var| ca_env_set(var))
+}
+
+fn want_system_certs_from_env() -> bool {
+    want_system_certs(std::env::var(USE_SYSTEM_CERTS_ENV).ok().as_deref(), |var| {
+        std::env::var_os(var).is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// Build (or fetch the cached) TLS connector.
+///
+/// Default: the bundled webpki root certificates. Using webpki roots avoids
+/// hitting the OS trust store, which on macOS calls into Security.framework
+/// (`SecTrustSettingsCopyTrustSettings`) and can spend many seconds at high
+/// CPU parsing the system cert trust plist on startup. See pi_agent_rust#101.
+///
+/// Opt-in (gh #186): [`want_system_certs`] switches to the OS trust store,
+/// with `enable_env_cert_loading()` so `SSL_CERT_FILE` / `SSL_CERT_DIR` /
+/// `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` bundles are merged in — needed
+/// behind TLS-terminating corporate proxies with custom CAs.
 fn shared_tls_connector() -> std::result::Result<TlsConnector, String> {
     TLS_CONNECTOR
         .get_or_init(|| {
-            TlsConnectorBuilder::new()
-                .with_webpki_roots()
+            let builder = TlsConnectorBuilder::new();
+            let builder = if want_system_certs_from_env() {
+                builder
+                    .enable_env_cert_loading()
+                    .with_native_roots()
+                    .map_err(|e| e.to_string())?
+            } else {
+                builder.with_webpki_roots()
+            };
+            builder
                 .alpn_protocols(vec![b"http/1.1".to_vec()])
                 .build()
                 .map_err(|e| e.to_string())
@@ -2720,6 +2774,38 @@ mod tests {
 
         // Verify default user agent contains crate version.
         assert!(DEFAULT_USER_AGENT.starts_with("pi_agent_rust/"));
+    }
+
+    // ── System-cert opt-in predicate (gh #186) ────────────────────────
+
+    #[test]
+    fn want_system_certs_predicate() {
+        let no_ca_env = |_: &str| false;
+        // Default: webpki roots.
+        assert!(!want_system_certs(None, no_ca_env));
+        // Explicit opt-in.
+        assert!(want_system_certs(Some("1"), no_ca_env));
+        assert!(want_system_certs(Some("true"), no_ca_env));
+        assert!(want_system_certs(Some("yes"), no_ca_env));
+        // Explicitly disabled values don't opt in.
+        assert!(!want_system_certs(Some(""), no_ca_env));
+        assert!(!want_system_certs(Some("0"), no_ca_env));
+        assert!(!want_system_certs(Some("false"), no_ca_env));
+        assert!(!want_system_certs(Some("OFF"), no_ca_env));
+        assert!(!want_system_certs(Some("no"), no_ca_env));
+        // Any custom-CA env var implies the opt-in (curl/requests semantics).
+        for var in CA_BUNDLE_ENV_VARS {
+            assert!(
+                want_system_certs(None, |v| v == var),
+                "{var} should imply system certs"
+            );
+        }
+        // An explicit disable beats an ambient custom-CA var: the escape
+        // hatch back to webpki (gh #101 startup cost) must stay available.
+        assert!(!want_system_certs(Some("0"), |v| v == "SSL_CERT_FILE"));
+        assert!(!want_system_certs(Some("off"), |v| v == "REQUESTS_CA_BUNDLE"));
+        // Empty explicit value defers to the CA vars.
+        assert!(want_system_certs(Some(""), |v| v == "SSL_CERT_FILE"));
     }
 
     #[test]
