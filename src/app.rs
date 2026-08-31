@@ -658,6 +658,31 @@ pub fn select_model_and_thinking(
             if selected_model.is_none() {
                 selected_model = select_preferred_exact_id_match(&matches);
             }
+
+            // gh #189: when a bare model id also matches a custom provider
+            // entry that was passed over because it is unready (missing
+            // credentials), say so instead of silently routing to a
+            // built-in. Exact `provider/model` selection is unaffected —
+            // it is custom-first.
+            if let Some(chosen) = &selected_model
+                && fallback_message.is_none()
+                && let Some(skipped) = matches.iter().find(|m| {
+                    !provider_ids_match(&m.model.provider, &chosen.model.provider)
+                        && canonical_provider_id(&m.model.provider).is_none()
+                        && !model_entry_is_ready(m)
+                })
+            {
+                fallback_message = Some(format!(
+                    "Model id '{model_id}' also matches custom provider '{skipped_provider}', \
+                     which was skipped because its credentials are not configured; \
+                     using {chosen_provider}/{chosen_id}. To use the custom provider, \
+                     configure its API key or select it explicitly as \
+                     {skipped_provider}/{model_id}.",
+                    skipped_provider = skipped.model.provider,
+                    chosen_provider = chosen.model.provider,
+                    chosen_id = chosen.model.id,
+                ));
+            }
         }
     } else if !scoped_models.is_empty() && !is_continuing {
         if let (Some(default_provider), Some(default_model)) = (
@@ -2113,6 +2138,55 @@ mod tests {
 
         assert_eq!(selection.model_entry.model.provider, "acme");
         assert_eq!(selection.model_entry.model.id, "local-model");
+    }
+
+    #[test]
+    fn select_model_and_thinking_exact_custom_provider_selection_is_custom_first() {
+        // gh #189 regression pin: an exact `<custom-provider>/<model-id>`
+        // selection must route to the custom provider even when a built-in
+        // provider lists a model with the identical id.
+        let cli = cli::Cli::parse_from(["pi", "--model", "my-proxy/gpt-4o"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+
+        let builtin = test_model_entry("gpt-4o", "openai", false);
+        let custom = test_model_entry("gpt-4o", "my-proxy", false);
+        let registry = registry_with_entries(vec![builtin, custom]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("exact custom provider selection should resolve");
+
+        assert_eq!(selection.model_entry.model.provider, "my-proxy");
+        assert_eq!(selection.model_entry.model.id, "gpt-4o");
+        assert!(selection.fallback_message.is_none());
+    }
+
+    #[test]
+    fn select_model_and_thinking_bare_id_warns_when_unready_custom_entry_skipped() {
+        // gh #189: bare-id selection prefers ready entries; when the same id
+        // also belongs to a custom provider that is unready (missing
+        // credentials), the silent fall-through to a built-in must at least
+        // be called out.
+        let cli = cli::Cli::parse_from(["pi", "--model", "shared-model"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+
+        let builtin = test_model_entry("shared-model", "openai", false);
+        let mut custom = test_model_entry("shared-model", "my-proxy", false);
+        custom.api_key = None; // unready: requires a credential it doesn't have
+        let registry = registry_with_entries(vec![builtin, custom]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("bare id selection should resolve to the ready entry");
+
+        assert_eq!(selection.model_entry.model.provider, "openai");
+        let warning = selection
+            .fallback_message
+            .expect("skipping an unready custom provider should warn");
+        assert!(warning.contains("my-proxy"), "warning: {warning}");
+        assert!(warning.contains("shared-model"), "warning: {warning}");
     }
 
     #[test]
