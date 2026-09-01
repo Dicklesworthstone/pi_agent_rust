@@ -317,15 +317,27 @@ impl Theme {
 
         config.document.style.color = Some(self.colors.foreground.clone());
 
-        // Headings use accent color
+        // Headings use accent color. The glamour presets pair their heading
+        // foregrounds with a fixed ANSI background (H1 ships on ANSI-63
+        // purple); overriding only the foreground left theme-accent text on
+        // that preset background — unreadable for most accent colors (issue
+        // #195). Clear the preset backgrounds so headings render as accent
+        // on the document background.
         let accent = Some(self.colors.accent.clone());
         config.heading.style.color.clone_from(&accent);
+        config.heading.style.background_color = None;
         config.h1.style.color.clone_from(&accent);
+        config.h1.style.background_color = None;
         config.h2.style.color.clone_from(&accent);
+        config.h2.style.background_color = None;
         config.h3.style.color.clone_from(&accent);
+        config.h3.style.background_color = None;
         config.h4.style.color.clone_from(&accent);
+        config.h4.style.background_color = None;
         config.h5.style.color.clone_from(&accent);
+        config.h5.style.background_color = None;
         config.h6.style.color.clone_from(&accent);
+        config.h6.style.background_color = None;
 
         // Links
         config.link.color.clone_from(&accent);
@@ -1277,6 +1289,26 @@ mod tests {
         // Verify the configs are created without panic
         assert!(dark_config.document.style.color.is_some());
         assert!(light_config.document.style.color.is_some());
+    }
+
+    /// Issue #195: theme heading foregrounds must not sit on the glamour
+    /// presets' fixed ANSI heading backgrounds (accent-on-ANSI-63 is
+    /// unreadable); the preset backgrounds must be cleared.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn glamour_style_config_clears_preset_heading_backgrounds() {
+        for config in [
+            Theme::dark().glamour_style_config(),
+            Theme::light().glamour_style_config(),
+        ] {
+            assert!(config.heading.style.background_color.is_none());
+            assert!(config.h1.style.background_color.is_none());
+            assert!(config.h2.style.background_color.is_none());
+            assert!(config.h3.style.background_color.is_none());
+            assert!(config.h4.style.background_color.is_none());
+            assert!(config.h5.style.background_color.is_none());
+            assert!(config.h6.style.background_color.is_none());
+        }
     }
 
     mod proptest_theme {
