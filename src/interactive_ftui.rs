@@ -665,6 +665,81 @@ fn push_role_block(
     }
 }
 
+/// Whether a rendered markdown line is a spacing boundary for compact mode
+/// (issue #202): headings and code/math block content keep one line of air
+/// around them so they never visually merge with body text. Detection works
+/// off the theme styles the renderer stamps on those lines: code-family
+/// lines carry the block style on their first span (the indent span for
+/// highlighted code, the whole line otherwise, including whitespace-only
+/// interior code lines — which therefore never count as blanks); heading
+/// lines carry an `h1`–`h6` style on some span.
+fn compact_line_is_boundary(
+    line: &ftui::text::Line<'_>,
+    theme: &ftui_extras::markdown::MarkdownTheme,
+) -> bool {
+    let code_styles = [
+        theme.code_block,
+        theme.math_block,
+        // The "─── lang ───" fence header emitted for common languages.
+        theme.code_inline.dim(),
+    ];
+    let heading_styles = [
+        theme.h1, theme.h2, theme.h3, theme.h4, theme.h5, theme.h6,
+    ];
+    let Some(first_style) = line.spans().first().and_then(|span| span.style) else {
+        return false;
+    };
+    code_styles.contains(&first_style)
+        || line
+            .spans()
+            .iter()
+            .any(|span| span.style.is_some_and(|style| heading_styles.contains(&style)))
+}
+
+/// Compact spacing policy (issue #202): the markdown renderer emits one
+/// blank line after every block, which reads ~2x the content height in a
+/// transcript. Compact keeps a single blank only where one of the
+/// neighboring lines is a boundary (heading or fence — collapsing those
+/// gaps makes them merge with body text) and where the run trails the
+/// message (preserving today's separation from the next transcript entry);
+/// paragraph/list gaps collapse to nothing and multi-blank runs to at most
+/// one.
+fn apply_compact_spacing(
+    lines: Vec<ftui::text::Line<'static>>,
+    theme: &ftui_extras::markdown::MarkdownTheme,
+) -> Vec<ftui::text::Line<'static>> {
+    let mut out: Vec<ftui::text::Line<'static>> = Vec::with_capacity(lines.len());
+    let mut prev_boundary = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let boundary = compact_line_is_boundary(&lines[i], theme);
+        let blank = !boundary && lines[i].to_plain_text().trim().is_empty();
+        if !blank {
+            out.push(lines[i].clone());
+            prev_boundary = boundary;
+            i += 1;
+            continue;
+        }
+        // Measure the whole blank run, then decide once.
+        let mut j = i + 1;
+        while j < lines.len()
+            && !compact_line_is_boundary(&lines[j], theme)
+            && lines[j].to_plain_text().trim().is_empty()
+        {
+            j += 1;
+        }
+        let keep = !out.is_empty()
+            && lines
+                .get(j)
+                .is_none_or(|next| prev_boundary || compact_line_is_boundary(next, theme));
+        if keep {
+            out.push(ftui::text::Line::new());
+        }
+        i = j;
+    }
+    out
+}
+
 /// Live state of a tool-execution card (bd-cv653.9.2): a pending card
 /// flips to its terminal state IN PLACE when the tool ends, mirroring
 /// omp's state-tinted tool boxes. Bordered widget chrome lands with the
@@ -682,6 +757,12 @@ enum CardState {
 struct TranscriptEntry {
     role: EntryRole,
     text: String,
+    /// Render-cache key (issue #201): globally unique, monotonically
+    /// assigned at push and re-assigned on EVERY in-place mutation (card
+    /// state flips, head replacement, detail folds, read grouping). A
+    /// cached block is reusable iff its recorded revision still matches —
+    /// uniqueness makes index shifts from entry removal self-invalidating.
+    revision: u64,
     /// Set for tool-execution cards; `None` renders as a plain role block.
     /// Pairing key: the sanitized tool_id that ties ToolStart/ToolEnd/
     /// ToolInvocation events to this card (stable even when the head text
@@ -955,6 +1036,45 @@ pub struct PiFtuiModel {
     /// Loop-lag probe with render/input/agent-event attribution. Inert unless
     /// `PI_PERF_TELEMETRY=1`.
     watchdog: LoopWatchdog,
+    /// Monotonic source for [`TranscriptEntry::revision`] values (issue
+    /// #201). Every push and every in-place entry mutation takes the next
+    /// value, so a revision seen once in the render cache can never label
+    /// different content.
+    transcript_revision: u64,
+    /// Per-entry rendered-line cache, index-aligned with `transcript`
+    /// (issue #201): reuses a block's styled lines while its revision
+    /// matches, so a frame re-renders only changed entries plus the
+    /// in-flight streaming tail instead of the whole transcript. Interior
+    /// mutability because `view()` builds frames through `&self`. Cleared
+    /// whenever the styling inputs change (theme picker) — the markdown
+    /// renderer itself is width-independent, so resizes need no flush.
+    render_cache: std::cell::RefCell<Vec<Option<CachedBlock>>>,
+    /// `(rendered, reused)` block counts from the most recent
+    /// `conversation_text()` pass — the observable that keeps the cache
+    /// honest in tests (O(changed) per frame, not O(transcript)).
+    render_stats: std::cell::Cell<(usize, usize)>,
+    /// Busy label for a long out-of-turn driver operation (issue #203):
+    /// session load/new, model switch, compaction, extension commands.
+    /// While set, the status region animates the shared spinner with this
+    /// label even though no agent turn is running; any driver reply clears
+    /// it (the driver is sequential, so the next non-tick message belongs
+    /// to the in-flight operation).
+    busy: Option<String>,
+    /// Set when `begin_busy` arms an operation; the key handler that
+    /// triggered it converts this into the spinner tick chain (`update()`
+    /// owns Cmd returns, the routing helpers don't).
+    busy_tick_pending: bool,
+    /// Transcript markdown spacing policy (issue #202), resolved from
+    /// `markdown.spacing` in settings at launch.
+    markdown_spacing: crate::config::MarkdownSpacing,
+}
+
+/// One cached transcript block (issue #201): the styled lines produced for
+/// the entry whose revision is recorded here.
+#[derive(Debug)]
+struct CachedBlock {
+    revision: u64,
+    lines: Vec<ftui::text::Line<'static>>,
 }
 
 /// Vertical frame regions, top to bottom. The clamp/normalize string hacks of
@@ -1034,6 +1154,12 @@ impl PiFtuiModel {
             alt_screen: false,
             suspending: false,
             watchdog: LoopWatchdog::new(),
+            transcript_revision: 0,
+            render_cache: std::cell::RefCell::new(Vec::new()),
+            render_stats: std::cell::Cell::new((0, 0)),
+            busy: None,
+            busy_tick_pending: false,
+            markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
             #[cfg(test)]
             suspend_task_override: None,
             input: TextArea::new()
@@ -1049,6 +1175,13 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_submit_channel(mut self, tx: Sender<UiCommand>) -> Self {
         self.submit_tx = Some(tx);
+        self
+    }
+
+    /// Set the transcript markdown spacing policy (issue #202).
+    #[must_use]
+    pub fn with_markdown_spacing(mut self, spacing: crate::config::MarkdownSpacing) -> Self {
+        self.markdown_spacing = spacing;
         self
     }
 
@@ -1155,10 +1288,20 @@ impl PiFtuiModel {
         transcript + streaming
     }
 
+    /// Next globally-unique transcript revision (issue #201). Taken at push
+    /// and at every in-place entry mutation so the render cache can trust a
+    /// matching revision completely.
+    fn next_revision(&mut self) -> u64 {
+        self.transcript_revision += 1;
+        self.transcript_revision
+    }
+
     fn push_entry(&mut self, role: EntryRole, text: String) {
+        let revision = self.next_revision();
         self.transcript.push(TranscriptEntry {
             role,
             text,
+            revision,
             card: None,
             pair_key: None,
             detail: None,
@@ -1172,9 +1315,11 @@ impl PiFtuiModel {
     /// (stable across head-text replacement by invocation summaries);
     /// `display` is the sanitized initial head (the tool name).
     fn push_tool_card(&mut self, pair_id: &str, display: &str, sanitized_name: &str) {
+        let revision = self.next_revision();
         self.transcript.push(TranscriptEntry {
             role: EntryRole::System,
             text: display.to_string(),
+            revision,
             card: Some(CardState::Pending),
             pair_key: Some(pair_id.to_string()),
             detail: None,
@@ -1190,11 +1335,15 @@ impl PiFtuiModel {
     /// leftover pending cards as errors so the transcript never shows a
     /// tool that is "still running" after the turn is over.
     fn settle_pending_cards(&mut self) {
+        let mut revision = self.transcript_revision;
         for entry in &mut self.transcript {
             if entry.card == Some(CardState::Pending) {
                 entry.card = Some(CardState::Err);
+                revision += 1;
+                entry.revision = revision;
             }
         }
+        self.transcript_revision = revision;
     }
 
     fn finish_tool_card(
@@ -1213,7 +1362,9 @@ impl PiFtuiModel {
             self.push_entry(EntryRole::System, format!("{mark} {display_name}"));
             return;
         };
+        let revision = self.next_revision();
         self.transcript[idx].card = Some(if ok { CardState::Ok } else { CardState::Err });
+        self.transcript[idx].revision = revision;
         if let Some(output) = sanitized_output {
             self.transcript[idx].detail = Some(output);
             self.transcript[idx].diff_styled = diff_styled;
@@ -1228,10 +1379,12 @@ impl PiFtuiModel {
         if ok && display_name == "read" && idx > 0 {
             let prev = &self.transcript[idx - 1];
             if prev.card == Some(CardState::Ok) && prev.tool_name.as_deref() == Some("read") {
+                let revision = self.next_revision();
                 self.transcript[idx - 1].group_count += 1;
                 // A grouped card can't show one file's summary as its head:
                 // render the generic name ("read ×N") once merging starts.
                 self.transcript[idx - 1].text = "read".to_string();
+                self.transcript[idx - 1].revision = revision;
                 self.transcript.remove(idx);
             }
         }
@@ -1243,6 +1396,7 @@ impl PiFtuiModel {
     /// open bash card exists (caller falls back to a plain block).
     fn fold_bash_detail(&mut self, sanitized_display: &str) -> bool {
         const MAX_DETAIL_LINES: usize = 8;
+        let revision = self.next_revision();
         let Some(entry) =
             self.transcript.iter_mut().rev().find(|e| {
                 e.card == Some(CardState::Pending) && e.tool_name.as_deref() == Some("bash")
@@ -1260,6 +1414,7 @@ impl PiFtuiModel {
             let _ = write!(collected, "\n… +{} more lines", total - MAX_DETAIL_LINES);
         }
         entry.detail = Some(collected);
+        entry.revision = revision;
         true
     }
 
@@ -1291,6 +1446,22 @@ impl PiFtuiModel {
 
     #[allow(clippy::too_many_lines)]
     fn handle_agent(&mut self, msg: PiMsg) -> Cmd<PiFtuiMsg> {
+        // A busy out-of-turn operation (issue #203) is over once the
+        // sequential driver replies with anything of substance. Background
+        // ticks don't count, and neither does the in-progress chatter of an
+        // extension command's own tool card (its ToolEnd/System reply is
+        // what settles it).
+        if self.busy.is_some()
+            && !matches!(
+                msg,
+                PiMsg::AutocompleteRefresh
+                    | PiMsg::ToolStart { .. }
+                    | PiMsg::ToolInvocation { .. }
+                    | PiMsg::ToolUpdate { .. }
+            )
+        {
+            self.busy = None;
+        }
         match msg {
             PiMsg::AgentStart => {
                 self.state = AgentUiState::Working;
@@ -1322,11 +1493,13 @@ impl PiFtuiModel {
                 // the text change.
                 let pair = sanitize(&tool_id).into_owned();
                 let summary = sanitize(&summary).into_owned();
+                let revision = self.next_revision();
                 if let Some(entry) = self.transcript.iter_mut().rev().find(|e| {
                     e.card == Some(CardState::Pending)
                         && e.pair_key.as_deref() == Some(pair.as_str())
                 }) {
                     entry.text = summary;
+                    entry.revision = revision;
                 }
             }
             PiMsg::ToolEnd {
@@ -1633,6 +1806,7 @@ impl PiFtuiModel {
                 && !model.is_empty()
             {
                 self.push_entry(EntryRole::System, format!("switching model to {spec} ..."));
+                self.begin_busy(format!("switching model to {spec} ..."));
                 self.send_command(UiCommand::SetModel {
                     provider: provider.to_string(),
                     model: model.to_string(),
@@ -1707,6 +1881,7 @@ impl PiFtuiModel {
                 EntryRole::System,
                 String::from("compacting conversation ..."),
             );
+            self.begin_busy("compacting conversation ...");
             self.send_command(UiCommand::Compact);
             return true;
         }
@@ -1722,6 +1897,7 @@ impl PiFtuiModel {
                 EntryRole::System,
                 String::from("fetching provider usage ..."),
             );
+            self.begin_busy("fetching provider usage ...");
             self.send_command(UiCommand::Usage { refresh });
             return true;
         }
@@ -1788,6 +1964,7 @@ impl PiFtuiModel {
         let (cmd_name, cmd_args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
         match cmd_name.to_ascii_lowercase().as_str() {
             "/new" => {
+                self.begin_busy("starting new session ...");
                 self.send_command(UiCommand::NewSession);
                 return true;
             }
@@ -1797,6 +1974,7 @@ impl PiFtuiModel {
                 // mid-turn — the editor gate (`input_active`) already blocks
                 // input while the agent works.
                 self.transcript.clear();
+                self.render_cache.borrow_mut().clear();
                 self.streaming.clear();
                 self.thinking.clear();
                 self.current_tool = None;
@@ -1843,6 +2021,7 @@ impl PiFtuiModel {
             if name.is_empty() {
                 self.push_entry(EntryRole::Error, String::from("Unknown command: /"));
             } else {
+                self.begin_busy(format!("running /{name} ..."));
                 self.send_command(UiCommand::ExtensionCommand {
                     name: name.to_string(),
                     args: args.trim().to_string(),
@@ -1892,6 +2071,9 @@ impl PiFtuiModel {
                     crate::theme::Theme::dark()
                 };
                 self.palette = FtuiPalette::from_theme(&theme);
+                // Role styling is palette-derived: drop every cached block
+                // so the whole transcript re-renders under the new theme.
+                self.render_cache.borrow_mut().clear();
                 self.push_entry(EntryRole::System, format!("theme set to {choice}"));
                 self.scroll_from_tail = 0;
             }
@@ -1902,6 +2084,7 @@ impl PiFtuiModel {
                         format!("switching model to {choice} ..."),
                     );
                     self.scroll_from_tail = 0;
+                    self.begin_busy(format!("switching model to {choice} ..."));
                     self.send_command(UiCommand::SetModel {
                         provider: provider.to_string(),
                         model: model.to_string(),
@@ -1913,6 +2096,7 @@ impl PiFtuiModel {
             PickerKind::Session => {
                 self.push_entry(EntryRole::System, String::from("resuming session ..."));
                 self.scroll_from_tail = 0;
+                self.begin_busy("loading session ...");
                 self.send_command(UiCommand::ResumeSession {
                     path: choice.to_string(),
                 });
@@ -1928,6 +2112,38 @@ impl PiFtuiModel {
         }
     }
 
+    /// Arm the busy indicator for a long out-of-turn driver operation
+    /// (issue #203): the status region animates the shared spinner with
+    /// `label` until the driver replies. Call right before/after sending
+    /// the matching [`UiCommand`]; the key handler that routed the input
+    /// turns the pending flag into the spinner tick chain.
+    fn begin_busy(&mut self, label: impl Into<String>) {
+        self.busy = Some(label.into());
+        self.busy_tick_pending = true;
+    }
+
+    /// Convert a freshly armed busy operation into the tick command that
+    /// starts the spinner chain (`Cmd::none()` when nothing was armed).
+    /// Split from [`Self::begin_busy`] because the routing helpers return
+    /// `bool`/`()` — only `update()`'s key paths own Cmd returns.
+    fn take_busy_tick(&mut self) -> Cmd<PiFtuiMsg> {
+        if std::mem::take(&mut self.busy_tick_pending) {
+            Cmd::tick(SPINNER_INTERVAL)
+        } else {
+            Cmd::none()
+        }
+    }
+
+    /// Whether any tool card is still pending — those animate with the
+    /// shared spinner frame, so ticks must keep flowing for them even when
+    /// no turn is running (extension commands render a card out-of-turn).
+    fn has_pending_cards(&self) -> bool {
+        self.transcript
+            .iter()
+            .rev()
+            .any(|entry| entry.card == Some(CardState::Pending))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
         match event {
@@ -1938,9 +2154,14 @@ impl PiFtuiModel {
                 if self.suspending {
                     return Cmd::none();
                 }
-                // Spinner heartbeat: advance and reschedule only while the
-                // agent is working, so idle sessions stay fully parked.
-                if self.state == AgentUiState::Working {
+                // Spinner heartbeat: advance and reschedule only while
+                // something animated needs it — a working turn, an
+                // out-of-turn busy operation (issue #203), or a pending
+                // tool card — so idle sessions stay fully parked.
+                if self.state == AgentUiState::Working
+                    || self.busy.is_some()
+                    || self.has_pending_cards()
+                {
                     self.spinner.tick();
                     return Cmd::tick(SPINNER_INTERVAL);
                 }
@@ -1972,7 +2193,9 @@ impl PiFtuiModel {
                 // as the bubbletea modal-capture chain).
                 if self.picker.is_some() {
                     self.handle_picker_key(key);
-                    return Cmd::none();
+                    // A picker selection may have armed a busy operation
+                    // (model switch, session load); start its spinner chain.
+                    return self.take_busy_tick();
                 }
 
                 // Resolve through the shared keybinding catalog so user
@@ -2060,7 +2283,9 @@ impl PiFtuiModel {
                                 return Cmd::quit();
                             }
                         }
-                        return Cmd::none();
+                        // A routed slash command may have armed a busy
+                        // operation (issue #203); start its spinner chain.
+                        return self.take_busy_tick();
                     }
                     Some(AppAction::NewLine) if self.input_active() => {
                         self.input.insert_newline();
@@ -2180,6 +2405,7 @@ impl PiFtuiModel {
         status: Option<String>,
     ) {
         self.transcript.clear();
+        self.render_cache.borrow_mut().clear();
         self.streaming.clear();
         for message in messages {
             let role = match message.role {
@@ -2288,18 +2514,31 @@ impl PiFtuiModel {
     fn conversation_text(&self) -> Text<'static> {
         // Assistant output always renders as markdown, matching the glamour
         // treatment in the bubbletea stack (auto-detection would leave short
-        // or mostly-plain replies unstyled).
-        let md = ftui_extras::markdown::MarkdownRenderer::new(
-            ftui_extras::markdown::MarkdownTheme::default(),
-        );
+        // or mostly-plain replies unstyled). The renderer takes no width, so
+        // cached blocks survive resizes untouched.
+        let theme = ftui_extras::markdown::MarkdownTheme::default();
+        let md = ftui_extras::markdown::MarkdownRenderer::new(theme.clone());
         let palette = self.palette;
+        let compact = self.markdown_spacing == crate::config::MarkdownSpacing::Compact;
+        // Per-entry render cache (issue #201): reuse each block's styled
+        // lines while its revision matches, so a frame costs O(changed
+        // entries + streaming tail) markdown renders, not O(transcript).
+        let mut cache = self.render_cache.borrow_mut();
+        cache.resize_with(self.transcript.len(), || None);
+        let mut rendered_blocks = 0_usize;
+        let mut reused_blocks = 0_usize;
         let mut lines: Vec<ftui::text::Line<'static>> =
             Vec::with_capacity(self.conversation_line_count());
-        for entry in &self.transcript {
-            if let Some(state) = entry.card {
+        for (idx, entry) in self.transcript.iter().enumerate() {
+            if entry.card == Some(CardState::Pending) {
+                // Pending cards animate with the shared spinner frame, so
+                // their lines are frame-dependent: always render fresh and
+                // leave no stale cache slot behind.
+                cache[idx] = None;
+                rendered_blocks += 1;
                 push_card_block(
                     &mut lines,
-                    state,
+                    CardState::Pending,
                     &entry.text,
                     entry.detail.as_ref(),
                     entry.diff_styled,
@@ -2309,13 +2548,49 @@ impl PiFtuiModel {
                 );
                 continue;
             }
-            push_role_block(&mut lines, entry.role, &entry.text, &palette, &md);
+            if let Some(block) = cache[idx].as_ref()
+                && block.revision == entry.revision
+            {
+                reused_blocks += 1;
+                lines.extend(block.lines.iter().cloned());
+                continue;
+            }
+            rendered_blocks += 1;
+            let mut block_lines: Vec<ftui::text::Line<'static>> = Vec::new();
+            if let Some(state) = entry.card {
+                push_card_block(
+                    &mut block_lines,
+                    state,
+                    &entry.text,
+                    entry.detail.as_ref(),
+                    entry.diff_styled,
+                    entry.group_count,
+                    &palette,
+                    self.spinner.current_frame,
+                );
+            } else {
+                push_role_block(&mut block_lines, entry.role, &entry.text, &palette, &md);
+                if compact && entry.role == EntryRole::Assistant {
+                    block_lines = apply_compact_spacing(block_lines, &theme);
+                }
+            }
+            lines.extend(block_lines.iter().cloned());
+            cache[idx] = Some(CachedBlock {
+                revision: entry.revision,
+                lines: block_lines,
+            });
         }
+        self.render_stats.set((rendered_blocks, reused_blocks));
         if !self.streaming.is_empty() {
             // Streaming fragments may end mid-construct; the streaming
-            // renderer is tolerant of unterminated markdown.
+            // renderer is tolerant of unterminated markdown. The in-flight
+            // tail is deliberately uncached — it changes every delta.
             let rendered = md.render_streaming(&self.streaming);
-            lines.extend(rendered.lines().iter().cloned());
+            if compact {
+                lines.extend(apply_compact_spacing(rendered.lines().to_vec(), &theme));
+            } else {
+                lines.extend(rendered.lines().iter().cloned());
+            }
         }
         Text::from_lines(lines)
     }
@@ -2446,7 +2721,8 @@ impl PiFtuiModel {
             .render(regions.banner, frame);
         }
         // Status region. While working: spinner + activity (tool > thinking >
-        // responding). While idle: the todo summary.
+        // responding). While a long out-of-turn driver operation runs
+        // (issue #203): spinner + its label. While idle: the todo summary.
         let status_line = if self.state == AgentUiState::Working {
             let spin = DOTS[self.spinner.current_frame % DOTS.len()];
             let activity = self.current_tool.as_ref().map_or_else(
@@ -2460,13 +2736,16 @@ impl PiFtuiModel {
                 |tool| format!("running {tool} ..."),
             );
             format!("{spin} {activity}")
+        } else if let Some(busy) = &self.busy {
+            let spin = DOTS[self.spinner.current_frame % DOTS.len()];
+            format!("{spin} {busy}")
         } else {
             self.todo_summary
                 .as_ref()
                 .map_or_else(String::new, |todo| format!("todo {todo}"))
         };
         if !status_line.is_empty() {
-            let status_style = if self.state == AgentUiState::Working {
+            let status_style = if self.state == AgentUiState::Working || self.busy.is_some() {
                 ftui::Style::new().fg(self.palette.warning)
             } else {
                 ftui::Style::new().dim().fg(self.palette.muted)
@@ -3797,6 +4076,7 @@ pub fn run(
     inline: bool,
     available_models: Vec<String>,
     available_sessions: Vec<(String, String)>,
+    markdown_spacing: crate::config::MarkdownSpacing,
 ) -> std::io::Result<()> {
     const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
@@ -4000,6 +4280,7 @@ pub fn run(
         .with_available_models(available_models)
         .with_available_sessions(available_sessions)
         .with_alt_screen(!inline)
+        .with_markdown_spacing(markdown_spacing)
         .with_ext_reply_channel(ext_reply_tx);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen

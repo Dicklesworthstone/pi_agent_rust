@@ -595,6 +595,22 @@ pub struct MarkdownSettings {
         deserialize_with = "deserialize_code_block_indent_option"
     )]
     pub code_block_indent: Option<u8>,
+    /// Vertical spacing policy for rendered markdown in the transcript
+    /// (issue #202): "comfortable" (default) keeps the renderer's blank line
+    /// after every block; "compact" drops the blanks between paragraphs and
+    /// list items while keeping one line of air around headings and fences.
+    pub spacing: Option<MarkdownSpacing>,
+}
+
+/// Inter-block spacing policy for transcript markdown (issue #202).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkdownSpacing {
+    /// Renderer default: one blank line after every block.
+    #[default]
+    Comfortable,
+    /// Blank lines survive only around headings and code fences.
+    Compact,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1170,6 +1186,15 @@ impl Config {
             .unwrap_or(2)
     }
 
+    /// Resolved transcript markdown spacing policy (issue #202).
+    #[must_use]
+    pub fn markdown_spacing(&self) -> MarkdownSpacing {
+        self.markdown
+            .as_ref()
+            .and_then(|m| m.spacing)
+            .unwrap_or_default()
+    }
+
     pub fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands.unwrap_or(true)
     }
@@ -1624,6 +1649,7 @@ fn merge_markdown(
     match (base, other) {
         (Some(base), Some(other)) => Some(MarkdownSettings {
             code_block_indent: other.code_block_indent.or(base.code_block_indent),
+            spacing: other.spacing.or(base.spacing),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

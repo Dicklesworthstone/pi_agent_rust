@@ -2305,8 +2305,15 @@ async fn run(
                     (label, meta.path)
                 })
                 .collect::<Vec<_>>();
-            pi::interactive_ftui::run(options, &theme, cli.inline, ftui_models, ftui_sessions)
-                .map_err(Into::into)
+            pi::interactive_ftui::run(
+                options,
+                &theme,
+                cli.inline,
+                ftui_models,
+                ftui_sessions,
+                config.markdown_spacing(),
+            )
+            .map_err(Into::into)
         }
         #[cfg(not(feature = "ftui"))]
         unreachable!("ftui_requested is false without the ftui feature")
