@@ -289,6 +289,26 @@ fn render_header_uses_cycle_thinking_binding_hint() {
     );
 }
 
+/// Issue #200: a named session (via `/name` or a resumed named session)
+/// titles the terminal tab after itself; unnamed sessions keep the model
+/// label (pinned by `render_header_uses_cycle_thinking_binding_hint`).
+#[test]
+fn render_header_titles_terminal_after_session_name() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    {
+        let mut session = app.session.try_lock().expect("session lock");
+        session.set_name("refactor-plan");
+    }
+
+    let header = app.render_header();
+    assert!(
+        header.contains("\x1b]0;Pi · refactor-plan · ready\x07"),
+        "named session must title the tab after itself: {header:?}"
+    );
+}
+
 #[test]
 fn live_view_renders_default_welcome_and_powerline_status() {
     let dir = tempdir();
@@ -738,6 +758,35 @@ fn todo_summary_message_drives_footer_line() {
 
 /// bd-cv653.3.8: an ask card owns the input line — the question renders as a
 /// system card, numbered answers advance through the questions, and answers
+/// Issue #197: `/new` must restore the configured default thinking level
+/// (clamped to the model), not hard-code `off`.
+#[test]
+fn new_session_thinking_level_resolves_configured_default() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+
+    app.config.default_thinking_level = Some("max".to_string());
+    assert_eq!(
+        app.new_session_thinking_level(),
+        app.model_entry
+            .clamp_thinking_level(crate::model::ThinkingLevel::Max)
+    );
+
+    app.config.default_thinking_level = Some("low".to_string());
+    assert_eq!(
+        app.new_session_thinking_level(),
+        crate::model::ThinkingLevel::Low
+    );
+
+    // Unset resolves exactly like launch: XHigh clamped to the model.
+    app.config.default_thinking_level = None;
+    assert_eq!(
+        app.new_session_thinking_level(),
+        app.model_entry
+            .clamp_thinking_level(crate::model::ThinkingLevel::XHigh)
+    );
+}
+
 /// route to AskTool::respond_ui (an expired request surfaces a status).
 #[test]
 fn ask_card_consumes_input_and_advances_questions() {

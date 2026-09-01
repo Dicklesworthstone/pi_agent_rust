@@ -1372,12 +1372,24 @@ impl PiApp {
     /// Rebuild the conversation viewport after a height change (terminal resize or
     /// input area growth). Preserves mouse-wheel settings and scroll position.
     fn resize_conversation_viewport(&mut self) {
+        let follow_tail = self.follow_stream_tail;
+        let saved_offset = self.conversation_viewport.y_offset();
         let viewport_height = self.conversation_viewport_height();
         let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
         viewport.mouse_wheel_enabled = true;
         viewport.mouse_wheel_delta = 1;
         self.conversation_viewport = viewport;
-        self.scroll_to_bottom();
+        if follow_tail {
+            self.scroll_to_bottom();
+        } else {
+            // Issue #206: a resize (or input-area growth, which routes here
+            // too) used to snap the view to the bottom unconditionally,
+            // throwing away the user's reading position. Rebuild the content
+            // at the new size, then restore the offset — set_y_offset clamps
+            // to the new maximum, so a shrunken viewport stays in range.
+            self.refresh_conversation_viewport(false);
+            self.conversation_viewport.set_y_offset(saved_offset);
+        }
     }
 
     pub fn set_terminal_size(&mut self, width: usize, height: usize) {
@@ -1934,6 +1946,12 @@ pub enum PiMsg {
     },
     /// Internal: shut down the async→UI message bridge (used for clean exit).
     UiShutdown,
+    /// Host-driven terminal (tab) title update (issue #200). Emitted by
+    /// driver commands (`/name`, `/resume`, `/new`) for surfaces whose
+    /// renderer cannot embed OSC sequences in frame content (ftui); the
+    /// charmed stack ignores it because its header re-emits the title every
+    /// frame.
+    TerminalTitle(String),
     /// Periodic autocomplete refresh tick (background file index).
     AutocompleteRefresh,
     /// Text delta from assistant.
@@ -2496,6 +2514,12 @@ pub struct PiApp {
     /// Set to false when the user manually scrolls up; re-enabled when they
     /// scroll back to the bottom or a new user message is submitted.
     follow_stream_tail: bool,
+    /// Last thinking level successfully read from the session header for the
+    /// input-frame badge. The render path uses `try_lock`, and falling back
+    /// to the config default whenever the agent holds the session lock made
+    /// the badge flicker between the session's real level and the default
+    /// mid-turn (issue #197). `Cell` because the render path takes `&self`.
+    thinking_badge_cache: std::cell::Cell<Option<ThinkingLevel>>,
     /// `/btw` side-question client on the smol role (bd-cv653.3.16);
     /// `None` when the role does not resolve or lacks credentials.
     btw_client: Option<Arc<pi::btw::BtwClient>>,
@@ -2944,6 +2968,7 @@ impl PiApp {
             injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,
             follow_stream_tail: true,
+            thinking_badge_cache: std::cell::Cell::new(None),
             btw_client: None,
             btw_factory: None,
             spinner,

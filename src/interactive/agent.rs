@@ -946,10 +946,12 @@ impl PiApp {
                 }
                 return self.handle_pi_message_with_session_retry(*event, attempts_remaining);
             }
-            PiMsg::UiShutdown => {
-                // Internal signal for shutting down the async→UI bridge; should not normally reach
-                // the UI event loop, but handle it defensively.
-            }
+            // UiShutdown: internal signal for shutting down the async→UI
+            // bridge; should not normally reach the UI event loop, but handle
+            // it defensively. TerminalTitle: driver-pushed title updates are
+            // an ftui affordance (issue #200) — the charmed stack re-emits
+            // the terminal title from render_header every frame.
+            PiMsg::UiShutdown | PiMsg::TerminalTitle(_) => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();

@@ -694,7 +694,19 @@ impl PiApp {
             AgentState::Processing => "processing",
             AgentState::ToolRunning => "tool",
         };
-        let terminal_title = format!("Pi · {} · {activity}", self.model);
+        // Issue #200: a `/name`d (or resumed named) session titles the
+        // terminal tab after itself; unnamed sessions keep the model label.
+        // The header re-renders every frame, so both `/name` and resume are
+        // covered without extra hooks.
+        let session_name = self
+            .session
+            .try_lock()
+            .ok()
+            .and_then(|session| session.get_name());
+        let terminal_title = session_name.map_or_else(
+            || format!("Pi · {} · {activity}", self.model),
+            |name| format!("Pi · {name} · {activity}"),
+        );
         output.push_str(&crate::delight::format_terminal_title(&terminal_title));
 
         let _ = write!(
@@ -715,22 +727,43 @@ impl PiApp {
         buf
     }
 
+    /// Thinking level for the input-frame badge.
+    ///
+    /// Issue #197: only re-resolve when the session header is actually
+    /// readable. Under lock contention (agent mid-turn) the old code
+    /// silently fell back to the config default, flipping the badge between
+    /// the session's real level and the default; reuse the last successfully
+    /// read level instead.
+    fn thinking_badge_level(&self) -> ThinkingLevel {
+        self.session.try_lock().ok().map_or_else(
+            || {
+                self.thinking_badge_cache
+                    .get()
+                    .unwrap_or(ThinkingLevel::Off)
+            },
+            |guard| {
+                let level = guard
+                    .header
+                    .thinking_level
+                    .as_deref()
+                    .and_then(|level| level.parse::<ThinkingLevel>().ok())
+                    .or_else(|| {
+                        self.config
+                            .default_thinking_level
+                            .as_deref()
+                            .and_then(|level| level.parse::<ThinkingLevel>().ok())
+                    })
+                    .unwrap_or(ThinkingLevel::Off);
+                self.thinking_badge_cache.set(Some(level));
+                level
+            },
+        )
+    }
+
     pub(super) fn render_input(&self) -> String {
         let mut output = String::new();
 
-        let thinking_level = self
-            .session
-            .try_lock()
-            .ok()
-            .and_then(|guard| guard.header.thinking_level.clone())
-            .and_then(|level| level.parse::<ThinkingLevel>().ok())
-            .or_else(|| {
-                self.config
-                    .default_thinking_level
-                    .as_deref()
-                    .and_then(|level| level.parse::<ThinkingLevel>().ok())
-            })
-            .unwrap_or(ThinkingLevel::Off);
+        let thinking_level = self.thinking_badge_level();
 
         let input_text = self.input.value();
         let is_bash_mode = parse_bash_command(&input_text).is_some();

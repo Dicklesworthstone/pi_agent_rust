@@ -908,6 +908,10 @@ pub struct PiFtuiModel {
     ext_reply_tx: Option<Sender<ExtensionUiResponse>>,
     /// Where completed ask interactions go (launch path calls respond_ui).
     ask_reply_tx: Option<Sender<AskUiReply>>,
+    /// Abort handle for the driver's in-flight prompt turn (issue #205).
+    /// `run_prompt_turn` installs a fresh handle per turn; Ctrl-C fires it so
+    /// exit doesn't block on the provider stream and remaining tool calls.
+    turn_abort: Option<TurnAbortSlot>,
     /// Terminal size, tracked from `Event::Resize` (cols, rows).
     term: (u16, u16),
     /// Conversation scroll, measured in lines UP from the tail. 0 means
@@ -915,6 +919,17 @@ pub struct PiFtuiModel {
     /// semantics as `follow_stream_tail` in the bubbletea stack, but derived
     /// instead of stored so update() never needs the rendered line count.
     scroll_from_tail: usize,
+    /// Total rendered conversation lines from the last frame. Markdown
+    /// rendering expands the raw text (blank lines after blocks, fence
+    /// chrome), so the raw-line approximation in `conversation_line_count()`
+    /// badly undercounts the real scroll range — clamping against it made
+    /// PageUp stall partway up and made any resize collapse the scroll
+    /// position (issue #206). The view records the authoritative total here
+    /// each frame (a `Cell` because `view()` takes `&self`) and
+    /// `max_scroll_from_tail()` prefers it. Visible rows are still derived
+    /// from the live terminal size so a resize re-clamps against fresh
+    /// geometry rather than the pre-resize frame.
+    rendered_total_lines: std::cell::Cell<usize>,
     /// The input editor (ftui-widgets TextArea replaces bubbles TextArea).
     input: TextArea,
     /// Where submitted user input goes. The launch path hands the sending
@@ -1010,8 +1025,10 @@ impl PiFtuiModel {
             card_draft_snapshot: None,
             ext_reply_tx: None,
             ask_reply_tx: None,
+            turn_abort: None,
             term: (80, 24),
             scroll_from_tail: 0,
+            rendered_total_lines: std::cell::Cell::new(0),
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
 
             alt_screen: false,
@@ -1032,6 +1049,14 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_submit_channel(mut self, tx: Sender<UiCommand>) -> Self {
         self.submit_tx = Some(tx);
+        self
+    }
+
+    /// Share the driver's in-flight-turn abort slot so Ctrl-C can cancel the
+    /// running prompt instead of waiting out the full turn (issue #205).
+    #[must_use]
+    pub fn with_turn_abort(mut self, slot: TurnAbortSlot) -> Self {
+        self.turn_abort = Some(slot);
         self
     }
 
@@ -1239,9 +1264,18 @@ impl PiFtuiModel {
     }
 
     /// Cap for `scroll_from_tail`: can't scroll further up than the content.
+    ///
+    /// Uses the rendered total recorded by the last `view()` frame — the
+    /// raw-line approximation only fills in before the first frame renders.
+    /// The recorded total is at most one frame stale (every scroll/resize
+    /// event triggers a redraw), and the view re-clamps against the exact
+    /// total when drawing.
     fn max_scroll_from_tail(&self) -> usize {
-        self.conversation_line_count()
-            .saturating_sub(self.body_height())
+        let total = match self.rendered_total_lines.get() {
+            0 => self.conversation_line_count(),
+            rendered => rendered,
+        };
+        total.saturating_sub(self.body_height())
     }
 
     fn scroll_up(&mut self, lines: usize) {
@@ -1424,6 +1458,18 @@ impl PiFtuiModel {
                 }
             }
             PiMsg::UiShutdown => return Cmd::quit(),
+            PiMsg::TerminalTitle(title) => {
+                // Issue #200: the cell-grid renderer can't carry OSC escapes
+                // in frame content, so write the title directly. This runs on
+                // the UI thread — the same thread that owns renderer writes —
+                // so the sequence cannot interleave with a frame.
+                use std::io::Write as _;
+
+                let sequence = crate::delight::format_terminal_title(&title);
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(sequence.as_bytes());
+                let _ = out.flush();
+            }
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
             _ => {}
@@ -1908,6 +1954,17 @@ impl PiFtuiModel {
                 let ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL);
                 if ctrl_c {
+                    // Issue #205: cancel the in-flight turn before quitting;
+                    // otherwise teardown blocks on the driver joining a full
+                    // provider stream plus remaining tool calls.
+                    if let Some(slot) = &self.turn_abort
+                        && let Some(handle) = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                    {
+                        handle.abort();
+                    }
                     return Cmd::quit();
                 }
 
@@ -2366,6 +2423,9 @@ impl PiFtuiModel {
         let body_text = self.conversation_text();
         let total_lines = body_text.lines().len();
         let visible = usize::from(regions.body.height).max(1);
+        // Record the authoritative total for update()'s scroll clamping
+        // (issue #206); see `rendered_total_lines`.
+        self.rendered_total_lines.set(total_lines);
         let from_tail = self
             .scroll_from_tail
             .min(total_lines.saturating_sub(visible));
@@ -2817,6 +2877,11 @@ fn install_ask_bridges(
 /// whatever tool is current when the reply arrives.
 type CurrentAsk = Arc<Mutex<Option<crate::ask::AskTool>>>;
 
+/// Shared slot holding the abort handle for the driver's in-flight prompt
+/// turn (issue #205): the driver installs a handle per turn, the UI thread
+/// fires it on Ctrl-C.
+type TurnAbortSlot = Arc<Mutex<Option<crate::agent::AbortHandle>>>;
+
 /// Install the per-handle half of the ask bridge: a channel picker surface on
 /// the tool plus a forwarder task that turns cards into `PiMsg::AskUiRequest`.
 /// The forwarder dies naturally when the handle (and its ask tool clones)
@@ -2908,16 +2973,26 @@ async fn run_prompt_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
     agent_tx: &Sender<PiMsg>,
+    turn_abort: &TurnAbortSlot,
 ) {
     // ubs:ignore Sender clone per turn — the event callback must own its sender
     let tx = agent_tx.clone();
+    // Issue #205: install a per-turn abort handle the UI thread can fire on
+    // Ctrl-C, so exit doesn't wait out the provider stream and tool calls.
+    let (abort_handle, abort_signal) = crate::sdk::AgentSessionHandle::new_abort_handle();
+    *turn_abort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(abort_handle);
     let result = handle
-        .prompt(prompt, move |event| {
+        .prompt_with_abort(prompt, abort_signal, move |event| {
             for msg in agent_event_to_pi_msgs(&event) {
                 let _ = tx.send(msg);
             }
         })
         .await;
+    *turn_abort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     if let Err(err) = result {
         let _ = agent_tx.send(PiMsg::AgentError(err.to_string()));
     }
@@ -3163,7 +3238,9 @@ async fn complete_replacement_after_shutdown(
 
 /// Handle `/new` in the driver: build a fresh session from the launch
 /// template with the CURRENT provider/model selection preserved and thinking
-/// reset to off (SlashCommand::New parity). MCP activation is deferred until
+/// restored to the launch/configured default (issue #197: it used to be
+/// force-reset to off, so a `defaultThinkingLevel: max` setup showed
+/// "[thinking: off]" on every new session). MCP activation is deferred until
 /// after the old handle completes awaited shutdown so singleton servers never
 /// overlap and the previous session flushes before replacement.
 /// Construction failures surface as UI errors and keep the current session.
@@ -3182,7 +3259,8 @@ async fn new_session_command(
     options.session_path = None;
     options.extension_ui_handler =
         Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
-    options.thinking = Some(crate::model::ThinkingLevel::Off);
+    // `template.thinking` carries the launch selection; `None` lets session
+    // creation re-resolve the configured default (issue #197).
     options.no_session = false;
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
@@ -3219,14 +3297,25 @@ async fn new_session_command(
             if let Some(ask) = handle.ask_tool() {
                 drop(install_ask_forwarder(&ask, agent_tx, runtime_handle));
             }
+            let thinking_label = handle.state().await.ok().map_or_else(
+                || String::from("off"),
+                |state| {
+                    state
+                        .thinking_level
+                        .map_or_else(|| String::from("off"), |level| level.to_string())
+                },
+            );
             send_conversation_reset(
                 handle,
                 agent_tx,
                 &format!(
-                    "Started new session\nModel set to {provider}/{model_id}\nThinking level: off"
+                    "Started new session\nModel set to {provider}/{model_id}\nThinking level: {thinking_label}"
                 ),
             )
             .await;
+            // Issue #200: the fresh session has no name; drop any previous
+            // session's tab title back to the model label.
+            let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {provider}/{model_id}")));
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("new session: {err}")));
@@ -3347,7 +3436,12 @@ async fn run_set_name_command(
     agent_tx: &Sender<PiMsg>,
 ) {
     let msg = match handle.set_session_name(name).await {
-        Ok(()) => PiMsg::System(format!("Session name: {name}")),
+        Ok(()) => {
+            // Issue #200: a named session titles the terminal tab after
+            // itself.
+            let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
+            PiMsg::System(format!("Session name: {name}"))
+        }
         Err(err) => PiMsg::AgentError(format!("name: {err}")),
     };
     let _ = agent_tx.send(msg);
@@ -3524,6 +3618,10 @@ async fn resume_session_command(
                 drop(install_ask_forwarder(&ask, agent_tx, runtime_handle));
             }
             send_conversation_reset(handle, agent_tx, "session resumed").await;
+            // Issue #200: a resumed named session restores its tab title.
+            if let Ok(Some(name)) = handle.with_session(crate::session::Session::get_name).await {
+                let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
+            }
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("resume: {err}")));
@@ -3708,6 +3806,10 @@ pub fn run(
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
     let bash_cwd = driver_bash_cwd(&session_options);
     let resume_template = resume_template_from(&session_options);
+    // Issue #205: shared slot so Ctrl-C on the UI thread can abort the
+    // driver's in-flight prompt turn instead of waiting it out.
+    let turn_abort: TurnAbortSlot = Arc::new(Mutex::new(None));
+    let driver_turn_abort = Arc::clone(&turn_abort);
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -3740,11 +3842,18 @@ pub fn run(
                     "ftui preview stack — experimental (bd-cv653.9.1)",
                 )
                 .await;
+                // Issue #200: a session opened named at launch (--session)
+                // titles the terminal tab after itself immediately.
+                if let Ok(Some(name)) = handle.with_session(crate::session::Session::get_name).await
+                {
+                    let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
+                }
                 let mut replacement_failure = None;
                 loop {
                     match submit_rx.try_recv() {
                         Ok(UiCommand::Prompt(prompt)) => {
-                            run_prompt_turn(&mut handle, prompt, &agent_tx).await;
+                            run_prompt_turn(&mut handle, prompt, &agent_tx, &driver_turn_abort)
+                                .await;
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
@@ -3756,7 +3865,8 @@ pub fn run(
                                 run_bash_ui_command(&bash_cwd, &command, exclude, &agent_tx).await
                                 && !exclude
                             {
-                                run_prompt_turn(&mut handle, output, &agent_tx).await;
+                                run_prompt_turn(&mut handle, output, &agent_tx, &driver_turn_abort)
+                                    .await;
                             }
                         }
                         Ok(UiCommand::Compact) => {
@@ -3870,8 +3980,21 @@ pub fn run(
             )))
         })?;
 
+    // Issue #194: Windows Terminal has supported synchronized output
+    // (DECSET 2026) since 1.18, but it identifies via WT_SESSION rather than
+    // TERM_PROGRAM, so ftui's allowlist misses it and every multi-cell frame
+    // update tears — the reported flicker while typing, streaming, and
+    // wheel-scrolling. Force the capability on for WT sessions; the guard
+    // must outlive the app run.
+    let _wt_sync_guard = std::env::var_os("WT_SESSION").map(|_| {
+        let mut over = ftui::core::capability_override::CapabilityOverride::new();
+        over.sync_output = Some(true);
+        ftui::core::capability_override::push_override(over)
+    });
+
     let model = PiFtuiModel::new(agent_rx)
         .with_submit_channel(submit_tx)
+        .with_turn_abort(turn_abort)
         .with_ask_reply_channel(ask_reply_tx)
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
@@ -4424,6 +4547,86 @@ mod tests {
             height: 40,
         });
         assert_eq!(sim.model().scroll_from_tail, 0);
+    }
+
+    /// Issue #205: Ctrl-C must fire the in-flight turn's abort handle before
+    /// quitting, so process teardown doesn't wait for the provider stream
+    /// and remaining tool calls to finish naturally.
+    #[test]
+    fn ctrl_c_aborts_in_flight_turn_before_quit() {
+        let slot: TurnAbortSlot = Arc::new(Mutex::new(None));
+        let (abort_handle, abort_signal) = crate::agent::AbortHandle::new();
+        *slot.lock().expect("slot lock") = Some(abort_handle);
+
+        let (_tx, model) = new_model();
+        let model = model.with_turn_abort(Arc::clone(&slot));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+
+        assert!(
+            abort_signal.is_aborted(),
+            "Ctrl-C must abort the in-flight turn"
+        );
+        assert!(
+            slot.lock().expect("slot lock").is_none(),
+            "the fired handle must be consumed"
+        );
+    }
+
+    /// Issue #206: markdown rendering expands raw text, so clamping the
+    /// scroll range against the raw-line approximation made PageUp stall
+    /// partway up long sessions (the reported fixed-percentage snap-back)
+    /// and made any resize collapse the scroll position. The clamp must
+    /// honor the rendered total recorded by the last frame, and a resize
+    /// must preserve — not reset — an in-range offset.
+    #[test]
+    fn scroll_clamp_honors_rendered_total_and_survives_resize() {
+        let (_tx, mut model) = new_model();
+        // Markdown-heavy assistant entries: headings, paragraphs, and lists
+        // render with inserted blank lines, so the rendered line total far
+        // exceeds the raw `\n` count.
+        for i in 0..12 {
+            model.push_entry(EntryRole::Assistant, format!("# Head {i}\ntext {i}"));
+        }
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 40,
+            height: 12,
+        });
+        let _ = sim.capture_frame(40, 12);
+
+        let rendered = sim.model().rendered_total_lines.get();
+        let approx = sim.model().conversation_line_count();
+        assert!(
+            rendered > approx,
+            "markdown must expand raw text (rendered={rendered}, approx={approx})"
+        );
+
+        // Page all the way up: the offset must reach the rendered maximum,
+        // beyond where the raw approximation would have stalled.
+        for _ in 0..64 {
+            sim.inject_event(key(KeyCode::PageUp, Modifiers::empty()));
+        }
+        let pinned = sim.model().scroll_from_tail;
+        assert_eq!(pinned, sim.model().max_scroll_from_tail());
+        assert!(
+            pinned > approx.saturating_sub(sim.model().body_height()),
+            "scroll range still limited by the raw approximation: pinned={pinned}"
+        );
+
+        // A one-row resize must keep the reading position (clamped only by
+        // the fresh geometry), not snap to the bottom.
+        sim.inject_event(Event::Resize {
+            width: 40,
+            height: 11,
+        });
+        let after_resize = sim.model().scroll_from_tail;
+        assert!(
+            after_resize >= pinned.saturating_sub(2),
+            "resize collapsed the scroll position: before={pinned}, after={after_resize}"
+        );
     }
 
     #[test]

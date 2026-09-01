@@ -1083,6 +1083,21 @@ fn expand_home_path(raw: &str) -> std::path::PathBuf {
 }
 
 impl PiApp {
+    /// Thinking level for a session started with `/new`: the configured
+    /// default clamped to the current model, exactly as launch resolution
+    /// does (issue #197 — this used to be hard-coded to `Off`, so a
+    /// `defaultThinkingLevel: max` setup showed "[thinking: off]" after
+    /// every `/new` even though thinking still ran).
+    pub(super) fn new_session_thinking_level(&self) -> ThinkingLevel {
+        let configured = self
+            .config
+            .default_thinking_level
+            .as_deref()
+            .and_then(|level| level.parse::<ThinkingLevel>().ok());
+        self.model_entry
+            .clamp_thinking_level(configured.unwrap_or(ThinkingLevel::XHigh))
+    }
+
     pub(super) fn sync_active_provider_credentials(&mut self, changed_provider: &str) {
         let changed_canonical = normalize_auth_provider_input(changed_provider);
         let auth = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
@@ -2149,14 +2164,15 @@ impl PiApp {
                         self.status_message = Some("Session busy; try again".to_string());
                         return None;
                     };
+                    let reset_thinking = self.new_session_thinking_level();
                     let session_dir = session_guard.session_dir.clone();
                     *session_guard = Session::create_with_dir(session_dir);
                     session_guard.header.provider = Some(self.model_entry.model.provider.clone());
                     session_guard.header.model_id = Some(self.model_entry.model.id.clone());
-                    session_guard.header.thinking_level = Some(ThinkingLevel::Off.to_string());
+                    session_guard.header.thinking_level = Some(reset_thinking.to_string());
                     let new_session_id = session_guard.header.id.clone();
                     agent_guard.replace_messages(Vec::new());
-                    agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
+                    agent_guard.stream_options_mut().thinking_level = Some(reset_thinking);
                     drop(session_guard);
                     drop(agent_guard);
                     self.session_action_admission.advance_generation();
@@ -2183,7 +2199,7 @@ impl PiApp {
                     self.message_render_cache.clear();
 
                     self.status_message = Some(format!(
-                        "Started new session\nModel set to {}\nThinking level: off",
+                        "Started new session\nModel set to {}\nThinking level: {reset_thinking}",
                         self.model
                     ));
                     self.scroll_to_bottom();
@@ -2194,6 +2210,7 @@ impl PiApp {
                 let model_provider = self.model_entry.model.provider.clone();
                 let model_id = self.model_entry.model.id.clone();
                 let model_label = self.model.clone();
+                let reset_thinking = self.new_session_thinking_level();
                 let event_tx = self.event_tx.clone();
                 let session = Arc::clone(&self.session);
                 let agent = Arc::clone(&self.agent);
@@ -2237,7 +2254,7 @@ impl PiApp {
                     let mut new_session = Session::create_with_dir(session_dir);
                     new_session.header.provider = Some(model_provider);
                     new_session.header.model_id = Some(model_id);
-                    new_session.header.thinking_level = Some(ThinkingLevel::Off.to_string());
+                    new_session.header.thinking_level = Some(reset_thinking.to_string());
                     let new_session_id = new_session.header.id.clone();
                     if let Err(err) = Self::try_install_session(
                         &session,
@@ -2245,7 +2262,7 @@ impl PiApp {
                         &admission,
                         new_session,
                         Vec::new(),
-                        Some(ThinkingLevel::Off),
+                        Some(reset_thinking),
                     )
                     .await
                     {
@@ -2266,7 +2283,7 @@ impl PiApp {
                             messages: Vec::new(),
                             usage: Usage::default(),
                             status: Some(format!(
-                                "Started new session\nModel set to {model_label}\nThinking level: off"
+                                "Started new session\nModel set to {model_label}\nThinking level: {reset_thinking}"
                             )),
                         },
                     )
