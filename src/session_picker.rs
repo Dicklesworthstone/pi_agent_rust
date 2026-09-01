@@ -383,7 +383,40 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
         by_path.insert(meta.path.clone(), meta);
     }
 
-    sessions = by_path.into_values().collect();
+    // Issue #199: the map above dedups by raw path STRING only, so one
+    // session can surface twice — the index row and the directory scan can
+    // spell the same file differently (symlinked sessions root, macOS
+    // /tmp vs /private/tmp), and a session persisted under both store
+    // backends (`.jsonl` + `.sqlite`) yields two files with the same header
+    // id and identical content. Collapse rows sharing a session id, keeping
+    // the most recently modified (then largest) representative.
+    let mut by_id: HashMap<String, SessionMeta> = HashMap::new();
+    let mut anonymous = Vec::new();
+    for meta in by_path.into_values() {
+        if meta.id.is_empty() {
+            anonymous.push(meta);
+            continue;
+        }
+        match by_id.entry(meta.id.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                if (meta.last_modified_ms, meta.message_count, meta.size_bytes)
+                    > (
+                        current.last_modified_ms,
+                        current.message_count,
+                        current.size_bytes,
+                    )
+                {
+                    entry.insert(meta);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(meta);
+            }
+        }
+    }
+
+    sessions = by_id.into_values().chain(anonymous).collect();
     sessions.sort_by_key(|m| Reverse(m.last_modified_ms));
     sessions.truncate(50);
     sessions
@@ -1316,6 +1349,53 @@ mod tests {
         assert_eq!(session.size_bytes, expected.size_bytes);
         assert_eq!(session.name, expected.name);
         assert_eq!(session.last_modified_ms, expected.last_modified_ms);
+    }
+
+    /// Issue #199: two on-disk files carrying the same session id and
+    /// identical content (e.g. a session persisted under both the `.jsonl`
+    /// and `.sqlite` store backends, or the same file reached via two path
+    /// spellings) must list as ONE entry, not two.
+    #[test]
+    fn list_sessions_for_project_collapses_duplicate_session_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(encode_cwd(&cwd));
+        fs::create_dir_all(&project_dir).expect("create project sessions");
+
+        let mut header = SessionHeader::new();
+        header.id = "dup-id".to_string();
+        header.cwd = cwd.display().to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+        let content = format!(
+            "{}\n{{\"type\":\"message\"}}\n{{\"type\":\"session_info\",\"name\":\"Same name\"}}\n",
+            serde_json::to_string(&header).expect("serialize header"),
+        );
+        fs::write(project_dir.join("20250601_dup-a.jsonl"), &content).expect("write first copy");
+        fs::write(project_dir.join("20250602_dup-b.jsonl"), &content).expect("write second copy");
+
+        // A distinct session must survive the collapse.
+        let mut other = SessionHeader::new();
+        other.id = "other-id".to_string();
+        other.cwd = cwd.display().to_string();
+        other.timestamp = "2025-06-02T12:00:00.000Z".to_string();
+        fs::write(
+            project_dir.join("20250603_other.jsonl"),
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&other).expect("serialize header"),
+            ),
+        )
+        .expect("write distinct session");
+
+        let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
+        let mut ids: Vec<&str> = sessions.iter().map(|m| m.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["dup-id", "other-id"],
+            "duplicate-id rows must collapse to one entry: {sessions:?}"
+        );
     }
 
     #[test]
