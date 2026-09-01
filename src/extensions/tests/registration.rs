@@ -2545,6 +2545,7 @@ fn provider_stream_cleanup_retains_route_until_inner_cleanup_succeeds() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn stream_simple_cancel_stops_iteration() {
     let manager = ExtensionManager::new();
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()

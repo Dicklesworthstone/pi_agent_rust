@@ -296,6 +296,9 @@ pub struct McpSessionOptions {
 ///
 /// These options provide the programmatic equivalent of the core CLI startup
 /// path used in `src/main.rs`.
+// Independent on/off toggles mirroring CLI flags; an enum or builder state
+// machine would obscure the flag-to-field mapping.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct SessionOptions {
     pub provider: Option<String>,
@@ -1398,6 +1401,9 @@ impl AgentSessionHandle {
     /// Flush durable state and capture session ownership without stopping any
     /// runtime resource. On success the caller can synchronously install its
     /// prepared replacement before cleanup reaches an irreversible step.
+    // `&mut self` is deliberate: the preflight must hold exclusive access to
+    // the handle while ownership is captured, even though no field is mutated.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn preflight_replacement(
         &mut self,
     ) -> std::result::Result<PreparedSessionShutdown, SessionResourceShutdown> {
@@ -3409,12 +3415,16 @@ mod tests {
         let no_predecessor_manager = SessionResourceShutdown::default();
         assert!(no_predecessor_manager.permits_replacement_mcp_activation());
 
-        let mut released = SessionResourceShutdown::default();
-        released.mcp = McpShutdownOutcome::Released;
+        let released = SessionResourceShutdown {
+            mcp: McpShutdownOutcome::Released,
+            ..Default::default()
+        };
         assert!(released.permits_replacement_mcp_activation());
 
-        let mut indeterminate = SessionResourceShutdown::default();
-        indeterminate.mcp = McpShutdownOutcome::Indeterminate;
+        let mut indeterminate = SessionResourceShutdown {
+            mcp: McpShutdownOutcome::Indeterminate,
+            ..Default::default()
+        };
         indeterminate.fail(String::from("MCP shutdown timed out"));
         assert!(!indeterminate.permits_replacement_mcp_activation());
         assert!(!indeterminate.completed_cleanly());

@@ -5207,6 +5207,9 @@ impl Session {
     }
 
     /// Update header model info.
+    // `changed` accumulates across three conditional updates; folding it into
+    // one if/else expression would duplicate the update bodies.
+    #[allow(clippy::useless_let_if_seq)]
     pub fn set_model_header(
         &mut self,
         provider: Option<String>,

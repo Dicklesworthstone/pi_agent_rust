@@ -195,6 +195,9 @@ fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Option<Vec
 
     let file = File::open(path)
         .map_err(|err| Error::config(format!("Failed to read {}: {err}", escaped_path(path))))?;
+    // Capacity hint only: the value is clamped to `max_bytes`, and a wrapped
+    // cast on a 32-bit target could at worst under-reserve.
+    #[allow(clippy::cast_possible_truncation)]
     let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
     file.take(max_bytes as u64 + 1)
         .read_to_end(&mut bytes)

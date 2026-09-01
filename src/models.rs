@@ -5939,6 +5939,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn extension_merge_rejects_provider_and_model_collisions_before_mutation() {
         let (_dir, auth) = test_auth_storage();
         let mut registry = ModelRegistry::load(&auth, None);

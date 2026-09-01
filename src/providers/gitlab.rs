@@ -450,6 +450,7 @@ impl GitLabProvider {
     }
 
     /// Build a GitLab Chat request from the agent context.
+    #[allow(clippy::too_many_lines)]
     pub fn build_request(context: &Context<'_>) -> Result<GitLabChatRequest> {
         let (primary_index, primary_user) = context
             .messages
@@ -709,6 +710,9 @@ mod tests {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
+    // Ownership is part of the call contract here: consuming the listener
+    // closes it after the single accepted connection.
+    #[allow(clippy::needless_pass_by_value)]
     fn accept_test_request(listener: TcpListener) -> std::net::TcpStream {
         listener
             .set_nonblocking(true)

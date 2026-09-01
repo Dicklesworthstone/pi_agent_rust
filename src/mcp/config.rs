@@ -290,6 +290,8 @@ fn is_executable_file(path: &Path) -> bool {
 /// `cwd`, absolute paths pass through. The result collapses symlinks so a
 /// retargeted link changes identity, and hashes the executable's content so
 /// an in-place replacement is detected even when size/mtime lie.
+// Debug-quoting paths in these errors is deliberate (quotes delimit untrusted input).
+#[allow(clippy::unnecessary_debug_formatting)]
 pub fn resolve_command_identity(
     raw_command: &str,
     cwd: &Path,
@@ -305,10 +307,9 @@ pub fn resolve_command_identity(
     } else if trimmed.contains('/') || trimmed.contains('\\') {
         cwd.join(raw_path)
     } else {
-        let dirs = match path_env {
-            Some(os_str) => std::env::split_paths(os_str).collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
+        let dirs = path_env.map_or_else(Vec::new, |os_str| {
+            std::env::split_paths(os_str).collect::<Vec<_>>()
+        });
         dirs.iter()
             .filter(|dir| !dir.as_os_str().is_empty())
             .map(|dir| dir.join(raw_path))
@@ -567,6 +568,8 @@ fn hash_strings(hasher: &mut Sha256, label: &str, values: &[String]) {
     }
 }
 
+// if let reads clearer here
+#[allow(clippy::option_if_let_else)]
 fn hash_definitions(
     hasher: &mut Sha256,
     label: &str,
@@ -855,6 +858,7 @@ pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDisc
 /// global Pi config remain eligible because neither is discovered from the
 /// untrusted workspace.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn discover_with_project_trust(
     cwd: &Path,
     global_dir: &Path,

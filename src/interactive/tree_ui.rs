@@ -84,34 +84,31 @@ async fn stage_and_commit_tree_navigation(
         candidate.reset_leaf();
     }
 
-    let mut summary_entry_payload = None;
-    let mut summary_entry_id = None;
-    let mut expected_summary_entry = None;
-    if let Some((from_id, summary_text)) = summary {
-        let summary_clone = summary_text.clone();
-        let entry_id = candidate.append_branch_summary(from_id.clone(), summary_text, None, None);
-        summary_entry_id = Some(entry_id.clone());
-        let mut summary_entry = serde_json::Map::new();
-        summary_entry.insert(
-            "type".to_string(),
-            Value::String("branch_summary".to_string()),
-        );
-        summary_entry.insert("fromId".to_string(), Value::String(from_id));
-        summary_entry.insert("summary".to_string(), Value::String(summary_clone));
-        summary_entry.insert("fromHook".to_string(), Value::Bool(false));
-        summary_entry_payload = Some(Value::Object(summary_entry));
-        expected_summary_entry = candidate
-            .get_entry(&entry_id)
-            .and_then(|entry| serde_json::to_vec(entry).ok());
-    }
+    let (summary_entry_payload, summary_entry_id, expected_summary_entry) =
+        if let Some((from_id, summary_text)) = summary {
+            let summary_clone = summary_text.clone();
+            let entry_id =
+                candidate.append_branch_summary(from_id.clone(), summary_text, None, None);
+            let mut summary_entry = serde_json::Map::new();
+            summary_entry.insert(
+                "type".to_string(),
+                Value::String("branch_summary".to_string()),
+            );
+            summary_entry.insert("fromId".to_string(), Value::String(from_id));
+            summary_entry.insert("summary".to_string(), Value::String(summary_clone));
+            summary_entry.insert("fromHook".to_string(), Value::Bool(false));
+            let expected = candidate
+                .get_entry(&entry_id)
+                .and_then(|entry| serde_json::to_vec(entry).ok());
+            (Some(Value::Object(summary_entry)), Some(entry_id), expected)
+        } else {
+            (None, None, None)
+        };
 
     let new_leaf_id = candidate.leaf_id().map(str::to_string);
-    let mut persistence = if save_enabled {
-        TreeNavigationPersistenceOutcome::Confirmed
-    } else {
+    let persistence = if !save_enabled {
         TreeNavigationPersistenceOutcome::Disabled
-    };
-    if save_enabled && let Err(err) = candidate.save().await {
+    } else if let Err(err) = candidate.save().await {
         tracing::error!(
             error = %err,
             ?new_leaf_id,
@@ -129,8 +126,10 @@ async fn stage_and_commit_tree_navigation(
                 "Branch switch persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
             )));
         }
-        persistence = TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed;
-    }
+        TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed
+    } else {
+        TreeNavigationPersistenceOutcome::Confirmed
+    };
 
     let messages_for_agent = candidate.to_messages_for_current_path();
     let (messages_for_ui, usage) = conversation_from_session(&candidate);
@@ -749,10 +748,9 @@ mod tests {
     }
 
     fn branched_session(session_dir: Option<std::path::PathBuf>) -> (Session, String, String) {
-        let mut session = match session_dir {
-            Some(dir) => Session::create_with_dir(Some(dir)),
-            None => Session::in_memory(),
-        };
+        let mut session = session_dir.map_or_else(Session::in_memory, |dir| {
+            Session::create_with_dir(Some(dir))
+        });
         let root_id = session.append_message(crate::session::SessionMessage::User {
             content: crate::model::UserContent::Text("root".to_string()),
             timestamp: Some(0),

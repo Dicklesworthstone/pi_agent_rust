@@ -244,7 +244,9 @@ pub fn mount_server_tools(
 }
 
 /// Connect every acknowledged server, then snapshot its cached tools as
-/// first-class wrappers. Call this once after native, foreign, CLI, and
+/// first-class wrappers.
+///
+/// Call this once after native, foreign, CLI, and
 /// extension-provided server definitions have all been registered.
 #[must_use]
 pub async fn connect_trusted_and_mount_tools(

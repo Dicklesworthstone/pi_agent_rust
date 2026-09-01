@@ -395,6 +395,18 @@ pub(crate) fn stable_package_dir(
 /// files that do not exist just wastes a tool call and confuses the model
 /// (gh #183). Returns `None` when nothing is available.
 fn pi_docs_prompt_section(package_dir: &Path) -> Option<String> {
+    const SINGLE_FILE_TOPICS: [(&str, &str); 9] = [
+        ("themes", "docs/themes.md"),
+        ("skills", "docs/skills.md"),
+        ("prompt templates", "docs/prompt-templates.md"),
+        ("TUI components", "docs/tui.md"),
+        ("keybindings", "docs/keybindings.md"),
+        ("SDK integrations", "docs/sdk.md"),
+        ("custom providers", "docs/custom-provider.md"),
+        ("adding models", "docs/models.md"),
+        ("pi packages", "docs/packages.md"),
+    ];
+
     // Callers hand us an already-stable absolute root (bd-jtehj); every
     // advertised path below is verified to exist right here so empty or
     // partial installs never point the model at fiction.
@@ -430,18 +442,6 @@ fn pi_docs_prompt_section(package_dir: &Path) -> Option<String> {
             lines.push(format!("- Examples: {}", examples.display()));
         }
     }
-
-    const SINGLE_FILE_TOPICS: [(&str, &str); 9] = [
-        ("themes", "docs/themes.md"),
-        ("skills", "docs/skills.md"),
-        ("prompt templates", "docs/prompt-templates.md"),
-        ("TUI components", "docs/tui.md"),
-        ("keybindings", "docs/keybindings.md"),
-        ("SDK integrations", "docs/sdk.md"),
-        ("custom providers", "docs/custom-provider.md"),
-        ("adding models", "docs/models.md"),
-        ("pi packages", "docs/packages.md"),
-    ];
 
     // Topic index: one entry per label whose documented file(s) actually
     // exist. The old behavior advertised all ten unconditionally.

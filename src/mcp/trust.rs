@@ -1268,7 +1268,7 @@ impl TrustStore {
     {
         debug_assert_eq!(
             guard.parent_path.as_path(),
-            self.path.parent().unwrap_or(Path::new("."))
+            self.path.parent().unwrap_or_else(|| Path::new("."))
         );
         self.ensure_parent_unchanged(&guard.directory, "before creating the trust temporary file")?;
         let file = TrustFile {

@@ -284,6 +284,9 @@ fn kill_zero(pid: u32) -> bool {
 }
 
 #[test]
+// The id/pid and owner_a/owner_b pairings are the point of this test; the
+// deliberately parallel names beat clippy's similarity heuristic.
+#[allow(clippy::similar_names)]
 fn owner_scoped_session_shutdown_preserves_foreign_jobs() {
     let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock"); // ubs:ignore test guard
     let case = "owner_scoped_session_shutdown_preserves_foreign_jobs";

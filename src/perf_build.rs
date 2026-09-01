@@ -680,7 +680,9 @@ pub fn verify_binary_size_measurement_control(
 }
 
 /// Verify a release-binary control while reading the measured bytes from a
-/// digest-identical relocated evidence package. The control's producer path is
+/// digest-identical relocated evidence package.
+///
+/// The control's producer path is
 /// preserved as provenance and must remain an absolute normalized path.
 pub fn verify_binary_size_measurement_control_with_relocated_artifact(
     control_path: &Path,
@@ -1083,7 +1085,9 @@ pub fn profile_from_target_path(path: &Path) -> Option<String> {
 }
 
 /// Create a normalized target-relative output directory without traversing a
-/// symlink. RCH only returns selected subtrees beneath the active Cargo target,
+/// symlink.
+///
+/// RCH only returns selected subtrees beneath the active Cargo target,
 /// so benchmark producers use this helper to place evidence in a supported
 /// return path without trusting a controller-absolute environment value.
 pub fn prepare_target_output_dir(target_dir: &Path, subdir: &Path) -> Result<PathBuf, String> {
@@ -1268,6 +1272,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn cold_load_control_rejects_noisy_or_tampered_criterion_input() {
         let temp = tempfile::tempdir().expect("create test directory");
         let run_instance_id = "a".repeat(64);
@@ -1394,6 +1399,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn idle_rss_control_binds_pi_process_allocator_and_executable() {
         let temp = tempfile::tempdir().expect("create test directory");
         let binary_path = temp.path().join("pi");

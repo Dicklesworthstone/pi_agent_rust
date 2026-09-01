@@ -407,6 +407,8 @@ impl AskTool {
     /// flow out through `sender`, and the host answers via
     /// [`Self::respond_ui`]. Mirrors the extension-UI request/response
     /// bridge, including the wait budget.
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn install_channel_ui(&self, sender: asupersync::channel::mpsc::Sender<AskUiRequest>) {
         let pending = Arc::clone(&self.pending_ui);
         let channel_ui_open = Arc::clone(&self.channel_ui_open);

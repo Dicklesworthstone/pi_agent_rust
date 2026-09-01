@@ -511,7 +511,7 @@ pub fn plan_retry(session: &Session) -> Option<RetryPlan> {
     let projected = project_retry_path(session);
     for item in projected.into_iter().rev() {
         match item.disposition {
-            RetryDisposition::Skip => continue,
+            RetryDisposition::Skip => {}
             RetryDisposition::Barrier => return None,
             RetryDisposition::Candidate => {
                 return Some(RetryPlan {

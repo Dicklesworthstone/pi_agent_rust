@@ -13317,8 +13317,14 @@ pub(crate) struct JobGatedChildLaunch {
 
 impl JobGatedChildLaunch {
     /// Allow the wrapper to start its target after process-tree discipline is live.
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) const fn release(&self) -> std::io::Result<()> {
+    // Not const, and `self` is not unused: the cfg(windows) body opens
+    // `self.gate_path`, which file I/O forbids in a const fn.
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::unused_self,
+        clippy::missing_const_for_fn
+    )]
+    pub(crate) fn release(&self) -> std::io::Result<()> {
         #[cfg(windows)]
         {
             std::fs::OpenOptions::new()

@@ -1818,6 +1818,7 @@ export default function init(pi) {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn manual_model_override_keeps_mixed_case_extension_stream_handler_reachable() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

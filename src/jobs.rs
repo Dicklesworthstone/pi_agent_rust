@@ -382,6 +382,8 @@ impl CancelDeadline {
         })
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn start_with<F>(self: &Arc<Self>, timeout: Duration, spawn: F) -> Result<bool>
     where
         F: FnOnce(Arc<Self>, Duration) -> std::io::Result<()>,
@@ -407,6 +409,8 @@ impl CancelDeadline {
         Ok(true)
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn run(&self, timeout: Duration) {
         let (lock, wake) = &*self.settlement;
         let settled = lock
@@ -423,6 +427,8 @@ impl CancelDeadline {
         }
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn finish(&self) {
         let (lock, wake) = &*self.settlement;
         let mut settled = lock
@@ -562,6 +568,7 @@ fn lifecycle_lock() -> &'static Mutex<()> {
 
 #[cfg(test)]
 #[derive(Clone, Default)]
+#[allow(clippy::type_complexity)]
 struct SpawnBackgroundTestHooks {
     owner_session_id: Option<String>,
     after_initial_owner_check: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -686,12 +693,14 @@ fn remove_quiescent_owner_generation(reg: &mut JobRegistry, owner_session_id: &s
         && reg
             .owner_spawns_in_flight
             .get(owner_session_id)
-            .is_none_or(|count| *count <= 0)
+            .is_none_or(|count| *count == 0)
     {
         reg.owner_shutdown_generations.remove(owner_session_id);
     }
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn ensure_session_accepting_jobs(owner_session_id: &str) -> Result<()> {
     {
         let reg = registry()
@@ -757,17 +766,19 @@ impl SessionSpawnAttempt {
 }
 
 impl Drop for SessionSpawnAttempt {
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn drop(&mut self) {
         let mut reg = registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let remove_counter =
-            if let Some(count) = reg.owner_spawns_in_flight.get_mut(&self.owner_session_id) {
+        let remove_counter = reg
+            .owner_spawns_in_flight
+            .get_mut(&self.owner_session_id)
+            .is_some_and(|count| {
                 *count = count.saturating_sub(1);
                 *count == 0
-            } else {
-                false
-            };
+            });
         if remove_counter {
             reg.owner_spawns_in_flight.remove(&self.owner_session_id);
         }
@@ -775,6 +786,8 @@ impl Drop for SessionSpawnAttempt {
     }
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn capture_session_spawn_generation(owner_session_id: &str) -> Result<SessionSpawnAttempt> {
     ensure_session_accepting_jobs(owner_session_id)?;
     let mut reg = registry()
@@ -806,6 +819,8 @@ fn capture_session_spawn_generation(owner_session_id: &str) -> Result<SessionSpa
     })
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn ensure_session_spawn_generation(owner_session_id: &str, expected: u64) -> Result<()> {
     ensure_session_accepting_jobs(owner_session_id)?;
     let reg = registry()
@@ -845,6 +860,8 @@ impl Drop for StartingJobSlot {
     }
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn reserve_job_slot() -> Result<(String, u64, StartingJobSlot)> {
     let mut reg = registry()
         .lock()
@@ -1393,7 +1410,8 @@ impl Drop for BackgroundChild {
 /// Named `PI_JOBS_AT_CAPACITY` when 8 jobs are already running,
 /// `PI_JOBS_SESSION_CLOSING` when owner teardown has started, or tool errors
 /// for spawn/artifact failures.
-#[allow(clippy::too_many_lines)]
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 pub fn spawn_background(
     owner_session_id: &str,
     cwd: &Path,
@@ -1863,6 +1881,8 @@ fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
     truncated
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 fn monitor_job(
     id: &str,
     started_at: Instant,
@@ -2018,6 +2038,8 @@ fn settle_job_without_notice(
     settle_job(id, status, exit_code, output_complete, false);
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn settle_job(
     id: &str,
     status: JobStatus,
@@ -2092,7 +2114,7 @@ fn settle_job(
         let owner_session_id = job.owner_session_id.clone();
         job.cancel_deadline.finish();
         if let Some(notice) = notice {
-            enqueue_completion_notice(&mut reg, &owner_session_id, notice);
+            enqueue_completion_notice(&mut reg, &owner_session_id, &notice);
         }
         prune_settled_jobs(&mut reg);
         notify
@@ -2181,6 +2203,8 @@ fn unknown_job_error(id: &str) -> Error {
     )
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn wait_handle(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
     let reg = registry()
         .lock()
@@ -2278,12 +2302,28 @@ pub async fn wait_async(
     wait_async_with_slice(owner_session_id, id, timeout, MAX_ASYNC_WAIT_SLICE).await
 }
 
+// u64 nanoseconds cover centuries of timeout; the truncating cast cannot
+// overflow for any accepted job timeout.
+#[allow(clippy::cast_possible_truncation)]
 async fn wait_async_with_slice(
     owner_session_id: &str,
     id: &str,
     timeout: Duration,
     max_wait_slice: Duration,
 ) -> Result<JobSnapshot> {
+    /// Time-based variant of [`remaining_wait_slice`] for timer-driver
+    /// deadlines (bd-9zmyf wave fix-forward): asupersync `Time` has no
+    /// `checked_add`, and `duration_since` yields nanoseconds directly.
+    fn remaining_wait_slice_at(now: Time, deadline: Option<Time>) -> Option<Duration> {
+        match deadline {
+            Some(deadline) if now >= deadline => None,
+            Some(deadline) => {
+                Some(Duration::from_nanos(deadline.duration_since(now)).min(MAX_ASYNC_WAIT_SLICE))
+            }
+            None => Some(MAX_ASYNC_WAIT_SLICE),
+        }
+    }
+
     let handle = wait_handle(owner_session_id, id)?;
     let cx = crate::agent_cx::AgentCx::for_current_or_request();
     let now = cx
@@ -2319,19 +2359,6 @@ async fn wait_async_with_slice(
             }
         }
     }
-
-    /// Time-based variant of [`remaining_wait_slice`] for timer-driver
-    /// deadlines (bd-9zmyf wave fix-forward): asupersync `Time` has no
-    /// `checked_add`, and `duration_since` yields nanoseconds directly.
-    fn remaining_wait_slice_at(now: Time, deadline: Option<Time>) -> Option<Duration> {
-        match deadline {
-            Some(deadline) if now >= deadline => None,
-            Some(deadline) => {
-                Some(Duration::from_nanos(deadline.duration_since(now)).min(MAX_ASYNC_WAIT_SLICE))
-            }
-            None => Some(MAX_ASYNC_WAIT_SLICE),
-        }
-    }
 }
 
 async fn wait_for_settlement_wall(
@@ -2359,6 +2386,8 @@ async fn wait_for_settlement_wall(
     }
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn request_cancel(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
     let mut reg = registry()
         .lock()
@@ -2453,6 +2482,8 @@ pub fn take_completion_notices(owner_session_id: &str) -> Vec<Message> {
 /// changes before delivery. Entries are prepended because they predate notices
 /// that could have settled while they were staged; normal per-owner and global
 /// retention then discards the oldest entries if either bound is exceeded.
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 pub(crate) fn restore_completion_notices(notices: Vec<(String, Message)>) {
     let restored = notices
         .into_iter()
@@ -2553,11 +2584,11 @@ pub fn push_completion_notice(owner_session_id: &str, text: impl Into<String>) -
     let mut reg = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    enqueue_completion_notice(&mut reg, owner_session_id, text);
+    enqueue_completion_notice(&mut reg, owner_session_id, &text);
     Ok(())
 }
 
-fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text: String) {
+fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text: &str) {
     let owner_notice_count = reg
         .notices
         .iter()
@@ -2573,7 +2604,7 @@ fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text
     }
     reg.notices.push_back(CompletionNotice {
         owner_session_id: owner_session_id.to_string(),
-        text: truncate_utf8_bytes(&text, MAX_COMPLETION_NOTICE_BYTES),
+        text: truncate_utf8_bytes(text, MAX_COMPLETION_NOTICE_BYTES),
     });
     while reg.notices.len() > MAX_TOTAL_COMPLETION_NOTICES {
         let _ = reg.notices.pop_front();
@@ -2586,6 +2617,8 @@ struct SessionShutdownAttempt {
 }
 
 impl SessionShutdownAttempt {
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn begin(owner_session_id: &str) -> Result<Self> {
         let mut reg = registry()
             .lock()
@@ -2641,6 +2674,8 @@ impl Drop for SessionShutdownAttempt {
     }
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn finish_session_shutdown_attempt(owner_session_id: &str, clear_when_safe: bool) -> Result<()> {
     let mut reg = registry()
         .lock()
@@ -2679,6 +2714,8 @@ fn request_session_shutdown(
     request_session_shutdown_with_timeout(owner_session_id, SESSION_SHUTDOWN_TIMEOUT)
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn request_session_shutdown_with_timeout(
     owner_session_id: &str,
     lifecycle_timeout: Duration,
@@ -2854,6 +2891,8 @@ mod tests {
     }
 
     #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn spawn_background_test_hooks_are_scoped_to_the_configured_owner() {
         let _guard = process_test_guard();
         let after_initial = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2926,6 +2965,9 @@ mod tests {
         timed_out: bool,
     }
 
+    // Guard scope is deliberate; these condvar helpers must hold their guards
+    // across the wait, so tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     impl SpawnHookGate {
         fn enter_and_wait(&self) {
             let mut state = self
@@ -2992,6 +3034,9 @@ mod tests {
         timed_out: bool,
     }
 
+    // Guard scope is deliberate; these condvar helpers must hold their guards
+    // across the wait, so tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     impl CountedSpawnHookGate {
         fn enter_and_wait(&self) {
             let mut state = self
@@ -3762,6 +3807,8 @@ mod tests {
     }
 
     #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn shutdown_fence_after_initial_check_is_seen_under_lifecycle_lock() {
         let _guard = process_test_guard();
         let root = temp_root();
@@ -3842,6 +3889,8 @@ mod tests {
     }
 
     #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn shutdown_generation_waits_for_every_stale_spawn_capture() {
         let _guard = process_test_guard();
         let root = temp_root();
@@ -4117,6 +4166,8 @@ mod tests {
     }
 
     #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn quiescent_owner_shutdown_generations_do_not_accumulate() {
         let _guard = process_test_guard();
         let generations_before = registry()
@@ -4475,9 +4526,9 @@ mod tests {
     #[test]
     fn completion_notice_retention_is_fair_across_sessions() {
         let mut reg = JobRegistry::default();
-        enqueue_completion_notice(&mut reg, "owner-a", "owner-a-notice".to_string());
+        enqueue_completion_notice(&mut reg, "owner-a", "owner-a-notice");
         for index in 0..=MAX_COMPLETION_NOTICES_PER_SESSION {
-            enqueue_completion_notice(&mut reg, "owner-b", format!("owner-b-notice-{index}"));
+            enqueue_completion_notice(&mut reg, "owner-b", &format!("owner-b-notice-{index}"));
         }
 
         assert_eq!(
@@ -4509,7 +4560,7 @@ mod tests {
             enqueue_completion_notice(
                 &mut reg,
                 &format!("owner-{index}"),
-                format!("notice-{index}"),
+                &format!("notice-{index}"),
             );
         }
 
@@ -4525,7 +4576,7 @@ mod tests {
     #[test]
     fn restored_completion_notices_preserve_fifo_before_newer_registry_entries() {
         let mut reg = JobRegistry::default();
-        enqueue_completion_notice(&mut reg, "owner-a", "newer".to_string());
+        enqueue_completion_notice(&mut reg, "owner-a", "newer");
         let restored = ["older-1", "older-2"]
             .into_iter()
             .map(|text| CompletionNotice {
@@ -4550,7 +4601,7 @@ mod tests {
         for index in
             MAX_COMPLETION_NOTICES_PER_SESSION..MAX_COMPLETION_NOTICES_PER_SESSION.saturating_mul(2)
         {
-            enqueue_completion_notice(&mut reg, "owner-a", format!("notice-{index}"));
+            enqueue_completion_notice(&mut reg, "owner-a", &format!("notice-{index}"));
         }
         let restored = (0..MAX_COMPLETION_NOTICES_PER_SESSION)
             .map(|index| CompletionNotice {
@@ -4606,7 +4657,7 @@ mod tests {
         assert!(truncated.ends_with("\n...[truncated]"));
 
         let mut reg = JobRegistry::default();
-        enqueue_completion_notice(&mut reg, TEST_SESSION_ID, oversized);
+        enqueue_completion_notice(&mut reg, TEST_SESSION_ID, &oversized);
         let retained = reg.notices.pop_front().expect("bounded notice");
         assert!(retained.text.len() <= MAX_COMPLETION_NOTICE_BYTES);
         assert!(retained.text.ends_with("\n...[truncated]"));
@@ -5069,6 +5120,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn monitor_spawn_failure_joins_pumps_even_with_an_escaped_writer() {
         struct KillPidOnDrop(u32);
 

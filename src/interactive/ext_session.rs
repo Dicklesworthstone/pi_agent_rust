@@ -610,13 +610,14 @@ pub fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
 
     match request.method.as_str() {
         "confirm" => {
-            if let Some(capability) = capability.as_deref() {
-                format!(
-                    "[{provenance}] capability request: {capability}\n{message}\n\nEnter yes/no, or 'cancel'."
-                )
-            } else {
-                format!("[{provenance}] confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'.")
-            }
+            capability.as_deref().map_or_else(
+                || format!("[{provenance}] confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'."),
+                |capability| {
+                    format!(
+                        "[{provenance}] capability request: {capability}\n{message}\n\nEnter yes/no, or 'cancel'."
+                    )
+                },
+            )
         }
         "select" => {
             let options = request
@@ -1922,6 +1923,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn real_js_timer_and_promise_mutations_are_rejected_across_session_replacement() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

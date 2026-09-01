@@ -279,6 +279,8 @@ fn valid_params(params: Option<&Value>) -> bool {
     params.is_none_or(|value| value.is_object() || value.is_array())
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_in_scrutinee)]
 fn route_stdio_message(
     message: &Value,
     pending: &StdioPending,
@@ -385,6 +387,8 @@ fn route_stdio_message(
     Ok(())
 }
 
+// Ownership is part of the call contract here.
+#[allow(clippy::needless_pass_by_value)]
 fn fail_pending(pending: &StdioPending, error: McpStdioError) {
     let senders: Vec<_> = lock(pending).drain().map(|(_, sender)| sender).collect();
     for sender in senders {
@@ -392,6 +396,8 @@ fn fail_pending(pending: &StdioPending, error: McpStdioError) {
     }
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn kill_tree_once(pid: u32, cleanup_state: &Mutex<TreeCleanupState>) {
     let mut state = lock(cleanup_state);
     if *state != TreeCleanupState::Killed {
@@ -400,6 +406,8 @@ fn kill_tree_once(pid: u32, cleanup_state: &Mutex<TreeCleanupState>) {
     }
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn terminate_tree_once(pid: u32, cleanup_state: &Mutex<TreeCleanupState>) {
     let mut state = lock(cleanup_state);
     if *state != TreeCleanupState::Pending {
@@ -481,6 +489,8 @@ fn stop_reader_connection(
     .finish(error, wake_writer_shutdown);
 }
 
+// Ownership is part of the call contract here.
+#[allow(clippy::needless_pass_by_value)]
 fn writer_loop(
     mut stdin: impl Write,
     writer_rx: StdReceiver<WriterCommand>,
@@ -529,7 +539,7 @@ fn writer_loop(
     }
 }
 
-fn classify_read_error(error: std::io::Error) -> McpStdioError {
+fn classify_read_error(error: &std::io::Error) -> McpStdioError {
     match error.kind() {
         std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
             McpStdioError::Protocol(error.to_string())
@@ -538,6 +548,8 @@ fn classify_read_error(error: std::io::Error) -> McpStdioError {
     }
 }
 
+// Ownership is part of the call contract here.
+#[allow(clippy::needless_pass_by_value)]
 fn reader_loop(
     stdout: std::process::ChildStdout,
     writer_tx: StdSyncSender<WriterCommand>,
@@ -577,7 +589,7 @@ fn reader_loop(
                 return;
             }
             Err(error) => {
-                let error = classify_read_error(error);
+                let error = classify_read_error(&error);
                 stop_reader_connection(
                     &writer_tx,
                     &pending,
@@ -633,6 +645,7 @@ struct McpStdioClient {
 }
 
 impl McpStdioClient {
+    #[allow(clippy::too_many_lines)]
     fn spawn(command: &str, args: &[String], env: &[(String, String)], cwd: &Path) -> Result<Self> {
         let mut command_builder = crate::tools::command_with_default_sigpipe_in_dir(command, cwd)
             .map_err(|error| {
@@ -1642,6 +1655,8 @@ impl HttpTransport {
     /// Admit only the first public initialize call. A failed initialize may
     /// leave a server-assigned provisional session for `close()` to retire;
     /// rejecting retries without mutation preserves that cleanup ownership.
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn ensure_explicit_initialize_admissible(&self) -> Result<()> {
         let session = Self::lock(&self.session);
         if !self.alive.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1772,14 +1787,16 @@ impl HttpTransport {
         kind: HttpRoundTripKind<'_>,
         wire_state: Option<&HttpWireState>,
     ) -> Result<Value> {
-        self.run_until_abort(Self::run_with_deadline(
+        // Boxed: clippy::large_futures.
+        Box::pin(self.run_until_abort(Self::run_with_deadline(
             self.round_trip_inner(frame, timeout, kind, wire_state),
             timeout,
             "HTTP JSON-RPC round trip",
-        ))
+        )))
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn round_trip_inner(
         &self,
         frame: &Value,
@@ -2420,16 +2437,17 @@ impl HttpTransport {
                 ));
             }
         };
-        match self
-            .receive_request_sse_stream(resumed, expected_id, &mut cursor, wire_state)
+        self.receive_request_sse_stream(resumed, expected_id, &mut cursor, wire_state)
             .await?
-        {
-            Some(result) => Ok(result),
-            None => Err(tool_err(
-                "MCP_DELIVERY_INDETERMINATE",
-                "one-shot SSE resumption ended before the pending JSON-RPC response",
-            )),
-        }
+            .map_or_else(
+                || {
+                    Err(tool_err(
+                        "MCP_DELIVERY_INDETERMINATE",
+                        "one-shot SSE resumption ended before the pending JSON-RPC response",
+                    ))
+                },
+                Ok,
+            )
     }
 
     async fn receive_server_event_stream(
@@ -2896,9 +2914,10 @@ impl McpTransport for HttpTransport {
         }
         let listener_transport = std::sync::Arc::clone(&self);
         if let Err(error) = runtime.try_spawn(async move {
-            let result = listener_transport
-                .run_until_abort(listener_transport.run_server_event_supervisor(wire_state, first))
-                .await;
+            let supervisor = listener_transport
+                .run_until_abort(listener_transport.run_server_event_supervisor(wire_state, first));
+            // Boxed: clippy::large_futures.
+            let result = Box::pin(supervisor).await;
             if let Err(error) = result
                 && listener_transport.is_alive()
             {
@@ -2930,7 +2949,12 @@ impl McpTransport for HttpTransport {
 mod tests {
     use super::*;
 
+    /// Captured (headers, body) pairs shared with a fixture server thread.
+    type CapturedRequests = std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>>;
+
     #[test]
+    // Naive count is fine at this data size; not worth a dependency.
+    #[allow(clippy::naive_bytecount)]
     fn stdio_encoding_is_one_compact_json_line() {
         let value = serde_json::json!({
             "jsonrpc": "2.0",
@@ -3011,6 +3035,8 @@ mod tests {
         }
 
         impl Write for HeldFirstWrite {
+            // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+            #[allow(clippy::significant_drop_tightening)]
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if let Some(entered) = self.entered.take() {
                     let _ = entered.send(());
@@ -3398,7 +3424,7 @@ mod tests {
     /// id allocation.
     struct ScriptedHttpServer {
         addr: std::net::SocketAddr,
-        captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>>,
+        captured: CapturedRequests,
         request_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         stopping: std::sync::Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
@@ -3409,8 +3435,7 @@ mod tests {
             let listener =
                 std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted http server");
             let addr = listener.local_addr().expect("listener addr");
-            let captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured: CapturedRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let captured_for_thread = std::sync::Arc::clone(&captured);
             let request_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let request_lines_for_thread = std::sync::Arc::clone(&request_lines);
@@ -3421,9 +3446,8 @@ mod tests {
                     if stopping_for_thread.load(Ordering::SeqCst) {
                         break;
                     }
-                    let (mut stream, _) = match listener.accept() {
-                        Ok(pair) => pair,
-                        Err(_) => break,
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
                     };
                     if stopping_for_thread.load(Ordering::SeqCst) {
                         break;
@@ -3627,6 +3651,7 @@ mod tests {
     }
 
     impl ControlledInitializeHttpServer {
+        #[allow(clippy::too_many_lines)]
         fn start() -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")
                 .expect("bind controlled initialize server");
@@ -3784,13 +3809,14 @@ mod tests {
 
     struct CancellationHttpServer {
         addr: std::net::SocketAddr,
-        captured: std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>>,
+        captured: CapturedRequests,
         slow_started: std::sync::Arc<AtomicBool>,
         cancellation_received: std::sync::Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl CancellationHttpServer {
+        #[allow(clippy::too_many_lines)]
         fn start() -> Self {
             let listener =
                 std::net::TcpListener::bind("127.0.0.1:0").expect("bind cancellation server");
@@ -3941,6 +3967,8 @@ mod tests {
         }
     }
 
+    // Ownership is part of the call contract here.
+    #[allow(clippy::needless_pass_by_value)]
     fn http_ok_with_session(
         id_placeholder: &str,
         body: serde_json::Value,
@@ -3953,6 +3981,8 @@ mod tests {
         )
     }
 
+    // Ownership is part of the call contract here.
+    #[allow(clippy::needless_pass_by_value)]
     fn http_ok_plain(id_placeholder: &str, body: serde_json::Value) -> String {
         let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id_placeholder},\"result\":{body}}}");
         format!(
@@ -4478,6 +4508,9 @@ mod tests {
     }
 
     #[test]
+    // The block deliberately yields the still-pending initialize future so the
+    // test can drop it outside the runtime.
+    #[allow(clippy::async_yields_async)]
     fn streamable_http_close_during_initialize_rejects_and_deletes_session() {
         let server = ControlledInitializeHttpServer::start();
         let transport = std::sync::Arc::new(

@@ -14133,7 +14133,11 @@ fn push_resource_paths(target: &mut Vec<Value>, value: Option<&Value>) {
     }
 }
 
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 async fn dispatch_extension_event_across_shards_until(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
@@ -14608,7 +14612,7 @@ async fn execute_extension_tool_sharded(
     result
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn execute_extension_command_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
@@ -14670,7 +14674,7 @@ async fn execute_extension_command_sharded(
     result
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn execute_extension_shortcut_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
@@ -15082,20 +15086,17 @@ async fn pump_js_runtime_once_for_owner(
                     0,
                 ));
             };
-            match timeout(
+            timeout(
                 wall_now(),
                 remaining,
                 Box::pin(dispatch_hostcall_with_runtime(Some(runtime), host, req)),
             )
             .await
-            {
-                Ok(outcome) => outcome,
-                Err(_) => HostcallOutcome::Error {
-                    code: "timeout".to_string(),
-                    message: "Root JavaScript task deadline elapsed during hostcall dispatch"
-                        .to_string(),
-                },
-            }
+            .unwrap_or_else(|_| HostcallOutcome::Error {
+                code: "timeout".to_string(),
+                message: "Root JavaScript task deadline elapsed during hostcall dispatch"
+                    .to_string(),
+            })
         } else {
             dispatch_hostcall_with_runtime(Some(runtime), host, req).await
         };
@@ -16758,6 +16759,8 @@ async fn dispatch_shared_allowed(
             // Record reactor mesh routing for shard telemetry (bd-3ar8v.4.20).
             // The reactor mesh assigns a shard for this opcode and uses completions
             // to keep queue-depth and dispatch-latency telemetry tied to real work.
+            // Held for its Drop effect (reactor completion telemetry), never read.
+            #[allow(clippy::collection_is_never_read)]
             let mut _reactor_completion = None;
             if let Some(ref manager) = ctx.manager {
                 match manager.reactor_submit(

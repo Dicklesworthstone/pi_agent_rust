@@ -296,12 +296,24 @@ fn command_payload_can_advance_rpc_session(
     }
 }
 
+/// Payload of a completed RPC `fork`: `(selected_text, previous_session_file,
+/// source_session_id, new_session_id)`; `None` when an extension cancelled the
+/// fork.
+type ForkCompletion = Option<(String, Option<String>, String, String)>;
+
 async fn take_last_rpc_user_turn_for_retry(session: &mut AgentSession) -> Result<Option<String>> {
     // Session is the durable authority. Truncating only Agent history is undone
     // by `run_agent_with_text`, which rehydrates Agent from this path before it
     // appends the retried prompt. Read the same retryable turn shape as
     // checkpoint retry, then move the active leaf behind that user entry while
     // retaining the original branch in the session tree.
+    #[derive(Debug)]
+    enum ProjectedUserTurn {
+        Text { entry_id: String, text: String },
+        Other,
+        NotUser,
+    }
+
     let provider_admission = session.provider_admission_gate();
     provider_admission.ensure_allowed()?;
     let save_enabled = session.save_enabled();
@@ -312,13 +324,6 @@ async fn take_last_rpc_user_turn_for_retry(session: &mut AgentSession) -> Result
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         let mut candidate = inner.clone();
-
-        #[derive(Debug)]
-        enum ProjectedUserTurn {
-            Text { entry_id: String, text: String },
-            Other,
-            NotUser,
-        }
 
         let selected = {
             let path = candidate.entries_for_current_path();
@@ -1502,7 +1507,8 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
     });
 
     let out_tx_shutdown = out_tx.clone();
-    let result = run(session, options, in_rx, out_tx).await;
+    // Boxed: clippy::large_futures.
+    let result = Box::pin(run(session, options, in_rx, out_tx)).await;
 
     // `run` has drained any in-flight turn, so everything queued ahead of the
     // sentinel is the complete event stream. The sentinel (rather than a bare
@@ -4224,7 +4230,7 @@ pub async fn run(
                     }
                 };
 
-                let result: Result<Option<(String, Option<String>, String, String)>> = async {
+                let result: Result<ForkCompletion> = async {
                     // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
                     let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
                         let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
@@ -9314,7 +9320,9 @@ mod retry_tests {
             };
 
             let (server_result, ()) =
-                futures::future::join(run(agent_session, options, in_rx, out_tx), client).await;
+                // Boxed: clippy::large_futures.
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
             assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
         });
     }
@@ -9390,7 +9398,8 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            run(agent_session, options, in_rx, out_tx)
+            // Boxed: clippy::large_futures.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
                 .expect("rpc server should reject the command without failing its loop");
 
@@ -9480,7 +9489,8 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            run(agent_session, options, in_rx, out_tx)
+            // Boxed: clippy::large_futures.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
                 .expect("rpc server loop");
 
@@ -9583,7 +9593,8 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            run(agent_session, options, in_rx, out_tx)
+            // Boxed: clippy::large_futures.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
                 .expect("rpc server loop");
 
@@ -9684,7 +9695,8 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            run(agent_session, options, in_rx, out_tx)
+            // Boxed: clippy::large_futures.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
                 .expect("rpc server loop");
 
@@ -9792,7 +9804,8 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            run(agent_session, options, in_rx, out_tx)
+            // Boxed: clippy::large_futures.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
                 .expect("rpc server loop");
 
@@ -9893,7 +9906,8 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            run(agent_session, options, in_rx, out_tx)
+            // Boxed: clippy::large_futures.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
                 .expect("rpc server loop");
 
@@ -10009,7 +10023,8 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            run(agent_session, options, in_rx, out_tx)
+            // Boxed: clippy::large_futures.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
                 .expect("rpc server loop");
 
@@ -13737,7 +13752,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let first = send_recv(
                 &in_tx,
@@ -13821,7 +13837,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let ack = send_recv(
                 &in_tx,
@@ -13903,7 +13920,8 @@ export default function init(pi) {
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
             let out_rx = Arc::new(Mutex::new(out_rx));
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let ready = send_recv(
                 &in_tx,
@@ -14049,7 +14067,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
             let ready = send_recv(
                 &in_tx,
                 &out_rx,
@@ -14124,7 +14143,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let steering = send_recv(
                 &in_tx,
@@ -14187,7 +14207,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let prompt = send_recv(
                 &in_tx,
@@ -14238,7 +14259,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let response = send_recv(
                 &in_tx,
@@ -14275,7 +14297,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let response = send_recv(
                 &in_tx,
@@ -14325,7 +14348,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let prompt = send_recv(
                 &in_tx,
@@ -15239,7 +15263,8 @@ export default function init(pi) {
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
             let out_rx = Arc::new(Mutex::new(out_rx));
             let server = runtime_handle
-                .spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let initial = send_recv(
                 &in_tx,
@@ -15350,7 +15375,8 @@ export default function init(pi) {
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
             let out_rx = Arc::new(Mutex::new(out_rx));
             let server = runtime_handle
-                .spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let prompt = send_recv(
                 &in_tx,
@@ -15619,7 +15645,7 @@ export default function init(pi) {
                 );
             }
 
-            let err = match acquire_rpc_session_transition(
+            let Err(err) = acquire_rpc_session_transition(
                 &baseline,
                 &AtomicBool::new(false),
                 &AtomicBool::new(false),
@@ -15630,9 +15656,8 @@ export default function init(pi) {
                 &cx,
             )
             .await
-            {
-                Ok(_) => panic!("source mutation must reject the transition"),
-                Err(err) => err,
+            else {
+                panic!("source mutation must reject the transition")
             };
             assert!(
                 err.to_string().contains("modified the source Session"),
@@ -15893,7 +15918,7 @@ export default function init(pi) {
                 assert_eq!(inner.leaf_id(), baseline.leaf_id.as_deref());
             }
 
-            let err = match acquire_rpc_session_transition(
+            let Err(err) = acquire_rpc_session_transition(
                 &baseline,
                 &AtomicBool::new(false),
                 &AtomicBool::new(false),
@@ -15904,9 +15929,8 @@ export default function init(pi) {
                 &cx,
             )
             .await
-            {
-                Ok(_) => panic!("header-only source mutation must reject the transition"),
-                Err(err) => err,
+            else {
+                panic!("header-only source mutation must reject the transition")
             };
             assert!(
                 err.to_string().contains("modified the source Session"),
@@ -17273,7 +17297,8 @@ export default function init(pi) {
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
             let out_rx = Arc::new(Mutex::new(out_rx));
             let server = runtime_handle
-                .spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let first = send_recv(
                 &in_tx,
@@ -18388,7 +18413,8 @@ export default function init(pi) {
             let out_rx = Arc::new(Mutex::new(out_rx));
 
             let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+                // Boxed: clippy::large_futures.
+                handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
             let response = send_recv(
                 &in_tx,
@@ -18499,7 +18525,9 @@ export default function init(pi) {
             };
 
             let (server_result, ()) =
-                futures::future::join(run(agent_session, options, in_rx, out_tx), client).await;
+                // Boxed: clippy::large_futures.
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
             assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
             let calls = state.calls.load(Ordering::SeqCst);
             assert_eq!(

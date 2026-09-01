@@ -377,6 +377,7 @@ impl SessionIndex {
         self.refresh_incremental_with_file_stats_and_after_scan(file_stats, || {})
     }
 
+    #[allow(clippy::too_many_lines)]
     fn refresh_incremental_with_file_stats_and_after_scan(
         &self,
         file_stats: impl Fn(&Path) -> Result<(i64, u64)> + Send,

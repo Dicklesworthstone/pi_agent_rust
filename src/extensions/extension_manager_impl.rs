@@ -3008,6 +3008,8 @@ impl ExtensionManager {
     /// `Some(true)` forces a durable record, and `Some(false)` keeps the
     /// decision session-scoped. If a requested durable write fails, the
     /// session cache remains installed and the error reports that downgrade.
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn cache_policy_prompt_decision_scoped(
         &self,
         extension_id: &str,
@@ -4185,6 +4187,13 @@ impl ExtensionManager {
             .await
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    // option_if_let_else: both branches await, so combinator closures cannot apply.
+    #[allow(
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines,
+        clippy::option_if_let_else
+    )]
     pub async fn request_ui(
         &self,
         mut request: ExtensionUiRequest,

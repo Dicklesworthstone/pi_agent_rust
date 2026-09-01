@@ -96,15 +96,13 @@ async fn persist_excluded_bash_execution_bounded(
     save_enabled: bool,
     cx: &Cx,
 ) -> ExcludedBashPersistenceOutcome {
-    if let Ok(outcome) = asupersync::time::timeout(
+    asupersync::time::timeout(
         asupersync::time::wall_now(),
         BASH_COMPLETION_TIMEOUT,
         persist_excluded_bash_execution(session, message, save_enabled, cx),
     )
     .await
-    {
-        outcome
-    } else {
+    .unwrap_or_else(|_| {
         tracing::error!(
             "completed excluded-context bash command exceeded its persistence cleanup budget"
         );
@@ -112,7 +110,7 @@ async fn persist_excluded_bash_execution_bounded(
             pending_mutations: None,
             failed_flushes: None,
         }
-    }
+    })
 }
 
 async fn deliver_bash_result(
@@ -3524,10 +3522,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         // asupersync TryLockError carries the guard, so the match temporary
         // would pin the immutable borrow across self mutations (bd-9x70g
         // unblock). Extract an owned decision first, mutate after.
-        let (owner_session_id, session_busy) = match self.session.try_lock() {
-            Ok(session) => (session.header.id.clone(), false),
-            Err(_) => (String::new(), true),
-        };
+        let (owner_session_id, session_busy) = self.session.try_lock().map_or_else(
+            |_| (String::new(), true),
+            |session| (session.header.id.clone(), false),
+        );
         if session_busy {
             self.status_message = Some("/btw unavailable: session is busy".to_string());
             self.scroll_to_bottom();
@@ -3565,7 +3563,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
     fn completed_tan_event(
         owner_session_id: String,
-        completion: pi::subagents::TanCompletion,
+        completion: &pi::subagents::TanCompletion,
     ) -> PiMsg {
         let card = pi::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
             .map_or_else(
@@ -3622,10 +3620,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
-        let (owner_session_id, session_busy) = match self.session.try_lock() {
-            Ok(session) => (session.header.id.clone(), false),
-            Err(_) => (String::new(), true),
-        };
+        let (owner_session_id, session_busy) = self.session.try_lock().map_or_else(
+            |_| (String::new(), true),
+            |session| (session.header.id.clone(), false),
+        );
         if session_busy {
             self.status_message = Some("/tan unavailable: session is busy".to_string());
             self.scroll_to_bottom();
@@ -3640,7 +3638,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let display_work = work.clone();
         runtime.spawn(async move {
             let event = match tool.run_background_tan(&work).await {
-                Ok(completion) => Self::completed_tan_event(owner_session_id, completion),
+                Ok(completion) => Self::completed_tan_event(owner_session_id, &completion),
                 Err(err) => PiMsg::SessionSystemNote {
                     owner_session_id,
                     message: format!("(/tan failed)\n{err}"),
@@ -5175,7 +5173,7 @@ mod tests {
         };
         let expected_card = completion.card_text();
         let expected_follow_up = completion.follow_up_text();
-        let event = PiApp::completed_tan_event(origin_session_id.clone(), completion);
+        let event = PiApp::completed_tan_event(origin_session_id.clone(), &completion);
         assert!(matches!(
             &event,
             PiMsg::SessionSystemNote {

@@ -134,12 +134,9 @@ async fn stage_and_commit_compaction_session(
             )
         })?;
     let expected_entry = serde_json::to_vec(&SessionEntry::Compaction(compaction_entry.clone()))?;
-    let mut persistence = if save_enabled {
-        CompactionPersistenceOutcome::Confirmed
-    } else {
+    let persistence = if !save_enabled {
         CompactionPersistenceOutcome::Disabled
-    };
-    if save_enabled && let Err(err) = candidate.save().await {
+    } else if let Err(err) = candidate.save().await {
         tracing::error!(
             error = %err,
             entry_id,
@@ -154,8 +151,10 @@ async fn stage_and_commit_compaction_session(
                         .to_string(),
                 ));
         }
-        persistence = CompactionPersistenceOutcome::ReconciledButUnconfirmed;
-    }
+        CompactionPersistenceOutcome::ReconciledButUnconfirmed
+    } else {
+        CompactionPersistenceOutcome::Confirmed
+    };
 
     let messages_for_agent = candidate.to_messages_for_current_path();
     let (messages_for_ui, usage) = conversation_from_session(&candidate);
@@ -232,12 +231,9 @@ async fn stage_and_commit_retry(
     })?;
 
     let new_leaf_id = candidate.leaf_id().map(str::to_string);
-    let mut persistence = if save_enabled {
-        RetryPersistenceOutcome::Confirmed
-    } else {
+    let persistence = if !save_enabled {
         RetryPersistenceOutcome::Disabled
-    };
-    if save_enabled && let Err(err) = candidate.save().await {
+    } else if let Err(err) = candidate.save().await {
         tracing::error!(
             error = %err,
             ?new_leaf_id,
@@ -251,8 +247,10 @@ async fn stage_and_commit_retry(
                 "Retry persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
             )));
         }
-        persistence = RetryPersistenceOutcome::ReconciledButUnconfirmed;
-    }
+        RetryPersistenceOutcome::ReconciledButUnconfirmed
+    } else {
+        RetryPersistenceOutcome::Confirmed
+    };
 
     let messages_for_agent = candidate.to_messages_for_current_path();
     let (messages_for_ui, usage) = conversation_from_session(&candidate);
@@ -1195,6 +1193,7 @@ impl PiApp {
     /// rewound leaf, then swaps Session/Agent only after that save. The prompt
     /// is emitted as one `RetryCommitted` event so slash-command reparse cannot
     /// steal the sibling parent.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_retry(&mut self) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot retry while processing".to_string());
@@ -2275,10 +2274,9 @@ mod tests {
     }
 
     fn linear_retry_session(session_dir: Option<std::path::PathBuf>) -> (Session, String, String) {
-        let mut session = match session_dir {
-            Some(dir) => Session::create_with_dir(Some(dir)),
-            None => Session::in_memory(),
-        };
+        let mut session = session_dir.map_or_else(Session::in_memory, |dir| {
+            Session::create_with_dir(Some(dir))
+        });
         session.append_message(session_user("first question"));
         let first_answer = session.append_message(session_assistant("first answer"));
         let abandoned = session.append_message(session_user("second question"));
@@ -2358,12 +2356,11 @@ mod tests {
                 .await
                 .expect("lock retried session");
             assert_eq!(guard.leaf_id(), Some(first_answer.as_str()));
-            let path_ids: Vec<String> = guard
+            let abandoned_on_path = guard
                 .entries_for_current_path()
                 .iter()
-                .filter_map(|entry| entry.base().id.clone())
-                .collect();
-            assert!(!path_ids.contains(&abandoned));
+                .any(|entry| entry.base().id.as_ref() == Some(&abandoned));
+            assert!(!abandoned_on_path);
             assert!(guard.get_entry(&abandoned).is_some());
         });
     }
@@ -2408,12 +2405,11 @@ mod tests {
             .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
             .expect("reopen retried session");
         assert_eq!(reopened.leaf_id(), Some(first_answer.as_str()));
-        let path_ids: Vec<String> = reopened
+        let abandoned_on_path = reopened
             .entries_for_current_path()
             .iter()
-            .filter_map(|entry| entry.base().id.clone())
-            .collect();
-        assert!(!path_ids.contains(&abandoned));
+            .any(|entry| entry.base().id.as_ref() == Some(&abandoned));
+        assert!(!abandoned_on_path);
         assert!(reopened.get_entry(&abandoned).is_some());
         let mut live = reopened;
         let retried = live.append_message(session_user("second question"));

@@ -1472,18 +1472,15 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
 
                 let session = Arc::clone(&self.session);
-                let session_guard = match session.try_lock() {
-                    Ok(session_guard) => session_guard,
-                    Err(_) => {
-                        return self.retry_busy_session_event(
-                            PiMsg::OpenTree {
-                                owner_session_id,
-                                initial_selected_id,
-                                label,
-                            },
-                            attempts_remaining,
-                        );
-                    }
+                let Ok(session_guard) = session.try_lock() else {
+                    return self.retry_busy_session_event(
+                        PiMsg::OpenTree {
+                            owner_session_id,
+                            initial_selected_id,
+                            label,
+                        },
+                        attempts_remaining,
+                    );
                 };
                 if session_guard.header.id != owner_session_id {
                     return None;
@@ -1535,7 +1532,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 generation,
                 timer_generation,
             } => {
-                return self.handle_capability_prompt_tick(id, generation, timer_generation);
+                return self.handle_capability_prompt_tick(&id, generation, timer_generation);
             }
             PiMsg::ExtensionCommandDone {
                 command: _,
@@ -1857,7 +1854,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     ///    (bd-yllbn reopen audit).
     fn handle_capability_prompt_tick(
         &mut self,
-        id: String,
+        id: &str,
         generation: u64,
         timer_generation: u64,
     ) -> Option<Cmd> {
@@ -1873,16 +1870,10 @@ After approving access in the browser, press Enter in Pi to complete login."
                     && prompt.generation == generation
                     && prompt.timer_generation() == timer_generation
             });
-            let Some(queue_index) = queue_index else {
-                return None;
-            };
-            let Some(queued) = self.capability_prompt_queue.get(queue_index) else {
-                return None;
-            };
+            let queue_index = queue_index?;
+            let queued = self.capability_prompt_queue.get(queue_index)?;
             if queued.has_time_remaining(now) {
-                let Some(queued) = self.capability_prompt_queue.get_mut(queue_index) else {
-                    return None;
-                };
+                let queued = self.capability_prompt_queue.get_mut(queue_index)?;
                 // Invalidate this delivered epoch before arming its
                 // replacement. A duplicate copy of the current tick can then
                 // never create a second live waiter chain.
@@ -1910,9 +1901,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             active.restart_timer();
             return Self::capability_prompt_tick_cmd(active);
         }
-        let Some(expired) = self.capability_prompt.take() else {
-            return None;
-        };
+        let expired = self.capability_prompt.take()?;
         expired.cancel_timer();
         let response = expired.request.auto_deny_response();
         self.send_extension_ui_response_quiet(response);
@@ -2378,6 +2367,10 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// Returns `None` when no card is pending (the caller continues with its
     /// normal submit/queue handling); otherwise the card consumed the line.
     /// An empty editor is a no-op so Enter cannot accidentally answer.
+    // Outer None = "no card pending, caller keeps its normal submit path";
+    // inner Option is the routed command itself. Flattening would lose the
+    // pending/not-pending distinction.
+    #[allow(clippy::option_option)]
     pub(super) fn submit_pending_card_answer(&mut self) -> Option<Option<Cmd>> {
         if !self.has_pending_input_card() {
             return None;
@@ -2465,7 +2458,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.active_input_card_kind = None;
         }
         if self.resolve_order_head_after(kind) {
-            self.try_activate_next_input_card_impl()
+            self.try_activate_next_input_card_impl();
         } else {
             match kind {
                 InputCardKind::Ask => self.advance_ask_ui_queue(),
@@ -5146,6 +5139,7 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn conversation_reset_clears_session_scoped_ui_state() {
         let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app.title_requested = true;
@@ -5316,6 +5310,7 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn contended_current_session_reset_is_retried_then_applied() {
         let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         let session_id = app
@@ -6837,12 +6832,11 @@ mod stream_delta_batcher_tests {
         {
             let session_guard = app.session.try_lock().expect("lock session");
             assert_eq!(session_guard.leaf_id(), Some(first_answer.as_str()));
-            let path_ids: Vec<String> = session_guard
+            let abandoned_on_path = session_guard
                 .entries_for_current_path()
                 .iter()
-                .filter_map(|entry| entry.base().id.clone())
-                .collect();
-            assert!(!path_ids.contains(&abandoned));
+                .any(|entry| entry.base().id.as_ref() == Some(&abandoned));
+            assert!(!abandoned_on_path);
             assert!(session_guard.get_entry(&abandoned).is_some());
         }
 

@@ -642,6 +642,8 @@ impl CapabilityPromptTimer {
         }
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     pub(super) fn cancel(&self) {
         let (cancelled, wake) = &*self.state;
         let mut cancelled = cancelled
@@ -653,6 +655,8 @@ impl CapabilityPromptTimer {
 
     /// Wait for one redraw interval. Returns false when lifecycle cleanup
     /// cancelled this generation before the interval elapsed.
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     pub(super) fn wait(&self, delay: std::time::Duration) -> bool {
         let (cancelled, wake) = &*self.state;
         let cancelled = cancelled

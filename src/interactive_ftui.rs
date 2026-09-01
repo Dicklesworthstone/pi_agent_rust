@@ -2056,12 +2056,16 @@ impl PiFtuiModel {
     /// Fail closed every modal owned by the completed/replaced turn. Replies
     /// are emitted before state is cleared so no Ask or extension waiter can
     /// survive invisibly and consume ordinary editor input later.
+    // The flag accumulates across three sequential dismissal steps with side
+    // effects; collapsing them into one expression would obscure that order.
+    #[allow(clippy::useless_let_if_seq)]
     fn dismiss_pending_interactions(&mut self) -> bool {
-        let mut dismissed = false;
-        if let Some(ask) = self.active_ask.take() {
+        let mut dismissed = if let Some(ask) = self.active_ask.take() {
             self.send_ask_reply(ask.request.id, Vec::new(), true);
-            dismissed = true;
-        }
+            true
+        } else {
+            false
+        };
         if let Some(request) = self.active_ext.take() {
             self.send_ext_reply(ExtensionUiResponse {
                 id: request.id,
@@ -2686,6 +2690,8 @@ impl Drop for FtuiPendingUiLease<'_> {
 
 #[async_trait::async_trait]
 impl crate::sdk::ExtensionUiHandler for FtuiExtensionUiHandler {
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     async fn request_ui(
         &self,
         request: ExtensionUiRequest,
@@ -2852,6 +2858,8 @@ enum AskReplyPoll {
     Disconnected,
 }
 
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
 fn poll_ask_reply(current_ask: &CurrentAsk, ask_reply_rx: &Receiver<AskUiReply>) -> AskReplyPoll {
     match ask_reply_rx.try_recv() {
         Ok(reply) => {
@@ -3717,16 +3725,13 @@ pub fn run(
             let runtime_handle = runtime.handle();
             let terminal_agent_tx = agent_tx.clone();
             let shutdown = runtime.block_on(async move {
-                let Some((mut handle, ext_handler)) = create_driver_session(
+                let (mut handle, ext_handler) = create_driver_session(
                     session_options,
                     &agent_tx,
                     ext_reply_rx,
                     &runtime_handle,
                 )
-                .await
-                else {
-                    return None;
-                };
+                .await?;
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
                 send_conversation_reset(
@@ -3781,7 +3786,8 @@ pub fn run(
                                 .await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
-                            if let Err(err) = resume_session_command(
+                            // Boxed: clippy::large_futures.
+                            if let Err(err) = Box::pin(resume_session_command(
                                 &path,
                                 &resume_template,
                                 &mut handle,
@@ -3789,7 +3795,7 @@ pub fn run(
                                 &ext_handler,
                                 &agent_tx,
                                 &runtime_handle,
-                            )
+                            ))
                             .await
                             {
                                 replacement_failure = Some(err);
@@ -3797,14 +3803,15 @@ pub fn run(
                             }
                         }
                         Ok(UiCommand::NewSession) => {
-                            if let Err(err) = new_session_command(
+                            // Boxed: clippy::large_futures.
+                            if let Err(err) = Box::pin(new_session_command(
                                 &resume_template,
                                 &mut handle,
                                 &current_ask,
                                 &ext_handler,
                                 &agent_tx,
                                 &runtime_handle,
-                            )
+                            ))
                             .await
                             {
                                 replacement_failure = Some(err);

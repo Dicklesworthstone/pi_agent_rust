@@ -135,7 +135,9 @@ fn url_host(url: &str) -> Option<String> {
     Some(host.to_string())
 }
 
-/// The full fetch pipeline. Reader mode converts supported documents to
+/// The full fetch pipeline.
+///
+/// Reader mode converts supported documents to
 /// markdown; raw mode returns the downloaded body without conversion. Honors
 /// the global request-timeout override (`PI_HTTP_REQUEST_TIMEOUT_SECS`) via the
 /// shared HTTP client.

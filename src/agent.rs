@@ -7793,11 +7793,8 @@ mod extensions_integration_tests {
             let foreign_gate = SessionActionAdmissionGate::default();
             assert_eq!(gate.generation(), foreign_gate.generation());
 
-            let err = match gate.acquire_origin(&foreign_gate.capture_origin()).await {
-                Ok(_) => {
-                    panic!("a same-counter token from another Session gate must be rejected")
-                }
-                Err(error) => error,
+            let Err(err) = gate.acquire_origin(&foreign_gate.capture_origin()).await else {
+                panic!("a same-counter token from another Session gate must be rejected")
             };
             assert!(
                 err.to_string().contains("active Session changed"),
@@ -8541,6 +8538,7 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn extension_command_rejects_real_js_timer_promise_mutation_delayed_across_transition() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -8675,6 +8673,7 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn extension_command_deadline_cancels_blocked_session_hostcalls_and_reuses_shard() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -12369,14 +12368,16 @@ impl AgentSession {
             model_id: provider.model_id().to_string(),
             snapshot_leaf_id: session.leaf_id().map(str::to_string),
         };
-        let snapshot_is_ancestor = match &origin.snapshot_leaf_id {
-            Some(snapshot_leaf_id) => session.entries_for_current_path().iter().any(|entry| {
-                entry
-                    .base_id()
-                    .is_some_and(|entry_id| entry_id == snapshot_leaf_id)
-            }),
-            None => session.leaf_id().is_none(),
-        };
+        let snapshot_is_ancestor = origin.snapshot_leaf_id.as_ref().map_or_else(
+            || session.leaf_id().is_none(),
+            |snapshot_leaf_id| {
+                session.entries_for_current_path().iter().any(|entry| {
+                    entry
+                        .base_id()
+                        .is_some_and(|entry_id| entry_id == snapshot_leaf_id)
+                })
+            },
+        );
         let matches = origin.session_id == current.session_id
             && origin.provider_id == current.provider_id
             && origin.model_id == current.model_id
@@ -13019,6 +13020,7 @@ impl AgentSession {
     }
 
     /// Run compaction synchronously (inline), blocking until completion.
+    #[allow(clippy::too_many_lines)]
     async fn compact_synchronous(&mut self, on_event: AgentEventHandler) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
@@ -18970,6 +18972,8 @@ mod tests {
     }
 
     #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn session_compact_hook_can_reenter_provider_after_transition_install() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -19056,6 +19060,8 @@ mod tests {
     }
 
     #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn compaction_persistence_failure_preserves_live_session_and_quarantines_provider() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

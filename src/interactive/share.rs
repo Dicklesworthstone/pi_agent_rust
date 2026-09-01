@@ -449,16 +449,17 @@ fn sanitize_share_label(raw: &str, workspace_cwd: &str) -> String {
         if index >= 160 {
             break;
         }
-        if character.is_whitespace() || character.is_control() {
-            safe.push(' ');
-        } else if matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        ) {
+        if character.is_whitespace()
+            || character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        {
             safe.push(' ');
         } else {
             safe.push(character);

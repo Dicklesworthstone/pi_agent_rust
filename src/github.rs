@@ -240,7 +240,7 @@ fn stderr_evidence(output: &BoundedProcessOutput) -> String {
     let truncation = if output.stderr_truncated {
         format!("\n[stderr truncated at {MAX_GH_STDERR_BYTES} bytes]")
     } else {
-        Default::default()
+        String::default()
     };
     if brief.is_empty() && truncation.is_empty() {
         String::new()
@@ -706,6 +706,7 @@ impl GithubTool {
         Ok(text_output(format_run_list(&items), items))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn op_run_watch(
         &self,
         input: &Value,
@@ -1297,6 +1298,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    // The capture limits are small compile-time constants (<= 1MB), far below
+    // usize::MAX on any supported target, so the casts cannot truncate.
+    #[allow(clippy::cast_possible_truncation)]
     fn production_capture_is_bounded_and_reports_json_overflow() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = GithubTool::new(dir.path(), Some("/bin/sh"));

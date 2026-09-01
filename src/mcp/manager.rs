@@ -495,12 +495,11 @@ impl McpManager {
                         ),
                     )
                 })?;
+            let mut store = TrustStore::load(&self.inner.trust_path)?;
             if let Some(execution) = &identity {
-                let mut store = TrustStore::load(&self.inner.trust_path)?;
                 store.acknowledge_execution(name, &fingerprint, "operator", execution.clone())?;
             } else {
                 // HTTP transport: nothing local executes.
-                let mut store = TrustStore::load(&self.inner.trust_path)?;
                 store.acknowledge(name, &fingerprint, "operator")?;
             }
         }
@@ -559,6 +558,8 @@ impl McpManager {
     /// names of transports that were actually closed (empty when idle). A
     /// manager cannot be restarted after this call; construct a replacement
     /// session manager instead.
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_in_scrutinee)]
     pub async fn shutdown_all(&self) -> Vec<String> {
         self.inner.shutting_down.store(true, Ordering::Release);
         let servers = Self::lock(&self.inner.servers).clone();
@@ -718,6 +719,8 @@ impl McpManager {
         Ok(tools)
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn clear_tools_cache_if_current(
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
@@ -733,6 +736,8 @@ impl McpManager {
         true
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn publish_tools_if_current(
         &self,
         entry: &Arc<ServerEntry>,
@@ -752,6 +757,8 @@ impl McpManager {
         true
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn fail_transport_generation(
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
@@ -940,6 +947,7 @@ impl McpManager {
         self.ensure_ready_in_lane(entry).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn ensure_ready_in_lane(&self, entry: &Arc<ServerEntry>) -> Result<()> {
         self.check_running()?;
         if let Err(err) = self.check_trust(entry) {
@@ -1293,6 +1301,8 @@ impl McpManager {
         }
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn detach_failed_call_transport(
         entry: &Arc<ServerEntry>,
         failed_transport: &Arc<dyn McpTransport>,
@@ -1319,6 +1329,8 @@ impl McpManager {
         removed_failed_transport.is_some()
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     async fn close_revoked_transport(entry: &Arc<ServerEntry>, transport: &Arc<dyn McpTransport>) {
         let removed = {
             let mut current = Self::lock(&entry.transport);
@@ -1373,6 +1385,8 @@ impl McpManager {
         }
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn record_operational_success(
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
@@ -1480,6 +1494,8 @@ impl McpManager {
         true
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_in_scrutinee)]
     async fn connect_trusted_with_budget(&self, budget: Duration) {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1513,7 +1529,8 @@ impl McpManager {
                         // Capture and list one exact generation while retaining
                         // the same lane. Timeout cleanup can then safely compare
                         // this snapshot with the transport whose request hung.
-                        *Self::lock(&observed_transport) = Self::lock(&entry.transport).clone();
+                        let current_generation = Self::lock(&entry.transport).clone();
+                        *Self::lock(&observed_transport) = current_generation;
                         #[cfg(test)]
                         if let Some(hook) =
                             Self::lock(&self.inner.startup_after_generation_hook).clone()
@@ -1578,6 +1595,7 @@ impl McpManager {
     /// Same registry, same trust gate: the spec flows through the identical
     /// spawn path as file-configured servers, with `provenance=extension`.
     /// Name collisions with existing entries are ignored (file config wins).
+    #[allow(clippy::too_many_lines)]
     pub fn register_extension_server(&self, name: &str, spec: &Value) {
         if let Err(reason) = super::config::validate_server_name(name) {
             tracing::warn!(
@@ -1920,6 +1938,8 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for HangingToolsTransport {
+        // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+        #[allow(clippy::significant_drop_in_scrutinee)]
         async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             if method == "tools/list" {
                 if let Some(started) = McpManager::lock(&self.started).take() {
@@ -1953,6 +1973,8 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for HangingInitializeTransport {
+        // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+        #[allow(clippy::significant_drop_in_scrutinee)]
         async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             if method == "initialize" {
                 if let Some(started) = McpManager::lock(&self.state.started).take() {
@@ -2823,6 +2845,8 @@ mod tests {
     }
 
     #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn startup_budget_preempts_blocked_synchronous_transport_construction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry) = trusted_fixture_manager(&temp);
@@ -3086,6 +3110,11 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for HeldRequestTransport {
+        // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+        #[allow(
+            clippy::significant_drop_in_scrutinee,
+            clippy::significant_drop_tightening
+        )]
         async fn request(
             &self,
             _method: &str,

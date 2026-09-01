@@ -167,6 +167,8 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
 
 type CompactionOutcome = Result<CompactionResult>;
 
+// The _id suffixes mirror the wire/session vocabulary; renaming would hurt greppability.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionOrigin {
     pub session_id: String,
@@ -351,6 +353,7 @@ impl CompactionWorkerState {
     }
 
     /// Spawn a background compaction on the provided runtime.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_for_origin(
         &mut self,
         origin: CompactionOrigin,
@@ -393,6 +396,7 @@ impl CompactionWorkerState {
         .expect("test compaction runtime must admit the task");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_inner(
         &mut self,
         origin: Option<CompactionOrigin>,
