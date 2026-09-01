@@ -2377,7 +2377,9 @@ fn microbench_only_claim_failure(path: &Path, payload: &Value) -> Option<DataCon
         })
 }
 
-#[allow(clippy::too_many_lines)]
+// items_after_statements: the REQUIRED_* tables sit next to the checks they
+// feed; hoisting them away from that context would hurt readability.
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
 fn evaluate_phase1_weighted_attribution_contract(
     root: &Path,
     max_age_hours: f64,
@@ -6097,6 +6099,8 @@ fn classify_budget_status_promotes_ci_no_data_to_fail_under_strict() {
     assert_eq!(classify_budget_status(budget, None, true), "FAIL");
 }
 
+// Fixture helper; taking ownership keeps the many vec![...] call sites terse.
+#[allow(clippy::needless_pass_by_value)]
 fn write_post_generation_inventory_fixture(
     evidence_root: &Path,
     source_commit: &str,
