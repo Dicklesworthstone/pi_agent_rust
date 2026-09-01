@@ -6660,4 +6660,303 @@ mod loop_watchdog_tests {
             "an in-budget phase clears the latch for the next stall"
         );
     }
+
+    // ── Issue #201: per-message render cache ─────────────────────────────
+
+    /// Complete one streamed assistant turn, leaving `text` as a transcript
+    /// entry.
+    fn finish_turn(sim: &mut ProgramSimulator<PiFtuiModel>, text: &str) {
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta(text.into())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+    }
+
+    #[test]
+    fn render_cache_makes_warm_frames_o_changed_not_o_transcript() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for i in 0..4 {
+            finish_turn(&mut sim, &format!("message **{i}** body"));
+        }
+        assert_eq!(sim.model().transcript.len(), 4);
+        let _ = sim.model().conversation_text();
+        assert_eq!(
+            sim.model().render_stats.get(),
+            (4, 0),
+            "cold frame renders every block"
+        );
+        let _ = sim.model().conversation_text();
+        assert_eq!(
+            sim.model().render_stats.get(),
+            (0, 4),
+            "warm frame must reuse every unchanged block"
+        );
+        finish_turn(&mut sim, "one more");
+        let _ = sim.model().conversation_text();
+        assert_eq!(
+            sim.model().render_stats.get(),
+            (1, 4),
+            "only the new entry may render"
+        );
+        let _ = sim.model().conversation_text();
+        assert_eq!(sim.model().render_stats.get(), (0, 5));
+    }
+
+    #[test]
+    fn render_cache_skips_pending_cards_and_settles_finished_ones() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        finish_turn(&mut sim, "before the tool");
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "bash".into(),
+            tool_id: "t1".into(),
+        }));
+        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text();
+        assert_eq!(
+            sim.model().render_stats.get(),
+            (1, 1),
+            "a pending card renders fresh every frame (spinner-dependent)"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "bash".into(),
+            tool_id: "t1".into(),
+            is_error: false,
+            output: Some("ok".into()),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+        let _ = sim.model().conversation_text();
+        let (rendered, _) = sim.model().render_stats.get();
+        assert!(
+            rendered >= 1,
+            "the settled card must re-render once after mutation"
+        );
+        let _ = sim.model().conversation_text();
+        let (rendered, reused) = sim.model().render_stats.get();
+        assert_eq!(rendered, 0, "settled card caches like any other block");
+        assert_eq!(reused, sim.model().transcript.len());
+    }
+
+    #[test]
+    fn render_cache_leaves_streaming_tail_uncached() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("streaming tail".into())));
+        let text = sim.model().conversation_text();
+        assert!(
+            text.lines()
+                .iter()
+                .any(|line| line.to_plain_text().contains("streaming tail")),
+            "streaming tail must render"
+        );
+        assert_eq!(
+            sim.model().render_stats.get(),
+            (0, 0),
+            "the in-flight tail is not a cached block"
+        );
+    }
+
+    #[test]
+    fn render_cache_flushes_on_theme_change() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        finish_turn(&mut sim, "themed message");
+        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text();
+        assert_eq!(sim.model().render_stats.get(), (0, 1));
+        type_str(&mut sim, "/theme");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty())); // apply "dark"
+        let _ = sim.model().conversation_text();
+        let (rendered, reused) = sim.model().render_stats.get();
+        assert_eq!(reused, 0, "theme change must drop every cached block");
+        assert_eq!(rendered, sim.model().transcript.len());
+    }
+
+    // ── Issue #202: compact markdown spacing ─────────────────────────────
+
+    #[test]
+    fn compact_spacing_collapses_paragraph_gaps_keeps_heading_and_fence_air() {
+        let source = "para one\n\npara two\n\n# Section\n\nbody text\n\n```rust\nlet x = 1;\n```\n\ntail line";
+        let render = |spacing: crate::config::MarkdownSpacing| {
+            let (_tx, rx) = mpsc::channel();
+            let model = PiFtuiModel::new(rx).with_markdown_spacing(spacing);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            finish_turn(&mut sim, source);
+            sim.model()
+                .conversation_text()
+                .lines()
+                .iter()
+                .map(ftui::text::Line::to_plain_text)
+                .collect::<Vec<_>>()
+        };
+        let comfortable = render(crate::config::MarkdownSpacing::Comfortable);
+        let compact = render(crate::config::MarkdownSpacing::Compact);
+        assert!(
+            compact.len() < comfortable.len(),
+            "compact must be denser: comfortable={comfortable:?} compact={compact:?}"
+        );
+        let para = compact
+            .iter()
+            .position(|l| l.contains("para one"))
+            .expect("para one rendered");
+        assert!(
+            compact[para + 1].contains("para two"),
+            "paragraph gap must collapse: {compact:?}"
+        );
+        let head = compact
+            .iter()
+            .position(|l| l.contains("Section"))
+            .expect("heading rendered");
+        assert!(
+            compact[head - 1].trim().is_empty(),
+            "heading keeps a blank above: {compact:?}"
+        );
+        assert!(
+            compact[head + 1].trim().is_empty(),
+            "heading keeps a blank below: {compact:?}"
+        );
+        let code = compact
+            .iter()
+            .position(|l| l.contains("let x = 1;"))
+            .expect("code line rendered");
+        assert!(
+            compact[code].starts_with("  "),
+            "code body keeps its indent: {compact:?}"
+        );
+        let tail = compact
+            .iter()
+            .position(|l| l.contains("tail line"))
+            .expect("tail rendered");
+        assert!(
+            compact[tail - 1].trim().is_empty(),
+            "fence keeps a blank below: {compact:?}"
+        );
+    }
+
+    #[test]
+    fn comfortable_spacing_is_the_unchanged_default() {
+        let (_tx, model) = new_model();
+        assert_eq!(
+            model.markdown_spacing,
+            crate::config::MarkdownSpacing::Comfortable
+        );
+    }
+
+    // ── Issue #203: busy indicator for out-of-turn driver operations ─────
+
+    #[test]
+    fn model_switch_arms_busy_spinner_until_driver_replies() {
+        use ftui::runtime::simulator::CmdRecord;
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, _submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/model openai/gpt-5");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            sim.model().busy.as_deref(),
+            Some("switching model to openai/gpt-5 ..."),
+            "routing /model must arm the busy indicator"
+        );
+        assert!(
+            matches!(sim.command_log().last(), Some(CmdRecord::Tick(_))),
+            "arming busy must start the spinner tick chain"
+        );
+        // Ticks animate and re-arm while busy even though no turn runs.
+        let before = sim.model().spinner.current_frame;
+        sim.inject_event(Event::Tick);
+        assert_eq!(sim.model().spinner.current_frame, before + 1);
+        assert!(matches!(sim.command_log().last(), Some(CmdRecord::Tick(_))));
+        let spin = DOTS[sim.model().spinner.current_frame % DOTS.len()];
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains(&format!("{spin} switching model to")),
+            "status region missing busy spinner: {rendered:?}"
+        );
+        // The driver's reply clears busy and parks the ticks.
+        sim.send(PiFtuiMsg::Agent(PiMsg::System(
+            "model set to openai/gpt-5".into(),
+        )));
+        assert!(sim.model().busy.is_none(), "driver reply must clear busy");
+        let frame = sim.model().spinner.current_frame;
+        sim.inject_event(Event::Tick);
+        assert_eq!(sim.model().spinner.current_frame, frame);
+        assert!(matches!(sim.command_log().last(), Some(CmdRecord::None)));
+    }
+
+    #[test]
+    fn resume_picker_selection_arms_busy_indicator() {
+        use ftui::runtime::simulator::CmdRecord;
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_sessions(vec![(
+                "old session · 3 msgs".into(),
+                "/tmp/s.jsonl".into(),
+            )]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/resume");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "picker must open");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("resume routed"),
+            UiCommand::ResumeSession {
+                path: "/tmp/s.jsonl".into()
+            }
+        );
+        assert_eq!(sim.model().busy.as_deref(), Some("loading session ..."));
+        assert!(
+            matches!(sim.command_log().last(), Some(CmdRecord::Tick(_))),
+            "picker selection must start the spinner tick chain"
+        );
+    }
+
+    #[test]
+    fn extension_command_busy_survives_its_own_tool_card_until_it_ends() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, _submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/mycmd arg");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(sim.model().busy.as_deref(), Some("running /mycmd ..."));
+        // The driver renders the command as a tool card; its start/progress
+        // must not clear the busy state — only the settled result does.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "/mycmd".into(),
+            tool_id: "ftui-ext-command".into(),
+        }));
+        assert!(
+            sim.model().busy.is_some(),
+            "ToolStart must not clear the busy label"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "/mycmd".into(),
+            tool_id: "ftui-ext-command".into(),
+            is_error: false,
+            output: None,
+        }));
+        assert!(sim.model().busy.is_none(), "ToolEnd settles the busy op");
+    }
 }

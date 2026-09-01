@@ -291,7 +291,12 @@ crossbeam-queue = "0.3"
 # decoupling reclaimed ~nothing (lto=true had already dead-stripped them);
 # the 26 MiB budget (src/perf_build.rs BINARY_SIZE_RELEASE_BUDGET_MB) stands
 # with darwin-arm64 release at 24.59 MiB (bd-2ohw2).
-fsqlite = { version = "0.3.5", default-features = false, features = ["native", "fts5"] }
+# MOVED 0.3.5 -> 0.3.13 on 2026-09-01: picks up the fsqlite GH#399
+# cross-process WAL corruption-fix wave (reader-slot registration, checkpoint
+# horizon gating, generation-boundary pool drop; shipped 0.3.12/0.3.13) plus
+# the 0.3.6-0.3.11 correctness train. Known-open upstream at this pin: FTS5
+# %_data stock-compat divergence (fsqlite GH#404, targeted for 0.3.14).
+fsqlite = { version = "0.3.13", default-features = false, features = ["native", "fts5"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

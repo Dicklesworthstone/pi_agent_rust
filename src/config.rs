@@ -4037,6 +4037,35 @@ mod tests {
         assert_eq!(merged.markdown.as_ref().unwrap().code_block_indent, Some(4));
     }
 
+    // ── markdown.spacing config (issue #202) ──────────────────────────
+
+    #[test]
+    fn markdown_spacing_deserializes_compact() {
+        let json = r#"{"markdown":{"spacing":"compact"}}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Compact);
+    }
+
+    #[test]
+    fn markdown_spacing_defaults_to_comfortable() {
+        let config: Config = serde_json::from_str(r"{}").unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+        let config: Config = serde_json::from_str(r#"{"markdown":{}}"#).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+        let config: Config =
+            serde_json::from_str(r#"{"markdown":{"spacing":"comfortable"}}"#).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+    }
+
+    #[test]
+    fn markdown_spacing_merge_prefers_other_and_survives_partial() {
+        let base: Config = serde_json::from_str(r#"{"markdown":{"spacing":"compact"}}"#).unwrap();
+        let other: Config = serde_json::from_str(r#"{"markdown":{"codeBlockIndent":4}}"#).unwrap();
+        let merged = Config::merge(base, other);
+        assert_eq!(merged.markdown_spacing(), MarkdownSpacing::Compact);
+        assert_eq!(merged.markdown_code_block_indent(), 4);
+    }
+
     // ── check_for_updates config ──────────────────────────────────────
 
     #[test]
