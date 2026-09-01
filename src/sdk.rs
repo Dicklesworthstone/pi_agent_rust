@@ -409,6 +409,29 @@ pub struct SessionOptions {
     /// particular, `context_window_tokens` is not updated to the new model's
     /// window).
     pub compaction_settings: Option<ResolvedCompactionSettings>,
+
+    /// Graduated approval gating for this session (issue #196).
+    ///
+    /// When `Some`, tool calls are evaluated against the mode
+    /// (`ask`/`write`/`yolo`) exactly as in the classic CLI stack. Calls that
+    /// require approval are routed to [`SessionOptions::tool_approval`] when
+    /// set; otherwise, when the session's ask tool is enabled, an approval
+    /// card is bridged through the interactive ask surface
+    /// ([`crate::ask::approval_handler_via_ask`]). With neither available the
+    /// call is denied with an explicit reason (fail closed).
+    ///
+    /// `None` (the default) preserves the historical SDK behavior: no
+    /// approval gating.
+    pub approval_state: Option<crate::approval::ApprovalState>,
+
+    /// Explicit tool-approval prompt handler.
+    ///
+    /// Takes precedence over the ask-surface bridge that
+    /// [`SessionOptions::approval_state`] would otherwise install. Only
+    /// consulted for calls that `approval_state` gates (or, matching
+    /// `AgentConfig` semantics, for every tool call when `approval_state` is
+    /// `None`).
+    pub tool_approval: Option<crate::agent::ToolApprovalHandler>,
 }
 
 impl Default for SessionOptions {
@@ -443,6 +466,8 @@ impl Default for SessionOptions {
             extension_ui_handler: None,
             persist_extension_permissions: true,
             compaction_settings: None,
+            approval_state: None,
+            tool_approval: None,
         }
     }
 }
@@ -2303,11 +2328,11 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             .input
             .contains(&crate::provider::InputType::Image),
         fail_closed_hooks: config.fail_closed_hooks(),
-        tool_approval: None,
+        tool_approval: options.tool_approval.clone(),
         keyword_settings: config.keywords.clone(),
         max_time: None,
         turn_recovery: config.turn_recovery_mode(),
-        approval_state: None,
+        approval_state: options.approval_state.clone(),
         bash_settings: config.bash.clone(),
         secrets: None,
     };
@@ -2379,6 +2404,19 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         agent_session
             .agent
             .extend_tools(vec![Box::new(ask) as Box<dyn crate::tools::Tool>]);
+    }
+    // Approval prompts (issue #196): when this session gates tool calls and
+    // the embedder supplied no explicit handler, bridge approval requests
+    // through the ask surface the host installs (`install_channel_ui`). The
+    // bridge never auto-answers — with no surface installed it denies with an
+    // explicit reason instead of prompting nobody and denying silently.
+    if options.approval_state.is_some()
+        && options.tool_approval.is_none()
+        && let Some(ask) = &ask_tool_handle
+    {
+        agent_session
+            .agent
+            .set_tool_approval(Some(crate::ask::approval_handler_via_ask(ask.clone())));
     }
 
     if !options.extension_paths.is_empty() {

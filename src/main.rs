@@ -1728,7 +1728,7 @@ async fn run(
         keyword_settings: config.keywords.clone(),
         max_time: cli.max_time.map(std::time::Duration::from_secs),
         turn_recovery: config.turn_recovery_mode(),
-        approval_state: Some(approval_state),
+        approval_state: Some(approval_state.clone()),
         bash_settings: config.bash.clone(),
         secrets: config.secrets.clone(),
     };
@@ -1845,6 +1845,16 @@ async fn run(
             .extend_tools(vec![Box::new(tool.clone()) as Box<dyn pi::tools::Tool>]);
         tool
     });
+    // Approval prompts (issue #196): route calls the approval mode gates
+    // through the ask surface the interactive/RPC hosts install, instead of
+    // silently denying because no `tool_approval` handler existed. Surfaces
+    // that never install an ask UI (print/JSON mode) still fail closed, now
+    // with an explicit "prompt unavailable" reason.
+    if let Some(ask) = &ask_tool {
+        agent_session
+            .agent
+            .set_tool_approval(Some(pi::ask::approval_handler_via_ask(ask.clone())));
+    }
 
     // The /btw side-question client (bd-cv653.3.16): bound to the smol
     // role when it resolves AND credentials exist; interactive-only.
@@ -2267,6 +2277,11 @@ async fn run(
                     config_paths: cli.mcp_config.clone(),
                     global_dir: Some(pi::config::Config::global_dir()),
                 }),
+                // Approval gating (issue #196): the ftui stack previously
+                // dropped the approval mode entirely; thread the same state
+                // the classic stack uses so `ask`/`write` modes gate here
+                // too, prompting through the ask-card bridge.
+                approval_state: Some(approval_state.clone()),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);

@@ -589,6 +589,129 @@ impl AskTool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Route a request through the installed interactive picker surface.
+    ///
+    /// Unlike tool execution, this NEVER falls back to [`AskPolicy`]
+    /// auto-answering: callers use it for host-originated prompts (tool
+    /// approval, issue #196) where an automatic "recommended" answer would
+    /// silently approve on the user's behalf. With no surface installed
+    /// (print/JSON mode, headless SDK embedders) it errors, which approval
+    /// callers map to a deny.
+    pub async fn prompt_installed(&self, request: AskRequest) -> Result<AskResponse> {
+        let Some(handler) = self.handler() else {
+            return Err(Error::tool(
+                "ask",
+                "no interactive picker surface is installed in this session",
+            ));
+        };
+        handler(request).await
+    }
+}
+
+/// Option labels for the approval card built by [`approval_handler_via_ask`].
+pub const APPROVAL_ALLOW_LABEL: &str = "Allow";
+pub const APPROVAL_DENY_LABEL: &str = "Deny";
+
+/// Bounded preview of a tool call's arguments for the approval card.
+///
+/// Bash-style calls show the command line directly; everything else shows
+/// pretty-printed JSON, truncated on a char boundary so a huge `write` body
+/// cannot flood the card.
+fn approval_arguments_preview(arguments: &serde_json::Value) -> String {
+    const MAX_PREVIEW_CHARS: usize = 700;
+
+    let rendered = arguments
+        .get("command")
+        .or_else(|| arguments.get("cmd"))
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string()),
+            |command| format!("$ {command}"),
+        );
+    if rendered.chars().count() > MAX_PREVIEW_CHARS {
+        let truncated: String = rendered.chars().take(MAX_PREVIEW_CHARS).collect();
+        format!("{truncated}\n… (arguments truncated)")
+    } else {
+        rendered
+    }
+}
+
+/// Builds a [`crate::agent::ToolApprovalHandler`] that surfaces approval
+/// prompts through the session's interactive ask surface (issue #196).
+///
+/// Approval-mode gating used to deny silently in interactive sessions
+/// because nothing installed a `tool_approval` handler. This bridge reuses
+/// the ask question-card machinery every interactive surface (classic TUI,
+/// ftui, RPC) already implements: the prompt renders as a standard
+/// Allow/Deny card, the reply maps onto [`crate::agent::ToolApprovalDecision`],
+/// and every non-affirmative outcome — deny, dismissal, free-text answer,
+/// timeout, or no surface installed at all — fails closed to a deny with an
+/// explicit reason the model can relay.
+#[must_use]
+pub fn approval_handler_via_ask(ask: AskTool) -> crate::agent::ToolApprovalHandler {
+    Arc::new(move |request: crate::agent::ToolApprovalRequest| {
+        let ask = ask.clone();
+        Box::pin(async move {
+            use crate::agent::ToolApprovalDecision;
+
+            let question = AskQuestion {
+                id: Some(format!("approval:{}", request.tool_call_id)),
+                question: format!(
+                    "Allow the `{}` tool to run?\n{}",
+                    request.tool_name,
+                    approval_arguments_preview(&request.arguments)
+                ),
+                header: Some("approval".to_string()),
+                options: vec![
+                    AskOption {
+                        label: APPROVAL_ALLOW_LABEL.to_string(),
+                        description: Some("Run this tool call".to_string()),
+                    },
+                    AskOption {
+                        label: APPROVAL_DENY_LABEL.to_string(),
+                        description: Some("Reject this tool call".to_string()),
+                    },
+                ],
+                recommended: None,
+                multi: false,
+            };
+            match ask
+                .prompt_installed(AskRequest {
+                    questions: vec![question],
+                })
+                .await
+            {
+                Ok(response) => {
+                    if response.dismissed {
+                        return ToolApprovalDecision::deny(format!(
+                            "user dismissed the approval prompt for `{}`",
+                            request.tool_name
+                        ));
+                    }
+                    let allowed = response.answers.first().is_some_and(|answer| {
+                        answer.other.is_none()
+                            && answer
+                                .selected
+                                .iter()
+                                .any(|label| label.eq_ignore_ascii_case(APPROVAL_ALLOW_LABEL))
+                    });
+                    if allowed {
+                        ToolApprovalDecision::Allow
+                    } else {
+                        ToolApprovalDecision::deny(format!(
+                            "user denied approval for `{}`",
+                            request.tool_name
+                        ))
+                    }
+                }
+                Err(error) => ToolApprovalDecision::deny(format!(
+                    "approval required for `{}` but the prompt could not be completed: {error}",
+                    request.tool_name
+                )),
+            }
+        })
+    })
 }
 
 #[async_trait::async_trait]
@@ -1188,5 +1311,121 @@ mod tests {
         };
         let rendered = render_answers(&request, &response, false);
         assert!(rendered.contains("A: Other: do it differently"));
+    }
+
+    fn approval_request(tool_name: &str) -> crate::agent::ToolApprovalRequest {
+        crate::agent::ToolApprovalRequest {
+            tool_call_id: "call-1".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: serde_json::json!({"command": "rm -rf build"}),
+        }
+    }
+
+    /// Answer the bridge's approval card with the given reply.
+    fn install_canned_reply(tool: &AskTool, selected: Vec<&str>, other: Option<&str>) {
+        let selected: Vec<String> = selected.into_iter().map(str::to_string).collect();
+        let other = other.map(str::to_string);
+        tool.set_handler(Arc::new(move |request: AskRequest| {
+            let selected = selected.clone();
+            let other = other.clone();
+            Box::pin(async move {
+                Ok(AskResponse {
+                    answers: vec![AskAnswer {
+                        question_id: effective_question_id(&request.questions[0], 0),
+                        selected,
+                        other,
+                    }],
+                    dismissed: false,
+                })
+            })
+        }));
+    }
+
+    /// Issue #196: the ask-surface approval bridge maps card replies onto
+    /// approval decisions, failing closed on every non-affirmative outcome.
+    #[test]
+    fn approval_bridge_decision_mapping() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent::ToolApprovalDecision;
+
+            // Allow selection approves.
+            let tool = AskTool::new(AskPolicy::Recommended);
+            install_canned_reply(&tool, vec![APPROVAL_ALLOW_LABEL], None);
+            let handler = approval_handler_via_ask(tool.clone());
+            assert_eq!(
+                handler(approval_request("bash")).await,
+                ToolApprovalDecision::Allow
+            );
+
+            // Deny selection denies.
+            install_canned_reply(&tool, vec![APPROVAL_DENY_LABEL], None);
+            let handler = approval_handler_via_ask(tool.clone());
+            let decision = handler(approval_request("bash")).await;
+            assert!(
+                matches!(decision, ToolApprovalDecision::Deny { ref reason } if reason.contains("denied")),
+                "deny selection must deny, got {decision:?}"
+            );
+
+            // A free-text "Other" answer is not an approval, even when it
+            // happens to spell out "Allow".
+            install_canned_reply(&tool, vec![], Some("Allow"));
+            let handler = approval_handler_via_ask(tool.clone());
+            assert!(matches!(
+                handler(approval_request("bash")).await,
+                ToolApprovalDecision::Deny { .. }
+            ));
+
+            // Dismissal denies.
+            tool.set_handler(Arc::new(|_request: AskRequest| {
+                Box::pin(async {
+                    Ok(AskResponse {
+                        answers: Vec::new(),
+                        dismissed: true,
+                    })
+                })
+            }));
+            let handler = approval_handler_via_ask(tool.clone());
+            let decision = handler(approval_request("write")).await;
+            assert!(
+                matches!(decision, ToolApprovalDecision::Deny { ref reason } if reason.contains("dismissed")),
+                "dismissal must deny, got {decision:?}"
+            );
+        });
+    }
+
+    /// Issue #196: with no interactive picker surface installed the bridge
+    /// must deny with an explicit reason — never auto-answer via
+    /// `AskPolicy::Recommended`, which would silently self-approve.
+    #[test]
+    fn approval_bridge_without_surface_denies_and_never_auto_answers() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent::ToolApprovalDecision;
+
+            let tool = AskTool::new(AskPolicy::Recommended);
+            let handler = approval_handler_via_ask(tool);
+            let decision = handler(approval_request("bash")).await;
+            assert!(
+                matches!(
+                    decision,
+                    ToolApprovalDecision::Deny { ref reason }
+                        if reason.contains("could not be completed")
+                ),
+                "no surface must fail closed with an explicit reason, got {decision:?}"
+            );
+        });
+    }
+
+    /// The approval card preview stays bounded and shows bash commands
+    /// directly.
+    #[test]
+    fn approval_arguments_preview_shapes() {
+        let bash = approval_arguments_preview(&serde_json::json!({"command": "cargo build"}));
+        assert_eq!(bash, "$ cargo build");
+
+        let huge = "x".repeat(5000);
+        let bounded =
+            approval_arguments_preview(&serde_json::json!({"path": "a.txt", "content": huge}));
+        assert!(bounded.chars().count() < 800);
+        assert!(bounded.contains("truncated"));
     }
 }

@@ -1957,6 +1957,17 @@ impl Agent {
         self.cached_tool_defs = None; // Invalidate cache when tools change
     }
 
+    /// Install (or clear) the tool-approval prompt handler after
+    /// construction.
+    ///
+    /// Hosts wire their prompt surface later than `AgentConfig` is built —
+    /// the ask tool that backs the interactive approval card (issue #196) is
+    /// only created once the registry exists — so this mirrors
+    /// [`Self::extend_tools`]' post-construction shape.
+    pub fn set_tool_approval(&mut self, handler: Option<ToolApprovalHandler>) {
+        self.config.tool_approval = handler;
+    }
+
     /// Whether a tool implementation is enabled for this agent session.
     ///
     /// Interactive host commands use this to inherit opt-in tool gates
@@ -9641,6 +9652,121 @@ mod extensions_integration_tests {
                 matches!(output.content.as_slice(), [ContentBlock::Text(text)] if text
                     .text
                     .contains("denied by approval test"))
+            );
+        });
+    }
+
+    /// Issue #196: with graduated gating configured (`approval_state`
+    /// present, the shipped CLI shape), calls the mode gates must consult
+    /// the installed `tool_approval` prompt handler rather than denying.
+    #[test]
+    fn ask_mode_with_gating_state_consults_tool_approval_handler() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = Arc::new(NoopProvider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let approval_calls = Arc::new(AtomicUsize::new(0));
+            let approval_counter = Arc::clone(&approval_calls);
+            let agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    approval_state: Some(crate::approval::ApprovalState::new(
+                        crate::approval::ApprovalMode::AlwaysAsk,
+                        false,
+                        Vec::new(),
+                    )),
+                    tool_approval: Some(Arc::new(move |request| {
+                        assert_eq!(request.tool_name, "count_tool");
+                        approval_counter.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { ToolApprovalDecision::Allow })
+                    })),
+                    ..AgentConfig::default()
+                },
+            );
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(tool_call, on_event, test_turn_latency())
+                .await;
+
+            assert!(!is_error, "an approved gated call must execute");
+            assert!(!output.is_error);
+            assert_eq!(approval_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// Issue #196 regression pin: gating with NO prompt handler still fails
+    /// closed, and the denial carries an explicit reason (the historical bug
+    /// was that every interactive surface ran in this shape, so users saw
+    /// silent denials with no prompt).
+    #[test]
+    fn ask_mode_without_handler_denies_with_explicit_reason() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = Arc::new(NoopProvider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    approval_state: Some(crate::approval::ApprovalState::new(
+                        crate::approval::ApprovalMode::AlwaysAsk,
+                        false,
+                        Vec::new(),
+                    )),
+                    tool_approval: None,
+                    ..AgentConfig::default()
+                },
+            );
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(tool_call, on_event, test_turn_latency())
+                .await;
+
+            assert!(is_error);
+            assert!(output.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(
+                matches!(output.content.as_slice(), [ContentBlock::Text(text)] if text
+                    .text
+                    .contains("Approval required"))
             );
         });
     }
