@@ -8735,6 +8735,7 @@ fn emit_print_restore_failure(is_json: bool, retry_count: u32, error: &anyhow::E
 /// `FailoverStart` (json mode), and record the session audit + `ModelChange`.
 /// Returns the swapped-to `(provider, model)` so the caller can continue the
 /// turn on it; `None` means no failover happened.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn try_print_failover(
     session: &mut AgentSession,
     config: &Config,
@@ -11207,6 +11208,7 @@ mod tests {
     /// persistence marker must not walk retry or failover even if the prose
     /// looks like a transient 500/connection reset.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn run_print_prompt_with_retry_rejects_ok_error_persistence_marker() {
         struct MarkerProvider {
             stream_calls: std::sync::atomic::AtomicUsize,
@@ -11339,6 +11341,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn print_retry_and_failover_persist_restored_candidates() {
         let runtime = RuntimeBuilder::new()
             .blocking_threads(1, 8)
@@ -11653,6 +11656,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn print_retry_restore_save_failure_preserves_live_tail() {
         let runtime = RuntimeBuilder::new()
             .blocking_threads(1, 8)

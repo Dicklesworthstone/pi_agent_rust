@@ -9765,9 +9765,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         },
         "exit_codes": {
             "jsonl": 0,
-            "sqlite": if fault_injection_passed {
-                0
-            } else if fault_injection_summary_only_failure {
+            "sqlite": if fault_injection_passed || fault_injection_summary_only_failure {
                 0
             } else if fault_injection_case_exit_69 {
                 69

@@ -1330,6 +1330,7 @@ fn mcp_http_transport_does_not_retain_invalid_initialize_state() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn mcp_http_transport_rejects_unsupported_version_and_invisible_session_id() {
     let case = "mcp_http_transport_rejects_unsupported_version_and_invisible_session_id";
     let harness = TestHarness::new(case);

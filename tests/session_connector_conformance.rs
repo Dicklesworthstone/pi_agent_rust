@@ -19,6 +19,8 @@ fn session_handle() -> SessionHandle {
     SessionHandle(Arc::new(asupersync::sync::Mutex::new(Session::create())))
 }
 
+// Assertion helper; consuming the Result keeps the many call sites terse.
+#[allow(clippy::needless_pass_by_value)]
 fn assert_session_action_ok(result: pi::error::Result<()>, operation: &str) {
     assert!(result.is_ok(), "{operation} failed: {result:?}");
 }

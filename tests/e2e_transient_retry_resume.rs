@@ -273,7 +273,6 @@ fn run_case(mode: FailMode) -> DriverOutcome {
     run_async({
         let provider = Arc::clone(&provider);
         let tool_starts = Arc::clone(&tool_starts);
-        let cwd = cwd;
         async move {
             let mut stored = Session::create_with_dir(Some(cwd.clone()));
             stored.path = Some(cwd.join("session.jsonl"));
@@ -396,9 +395,6 @@ fn session_persistence_after_tool_does_not_retry() {
     let write_path = cwd.join("out.txt");
 
     let out = run_async({
-        let cwd = cwd;
-        let poison = poison;
-        let write_path = write_path;
         async move {
             let mut stored = Session::create_with_dir(Some(cwd.clone()));
             stored.path = Some(cwd.join("session.jsonl"));

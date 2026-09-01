@@ -369,6 +369,7 @@ fn normalized_criterion_output_subdir(raw: &str) -> Result<PathBuf> {
     Ok(relative)
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_regression_gate_pair(records: &[serde_json::Value]) -> Result<()> {
     if records.len() != REGRESSION_GATE_TOOL_CALLS.len() {
         return Err(Error::extension(

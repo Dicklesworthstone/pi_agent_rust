@@ -3864,6 +3864,8 @@ fn ui_request_generation(event: &Value) -> u64 {
         .expect("extension UI request must carry its correlation generation")
 }
 
+// Fixture helper; taking ownership keeps the json! call sites terse.
+#[allow(clippy::needless_pass_by_value)]
 fn extension_ui_response_command(
     command_id: &str,
     request_id: &str,
