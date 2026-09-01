@@ -2164,8 +2164,8 @@ fn sync_settings_parent_dir(_path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::{
         BranchSummarySettings, CompactionSettings, Config, ExtensionPolicyConfig,
-        ExtensionRiskConfig, ImageSettings, RepairPolicyConfig, RetrySettings, SettingsScope,
-        TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
+        ExtensionRiskConfig, ImageSettings, MarkdownSpacing, RepairPolicyConfig, RetrySettings,
+        SettingsScope, TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
         extension_index_path_from_env, global_dir_from_env, merge_branch_summary, merge_compaction,
         merge_extension_policy, merge_extension_risk, merge_images, merge_repair_policy,
         merge_retry, merge_terminal, merge_thinking_budgets, package_dir_from_env,

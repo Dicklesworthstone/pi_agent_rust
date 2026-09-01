@@ -683,17 +683,15 @@ fn compact_line_is_boundary(
         // The "─── lang ───" fence header emitted for common languages.
         theme.code_inline.dim(),
     ];
-    let heading_styles = [
-        theme.h1, theme.h2, theme.h3, theme.h4, theme.h5, theme.h6,
-    ];
+    let heading_styles = [theme.h1, theme.h2, theme.h3, theme.h4, theme.h5, theme.h6];
     let Some(first_style) = line.spans().first().and_then(|span| span.style) else {
         return false;
     };
     code_styles.contains(&first_style)
-        || line
-            .spans()
-            .iter()
-            .any(|span| span.style.is_some_and(|style| heading_styles.contains(&style)))
+        || line.spans().iter().any(|span| {
+            span.style
+                .is_some_and(|style| heading_styles.contains(&style))
+        })
 }
 
 /// Compact spacing policy (issue #202): the markdown renderer emits one
@@ -705,7 +703,7 @@ fn compact_line_is_boundary(
 /// paragraph/list gaps collapse to nothing and multi-blank runs to at most
 /// one.
 fn apply_compact_spacing(
-    lines: Vec<ftui::text::Line<'static>>,
+    lines: &[ftui::text::Line<'static>],
     theme: &ftui_extras::markdown::MarkdownTheme,
 ) -> Vec<ftui::text::Line<'static>> {
     let mut out: Vec<ftui::text::Line<'static>> = Vec::with_capacity(lines.len());
@@ -1053,17 +1051,13 @@ pub struct PiFtuiModel {
     /// `conversation_text()` pass — the observable that keeps the cache
     /// honest in tests (O(changed) per frame, not O(transcript)).
     render_stats: std::cell::Cell<(usize, usize)>,
-    /// Busy label for a long out-of-turn driver operation (issue #203):
+    /// Busy state for a long out-of-turn driver operation (issue #203):
     /// session load/new, model switch, compaction, extension commands.
-    /// While set, the status region animates the shared spinner with this
-    /// label even though no agent turn is running; any driver reply clears
-    /// it (the driver is sequential, so the next non-tick message belongs
-    /// to the in-flight operation).
-    busy: Option<String>,
-    /// Set when `begin_busy` arms an operation; the key handler that
-    /// triggered it converts this into the spinner tick chain (`update()`
-    /// owns Cmd returns, the routing helpers don't).
-    busy_tick_pending: bool,
+    /// While set, the status region animates the shared spinner with the
+    /// operation's label even though no agent turn is running; any driver
+    /// reply clears it (the driver is sequential, so the next non-tick
+    /// message belongs to the in-flight operation).
+    busy: Option<BusyOp>,
     /// Transcript markdown spacing policy (issue #202), resolved from
     /// `markdown.spacing` in settings at launch.
     markdown_spacing: crate::config::MarkdownSpacing,
@@ -1075,6 +1069,16 @@ pub struct PiFtuiModel {
 struct CachedBlock {
     revision: u64,
     lines: Vec<ftui::text::Line<'static>>,
+}
+
+/// A long out-of-turn driver operation the status region is animating
+/// (issue #203). `tick_pending` is set by [`PiFtuiModel::begin_busy`] and
+/// consumed by the key handler that routed the input — `update()` owns Cmd
+/// returns, the routing helpers don't.
+#[derive(Debug)]
+struct BusyOp {
+    label: String,
+    tick_pending: bool,
 }
 
 /// Vertical frame regions, top to bottom. The clamp/normalize string hacks of
@@ -1158,7 +1162,6 @@ impl PiFtuiModel {
             render_cache: std::cell::RefCell::new(Vec::new()),
             render_stats: std::cell::Cell::new((0, 0)),
             busy: None,
-            busy_tick_pending: false,
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
             #[cfg(test)]
             suspend_task_override: None,
@@ -1180,7 +1183,7 @@ impl PiFtuiModel {
 
     /// Set the transcript markdown spacing policy (issue #202).
     #[must_use]
-    pub fn with_markdown_spacing(mut self, spacing: crate::config::MarkdownSpacing) -> Self {
+    pub const fn with_markdown_spacing(mut self, spacing: crate::config::MarkdownSpacing) -> Self {
         self.markdown_spacing = spacing;
         self
     }
@@ -1291,7 +1294,7 @@ impl PiFtuiModel {
     /// Next globally-unique transcript revision (issue #201). Taken at push
     /// and at every in-place entry mutation so the render cache can trust a
     /// matching revision completely.
-    fn next_revision(&mut self) -> u64 {
+    const fn next_revision(&mut self) -> u64 {
         self.transcript_revision += 1;
         self.transcript_revision
     }
@@ -2118,8 +2121,15 @@ impl PiFtuiModel {
     /// the matching [`UiCommand`]; the key handler that routed the input
     /// turns the pending flag into the spinner tick chain.
     fn begin_busy(&mut self, label: impl Into<String>) {
-        self.busy = Some(label.into());
-        self.busy_tick_pending = true;
+        self.busy = Some(BusyOp {
+            label: label.into(),
+            tick_pending: true,
+        });
+    }
+
+    /// The active busy operation's status label, if any.
+    fn busy_label(&self) -> Option<&str> {
+        self.busy.as_ref().map(|op| op.label.as_str())
     }
 
     /// Convert a freshly armed busy operation into the tick command that
@@ -2127,7 +2137,9 @@ impl PiFtuiModel {
     /// Split from [`Self::begin_busy`] because the routing helpers return
     /// `bool`/`()` — only `update()`'s key paths own Cmd returns.
     fn take_busy_tick(&mut self) -> Cmd<PiFtuiMsg> {
-        if std::mem::take(&mut self.busy_tick_pending) {
+        if let Some(op) = &mut self.busy
+            && std::mem::take(&mut op.tick_pending)
+        {
             Cmd::tick(SPINNER_INTERVAL)
         } else {
             Cmd::none()
@@ -2571,7 +2583,7 @@ impl PiFtuiModel {
             } else {
                 push_role_block(&mut block_lines, entry.role, &entry.text, &palette, &md);
                 if compact && entry.role == EntryRole::Assistant {
-                    block_lines = apply_compact_spacing(block_lines, &theme);
+                    block_lines = apply_compact_spacing(&block_lines, &theme);
                 }
             }
             lines.extend(block_lines.iter().cloned());
@@ -2587,7 +2599,7 @@ impl PiFtuiModel {
             // tail is deliberately uncached — it changes every delta.
             let rendered = md.render_streaming(&self.streaming);
             if compact {
-                lines.extend(apply_compact_spacing(rendered.lines().to_vec(), &theme));
+                lines.extend(apply_compact_spacing(rendered.lines(), &theme));
             } else {
                 lines.extend(rendered.lines().iter().cloned());
             }
@@ -2736,7 +2748,7 @@ impl PiFtuiModel {
                 |tool| format!("running {tool} ..."),
             );
             format!("{spin} {activity}")
-        } else if let Some(busy) = &self.busy {
+        } else if let Some(busy) = self.busy_label() {
             let spin = DOTS[self.spinner.current_frame % DOTS.len()];
             format!("{spin} {busy}")
         } else {
@@ -6559,107 +6571,6 @@ mod tests {
             ("a", "b", "")
         );
     }
-}
-
-#[cfg(test)]
-mod loop_watchdog_tests {
-    use super::{LOOP_STALL_BUDGET, LoopPhase, LoopWatchdog};
-    use std::time::{Duration, Instant};
-
-    /// A probe start far enough in the past that `finish` sees `over` as the
-    /// measured phase duration.
-    fn started_ago(over: Duration) -> Option<Instant> {
-        Instant::now().checked_sub(over)
-    }
-
-    #[test]
-    fn disabled_watchdog_reads_no_clock_and_records_nothing() {
-        let wd = LoopWatchdog::with_enabled(false);
-        // The zero-overhead contract: with telemetry off, `start` must not
-        // hand back an Instant, so no clock is read on the hot path.
-        assert!(wd.start().is_none());
-        // Even a deliberately over-budget probe stays unrecorded.
-        wd.finish(LoopPhase::Render, None);
-        let snap = wd.snapshot();
-        assert_eq!(snap["verdict"], "disabled");
-        assert_eq!(snap["enabled"], false);
-        assert_eq!(snap["totals"]["stalls"], 0);
-        assert_eq!(snap["phases"]["render"]["samples"], 0);
-    }
-
-    #[test]
-    fn enabled_watchdog_attributes_samples_per_phase() {
-        let wd = LoopWatchdog::with_enabled(true);
-        assert!(wd.start().is_some(), "enabled watchdog reads the clock");
-        for phase in [LoopPhase::Render, LoopPhase::Input, LoopPhase::AgentEvent] {
-            wd.finish(phase, wd.start());
-        }
-        wd.finish(LoopPhase::Render, wd.start());
-
-        let snap = wd.snapshot();
-        assert_eq!(snap["schema"], "pi.tui.loop_watchdog.v1");
-        assert_eq!(snap["surface"], "ftui");
-        assert_eq!(snap["phases"]["render"]["samples"], 2);
-        assert_eq!(snap["phases"]["input"]["samples"], 1);
-        assert_eq!(snap["phases"]["agent_event"]["samples"], 1);
-        // Sub-budget work is not a stall.
-        assert_eq!(snap["totals"]["stalls"], 0);
-        assert_eq!(snap["verdict"], "pass");
-    }
-
-    #[test]
-    fn over_budget_phase_is_counted_and_attributed() {
-        let wd = LoopWatchdog::with_enabled(true);
-        let Some(started) = started_ago(LOOP_STALL_BUDGET + Duration::from_millis(50)) else {
-            return; // Monotonic clock too young to subtract from; nothing to assert.
-        };
-        wd.finish(LoopPhase::AgentEvent, Some(started));
-
-        let snap = wd.snapshot();
-        assert_eq!(snap["totals"]["stalls"], 1);
-        assert_eq!(snap["phases"]["agent_event"]["stalls"], 1);
-        // Attribution must be exact: a stalled agent-event phase never shows
-        // up against render or input.
-        assert_eq!(snap["phases"]["render"]["stalls"], 0);
-        assert_eq!(snap["phases"]["input"]["stalls"], 0);
-        assert_eq!(snap["verdict"], "warn");
-        let worst = snap["phases"]["agent_event"]["worst_us"]
-            .as_u64()
-            .expect("worst_us is a number");
-        assert!(
-            worst >= u64::try_from(LOOP_STALL_BUDGET.as_micros()).unwrap_or(u64::MAX),
-            "worst_us {worst} should be at least the budget"
-        );
-    }
-
-    #[test]
-    fn sustained_stall_latches_until_a_phase_comes_back_in_budget() {
-        let wd = LoopWatchdog::with_enabled(true);
-        let over = LOOP_STALL_BUDGET + Duration::from_millis(10);
-        let Some(first) = started_ago(over) else {
-            return;
-        };
-
-        // Three consecutive over-budget renders: all three count, but the
-        // latch means only the first would have logged.
-        wd.finish(LoopPhase::Render, Some(first));
-        assert!(wd.stalled.get(), "first over-budget call arms the latch");
-        for _ in 0..2 {
-            let Some(again) = started_ago(over) else {
-                return;
-            };
-            wd.finish(LoopPhase::Render, Some(again));
-            assert!(wd.stalled.get(), "latch stays armed through the stall");
-        }
-        assert_eq!(wd.snapshot()["totals"]["stalls"], 3);
-
-        // Recovery re-arms reporting so a later stall is not swallowed.
-        wd.finish(LoopPhase::Render, wd.start());
-        assert!(
-            !wd.stalled.get(),
-            "an in-budget phase clears the latch for the next stall"
-        );
-    }
 
     // ── Issue #201: per-message render cache ─────────────────────────────
 
@@ -6871,7 +6782,7 @@ mod loop_watchdog_tests {
         type_str(&mut sim, "/model openai/gpt-5");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
-            sim.model().busy.as_deref(),
+            sim.model().busy_label(),
             Some("switching model to openai/gpt-5 ..."),
             "routing /model must arm the busy indicator"
         );
@@ -6908,10 +6819,7 @@ mod loop_watchdog_tests {
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
         let model = PiFtuiModel::new(rx)
             .with_submit_channel(submit_tx)
-            .with_available_sessions(vec![(
-                "old session · 3 msgs".into(),
-                "/tmp/s.jsonl".into(),
-            )]);
+            .with_available_sessions(vec![("old session · 3 msgs".into(), "/tmp/s.jsonl".into())]);
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         type_str(&mut sim, "/resume");
@@ -6924,7 +6832,7 @@ mod loop_watchdog_tests {
                 path: "/tmp/s.jsonl".into()
             }
         );
-        assert_eq!(sim.model().busy.as_deref(), Some("loading session ..."));
+        assert_eq!(sim.model().busy_label(), Some("loading session ..."));
         assert!(
             matches!(sim.command_log().last(), Some(CmdRecord::Tick(_))),
             "picker selection must start the spinner tick chain"
@@ -6940,7 +6848,7 @@ mod loop_watchdog_tests {
         sim.init();
         type_str(&mut sim, "/mycmd arg");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert_eq!(sim.model().busy.as_deref(), Some("running /mycmd ..."));
+        assert_eq!(sim.model().busy_label(), Some("running /mycmd ..."));
         // The driver renders the command as a tool card; its start/progress
         // must not clear the busy state — only the settled result does.
         sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
@@ -6958,5 +6866,106 @@ mod loop_watchdog_tests {
             output: None,
         }));
         assert!(sim.model().busy.is_none(), "ToolEnd settles the busy op");
+    }
+}
+
+#[cfg(test)]
+mod loop_watchdog_tests {
+    use super::{LOOP_STALL_BUDGET, LoopPhase, LoopWatchdog};
+    use std::time::{Duration, Instant};
+
+    /// A probe start far enough in the past that `finish` sees `over` as the
+    /// measured phase duration.
+    fn started_ago(over: Duration) -> Option<Instant> {
+        Instant::now().checked_sub(over)
+    }
+
+    #[test]
+    fn disabled_watchdog_reads_no_clock_and_records_nothing() {
+        let wd = LoopWatchdog::with_enabled(false);
+        // The zero-overhead contract: with telemetry off, `start` must not
+        // hand back an Instant, so no clock is read on the hot path.
+        assert!(wd.start().is_none());
+        // Even a deliberately over-budget probe stays unrecorded.
+        wd.finish(LoopPhase::Render, None);
+        let snap = wd.snapshot();
+        assert_eq!(snap["verdict"], "disabled");
+        assert_eq!(snap["enabled"], false);
+        assert_eq!(snap["totals"]["stalls"], 0);
+        assert_eq!(snap["phases"]["render"]["samples"], 0);
+    }
+
+    #[test]
+    fn enabled_watchdog_attributes_samples_per_phase() {
+        let wd = LoopWatchdog::with_enabled(true);
+        assert!(wd.start().is_some(), "enabled watchdog reads the clock");
+        for phase in [LoopPhase::Render, LoopPhase::Input, LoopPhase::AgentEvent] {
+            wd.finish(phase, wd.start());
+        }
+        wd.finish(LoopPhase::Render, wd.start());
+
+        let snap = wd.snapshot();
+        assert_eq!(snap["schema"], "pi.tui.loop_watchdog.v1");
+        assert_eq!(snap["surface"], "ftui");
+        assert_eq!(snap["phases"]["render"]["samples"], 2);
+        assert_eq!(snap["phases"]["input"]["samples"], 1);
+        assert_eq!(snap["phases"]["agent_event"]["samples"], 1);
+        // Sub-budget work is not a stall.
+        assert_eq!(snap["totals"]["stalls"], 0);
+        assert_eq!(snap["verdict"], "pass");
+    }
+
+    #[test]
+    fn over_budget_phase_is_counted_and_attributed() {
+        let wd = LoopWatchdog::with_enabled(true);
+        let Some(started) = started_ago(LOOP_STALL_BUDGET + Duration::from_millis(50)) else {
+            return; // Monotonic clock too young to subtract from; nothing to assert.
+        };
+        wd.finish(LoopPhase::AgentEvent, Some(started));
+
+        let snap = wd.snapshot();
+        assert_eq!(snap["totals"]["stalls"], 1);
+        assert_eq!(snap["phases"]["agent_event"]["stalls"], 1);
+        // Attribution must be exact: a stalled agent-event phase never shows
+        // up against render or input.
+        assert_eq!(snap["phases"]["render"]["stalls"], 0);
+        assert_eq!(snap["phases"]["input"]["stalls"], 0);
+        assert_eq!(snap["verdict"], "warn");
+        let worst = snap["phases"]["agent_event"]["worst_us"]
+            .as_u64()
+            .expect("worst_us is a number");
+        assert!(
+            worst >= u64::try_from(LOOP_STALL_BUDGET.as_micros()).unwrap_or(u64::MAX),
+            "worst_us {worst} should be at least the budget"
+        );
+    }
+
+    #[test]
+    fn sustained_stall_latches_until_a_phase_comes_back_in_budget() {
+        let wd = LoopWatchdog::with_enabled(true);
+        let over = LOOP_STALL_BUDGET + Duration::from_millis(10);
+        let Some(first) = started_ago(over) else {
+            return;
+        };
+
+        // Three consecutive over-budget renders: all three count, but the
+        // latch means only the first would have logged.
+        wd.finish(LoopPhase::Render, Some(first));
+        assert!(wd.stalled.get(), "first over-budget call arms the latch");
+        for _ in 0..2 {
+            let Some(again) = started_ago(over) else {
+                return;
+            };
+            wd.finish(LoopPhase::Render, Some(again));
+            assert!(wd.stalled.get(), "latch stays armed through the stall");
+        }
+        assert_eq!(wd.snapshot()["totals"]["stalls"], 3);
+
+        // Recovery re-arms reporting so a later stall is not swallowed.
+        wd.finish(LoopPhase::Render, wd.start());
+        assert!(
+            !wd.stalled.get(),
+            "an in-budget phase clears the latch for the next stall"
+        );
     }
 }
