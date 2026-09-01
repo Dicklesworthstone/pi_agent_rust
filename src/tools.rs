@@ -4346,6 +4346,44 @@ fn ensure_atomic_source_unchanged(
     Ok(())
 }
 
+/// Verifies that the directory entry `target_name` under the pinned
+/// `parent_file` descriptor is a regular file whose content is exactly
+/// `contents`.
+///
+/// Used as the post-rename fallback for filesystems (virtiofs/FUSE) that do
+/// not preserve inode identity across `rename(2)`, where the dev/ino
+/// comparison against the temp-file descriptor can no longer prove that the
+/// persisted entry is the file we just wrote (issue #193). Opening through
+/// the pinned parent descriptor with `NOFOLLOW` keeps the check immune to
+/// parent-directory swaps and symlink redirection.
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+fn verify_persisted_entry_content(
+    parent_file: &std::fs::File,
+    target_name: &OsStr,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    let descriptor = rustix::fs::openat(
+        parent_file,
+        target_name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file = std::fs::File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "persisted entry is not a regular file",
+        ));
+    }
+    ensure_atomic_source_unchanged(file, AtomicContentExpectation::from_bytes(contents)).map_err(
+        |_| std::io::Error::other("persisted entry content does not match the bytes just written"),
+    )
+}
+
 /// Normalize a raw `rustix` stat identity to platform-independent widths.
 ///
 /// The libc stat field types differ per target (`st_dev` is `i32` and
@@ -4612,10 +4650,32 @@ where
             if temp_descriptor_metadata.st_dev != persisted_entry_metadata.st_dev
                 || temp_descriptor_metadata.st_ino != persisted_entry_metadata.st_ino
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "atomic replacement target changed immediately after rename",
-                ));
+                // On virtiofs/FUSE the filesystem assigns a fresh inode during
+                // `rename(2)`, so this descriptor-vs-entry identity comparison
+                // reports a mismatch even though the rename landed our bytes
+                // correctly (issue #193; kernel-backed filesystems like ext4
+                // and overlayfs keep the inode stable). Fall back to verifying
+                // the persisted entry's *content* through the pinned parent
+                // descriptor: identical bytes mean the rename result is ours
+                // regardless of inode identity, while a genuine post-rename
+                // swap still fails because the attacker's content differs (or
+                // is byte-identical to what we just wrote, which is harmless).
+                verify_persisted_entry_content(&parent_file, target_name, contents).map_err(
+                    |verify_error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "atomic replacement target changed immediately after rename \
+                                 (content verification also failed: {verify_error})"
+                            ),
+                        )
+                    },
+                )?;
+                tracing::warn!(
+                    path = %target.display(),
+                    "atomic replacement inode identity not preserved across rename \
+                     (virtiofs/FUSE semantics); persisted content verified by hash instead"
+                );
             }
             tolerate_fsync_refusal(parent_file.sync_all(), "parent directory", parent)?;
 
@@ -14424,6 +14484,48 @@ mod tests {
             "original\n",
             "a parent swap observed before rename must abort the mutation"
         );
+    }
+
+    /// Issue #193: the post-rename fallback for filesystems that do not keep
+    /// inode identity stable across `rename(2)` (virtiofs/FUSE) must accept
+    /// exactly the bytes that were written and nothing else.
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn verify_persisted_entry_content_accepts_written_bytes_only() {
+        let tmp = tempfile::tempdir().expect("content verification fixture");
+        let parent_file = std::fs::File::open(tmp.path()).expect("open parent directory");
+        let target_name = OsStr::new("target.txt");
+        std::fs::write(tmp.path().join("target.txt"), b"written bytes\n").expect("write target");
+
+        verify_persisted_entry_content(&parent_file, target_name, b"written bytes\n")
+            .expect("identical content must verify");
+
+        verify_persisted_entry_content(&parent_file, target_name, b"different bytes\n")
+            .expect_err("content mismatch must fail verification");
+        verify_persisted_entry_content(&parent_file, target_name, b"written bytes")
+            .expect_err("length mismatch must fail verification");
+        verify_persisted_entry_content(&parent_file, OsStr::new("missing.txt"), b"anything")
+            .expect_err("a missing entry must fail verification");
+    }
+
+    /// Issue #193: the content fallback opens with `NOFOLLOW` through the
+    /// pinned parent descriptor, so a symlink swapped in at the target name
+    /// cannot satisfy verification even when it points at matching bytes.
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn verify_persisted_entry_content_rejects_symlink_and_directory_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("content verification fixture");
+        let parent_file = std::fs::File::open(tmp.path()).expect("open parent directory");
+        std::fs::write(tmp.path().join("real.txt"), b"payload\n").expect("write real file");
+        symlink("real.txt", tmp.path().join("link.txt")).expect("create symlink entry");
+        std::fs::create_dir(tmp.path().join("subdir")).expect("create directory entry");
+
+        verify_persisted_entry_content(&parent_file, OsStr::new("link.txt"), b"payload\n")
+            .expect_err("a symlink entry must fail verification even with matching bytes");
+        verify_persisted_entry_content(&parent_file, OsStr::new("subdir"), b"payload\n")
+            .expect_err("a directory entry must fail verification");
     }
 
     #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
