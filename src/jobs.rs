@@ -685,7 +685,8 @@ fn remove_quiescent_owner_generation(reg: &mut JobRegistry, owner_session_id: &s
     if !reg.closing_owners.contains_key(owner_session_id)
         && reg
             .owner_spawns_in_flight
-            .get(owner_session_id).is_none_or(|count| *count <= 0)
+            .get(owner_session_id)
+            .is_none_or(|count| *count <= 0)
     {
         reg.owner_shutdown_generations.remove(owner_session_id);
     }

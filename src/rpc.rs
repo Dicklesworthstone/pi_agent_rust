@@ -454,14 +454,14 @@ async fn take_last_rpc_user_turn_for_retry(session: &mut AgentSession) -> Result
             .await?;
         if save_enabled
             && let Err(first_err) = candidate.save().await
-                && let Err(retry_err) = candidate.save().await
-            {
-                let reason = format!(
-                    "retry rewind persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                );
-                provider_admission.block(reason.clone());
-                return Err(Error::session_persistence(reason));
-            }
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "retry rewind persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            provider_admission.block(reason.clone());
+            return Err(Error::session_persistence(reason));
+        }
         session.invalidate_background_compaction();
         *inner = candidate;
         provider_admission.clear();
@@ -5197,14 +5197,14 @@ async fn restore_rpc_retry_tail(
         .await?;
     if save_enabled
         && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            let reason = format!(
-                "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            );
-            state.provider_admission.block(reason.clone());
-            return Err(Error::session_persistence(reason));
-        }
+        && let Err(retry_err) = candidate.save().await
+    {
+        let reason = format!(
+            "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+        );
+        state.provider_admission.block(reason.clone());
+        return Err(Error::session_persistence(reason));
+    }
 
     guard.invalidate_background_compaction();
     *inner = candidate;
@@ -5940,14 +5940,14 @@ async fn maybe_restore_primary(
         .await?;
     if save_enabled
         && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            let reason = format!(
-                "primary restore persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            );
-            state.provider_admission.block(reason.clone());
-            return Err(Error::session_persistence(reason));
-        }
+        && let Err(retry_err) = candidate.save().await
+    {
+        let reason = format!(
+            "primary restore persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+        );
+        state.provider_admission.block(reason.clone());
+        return Err(Error::session_persistence(reason));
+    }
 
     *inner = candidate;
     guard.agent.set_provider(provider_impl);
@@ -6176,14 +6176,14 @@ async fn try_failover_to_next_chain_entry(
             .await?;
         if save_enabled
             && let Err(first_err) = candidate.save().await
-                && let Err(retry_err) = candidate.save().await
-            {
-                let reason = format!(
-                    "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                );
-                state.provider_admission.block(reason.clone());
-                return Err(Error::session_persistence(reason));
-            }
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            state.provider_admission.block(reason.clone());
+            return Err(Error::session_persistence(reason));
+        }
 
         // No fallible operation remains in the transition after installation.
         *inner = candidate;
@@ -11647,16 +11647,17 @@ async fn apply_thinking_level_for_session(
     } else {
         None
     };
-    if save_enabled && changed
+    if save_enabled
+        && changed
         && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            let reason = format!(
-                "thinking-level persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            );
-            state.provider_admission.block(reason.clone());
-            return Err(Error::session_persistence(reason));
-        }
+        && let Err(retry_err) = candidate.save().await
+    {
+        let reason = format!(
+            "thinking-level persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+        );
+        state.provider_admission.block(reason.clone());
+        return Err(Error::session_persistence(reason));
+    }
     *inner_session = candidate;
     guard.agent.stream_options_mut().thinking_level = Some(level);
     guard.refresh_extension_completion_host_state();
@@ -11706,14 +11707,14 @@ async fn apply_model_change(
         .await?;
     if save_enabled
         && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            let reason = format!(
-                "model selection persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            );
-            state.provider_admission.block(reason.clone());
-            return Err(Error::session_persistence(reason));
-        }
+        && let Err(retry_err) = candidate.save().await
+    {
+        let reason = format!(
+            "model selection persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+        );
+        state.provider_admission.block(reason.clone());
+        return Err(Error::session_persistence(reason));
+    }
     *inner_session = candidate;
     Ok(provider_transition)
 }

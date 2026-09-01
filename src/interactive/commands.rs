@@ -101,7 +101,10 @@ async fn persist_excluded_bash_execution_bounded(
         BASH_COMPLETION_TIMEOUT,
         persist_excluded_bash_execution(session, message, save_enabled, cx),
     )
-    .await { outcome } else {
+    .await
+    {
+        outcome
+    } else {
         tracing::error!(
             "completed excluded-context bash command exceeded its persistence cleanup budget"
         );
@@ -2410,7 +2413,9 @@ impl PiApp {
                 }
 
                 if let Some(extensions) = self.extensions.clone() {
-                    let owner_session_id = if let Ok(session) = self.session.try_lock() { session.header.id.clone() } else {
+                    let owner_session_id = if let Ok(session) = self.session.try_lock() {
+                        session.header.id.clone()
+                    } else {
                         self.status_message = Some("Session busy; try again".to_string());
                         return None;
                     };

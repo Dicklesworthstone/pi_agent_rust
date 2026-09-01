@@ -497,12 +497,7 @@ impl McpManager {
                 })?;
             if let Some(execution) = &identity {
                 let mut store = TrustStore::load(&self.inner.trust_path)?;
-                store.acknowledge_execution(
-                    name,
-                    &fingerprint,
-                    "operator",
-                    execution.clone(),
-                )?;
+                store.acknowledge_execution(name, &fingerprint, "operator", execution.clone())?;
             } else {
                 // HTTP transport: nothing local executes.
                 let mut store = TrustStore::load(&self.inner.trust_path)?;

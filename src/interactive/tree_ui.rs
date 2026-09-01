@@ -111,27 +111,26 @@ async fn stage_and_commit_tree_navigation(
     } else {
         TreeNavigationPersistenceOutcome::Disabled
     };
-    if save_enabled
-        && let Err(err) = candidate.save().await {
-            tracing::error!(
-                error = %err,
-                ?new_leaf_id,
-                "tree navigation save failed; reconciling the exact operation against current disk state"
-            );
-            if confirm_exact_tree_navigation_after_save_error(
-                &candidate,
-                new_leaf_id.as_deref(),
-                expected_summary_entry.as_deref(),
-            )
-            .await
-            .is_none()
-            {
-                return Err(crate::error::Error::session(format!(
-                    "Branch switch persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
-                )));
-            }
-            persistence = TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed;
+    if save_enabled && let Err(err) = candidate.save().await {
+        tracing::error!(
+            error = %err,
+            ?new_leaf_id,
+            "tree navigation save failed; reconciling the exact operation against current disk state"
+        );
+        if confirm_exact_tree_navigation_after_save_error(
+            &candidate,
+            new_leaf_id.as_deref(),
+            expected_summary_entry.as_deref(),
+        )
+        .await
+        .is_none()
+        {
+            return Err(crate::error::Error::session(format!(
+                "Branch switch persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
+            )));
         }
+        persistence = TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed;
+    }
 
     let messages_for_agent = candidate.to_messages_for_current_path();
     let (messages_for_ui, usage) = conversation_from_session(&candidate);

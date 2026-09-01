@@ -12116,14 +12116,14 @@ impl AgentSession {
             .await?;
         if save_enabled
             && let Err(first_err) = candidate.save().await
-                && let Err(retry_err) = candidate.save().await
-            {
-                let reason = format!(
-                    "model selection persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                );
-                self.quarantine_provider_reentry(reason.clone());
-                return Err(Error::session_persistence(reason));
-            }
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "model selection persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            self.quarantine_provider_reentry(reason.clone());
+            return Err(Error::session_persistence(reason));
+        }
         *session = candidate;
         drop(session);
         self.install_prepared_model_selection(prepared);
@@ -12178,16 +12178,17 @@ impl AgentSession {
         } else {
             None
         };
-        if save_enabled && changed
+        if save_enabled
+            && changed
             && let Err(first_err) = candidate.save().await
-                && let Err(retry_err) = candidate.save().await
-            {
-                let reason = format!(
-                    "thinking-level persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                );
-                self.quarantine_provider_reentry(reason.clone());
-                return Err(Error::session_persistence(reason));
-            }
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "thinking-level persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            self.quarantine_provider_reentry(reason.clone());
+            return Err(Error::session_persistence(reason));
+        }
         *session = candidate;
         self.agent.stream_options_mut().thinking_level = Some(effective_level);
         self.refresh_extension_completion_host_state();
@@ -12306,16 +12307,17 @@ impl AgentSession {
                 cx.cx(),
             )
             .await?;
-        if save_enabled && persist_needed
+        if save_enabled
+            && persist_needed
             && let Err(first_err) = candidate.save().await
-                && let Err(retry_err) = candidate.save().await
-            {
-                let reason = format!(
-                    "Session-header synchronization persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                );
-                self.quarantine_provider_reentry(reason.clone());
-                return Err(Error::session_persistence(reason));
-            }
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "Session-header synchronization persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            self.quarantine_provider_reentry(reason.clone());
+            return Err(Error::session_persistence(reason));
+        }
 
         *session = candidate;
         drop(session);
@@ -12831,9 +12833,8 @@ impl AgentSession {
                 return Err(err);
             }
         };
-        
-        self
-            .apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
+
+        self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
             .await
     }
 

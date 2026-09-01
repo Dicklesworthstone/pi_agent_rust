@@ -542,20 +542,20 @@ fn main_impl() -> Result<()> {
         let project_trusted = package_subcommand_trust;
         match command {
             cli::Commands::Install { source, local } => {
-                let manager = PackageManager::new(cwd)
-                    .with_project_trust(project_trusted.unwrap_or(false));
+                let manager =
+                    PackageManager::new(cwd).with_project_trust(project_trusted.unwrap_or(false));
                 handle_package_install_blocking(&manager, source, *local)?;
                 return Ok(());
             }
             cli::Commands::Remove { source, local } => {
-                let manager = PackageManager::new(cwd)
-                    .with_project_trust(project_trusted.unwrap_or(false));
+                let manager =
+                    PackageManager::new(cwd).with_project_trust(project_trusted.unwrap_or(false));
                 handle_package_remove_blocking(&manager, source, *local)?;
                 return Ok(());
             }
             cli::Commands::Update { source } => {
-                let manager = PackageManager::new(cwd)
-                    .with_project_trust(project_trusted.unwrap_or(false));
+                let manager =
+                    PackageManager::new(cwd).with_project_trust(project_trusted.unwrap_or(false));
                 handle_package_update_blocking(&manager, source.as_deref())?;
                 return Ok(());
             }
@@ -621,8 +621,8 @@ fn main_impl() -> Result<()> {
                 return Ok(());
             }
             cli::Commands::List => {
-                let manager = PackageManager::new(cwd)
-                    .with_project_trust(project_trusted.unwrap_or(false));
+                let manager =
+                    PackageManager::new(cwd).with_project_trust(project_trusted.unwrap_or(false));
                 handle_package_list_blocking(&manager)?;
                 return Ok(());
             }

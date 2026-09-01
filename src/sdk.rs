@@ -1439,22 +1439,23 @@ impl AgentSessionHandle {
         mut report: SessionResourceShutdown,
     ) -> SessionResourceShutdown {
         if let Some(owner_session_id) = owner_session_id
-            && let Err(err) = crate::jobs::kill_session(owner_session_id).await {
-                let warning = format!("failed to stop session-owned background jobs: {err}");
-                tracing::warn!(event = "sdk.session.shutdown.jobs_failed", "{warning}");
-                report.fail(warning);
-            }
+            && let Err(err) = crate::jobs::kill_session(owner_session_id).await
+        {
+            let warning = format!("failed to stop session-owned background jobs: {err}");
+            tracing::warn!(event = "sdk.session.shutdown.jobs_failed", "{warning}");
+            report.fail(warning);
+        }
 
         if let Some(region) = self.session.extensions.as_ref()
-            && !region.shutdown().await {
-                let warning =
-                    "extension runtime did not stop within its shutdown budget".to_string();
-                tracing::warn!(
-                    event = "sdk.session.shutdown.extension_timeout",
-                    "{warning}"
-                );
-                report.fail(warning);
-            }
+            && !region.shutdown().await
+        {
+            let warning = "extension runtime did not stop within its shutdown budget".to_string();
+            tracing::warn!(
+                event = "sdk.session.shutdown.extension_timeout",
+                "{warning}"
+            );
+            report.fail(warning);
+        }
 
         if let Some(manager) = self.mcp_manager.clone() {
             report.mcp = McpShutdownOutcome::Indeterminate;

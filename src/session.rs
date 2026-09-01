@@ -4921,10 +4921,7 @@ impl Session {
         let message = SessionMessage::from(message);
         if let Some(&existing_index) = self.entry_index.get(&id) {
             let existing = &self.entries[existing_index];
-            let expected = SessionEntry::Message(MessageEntry {
-                base,
-                message,
-            });
+            let expected = SessionEntry::Message(MessageEntry { base, message });
             if serde_json::to_vec(existing)? != serde_json::to_vec(&expected)? {
                 return Err(Error::session(format!(
                     "stable session entry ID {id} has conflicting in-memory content"

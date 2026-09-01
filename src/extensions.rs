@@ -15997,8 +15997,6 @@ pub async fn dispatch_host_call_shared(
             cfg.enabled && !cfg.enforce
         });
 
-        
-
         if shadow_mode {
             // SEC-7.1: Shadow mode — score is recorded but call is always allowed.
             // Alerts are still generated with counterfactual actions for review.

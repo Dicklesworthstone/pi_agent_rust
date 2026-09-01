@@ -2464,10 +2464,14 @@ After approving access in the browser, press Enter in Pi to complete login."
         if self.active_input_card_kind == Some(kind) {
             self.active_input_card_kind = None;
         }
-        if self.resolve_order_head_after(kind) { self.try_activate_next_input_card_impl() } else { match kind {
-            InputCardKind::Ask => self.advance_ask_ui_queue(),
-            InputCardKind::Extension => self.advance_extension_ui_queue(),
-        } }
+        if self.resolve_order_head_after(kind) {
+            self.try_activate_next_input_card_impl()
+        } else {
+            match kind {
+                InputCardKind::Ask => self.advance_ask_ui_queue(),
+                InputCardKind::Extension => self.advance_extension_ui_queue(),
+            }
+        }
         self.restore_card_draft_after_cards_settle();
     }
 

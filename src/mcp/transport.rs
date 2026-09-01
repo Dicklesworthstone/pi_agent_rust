@@ -2471,9 +2471,10 @@ impl HttpTransport {
             .receive_server_event_stream(first, &mut cursor, wire_state)
             .await;
         if let Err(error) = first_result
-            && (!is_transport_io(&error) || cursor.resume_id().is_none()) {
-                return Err(error);
-            }
+            && (!is_transport_io(&error) || cursor.resume_id().is_none())
+        {
+            return Err(error);
+        }
         let Some(last_event_id) = cursor.resume_id().map(str::to_string) else {
             return Ok(());
         };
@@ -3479,7 +3480,8 @@ mod tests {
                         .lock()
                         .expect("capture lock")
                         .push((headers, body_text));
-                    let id_text = request_body_id.map_or_else(|| "null".to_string(), |n| n.to_string());
+                    let id_text =
+                        request_body_id.map_or_else(|| "null".to_string(), |n| n.to_string());
                     let response = render_scripted_response(&response, &id_text);
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
@@ -4011,7 +4013,9 @@ mod tests {
     /// it must fail closed (bd-zz6yo).
     #[test]
     fn streamable_http_rejects_202_for_requests() {
-        let server = ScriptedHttpServer::start(vec!["HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string()]);
+        let server = ScriptedHttpServer::start(vec![
+            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string(),
+        ]);
         let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
         let runtime = runtime_for_tests();
         let error = runtime
@@ -4031,7 +4035,9 @@ mod tests {
     /// violates the contract, while an empty 202 resolves (bd-zz6yo).
     #[test]
     fn streamable_http_notification_202_body_rules() {
-        let with_body = ScriptedHttpServer::start(vec!["HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 1\r\n\r\nx".to_string()]);
+        let with_body = ScriptedHttpServer::start(vec![
+            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 1\r\n\r\nx".to_string(),
+        ]);
         let transport = HttpTransport::new(&with_body.url(), Vec::new()).expect("transport");
         let runtime = runtime_for_tests();
         let error = runtime
@@ -4040,7 +4046,9 @@ mod tests {
         assert!(error.to_string().contains("must have no body"), "{error}");
         drop(transport);
 
-        let without_body = ScriptedHttpServer::start(vec!["HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string()]);
+        let without_body = ScriptedHttpServer::start(vec![
+            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string(),
+        ]);
         let transport = HttpTransport::new(&without_body.url(), Vec::new()).expect("transport");
         runtime
             .block_on(transport.notify("notifications/initialized", serde_json::json!({})))
@@ -4508,14 +4516,13 @@ mod tests {
                 }
                 panic!("timed out waiting for provisional initialize session publication");
             });
-            
 
             match futures::future::select(pending_initialize, provisional_published).await {
-                    futures::future::Either::Left((result, _)) => {
-                        panic!("initialize completed before its body was released: {result:?}");
-                    }
-                    futures::future::Either::Right(((), pending_initialize)) => pending_initialize,
+                futures::future::Either::Left((result, _)) => {
+                    panic!("initialize completed before its body was released: {result:?}");
                 }
+                futures::future::Either::Right(((), pending_initialize)) => pending_initialize,
+            }
         });
 
         // Exercise cancellation outside an active runtime. Dropping the armed

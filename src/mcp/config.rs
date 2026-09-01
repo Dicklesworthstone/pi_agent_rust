@@ -333,8 +333,7 @@ pub fn resolve_command_identity(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&resolved)
-            .map_or(0, |m| m.permissions().mode());
+        let mode = std::fs::metadata(&resolved).map_or(0, |m| m.permissions().mode());
         if mode & 0o111 == 0 {
             return Err(format!(
                 "resolved command {resolved:?} exists but is not executable"
@@ -431,7 +430,8 @@ fn canonical_cwd(path: &Path) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |current| current.join(path))
+            std::env::current_dir()
+                .map_or_else(|_| path.to_path_buf(), |current| current.join(path))
         }
     })
 }

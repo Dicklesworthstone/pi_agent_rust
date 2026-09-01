@@ -139,24 +139,23 @@ async fn stage_and_commit_compaction_session(
     } else {
         CompactionPersistenceOutcome::Disabled
     };
-    if save_enabled
-        && let Err(err) = candidate.save().await {
-            tracing::error!(
-                error = %err,
-                entry_id,
-                "compaction save failed; reconciling the exact operation against current disk state"
-            );
-            if confirm_exact_compaction_after_save_error(&candidate, &entry_id, &expected_entry)
-                .await
-                .is_none()
-            {
-                return Err(crate::error::Error::session(
+    if save_enabled && let Err(err) = candidate.save().await {
+        tracing::error!(
+            error = %err,
+            entry_id,
+            "compaction save failed; reconciling the exact operation against current disk state"
+        );
+        if confirm_exact_compaction_after_save_error(&candidate, &entry_id, &expected_entry)
+            .await
+            .is_none()
+        {
+            return Err(crate::error::Error::session(
                     "Compaction persistence was not confirmed, current disk state could not be reconciled, and the active in-memory session was left unchanged"
                         .to_string(),
                 ));
-            }
-            persistence = CompactionPersistenceOutcome::ReconciledButUnconfirmed;
         }
+        persistence = CompactionPersistenceOutcome::ReconciledButUnconfirmed;
+    }
 
     let messages_for_agent = candidate.to_messages_for_current_path();
     let (messages_for_ui, usage) = conversation_from_session(&candidate);
@@ -238,23 +237,22 @@ async fn stage_and_commit_retry(
     } else {
         RetryPersistenceOutcome::Disabled
     };
-    if save_enabled
-        && let Err(err) = candidate.save().await {
-            tracing::error!(
-                error = %err,
-                ?new_leaf_id,
-                "retry save failed; reconciling the exact operation against current disk state"
-            );
-            if confirm_exact_retry_after_save_error(&candidate, new_leaf_id.as_deref())
-                .await
-                .is_none()
-            {
-                return Err(crate::error::Error::session(format!(
-                    "Retry persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
-                )));
-            }
-            persistence = RetryPersistenceOutcome::ReconciledButUnconfirmed;
+    if save_enabled && let Err(err) = candidate.save().await {
+        tracing::error!(
+            error = %err,
+            ?new_leaf_id,
+            "retry save failed; reconciling the exact operation against current disk state"
+        );
+        if confirm_exact_retry_after_save_error(&candidate, new_leaf_id.as_deref())
+            .await
+            .is_none()
+        {
+            return Err(crate::error::Error::session(format!(
+                "Retry persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
+            )));
         }
+        persistence = RetryPersistenceOutcome::ReconciledButUnconfirmed;
+    }
 
     let messages_for_agent = candidate.to_messages_for_current_path();
     let (messages_for_ui, usage) = conversation_from_session(&candidate);
@@ -2377,8 +2375,7 @@ mod tests {
             .tempdir_in("/tmp")
             .unwrap_or_else(|_| TempDir::new().expect("tempdir"));
         let session_dir = temp.path().join("sessions");
-        let (mut raw_session, first_answer, abandoned) =
-            linear_retry_session(Some(session_dir));
+        let (mut raw_session, first_answer, abandoned) = linear_retry_session(Some(session_dir));
         raw_session.path = Some(temp.path().join("session.jsonl"));
         let expected_session_id = raw_session.header.id.clone();
         let expected_leaf_id = raw_session.leaf_id().map(str::to_string);
