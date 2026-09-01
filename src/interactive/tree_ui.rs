@@ -111,8 +111,8 @@ async fn stage_and_commit_tree_navigation(
     } else {
         TreeNavigationPersistenceOutcome::Disabled
     };
-    if save_enabled {
-        if let Err(err) = candidate.save().await {
+    if save_enabled
+        && let Err(err) = candidate.save().await {
             tracing::error!(
                 error = %err,
                 ?new_leaf_id,
@@ -132,7 +132,6 @@ async fn stage_and_commit_tree_navigation(
             }
             persistence = TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed;
         }
-    }
 
     let messages_for_agent = candidate.to_messages_for_current_path();
     let (messages_for_ui, usage) = conversation_from_session(&candidate);

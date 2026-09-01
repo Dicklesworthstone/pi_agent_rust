@@ -441,7 +441,7 @@ impl PiApp {
 
             let messages_for_agent = new_session.to_messages_for_current_path();
             let (messages, usage) = conversation_from_session(&new_session);
-            if let Err(err) = PiApp::try_install_session(
+            if let Err(err) = Self::try_install_session(
                 &session,
                 &agent,
                 &admission,

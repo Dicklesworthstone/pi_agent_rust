@@ -12114,8 +12114,8 @@ impl AgentSession {
                 cx.cx(),
             )
             .await?;
-        if save_enabled {
-            if let Err(first_err) = candidate.save().await
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
                 && let Err(retry_err) = candidate.save().await
             {
                 let reason = format!(
@@ -12124,7 +12124,6 @@ impl AgentSession {
                 self.quarantine_provider_reentry(reason.clone());
                 return Err(Error::session_persistence(reason));
             }
-        }
         *session = candidate;
         drop(session);
         self.install_prepared_model_selection(prepared);
@@ -12179,8 +12178,8 @@ impl AgentSession {
         } else {
             None
         };
-        if save_enabled && changed {
-            if let Err(first_err) = candidate.save().await
+        if save_enabled && changed
+            && let Err(first_err) = candidate.save().await
                 && let Err(retry_err) = candidate.save().await
             {
                 let reason = format!(
@@ -12189,7 +12188,6 @@ impl AgentSession {
                 self.quarantine_provider_reentry(reason.clone());
                 return Err(Error::session_persistence(reason));
             }
-        };
         *session = candidate;
         self.agent.stream_options_mut().thinking_level = Some(effective_level);
         self.refresh_extension_completion_host_state();
@@ -12308,8 +12306,8 @@ impl AgentSession {
                 cx.cx(),
             )
             .await?;
-        if save_enabled && persist_needed {
-            if let Err(first_err) = candidate.save().await
+        if save_enabled && persist_needed
+            && let Err(first_err) = candidate.save().await
                 && let Err(retry_err) = candidate.save().await
             {
                 let reason = format!(
@@ -12318,7 +12316,6 @@ impl AgentSession {
                 self.quarantine_provider_reentry(reason.clone());
                 return Err(Error::session_persistence(reason));
             }
-        }
 
         *session = candidate;
         drop(session);
@@ -12834,10 +12831,10 @@ impl AgentSession {
                 return Err(err);
             }
         };
-        let apply_result = self
+        
+        self
             .apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
-            .await;
-        apply_result
+            .await
     }
 
     fn compaction_runtime_handle(&mut self) -> Result<RuntimeHandle> {

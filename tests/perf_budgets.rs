@@ -659,8 +659,8 @@ fn collect_post_generation_evidence_files(
     Ok(())
 }
 
-fn validate_admission_receipts<'a>(
-    payload: &'a Value,
+fn validate_admission_receipts(
+    payload: &Value,
     field: &str,
     label: &str,
     required: &BTreeMap<&str, (&str, &str)>,
@@ -2328,7 +2328,7 @@ fn claim_integrity_guard_failure(path: &Path, payload: &Value) -> Option<DataCon
     let invalidity_reasons_empty = payload
         .pointer("/claim_integrity/cherry_pick_guard/invalidity_reasons")
         .and_then(Value::as_array)
-        .is_some_and(|reasons| reasons.is_empty());
+        .is_some_and(std::vec::Vec::is_empty);
 
     (global_claim_valid != Some(true)
         || layer_coverage
@@ -6966,7 +6966,7 @@ fn context_intelligence_budget_reader_rejects_stale_criterion_sample() {
     file.set_times(
         std::fs::FileTimes::new().set_modified(
             SystemTime::now()
-                .checked_sub(Duration::from_secs(48 * 60 * 60))
+                .checked_sub(Duration::from_hours(48))
                 .expect("represent old Criterion timestamp"),
         ),
     )

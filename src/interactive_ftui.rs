@@ -2627,7 +2627,7 @@ impl FtuiExtensionUiHandler {
         }
     }
 
-    fn cancelled_response(id: String) -> ExtensionUiResponse {
+    const fn cancelled_response(id: String) -> ExtensionUiResponse {
         ExtensionUiResponse {
             id,
             value: None,

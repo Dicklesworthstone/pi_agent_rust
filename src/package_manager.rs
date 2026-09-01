@@ -678,7 +678,7 @@ impl PackageManager {
         self.apply_project_trust(ResolveRoots::from_env(&self.cwd))
     }
 
-    fn apply_project_trust(&self, mut roots: ResolveRoots) -> ResolveRoots {
+    const fn apply_project_trust(&self, mut roots: ResolveRoots) -> ResolveRoots {
         roots.project_settings_enabled &= self.project_trust;
         roots
     }

@@ -114,8 +114,7 @@ fn each_math_technique_has_a_reachable_test() {
     }
     assert!(
         missing.is_empty(),
-        "math techniques without a reachable test: {:?}",
-        missing
+        "math techniques without a reachable test: {missing:?}"
     );
 }
 

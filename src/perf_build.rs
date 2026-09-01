@@ -1233,7 +1233,7 @@ mod tests {
             .expect("write relocated release binary");
         let relocated_binary_path = std::fs::canonicalize(relocated_binary_path)
             .expect("canonicalize relocated release binary");
-        let mut relocated_control = control.clone();
+        let mut relocated_control = control;
         relocated_control["binary_path"] =
             serde_json::json!("/unavailable/producer/target/release/pi");
         let relocated_control_path = temp.path().join("binary-size-relocated.json");

@@ -13038,8 +13038,7 @@ sso_region = us-east-1
         let started = Instant::now();
         let error =
             run_bounded_secret_command(&script.display().to_string(), Duration::from_secs(20))
-                .err()
-                .expect("flood must fail closed");
+                .expect_err("flood must fail closed");
         assert!(
             error.contains("OUTPUT_OVERFLOW"),
             "expected overflow diagnostic, got {error}"
@@ -13070,8 +13069,7 @@ sso_region = us-east-1
         let started = Instant::now();
         let error =
             run_bounded_secret_command(&script.display().to_string(), Duration::from_secs(2))
-                .err()
-                .expect("must hit the bounded deadline");
+                .expect_err("must hit the bounded deadline");
         assert!(error.contains("TIMEOUT"), "{error}");
         let elapsed = started.elapsed();
         assert!(

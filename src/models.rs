@@ -420,12 +420,11 @@ pub fn extension_provider_bindings(
                 "extension provider {:?} is registered more than once",
                 binding.provider
             )));
-        } else {
-            providers.insert(
-                provider_key,
-                (binding.provider.clone(), binding.oauth_config.clone()),
-            );
         }
+        providers.insert(
+            provider_key,
+            (binding.provider.clone(), binding.oauth_config.clone()),
+        );
     }
     Ok(bindings)
 }
@@ -1884,12 +1883,11 @@ impl ModelRegistry {
                     "extension provider {:?} is registered more than once",
                     binding.provider
                 )));
-            } else {
-                extension_providers.insert(
-                    provider_key.clone(),
-                    (binding.provider.clone(), binding.oauth_config.clone()),
-                );
             }
+            extension_providers.insert(
+                provider_key.clone(),
+                (binding.provider.clone(), binding.oauth_config.clone()),
+            );
         }
 
         for entry in &entries {
@@ -6130,7 +6128,7 @@ mod tests {
         let template = ModelRegistry::load(&auth, None)
             .find("openai", "gpt-4o")
             .expect("expected built-in model template");
-        let mut manual_chat = template.clone();
+        let mut manual_chat = template;
         manual_chat.model.provider = "acme".to_string();
         manual_chat.model.id = "chat".to_string();
         manual_chat.model.name = "Manual Chat".to_string();
@@ -6297,7 +6295,7 @@ mod tests {
         let mut oauth_collision = ModelRegistry::from_entries_for_tests(vec![sentinel.clone()]);
         let error = oauth_collision
             .merge_extension_entries(vec![
-                entry("Acme", "one", Some(oauth.clone())),
+                entry("Acme", "one", Some(oauth)),
                 entry("Acme", "two", None),
             ])
             .expect_err("conflicting provider OAuth metadata must fail")

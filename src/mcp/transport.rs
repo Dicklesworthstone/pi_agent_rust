@@ -593,7 +593,7 @@ fn reader_loop(
     }
 }
 
-fn is_bidi_control(character: char) -> bool {
+const fn is_bidi_control(character: char) -> bool {
     matches!(
         character,
         '\u{061c}'
@@ -969,11 +969,11 @@ struct PendingStdioRequest<'a> {
 }
 
 impl PendingStdioRequest<'_> {
-    fn cancellation_was_sent(&mut self) {
+    const fn cancellation_was_sent(&mut self) {
         self.send_cancellation = false;
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -993,7 +993,7 @@ struct StdioAbortGuard<'a> {
 }
 
 impl StdioAbortGuard<'_> {
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -1400,7 +1400,7 @@ impl HttpSseCursor {
 
     fn resume_id(&self) -> Option<&str> {
         self.resume_safe
-            .then(|| self.last_event_id.as_deref())
+            .then_some(self.last_event_id.as_deref())
             .flatten()
     }
 }
@@ -1721,10 +1721,10 @@ impl HttpTransport {
                 // Both futures can become ready in the same scheduling turn.
                 // In that tie the left-biased select may return an error from
                 // the old stream, so re-check before exposing its result.
-                if self.session_generation() != generation {
-                    Ok(None)
-                } else {
+                if self.session_generation() == generation {
                     result.map(Some)
+                } else {
+                    Ok(None)
                 }
             }
             futures::future::Either::Right(((), _)) => Ok(None),
@@ -2470,11 +2470,10 @@ impl HttpTransport {
         let first_result = self
             .receive_server_event_stream(first, &mut cursor, wire_state)
             .await;
-        if let Err(error) = first_result {
-            if !is_transport_io(&error) || cursor.resume_id().is_none() {
+        if let Err(error) = first_result
+            && (!is_transport_io(&error) || cursor.resume_id().is_none()) {
                 return Err(error);
             }
-        }
         let Some(last_event_id) = cursor.resume_id().map(str::to_string) else {
             return Ok(());
         };
@@ -2524,19 +2523,16 @@ impl HttpTransport {
                         continue;
                     }
                 };
-                match listener_result {
-                    Some(()) => {
-                        // The optional channel ended or exhausted its single
-                        // resume. Stay dormant until a newly initialized
-                        // session supplies a fresh, cursor-free stream.
-                        let _ = self
-                            .run_until_session_change(
-                                wire_state.generation,
-                                futures::future::pending::<Result<()>>(),
-                            )
-                            .await?;
-                    }
-                    None => {}
+                if listener_result == Some(()) {
+                    // The optional channel ended or exhausted its single
+                    // resume. Stay dormant until a newly initialized
+                    // session supplies a fresh, cursor-free stream.
+                    let _ = self
+                        .run_until_session_change(
+                            wire_state.generation,
+                            futures::future::pending::<Result<()>>(),
+                        )
+                        .await?;
                 }
             }
 
@@ -3473,7 +3469,7 @@ mod tests {
                     if request_body_id.is_none() {
                         request_body_id = body_text.split("\"id\":").nth(1).and_then(|rest| {
                             rest.chars()
-                                .take_while(|c| c.is_ascii_digit())
+                                .take_while(char::is_ascii_digit)
                                 .collect::<String>()
                                 .parse::<u64>()
                                 .ok()
@@ -3483,9 +3479,7 @@ mod tests {
                         .lock()
                         .expect("capture lock")
                         .push((headers, body_text));
-                    let id_text = request_body_id
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "null".to_string());
+                    let id_text = request_body_id.map_or_else(|| "null".to_string(), |n| n.to_string());
                     let response = render_scripted_response(&response, &id_text);
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
@@ -4017,9 +4011,7 @@ mod tests {
     /// it must fail closed (bd-zz6yo).
     #[test]
     fn streamable_http_rejects_202_for_requests() {
-        let server = ScriptedHttpServer::start(vec![format!(
-            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        )]);
+        let server = ScriptedHttpServer::start(vec!["HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string()]);
         let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
         let runtime = runtime_for_tests();
         let error = runtime
@@ -4039,9 +4031,7 @@ mod tests {
     /// violates the contract, while an empty 202 resolves (bd-zz6yo).
     #[test]
     fn streamable_http_notification_202_body_rules() {
-        let with_body = ScriptedHttpServer::start(vec![format!(
-            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 1\r\n\r\nx"
-        )]);
+        let with_body = ScriptedHttpServer::start(vec!["HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 1\r\n\r\nx".to_string()]);
         let transport = HttpTransport::new(&with_body.url(), Vec::new()).expect("transport");
         let runtime = runtime_for_tests();
         let error = runtime
@@ -4050,9 +4040,7 @@ mod tests {
         assert!(error.to_string().contains("must have no body"), "{error}");
         drop(transport);
 
-        let without_body = ScriptedHttpServer::start(vec![format!(
-            "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        )]);
+        let without_body = ScriptedHttpServer::start(vec!["HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_string()]);
         let transport = HttpTransport::new(&without_body.url(), Vec::new()).expect("transport");
         runtime
             .block_on(transport.notify("notifications/initialized", serde_json::json!({})))
@@ -4520,15 +4508,14 @@ mod tests {
                 }
                 panic!("timed out waiting for provisional initialize session publication");
             });
-            let pending_initialize =
-                match futures::future::select(pending_initialize, provisional_published).await {
+            
+
+            match futures::future::select(pending_initialize, provisional_published).await {
                     futures::future::Either::Left((result, _)) => {
                         panic!("initialize completed before its body was released: {result:?}");
                     }
                     futures::future::Either::Right(((), pending_initialize)) => pending_initialize,
-                };
-
-            pending_initialize
+                }
         });
 
         // Exercise cancellation outside an active runtime. Dropping the armed

@@ -15997,7 +15997,9 @@ pub async fn dispatch_host_call_shared(
             cfg.enabled && !cfg.enforce
         });
 
-        let dispatched = if shadow_mode {
+        
+
+        if shadow_mode {
             // SEC-7.1: Shadow mode — score is recorded but call is always allowed.
             // Alerts are still generated with counterfactual actions for review.
             let (outcome, lane_meta) = dispatch_shared_allowed(ctx, &call).await;
@@ -16138,9 +16140,7 @@ pub async fn dispatch_host_call_shared(
                     }
                 }
             }
-        };
-
-        dispatched
+        }
     } else {
         // SEC-5.1: Alert for static policy denial.
         if let Some(ref manager) = ctx.manager {

@@ -1364,7 +1364,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
                 let reset_cmd = self.handle_pi_message_with_session_retry(
                     PiMsg::ConversationReset {
-                        session_id: session_id.clone(),
+                        session_id,
                         messages,
                         usage,
                         status,
@@ -2370,7 +2370,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// Whether a pending ask or extension UI card currently owns the input
     /// line. Cards arrive mid-turn, so callers must check this before any
     /// "agent is busy" gating of the editor.
-    pub(super) fn has_pending_input_card(&self) -> bool {
+    pub(super) const fn has_pending_input_card(&self) -> bool {
         self.active_ask_ui.is_some() || self.active_extension_ui.is_some()
     }
 
@@ -2464,13 +2464,10 @@ After approving access in the browser, press Enter in Pi to complete login."
         if self.active_input_card_kind == Some(kind) {
             self.active_input_card_kind = None;
         }
-        match self.resolve_order_head_after(kind) {
-            true => self.try_activate_next_input_card_impl(),
-            false => match kind {
-                InputCardKind::Ask => self.advance_ask_ui_queue(),
-                InputCardKind::Extension => self.advance_extension_ui_queue(),
-            },
-        }
+        if self.resolve_order_head_after(kind) { self.try_activate_next_input_card_impl() } else { match kind {
+            InputCardKind::Ask => self.advance_ask_ui_queue(),
+            InputCardKind::Extension => self.advance_extension_ui_queue(),
+        } }
         self.restore_card_draft_after_cards_settle();
     }
 
@@ -2479,7 +2476,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// existing snapshot.
     fn capture_preexisting_card_draft(&mut self) {
         if self.card_draft_snapshot.is_none() && !self.input.value().trim().is_empty() {
-            self.card_draft_snapshot = Some(self.input.value().to_string());
+            self.card_draft_snapshot = Some(self.input.value());
             // AC: first activation snapshots AND clears the preexisting draft
             // (bd-1qol9); the editor now belongs to the card.
             self.input.reset();
@@ -6608,7 +6605,7 @@ mod stream_delta_batcher_tests {
         );
         assert!(
             app.handle_pi_message(PiMsg::CapabilityPromptTick {
-                id: rearmed.0.clone(),
+                id: rearmed.0,
                 generation,
                 timer_generation,
             })

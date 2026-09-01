@@ -1831,7 +1831,7 @@ impl ExtensionUiRequest {
     }
 
     /// Whether this request carries host-authenticated capability metadata.
-    pub fn is_capability_prompt(&self) -> bool {
+    pub const fn is_capability_prompt(&self) -> bool {
         self.capability_prompt.is_some()
     }
 

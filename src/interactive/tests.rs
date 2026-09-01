@@ -989,7 +989,7 @@ fn mixed_cards_ask_then_ext_preserve_drafts_across_resolution_paths() {
         "cargo test -- --filter bd_1",
         "explicit merge policy restores the draft after the last card settles"
     );
-    assert!(app.agent_state == AgentState::ToolRunning);
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
     app.agent_state = AgentState::Idle;
 }
 

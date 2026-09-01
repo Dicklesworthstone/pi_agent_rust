@@ -197,7 +197,7 @@ fn jobs_tool_rejects_a_foreign_session_job_id_without_metadata() {
     assert!(!first_text(&foreign_list).contains(&id));
     let foreign_wait = block_on_local(jobs_tool_for_session(&foreign).execute(
         "foreign-wait",
-        json!({"action": "wait", "jobId": id.clone(), "timeoutMs": 10}),
+        json!({"action": "wait", "jobId": id, "timeoutMs": 10}),
         None,
     ))
     .expect_err("foreign wait must fail closed");
@@ -207,7 +207,7 @@ fn jobs_tool_rejects_a_foreign_session_job_id_without_metadata() {
     assert!(!rendered.contains(&artifact_path));
     let foreign_cancel = block_on_local(jobs_tool_for_session(&foreign).execute(
         "foreign-cancel",
-        json!({"action": "cancel", "jobId": id.clone()}),
+        json!({"action": "cancel", "jobId": id}),
         None,
     ))
     .expect_err("foreign cancel must fail closed");

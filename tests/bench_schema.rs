@@ -808,11 +808,11 @@ fn assert_persistence_completion_contract(
     }
     assert_eq!(
         manifest["exit_codes"]["overall"].as_i64(),
-        Some(if expected_passed { 0 } else { 1 })
+        Some(i64::from(!expected_passed))
     );
     assert_eq!(
         manifest["exit_codes"]["summary_validation"].as_i64(),
-        Some(if expected_passed { 0 } else { 1 })
+        Some(i64::from(!expected_passed))
     );
     assert_eq!(
         manifest["integrity_summary"]["path"].as_str(),
@@ -4921,12 +4921,10 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             // may have null metrics when the underlying data is missing.
             if status == "pass" {
                 let _ = require_positive_metric(primary, "matrix cell primary_e2e", field)?;
-            } else {
-                if require_nullable_positive_metric(primary, "matrix cell primary_e2e", field)?
-                    .is_none()
-                {
-                    primary_complete = false;
-                }
+            } else if require_nullable_positive_metric(primary, "matrix cell primary_e2e", field)?
+                .is_none()
+            {
+                primary_complete = false;
             }
         }
 
@@ -9776,8 +9774,8 @@ fn run_orchestrate_with_fake_toolchain_with_env(
             } else {
                 1
             },
-            "summary_validation": if fault_injection_passed { 0 } else { 1 },
-            "overall": if fault_injection_passed { 0 } else { 1 },
+            "summary_validation": i32::from(!fault_injection_passed),
+            "overall": i32::from(!fault_injection_passed),
         }
     });
     if !extra_env

@@ -174,10 +174,7 @@ async fn run_bounded_process(
     let stderr_thread = spawn_pipe_capture("github-stderr", stderr, MAX_GH_STDERR_BYTES)?;
 
     let termination = loop {
-        match guard.try_wait()? {
-            Some(_) => break ProcessTermination::Exited(guard.finish_exited()?),
-            None => {}
-        }
+        if guard.try_wait()?.is_some() { break ProcessTermination::Exited(guard.finish_exited()?) }
         if started.elapsed() >= timeout {
             guard.kill_and_reap()?;
             break ProcessTermination::TimedOut;
@@ -238,10 +235,8 @@ fn join_pipe_capture(
 fn stderr_evidence(output: &BoundedProcessOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let brief = sanitize_process_diagnostic(&stderr.lines().take(4).collect::<Vec<_>>().join("\n"));
-    let truncation = output
-        .stderr_truncated
-        .then(|| format!("\n[stderr truncated at {MAX_GH_STDERR_BYTES} bytes]"))
-        .unwrap_or_default();
+    let truncation = if output
+        .stderr_truncated { format!("\n[stderr truncated at {MAX_GH_STDERR_BYTES} bytes]") } else { Default::default() };
     if brief.is_empty() && truncation.is_empty() {
         String::new()
     } else {

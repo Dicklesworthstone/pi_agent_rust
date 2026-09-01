@@ -2720,7 +2720,7 @@ mod tests {
         assert_eq!(seeded.failed_files, 0);
         assert_eq!(index.list_sessions(None).expect("list seeded").len(), 1);
 
-        let rejected_path = session_path.clone();
+        let rejected_path = session_path;
         let refreshed = index
             .refresh_incremental_with_file_stats(|path| {
                 if path == rejected_path {

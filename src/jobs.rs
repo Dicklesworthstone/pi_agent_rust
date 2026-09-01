@@ -39,6 +39,7 @@ use crate::model::{Message, UserContent, UserMessage};
 pub type JobSessionIdFuture = futures::future::BoxFuture<'static, Option<String>>;
 
 /// Resolves the session that owns a job operation at the instant it runs.
+///
 /// Reading the live session rather than caching its startup id keeps RPC and
 /// interactive new/switch/fork transitions scoped without special-case
 /// rebinding at every transition site.
@@ -151,7 +152,7 @@ static JOB_PUMP_THREADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Very large async waits are represented as repeated bounded timer sleeps so
 /// `Instant` overflow never turns a valid request into a panic.
-const MAX_ASYNC_WAIT_SLICE: Duration = Duration::from_secs(60 * 60);
+const MAX_ASYNC_WAIT_SLICE: Duration = Duration::from_hours(1);
 
 /// Maximum completion notices retained per session in each storage tier: the
 /// registry and the Agent's one staged batch. A transition can therefore
@@ -521,7 +522,7 @@ impl TailBuffer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    fn seal(&mut self) {
+    const fn seal(&mut self) {
         self.sealed = true;
     }
 }
@@ -682,10 +683,9 @@ fn session_closing_error(owner_session_id: &str) -> Error {
 
 fn remove_quiescent_owner_generation(reg: &mut JobRegistry, owner_session_id: &str) {
     if !reg.closing_owners.contains_key(owner_session_id)
-        && !reg
+        && reg
             .owner_spawns_in_flight
-            .get(owner_session_id)
-            .is_some_and(|count| *count > 0)
+            .get(owner_session_id).is_none_or(|count| *count <= 0)
     {
         reg.owner_shutdown_generations.remove(owner_session_id);
     }
@@ -1918,8 +1918,7 @@ fn monitor_job(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .jobs
                 .get(id)
-                .map(|job| job.cancel_requested)
-                .unwrap_or(false);
+                .is_some_and(|job| job.cancel_requested);
             if cancel_requested {
                 termination_status = Some(JobStatus::Killed);
                 crate::tools::terminate_process_group_tree(resources.child.id());
@@ -3781,7 +3780,7 @@ mod tests {
             ..SpawnBackgroundTestHooks::default()
         });
         let spawn_owner = owner.clone();
-        let spawn_root = root.clone();
+        let spawn_root = root;
         let spawn = std::thread::spawn(move || {
             spawn_background(
                 &spawn_owner,
@@ -3961,7 +3960,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .starting_jobs;
         let spawn_owner = owner.clone();
-        let spawn_root = root.clone();
+        let spawn_root = root;
         let spawn = std::thread::spawn(move || {
             spawn_background(
                 &spawn_owner,
@@ -4024,7 +4023,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .starting_jobs;
         let spawn_owner = owner.clone();
-        let spawn_root = root.clone();
+        let spawn_root = root;
         let spawn = std::thread::spawn(move || {
             spawn_background(
                 &spawn_owner,
@@ -4805,7 +4804,7 @@ mod tests {
     #[test]
     fn async_wait_slices_do_not_become_premature_deadlines() {
         let now = Instant::now();
-        let deadline = now.checked_add(Duration::from_secs(3 * 60 * 60));
+        let deadline = now.checked_add(Duration::from_hours(3));
         assert_eq!(
             remaining_wait_slice(now, deadline),
             Some(MAX_ASYNC_WAIT_SLICE)

@@ -859,7 +859,7 @@ fn sdk_mcp_discovery_honors_workspace_trust() {
     options.workspace_trusted = false;
     options.mcp = Some(McpSessionOptions {
         config_paths: Vec::new(),
-        global_dir: Some(global_dir.clone()),
+        global_dir: Some(global_dir),
     });
 
     let untrusted = run_async(create_agent_session(options.clone())).expect("create session");

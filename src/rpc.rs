@@ -452,8 +452,8 @@ async fn take_last_rpc_user_turn_for_retry(session: &mut AgentSession) -> Result
                 cx.cx(),
             )
             .await?;
-        if save_enabled {
-            if let Err(first_err) = candidate.save().await
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
                 && let Err(retry_err) = candidate.save().await
             {
                 let reason = format!(
@@ -462,7 +462,6 @@ async fn take_last_rpc_user_turn_for_retry(session: &mut AgentSession) -> Result
                 provider_admission.block(reason.clone());
                 return Err(Error::session_persistence(reason));
             }
-        }
         session.invalidate_background_compaction();
         *inner = candidate;
         provider_admission.clear();
@@ -3584,8 +3583,8 @@ pub async fn run(
                                 .to_string(),
                         );
                     }
-                    if save_enabled {
-                        if let Err(first_err) = candidate.save().await
+                    if save_enabled
+                        && let Err(first_err) = candidate.save().await
                             && let Err(retry_err) = candidate.save().await
                         {
                             let reason = format!(
@@ -3594,7 +3593,6 @@ pub async fn run(
                             state.provider_admission.block(reason.clone());
                             return Err(Error::session_persistence(reason));
                         }
-                    }
                     guard.invalidate_background_compaction();
                     *inner = candidate;
                     guard.agent.replace_messages(agent_messages);
@@ -3657,8 +3655,8 @@ pub async fn run(
                             &cx,
                         )
                         .await?;
-                    if save_enabled {
-                        if let Err(first_err) = candidate.save().await
+                    if save_enabled
+                        && let Err(first_err) = candidate.save().await
                             && let Err(retry_err) = candidate.save().await
                         {
                             let reason = format!(
@@ -3667,7 +3665,6 @@ pub async fn run(
                             state.provider_admission.block(reason.clone());
                             return Err(Error::session_persistence(reason));
                         }
-                    }
                     *inner = candidate;
                     crate::app::rebind_stream_options_session(guard.agent.stream_options_mut(), &new_id);
                     guard.refresh_extension_completion_host_state();
@@ -4107,15 +4104,14 @@ pub async fn run(
                                 inner_session.path.as_ref().map(|p| p.display().to_string());
                             guard.invalidate_background_compaction();
                             state.provider_admission.ensure_allowed()?;
-                            if guard.save_enabled() && normalization_changed {
-                                if let Err(first_err) = new_session.save().await
+                            if guard.save_enabled() && normalization_changed
+                                && let Err(first_err) = new_session.save().await
                                     && let Err(retry_err) = new_session.save().await
                                 {
                                     return Err(Error::session_persistence(format!(
                                         "resumed Session normalization remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
                                     )));
                                 }
-                            }
 
                             let target_plan_mode = replayed_plan_mode(&new_session);
                             let messages = new_session.to_messages_for_current_path();
@@ -4369,15 +4365,14 @@ pub async fn run(
                         }
                         guard.invalidate_background_compaction();
                         state.provider_admission.ensure_allowed()?;
-                        if save_enabled {
-                            if let Err(first_err) = new_session.save().await
+                        if save_enabled
+                            && let Err(first_err) = new_session.save().await
                                 && let Err(retry_err) = new_session.save().await
                             {
                                 return Err(Error::session_persistence(format!(
                                     "forked Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
                                 )));
                             }
-                        }
 
                         let target_plan_mode = replayed_plan_mode(&new_session);
                         let messages = new_session.to_messages_for_current_path();
@@ -5200,8 +5195,8 @@ async fn restore_rpc_retry_tail(
             cx,
         )
         .await?;
-    if save_enabled {
-        if let Err(first_err) = candidate.save().await
+    if save_enabled
+        && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
         {
             let reason = format!(
@@ -5210,7 +5205,6 @@ async fn restore_rpc_retry_tail(
             state.provider_admission.block(reason.clone());
             return Err(Error::session_persistence(reason));
         }
-    }
 
     guard.invalidate_background_compaction();
     *inner = candidate;
@@ -5944,8 +5938,8 @@ async fn maybe_restore_primary(
             cx,
         )
         .await?;
-    if save_enabled {
-        if let Err(first_err) = candidate.save().await
+    if save_enabled
+        && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
         {
             let reason = format!(
@@ -5954,7 +5948,6 @@ async fn maybe_restore_primary(
             state.provider_admission.block(reason.clone());
             return Err(Error::session_persistence(reason));
         }
-    }
 
     *inner = candidate;
     guard.agent.set_provider(provider_impl);
@@ -6181,8 +6174,8 @@ async fn try_failover_to_next_chain_entry(
                 cx,
             )
             .await?;
-        if save_enabled {
-            if let Err(first_err) = candidate.save().await
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
                 && let Err(retry_err) = candidate.save().await
             {
                 let reason = format!(
@@ -6191,7 +6184,6 @@ async fn try_failover_to_next_chain_entry(
                 state.provider_admission.block(reason.clone());
                 return Err(Error::session_persistence(reason));
             }
-        }
 
         // No fallible operation remains in the transition after installation.
         *inner = candidate;
@@ -11655,8 +11647,8 @@ async fn apply_thinking_level_for_session(
     } else {
         None
     };
-    if save_enabled && changed {
-        if let Err(first_err) = candidate.save().await
+    if save_enabled && changed
+        && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
         {
             let reason = format!(
@@ -11665,7 +11657,6 @@ async fn apply_thinking_level_for_session(
             state.provider_admission.block(reason.clone());
             return Err(Error::session_persistence(reason));
         }
-    }
     *inner_session = candidate;
     guard.agent.stream_options_mut().thinking_level = Some(level);
     guard.refresh_extension_completion_host_state();
@@ -11713,8 +11704,8 @@ async fn apply_model_change(
             &cx,
         )
         .await?;
-    if save_enabled {
-        if let Err(first_err) = candidate.save().await
+    if save_enabled
+        && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
         {
             let reason = format!(
@@ -11723,7 +11714,6 @@ async fn apply_model_change(
             state.provider_admission.block(reason.clone());
             return Err(Error::session_persistence(reason));
         }
-    }
     *inner_session = candidate;
     Ok(provider_transition)
 }

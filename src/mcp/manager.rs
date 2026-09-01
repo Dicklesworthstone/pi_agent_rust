@@ -257,7 +257,7 @@ impl PrivateHandshakeTransport {
         }
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -279,14 +279,14 @@ struct TransportConstructionAttempt {
 }
 
 impl TransportConstructionAttempt {
-    fn new(abandoned: Arc<AtomicBool>) -> Self {
+    const fn new(abandoned: Arc<AtomicBool>) -> Self {
         Self {
             abandoned,
             armed: true,
         }
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -495,21 +495,18 @@ impl McpManager {
                         ),
                     )
                 })?;
-            match &identity {
-                Some(execution) => {
-                    let mut store = TrustStore::load(&self.inner.trust_path)?;
-                    store.acknowledge_execution(
-                        name,
-                        &fingerprint,
-                        "operator",
-                        execution.clone(),
-                    )?;
-                }
-                None => {
-                    // HTTP transport: nothing local executes.
-                    let mut store = TrustStore::load(&self.inner.trust_path)?;
-                    store.acknowledge(name, &fingerprint, "operator")?;
-                }
+            if let Some(execution) = &identity {
+                let mut store = TrustStore::load(&self.inner.trust_path)?;
+                store.acknowledge_execution(
+                    name,
+                    &fingerprint,
+                    "operator",
+                    execution.clone(),
+                )?;
+            } else {
+                // HTTP transport: nothing local executes.
+                let mut store = TrustStore::load(&self.inner.trust_path)?;
+                store.acknowledge(name, &fingerprint, "operator")?;
             }
         }
         self.connect_and_list(&entry).await
@@ -795,7 +792,7 @@ impl McpManager {
     fn check_trust(&self, entry: &Arc<ServerEntry>) -> Result<()> {
         let decision = self
             .trust_store()?
-            .decision(&entry.config.name, &self.trust_fingerprint_for(&entry));
+            .decision(&entry.config.name, &self.trust_fingerprint_for(entry));
         match decision {
             TrustDecision::Acknowledged => Ok(()),
             TrustDecision::Pending => Err(tool_err(
@@ -1407,7 +1404,7 @@ impl McpManager {
         servers
             .values()
             .filter_map(|entry| {
-                if store.decision(&entry.config.name, &self.trust_fingerprint_for(&entry))
+                if store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
                     != TrustDecision::Acknowledged
                 {
                     return None;
@@ -1498,7 +1495,7 @@ impl McpManager {
         let mut tracked = Vec::new();
         let mut pending = Vec::new();
         for entry in servers.values().filter(|entry| {
-            store.decision(&entry.config.name, &self.trust_fingerprint_for(&entry))
+            store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
                 == TrustDecision::Acknowledged
         }) {
             let entry = Arc::clone(entry);
@@ -3377,7 +3374,7 @@ mod tests {
         );
         let entry = manager.entry("cwd-srv").expect("registered cwd server");
         assert_eq!(
-            entry.cwd_override.as_ref().map(PathBuf::as_path),
+            entry.cwd_override.as_deref(),
             Some(helper_dir.as_path()),
             "cwd override stored (canonicalized)"
         );

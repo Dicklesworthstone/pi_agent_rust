@@ -45,8 +45,7 @@ fn preflight_script_exists_and_is_executable() {
         let mode = permissions.mode();
         assert!(
             mode & 0o111 != 0,
-            "preflight script not executable: mode={:o}",
-            mode
+            "preflight script not executable: mode={mode:o}"
         );
     }
     let _ = permissions; // suppress unused warning on non-unix

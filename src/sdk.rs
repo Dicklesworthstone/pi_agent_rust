@@ -1318,19 +1318,19 @@ const SESSION_MCP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::f
 
 impl SessionResourceShutdown {
     #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.failures.is_empty()
     }
 
     #[must_use]
-    pub(crate) fn completed_cleanly(&self) -> bool {
+    pub(crate) const fn completed_cleanly(&self) -> bool {
         self.failures.is_empty()
     }
 
     /// A replacement may start its MCP manager only after the previous
     /// manager's absence or complete release has been established.
     #[must_use]
-    pub(crate) fn permits_replacement_mcp_activation(&self) -> bool {
+    pub(crate) const fn permits_replacement_mcp_activation(&self) -> bool {
         matches!(
             self.mcp,
             McpShutdownOutcome::NotOwned | McpShutdownOutcome::Released
@@ -1438,16 +1438,15 @@ impl AgentSessionHandle {
         owner_session_id: Option<&str>,
         mut report: SessionResourceShutdown,
     ) -> SessionResourceShutdown {
-        if let Some(owner_session_id) = owner_session_id {
-            if let Err(err) = crate::jobs::kill_session(owner_session_id).await {
+        if let Some(owner_session_id) = owner_session_id
+            && let Err(err) = crate::jobs::kill_session(owner_session_id).await {
                 let warning = format!("failed to stop session-owned background jobs: {err}");
                 tracing::warn!(event = "sdk.session.shutdown.jobs_failed", "{warning}");
                 report.fail(warning);
             }
-        }
 
-        if let Some(region) = self.session.extensions.as_ref() {
-            if !region.shutdown().await {
+        if let Some(region) = self.session.extensions.as_ref()
+            && !region.shutdown().await {
                 let warning =
                     "extension runtime did not stop within its shutdown budget".to_string();
                 tracing::warn!(
@@ -1456,7 +1455,6 @@ impl AgentSessionHandle {
                 );
                 report.fail(warning);
             }
-        }
 
         if let Some(manager) = self.mcp_manager.clone() {
             report.mcp = McpShutdownOutcome::Indeterminate;

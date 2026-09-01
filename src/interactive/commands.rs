@@ -96,22 +96,18 @@ async fn persist_excluded_bash_execution_bounded(
     save_enabled: bool,
     cx: &Cx,
 ) -> ExcludedBashPersistenceOutcome {
-    match asupersync::time::timeout(
+    if let Ok(outcome) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         BASH_COMPLETION_TIMEOUT,
         persist_excluded_bash_execution(session, message, save_enabled, cx),
     )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            tracing::error!(
-                "completed excluded-context bash command exceeded its persistence cleanup budget"
-            );
-            ExcludedBashPersistenceOutcome::NotConfirmed {
-                pending_mutations: None,
-                failed_flushes: None,
-            }
+    .await { outcome } else {
+        tracing::error!(
+            "completed excluded-context bash command exceeded its persistence cleanup budget"
+        );
+        ExcludedBashPersistenceOutcome::NotConfirmed {
+            pending_mutations: None,
+            failed_flushes: None,
         }
     }
 }
@@ -1756,7 +1752,7 @@ impl PiApp {
                             exit_code: result.exit_code,
                             cancelled: Some(result.cancelled),
                             truncated: Some(result.truncated),
-                            full_output_path: result.full_output_path.clone(),
+                            full_output_path: result.full_output_path,
                             timestamp: Some(Utc::now().timestamp_millis()),
                             extra,
                         };
@@ -2242,7 +2238,7 @@ impl PiApp {
                     new_session.header.model_id = Some(model_id);
                     new_session.header.thinking_level = Some(ThinkingLevel::Off.to_string());
                     let new_session_id = new_session.header.id.clone();
-                    if let Err(err) = PiApp::try_install_session(
+                    if let Err(err) = Self::try_install_session(
                         &session,
                         &agent,
                         &admission,
@@ -2414,12 +2410,9 @@ impl PiApp {
                 }
 
                 if let Some(extensions) = self.extensions.clone() {
-                    let owner_session_id = match self.session.try_lock() {
-                        Ok(session) => session.header.id.clone(),
-                        Err(_) => {
-                            self.status_message = Some("Session busy; try again".to_string());
-                            return None;
-                        }
+                    let owner_session_id = if let Ok(session) = self.session.try_lock() { session.header.id.clone() } else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
                     };
                     let session = Arc::clone(&self.session);
                     let event_tx = self.event_tx.clone();
@@ -3642,7 +3635,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let display_work = work.clone();
         runtime.spawn(async move {
             let event = match tool.run_background_tan(&work).await {
-                Ok(completion) => PiApp::completed_tan_event(owner_session_id, completion),
+                Ok(completion) => Self::completed_tan_event(owner_session_id, completion),
                 Err(err) => PiMsg::SessionSystemNote {
                     owner_session_id,
                     message: format!("(/tan failed)\n{err}"),
@@ -5905,7 +5898,7 @@ mod tests {
 
         let registered_extension_bindings = [ExtensionProviderBinding {
             provider: with_oauth.model.provider.clone(),
-            oauth_config: with_oauth.oauth_config.clone(),
+            oauth_config: with_oauth.oauth_config,
         }];
         let selected = super::extension_oauth_config_for_provider(
             &[no_oauth],

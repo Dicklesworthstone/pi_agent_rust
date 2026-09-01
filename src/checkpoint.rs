@@ -340,7 +340,7 @@ struct ProjectedPathMessage {
 }
 
 impl ProjectedPathMessage {
-    fn candidate(text: String, entry_id: String, parent_id: Option<String>) -> Self {
+    const fn candidate(text: String, entry_id: String, parent_id: Option<String>) -> Self {
         Self {
             disposition: RetryDisposition::Candidate,
             text: Some(text),
@@ -667,7 +667,7 @@ mod tests {
         let outcome = RewindOutcome {
             schema: CHECKPOINT_SCHEMA.to_string(),
             checkpoint: "alpha".to_string(),
-            checkpoint_entry_id: checkpoint.entry_id.clone(),
+            checkpoint_entry_id: checkpoint.entry_id,
             collapsed_messages: 2,
             summary: "collapsed the hidden span".to_string(),
             summary_tokens_estimate: 1,
@@ -693,7 +693,7 @@ mod tests {
         let outcome = RewindOutcome {
             schema: CHECKPOINT_SCHEMA.to_string(),
             checkpoint: "alpha".to_string(),
-            checkpoint_entry_id: checkpoint.entry_id.clone(),
+            checkpoint_entry_id: checkpoint.entry_id,
             collapsed_messages: 2,
             summary: "nothing visible left".to_string(),
             summary_tokens_estimate: 1,

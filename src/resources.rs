@@ -2807,7 +2807,7 @@ mod tests {
                 .expect("prompt metadata")
                 .permissions();
             let mut unreadable = original_permissions.clone();
-            unreadable.set_mode(0);
+            unreadable.set_mode(0o0);
             fs::set_permissions(&prompt, unreadable).expect("make prompt unreadable");
 
             let open_is_denied = fs::File::open(&prompt).is_err();

@@ -99,10 +99,10 @@ fn parse_gitlab_response(text: &str) -> Result<String> {
                     format!("Unsupported GitLab Chat response object: {err}"),
                 )
             })?;
-            if !parsed.response.trim().is_empty() {
-                parsed.response
-            } else {
+            if parsed.response.trim().is_empty() {
                 parsed.content
+            } else {
+                parsed.response
             }
         }
         _ => {
@@ -154,7 +154,7 @@ fn push_error_secret(secrets: &mut Vec<String>, value: &str, authorization: bool
     }
 }
 
-fn is_bidi_control(character: char) -> bool {
+const fn is_bidi_control(character: char) -> bool {
     matches!(
         character,
         '\u{061c}'

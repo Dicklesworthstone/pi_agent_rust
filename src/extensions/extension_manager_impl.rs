@@ -4264,8 +4264,7 @@ impl ExtensionManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ui_sender = guard
                 .ui_sender
-                .as_ref()
-                .cloned()
+                .clone()
                 .ok_or_else(|| Error::extension("Extension UI sender not configured"))?;
             match guard.pending_ui.entry(request.id.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {

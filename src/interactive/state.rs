@@ -753,7 +753,7 @@ impl CapabilityPromptOverlay {
 
     /// Returns `true` if this is a capability-specific confirm prompt (not a
     /// generic extension confirm).
-    pub(super) fn is_capability_prompt(request: &ExtensionUiRequest) -> bool {
+    pub(super) const fn is_capability_prompt(request: &ExtensionUiRequest) -> bool {
         request.is_capability_prompt()
     }
 }

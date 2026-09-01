@@ -435,7 +435,7 @@ fn hub_jobs_group_hides_foreign_session_jobs() {
         json!({
             "op": "jobs",
             "action": "wait",
-            "jobId": job_id.clone(),
+            "jobId": job_id,
             "timeoutMs": 10
         }),
     );
@@ -446,7 +446,7 @@ fn hub_jobs_group_hides_foreign_session_jobs() {
     let foreign_cancel = hub_exec_for_session(
         &root,
         &foreign,
-        json!({"op": "jobs", "action": "cancel", "jobId": job_id.clone()}),
+        json!({"op": "jobs", "action": "cancel", "jobId": job_id}),
     );
     assert!(foreign_cancel.is_error);
     assert!(first_text(&foreign_cancel).contains("PI_JOBS_UNKNOWN_ID"));

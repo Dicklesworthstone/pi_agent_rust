@@ -4923,7 +4923,7 @@ impl Session {
             let existing = &self.entries[existing_index];
             let expected = SessionEntry::Message(MessageEntry {
                 base,
-                message: message.clone(),
+                message,
             });
             if serde_json::to_vec(existing)? != serde_json::to_vec(&expected)? {
                 return Err(Error::session(format!(
@@ -5193,8 +5193,7 @@ impl Session {
         let mut html = render_session_html_entries(&self.header, redacted_entries.iter(), false);
         if html.len() > SHARE_SESSION_HTML_MAX_BYTES {
             return Err(Error::session(format!(
-                "Shared transcript exceeds the {}-byte HTML limit",
-                SHARE_SESSION_HTML_MAX_BYTES
+                "Shared transcript exceeds the {SHARE_SESSION_HTML_MAX_BYTES}-byte HTML limit"
             )));
         }
 
@@ -5204,8 +5203,7 @@ impl Session {
         html = crate::memory::screen_secrets(&html);
         if html.len() > SHARE_SESSION_HTML_MAX_BYTES {
             return Err(Error::session(format!(
-                "Redacted shared transcript exceeds the {}-byte HTML limit",
-                SHARE_SESSION_HTML_MAX_BYTES
+                "Redacted shared transcript exceeds the {SHARE_SESSION_HTML_MAX_BYTES}-byte HTML limit"
             )));
         }
         Ok(html)
@@ -6829,8 +6827,7 @@ fn validate_share_entries_size_with_cap<'a>(
     for entry in entries {
         serde_json::to_writer(&mut probe, entry).map_err(|err| {
             Error::session(format!(
-                "Shared transcript exceeds the {}-byte input limit or cannot be measured: {err}",
-                cap
+                "Shared transcript exceeds the {cap}-byte input limit or cannot be measured: {err}"
             ))
         })?;
         probe
@@ -6936,8 +6933,7 @@ fn account_redacted_share_bytes(total: &mut usize, additional: usize) -> Result<
         .ok_or_else(|| Error::session("Shared transcript redaction size overflow"))?;
     if *total > SHARE_SESSION_HTML_MAX_BYTES {
         return Err(Error::session(format!(
-            "Redacted shared transcript exceeds the {}-byte HTML limit",
-            SHARE_SESSION_HTML_MAX_BYTES
+            "Redacted shared transcript exceeds the {SHARE_SESSION_HTML_MAX_BYTES}-byte HTML limit"
         )));
     }
     Ok(())
@@ -6963,8 +6959,7 @@ fn replace_share_string_bounded(raw: &str, needle: &str, replacement: &str) -> R
         .ok_or_else(|| Error::session("Shared transcript redaction size overflow"))?;
     if projected > SHARE_SESSION_HTML_MAX_BYTES {
         return Err(Error::session(format!(
-            "Redacted shared transcript exceeds the {}-byte HTML limit",
-            SHARE_SESSION_HTML_MAX_BYTES
+            "Redacted shared transcript exceeds the {SHARE_SESSION_HTML_MAX_BYTES}-byte HTML limit"
         )));
     }
     Ok(raw.replace(needle, replacement))
@@ -16480,7 +16475,7 @@ mod tests {
         assert_eq!(diagnostics.orphaned_parent_links.len(), 1);
         assert!(loaded.source_integrity_failed);
 
-        let mut cloned = loaded.clone();
+        let mut cloned = loaded;
         assert!(cloned.source_integrity_failed);
         cloned.append_message(make_test_message("clone must remain read-only"));
         let error = run_async(async { cloned.save().await })

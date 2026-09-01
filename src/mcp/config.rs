@@ -54,7 +54,7 @@ fn is_terminal_control(character: char) -> bool {
         )
 }
 
-fn is_http_token_byte(byte: u8) -> bool {
+const fn is_http_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
             byte,
@@ -272,8 +272,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
@@ -335,8 +334,7 @@ pub fn resolve_command_identity(
     {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&resolved)
-            .map(|m| m.permissions().mode())
-            .unwrap_or(0);
+            .map_or(0, |m| m.permissions().mode());
         if mode & 0o111 == 0 {
             return Err(format!(
                 "resolved command {resolved:?} exists but is not executable"
@@ -433,9 +431,7 @@ fn canonical_cwd(path: &Path) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir()
-                .map(|current| current.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
+            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |current| current.join(path))
         }
     })
 }
@@ -1287,7 +1283,7 @@ mod tests {
             r#"{"mcpServers":{"fallback":{"command":"must-not-run"}}}"#,
         );
 
-        let discovery = discover(&cwd, &global, &[missing.clone()]);
+        let discovery = discover(&cwd, &global, std::slice::from_ref(&missing));
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
         assert_eq!(discovery.warnings[0].source_file, missing);
@@ -1618,8 +1614,7 @@ mod tests {
         );
 
         let error = resolve_command_identity("./bin/tool", &elsewhere, None)
-            .err()
-            .expect("must not resolve outside the effective cwd");
+            .expect_err("must not resolve outside the effective cwd");
         assert!(
             error.contains("cannot resolve") || error.contains("not a regular"),
             "{error}"
@@ -1694,16 +1689,14 @@ mod tests {
 
         let path_env = std::env::join_paths([&dir]).expect("join PATH");
         let error = resolve_command_identity("lazy", temp.path(), Some(path_env.as_os_str()))
-            .err()
-            .expect("missing exec bit fails closed");
+            .expect_err("missing exec bit fails closed");
         assert!(
             error.contains("not executable") || error.contains("not found"),
             "{error}"
         );
 
         let missing = resolve_command_identity("never-installed-binary", temp.path(), None)
-            .err()
-            .expect("absent from PATH fails closed");
+            .expect_err("absent from PATH fails closed");
         assert!(
             missing.contains("not found on the current PATH"),
             "{missing}"
