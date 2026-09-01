@@ -14,6 +14,10 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+---
+
+## [v0.4.0] — 2026-09-01 — Release
+
 ### Added
 
 - **System/custom CA certificate support** (gh
@@ -59,6 +63,28 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   round-trip runs under the dedicated long-running compact event budget
   (gh #178).
 
+- **ftui render caching, busy indicators, and compact markdown spacing** (gh
+  [#201](https://github.com/Dicklesworthstone/pi_agent_rust/issues/201),
+  [#202](https://github.com/Dicklesworthstone/pi_agent_rust/issues/202),
+  [#203](https://github.com/Dicklesworthstone/pi_agent_rust/issues/203)):
+  the ftui conversation view caches rendered markdown per entry (flushed on
+  theme/width changes), shows a busy spinner chain while a turn is in
+  flight, and tightens inter-block markdown spacing.
+
+- **Checkpoint retries with topology preservation**: `/retry` now stages and
+  commits provider retries while preserving sibling parent topology, and
+  provider retries are vetoed when session persistence fails so a retry can
+  never silently outrun a session that is not being saved.
+
+- **Bash mediation hardening**: stronger allow-pattern anchoring and command
+  classification (`shred` now classifies as a disk wipe).
+
+- **MCP/RPC transport and extensions-host wave**: multiplexed MCP transport
+  with streamable-HTTP protocol contract tests, refined RPC method routing,
+  handler dispatch and response framing, SSE event handling, extension
+  registration tests, preserved extension spec headers/type alias/cwd, and
+  WASM host refinements.
+
 ### Fixed
 
 - **GitHub Copilot: a configured catalog `base_url` no longer redirects the
@@ -80,6 +106,71 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   `provider/model` selection was and remains custom-first (regression test
   added); the bare-id fall-through now surfaces a startup warning naming the
   skipped provider and how to select it explicitly.
+
+- **Approval mode `ask` now actually prompts instead of denying silently**
+  (gh [#196](https://github.com/Dicklesworthstone/pi_agent_rust/issues/196),
+  [#198](https://github.com/Dicklesworthstone/pi_agent_rust/issues/198)):
+  the documented default approval mode never prompted anywhere — the CLI
+  stack set the approval state without a handler, so every gated tool call
+  hit the deny-by-default branch with a reason the user never saw, and the
+  ftui stack ignored the approval mode entirely. Every interactive surface
+  (classic TUI, ftui, RPC) now renders a real Allow/Deny card through the
+  ask machinery; every non-affirmative outcome (deny, dismissal, timeout,
+  missing surface) maps to a deny with an explicit reason the model can
+  relay. Print mode still fails closed, now with an explicit
+  "prompt unavailable" reason.
+
+- **virtiofs/FUSE bind mounts no longer fail every file write** (gh
+  [#193](https://github.com/Dicklesworthstone/pi_agent_rust/issues/193)):
+  virtiofs (Docker Desktop devcontainers) assigns a fresh inode during
+  rename(2), so post-rename dev/ino verification reported "atomic
+  replacement target changed" after every successful write. When the
+  identity check fails, verification falls back to content proof (size +
+  SHA-256 through the pinned parent descriptor); kernel-backed filesystems
+  never take the fallback, so the safety property is unchanged there.
+
+- **TUI interaction wave** (gh
+  [#206](https://github.com/Dicklesworthstone/pi_agent_rust/issues/206),
+  [#197](https://github.com/Dicklesworthstone/pi_agent_rust/issues/197),
+  [#200](https://github.com/Dicklesworthstone/pi_agent_rust/issues/200),
+  [#205](https://github.com/Dicklesworthstone/pi_agent_rust/issues/205),
+  [#194](https://github.com/Dicklesworthstone/pi_agent_rust/issues/194)):
+  resize preserves the reading position instead of snapping to the bottom,
+  and ftui scroll clamping honours the real rendered line count so long
+  sessions scroll all the way up (#206); `/new` restores the configured
+  default thinking level instead of hard-coding off, and the thinking badge
+  no longer flips under session-lock contention (#197); terminal tab titles
+  carry the session name in both TUIs, updated on `/name`, `/resume`,
+  `/new`, and named launch (#200); Ctrl-C in ftui aborts the in-flight
+  turn instead of waiting out the provider stream (#205); Windows Terminal
+  is recognized via `WT_SESSION` so synchronized output stops frame tearing
+  (#194).
+
+- **Glamour preset heading backgrounds cleared** (gh
+  [#195](https://github.com/Dicklesworthstone/pi_agent_rust/issues/195)):
+  headings rendered theme-accent-on-preset-purple (unreadable for most
+  accents); presets' fixed ANSI heading backgrounds are cleared so headings
+  render as accent on the document background.
+
+- **`/resume` no longer lists the same session twice** (gh
+  [#199](https://github.com/Dicklesworthstone/pi_agent_rust/issues/199)):
+  rows sharing a session id are collapsed after the index/directory-scan
+  merge (symlinked roots, macOS `/tmp` vs `/private/tmp`, dual `.jsonl` +
+  `.sqlite` persistence), keeping the most recently modified representative.
+
+- **Interactive session integrity**: tree navigation stages unconfirmed
+  saves so they cannot claim success, save errors surface instead of being
+  swallowed, and JS extension session mutators are fenced with
+  `SessionActionOrigin` so stale forked-JS lifecycles cannot mutate sessions
+  they no longer own; MCP HTTP sessions are no longer abandoned on
+  initialize/close races; blocked JS hostcalls are cancelled at the root
+  task deadline.
+
+### Changed
+
+- fsqlite updated to 0.3.14 (FTS5 stock-compat + checkpoint watermark).
+- fs4 upgraded to 1.1 (FileExt 1.x API).
+- Full clippy/rustfmt sweep across bin, example, and test targets.
 
 ## [v0.3.0] — 2026-08-21 — Release
 
