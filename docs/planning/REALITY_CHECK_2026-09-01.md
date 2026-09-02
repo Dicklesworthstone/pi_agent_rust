@@ -223,7 +223,7 @@ the evidence.
 
 ---
 
-## 7. Bridge plan (ordered by vision impact)
+## 7. Bridge plan sketch (superseded by §10, kept for the record)
 
 ### Gap A — Restore executable truth (Critical)
 **Current:** no gate run recorded after v0.3.0; recipe only on one Mac; 43 beads parked.
