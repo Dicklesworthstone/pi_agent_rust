@@ -1714,13 +1714,13 @@ fn mcp_extension_servers_registered_after_startup_sync_into_the_live_session() {
         provider: Some("openai".to_string()),
         model: Some("gpt-4o".to_string()),
         api_key: Some("dummy-key".to_string()),
-        working_directory: Some(root.clone()),
+        working_directory: Some(root),
         no_session: true,
         enabled_tools: Some(Vec::new()),
         extension_paths: vec![extension_path],
         mcp: Some(pi::sdk::McpSessionOptions {
             config_paths: Vec::new(),
-            global_dir: Some(global.clone()),
+            global_dir: Some(global),
         }),
         ..pi::sdk::SessionOptions::default()
     }))
