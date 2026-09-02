@@ -1685,6 +1685,107 @@ fn mcp_http_transport_aborts_after_second_session_404() {
     finish_case(&harness, case);
 }
 
+/// bd-8m21l: an MCP server that an extension registers after startup (the
+/// `registerMcpServer` hostcall only updates the extension manager's
+/// snapshot) is brought into the live session by the SDK's per-prompt sync:
+/// registered once under the same trust gate as at startup, listed with
+/// extension provenance, pending until acknowledged (so nothing mounts), and
+/// never registered twice.
+#[test]
+fn mcp_extension_servers_registered_after_startup_sync_into_the_live_session() {
+    let case = "mcp_extension_servers_registered_after_startup_sync_into_the_live_session";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let global = harness.temp_path("global");
+    let extension_path = root.join("late-extension.native.json");
+    std::fs::write(
+        &extension_path,
+        serde_json::to_vec(&json!({
+            "id": "late-extension",
+            "name": "late-extension",
+            "version": "1.0.0",
+            "apiVersion": pi::extensions::PROTOCOL_VERSION,
+            "mcpServers": []
+        }))
+        .expect("serialize native extension"),
+    )
+    .expect("write native extension");
+    let mut handle = block_on_local(pi::sdk::create_agent_session(pi::sdk::SessionOptions {
+        provider: Some("openai".to_string()),
+        model: Some("gpt-4o".to_string()),
+        api_key: Some("dummy-key".to_string()),
+        working_directory: Some(root),
+        no_session: true,
+        enabled_tools: Some(Vec::new()),
+        extension_paths: vec![extension_path],
+        mcp: Some(pi::sdk::McpSessionOptions {
+            config_paths: Vec::new(),
+            global_dir: Some(global),
+        }),
+        ..pi::sdk::SessionOptions::default()
+    }))
+    .expect("create MCP-enabled SDK session");
+    let manager = handle.mcp_manager().expect("SDK-owned MCP manager");
+    assert!(
+        manager.list().iter().all(|row| row.name != "late-fixture"),
+        "nothing is registered at startup"
+    );
+    assert_eq!(
+        block_on_local(handle.sync_extension_mcp_registrations()),
+        0,
+        "nothing to sync before the extension registers anything"
+    );
+
+    // What the `registerMcpServer` hostcall does once startup is over.
+    handle
+        .extension_manager()
+        .expect("extension manager")
+        .register_mcp_server(json!({
+            "name": "late-fixture",
+            "command": "pi-mcp-late-fixture-does-not-exist",
+            "extension_id": "late-extension"
+        }));
+    assert!(
+        manager.list().iter().all(|row| row.name != "late-fixture"),
+        "the extension snapshot alone must not reach the MCP manager"
+    );
+
+    let registered = block_on_local(handle.sync_extension_mcp_registrations());
+    assert_eq!(
+        registered, 1,
+        "the sync must register the late definition once"
+    );
+    let row = manager
+        .list()
+        .into_iter()
+        .find(|row| row.name == "late-fixture")
+        .expect("late server listed after the sync");
+    assert_eq!(row.provenance, "extension");
+    assert_eq!(
+        row.trust, "pending",
+        "a server first seen at runtime waits for acknowledgement exactly like at startup"
+    );
+    assert!(
+        !handle.session().agent.has_tool("mcp__late-fixture__echo"),
+        "a pending server must not mount wrappers"
+    );
+    assert_eq!(
+        block_on_local(handle.sync_extension_mcp_registrations()),
+        0,
+        "a second sync must not register the same server again"
+    );
+    assert_eq!(
+        manager
+            .list()
+            .iter()
+            .filter(|row| row.name == "late-fixture")
+            .count(),
+        1,
+        "the manager must hold one definition for the late server"
+    );
+    finish_case(&harness, case);
+}
+
 // ---------------------------------------------------------------------------
 // Stdio fixture lifecycle (feature-gated)
 // ---------------------------------------------------------------------------

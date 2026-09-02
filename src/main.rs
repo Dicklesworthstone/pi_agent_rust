@@ -1402,6 +1402,20 @@ async fn run(
     // the extension pre-warm so the runtime's hostcall registry shares it.
     let session_mutation_recorder = Arc::new(pi::undo::FileMutationRecorder::default());
 
+    // One tool registry for the whole session (bd-4t6oz): the extension
+    // runtime pre-warmed below and the Agent constructed later resolve tools
+    // through the same handle, so `pi.tool` hostcalls apply the session's
+    // undo/workspace policy and see tools mounted after boot (extension
+    // wrappers, MCP tools, plan tools).
+    let shared_enabled_tools = cli.enabled_tools();
+    let shared_tools = pi::tools::SharedToolRegistry::new(ToolRegistry::with_mutation_recorder(
+        &shared_enabled_tools,
+        &cwd,
+        Some(&config),
+        Some(Arc::clone(&session_mutation_recorder)),
+        Some(&workspace),
+    ));
+
     // Pre-warm extension runtime in a background task so startup work can overlap
     // with auth refresh, model selection, and session creation.
     let extension_prewarm_handle =
@@ -1409,26 +1423,18 @@ async fn run(
             if ftui_requested || resources.extensions().is_empty() {
                 None
             } else {
-                let pre_enabled_tools = cli.enabled_tools();
                 let pre_mgr = pi::extensions::ExtensionManager::new();
                 pre_mgr.set_cwd(cwd.display().to_string());
 
-                // The runtime registry shares the session's undo recorder and
-                // workspace roots so `pi.tool` hostcalls that write files are
-                // undoable and confined like the agent's own calls (bd-4t6oz).
-                let pre_tools = Arc::new(ToolRegistry::with_mutation_recorder(
-                    &pre_enabled_tools,
-                    &cwd,
-                    Some(&config),
-                    Some(Arc::clone(&session_mutation_recorder)),
-                    Some(&workspace),
-                ));
+                // The runtime resolves tools through the session's shared
+                // registry (undo recorder, workspace roots, later mounts).
+                let pre_tools = shared_tools.clone();
 
                 let resolved_risk = config.resolve_extension_risk_with_metadata();
                 pre_mgr.set_runtime_risk_config(resolved_risk.settings);
 
                 let pre_mgr_for_runtime = pre_mgr.clone();
-                let pre_tools_for_runtime = Arc::clone(&pre_tools);
+                let pre_tools_for_runtime = pre_tools.clone();
                 let prewarm_policy_for_runtime = prewarm_policy.clone();
                 let prewarm_cwd = cwd.display().to_string();
                 Some((
@@ -1466,17 +1472,10 @@ async fn run(
                 ))
             }
         } else {
-            let pre_enabled_tools = cli.enabled_tools();
             let pre_mgr = pi::extensions::ExtensionManager::new();
             pre_mgr.set_cwd(cwd.display().to_string());
-            // Same shared undo recorder / workspace as the JS pre-warm (bd-4t6oz).
-            let pre_tools = Arc::new(ToolRegistry::with_mutation_recorder(
-                &pre_enabled_tools,
-                &cwd,
-                Some(&config),
-                Some(Arc::clone(&session_mutation_recorder)),
-                Some(&workspace),
-            ));
+            // Same shared registry as the JS pre-warm (bd-4t6oz).
+            let pre_tools = shared_tools.clone();
 
             let resolved_risk = config.resolve_extension_risk_with_metadata();
             pre_mgr.set_runtime_risk_config(resolved_risk.settings);
@@ -1768,15 +1767,6 @@ async fn run(
         secrets: config.secrets.clone(),
     };
 
-    // Session undo recorder (bd-cv653.3.13), shared with the extension
-    // runtime's hostcall registry built during pre-warm (bd-4t6oz).
-    let tools = ToolRegistry::with_mutation_recorder(
-        &enabled_tools,
-        &cwd,
-        Some(&config),
-        Some(Arc::clone(&session_mutation_recorder)),
-        Some(&workspace),
-    );
     let session_arc = Arc::new(Mutex::new(session));
     let compaction_settings = ResolvedCompactionSettings {
         enabled: config.compaction_enabled(),
@@ -1787,7 +1777,9 @@ async fn run(
         render_mode: config.compaction_render_mode(),
     };
     let mut agent_session = AgentSession::new(
-        Agent::new(provider, tools, agent_config),
+        // The same registry the pre-warmed extension runtime resolves
+        // `pi.tool` hostcalls through (bd-4t6oz).
+        Agent::with_shared_tools(provider, shared_tools.clone(), agent_config),
         session_arc,
         !cli.no_session,
         compaction_settings,

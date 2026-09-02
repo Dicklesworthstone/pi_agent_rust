@@ -1849,7 +1849,7 @@ fn js_hostcall_prompt_mode_asks_once_per_capability() {
 
         let dir = tempdir().expect("tempdir");
         let host = JsRuntimeHost {
-            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)).into(),
             manager_ref: Arc::downgrade(&manager.inner),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -2790,7 +2790,7 @@ fn js_runtime_pump_once_exec_streaming_callback_delivers_chunks_and_final_result
         let dir = tempdir().expect("tempdir");
         let manager = ExtensionManager::new();
         let host = JsRuntimeHost {
-            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)).into(),
             manager_ref: Arc::downgrade(&manager.inner),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -2896,7 +2896,7 @@ fn js_runtime_pump_once_exec_streaming_signal_termination_reports_nonzero_code()
         let dir = tempdir().expect("tempdir");
         let manager = ExtensionManager::new();
         let host = JsRuntimeHost {
-            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)).into(),
             manager_ref: Arc::downgrade(&manager.inner),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -2990,7 +2990,7 @@ fn js_runtime_pump_once_exec_streaming_async_iterator_delivers_chunks_in_order()
         let dir = tempdir().expect("tempdir");
         let manager = ExtensionManager::new();
         let host = JsRuntimeHost {
-            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)).into(),
             manager_ref: Arc::downgrade(&manager.inner),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -3082,7 +3082,7 @@ fn js_runtime_pump_once_exec_streaming_timeout_sets_killed_final_chunk() {
         let dir = tempdir().expect("tempdir");
         let manager = ExtensionManager::new();
         let host = JsRuntimeHost {
-            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)).into(),
             manager_ref: Arc::downgrade(&manager.inner),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -3169,7 +3169,7 @@ fn js_runtime_pump_once_exec_streaming_return_cancels_before_dispatch() {
         let dir = tempdir().expect("tempdir");
         let manager = ExtensionManager::new();
         let host = JsRuntimeHost {
-            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)).into(),
             manager_ref: Arc::downgrade(&manager.inner),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -4864,7 +4864,7 @@ fn js_hostcall_prompt_policy_caches_user_allow_and_never_logs_raw_params() {
     let manager = extension_manager_no_persisted_permissions();
 
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -5010,7 +5010,7 @@ fn js_hostcall_strict_policy_denies_and_logs_reason() {
 
     let mgr = ExtensionManager::new();
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&mgr.inner),
         manager_snapshot: Arc::clone(&mgr.snapshot),
         manager_snapshot_version: Arc::clone(&mgr.snapshot_version),
@@ -5127,7 +5127,7 @@ fn js_hostcall_ui_missing_op_is_invalid_request() {
     let manager = extension_manager_no_persisted_permissions();
 
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -5165,7 +5165,7 @@ fn js_hostcall_ui_timeout_maps_to_timeout_taxonomy() {
     manager.set_ui_sender(ui_tx);
 
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -5287,7 +5287,7 @@ fn js_hostcall_capability_denial_matrix_emits_deterministic_errors_and_logs() {
     // Strict: deny anything not in default_caps.
     let mgr_strict = ExtensionManager::new();
     let host_strict = JsRuntimeHost {
-        tools: Arc::clone(&tools),
+        tools: Arc::clone(&tools).into(),
         manager_ref: Arc::downgrade(&mgr_strict.inner),
         manager_snapshot: Arc::clone(&mgr_strict.snapshot),
         manager_snapshot_version: Arc::clone(&mgr_strict.snapshot_version),
@@ -5378,7 +5378,7 @@ fn js_hostcall_capability_denial_matrix_emits_deterministic_errors_and_logs() {
     let manager_prompt = extension_manager_no_persisted_permissions();
 
     let host_prompt = JsRuntimeHost {
-        tools: Arc::clone(&tools),
+        tools: Arc::clone(&tools).into(),
         manager_ref: Arc::downgrade(&manager_prompt.inner),
         manager_snapshot: Arc::clone(&manager_prompt.snapshot),
         manager_snapshot_version: Arc::clone(&manager_prompt.snapshot_version),
@@ -5473,7 +5473,7 @@ fn js_hostcall_capability_denial_matrix_emits_deterministic_errors_and_logs() {
     // Permissive: deny_caps still takes precedence and must produce deterministic denial.
     let mgr_perm = ExtensionManager::new();
     let host_perm = JsRuntimeHost {
-        tools,
+        tools: tools.into(),
         manager_ref: Arc::downgrade(&mgr_perm.inner),
         manager_snapshot: Arc::clone(&mgr_perm.snapshot),
         manager_snapshot_version: Arc::clone(&mgr_perm.snapshot_version),
@@ -5522,7 +5522,8 @@ fn js_hostcall_routes_write_and_read_tools_when_allowed() {
             &["read", "write"],
             &cwd,
             None,
-        )),
+        ))
+        .into(),
         manager_ref: Arc::downgrade(&mgr2.inner),
         manager_snapshot: Arc::clone(&mgr2.snapshot),
         manager_snapshot_version: Arc::clone(&mgr2.snapshot_version),

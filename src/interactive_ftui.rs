@@ -3143,13 +3143,31 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
                 crate::model::Message::Assistant(assistant) => Some(assistant),
                 _ => None,
             });
+            let stop_reason =
+                last_assistant.map_or(crate::model::StopReason::Stop, |a| a.stop_reason);
+            // #209: a provider failure ends the turn as a structured card
+            // (provider · HTTP status · retry status · bounded detail), not a
+            // raw payload dump. Aborts keep their plain "Aborted" line.
+            let error_message = error.as_ref().map(|raw| {
+                if stop_reason == crate::model::StopReason::Error {
+                    crate::error::ProviderErrorSummary::from_error_text(
+                        last_assistant.map(|a| a.provider.as_str()),
+                        raw,
+                    )
+                    .turn_end_card(raw, None)
+                } else {
+                    raw.clone()
+                }
+            });
             vec![PiMsg::AgentDone {
                 usage: last_assistant.map(|a| a.usage.clone()),
-                stop_reason: last_assistant
-                    .map_or(crate::model::StopReason::Stop, |a| a.stop_reason),
-                error_message: error.clone(),
+                stop_reason,
+                error_message,
             }]
         }
+        // `ProviderError` is deliberately silent here: the structured card is
+        // built from `AgentEnd` above so it lands exactly once, at turn end;
+        // the event itself serves JSON/RPC consumers.
         E::MessageUpdate {
             assistant_message_event,
             ..
@@ -3575,8 +3593,28 @@ async fn run_prompt_turn(
     *turn_abort
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    if let Err(err) = result {
-        let _ = agent_tx.send(PiMsg::AgentError(err.to_string()));
+    match result {
+        // #209: the transcript already holds the structured turn-end card
+        // (built from `AgentEnd`); the banner pinned above the editor carries
+        // the one-line headline so the failure is visible even when the
+        // transcript is scrolled away.
+        Err(err @ crate::error::Error::Provider { .. }) => {
+            let raw = err.to_string();
+            let headline =
+                crate::error::ProviderErrorSummary::from_error_text(None, &raw).headline();
+            let _ = agent_tx.send(PiMsg::AgentError(headline));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(err.to_string()));
+        }
+        Ok(message) if message.stop_reason == crate::model::StopReason::Error => {
+            let raw = message.error_message.as_deref().unwrap_or("Request failed");
+            let headline =
+                crate::error::ProviderErrorSummary::from_error_text(Some(&message.provider), raw)
+                    .headline();
+            let _ = agent_tx.send(PiMsg::AgentError(headline));
+        }
+        Ok(_) => {}
     }
 }
 
@@ -7097,6 +7135,118 @@ mod tests {
         );
         assert!(rendered.contains("line-one"), "folded detail missing");
     }
+    /// #209: a provider failure at turn end translates into ONE structured
+    /// card (provider · HTTP status · retry status · bounded detail) carried
+    /// by `AgentDone`; the `ProviderError` event itself is silent for the UI
+    /// and an abort keeps its plain message.
+    #[test]
+    fn agent_end_provider_error_translates_to_structured_card() {
+        use crate::agent::AgentEvent as E;
+        use crate::model::{AssistantMessage, Message};
+        use std::sync::Arc;
+
+        let raw = "Provider error: deepseek: OpenAI API error (HTTP 503): \
+{\"error\":{\"code\":\"service_unavailable_error\",\"message\":\"Server Overloaded\"}}";
+        let assistant = Arc::new(AssistantMessage {
+            provider: "deepseek".into(),
+            stop_reason: StopReason::Error,
+            error_message: Some(raw.into()),
+            ..Default::default()
+        });
+        let msgs = agent_event_to_pi_msgs(&E::AgentEnd {
+            session_id: Arc::from("s1"),
+            messages: vec![Message::Assistant(Arc::clone(&assistant))],
+            error: Some(raw.into()),
+        });
+        let [
+            PiMsg::AgentDone {
+                stop_reason: StopReason::Error,
+                error_message: Some(card),
+                ..
+            },
+        ] = msgs.as_slice()
+        else {
+            // ubs:ignore panic in #[cfg(test)] let-else is an assertion failure, not library code
+            panic!("unexpected translation: {msgs:?}");
+        };
+        let mut lines = card.lines();
+        assert_eq!(
+            lines.next(),
+            Some("Provider error: deepseek: HTTP 503 (service unavailable / overloaded)")
+        );
+        assert!(
+            lines
+                .next()
+                .is_some_and(|line| line.contains("not auto-retried")),
+            "retry status line missing: {card}"
+        );
+        assert!(
+            lines
+                .next()
+                .is_some_and(|line| line.starts_with("Detail: OpenAI API error (HTTP 503)")),
+            "detail line missing: {card}"
+        );
+
+        let summary = crate::error::ProviderErrorSummary::from_error_text(Some("deepseek"), raw);
+        assert!(
+            agent_event_to_pi_msgs(&E::ProviderError {
+                session_id: Arc::from("s1"),
+                provider: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                summary,
+                message: raw.into(),
+            })
+            .is_empty(),
+            "ProviderError must not double-post the card"
+        );
+
+        let aborted = Arc::new(AssistantMessage {
+            stop_reason: StopReason::Aborted,
+            error_message: Some("Aborted".into()),
+            ..Default::default()
+        });
+        let msgs = agent_event_to_pi_msgs(&E::AgentEnd {
+            session_id: Arc::from("s1"),
+            messages: vec![Message::Assistant(aborted)],
+            error: Some("Aborted".into()),
+        });
+        assert!(
+            matches!(
+                msgs.as_slice(),
+                [PiMsg::AgentDone { error_message: Some(text), .. }] if text == "Aborted"
+            ),
+            "abort must keep its plain message: {msgs:?}"
+        );
+
+        // The card lands in the transcript as an error entry at turn end,
+        // even when partial text streamed first.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, _submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta(String::from("partial "))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Error,
+            error_message: Some(card.clone()),
+        }));
+        let transcript = &sim.model().transcript;
+        assert!(
+            transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Assistant && e.text.starts_with("partial")),
+            "partial text must be kept"
+        );
+        assert!(
+            transcript.iter().any(|e| e.role == EntryRole::Error
+                && e.text.starts_with("Provider error: deepseek: HTTP 503")),
+            "turn-end error card missing: {transcript:?}"
+        );
+        assert_eq!(sim.model().state, AgentUiState::Ready);
+    }
+
     #[test]
     fn agent_error_pins_banner_and_send_dismisses() {
         let (_agent_tx, rx) = mpsc::channel();

@@ -1428,6 +1428,20 @@ pub enum AgentEvent {
     },
     /// Advisor verdict delivered into the session (bd-cv653.3.3).
     AdvisorNote { level: String, rationale: String },
+    /// A provider request failed and ended the turn (#209). Emitted right
+    /// before the `TurnEnd`/`AgentEnd` pair so consumers get the provider,
+    /// HTTP status, and retryability as structured fields rather than having
+    /// to parse `AgentEnd.error`. Retry lifecycle (`AutoRetryStart`/`End`)
+    /// is reported separately by the caller that owns the retry budget.
+    ProviderError {
+        #[serde(rename = "sessionId")]
+        session_id: Arc<str>,
+        provider: String,
+        model: String,
+        #[serde(flatten)]
+        summary: crate::error::ProviderErrorSummary,
+        message: String,
+    },
     /// Extension error during event dispatch or execution.
     ExtensionError {
         #[serde(rename = "extensionId", skip_serializing_if = "Option::is_none")]
@@ -1509,8 +1523,9 @@ pub struct Agent {
     /// The LLM provider.
     provider: Arc<dyn Provider>,
 
-    /// Tool registry.
-    tools: ToolRegistry,
+    /// Tool registry, shared with the extension hosts (see
+    /// [`crate::tools::SharedToolRegistry`]).
+    tools: crate::tools::SharedToolRegistry,
 
     /// Agent configuration.
     config: AgentConfig,
@@ -1631,11 +1646,32 @@ fn path_like_inputs(arguments: &Value) -> Vec<&str> {
 impl Agent {
     /// Create a new agent with the given provider and tools.
     pub fn new(provider: Arc<dyn Provider>, tools: ToolRegistry, config: AgentConfig) -> Self {
+        Self::with_shared_tools(
+            provider,
+            crate::tools::SharedToolRegistry::new(tools),
+            config,
+        )
+    }
+
+    /// The registry handle this agent resolves and mounts tools through.
+    /// Hand the same handle to an extension runtime so `pi.tool` hostcalls
+    /// resolve against the live registry, including tools mounted later.
+    #[must_use]
+    pub fn shared_tools(&self) -> crate::tools::SharedToolRegistry {
+        self.tools.clone()
+    }
+
+    /// Create a new agent over an already-shared tool registry.
+    pub fn with_shared_tools(
+        provider: Arc<dyn Provider>,
+        tools: crate::tools::SharedToolRegistry,
+        config: AgentConfig,
+    ) -> Self {
         let keyword_max_thinking_level = config
             .stream_options
             .thinking_level
             .unwrap_or(crate::model::ThinkingLevel::Off);
-        let job_session_scope = tools.job_session_scope();
+        let job_session_scope = tools.snapshot().job_session_scope();
         Self {
             provider,
             tools,
@@ -1677,7 +1713,7 @@ impl Agent {
         if !matches!(msg.stop_reason, StopReason::Stop) {
             return msg;
         }
-        if self.tools.tools().is_empty() {
+        if self.tools.snapshot().tools().is_empty() {
             return msg;
         }
         if self.tool_call_dialect != Dialect::Xmlish {
@@ -1691,7 +1727,7 @@ impl Agent {
                 .find_map(|(index, block)| match block {
                     ContentBlock::Text(text) => {
                         let candidates = extract_text_tool_calls(&text.text, &|name| {
-                            self.tools.get(name).is_some()
+                            self.tools.snapshot().get(name).is_some()
                         });
                         (!candidates.is_empty()).then_some((index, candidates))
                     }
@@ -1963,7 +1999,9 @@ impl Agent {
     where
         I: IntoIterator<Item = Box<dyn Tool>>,
     {
-        self.tools.extend(tools);
+        // Publishes a new snapshot, so extension hostcalls see the mounted
+        // tools on their next lookup as well.
+        self.tools.update(|registry| registry.extend(tools));
         self.cached_tool_defs = None; // Invalidate cache when tools change
     }
 
@@ -1984,7 +2022,7 @@ impl Agent {
     /// without exposing the registry itself.
     #[must_use]
     pub fn has_tool(&self, name: &str) -> bool {
-        self.tools.get(name).is_some()
+        self.tools.snapshot().get(name).is_some()
     }
 
     /// Queue a steering message (delivered after tool completion).
@@ -2041,7 +2079,7 @@ impl Agent {
     /// (bd-cv653.3.13).
     #[must_use]
     pub fn mutation_recorder(&self) -> Option<Arc<crate::undo::FileMutationRecorder>> {
-        self.tools.mutation_recorder()
+        self.tools.snapshot().mutation_recorder()
     }
 
     pub const fn stream_options(&self) -> &StreamOptions {
@@ -2112,9 +2150,13 @@ impl Agent {
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
         // Load modes (bd-cv653.1.6): discoverable-tier tools are excluded
         // until promoted; the generation counter invalidates on promotion.
+        // The registry version covers every published swap, including the
+        // ones made from extension hostcalls (`setActiveTools`), so those
+        // reach the next provider request without out-of-band invalidation.
         let generation = self
             .tool_defs_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
+            .load(std::sync::atomic::Ordering::SeqCst)
+            ^ self.tools.version().rotate_left(32);
         let cache_fresh = self
             .cached_tool_defs
             .as_ref()
@@ -2125,11 +2167,11 @@ impl Agent {
                 .lock()
                 .map(|set| set.clone())
                 .unwrap_or_default();
-            let defs: Vec<ToolDef> = self
-                .tools
+            let registry = self.tools.snapshot();
+            let defs: Vec<ToolDef> = registry
                 .tools()
                 .iter()
-                .filter(|t| !self.tools.is_discoverable(t.name()) || promoted.contains(t.name()))
+                .filter(|t| !registry.is_discoverable(t.name()) || promoted.contains(t.name()))
                 .map(|t| ToolDef {
                     name: t.name().to_string(),
                     description: t.description().to_string(),
@@ -2459,6 +2501,19 @@ impl Agent {
         message.error_message = Some(error_message);
         message.timestamp = Utc::now().timestamp_millis();
         message
+    }
+
+    /// Structured turn-ending provider failure (#209), classified from the
+    /// flattened error text and stamped with the provider the request went to.
+    fn build_provider_error_event(&self, session_id: &Arc<str>, message: &str) -> AgentEvent {
+        let provider = self.provider.name().to_string();
+        AgentEvent::ProviderError {
+            session_id: Arc::clone(session_id),
+            summary: crate::error::ProviderErrorSummary::from_error_text(Some(&provider), message),
+            provider,
+            model: self.provider.model_id().to_string(),
+            message: message.to_string(),
+        }
     }
 
     /// The main agent loop. Magic keywords (bd-cv653.3.6) mutate the
@@ -2870,6 +2925,7 @@ impl Agent {
                         on_event(AgentEvent::MessageEnd {
                             message: assistant_event_message.clone(),
                         });
+                        on_event(self.build_provider_error_event(&session_id, &err_string));
 
                         let turn_end_event = AgentEvent::TurnEnd {
                             session_id: session_id.clone(),
@@ -2917,6 +2973,18 @@ impl Agent {
                             message: message.clone(),
                         });
                         new_messages.push(message);
+                    }
+
+                    // A provider-side failure (stream `Error` event, dropped
+                    // stream, truncated tool call) surfaces as a stop reason of
+                    // `Error`; an abort is the user's doing and not reported
+                    // as a provider error.
+                    if assistant_arc.stop_reason == StopReason::Error {
+                        let message = assistant_arc
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "Request failed".to_string());
+                        on_event(self.build_provider_error_event(&session_id, &message));
                     }
 
                     let turn_end_event = AgentEvent::TurnEnd {
@@ -4303,6 +4371,7 @@ impl Agent {
             .iter()
             .map(|tool_call| {
                 self.tools
+                    .snapshot()
                     .get(&tool_call.name)
                     .map_or_else(ToolEffects::write, Tool::effects)
             })
@@ -4812,9 +4881,10 @@ impl Agent {
                 if name.is_empty() {
                     return Some(Self::xdev_text_output("xdev run requires a `name`", true));
                 }
-                if !self.tools.is_discoverable(name) {
+                let registry = self.tools.snapshot();
+                if !registry.is_discoverable(name) {
                     return Some(Self::xdev_text_output(
-                        &if self.tools.get(name).is_some() {
+                        &if registry.get(name).is_some() {
                             format!("{name:?} is already in the live schema — call it directly.")
                         } else {
                             format!("No discoverable tool named {name:?}; use xdev list.")
@@ -4823,7 +4893,7 @@ impl Agent {
                     ));
                 }
                 let inner_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
-                let Some(inner) = self.tools.get(name) else {
+                let Some(inner) = registry.get(name) else {
                     return Some(Self::xdev_text_output(
                         &format!("Tool {name:?} not registered"),
                         true,
@@ -4847,9 +4917,10 @@ impl Agent {
                         true,
                     ));
                 }
-                if !self.tools.is_discoverable(name) {
+                let registry = self.tools.snapshot();
+                if !registry.is_discoverable(name) {
                     return Some(Self::xdev_text_output(
-                        &if self.tools.get(name).is_some() {
+                        &if registry.get(name).is_some() {
                             format!("{name:?} is already in the live schema.")
                         } else {
                             format!("No discoverable tool named {name:?}; use xdev list.")
@@ -4902,10 +4973,12 @@ impl Agent {
                 .unwrap_or("");
             return self
                 .tools
+                .snapshot()
                 .get(inner)
                 .map_or_else(crate::tools::ToolEffects::read, crate::tools::Tool::effects);
         }
         self.tools
+            .snapshot()
             .get(&tool_call.name)
             .map_or_else(crate::tools::ToolEffects::read, crate::tools::Tool::effects)
     }
@@ -4941,8 +5014,10 @@ impl Agent {
             return (output, is_error);
         }
 
-        // Find the tool
-        let Some(tool) = self.tools.get(&tool_call.name) else {
+        // Find the tool in the current registry snapshot (kept alive for the
+        // duration of the call so the handle outlives the await below).
+        let registry = self.tools.snapshot();
+        let Some(tool) = registry.get(&tool_call.name) else {
             return (Self::tool_not_found_output(&tool_call.name), true);
         };
 
@@ -5173,8 +5248,9 @@ pub struct PreWarmedExtensionRuntime {
     pub manager: ExtensionManager,
     /// The booted runtime handle.
     pub runtime: ExtensionRuntimeHandle,
-    /// The tool registry passed to the runtime during boot.
-    pub tools: Arc<ToolRegistry>,
+    /// The tool registry passed to the runtime during boot; the same handle
+    /// the agent is later constructed over (bd-4t6oz).
+    pub tools: crate::tools::SharedToolRegistry,
 }
 
 /// Host bridges that must exist while extensions register and run startup
@@ -7354,11 +7430,8 @@ mod extensions_integration_tests {
                 .await
                 .expect("enable extensions");
 
-            let tool = agent_session
-                .agent
-                .tools
-                .get("hello_tool")
-                .expect("hello_tool registered");
+            let registry = agent_session.agent.tools.snapshot();
+            let tool = registry.get("hello_tool").expect("hello_tool registered");
 
             let output = tool
                 .execute("call-1", json!({ "name": "pi" }), None)
@@ -7520,9 +7593,8 @@ mod extensions_integration_tests {
                 .await
                 .expect("enable extensions");
 
-            let tool = agent_session
-                .agent
-                .tools
+            let registry = agent_session.agent.tools.snapshot();
+            let tool = registry
                 .get("emit_message")
                 .expect("emit_message registered");
 
@@ -7604,9 +7676,8 @@ mod extensions_integration_tests {
                 .await
                 .expect("enable extensions");
 
-            let tool = agent_session
-                .agent
-                .tools
+            let registry = agent_session.agent.tools.snapshot();
+            let tool = registry
                 .get("emit_message")
                 .expect("emit_message registered");
 
@@ -10486,6 +10557,7 @@ mod abort_tests {
             AgentEvent::FailoverStart { .. } => "failover_start",
             AgentEvent::FailoverEnd { .. } => "failover_end",
             AgentEvent::AdvisorNote { .. } => "advisor_note",
+            AgentEvent::ProviderError { .. } => "provider_error",
             AgentEvent::ExtensionError { .. } => "extension_error",
         }
     }
@@ -11843,7 +11915,7 @@ impl AgentSession {
     async fn start_js_extension_runtime(
         stage: &'static str,
         cwd: &std::path::Path,
-        tools: Arc<ToolRegistry>,
+        tools: crate::tools::SharedToolRegistry,
         manager: ExtensionManager,
         policy: ExtensionPolicy,
         repair_mode: RepairMode,
@@ -11873,7 +11945,7 @@ impl AgentSession {
     async fn start_native_extension_runtime(
         stage: &'static str,
         _cwd: &std::path::Path,
-        _tools: Arc<ToolRegistry>,
+        _tools: crate::tools::SharedToolRegistry,
         _manager: ExtensionManager,
         _policy: ExtensionPolicy,
         _repair_mode: RepairMode,
@@ -11897,8 +11969,11 @@ impl AgentSession {
         save_enabled: bool,
         compaction_settings: ResolvedCompactionSettings,
     ) -> Self {
+        // The job scope is shared by every snapshot of the registry, so
+        // binding through the current one binds the live registry.
         agent
             .tools
+            .snapshot()
             .bind_job_session_resolver(Self::job_session_id_resolver(&session));
         let extension_ai_completion = Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
             provider: agent.provider(),
@@ -13333,10 +13408,13 @@ impl AgentSession {
         .await
     }
 
+    /// `_enabled_tools` is kept for call-site compatibility: the extension
+    /// runtime now resolves tools through the agent's own registry, whose
+    /// enabled set was fixed when the agent was built (bd-4t6oz).
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub async fn enable_extensions_with_policy(
         &mut self,
-        enabled_tools: &[&str],
+        _enabled_tools: &[&str],
         cwd: &std::path::Path,
         config: Option<&crate::config::Config>,
         extension_entries: &[std::path::PathBuf],
@@ -13412,7 +13490,7 @@ impl AgentSession {
                         Self::start_js_extension_runtime(
                             "agent_enable_extensions_prewarm_mismatch",
                             cwd,
-                            Arc::clone(&tools),
+                            tools.clone(),
                             manager.clone(),
                             resolved_policy.clone(),
                             runtime_repair_mode,
@@ -13452,7 +13530,7 @@ impl AgentSession {
                         Self::start_native_extension_runtime(
                             "agent_enable_extensions_prewarm_mismatch",
                             cwd,
-                            Arc::clone(&tools),
+                            tools.clone(),
                             manager.clone(),
                             resolved_policy.clone(),
                             runtime_repair_mode,
@@ -13472,13 +13550,11 @@ impl AgentSession {
             // own tool calls (bd-4t6oz). Workspace roots are not available on
             // this path; the classic startup threads them through the
             // pre-warmed registry instead.
-            let tools = Arc::new(ToolRegistry::with_mutation_recorder(
-                enabled_tools,
-                cwd,
-                config,
-                self.agent.mutation_recorder(),
-                None,
-            ));
+            // The runtime resolves tools through the agent's own registry:
+            // same undo recorder, same workspace roots, and every tool
+            // mounted later (extension wrappers, MCP, plan tools) is visible
+            // to `pi.tool` hostcalls (bd-4t6oz).
+            let tools = self.agent.shared_tools();
 
             if let Some(cfg) = config {
                 let resolved_risk = cfg.resolve_extension_risk_with_metadata();
@@ -13499,7 +13575,7 @@ impl AgentSession {
                 Self::start_js_extension_runtime(
                     "agent_enable_extensions_boot",
                     cwd,
-                    Arc::clone(&tools),
+                    tools.clone(),
                     manager.clone(),
                     resolved_policy.clone(),
                     runtime_repair_mode,
@@ -13510,7 +13586,7 @@ impl AgentSession {
                 Self::start_native_extension_runtime(
                     "agent_enable_extensions_boot",
                     cwd,
-                    Arc::clone(&tools),
+                    tools.clone(),
                     manager.clone(),
                     resolved_policy.clone(),
                     runtime_repair_mode,
@@ -13525,7 +13601,9 @@ impl AgentSession {
             manager.set_ui_handler(handler);
         }
         manager.set_policy_prompt_persistence(host.persist_permission_decisions);
-        tools.bind_job_session_resolver(Self::job_session_id_resolver(&self.session));
+        tools
+            .snapshot()
+            .bind_job_session_resolver(Self::job_session_id_resolver(&self.session));
 
         // Session, host actions, and message fetchers are always set here
         // (after runtime boot) — the JS runtime only needs these when
@@ -13629,7 +13707,7 @@ impl AgentSession {
         if !wasm_specs.is_empty() {
             let host = WasmExtensionHost::new(cwd, resolved_policy.clone())?;
             manager
-                .load_wasm_extensions(&host, wasm_specs, Arc::clone(&tools))
+                .load_wasm_extensions(&host, wasm_specs, tools.clone())
                 .await?;
         }
 
@@ -19567,7 +19645,8 @@ mod tests {
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
             let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
-            let xdev = agent.tools.get("xdev").expect("xdev registered");
+            let registry = agent.tools.snapshot();
+            let xdev = registry.get("xdev").expect("xdev registered");
 
             let list = xdev
                 .execute("c1", json!({"action": "list"}), None)

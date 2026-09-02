@@ -1568,7 +1568,7 @@ fn js_runtime_pump_once_exec_streaming_large_output_completes_without_deadlock()
         let dir = tempdir().expect("tempdir");
         let manager = ExtensionManager::new();
         let host = JsRuntimeHost {
-            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+            tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)).into(),
             manager_ref: Arc::downgrade(&manager.inner),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),

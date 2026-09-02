@@ -1150,6 +1150,255 @@ pub fn is_retryable_error(
     re.is_match(&lower)
 }
 
+static HTTP_STATUS_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+/// Coarse category of a provider request failure (#209).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    /// 503/529, "overloaded", "service unavailable".
+    Overloaded,
+    /// 429, "rate limit", "too many requests".
+    RateLimited,
+    /// Any other 5xx or "server error"/"internal error".
+    ServerError,
+    /// 401/403 or credential wording.
+    Authentication,
+    /// Prompt exceeds the context window; needs compaction, not a retry.
+    ContextOverflow,
+    /// 408/504 or timeout wording.
+    Timeout,
+    /// Connection-level failures (refused/reset/EOF/DNS/TLS).
+    Network,
+    /// The turn was cancelled locally.
+    Aborted,
+    /// Anything unclassified.
+    Other,
+}
+
+impl ProviderErrorKind {
+    /// Short human label used in turn-end error cards.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overloaded => "service unavailable / overloaded",
+            Self::RateLimited => "rate limited",
+            Self::ServerError => "server error",
+            Self::Authentication => "authentication failed",
+            Self::ContextOverflow => "context window exceeded",
+            Self::Timeout => "timed out",
+            Self::Network => "connection failed",
+            Self::Aborted => "aborted",
+            Self::Other => "request failed",
+        }
+    }
+}
+
+/// Why a provider request ended the turn (#209).
+///
+/// Distilled from the flattened error text so every surface (interactive
+/// cards, JSON/RPC consumers) reports the same provider / HTTP status /
+/// retryability facts instead of a raw payload dump.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderErrorSummary {
+    /// Provider display name, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// HTTP status code parsed from the error text, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// Coarse failure category.
+    pub kind: ProviderErrorKind,
+    /// Whether the same request is worth re-issuing unchanged.
+    pub retryable: bool,
+}
+
+/// Longest tail of the raw provider message reproduced on a turn-end card.
+/// Provider bodies can be multi-kilobyte JSON; the card needs the headline,
+/// not the payload.
+const PROVIDER_ERROR_DETAIL_MAX_CHARS: usize = 600;
+
+impl ProviderErrorSummary {
+    /// Classify a flattened provider error message.
+    ///
+    /// `provider` is the provider the request went to; when it is `None` the
+    /// `Provider error: <name>: ...` prefix produced by [`Error::Provider`] is
+    /// used instead, if present.
+    #[must_use]
+    pub fn from_error_text(provider: Option<&str>, message: &str) -> Self {
+        let provider = provider
+            .map(str::to_string)
+            .filter(|name| !name.is_empty())
+            .or_else(|| provider_from_prefixed_message(message).map(str::to_string));
+        let http_status = parse_http_status(message);
+        let lower = message.to_ascii_lowercase();
+        let kind = classify_provider_error(http_status, &lower, message);
+        let retryable = match kind {
+            ProviderErrorKind::Authentication
+            | ProviderErrorKind::ContextOverflow
+            | ProviderErrorKind::Aborted => false,
+            ProviderErrorKind::Overloaded
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::ServerError
+            | ProviderErrorKind::Timeout
+            | ProviderErrorKind::Network => true,
+            ProviderErrorKind::Other => is_retryable_error(message, None, None),
+        };
+        Self {
+            provider,
+            http_status,
+            kind,
+            retryable,
+        }
+    }
+
+    /// One-line headline: `DeepSeek: HTTP 503 (service unavailable / overloaded)`.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        let provider = self.provider.as_deref().unwrap_or("Provider");
+        let label = self.kind.label();
+        self.http_status.map_or_else(
+            || format!("Provider error: {provider}: {label}"),
+            |status| format!("Provider error: {provider}: HTTP {status} ({label})"),
+        )
+    }
+
+    /// One-line retry status. `attempts` is `(made, budget)` when a caller ran
+    /// an auto-retry loop; `None` when the turn was not auto-retried.
+    #[must_use]
+    pub fn retry_note(&self, attempts: Option<(u32, u32)>) -> String {
+        match (attempts, self.retryable) {
+            (Some((made, budget)), _) if made > 0 => {
+                format!("auto-retried {made}/{budget} before giving up")
+            }
+            (_, true) => String::from(
+                "transient; not auto-retried this turn — resend the prompt once the provider recovers",
+            ),
+            (_, false) => match self.kind {
+                ProviderErrorKind::ContextOverflow => {
+                    String::from("not retryable — compact the context (/compact) and resend")
+                }
+                ProviderErrorKind::Authentication => {
+                    String::from("not retryable — check the provider credentials and resend")
+                }
+                _ => String::from("not retryable as-is"),
+            },
+        }
+    }
+
+    /// Full turn-end card: headline, retry status, and a bounded copy of the
+    /// raw provider message. `raw` may carry the `Provider error: <name>:`
+    /// prefix; it is stripped so the card does not repeat the headline.
+    #[must_use]
+    pub fn turn_end_card(&self, raw: &str, attempts: Option<(u32, u32)>) -> String {
+        let mut card = self.headline();
+        card.push('\n');
+        card.push_str("The turn ended without a reply: ");
+        card.push_str(&self.retry_note(attempts));
+        card.push('.');
+        let detail = strip_provider_prefix(raw).trim();
+        if !detail.is_empty() {
+            card.push('\n');
+            card.push_str("Detail: ");
+            let mut chars = detail.chars();
+            let bounded: String = chars
+                .by_ref()
+                .take(PROVIDER_ERROR_DETAIL_MAX_CHARS)
+                .collect();
+            card.push_str(&bounded);
+            if chars.next().is_some() {
+                card.push('…');
+            }
+        }
+        card
+    }
+}
+
+/// Provider name from a `Provider error: <name>: <message>` string.
+fn provider_from_prefixed_message(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("Provider error: ")?;
+    let (name, _) = rest.split_once(": ")?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// Drop the `Provider error: <name>: ` prefix (when present) from `message`.
+fn strip_provider_prefix(message: &str) -> &str {
+    message
+        .strip_prefix("Provider error: ")
+        .and_then(|rest| rest.split_once(": ").map(|(_, tail)| tail))
+        .unwrap_or(message)
+}
+
+/// First `HTTP <code>` / `status <code>` marker in the message. Providers
+/// format transport failures as `<Name> API error (HTTP <status>): <body>`,
+/// so the first marker is the response status rather than a number quoted
+/// inside the body.
+fn parse_http_status(message: &str) -> Option<u16> {
+    let re = HTTP_STATUS_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:http|status(?:\s+code)?)\s*[:=]?\s*([1-5]\d{2})\b")
+            .expect("http status regex")
+    });
+    re.captures(message)
+        .and_then(|caps| caps.get(1))
+        .and_then(|code| code.as_str().parse::<u16>().ok())
+}
+
+fn classify_provider_error(
+    http_status: Option<u16>,
+    lower: &str,
+    original: &str,
+) -> ProviderErrorKind {
+    if original == "Aborted" || lower.starts_with("operation aborted") {
+        return ProviderErrorKind::Aborted;
+    }
+    if is_context_overflow(original, None, None) {
+        return ProviderErrorKind::ContextOverflow;
+    }
+    if let Some(status) = http_status {
+        let by_status = match status {
+            401 | 403 => Some(ProviderErrorKind::Authentication),
+            408 | 504 => Some(ProviderErrorKind::Timeout),
+            429 => Some(ProviderErrorKind::RateLimited),
+            503 | 529 => Some(ProviderErrorKind::Overloaded),
+            500..=599 => Some(ProviderErrorKind::ServerError),
+            _ => None,
+        };
+        if let Some(kind) = by_status {
+            return kind;
+        }
+    }
+    if lower.contains("overloaded") || lower.contains("service unavailable") {
+        ProviderErrorKind::Overloaded
+    } else if lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+    {
+        ProviderErrorKind::RateLimited
+    } else if lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("authentication")
+        || lower.contains("forbidden")
+        || lower.contains("permission denied")
+    {
+        ProviderErrorKind::Authentication
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        ProviderErrorKind::Timeout
+    } else if lower.contains("server error") || lower.contains("internal error") {
+        ProviderErrorKind::ServerError
+    } else if lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("dns")
+        || lower.contains("tls")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || lower.contains("other side closed")
+    {
+        ProviderErrorKind::Network
+    } else {
+        ProviderErrorKind::Other
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2912,6 +3161,139 @@ mod tests {
                 assert_eq!(Error::extension(&msg).category_code(), "extension");
                 assert_eq!(Error::api(&msg).category_code(), "api");
             }
+        }
+    }
+
+    // ─── Provider error summary (#209) ───────────────────────────────
+
+    mod provider_error_summary {
+        use super::*;
+
+        const DEEPSEEK_503: &str = "Provider error: DeepSeek: OpenAI API error (HTTP 503): \
+{\"error\":{\"code\":\"service_unavailable_error\",\"message\":\"Server Overloaded\"}}";
+
+        #[test]
+        fn http_503_is_overloaded_and_retryable() {
+            let summary = ProviderErrorSummary::from_error_text(None, DEEPSEEK_503);
+            assert_eq!(summary.provider.as_deref(), Some("DeepSeek"));
+            assert_eq!(summary.http_status, Some(503));
+            assert_eq!(summary.kind, ProviderErrorKind::Overloaded);
+            assert!(summary.retryable);
+            assert_eq!(
+                summary.headline(),
+                "Provider error: DeepSeek: HTTP 503 (service unavailable / overloaded)"
+            );
+        }
+
+        #[test]
+        fn explicit_provider_wins_over_prefix() {
+            let summary = ProviderErrorSummary::from_error_text(Some("openai"), DEEPSEEK_503);
+            assert_eq!(summary.provider.as_deref(), Some("openai"));
+        }
+
+        #[test]
+        fn status_in_body_does_not_shadow_transport_status() {
+            let text = "Anthropic API error (HTTP 429): {\"detail\":\"see HTTP 200 docs\"}";
+            let summary = ProviderErrorSummary::from_error_text(Some("anthropic"), text);
+            assert_eq!(summary.http_status, Some(429));
+            assert_eq!(summary.kind, ProviderErrorKind::RateLimited);
+            assert!(summary.retryable);
+        }
+
+        #[test]
+        fn auth_failures_are_not_retryable() {
+            let summary = ProviderErrorSummary::from_error_text(
+                Some("openai"),
+                "OpenAI API error (HTTP 401): invalid api key",
+            );
+            assert_eq!(summary.kind, ProviderErrorKind::Authentication);
+            assert!(!summary.retryable);
+            assert!(summary.retry_note(None).contains("credentials"));
+        }
+
+        #[test]
+        fn context_overflow_is_not_retryable_even_with_5xx_wording() {
+            let summary = ProviderErrorSummary::from_error_text(
+                Some("anthropic"),
+                "HTTP 400: prompt is too long: 250000 tokens > 200000 maximum",
+            );
+            assert_eq!(summary.kind, ProviderErrorKind::ContextOverflow);
+            assert!(!summary.retryable);
+            assert!(summary.retry_note(None).contains("/compact"));
+        }
+
+        #[test]
+        fn connection_drop_without_status_is_network() {
+            let summary =
+                ProviderErrorSummary::from_error_text(Some("gemini"), "connection reset by peer");
+            assert_eq!(summary.http_status, None);
+            assert_eq!(summary.kind, ProviderErrorKind::Network);
+            assert!(summary.retryable);
+            assert_eq!(
+                summary.headline(),
+                "Provider error: gemini: connection failed"
+            );
+        }
+
+        #[test]
+        fn unknown_text_falls_back_to_other() {
+            let summary = ProviderErrorSummary::from_error_text(None, "something odd happened");
+            assert_eq!(summary.provider, None);
+            assert_eq!(summary.kind, ProviderErrorKind::Other);
+            assert!(!summary.retryable);
+            assert_eq!(
+                summary.headline(),
+                "Provider error: Provider: request failed"
+            );
+        }
+
+        #[test]
+        fn retry_note_reports_exhausted_budget() {
+            let summary = ProviderErrorSummary::from_error_text(None, DEEPSEEK_503);
+            assert_eq!(
+                summary.retry_note(Some((3, 3))),
+                "auto-retried 3/3 before giving up"
+            );
+            assert!(
+                summary
+                    .retry_note(Some((0, 3)))
+                    .contains("not auto-retried")
+            );
+        }
+
+        #[test]
+        fn card_strips_prefix_and_bounds_detail() {
+            let summary = ProviderErrorSummary::from_error_text(None, DEEPSEEK_503);
+            let card = summary.turn_end_card(DEEPSEEK_503, None);
+            let mut lines = card.lines();
+            assert_eq!(
+                lines.next(),
+                Some("Provider error: DeepSeek: HTTP 503 (service unavailable / overloaded)")
+            );
+            assert!(
+                lines
+                    .next()
+                    .is_some_and(|l| l.starts_with("The turn ended without a reply: "))
+            );
+            let detail = lines.next().expect("detail line");
+            assert!(detail.starts_with("Detail: OpenAI API error (HTTP 503)"));
+            assert!(!detail.contains("Provider error: DeepSeek"));
+
+            let long = format!("OpenAI API error (HTTP 503): {}", "x".repeat(2000));
+            let card = summary.turn_end_card(&long, None);
+            let detail = card.lines().last().expect("detail line");
+            assert!(detail.ends_with('…'));
+            assert!(detail.chars().count() < 700);
+        }
+
+        #[test]
+        fn summary_serializes_camel_case() {
+            let summary = ProviderErrorSummary::from_error_text(None, DEEPSEEK_503);
+            let value = serde_json::to_value(&summary).expect("serialize");
+            assert_eq!(value["provider"], "DeepSeek");
+            assert_eq!(value["httpStatus"], 503);
+            assert_eq!(value["kind"], "overloaded");
+            assert_eq!(value["retryable"], true);
         }
     }
 }

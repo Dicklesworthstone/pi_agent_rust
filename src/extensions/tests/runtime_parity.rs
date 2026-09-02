@@ -15,7 +15,7 @@ fn js_hostcall_log_defaults_correlation_and_succeeds() {
     let manager = extension_manager_no_persisted_permissions();
 
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -62,7 +62,7 @@ fn js_hostcall_log_missing_required_fields_is_invalid_request() {
     let manager = extension_manager_no_persisted_permissions();
 
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -111,7 +111,7 @@ fn js_hostcall_unknown_tool_returns_invalid_request() {
     let manager = extension_manager_no_persisted_permissions();
 
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -162,7 +162,7 @@ fn js_hostcall_tool_execution_failure_maps_to_taxonomy() {
     let manager = extension_manager_no_persisted_permissions();
 
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -232,7 +232,7 @@ fn js_hostcall_manager_shutdown_maps_to_denied() {
     };
 
     let host = JsRuntimeHost {
-        tools,
+        tools: tools.into(),
         manager_ref: dead_manager_ref,
         manager_snapshot: dead_snapshot,
         manager_snapshot_version: dead_version,
@@ -281,7 +281,7 @@ fn js_hostcall_all_error_codes_are_taxonomy_only() {
     let manager = extension_manager_no_persisted_permissions();
 
     let host = JsRuntimeHost {
-        tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
+        tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -731,7 +731,7 @@ fn parity_js_conversion_vs_protocol() {
 
     let manager = extension_manager_no_persisted_permissions();
     let host = JsRuntimeHost {
-        tools: Arc::new(ToolRegistry::new(&["read"], cwd, None)),
+        tools: Arc::new(ToolRegistry::new(&["read"], cwd, None)).into(),
         manager_ref: Arc::downgrade(&manager.inner),
         manager_snapshot: Arc::clone(&manager.snapshot),
         manager_snapshot_version: Arc::clone(&manager.snapshot_version),
