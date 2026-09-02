@@ -4722,8 +4722,21 @@ mod stream_delta_batcher_tests {
             "session-bound input must also fail closed while a transition owns the UI"
         );
         app.agent_state = AgentState::Idle;
+        // Deliver the current session's card while no turn is running: an
+        // accepted input starts its turn on a spawned task that takes the
+        // Session lock, and `session_event_ownership` would then defer the
+        // card through the busy-retry path instead of appending it.
+        let _ = app.handle_pi_message(PiMsg::SessionSystemNote {
+            owner_session_id: session_id.clone(),
+            message: "current tan card".to_string(),
+        });
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationMessage { role: MessageRole::System, content, .. })
+                if content == "current tan card"
+        ));
         let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput {
-            session_id: session_id.clone(),
+            session_id,
             input: PendingInput::GeneratedText("current input".to_string()),
         });
         // Submissions run the turn on a spawned task and return no `Cmd`
@@ -4733,15 +4746,6 @@ mod stream_delta_batcher_tests {
             matches!(app.agent_state, AgentState::Processing),
             "current idle-session input must still run"
         );
-        let _ = app.handle_pi_message(PiMsg::SessionSystemNote {
-            owner_session_id: session_id,
-            message: "current tan card".to_string(),
-        });
-        assert!(matches!(
-            app.messages.last(),
-            Some(ConversationMessage { role: MessageRole::System, content, .. })
-                if content == "current tan card"
-        ));
     }
 
     #[test]

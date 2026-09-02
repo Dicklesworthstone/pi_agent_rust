@@ -921,6 +921,24 @@ footer for it), i.e. the deliberate #200/#201 rendering; the goldens were
 regenerated on a worker and re-checked against that classification before
 committing.
 
+Run10 (e3d16a72, run dir `20260902T045103-207150`, receipt): 5 of 6 checks
+green; the lane fell from 187 failures in 41 binaries to 119 in 31, with 68
+tests fixed and nothing newly broken. `tui_snapshot` is green (bd-hey4b
+closed on that evidence), the eleven `.codex` startup failures are gone, and
+`bench_schema` went from 31 to 13 (the rest are fake-toolchain contract
+mismatches, left on bd-b3yao). Two lib failures in that run were transient
+and instructive: the embedded-changelog round-trip failed because the worker's
+build-script output was stale (I edited `CHANGELOG.md` seconds after a sync,
+and the next sync delivered it with an mtime older than the build-script run,
+so cargo's mtime-based `rerun-if-changed` never fired; a `touch` before the
+next sync cures it, and the hazard is recorded on bd-yqo76), and my reworked
+pending-input test lost a real race with the spawned turn's session lock
+(rewritten to deliver the note before the turn starts). What remains red is
+owner-decided or worker-environment: stale performance evidence and its
+validators (bd-sog97.*), the fault-injection healing contract (bd-te4ks),
+the MCP HTTP transport aborts (bd-z6004), tmux/gh-driven e2e tests, and a
+tail of singletons inventoried on bd-yqo76.
+
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 
 1. `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` → 6/6
