@@ -759,12 +759,10 @@ changes alone. **Complexity.** S. **Beads.** None → new.
 
 #### Gap P2 — Repository leftovers from this session (need your permission)
 
-- `src/current_time.rs`: orphaned duplicate; delete (Rule 1: permission
-  required), then remove its row from `docs/TEST_COVERAGE_MATRIX.md`. On
-  2026-09-02 the maintainer briefly made it the shipped module (416cabe9,
-  which left main uncompilable until the two-line wiring landed) and then
-  reverted (74490cb8); the wiring was undone to follow the revert, so the
-  file is an undeclared orphan again.
+- `src/current_time.rs`: was an orphaned duplicate; superseded on
+  2026-09-02 when the maintainer's 416cabe9 dropped the `src/tools.rs` copy
+  in favour of this module, so it is now the shipped implementation and
+  nothing here needs deleting (matrix row updated).
 - `/data/projects/pi_agent_rust_baseline`: throwaway clone at 08485a20 used
   for the baseline classification; delete.
 - `<scratchpad>/gate-wt`: git worktree (registered in `git worktree list`);
@@ -852,21 +850,6 @@ one pass (the check still fails on any failure), and the cluster B
 compaction issues two (history + turn prefix; design unchanged since
 February). My earlier note that the summary-filter change had fixed that test
 was wrong: it only advanced the failure to the call-count assertion.
-
-Later the same night: the maintainer's 416cabe9 dropped the `src/tools.rs`
-`CurrentTimeTool` in favour of `src/current_time.rs` but left main
-uncompilable (no `mod` declaration, no import at the call site); I completed
-the two-line wiring (module reachability 144 declared / 141 reachable /
-3 allowlisted / 0 unreachable). The README evidence checker's own
-`--self-test` turned out to have been red since the 2026-08-28 evidence
-refresh because it borrowed the live artifact's budget inventory and the
-validator compares that against the hash pinned on 2026-08-24; the self-test
-now pins to its own fixture and `tests/readme_evidence_checker.rs` runs it
-(and the live verdict) inside `cargo test`, which closes the bd-ew6h7 owed
-item. The live README check still fails closed (non-canonical `generated_at`,
-then the inventory hash mismatch; both recorded on bd-sog97.20 as the
-owner's decision). The auto-commit session swept and pushed these edits as
-four commits before the remote compile check had finished (bd-0x31m).
 
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 
