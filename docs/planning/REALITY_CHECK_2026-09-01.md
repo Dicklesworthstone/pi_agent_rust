@@ -808,6 +808,24 @@ the header==rows checker assertion and synthetic-fallback deletion (M1
 steps 1–2), the table-rendering defect (M3), the README inventory test (P1),
 and closure discipline (P3). Those are the beads Phase 3a must create.
 
+### 10.5a Execution log (2026-09-02, Phase 3a beads created and worked)
+
+Beads created for the no-bead gaps: bd-ew6h7 (M1 checker + synthetic
+fallback), bd-dwh6g (P1 inventory test), bd-yqo76 (C1 gate green), bd-0x31m
+(M4 sweeper), bd-ikl7j (C2 build authority file), bd-0znp2 (M3 tables),
+bd-vchwp (P3 closure rule). Dependencies: bd-yqo76 blocks on bd-x8mn7 and
+bd-ew6h7; bd-ghfu4 blocks on bd-yqo76.
+
+Done the same day: bd-vchwp closed (AGENTS.md rule); bd-dwh6g closed
+(`tests/readme_tool_inventory.rs`, 4/4 remote); bd-ew6h7 mostly done (the
+README checker now validates the v2 perf contract for path-only release-facing
+citations and fails closed on the current artifact; `run_pijs_workload.py` has
+no fabrication path; a fixture unit test is still owed); bd-ghfu4 step B
+(CHANGELOG "Tag-only"); bd-0znp2 fix landed (table budget + width-change cache
+flush + unit test); bd-ikl7j and bd-0x31m sized with exact requirements on the
+beads (both need maintainer-held inputs); AGENTS.md also gained the
+"stage only your own files" rule.
+
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 
 1. `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` → 6/6

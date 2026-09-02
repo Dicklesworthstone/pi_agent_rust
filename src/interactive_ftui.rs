@@ -2324,6 +2324,12 @@ impl PiFtuiModel {
                 _ => {}
             },
             Event::Resize { width, height } => {
+                // Rendered markdown depends on the width only through the
+                // table budget; drop cached blocks when it changes so tables
+                // re-fit (gh #195). Height-only resizes keep the cache.
+                if *width != self.term.0 {
+                    self.render_cache.borrow_mut().clear();
+                }
                 self.term = (*width, *height);
                 // The suspend task reports back through a Resize; the flag
                 // unfreezes tick-driven model changes from here on.
@@ -2517,6 +2523,14 @@ impl PiFtuiModel {
         Cmd::none()
     }
 
+    /// Markdown table budget for a terminal `cols` wide: the conversation
+    /// region minus a one-cell gutter on each side, never below the width a
+    /// two-column table needs to stay legible.
+    const fn table_width_for(cols: u16) -> u16 {
+        let usable = cols.saturating_sub(2);
+        if usable < 20 { 20 } else { usable }
+    }
+
     /// Build the styled conversation. Assistant content renders as markdown
     /// (auto-detected; plain text stays plain); other roles get their prefix
     /// on the first line, matching indent on continuations, and role style.
@@ -2527,10 +2541,14 @@ impl PiFtuiModel {
     fn conversation_text(&self) -> Text<'static> {
         // Assistant output always renders as markdown, matching the glamour
         // treatment in the bubbletea stack (auto-detection would leave short
-        // or mostly-plain replies unstyled). The renderer takes no width, so
-        // cached blocks survive resizes untouched.
+        // or mostly-plain replies unstyled). Tables are fitted to the
+        // terminal width (gh #195: at natural width a wide table overflowed
+        // the frame and its cells were clipped mid-column); the resize handler
+        // drops the render cache when the width changes so cached table
+        // blocks re-fit.
         let theme = ftui_extras::markdown::MarkdownTheme::default();
-        let md = ftui_extras::markdown::MarkdownRenderer::new(theme.clone());
+        let md = ftui_extras::markdown::MarkdownRenderer::new(theme.clone())
+            .table_max_width(Self::table_width_for(self.term.0));
         let palette = self.palette;
         let compact = self.markdown_spacing == crate::config::MarkdownSpacing::Compact;
         // Per-entry render cache (issue #201): reuse each block's styled
@@ -6697,6 +6715,66 @@ mod tests {
         let (rendered, reused) = sim.model().render_stats.get();
         assert_eq!(reused, 0, "theme change must drop every cached block");
         assert_eq!(rendered, sim.model().transcript.len());
+    }
+
+    // ── gh #195: tables fit the terminal width ───────────────────────────
+
+    #[test]
+    fn markdown_tables_fit_the_terminal_width_and_refit_on_resize() {
+        let source = "| Column one with a long header | Column two with a longer header | Column three |\n\
+                      |---|---|---|\n\
+                      | first cell has quite a lot of text in it | second cell also has a lot of text | third |\n\
+                      | short | short | short |";
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 48,
+            height: 24,
+        });
+        finish_turn(&mut sim, source);
+        let widest = |model: &PiFtuiModel| {
+            model
+                .conversation_text()
+                .lines()
+                .iter()
+                .map(|line| line.to_plain_text().chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let narrow = widest(sim.model());
+        assert!(
+            narrow <= 48,
+            "table must be fitted to a 48-column terminal, widest rendered line is {narrow}"
+        );
+
+        // A width change must drop the cache so cached table blocks re-fit.
+        sim.inject_event(Event::Resize {
+            width: 120,
+            height: 24,
+        });
+        let _ = sim.model().conversation_text();
+        let (rendered, reused) = sim.model().render_stats.get();
+        assert_eq!(reused, 0, "width change must drop every cached block");
+        assert_eq!(rendered, sim.model().transcript.len());
+        let wide = widest(sim.model());
+        assert!(
+            wide > narrow,
+            "a wider terminal must let the table use more width (narrow={narrow}, wide={wide})"
+        );
+
+        // A height-only resize keeps the cache warm.
+        let _ = sim.model().conversation_text();
+        sim.inject_event(Event::Resize {
+            width: 120,
+            height: 40,
+        });
+        let _ = sim.model().conversation_text();
+        let (_, reused) = sim.model().render_stats.get();
+        assert!(
+            reused > 0,
+            "height-only resize must not flush the render cache"
+        );
     }
 
     // ── Issue #202: compact markdown spacing ─────────────────────────────
