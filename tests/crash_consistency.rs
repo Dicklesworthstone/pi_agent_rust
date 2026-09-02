@@ -470,15 +470,17 @@ fn crash_duplicate_entry_ids_do_not_panic() {
     );
     std::fs::write(&file_path, &content).unwrap();
 
-    let (session, _) = run_async(async {
+    // Duplicate entry ids are rejected before the replay cache is built (see
+    // `session::tests::proptest_session::duplicate_entry_ids_fail_before_replay_cache_construction`);
+    // what this test guards is that the loader reports it as an error
+    // instead of panicking or silently keeping one of the two entries.
+    let error = run_async(async {
         Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
     })
-    .unwrap();
-
-    assert_eq!(
-        session.entries.len(),
-        2,
-        "both entries loaded despite dup IDs"
+    .expect_err("duplicate entry ids must be rejected, not loaded");
+    assert!(
+        error.to_string().contains("duplicate entry ID"),
+        "unexpected error: {error}"
     );
 }
 

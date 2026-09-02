@@ -406,6 +406,15 @@ fn canon(p: &Path) -> PathBuf {
     pi::extensions::strip_unc_prefix(c)
 }
 
+/// Filesystem permission denials cannot be observed by root (DAC bypass), so
+/// tests whose premise is "the process cannot read/write this path" skip
+/// under euid 0 instead of asserting a denial the kernel never produces.
+/// Remote gate workers run as root.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
 #[cfg(unix)]
 fn deny_auth_fixture_reads(agent_dir: &Path) -> PathBuf {
     let auth_path = agent_dir.join("auth.json");
@@ -2016,6 +2025,10 @@ fn e2e_cli_config_show_lists_discovered_package_resources() {
 
 #[test]
 fn e2e_cli_startup_surfaces_configured_resource_failures() {
+    if running_as_root() {
+        eprintln!("skipping: an unreadable auth fixture is readable by root");
+        return;
+    }
     let mut harness = CliTestHarness::new("e2e_cli_startup_surfaces_configured_resource_failures");
     harness.env.remove("PI_CONFIG_PATH");
     harness
@@ -2308,6 +2321,10 @@ fn e2e_cli_export_missing_input_is_error() {
 fn e2e_cli_export_permission_denied_is_error() {
     use std::os::unix::fs::PermissionsExt;
 
+    if running_as_root() {
+        eprintln!("skipping: a read-only directory is writable by root");
+        return;
+    }
     let harness = CliTestHarness::new("e2e_cli_export_permission_denied_is_error");
     let session_path = harness.harness.temp_path("session.jsonl");
     let _ = write_minimal_session(&session_path, harness.harness.temp_dir());

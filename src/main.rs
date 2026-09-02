@@ -11785,7 +11785,7 @@ mod tests {
             let error = restore_print_retry_tail(&mut agent_session, true)
                 .await
                 .expect_err("unwritable candidate must fail restoration");
-            assert!(error.to_string().contains("PI_SESSION_PERSISTENCE_FAILED"));
+            assert!(error.to_string().contains("SESSION_PERSISTENCE_FAILED"));
             let cx = pi::agent_cx::AgentCx::for_request();
             let inner = OwnedMutexGuard::lock(Arc::clone(&session_store), &cx)
                 .await
@@ -11853,7 +11853,7 @@ mod tests {
             assert!(
                 failover_error
                     .to_string()
-                    .contains("PI_SESSION_PERSISTENCE_FAILED")
+                    .contains("SESSION_PERSISTENCE_FAILED")
             );
             assert_eq!(
                 position, 0,

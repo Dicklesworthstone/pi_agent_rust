@@ -882,6 +882,29 @@ pre-submission runtime sync keeps them installed (three stream_delta tests);
 the FTUI ask-forwarder test drives the guard deterministically (asupersync's
 `current_thread()` runtime runs spawned tasks on a worker thread).
 
+Run8 (cbeb3705, run dir `20260902T015053-3764248`): 5 of 6 checks green,
+including the first DSR-recorded pass of `tests/installer_regression.sh`
+(69/69), and the first complete test lane in the project's DSR history: 404
+binaries, 37,830 passed, 187 failed in 41 binaries. The failures are
+inventoried on bd-yqo76 by cluster: stale performance-evidence artifacts and
+their validators (owner bd-sog97.*; the Rust validators also reject the
+artifact's `git_commit` field that the Python checker tolerates), orchestrate
+harness tests that call the live rch fleet (bd-b3yao), 28 insta snapshots
+stale after the title/status-line TUI work (bd-hey4b), seven fault-injection
+tests that expect a healing rewrite the fail-closed source-integrity rule
+refuses (bd-te4ks), five MCP HTTP-transport aborts (bd-z6004), and a tail of
+worker-environment cases (tmux, gh, root, dcg). Fixed in the same round: the
+`cli_flags` conformance fixture and a parser test that still used `--plan`
+as an extension flag (built-in since 2026-08-14), a crash-consistency test
+that predates fail-closed duplicate-id loading, two error-code assertions,
+root skips for two permission-denial tests, four unclassified test files and
+eighteen source files missing from the coverage matrix. One reversal: my
+terminal-persistence reorder from the previous round contradicted the
+maintainer's `rpc_retry_restore_save_failure_latches_without_live_mutation`
+(quarantine must surface even with nothing to preserve), so the product
+change was reverted and the two RPC loop tests now expect the surfaced error;
+only the rejection wording change survives.
+
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 
 1. `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` → 6/6

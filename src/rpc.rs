@@ -4862,6 +4862,17 @@ async fn preserve_terminal_rpc_state(
     let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
         .await
         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+    // The quarantine is checked before looking at what there is to preserve:
+    // an indeterminate transition makes the persistence target untrustworthy
+    // for any terminal write, and `rpc_retry_restore_save_failure_latches_without_live_mutation`
+    // pins that even an empty terminal pass must surface it. The RPC loop
+    // therefore exits with this error after a quarantined command; clients
+    // see [SESSION_PERSISTENCE_FAILED] rather than a silent clean exit.
+    if let Some(reason) = state.provider_admission.reason() {
+        return Err(Error::session_persistence(format!(
+            "terminal RPC persistence is quarantined after an indeterminate transition: {reason}"
+        )));
+    }
     let completed_tool_transcript =
         completed_live_tool_effect_suffix(&inner, guard.agent.messages())?;
     state.stage_completed_tool_transcript(&inner, &completed_tool_transcript)?;
@@ -4871,17 +4882,6 @@ async fn preserve_terminal_rpc_state(
             || state.pending_count() == 0)
     {
         return Ok(0);
-    }
-    // A quarantined transition means the persistence target is indeterminate,
-    // so nothing new may be written to it. Shutting down with nothing to
-    // preserve is not an error, though: a command rejected before it touched
-    // the live session leaves no state to lose, and reporting a terminal
-    // persistence failure for it would tell the client that state was lost
-    // when none existed (bd-m83oo).
-    if let Some(reason) = state.provider_admission.reason() {
-        return Err(Error::session_persistence(format!(
-            "terminal RPC persistence is quarantined after an indeterminate transition: {reason}"
-        )));
     }
 
     // A private first-save candidate would choose and retain its own session
@@ -9410,10 +9410,16 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            // Boxed: clippy::large_futures.
-            Box::pin(run(agent_session, options, in_rx, out_tx))
+            // Boxed: clippy::large_futures. The rejected command quarantines
+            // terminal persistence, so the loop surfaces that on stdin close
+            // instead of exiting clean (see preserve_terminal_rpc_state).
+            let loop_error = Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
-                .expect("rpc server should reject the command without failing its loop");
+                .expect_err("quarantined terminal persistence must surface on stdin close");
+            assert!(
+                loop_error.to_string().contains("quarantined"),
+                "unexpected loop error: {loop_error}"
+            );
 
             let events = out_rx
                 .try_iter()
@@ -9501,10 +9507,16 @@ mod retry_tests {
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
-            // Boxed: clippy::large_futures.
-            Box::pin(run(agent_session, options, in_rx, out_tx))
+            // Boxed: clippy::large_futures. The failed fresh-session
+            // persistence quarantines terminal persistence, which the loop
+            // surfaces on stdin close (see preserve_terminal_rpc_state).
+            let loop_error = Box::pin(run(agent_session, options, in_rx, out_tx))
                 .await
-                .expect("rpc server loop");
+                .expect_err("quarantined terminal persistence must surface on stdin close");
+            assert!(
+                loop_error.to_string().contains("quarantined"),
+                "unexpected loop error: {loop_error}"
+            );
 
             let events = out_rx
                 .try_iter()

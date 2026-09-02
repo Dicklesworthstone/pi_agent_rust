@@ -133,13 +133,13 @@
       "name": "extension_flags",
       "description": "Unknown flags are extracted for extensions without breaking parsing",
       "input": {
-        "args": ["--plan", "ship-it", "--dry-run", "--model", "gpt-4o"]
+        "args": ["--deploy-lane", "ship-it", "--dry-run", "--model", "gpt-4o"]
       },
       "expected": {
         "details_exact": {
           "model": "gpt-4o",
           "extension_flags": [
-            { "name": "plan", "value": "ship-it" },
+            { "name": "deploy-lane", "value": "ship-it" },
             { "name": "dry-run", "value": null }
           ]
         }
@@ -193,7 +193,7 @@
           "--no-mouse-capture",
           "--max-tool-iterations",
           "75",
-          "--plan",
+          "--deploy-lane",
           "ship-it",
           "--print",
           "hello"
@@ -205,7 +205,7 @@
           "max_tool_iterations": 75,
           "print": true,
           "message_args": ["hello"],
-          "extension_flags": [{ "name": "plan", "value": "ship-it" }]
+          "extension_flags": [{ "name": "deploy-lane", "value": "ship-it" }]
         }
       }
     },

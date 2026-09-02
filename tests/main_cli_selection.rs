@@ -1170,9 +1170,11 @@ fn cli_ts_flag_parity_matrix_reports_full_coverage() {
 
 #[test]
 fn extension_registered_flags_can_be_passed_through_cli_parser() {
+    // `--plan` became a built-in flag in bbc68341 (model roles), so the
+    // extension-owned string flag needs a name the root parser does not claim.
     let manager = pi::extensions::ExtensionManager::new();
     manager.register_flag(serde_json::json!({
-        "name": "plan",
+        "name": "deploy-lane",
         "type": "string",
         "extension_id": "plan_mode",
     }));
@@ -1186,7 +1188,7 @@ fn extension_registered_flags_can_be_passed_through_cli_parser() {
         "pi".to_string(),
         "--model".to_string(),
         "gpt-4o".to_string(),
-        "--plan".to_string(),
+        "--deploy-lane".to_string(),
         "ship-it".to_string(),
         "--dry-run".to_string(),
         "--print".to_string(),
@@ -1216,7 +1218,7 @@ fn extension_registered_flags_can_be_passed_through_cli_parser() {
             ext_flag.display_name()
         );
     }
-    assert_eq!(parsed.extension_flags[0].name, "plan");
+    assert_eq!(parsed.extension_flags[0].name, "deploy-lane");
     assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     assert_eq!(parsed.extension_flags[1].name, "dry-run");
     assert!(parsed.extension_flags[1].value.is_none());

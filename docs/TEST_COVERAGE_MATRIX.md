@@ -39,6 +39,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/advisor.rs` | Advisor turns | `tests/e2e_advisor.rs` (concern injection, failure isolation). |
 | `src/agent.rs` | Agent loop | Unit; `tests/agent_loop_vcr.rs`, `tests/agent_loop_reliability.rs`, `tests/e2e_agent_loop.rs`, `tests/rpc_mode.rs`. |
 | `src/agent_cx.rs` | Agent context | Unit; covered through agent/RPC suites. |
+| `src/agent_hub.rs` | Agent hub registry (bd-cv653.5.3): session-scoped roster of spawned child agents | Unit (7 tests); `tests/agent_hub.rs`. |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
 | `src/approval.rs` | Tool approval flow | `tests/e2e_plan_mode.rs`, `tests/e2e_rpc.rs` approval paths. |
 | `src/ask.rs` | Ask prompts | Interactive coverage via `tests/tui_state.rs` and RPC suites. |
@@ -48,28 +49,36 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/bash_mediation.rs` | Bash mediation | `tests/bash_mediation.rs`. |
 | `src/bin/pi_legacy_capture.rs` | Legacy capture utility | Unit; opt-in capture utility, not a default user path. |
 | `src/bin/pi_mcp_fixture.rs` | MCP test fixture binary | Waived glue; test-support binary driven by `tests/mcp.rs`. |
+| `src/bpe.rs` | Vendored tiktoken BPE core (bd-w8q6u): rank tables loaded from gzip assets for token counting | Unit (2 tests); exercised through `src/token_count.rs` and its tests. |
+| `src/browser.rs` | Opt-in headless Chromium automation tool via CDP attach (bd-cv653.2.4) | `tests/browser.rs`, `tests/cross_surface_parity.rs`. |
+| `src/btw.rs` | `/btw` ephemeral side questions (bd-cv653.3.16) | Unit (6 tests); `tests/btw_tan.rs`. |
 | `src/buffer_shim.rs` | Node buffer shim | `tests/node_buffer_shim.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/checkpoint.rs` | Session checkpoints | `tests/checkpoint.rs` (checkpoint/rewind/fresh/retry). |
 | `src/cli.rs` | CLI parsing | Unit; `tests/main_cli_selection.rs`, `tests/cli_edge_cases.rs`, `tests/e2e_cli.rs`. |
 | `src/commit_split.rs` | Commit splitting | `tests/commit_split.rs`. |
 | `src/compaction.rs` | Session compaction | Unit; `tests/compaction.rs`, `tests/compaction_bug.rs`. |
+| `src/compaction_snap.rs` | Snapcompact compaction mode (bd-cv653.7.6) | Unit (6 tests); `tests/snapcompact.rs`, `tests/snapcompact_provider.rs`. |
 | `src/compaction_worker.rs` | Compaction worker | Unit; exercised by compaction suites. |
 | `src/completions.rs` | Shell completions | CLI coverage via `tests/main_cli_selection.rs`, `tests/cli_edge_cases.rs`. |
+| `src/computer.rs` | Opt-in desktop computer automation tool (bd-cv653.2.5) | `tests/computer.rs`, `tests/cross_surface_parity.rs`. |
 | `src/config.rs` | Config loading | Unit; `tests/config_precedence.rs`, `tests/config_edge_cases.rs`. |
 | `src/conformance.rs` | Conformance runner | Unit; `tests/conformance_*.rs`, `tests/tools_conformance.rs`. |
 | `src/conformance_shapes.rs` | Conformance schemas | Unit; `tests/ext_conformance_shapes.rs`. |
 | `src/connectors/http.rs` | HTTP connector | `tests/pi_connector_shims.rs`; connector coverage still needs machine-readable trace expansion under `bd-8t27h.3`. |
 | `src/connectors/mod.rs` | Connector registry | Unit; `tests/rpc_session_connector.rs`, `tests/pi_connector_shims.rs`. |
 | `src/context_files.rs` | Context file loading | Covered through agent/session suites and `tests/config_precedence.rs`. |
+| `src/crash.rs` | Crash capture: redacted crash bundles from panics and fatal signals | Unit (6 tests); `tests/fault_injection_persistence.rs`, `tests/e2e_golden_path.rs`, `tests/adversarial_extensions.rs`, `tests/e2e_ftui.rs`. |
 | `src/crypto_shim.rs` | Node crypto shim | Unit; `tests/node_crypto_shim.rs`. |
 | `src/current_time.rs` | `current_time` tool, the shipped implementation since 82fd0468 (2026-09-02) routed the registry to this module; `src/tools.rs` still carries an older in-file `CurrentTimeTool` that nothing constructs (its own unit tests keep it compiling) pending the maintainer's decision | Unit tests in the module (offset rendering, snapshot fields); registry membership in `src/tools.rs` tests; `src/xdev.rs` one-liner drift test; CLI default-list goldens; `tests/readme_tool_inventory.rs`. |
 | `src/debug.rs` | Debug (DAP) facade | `tests/debug.rs`. |
 | `src/debug/adapters.rs` | DAP adapters | `tests/debug.rs`. |
 | `src/debug/dap.rs` | DAP protocol | `tests/debug.rs`. |
 | `src/debug/session.rs` | DAP sessions | `tests/debug.rs`. |
+| `src/delight.rs` | Premium delight layer (OMP-ADOPT / bd-cv653.9.9) | Unit (6 tests); `tests/delight.rs`, `tests/e2e_tui.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/dialects.rs` | Provider dialects | Provider conformance suites; `tests/json_mode_parity.rs`. |
 | `src/doctor.rs` | Doctor and diagnostics | Unit; `tests/doctor_swarm_temp_dir_json.rs`, `tests/franken_node_compatibility_doctor_contract.rs`. |
 | `src/embedded_assets.rs` | Embedded assets | Waived glue; exercised implicitly by resource loading suites. |
+| `src/enforcement.rs` | Extension policy enforcement state machine | Unit (37 tests); `tests/ci_strict_gates_validation.rs`, `tests/extensions_auth_error_coverage.rs`, `tests/graduated_rollout_integration_sec72.rs`, `tests/security_http_policy.rs`. |
 | `src/error.rs` | Error types | Unit; `tests/error_types.rs`, `tests/error_handling.rs`. |
 | `src/error_hints.rs` | Error remediation hints | Unit; `tests/error_handling.rs`. |
 | `src/eval.rs` | Eval harness | `tests/eval.rs`. |
@@ -117,10 +126,12 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/failover.rs` | Provider failover | `tests/e2e_failover.rs`. |
 | `src/file_lock.rs` | Cross-process directory locking | Unit; session-index lock integration coverage in `tests/session_index_tests.rs` and RPC concurrency coverage in `tests/e2e_rpc.rs`. |
 | `src/flake_classifier.rs` | Flake classifier | Unit; patterns are mirrored by `scripts/ci_conformance_retry.sh`. |
+| `src/gallery.rs` | Visual component gallery harness (OMP-ADOPT / bd-cv653.9.10) | Unit (1 test); `tests/gallery.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/gc.rs` | Session GC | `tests/gc.rs`. |
 | `src/github.rs` | GitHub integration | `tests/hub.rs`; covered through hub/review suites. |
 | `src/handoff.rs` | Handoff generation | `tests/handoff_generator.rs`. |
 | `src/hostcall_amac.rs` | Hostcall AMAC | Unit; `tests/streaming_hostcall.rs`. |
+| `src/hostcall_egraph.rs` | Equality-saturation rewrite search over hot hostcall execution plans | Unit (43 tests); `tests/hostcall_egraph.rs`. |
 | `src/hostcall_io_uring_lane.rs` | Hostcall io_uring lane | Unit; `tests/streaming_hostcall.rs`. |
 | `src/hostcall_queue.rs` | Hostcall queue | Unit; `tests/hostcall_queue_ebr.rs`, `tests/hostcall_queue_loom.rs`; loom opt-in owner `bd-8t27h.6`. |
 | `src/hostcall_rewrite.rs` | Hostcall rewrite | Unit; `tests/streaming_hostcall.rs`. |
@@ -162,24 +173,29 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/registry.rs` | LSP registry | `tests/lsp.rs`. |
 | `src/lsp/text.rs` | LSP text mapping | `tests/lsp.rs`. |
 | `src/magic_keywords.rs` | Magic keywords | `tests/magic_keywords.rs`. |
+| `src/markdown_rich.rs` | Markdown, math, mermaid, and visual rendering (OMP-ADOPT / bd-cv653.9.7) | Unit (9 tests); `tests/markdown_rich.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/main.rs` | CLI entry | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/mcp.rs` | MCP facade | `tests/mcp.rs`. |
 | `src/mcp/config.rs` | MCP config | `tests/mcp.rs`. |
 | `src/mcp/manager.rs` | MCP manager | `tests/mcp.rs`. |
 | `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
 | `src/mcp/trust.rs` | MCP trust | `tests/mcp.rs`. |
+| `src/media_tools.rs` | Opt-in media trio tools `inspect_image` / `generate_image` / `tts` (bd-cv653.2.7) | `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
 | `src/memory.rs` | Memory files | `tests/memory.rs`. |
 | `src/migrations.rs` | Migrations | Unit; SQLite/session migration coverage through `tests/session_sqlite.rs`. |
 | `src/model.rs` | Message/content model | Unit; `tests/model_serialization.rs`. |
 | `src/model_routing.rs` | Model-routing policy and evidence | Unit; model-routing tests in this module plus `tests/model_selector_cycling.rs`. |
 | `src/model_selector.rs` | Model selector | Unit; `tests/model_selector_cycling.rs`. |
 | `src/models.rs` | Model registry | Unit; `tests/model_registry.rs`. |
+| `src/overlay_system.rs` | Unified overlay and set-piece surfaces (OMP-ADOPT / bd-cv653.9.8) | Unit (3 tests); `tests/overlay_system.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/package_manager.rs` | Package manager | Unit; `tests/package_manager.rs`, `tests/e2e_cli.rs`. |
 | `src/perf_build.rs` | Perf build metadata | Unit; `tests/perf_bench_harness.rs`, `tests/perf_budgets.rs`, `tests/perf_regression.rs`. |
 | `src/permissions.rs` | Capability permissions | Unit; `tests/capability_policy_model.rs`, `tests/capability_policy_scoped.rs`, `tests/capability_denial_matrix.rs`. |
 | `src/pi_wasm.rs` | PiWasm runtime | Unit; `tests/lab_runtime_extensions.rs`; unsupported imports fail closed, with bounded Emscripten compatibility stubs covered by source tests. |
 | `src/plan.rs` | Plan mode | `tests/e2e_plan_mode.rs`. |
 | `src/platform.rs` | Platform helpers | Unit. |
+| `src/pmu_telemetry.rs` | PMU-guided stall-cycle elimination and microarchitectural regression budgets | `tests/pmu_telemetry.rs`. |
+| `src/profiler.rs` | Sampling profiler front-end (`--profile` / `PI_PROFILE=1`, bd-cv653.7.12.1) | Unit (3 tests); no dedicated integration test (manual `pi --profile`). |
 | `src/provider.rs` | Provider trait/schema | Unit; `tests/provider_factory.rs`, `tests/provider_contract.rs`, `tests/provider_native_contract.rs`. |
 | `src/provider_metadata.rs` | Provider metadata | Unit; `tests/provider_metadata_comprehensive.rs`, `tests/provider_registry_guardrails.rs`. |
 | `src/providers/anthropic.rs` | Anthropic provider | Unit; `tests/provider_streaming/anthropic.rs`, `tests/e2e_provider_streaming.rs`. |
@@ -202,6 +218,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/scheduler.rs` | Scheduler/admission | Unit; `tests/scheduler_repro.rs`, `tests/cargo_headroom_admission.rs`; traceability lane `resource_scheduler_admission`. |
 | `src/sdk.rs` | SDK API | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
 | `src/secrets.rs` | Secret handling | `tests/secrets.rs`. |
+| `src/security_scan.rs` | Agent-facing security scanner tool: plan/run/disposition/compare (bd-cv653.2.6) | Unit (6 tests); `tests/security_scan.rs`. |
 | `src/self_update.rs` | Self-update | `tests/self_update.rs`. |
 | `src/semantic_workspace_graph.rs` | Semantic workspace graph and context bundles | Unit; `tests/semantic_workspace_graph_contract.rs`, `tests/semantic_workspace_graph_builder.rs`, and agent integration tests. |
 | `src/session.rs` | Session JSONL/tree | Unit; `tests/session_conformance.rs`, `tests/e2e_session_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
@@ -214,6 +231,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_test.rs` | Session test helpers | Waived test-support module; compiled by session tests. |
 | `src/skills_managed.rs` | Managed skills | `tests/skills_managed.rs`. |
 | `src/sse.rs` | SSE parser | Unit; `tests/sse_strict_compliance.rs`, `tests/repro_sse_flush.rs`, `tests/repro_sse_newline.rs`. |
+| `src/stats.rs` | Local usage statistics over session files (`pi stats`, bd-cv653.7.7) | Unit (8 tests); no dedicated integration test. |
+| `src/status_line.rs` | Powerline status line, footer, and sticky HUDs (OMP-ADOPT / bd-cv653.9.4) | Unit (7 tests); `tests/status_line.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/stream_rules.rs` | Stream rules | `tests/stream_rules.rs`. |
 | `src/subagents.rs` | Native isolated child-agent tool | Unit tests in this module; opt-in registration coverage through built-in tool tests. |
 | `src/swarm_activity_ledger.rs` | Swarm activity ledger | Unit; evidence docs in `docs/swarm-activity-ledger.md`, CI evidence bundle tests. |
@@ -234,7 +253,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/validation_broker.rs` | Validation admission and slot broker | Unit; `tests/validation_broker_contract.rs`, `tests/validation_broker_store.rs`, `tests/validation_broker_cli.rs`, and `tests/validation_broker_e2e.rs`. |
 | `src/vcr.rs` | VCR playback/record | Unit; `tests/vcr_parity_validation.rs`, `tests/vcr_redaction_scan.rs`, provider/RPC VCR suites. |
 | `src/version_check.rs` | Version checks | Unit; cross-platform and release-readiness tests exercise the surrounding behavior. |
+| `src/web_remote.rs` | Web-remote access: ftui-web WASM browser client over WebSocket frame diffs (OMP-ADOPT / bd-cv653.10.1, .10.2) | Unit (3 tests); `tests/web_remote.rs`, `tests/web_security.rs`. |
 | `src/web_search.rs` | Web search tool | `tests/e2e_web_search.rs`, `tests/web_search_rungs.rs`. |
+| `src/workspace.rs` | Multi-root workspace state and the unified path-confinement helper (bd-cv653.3.12) | Unit (7 tests); `tests/tools_conformance.rs`, `tests/main_cli_selection.rs`, `tests/branch_edge_failure_coverage.rs`. |
 | `src/workspace_trust.rs` | Workspace trust | Covered through config/CLI suites. |
 | `src/worktree_iso.rs` | Worktree isolation | `tests/worktree_iso.rs`. |
 | `src/xdev.rs` | xdev tool development | `tests/e2e_xdev.rs`. |

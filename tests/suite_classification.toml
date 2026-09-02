@@ -31,6 +31,8 @@ files = [
     "snapcompact",
     "crash_consistency",
     "config_precedence",
+    "config_edge_cases",
+    "dsr_recipe_preflight_test",
     "context_intelligence_closeout_gate_contract",
     "cooperative_priority_lane_evaluation",
     "cross_surface_parity",
@@ -178,6 +180,7 @@ files = [
     "validate_e2e_artifact_schema",
     "vcr_parity_validation",
     "edit_empty_string_repro",
+    "edit_repro",
     "handoff_generator",
     "stream_rules",
     "commit_split",
@@ -388,6 +391,7 @@ files = [
     "e2e_url_read",
     "e2e_web_search",
     "e2e_xdev",
+    "math_reachability_e2e_test",
 ]
 
 # Quarantine: flaky tests with tracked expiry and ownership.

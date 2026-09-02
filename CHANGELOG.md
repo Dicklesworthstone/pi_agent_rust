@@ -70,11 +70,12 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   path, its workspace roots), so files written through extension hostcalls
   appear in `/undo` and respect workspace confinement like agent tool calls.
 
-- **RPC shutdown after a rejected command**: closing stdin after a command
-  that was rejected before it touched the session no longer ends the server
-  loop with a "terminal RPC persistence is quarantined" error; the error is
-  still raised when there is queued input or a completed tool transcript to
-  preserve.
+- **RPC quarantine rejections name the state**: a command refused while
+  terminal persistence is quarantined now answers with
+  `<command> is quarantined after an indeterminate transition: <reason>`,
+  matching the other quarantine messages, so clients can recognise the state
+  instead of parsing the underlying persistence failure. Closing stdin while
+  quarantined still ends the server loop with the surfaced error.
 
 - **Installer no longer depends on `SHA256SUMS`**: the network preflight
   probed the aggregate checksum manifest, which DSR releases may not ship at
