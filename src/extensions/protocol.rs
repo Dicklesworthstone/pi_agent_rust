@@ -1963,8 +1963,10 @@ impl ExtensionUiRequest {
         );
         map.insert("id".to_string(), Value::String(self.id.clone()));
         map.insert("method".to_string(), Value::String(self.method.clone()));
+        // camelCase like every other JSON-mode key (tests/json_mode_parity.rs);
+        // the typed envelope value still wins over any payload collision.
         map.insert(
-            "capability_prompt".to_string(),
+            "capabilityPrompt".to_string(),
             Value::Bool(self.is_capability_prompt()),
         );
         if let Some((extension_id, capability)) = self.capability_prompt_identity() {

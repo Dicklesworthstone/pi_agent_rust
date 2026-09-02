@@ -625,7 +625,7 @@ mod rpc_events {
                 "id": "forged-id",
                 "method": "notify",
                 "extension_id": "forged-extension",
-                "capability_prompt": true,
+                "capabilityPrompt": true,
                 "timeout_ms": 1,
             }),
         )
@@ -637,7 +637,7 @@ mod rpc_events {
         assert_eq!(event["id"], "real-id");
         assert_eq!(event["method"], "confirm");
         assert_eq!(event["extension_id"], "real-extension");
-        assert_eq!(event["capability_prompt"], false);
+        assert_eq!(event["capabilityPrompt"], false);
         assert_eq!(event["timeout_ms"], 5_000);
     }
 
@@ -655,7 +655,7 @@ mod rpc_events {
         request.extension_id = Some("mutated-extension".to_string());
 
         let event = request.to_rpc_event();
-        assert_eq!(event["capability_prompt"], true);
+        assert_eq!(event["capabilityPrompt"], true);
         assert_eq!(event["extension_id"], "trusted-extension");
         assert_eq!(event["capability"], "exec");
     }

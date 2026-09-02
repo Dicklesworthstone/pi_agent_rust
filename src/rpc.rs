@@ -17439,8 +17439,9 @@ export default function init(pi) {
 
     #[test]
     fn auto_compaction_rejects_stale_session_snapshot_with_paired_end_event() {
-        // Watchdog: on 2026-09-01 this test hung forever (the compaction
-        // provider was never entered) and stalled the whole lib test binary,
+        // Watchdog: on 2026-09-01 this test hung forever (the session swap
+        // below took the agent-session lock that auto-compaction holds across
+        // the gated provider call) and stalled the whole lib test binary,
         // which blocked the DSR test lane twice. The body runs on its own
         // thread so a regression fails after 120 s instead of hanging every
         // test scheduled after it.
@@ -17512,12 +17513,12 @@ export default function init(pi) {
                     .await
                     .expect("auto-compaction provider entered");
 
+                // Auto-compaction holds the agent-session lock across the
+                // provider call, so the swap must go through the shared inner
+                // session handle. Taking the agent-session lock here deadlocked
+                // against the gated provider (the cause of the 2026-09-01 hang).
                 let replacement_id = {
-                    let guard = agent_session
-                        .lock(&entered_cx)
-                        .await
-                        .expect("agent session lock");
-                    let mut inner = guard.session.lock(&entered_cx).await.expect("session lock");
+                    let mut inner = session.lock(&entered_cx).await.expect("session lock");
                     let replacement = Session::in_memory();
                     let replacement_id = replacement.header.id.clone();
                     *inner = replacement;

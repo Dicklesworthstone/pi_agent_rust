@@ -2,7 +2,7 @@
   "schema_version": "1.0.0",
   "program_issue_id": "bd-k5q5.7",
   "program_title": "Comprehensive Verification Program: unit tests, end-to-end scripts, and detailed diagnostics logging",
-  "updated_at": "2026-08-21",
+  "updated_at": "2026-09-02",
   "ci_policy": {
     "required_categories": [
       "unit_tests",
@@ -892,6 +892,18 @@
         {
           "path": "tests/validation_broker_store.rs",
           "justification": "Classified traceability repair suite included so CI governance covers validation broker slot-store and normalization behavior."
+        },
+        {
+          "path": "tests/hostcall_egraph.rs",
+          "justification": "Hostcall e-graph optimisation: roundtrip elimination/fusion, budget-exhaustion fallback, and the disabled kill switch."
+        },
+        {
+          "path": "tests/pmu_telemetry.rs",
+          "justification": "PMU telemetry derived metrics, budget evaluation, and opportunity ranking."
+        },
+        {
+          "path": "tests/edit_repro.rs",
+          "justification": "Edit tool reproduction for unicode normalization mismatches."
         }
       ],
       "e2e_scripts": [
@@ -1444,6 +1456,58 @@
         {
           "path": "tests/release_evidence_gate.rs",
           "justification": "Release gate validating evidence bundle completeness, schema, thresholds, and exception policy."
+        },
+        {
+          "path": "tests/clean_release_commit.rs",
+          "justification": "Drop-in certification contract schema/gates and the clean-release-commit script execution path."
+        },
+        {
+          "path": "tests/release_evidence_ledger.rs",
+          "justification": "Release evidence ledger contract schema/policy and live ledger verification with safe path resolution."
+        },
+        {
+          "path": "tests/waiver_ledger.rs",
+          "justification": "Waiver ledger contract and evidence schema, contract references, and active-waiver lifecycle validity."
+        },
+        {
+          "path": "tests/readme_evidence_checker.rs",
+          "justification": "Keeps scripts/check_readme_evidence_freshness.py honest inside the DSR lane (self-test and pinned inventory hash)."
+        },
+        {
+          "path": "tests/readme_tool_inventory.rs",
+          "justification": "README tool-inventory drift guard against the registered tool set (bd-dwh6g)."
+        },
+        {
+          "path": "tests/nrun_evidence_protocol.rs",
+          "justification": "N-run evidence protocol contract/schema, live artifact verification, and weighted-mean/effective-sample-size exactness."
+        },
+        {
+          "path": "tests/sequential_budget_gate.rs",
+          "justification": "Sequential budget gate contract, step-log likelihood-ratio conformance, Ville-inequality error control, and early stopping."
+        },
+        {
+          "path": "tests/variance_gating.rs",
+          "justification": "Variance gating contract, noise-score computation, and clean-run acceptance versus noisy-run rejection with named reasons."
+        },
+        {
+          "path": "tests/startup_benchmark.rs",
+          "justification": "Startup benchmark contract, percentile/bootstrap CI math, mock artifact verification, and tamper detection."
+        },
+        {
+          "path": "tests/perf_drift_watch.rs",
+          "justification": "Two-sided CUSUM drift watch over performance evidence series."
+        },
+        {
+          "path": "tests/dsr_recipe_preflight_test.rs",
+          "justification": "DSR perf recipe preflight checks (bd-ri-phase1-recipe-audit)."
+        },
+        {
+          "path": "tests/math_reachability_e2e_test.rs",
+          "justification": "Math technique reachability: every documented technique (CUSUM, BOCPD, conformal, PAC-Bayes, VOI, OCO) has a reachable test (bd-math-reachability-evidence)."
+        },
+        {
+          "path": "tests/conformal_budget_calibration.rs",
+          "justification": "Split-conformal calibration quantile thresholds with finite-sample coverage guarantees for budget evidence."
         }
       ],
       "e2e_scripts": [
@@ -1546,7 +1610,7 @@
     },
     {
       "id": "bd-f0huc",
-      "title": "SEC-2.1: Extension manifest v2 \u2014 explicit capabilities, behavioral intents, and trust metadata",
+      "title": "SEC-2.1: Extension manifest v2 — explicit capabilities, behavioral intents, and trust metadata",
       "acceptance_criteria": "Manifest v2 parsing, validation, and metadata extraction covered by unit tests.",
       "unit_tests": [
         {
@@ -1781,7 +1845,7 @@
     },
     {
       "id": "bd-3tb30",
-      "title": "SEC-3.4: Enforcement state machine \u2014 allow/harden/prompt/deny/terminate with hysteresis",
+      "title": "SEC-3.4: Enforcement state machine — allow/harden/prompt/deny/terminate with hysteresis",
       "acceptance_criteria": "State transitions, hysteresis logic, and edge cases covered by deterministic tests.",
       "unit_tests": [
         {
@@ -2245,6 +2309,74 @@
         {
           "path": "tests/worktree_iso.rs",
           "justification": "Worktree isolation primitives (bd-cv653.5.2)."
+        },
+        {
+          "path": "tests/agent_hub.rs",
+          "justification": "Session-scoped agent hub integration: registration, routing, and lifecycle of hub-managed agents (bd-cv653.5.3)."
+        },
+        {
+          "path": "tests/browser.rs",
+          "justification": "Browser tool schema/metadata, navigation, and tab lifecycle behaviour."
+        },
+        {
+          "path": "tests/computer.rs",
+          "justification": "Computer tool schema/metadata and display/window enumeration behaviour."
+        },
+        {
+          "path": "tests/media_tools.rs",
+          "justification": "inspect_image tool schema, fixture analysis, and missing-file error surfaces."
+        },
+        {
+          "path": "tests/web_remote.rs",
+          "justification": "Web remote frame protocol, client authentication/capacity limits, and QR console pairing rendering."
+        },
+        {
+          "path": "tests/web_security.rs",
+          "justification": "Web remote threat-model document validity, canary-secret obfuscation in frames, and local approval for remote mutating actions."
+        },
+        {
+          "path": "tests/e2e_ssh_workspace.rs",
+          "justification": "Fixture-sshd end-to-end coverage for ssh:// workspace tools (bd-cv653.6.5)."
+        },
+        {
+          "path": "tests/security_scan.rs",
+          "justification": "security_scan tool integration against seeded vulnerabilities (bd-cv653.2.6)."
+        },
+        {
+          "path": "tests/snapcompact.rs",
+          "justification": "Snapcompact compaction-mode unit tests (bd-cv653.7.6)."
+        },
+        {
+          "path": "tests/snapcompact_provider.rs",
+          "justification": "Snapcompact vision-model replay tests (bd-cv653.7.6, AC 2 and AC 4)."
+        },
+        {
+          "path": "tests/session_store_v2_ux.rs",
+          "justification": "Session store v2 UX: resume latency/tail reads and fork/export snapshot consistency including missing checkpoints."
+        },
+        {
+          "path": "tests/chrome_tui_integration.rs",
+          "justification": "Chrome-module integration into the TUI surface."
+        },
+        {
+          "path": "tests/gallery.rs",
+          "justification": "Gallery matrix schema and category coverage for the TUI showcase."
+        },
+        {
+          "path": "tests/markdown_rich.rs",
+          "justification": "Rich markdown rendering: syntax highlighting, math/hex swatches, OSC 8 links, and mermaid blocks."
+        },
+        {
+          "path": "tests/overlay_system.rs",
+          "justification": "Overlay system: toast queue lifecycle, welcome screen/tips, and overlay stack focus trap and Esc handling."
+        },
+        {
+          "path": "tests/delight.rs",
+          "justification": "Delight effects: shimmer intensity progression, unicode sparklines, and fireworks particle burst/decay."
+        },
+        {
+          "path": "tests/status_line.rs",
+          "justification": "Status line presets, responsive priority dropping, and session accent hue calculation."
         }
       ],
       "e2e_scripts": [

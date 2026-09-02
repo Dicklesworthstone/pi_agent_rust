@@ -3071,6 +3071,9 @@ fn e2e_interactive_smoke_tmux() {
         "--no-prompt-templates",
         "--no-extensions",
         "--no-themes",
+        // This test drives the classic charmed stack (its welcome banner and
+        // pane layout); the default FTUI stack is covered by tests/e2e_ftui.rs.
+        "--classic",
         "--system-prompt",
         "pi e2e interactive smoke test",
     ];
@@ -5213,6 +5216,9 @@ fn e2e_interactive_session_creates_valid_jsonl_tmux() {
         "--no-prompt-templates",
         "--no-extensions",
         "--no-themes",
+        // Classic charmed stack (pane-text assertions); FTUI is covered by
+        // tests/e2e_ftui.rs.
+        "--classic",
         "--thinking",
         "off",
         "--system-prompt",
@@ -5462,6 +5468,9 @@ fn e2e_interactive_session_continue_loads_previous_tmux() {
 
     let args = [
         "-c",
+        // Classic charmed stack (pane-text assertions); FTUI is covered by
+        // tests/e2e_ftui.rs.
+        "--classic",
         "--provider",
         "anthropic",
         "--model",

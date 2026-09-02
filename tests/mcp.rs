@@ -893,15 +893,14 @@ fn mcp_http_transport_never_replays_after_nested_response_session_404() {
     assert!(!transport.is_alive(), "indeterminate transport must abort");
 
     let requests = server.requests();
-    assert_eq!(
-        requests.len(),
-        4,
-        "accepted outer tools/call must never be renewed or replayed"
-    );
+    // Compare the full wire sequence first so an unexpected extra round-trip
+    // is named in the failure instead of reported as a bare count.
     let methods: Vec<String> = requests
         .iter()
         .map(|request| {
-            let frame: Value = serde_json::from_slice(&request.body).expect("request frame JSON");
+            let frame: Value = serde_json::from_slice(&request.body).unwrap_or_else(
+                |_| json!({"method": format!("{} {}", request.method, request.path)}),
+            );
             frame
                 .get("method")
                 .and_then(Value::as_str)
@@ -909,14 +908,25 @@ fn mcp_http_transport_never_replays_after_nested_response_session_404() {
                 .to_string()
         })
         .collect();
+    // The indeterminate abort sends one best-effort `notifications/cancelled`
+    // for the accepted tools/call before retiring the transport. That is a
+    // cancellation of the original request, never a renewal or a replay.
     assert_eq!(
         methods,
         vec![
             String::from("initialize"),
             String::from("notifications/initialized"),
             String::from("tools/call"),
-            String::from("response")
-        ]
+            String::from("response"),
+            String::from("notifications/cancelled")
+        ],
+        "accepted outer tools/call must never be renewed or replayed"
+    );
+    let cancel_frame: Value =
+        serde_json::from_slice(&requests[4].body).expect("cancel notification frame JSON");
+    assert_eq!(
+        cancel_frame["params"]["requestId"], 2,
+        "the cancellation must name the accepted tools/call: {cancel_frame}"
     );
     finish_case(&harness, case);
 }
@@ -993,13 +1003,14 @@ fn mcp_http_transport_rejects_result_or_error_on_streamed_method_envelopes() {
             },
         ],
     );
-    let transport = pi::mcp::transport::HttpTransport::new(
-        &format!("{}/sse-mixed-envelope", server.base_url()),
-        vec![],
-    )
-    .expect("transport construction");
-
+    // A malformed streamed envelope retires the transport, so each case gets
+    // a fresh transport that consumes the next queued response.
     for label in ["request with result", "notification with error"] {
+        let transport = pi::mcp::transport::HttpTransport::new(
+            &format!("{}/sse-mixed-envelope", server.base_url()),
+            vec![],
+        )
+        .expect("transport construction");
         let error = block_on_local(transport.request(
             "tools/list",
             json!({}),
@@ -1011,6 +1022,10 @@ fn mcp_http_transport_rejects_result_or_error_on_streamed_method_envelopes() {
                 .to_string()
                 .contains("must not contain result or error"),
             "unexpected {label} error: {error}"
+        );
+        assert!(
+            !transport.is_alive(),
+            "{label}: a malformed streamed envelope must retire the transport"
         );
     }
     assert_eq!(
@@ -1120,17 +1135,28 @@ fn mcp_http_transport_distinguishes_request_and_notification_202() {
             && request_error.to_string().contains("HTTP 202"),
         "unexpected request error: {request_error}"
     );
-    block_on_local(transport.notify("notifications/initialized", json!({})))
-        .expect("HTTP 202 must acknowledge a notification");
+    // A 202 to a request proves the server accepted it without ever telling
+    // us the outcome. The transport retires that logical session instead of
+    // sending further side effects over it, so the notification is refused
+    // before dispatch rather than acknowledged.
+    assert!(
+        !transport.is_alive(),
+        "an unanswerable accepted request must retire the transport"
+    );
+    let notify_error = block_on_local(transport.notify("notifications/initialized", json!({})))
+        .expect_err("a retired transport must not dispatch further notifications");
+    assert!(
+        notify_error
+            .to_string()
+            .contains("MCP_TRANSPORT_UNAVAILABLE"),
+        "unexpected notification error: {notify_error}"
+    );
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1, "nothing may follow the accepted request");
     let request_frame: Value =
         serde_json::from_slice(&requests[0].body).expect("request frame JSON");
     assert_eq!(request_frame["id"], 1);
-    let notification_frame: Value =
-        serde_json::from_slice(&requests[1].body).expect("notification frame JSON");
-    assert!(notification_frame.get("id").is_none());
     finish_case(&harness, case);
 }
 
@@ -1240,11 +1266,15 @@ fn mcp_http_transport_rejects_mismatched_jsonrpc_envelopes() {
             },
         ],
     );
-    let transport =
-        pi::mcp::transport::HttpTransport::new(&format!("{}/mismatch", server.base_url()), vec![])
-            .expect("transport construction");
-
+    // Each mismatched envelope proves the server accepted a request whose
+    // outcome is unknowable, which retires the transport. A fresh transport
+    // per case keeps the queued responses flowing in order.
     for reason in ["JSON version", "JSON id", "SSE id"] {
+        let transport = pi::mcp::transport::HttpTransport::new(
+            &format!("{}/mismatch", server.base_url()),
+            vec![],
+        )
+        .expect("transport construction");
         let error = block_on_local(transport.request(
             "tools/list",
             json!({}),
@@ -1255,8 +1285,26 @@ fn mcp_http_transport_rejects_mismatched_jsonrpc_envelopes() {
             error.to_string().contains("MCP_PROTOCOL"),
             "{reason} mismatch produced unexpected error: {error}"
         );
+        assert!(
+            !transport.is_alive(),
+            "{reason} mismatch must retire the transport"
+        );
+        let retired = block_on_local(transport.request(
+            "tools/list",
+            json!({}),
+            std::time::Duration::from_secs(10),
+        ))
+        .expect_err("a retired transport must refuse further requests");
+        assert!(
+            retired.to_string().contains("MCP_TRANSPORT_UNAVAILABLE"),
+            "{reason}: unexpected post-retirement error: {retired}"
+        );
     }
-    assert_eq!(server.requests().len(), 3);
+    assert_eq!(
+        server.requests().len(),
+        3,
+        "retired transports must not dispatch follow-up requests"
+    );
     finish_case(&harness, case);
 }
 
@@ -1308,23 +1356,35 @@ fn mcp_http_transport_does_not_retain_invalid_initialize_state() {
         initialize_error.to_string().contains("MCP_PROTOCOL"),
         "unexpected initialize error: {initialize_error}"
     );
-    let tools = block_on_local(transport.request(
+    // The hostile initialize response was accepted by the server but is
+    // unusable, so the transport retires rather than carrying the invalid
+    // session state into any later request.
+    assert!(
+        !transport.is_alive(),
+        "invalid initialize state must retire the transport"
+    );
+    let later_error = block_on_local(transport.request(
         "tools/list",
         json!({}),
         std::time::Duration::from_secs(10),
     ))
-    .expect("later request must remain usable without invalid initialize state");
-    assert_eq!(tools["tools"], json!([]));
+    .expect_err("a retired transport must not dispatch later requests");
+    assert!(
+        later_error
+            .to_string()
+            .contains("MCP_TRANSPORT_UNAVAILABLE"),
+        "unexpected later request error: {later_error}"
+    );
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(
-        !requests[1].headers.iter().any(|(name, _)| {
-            name.eq_ignore_ascii_case("mcp-session-id")
-                || name.eq_ignore_ascii_case("mcp-protocol-version")
-        }),
-        "invalid initialize state must not be replayed: {:?}",
-        requests[1].headers
+    assert_eq!(
+        requests.len(),
+        1,
+        "invalid initialize state must never be replayed: {:?}",
+        requests
+            .iter()
+            .map(|request| &request.headers)
+            .collect::<Vec<_>>()
     );
     finish_case(&harness, case);
 }

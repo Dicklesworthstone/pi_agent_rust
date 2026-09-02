@@ -620,6 +620,41 @@
           "matched-state",
           "realistic"
         ]
+      },
+      {
+        "workflow_id": "wf-background-tan-side-channel",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-agent-hub-session-scoped-routing",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-ssh-workspace-fixture-sshd",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-security-scan-seeded-vulnerabilities",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-math-technique-reachability",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
       }
     ],
     "weighting_policy": {
@@ -1032,6 +1067,36 @@
       "sli_ids": [
         "sli_tool_roundtrip_p95_ms"
       ]
+    },
+    {
+      "workflow_id": "wf-background-tan-side-channel",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-agent-hub-session-scoped-routing",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-ssh-workspace-fixture-sshd",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-security-scan-seeded-vulnerabilities",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-math-technique-reachability",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
     }
   ],
   "phase_validation_consumers": [
@@ -1116,7 +1181,12 @@
       "wf-subagent-task-role-routing",
       "wf-url-read-reader-mode",
       "wf-web-search-provider-chain",
-      "wf-xdev-discoverable-tools"
+      "wf-xdev-discoverable-tools",
+      "wf-background-tan-side-channel",
+      "wf-agent-hub-session-scoped-routing",
+      "wf-ssh-workspace-fixture-sshd",
+      "wf-security-scan-seeded-vulnerabilities",
+      "wf-math-technique-reachability"
     ],
     "required_metric_fields": [
       "run_id",
@@ -1403,6 +1473,46 @@
           "rust_vs_node_ratio",
           "rust_vs_bun_ratio"
         ]
+      },
+      {
+        "workflow_id": "wf-background-tan-side-channel",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-agent-hub-session-scoped-routing",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-ssh-workspace-fixture-sshd",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-security-scan-seeded-vulnerabilities",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-math-technique-reachability",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
       }
     ],
     "scenario_partition_requirements": [
@@ -1625,6 +1735,41 @@
       },
       {
         "workflow_id": "wf-xdev-discoverable-tools",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-background-tan-side-channel",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-agent-hub-session-scoped-routing",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-ssh-workspace-fixture-sshd",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-security-scan-seeded-vulnerabilities",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-math-technique-reachability",
         "required_partitions": [
           "matched-state",
           "realistic"

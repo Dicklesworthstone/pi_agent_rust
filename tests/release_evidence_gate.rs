@@ -3114,7 +3114,15 @@ fn validate_performance_budget_summary(
     maximum_age: Duration,
     source_binding_valid: bool,
 ) -> Result<PerformanceClaimValidation, String> {
-    let top = perf_exact_object(summary, PERF_TOP_LEVEL_FIELDS, &[], "performance summary")?;
+    // `git_commit` is optional source-binding provenance emitted by the perf
+    // harness since the 2026-08 rebind (accepted identically by the Python
+    // checker and src/semantic_workspace_graph.rs).
+    let top = perf_exact_object(
+        summary,
+        PERF_TOP_LEVEL_FIELDS,
+        &["git_commit"],
+        "performance summary",
+    )?;
     if top.get("schema").and_then(Value::as_str) != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
         return Err(format!(
             "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {:?}",

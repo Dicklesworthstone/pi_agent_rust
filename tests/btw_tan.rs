@@ -202,6 +202,9 @@ fn e2e_tan_runs_in_background_and_delivers_at_next_turn_boundary() {
         "--no-prompt-templates",
         "--no-extensions",
         "--no-themes",
+        // Classic charmed stack (pane-text assertions); FTUI is covered by
+        // tests/e2e_ftui.rs.
+        "--classic",
         "--thinking",
         "off",
         "--system-prompt",

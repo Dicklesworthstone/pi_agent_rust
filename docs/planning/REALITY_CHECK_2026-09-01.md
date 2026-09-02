@@ -939,6 +939,82 @@ validators (bd-sog97.*), the fault-injection healing contract (bd-te4ks),
 the MCP HTTP transport aborts (bd-z6004), tmux/gh-driven e2e tests, and a
 tail of singletons inventoried on bd-yqo76.
 
+Decide-everything round (2026-09-02, on the maintainer's instruction that
+there are no owner-decided items): the MCP aborts were the optional GET
+stream treating any non-405 answer as fatal (fixed: such answers now mean "no
+server stream"); hidden extension messages now reach the model, with pi's own
+provenance records as the one explicit exception; the three Rust
+performance validators accept the harness's `git_commit` field; the JSON-mode
+envelope key `capability_prompt` became `capabilityPrompt`; the inventory
+hash pin turned out to be correct and the checked-in budget artifact stale
+(it predates the 2026-08-24 cold-load amendment), so the remedy is a real
+perf regeneration, not a re-pin; the fail-closed session-integrity contract
+(2026-08-27, seven lib tests) wins over the older healing suite, whose seven
+tests now expect the refusal and preserved bytes; the RPC session-stats tests
+run with saving enabled because a save-disabled session truthfully reports
+"disabled"; the classic-era tmux tests pass `--classic`; the bash-mediation
+tests opt out of `dcg` to pin the in-tree classifier; the Node fs shim tests
+use in-root paths for ENOENT and pin the outside-root denial; the bench
+harness writes per-process artifacts outside the orchestrator; and the
+JSON-parse variance class is enforced only in the perf lane. Coverage debt
+recorded: FTUI equivalents of the share/continue/tan e2e scenarios.
+
+Second decide-everything pass (2026-09-02 afternoon). The rule applied
+throughout: when a maintainer test and a maintainer rule disagree, `git log`
+both and the newer deliberate contract wins; product fail-closed rules are
+never weakened to make a test pass, and every gate-facing test edit is
+disclosed here and in the commit. Findings and decisions: the five remaining
+MCP HTTP transport failures were not the GET stream after all but the
+2026-08-27 15:24 retirement rule (a malformed, mismatched, or 202-acknowledged
+request retires the transport) landing three hours after the resilience tests
+that assumed continued reuse; four tests now expect retirement, and the
+nested-404 test expects the one `notifications/cancelled` that the
+indeterminate abort sends for the accepted call. The compaction "rejects
+stale snapshot" hang was a lock-order deadlock inside the test (the
+auto-compaction path holds the agent-session lock across the provider call
+and the test swapped the session through that same lock); swapping through
+the shared inner handle makes it pass in under two seconds, and the watchdog
+comment now states the real cause. The three `/share` tmux tests write
+`.pi/settings.json` into the tmux working directory, which is a
+workspace-trust surface, so the classic TUI showed the trust prompt instead of
+the welcome banner; they now set the documented automation override. The RPC
+plan-mode e2e test approved the plan as soon as the mock server had seen the
+last request of turn one, while the agent was still streaming that turn, so
+the RPC loop refused both the approval and the follow-up prompt ("Agent is
+currently streaming"); waiting for `agent_end` then hit the second window,
+the post-turn compaction handoff that the turn runner claims before any
+further await ("Agent is currently compacting; wait before running"). Both
+refusals are the documented client contract, so the test now retries until
+the command is admitted, and it drains the child's output pipes, which it
+never read until the end. The FrankenNode matrix check compared
+the generating host's Node and Bun versions, which no DSR worker shares; it
+now compares verdicts and pass rates only. The extension stress test counted
+first-load costs as leak; RSS growth is measured after a warm-up cycle. The
+OCO budget tuner had a state struct and no test; it now has regret-accounting
+and rollback tests against the real implementation. The traceability matrix,
+e2e scenario matrix, and perf SLI contracts missed 33 test files, four e2e
+suites, and the background `/tan` workflow; all are mapped and the governance
+script passes at 100%. The swarm runpack golden lagged a script change that
+adds two retained-artifact inventory entries; regenerated after reading the
+diff. Two phase-1 matrix validator fixtures left an incomplete cell marked
+"pass", which the newer completeness check rejects first; fixed. Three
+smaller ones surfaced by the re-run: the `/share` success message
+soft-wrapped in the TUI so "Share URL:" straddled two terminal lines (the
+message now uses paragraph breaks — the one user-visible change of this
+pass); the math-reachability table looked for weighted bottleneck
+attribution in `src/extensions.rs`, where it never lived (it is the perf
+orchestrator's computation, validated by the phase-1 matrix tests); and the
+interruption "fresh run after abort" test resumed a session with a different
+mock provider, which the session-bound model selection rule now refuses (the
+fresh provider reports the bound identity). Parked with
+reasons: the ext-conformance artifact cluster is blocked by a stray ignored
+file (`tests/ext_conformance/artifacts/doom-overlay/tiny.wad`, bd-n4ov9,
+deletion needs written approval); eight orchestrate contract tests fail
+because the post-generation evidence contract is blocked under the stub
+toolchain (bd-b3yao); the drop-in slash differential needs the legacy tsx
+runner on the workers; the perf-evidence cluster needs a real regeneration
+bound to a clean committed HEAD (bd-ri-phase1-full-refresh-rndeg).
+
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 
 1. `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` → 6/6

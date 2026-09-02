@@ -3794,6 +3794,93 @@ impl OcoTunerState {
     }
 }
 
+#[cfg(test)]
+mod oco_tuner_tests {
+    use super::{ExtensionBudgetTier, OcoTunerConfig, OcoTunerState};
+
+    const EPSILON: f64 = 1e-9;
+
+    #[test]
+    fn regret_accumulates_only_when_loss_exceeds_the_baseline() {
+        let config = OcoTunerConfig::for_tier(ExtensionBudgetTier::Balanced);
+        let mut state = OcoTunerState::from_config(&config);
+
+        // Calm rounds on an empty queue cost 0.15 against a 0.2 baseline, so
+        // loss accrues while regret stays at zero.
+        for _ in 0..3 {
+            let telemetry = state.update(false, Some(0), Some(8), &config);
+            assert!(!telemetry.rolled_back);
+            assert!(telemetry.cumulative_regret.abs() < EPSILON);
+        }
+        let calm = state.snapshot();
+        assert_eq!(calm.rounds, 3);
+        assert!(calm.cumulative_loss > 0.0);
+        assert!(calm.cumulative_regret.abs() < EPSILON);
+        assert_eq!(calm.guardrail_rollbacks, 0);
+
+        // An overloaded round at half utilisation costs 1.5 against the 1.0
+        // overload baseline: regret grows by exactly the excess.
+        let telemetry = state.update(true, Some(4), Some(8), &config);
+        assert!((telemetry.instantaneous_loss - 1.5).abs() < EPSILON);
+        assert!((telemetry.cumulative_regret - 0.5).abs() < EPSILON);
+        let overloaded = state.snapshot();
+        assert_eq!(overloaded.rounds, 4);
+        assert!((overloaded.cumulative_regret - 0.5).abs() < EPSILON);
+        assert!((overloaded.cumulative_loss - calm.cumulative_loss - 1.5).abs() < EPSILON);
+    }
+
+    #[test]
+    fn oco_rollback_restores_the_safe_profile_when_loss_crosses_the_threshold() {
+        let config = OcoTunerConfig {
+            rollback_loss_threshold: 1.2,
+            ..OcoTunerConfig::for_tier(ExtensionBudgetTier::Balanced)
+        };
+        let mut state = OcoTunerState::from_config(&config);
+        let initial = state.snapshot();
+        assert!((initial.queue_budget - config.initial_queue_budget).abs() < EPSILON);
+
+        // Calm rounds on an empty queue (loss 0.15, under the 0.2 baseline, so
+        // no regret) walk the budgets away from the initial profile while
+        // staying inside the configured bounds.
+        for _ in 0..5 {
+            let telemetry = state.update(false, Some(0), Some(8), &config);
+            assert!(!telemetry.rolled_back);
+            assert!(telemetry.cumulative_regret.abs() < EPSILON);
+        }
+        let tuned = state.snapshot();
+        assert!(tuned.queue_budget < initial.queue_budget);
+        assert!(tuned.queue_budget >= config.min_queue_budget);
+        assert!(tuned.batch_budget <= config.max_batch_budget);
+        assert!(tuned.time_slice_ms >= config.min_time_slice_ms);
+        assert_eq!(tuned.guardrail_rollbacks, 0);
+
+        // A saturated overload (loss 2.0) crosses the 1.2 threshold: the
+        // guardrail rolls the budgets back to the safe initial profile and
+        // counts the rollback, while regret keeps the excess over baseline.
+        let telemetry = state.update(true, Some(8), Some(8), &config);
+        assert!(telemetry.rolled_back);
+        assert!((telemetry.instantaneous_loss - 2.0).abs() < EPSILON);
+        let rolled_back = state.snapshot();
+        assert_eq!(rolled_back.guardrail_rollbacks, 1);
+        assert!((rolled_back.queue_budget - initial.queue_budget).abs() < EPSILON);
+        assert!((rolled_back.batch_budget - initial.batch_budget).abs() < EPSILON);
+        assert!((rolled_back.time_slice_ms - initial.time_slice_ms).abs() < EPSILON);
+        assert!((rolled_back.cumulative_regret - 1.0).abs() < EPSILON);
+
+        // The same overload under a lenient threshold tunes without rolling back.
+        let lenient = OcoTunerConfig {
+            rollback_loss_threshold: 2.5,
+            ..config
+        };
+        let mut lenient_state = OcoTunerState::from_config(&lenient);
+        let telemetry = lenient_state.update(true, Some(8), Some(8), &lenient);
+        assert!(!telemetry.rolled_back);
+        let lenient_snapshot = lenient_state.snapshot();
+        assert_eq!(lenient_snapshot.guardrail_rollbacks, 0);
+        assert!(lenient_snapshot.queue_budget > lenient.initial_queue_budget);
+    }
+}
+
 impl SafetyEnvelopeState {
     const fn clear_veto(&mut self) {
         self.vetoing = false;

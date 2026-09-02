@@ -1,7 +1,7 @@
 {
   "schema": "pi.e2e.scenario_matrix.v2",
   "bead_id": "bd-1f42.8.5.1",
-  "updated_at": "2026-08-21",
+  "updated_at": "2026-09-02",
   "source_inputs": [
     "tests/suite_classification.toml",
     "scripts/e2e/run_all.sh",
@@ -1187,6 +1187,130 @@
         "evidence_contract.json"
       ],
       "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_lsp"
+    },
+    {
+      "workflow_id": "wf-agent-hub-session-scoped-routing",
+      "workflow_class": "success_path",
+      "workflow_title": "Session-scoped agent hub registers, routes, and retires hub-managed agents",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "In-process hub with deterministic mock providers; no live credentials or non-loopback network.",
+      "owner": "bd-cv653.5.3",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "agent_hub"
+      ],
+      "test_paths": [
+        "tests/agent_hub.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+    },
+    {
+      "workflow_id": "wf-ssh-workspace-fixture-sshd",
+      "workflow_class": "success_path",
+      "workflow_title": "ssh:// workspace tools operate against a fixture sshd on loopback",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Loopback fixture sshd only; skips when no sshd binary is available; no live credentials.",
+      "owner": "bd-cv653.6.5",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "e2e_ssh_workspace"
+      ],
+      "test_paths": [
+        "tests/e2e_ssh_workspace.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+    },
+    {
+      "workflow_id": "wf-security-scan-seeded-vulnerabilities",
+      "workflow_class": "success_path",
+      "workflow_title": "security_scan tool finds seeded vulnerabilities and reports them deterministically",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Seeded local fixture repository; no network or credentials.",
+      "owner": "bd-cv653.2.6",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "security_scan"
+      ],
+      "test_paths": [
+        "tests/security_scan.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+    },
+    {
+      "workflow_id": "wf-math-technique-reachability",
+      "workflow_class": "success_path",
+      "workflow_title": "Every documented math technique has a reachable test in the tree",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Static source-tree inspection only; no providers, credentials, or network.",
+      "owner": "bd-math-reachability-evidence",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "math_reachability_e2e_test"
+      ],
+      "test_paths": [
+        "tests/math_reachability_e2e_test.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
     }
   ]
 }

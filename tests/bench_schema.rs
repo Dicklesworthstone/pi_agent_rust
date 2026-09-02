@@ -8711,6 +8711,9 @@ fn phase1_matrix_validator_rejects_missing_cells_identity_mismatch() {
     malformed["matrix_cells"][1]["stage_attribution"]["index_ms"] = Value::Null;
     malformed["matrix_cells"][1]["stage_attribution"]["total_stage_ms"] = json!(95.0);
     malformed["matrix_cells"][1]["missing_reasons"] = json!(["missing_stage_metrics:index_ms"]);
+    // A cell with missing reasons is incomplete; keep its status consistent so
+    // the validator reaches the stage_summary identity check under test.
+    malformed["matrix_cells"][1]["status"] = json!("fail");
     malformed["stage_summary"]["operation_stage_coverage"]["index_ms"] = json!(1);
     malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(1);
     malformed["stage_summary"]["cells_missing_stage_breakdown"] = json!(1);
@@ -8744,6 +8747,9 @@ fn phase1_matrix_validator_rejects_missing_cells_reason_mismatch_vs_matrix_cell(
         "missing_stage_metrics:index_ms",
         "missing_matrix_source_record"
     ]);
+    // Incomplete cell: keep status consistent so the reason-parity check is
+    // the one that fires.
+    malformed["matrix_cells"][1]["status"] = json!("fail");
     malformed["stage_summary"]["operation_stage_coverage"]["index_ms"] = json!(1);
     malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(1);
     malformed["stage_summary"]["cells_missing_stage_breakdown"] = json!(1);

@@ -2514,6 +2514,9 @@ fn cli_continue_tmux_loads_existing_session() {
         "--no-prompt-templates",
         "--no-extensions",
         "--no-themes",
+        // Classic charmed stack (pane-text assertions); FTUI is covered by
+        // tests/e2e_ftui.rs.
+        "--classic",
         "--thinking",
         "off",
     ] {

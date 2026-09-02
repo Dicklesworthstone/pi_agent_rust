@@ -24,7 +24,7 @@
           "\"name\": \"docs\"",
           "\"provenance\": \".pi\"",
           "\"trust\": \"pending\"",
-          "/pi-fixture-definitely-missing/docs-mcp"
+          "\"target\": \"<stdio>\""
         ],
         "details": {
           "op": "list",

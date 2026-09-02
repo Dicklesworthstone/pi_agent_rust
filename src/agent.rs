@@ -89,6 +89,16 @@ const TOOL_APPROVAL_STATUS_SCHEMA_V1: &str = "pi.tool.approval_status.v1";
 const SEMANTIC_CONTEXT_PROMPT_SCHEMA_V1: &str = "pi.semantic_context_prompt.v1";
 const SEMANTIC_CONTEXT_PROVENANCE_SCHEMA_V1: &str = "pi.semantic_context_provenance.v1";
 const SEMANTIC_CONTEXT_CUSTOM_TYPE: &str = "semantic_context_bundle";
+
+/// Custom messages pi records for provenance only. They are persisted hidden
+/// (`display: false`) so resumes and audits keep them, but their payload
+/// reaches the model by another route (the semantic bundle rides the system
+/// prompt), so replaying them into the provider context would only spend
+/// budget. Every other custom message, hidden or not, is sent to the model:
+/// `display` is a rendering flag, not a context-visibility flag.
+fn context_excluded_custom_message(message: &CustomMessage) -> bool {
+    !message.display && message.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
+}
 const DEFAULT_SEMANTIC_CONTEXT_PROMPT_MAX_BYTES: u64 = 16 * 1024;
 const DEFAULT_SEMANTIC_CONTEXT_PROMPT_MAX_ITEMS: usize = 16;
 
@@ -2052,39 +2062,40 @@ impl Agent {
 
     /// Build context for a completion request.
     fn build_context(&mut self) -> Context<'_> {
-        let messages: Cow<'_, [Message]> = if self.config.block_images {
+        // `display` governs TUI rendering only: a hidden custom message still
+        // reaches the provider, which is how extension hooks inject context
+        // the model must see without showing it to the user (the
+        // before_agent_start contract in extension_events.rs). The one
+        // exception is pi's own provenance records (see
+        // `context_excluded_custom_message`): they are persisted hidden for
+        // audit and resume, and their payload reaches the model another way
+        // (the semantic bundle rides the system prompt), so replaying them
+        // would only spend context budget. Until 2026-09-02 every hidden
+        // custom message was dropped here, which silently discarded hidden
+        // hook injections.
+        let has_excluded = self
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Custom(c) if context_excluded_custom_message(c)));
+        let messages: Cow<'_, [Message]> = if self.config.block_images || has_excluded {
             let mut msgs = self.messages.clone();
-            // Filter out hidden custom messages.
             msgs.retain(|m| match m {
-                Message::Custom(c) => c.display,
+                Message::Custom(c) => !context_excluded_custom_message(c),
                 _ => true,
             });
-            let stats = filter_images_for_provider(&mut msgs);
-            if stats.removed_images > 0 {
-                tracing::debug!(
-                    filtered_images = stats.removed_images,
-                    affected_messages = stats.affected_messages,
-                    "Filtered image content from outbound provider context (images.block_images=true)"
-                );
+            if self.config.block_images {
+                let stats = filter_images_for_provider(&mut msgs);
+                if stats.removed_images > 0 {
+                    tracing::debug!(
+                        filtered_images = stats.removed_images,
+                        affected_messages = stats.affected_messages,
+                        "Filtered image content from outbound provider context (images.block_images=true)"
+                    );
+                }
             }
             Cow::Owned(msgs)
         } else {
-            // Check if we need to filter hidden custom messages to avoid cloning if not needed.
-            let has_hidden = self.messages.iter().any(|m| match m {
-                Message::Custom(c) => !c.display,
-                _ => false,
-            });
-
-            if has_hidden {
-                let mut msgs = self.messages.clone();
-                msgs.retain(|m| match m {
-                    Message::Custom(c) => c.display,
-                    _ => true,
-                });
-                Cow::Owned(msgs)
-            } else {
-                Cow::Borrowed(self.messages.as_slice())
-            }
+            Cow::Borrowed(self.messages.as_slice())
         };
 
         // Snapcompact vision gating (bd-cv653.7.6): text-only models never see

@@ -74,9 +74,22 @@ fn output_dir() -> PathBuf {
             .unwrap_or_else(|message| panic!("{message}"));
     }
 
-    std::env::var("BENCH_OUTPUT_DIR")
-        .ok()
-        .map_or_else(|| cargo_target_dir().join("perf"), PathBuf::from)
+    if let Ok(dir) = std::env::var("BENCH_OUTPUT_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    // Plain `cargo test` (the DSR quality gate, a developer loop): artifacts
+    // are written with create_new so evidence is never overwritten, which on
+    // a persistent target dir made the second run collide with the first
+    // ("write new extension_bench.jsonl: File exists"). Give each test process
+    // its own subdirectory; the orchestrator keeps its stable, retrievable
+    // paths through the two variables above.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    cargo_target_dir()
+        .join("perf")
+        .join(format!("test-{}-{nanos}", std::process::id()))
 }
 
 fn write_new_artifact(path: &Path, contents: &[u8]) -> std::io::Result<()> {

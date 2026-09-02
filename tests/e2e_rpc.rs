@@ -290,7 +290,10 @@ fn build_options(
         resources: ResourceLoader::empty(false),
         available_models,
         scoped_models,
-        cli_api_key: None,
+        // Session installs (switch/resume/fork) verify that credentials exist
+        // for the session's model before the RPC loop adopts it; the mock
+        // providers never read the key, so any non-empty value satisfies it.
+        cli_api_key: Some("test-key".to_string()),
         auth,
         runtime_handle: handle.clone(),
         ask_tool: None,

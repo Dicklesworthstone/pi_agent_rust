@@ -137,6 +137,43 @@ fn e2e_rpc_plan_mode_blocks_approves_executes() {
 
     let mut child = command.spawn().expect("spawn pi rpc");
     let mut stdin = child.stdin.take().expect("stdin");
+    // Drain both output pipes continuously. The RPC loop streams every event
+    // as a JSON line; an undrained pipe blocks the child once the OS buffer
+    // fills, which stalled turn 2 in the DSR lane (request 4 was never sent).
+    let stdout_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_reader = {
+        let pipe = child.stdout.take().expect("stdout");
+        let capture = std::sync::Arc::clone(&stdout_capture);
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(pipe);
+            let mut line = String::new();
+            while std::io::BufRead::read_line(&mut reader, &mut line).is_ok_and(|read| read > 0) {
+                capture.lock().expect("stdout capture").push_str(&line);
+                line.clear();
+            }
+        })
+    };
+    let rpc_output_tail = |capture: &std::sync::Mutex<String>| -> String {
+        let captured = capture.lock().expect("stdout capture");
+        captured
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|line| line.chars().take(400).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let stderr_reader = {
+        let mut pipe = child.stderr.take().expect("stderr");
+        std::thread::spawn(move || {
+            let mut captured = String::new();
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut captured);
+            captured
+        })
+    };
 
     let send = |stdin: &mut std::process::ChildStdin, line: &str| {
         stdin.write_all(line.as_bytes()).expect("write command");
@@ -155,6 +192,24 @@ fn e2e_rpc_plan_mode_blocks_approves_executes() {
 
     // Wait for turn 1 to complete (3 requests), then approve and prompt again.
     let deadline = Instant::now() + Duration::from_secs(120);
+    // The mock server seeing the last request of a turn does not mean the
+    // agent has finished streaming it; `approve_plan` and a new `prompt` are
+    // refused while the agent is still streaming, so wait for the RPC
+    // `agent_end` event before issuing them.
+    let wait_for_agent_end = |capture: &std::sync::Mutex<String>, count: usize| -> bool {
+        while Instant::now() < deadline {
+            let observed = capture
+                .lock()
+                .expect("stdout capture")
+                .matches("\"type\":\"agent_end\"")
+                .count();
+            if observed >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    };
     let wait_requests = |server: &common::harness::MockHttpServer, n: usize| {
         while Instant::now() < deadline {
             let count = server
@@ -173,6 +228,11 @@ fn e2e_rpc_plan_mode_blocks_approves_executes() {
         wait_requests(&server, 3),
         "turn 1 never completed (write block + submit + final text)"
     );
+    assert!(
+        wait_for_agent_end(&stdout_capture, 1),
+        "turn 1 never ended; last RPC output lines:\n{}",
+        rpc_output_tail(&stdout_capture)
+    );
 
     let blocked_file = workspace.join("plan_out.txt");
     assert!(
@@ -180,19 +240,77 @@ fn e2e_rpc_plan_mode_blocks_approves_executes() {
         "the blocked write must not create the file while planning"
     );
 
-    send(&mut stdin, r#"{"id":"c2","type":"approve_plan"}"#);
-    send(
-        &mut stdin,
-        r#"{"id":"c3","type":"prompt","message":"proceed with the approved plan"}"#,
+    // After `agent_end` the RPC loop still holds the turn in its compaction
+    // handoff phase while it decides whether to auto-compact; a command that
+    // lands in that window is refused with "wait before running ...". That is
+    // the documented client contract, so retry until the command is admitted.
+    let send_until_accepted =
+        |stdin: &mut std::process::ChildStdin, id: &str, build: &dyn Fn(&str) -> String| {
+            let mut attempt = 0usize;
+            while Instant::now() < deadline {
+                attempt += 1;
+                let attempt_id = format!("{id}-{attempt}");
+                send(stdin, &build(&attempt_id));
+                let response = loop {
+                    let found = stdout_capture
+                        .lock()
+                        .expect("stdout capture")
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find(|value| value["type"] == "response" && value["id"] == attempt_id);
+                    if let Some(value) = found {
+                        break value;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "no response for {attempt_id}; last RPC output lines:\n{}",
+                        rpc_output_tail(&stdout_capture)
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                if response["success"] == true {
+                    return response;
+                }
+                let error = response["error"].as_str().unwrap_or_default().to_string();
+                assert!(
+                    error.contains("wait before running") || error.contains("currently streaming"),
+                    "{id} rejected for a reason that is not the turn handoff: {response}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!(
+                "{id} never admitted before the deadline; last RPC output lines:\n{}",
+                rpc_output_tail(&stdout_capture)
+            );
+        };
+    let approval = send_until_accepted(&mut stdin, "c2", &|attempt_id| {
+        format!(r#"{{"id":"{attempt_id}","type":"approve_plan"}}"#)
+    });
+    assert_eq!(
+        approval["data"]["approved"], true,
+        "approve_plan must report the approved plan: {approval}"
     );
+    send_until_accepted(&mut stdin, "c3", &|attempt_id| {
+        format!(
+            r#"{{"id":"{attempt_id}","type":"prompt","message":"proceed with the approved plan"}}"#
+        )
+    });
 
     assert!(
         wait_requests(&server, 5),
-        "turn 2 never completed (write + final text)"
+        "turn 2 never completed (write + final text); last RPC output lines:\n{}",
+        rpc_output_tail(&stdout_capture)
+    );
+    assert!(
+        wait_for_agent_end(&stdout_capture, 2),
+        "turn 2 never ended; last RPC output lines:\n{}",
+        rpc_output_tail(&stdout_capture)
     );
     let _ = child.kill();
-    let output = child.wait_with_output().expect("collect output");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let _ = child.wait().expect("collect exit status");
+    stdout_reader.join().expect("stdout reader");
+    let _stderr = stderr_reader.join().expect("stderr reader");
+    let stdout = stdout_capture.lock().expect("stdout capture").clone();
 
     // After approval, the write executes for real.
     let written = std::fs::read_to_string(&blocked_file).unwrap_or_default();

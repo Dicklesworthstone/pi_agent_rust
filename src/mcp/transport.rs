@@ -2201,11 +2201,20 @@ impl HttpTransport {
                     return Ok(HttpEventStreamOpen::SessionExpired);
                 }
                 if status != 200 {
+                    // The server-initiated stream is optional. A server that
+                    // answers the GET with anything but a stream (202, 404
+                    // without a session, 4xx/5xx) simply does not offer one at
+                    // this endpoint; treating that as fatal retired the whole
+                    // transport, including a working POST channel, so the next
+                    // request or notification failed with
+                    // "HTTP transport was aborted before request dispatch".
                     let body = response.text_limited(4096).await.unwrap_or_default();
-                    return Err(tool_err(
-                        "MCP_HTTP_STATUS",
-                        format!("HTTP {status} opening server event stream: {}", body.trim()),
-                    ));
+                    tracing::warn!(
+                        status,
+                        body = %body.trim(),
+                        "MCP HTTP server event stream not offered; continuing without it"
+                    );
+                    return Ok(HttpEventStreamOpen::Unsupported);
                 }
                 let content_type = response
                     .headers()
@@ -2220,12 +2229,11 @@ impl HttpTransport {
                     .trim()
                     .eq_ignore_ascii_case("text/event-stream")
                 {
-                    return Err(tool_err(
-                        "MCP_PROTOCOL",
-                        format!(
-                            "HTTP GET server stream requires Content-Type text/event-stream, received {content_type:?}"
-                        ),
-                    ));
+                    tracing::warn!(
+                        content_type,
+                        "MCP HTTP GET answered without text/event-stream; continuing without a server event stream"
+                    );
+                    return Ok(HttpEventStreamOpen::Unsupported);
                 }
                 Ok(HttpEventStreamOpen::Stream(response))
             },
