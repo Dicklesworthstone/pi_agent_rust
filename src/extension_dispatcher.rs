@@ -41,9 +41,9 @@ use crate::resource_governor::{
     AdmissionAction, AdmissionDecision, ResourceGovernor, ResourceOperationKind, ResourceRequest,
 };
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
+use crate::tools::SharedToolRegistry;
 #[cfg(test)]
 use crate::tools::ToolRegistry;
-use crate::tools::SharedToolRegistry;
 
 struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for CancelGuard {
