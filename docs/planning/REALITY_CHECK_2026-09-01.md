@@ -329,6 +329,20 @@ Done and pushed with the commit that carries this section:
   receipt, perf-build, parser-contract, clippy, and hang-to-failure fixes are
   in the follow-up commit; the ask-card, compaction-admission, RPC, and
   approval clusters are left to their owning beads with exact anchors.
+- **Follow-up (2026-09-02).** Run `20260901T224048-3018634` at 49112a21:
+  fmt, `cargo check --all-targets`, and `clippy --all-targets -D warnings`
+  all PASS (first clean trio at any SHA); its test lane was polluted by
+  worker disk pressure and cancelled. Root causes since resolved with
+  targeted remote runs: the 7 direct-injection ask-card tests (pending-id
+  registration), the approval dual-confirm fixture, the compaction
+  "exclusion window" test (split-turn summary suffix; the probe trail also
+  proves auto-compaction admission and apply work in a healthy session), and
+  two channel-based ask tests whose single-option fixtures failed
+  `validate_request` (`MIN_OPTIONS = 2`). Still owner-decided on bd-x8mn7:
+  the compaction "rejects stale" test (provider never entered; now bounded
+  by a watchdog), two RPC persistence-surfacing tests, three
+  `stream_delta_batcher` turn-error tests, and the FTUI ask-forwarder close
+  race.
 
 ---
 

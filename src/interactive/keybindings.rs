@@ -1759,7 +1759,8 @@ mod tests {
         let mut ask_execution = Box::pin(ask_tool.execute(
             "quit-ask-call",
             serde_json::json!({
-                "questions": [{"question": "Quit?", "options": [{"label": "Yes"}]}]
+                // validate_request requires MIN_OPTIONS (2) choices per question.
+                "questions": [{"question": "Quit?", "options": [{"label": "Yes"}, {"label": "No"}]}]
             }),
             None,
         ));

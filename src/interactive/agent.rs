@@ -5182,7 +5182,8 @@ mod stream_delta_batcher_tests {
         let mut ask_execution = Box::pin(ask_tool.execute(
             "old-session-ask-call",
             serde_json::json!({
-                "questions": [{"question": "Old prompt?", "options": [{"label": "Yes"}]}]
+                // validate_request requires MIN_OPTIONS (2) choices per question.
+                "questions": [{"question": "Old prompt?", "options": [{"label": "Yes"}, {"label": "No"}]}]
             }),
             None,
         ));
