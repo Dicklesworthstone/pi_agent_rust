@@ -1037,7 +1037,15 @@ documents that an unusable requested name falls back to a lesson-derived
 one, and the test now pins that fallback plus the refusal on a repeat
 promotion), and two `/new`-cancellation
 TUI tests that had passed in every earlier run and ran on a root worker this
-time (re-run in isolation before deciding). Parked with
+time (re-run in isolation before deciding). Run14 (605f4dd7, run dir
+`20260902T152233-2446904`, valid receipt): five of six gates green again,
+test lane 37719 pass / 69 fail; the skill test and the two root-worker TUI
+failures are gone, and the one singleton left is the `/share` gist test,
+whose pane finally explained itself: `/share` was sent while the preceding
+`/name` update was still persisting and the product answered "Session is
+busy; retry `/share` after the current session update finishes". That is
+the documented retry contract, so the test retries on that message instead
+of racing it. Parked with
 reasons: the ext-conformance artifact cluster is blocked by a stray ignored
 file (`tests/ext_conformance/artifacts/doom-overlay/tiny.wad`, bd-n4ov9,
 deletion needs written approval); eight orchestrate contract tests fail

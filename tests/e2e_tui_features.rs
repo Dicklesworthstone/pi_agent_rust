@@ -25,6 +25,8 @@ use std::time::Duration;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const SHARE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Overall budget for resending `/share` while the session reports busy.
+const SHARE_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Standard CLI args for interactive mode with minimal features (no API calls).
 fn minimal_interactive_args() -> Vec<&'static str> {
@@ -196,9 +198,41 @@ fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
     );
 
     // Issue /share command (secret/unlisted, but not access-controlled).
-    // Wait for the last paragraph of the success message so the capture is
-    // not taken between two frames of the same message.
-    let pane = session.send_text_and_wait("share_secret", "/share", "Share URL:", SHARE_TIMEOUT);
+    // The preceding /name update may still be persisting, in which case the
+    // product answers "Session is busy; retry `/share` after the current
+    // session update finishes". Retrying is the documented contract, so
+    // resend while each attempt draws a fresh refusal, then wait for the last
+    // paragraph of the success message ("Share URL:") so the capture is not
+    // taken between two frames of the same message.
+    let share_deadline = std::time::Instant::now() + SHARE_RETRY_BUDGET;
+    let mut busy_replies = 0usize;
+    let mut attempts = 0usize;
+    let pane = loop {
+        attempts += 1;
+        session.tmux.send_literal("/share");
+        session.tmux.send_key("Enter");
+        let pane = session
+            .tmux
+            .wait_for_pane_contains_any(&["Share URL:", "Session is busy"], SHARE_TIMEOUT);
+        if pane.contains("Share URL:") {
+            break pane;
+        }
+        let busy_now = pane.matches("Session is busy").count();
+        if busy_now > busy_replies && std::time::Instant::now() < share_deadline {
+            busy_replies = busy_now;
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        // No fresh refusal: the share is in flight, wait for its URL.
+        break session
+            .tmux
+            .wait_for_pane_contains("Share URL:", SHARE_TIMEOUT);
+    };
+    log_test_event(
+        test_name,
+        "share_sent",
+        &json!({"attempts": attempts, "busy_replies": busy_replies}),
+    );
 
     assert!(
         pane.contains("Created secret gist"),
