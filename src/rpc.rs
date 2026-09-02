@@ -4856,11 +4856,6 @@ async fn preserve_terminal_rpc_state(
     let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
         .await
         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-    if let Some(reason) = state.provider_admission.reason() {
-        return Err(Error::session_persistence(format!(
-            "terminal RPC persistence is quarantined after an indeterminate transition: {reason}"
-        )));
-    }
     let completed_tool_transcript =
         completed_live_tool_effect_suffix(&inner, guard.agent.messages())?;
     state.stage_completed_tool_transcript(&inner, &completed_tool_transcript)?;
@@ -4870,6 +4865,17 @@ async fn preserve_terminal_rpc_state(
             || state.pending_count() == 0)
     {
         return Ok(0);
+    }
+    // A quarantined transition means the persistence target is indeterminate,
+    // so nothing new may be written to it. Shutting down with nothing to
+    // preserve is not an error, though: a command rejected before it touched
+    // the live session leaves no state to lose, and reporting a terminal
+    // persistence failure for it would tell the client that state was lost
+    // when none existed (bd-m83oo).
+    if let Some(reason) = state.provider_admission.reason() {
+        return Err(Error::session_persistence(format!(
+            "terminal RPC persistence is quarantined after an indeterminate transition: {reason}"
+        )));
     }
 
     // A private first-save candidate would choose and retain its own session

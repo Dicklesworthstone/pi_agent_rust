@@ -46,7 +46,35 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   and report in the same run even when an earlier binary is red (the check
   still fails on any failure).
 
+- **DSR test check runs against the worker's `/tmp`**: the recipe prefixes
+  the test command with `env TMPDIR=/tmp` because the project-local temp
+  directory rch exports can be owned by another uid on a worker, which pi's
+  strict mode-class checks refuse.
+
+- **README evidence checker is exercised by the gate**: its `--self-test`
+  now validates against its own fixture inventory instead of borrowing the
+  live performance artifact (it had been failing silently since the
+  2026-08-28 evidence refresh), and `tests/readme_evidence_checker.rs` runs
+  the self-test plus the live README verdict under `cargo test`. The live
+  check still fails closed on the current performance summary.
+
 ### Fixed
+
+- **FTUI launches boot the extension runtime once**: the classic startup
+  path no longer pre-warms, enables, and then discards a second extension
+  runtime (with a second `startup`/`session_start` hook dispatch) before the
+  default FTUI stack creates its own SDK session.
+
+- **Extension `pi.tool` file writes are undoable**: the runtime's hostcall
+  registry now shares the session's undo recorder (and, on the classic
+  path, its workspace roots), so files written through extension hostcalls
+  appear in `/undo` and respect workspace confinement like agent tool calls.
+
+- **RPC shutdown after a rejected command**: closing stdin after a command
+  that was rejected before it touched the session no longer ends the server
+  loop with a "terminal RPC persistence is quarantined" error; the error is
+  still raised when there is queued input or a completed tool transcript to
+  preserve.
 
 - **Installer no longer depends on `SHA256SUMS`**: the network preflight
   probed the aggregate checksum manifest, which DSR releases may not ship at

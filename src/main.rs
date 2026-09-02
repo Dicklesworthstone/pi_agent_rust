@@ -1383,88 +1383,124 @@ async fn run(
     let prewarm_memory_limit_bytes =
         (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
 
+    let is_interactive = !cli.print && cli.mode.is_none() && cli.export.is_none();
+    // The default FTUI stack runs on an SDK session that boots its own
+    // extension runtime (`pi::sdk::create_agent_session`), so the classic
+    // startup below must not boot one as well: until 2026-09-02 every FTUI
+    // launch started the JS/native runtime twice and dispatched the
+    // startup/session_start hooks twice (bd-2crrf). Everything FTUI takes from
+    // this function (provider/model flags, resources, workspace trust, approval
+    // state, enabled tools) is threaded through `SessionOptions`, and the SDK
+    // session cannot reach extension-provided providers or models anyway.
+    #[cfg(feature = "ftui")]
+    let ftui_requested = is_interactive && !cli.classic;
+    #[cfg(not(feature = "ftui"))]
+    let ftui_requested = false;
+
+    // Session undo recorder (bd-cv653.3.13): write/edit/hashline_edit snapshot
+    // file content through it so /undo and /redo can roll back. Created before
+    // the extension pre-warm so the runtime's hostcall registry shares it.
+    let session_mutation_recorder = Arc::new(pi::undo::FileMutationRecorder::default());
+
     // Pre-warm extension runtime in a background task so startup work can overlap
     // with auth refresh, model selection, and session creation.
-    let extension_prewarm_handle = if resources.extensions().is_empty() || has_js_extensions {
-        if resources.extensions().is_empty() {
-            None
+    let extension_prewarm_handle =
+        if ftui_requested || resources.extensions().is_empty() || has_js_extensions {
+            if ftui_requested || resources.extensions().is_empty() {
+                None
+            } else {
+                let pre_enabled_tools = cli.enabled_tools();
+                let pre_mgr = pi::extensions::ExtensionManager::new();
+                pre_mgr.set_cwd(cwd.display().to_string());
+
+                // The runtime registry shares the session's undo recorder and
+                // workspace roots so `pi.tool` hostcalls that write files are
+                // undoable and confined like the agent's own calls (bd-4t6oz).
+                let pre_tools = Arc::new(ToolRegistry::with_mutation_recorder(
+                    &pre_enabled_tools,
+                    &cwd,
+                    Some(&config),
+                    Some(Arc::clone(&session_mutation_recorder)),
+                    Some(&workspace),
+                ));
+
+                let resolved_risk = config.resolve_extension_risk_with_metadata();
+                pre_mgr.set_runtime_risk_config(resolved_risk.settings);
+
+                let pre_mgr_for_runtime = pre_mgr.clone();
+                let pre_tools_for_runtime = Arc::clone(&pre_tools);
+                let prewarm_policy_for_runtime = prewarm_policy.clone();
+                let prewarm_cwd = cwd.display().to_string();
+                Some((
+                    pre_mgr,
+                    pre_tools,
+                    runtime_handle.spawn(async move {
+                        let mut js_config = PiJsRuntimeConfig {
+                            cwd: prewarm_cwd,
+                            repair_mode: AgentSession::runtime_repair_mode_from_policy_mode(
+                                prewarm_repair_mode,
+                            ),
+                            ..PiJsRuntimeConfig::default()
+                        };
+                        js_config.limits.memory_limit_bytes =
+                            Some(prewarm_memory_limit_bytes).filter(|bytes| *bytes > 0);
+                        let runtime = JsExtensionRuntimeHandle::start_with_policy(
+                            js_config,
+                            pre_tools_for_runtime,
+                            pre_mgr_for_runtime,
+                            prewarm_policy_for_runtime,
+                        )
+                        .await
+                        .map(ExtensionRuntimeHandle::Js)
+                        .map_err(anyhow::Error::new)?;
+                        tracing::info!(
+                            event = "pi.extension_runtime.engine_decision",
+                            stage = "main_prewarm",
+                            requested = "quickjs",
+                            selected = "quickjs",
+                            fallback = false,
+                            "Extension runtime engine selected for prewarm (legacy JS/TS)"
+                        );
+                        Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
+                    }),
+                ))
+            }
         } else {
             let pre_enabled_tools = cli.enabled_tools();
             let pre_mgr = pi::extensions::ExtensionManager::new();
             pre_mgr.set_cwd(cwd.display().to_string());
-
-            let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
+            // Same shared undo recorder / workspace as the JS pre-warm (bd-4t6oz).
+            let pre_tools = Arc::new(ToolRegistry::with_mutation_recorder(
+                &pre_enabled_tools,
+                &cwd,
+                Some(&config),
+                Some(Arc::clone(&session_mutation_recorder)),
+                Some(&workspace),
+            ));
 
             let resolved_risk = config.resolve_extension_risk_with_metadata();
             pre_mgr.set_runtime_risk_config(resolved_risk.settings);
 
-            let pre_mgr_for_runtime = pre_mgr.clone();
-            let pre_tools_for_runtime = Arc::clone(&pre_tools);
-            let prewarm_policy_for_runtime = prewarm_policy.clone();
-            let prewarm_cwd = cwd.display().to_string();
             Some((
                 pre_mgr,
                 pre_tools,
                 runtime_handle.spawn(async move {
-                    let mut js_config = PiJsRuntimeConfig {
-                        cwd: prewarm_cwd,
-                        repair_mode: AgentSession::runtime_repair_mode_from_policy_mode(
-                            prewarm_repair_mode,
-                        ),
-                        ..PiJsRuntimeConfig::default()
-                    };
-                    js_config.limits.memory_limit_bytes =
-                        Some(prewarm_memory_limit_bytes).filter(|bytes| *bytes > 0);
-                    let runtime = JsExtensionRuntimeHandle::start_with_policy(
-                        js_config,
-                        pre_tools_for_runtime,
-                        pre_mgr_for_runtime,
-                        prewarm_policy_for_runtime,
-                    )
-                    .await
-                    .map(ExtensionRuntimeHandle::Js)
-                    .map_err(anyhow::Error::new)?;
+                    let runtime = NativeRustExtensionRuntimeHandle::start()
+                        .await
+                        .map(ExtensionRuntimeHandle::NativeRust)
+                        .map_err(anyhow::Error::new)?;
                     tracing::info!(
                         event = "pi.extension_runtime.engine_decision",
                         stage = "main_prewarm",
-                        requested = "quickjs",
-                        selected = "quickjs",
+                        requested = "native-rust",
+                        selected = "native-rust",
                         fallback = false,
-                        "Extension runtime engine selected for prewarm (legacy JS/TS)"
+                        "Extension runtime engine selected for prewarm (native-rust)"
                     );
                     Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
                 }),
             ))
-        }
-    } else {
-        let pre_enabled_tools = cli.enabled_tools();
-        let pre_mgr = pi::extensions::ExtensionManager::new();
-        pre_mgr.set_cwd(cwd.display().to_string());
-        let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
-
-        let resolved_risk = config.resolve_extension_risk_with_metadata();
-        pre_mgr.set_runtime_risk_config(resolved_risk.settings);
-
-        Some((
-            pre_mgr,
-            pre_tools,
-            runtime_handle.spawn(async move {
-                let runtime = NativeRustExtensionRuntimeHandle::start()
-                    .await
-                    .map(ExtensionRuntimeHandle::NativeRust)
-                    .map_err(anyhow::Error::new)?;
-                tracing::info!(
-                    event = "pi.extension_runtime.engine_decision",
-                    stage = "main_prewarm",
-                    requested = "native-rust",
-                    selected = "native-rust",
-                    fallback = false,
-                    "Extension runtime engine selected for prewarm (native-rust)"
-                );
-                Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
-            }),
-        ))
-    };
+        };
 
     let mut auth = auth_result?;
     auth.refresh_expired_oauth_tokens().await?;
@@ -1542,7 +1578,6 @@ async fn run(
     )?;
     messages.retain(|message| !message.trim().is_empty());
 
-    let is_interactive = !cli.print && cli.mode.is_none() && cli.export.is_none();
     let mode = cli.mode.clone().unwrap_or_else(|| {
         if is_interactive {
             "interactive".to_string()
@@ -1733,13 +1768,13 @@ async fn run(
         secrets: config.secrets.clone(),
     };
 
-    // Session undo recorder (bd-cv653.3.13): write/edit/hashline_edit
-    // snapshot file content through it so /undo and /redo can roll back.
+    // Session undo recorder (bd-cv653.3.13), shared with the extension
+    // runtime's hostcall registry built during pre-warm (bd-4t6oz).
     let tools = ToolRegistry::with_mutation_recorder(
         &enabled_tools,
         &cwd,
         Some(&config),
-        Some(Arc::new(pi::undo::FileMutationRecorder::default())),
+        Some(Arc::clone(&session_mutation_recorder)),
         Some(&workspace),
     );
     let session_arc = Arc::new(Mutex::new(session));
@@ -1877,11 +1912,6 @@ async fn run(
         pi::btw::BtwClient::for_model_entry(entry, btw_api_key.as_deref(), &auth)
     });
 
-    #[cfg(feature = "ftui")]
-    let ftui_requested = is_interactive && !cli.classic;
-    #[cfg(not(feature = "ftui"))]
-    let ftui_requested = false;
-
     // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >
     // .agents > global > foreign), eagerly connect already-acknowledged
     // servers under a bounded global budget, and mount their tools as
@@ -1902,7 +1932,7 @@ async fn run(
     let mut extension_bindings = Vec::new();
     let mut extension_model_entries = Vec::new();
 
-    if !resources.extensions().is_empty() {
+    if !ftui_requested && !resources.extensions().is_empty() {
         // Await the pre-warmed extension runtime (spawned earlier to overlap with
         // auth refresh, model selection, and session creation).
         let pre_warmed = if let Some((mgr, tools, join_handle)) = extension_prewarm_handle {
@@ -2063,7 +2093,7 @@ async fn run(
                 }
             }
         }
-    } else if !extension_flags.is_empty() {
+    } else if !ftui_requested && !extension_flags.is_empty() {
         let rendered = extension_flags
             .iter()
             .map(pi::cli::ExtensionCliFlag::display_name)
@@ -2092,7 +2122,7 @@ async fn run(
         .map(|name| (*name).to_string())
         .collect::<Vec<_>>();
 
-    if has_extensions {
+    if has_extensions && !ftui_requested {
         let session_snapshot = {
             let cx = pi::agent_cx::AgentCx::for_request();
             let session = agent_session

@@ -5745,14 +5745,21 @@ mod tests {
     }
 
     #[test]
-    fn installed_ftui_ask_forwarder_observes_close_before_dispatch() {
+    fn ask_forwarder_guard_drops_requests_closed_before_dispatch() {
+        // `RuntimeBuilder::current_thread()` still drives spawned tasks on a
+        // worker thread, so a forwarder installed with `install_ask_forwarder`
+        // may legitimately deliver a request before this thread closes the
+        // surface (the FTUI model re-checks `channel_ui_request_is_pending`
+        // for exactly that case). What must hold deterministically is the
+        // forwarder guard itself: a request whose surface closed before
+        // dispatch never reaches the model. Drive that step by hand.
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
-        let runtime_handle = runtime.handle();
         let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
         let (agent_tx, agent_rx) = mpsc::channel();
-        let forwarder = install_ask_forwarder(&tool, &agent_tx, &runtime_handle);
+        let (ask_ui_tx, mut ask_ui_rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(4);
+        tool.install_channel_ui(ask_ui_tx);
 
         runtime.block_on(async {
             let mut execution = Box::pin(crate::tools::Tool::execute(
@@ -5769,7 +5776,15 @@ mod tests {
             assert!(futures::poll!(execution.as_mut()).is_pending());
             assert_eq!(tool.close_channel_ui(), 1);
             drop(execution);
-            forwarder.await;
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let request = ask_ui_rx
+                .recv(&cx)
+                .await
+                .expect("the queued ask request survives the close");
+            assert!(
+                !forward_ask_ui_request(&tool, &agent_tx, request),
+                "the forwarder guard must reject a request whose surface closed"
+            );
             assert!(
                 agent_rx.try_recv().is_err(),
                 "closed Ask must not reach the FTUI model"

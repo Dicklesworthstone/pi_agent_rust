@@ -3819,10 +3819,17 @@ mod stream_delta_batcher_tests {
 
     struct DummyProvider;
 
+    // Test doubles report the identity of the app's model entry
+    // (`continue-probe` / `continue-probe-model`, see
+    // `build_test_app_with_provider`): every submission first runs
+    // `sync_runtime_selection_from_session_header`, which replaces a provider
+    // whose name/model differ from the entry with a real client built from the
+    // entry's `https://example.invalid` base URL, and the turn then fails on
+    // DNS instead of exercising the double.
     #[async_trait::async_trait]
     impl Provider for DummyProvider {
         fn name(&self) -> &'static str {
-            "dummy"
+            "continue-probe"
         }
 
         fn api(&self) -> &'static str {
@@ -3830,7 +3837,7 @@ mod stream_delta_batcher_tests {
         }
 
         fn model_id(&self) -> &'static str {
-            "dummy-model"
+            "continue-probe-model"
         }
 
         async fn stream(
@@ -4263,10 +4270,12 @@ mod stream_delta_batcher_tests {
         expected_system_prompt: &'static str,
     }
 
+    // Same identity rule as `DummyProvider`: match the app's model entry so the
+    // pre-submission runtime sync keeps this double installed.
     #[async_trait::async_trait]
     impl Provider for BeforeAgentStartProbeProvider {
         fn name(&self) -> &'static str {
-            "before-agent-start-probe"
+            "continue-probe"
         }
 
         fn api(&self) -> &'static str {
@@ -4274,7 +4283,7 @@ mod stream_delta_batcher_tests {
         }
 
         fn model_id(&self) -> &'static str {
-            "before-agent-start-probe-model"
+            "continue-probe-model"
         }
 
         async fn stream(

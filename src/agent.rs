@@ -13456,7 +13456,18 @@ impl AgentSession {
         } else {
             let manager = ExtensionManager::new();
             manager.set_cwd(cwd.display().to_string());
-            let tools = Arc::new(ToolRegistry::new(enabled_tools, cwd, config));
+            // Share the agent's undo recorder so extension `pi.tool` hostcalls
+            // that write files land in the same /undo ledger as the agent's
+            // own tool calls (bd-4t6oz). Workspace roots are not available on
+            // this path; the classic startup threads them through the
+            // pre-warmed registry instead.
+            let tools = Arc::new(ToolRegistry::with_mutation_recorder(
+                enabled_tools,
+                cwd,
+                config,
+                self.agent.mutation_recorder(),
+                None,
+            ));
 
             if let Some(cfg) = config {
                 let resolved_risk = cfg.resolve_extension_risk_with_metadata();

@@ -759,10 +759,16 @@ changes alone. **Complexity.** S. **Beads.** None → new.
 
 #### Gap P2 — Repository leftovers from this session (need your permission)
 
-- `src/current_time.rs`: was an orphaned duplicate; superseded on
-  2026-09-02 when the maintainer's 416cabe9 dropped the `src/tools.rs` copy
-  in favour of this module, so it is now the shipped implementation and
-  nothing here needs deleting (matrix row updated).
+- `src/current_time.rs` vs the in-file `CurrentTimeTool` in `src/tools.rs`:
+  one of the two must go, and that is the maintainer's call. Sequence on
+  2026-09-02: 416cabe9 (maintainer) dropped the in-file copy in favour of
+  the module but left main uncompilable; the wiring landed (8d8fdd6e); the
+  maintainer reverted the swap (74490cb8); I followed the revert (b802d9a6);
+  another session re-wired the module (82fd0468) while gate run7 was
+  executing. HEAD ships the module (registry, one-liner, prompt index all
+  point at it) and carries the in-file copy as dead code with live unit
+  tests. Removing either is a code deletion inside a tracked file, not a
+  file deletion, but the choice is a product decision.
 - `/data/projects/pi_agent_rust_baseline`: throwaway clone at 08485a20 used
   for the baseline classification; delete.
 - `<scratchpad>/gate-wt`: git worktree (registered in `git worktree list`);
@@ -850,6 +856,31 @@ one pass (the check still fails on any failure), and the cluster B
 compaction issues two (history + turn prefix; design unchanged since
 February). My earlier note that the summary-filter change had fixed that test
 was wrong: it only advanced the failure to the call-count assertion.
+
+Run7 (b802d9a6, run dir `20260902T002444-3404080`) was cancelled after its
+lib binary: fmt, check and clippy green; 8040 passed / 376 failed, and 370 of
+the failures had one environmental cause. rch exports `TMPDIR` as the
+project-local `.rch-tmp` on the worker, that directory was owned by a
+different uid than the test process on this worker (vmi1153651, as on
+vmi1149989 in run5), and pi's mode-class check (`src/platform.rs`, which
+deliberately gives root no DAC bypass) denies every temp-dir write. The
+recipe's test check now runs `env TMPDIR=/tmp cargo test …` (gate-facing,
+disclosed); the worker hygiene itself is an rch matter for the maintainer.
+The run was also invalidated by the tree moving under it: another session
+pushed three commits at 04:30Z, one of them (82fd0468) re-wiring
+`src/current_time.rs` as the shipped module ten minutes after the
+maintainer's revert had restored the in-file copy, so HEAD now carries both
+implementations (the in-file one is dead code with live unit tests) and the
+one-liner/prompt-index text follows the module. Landed afterwards, all
+pending run8 evidence: the FTUI startup no longer boots the classic
+extension runtime (bd-2crrf slice); the extension runtime's hostcall registry
+shares the session's undo recorder and workspace roots (bd-4t6oz slice); RPC
+stdin close after a rejected command no longer fails with a "quarantined"
+terminal error when there is nothing to preserve (bd-m83oo, product); the
+interactive test doubles carry the app's model identity so the
+pre-submission runtime sync keeps them installed (three stream_delta tests);
+the FTUI ask-forwarder test drives the guard deterministically (asupersync's
+`current_thread()` runtime runs spawned tasks on a worker thread).
 
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 

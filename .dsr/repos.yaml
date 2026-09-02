@@ -32,6 +32,13 @@
 # stopping at the first red binary; the check still fails on any failure.
 # Without it the integration/conformance binaries never executed while the
 # lib binary carried pre-existing failures (runs 3-6, 2026-09-01/02).
+# `env TMPDIR=/tmp` runs the tests against the worker's /tmp instead of the
+# project-local `.rch-tmp` that rch exports as TMPDIR: on some workers that
+# directory is owned by a different uid than the test process, and pi's
+# mode-class checks (src/platform.rs, deliberately no root DAC bypass) then
+# deny every temp-dir write (run7, 2026-09-02: 370+ session/tools failures
+# with "Unix group mode class 1700 on .../.rch-tmp does not allow path
+# traversal"). /tmp is owned by root on every worker.
 
 schema_version: "1.0.0"
 
@@ -51,6 +58,6 @@ tools:
       - cargo fmt --check
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 rch exec -- cargo check --locked --all-targets
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 rch exec -- cargo clippy --locked --all-targets -- -D warnings
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 rch exec -- cargo test --locked --all-targets --no-fail-fast
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 rch exec -- env TMPDIR=/tmp cargo test --locked --all-targets --no-fail-fast
       - bash tests/installer_regression.sh
       - python3 scripts/check_module_reachability.py
