@@ -14359,6 +14359,224 @@ impl Tool for HashlineEditTool {
 }
 
 // ============================================================================
+// Current-time tool (#207)
+// ============================================================================
+
+/// Schema tag for the `current_time` tool's `details` payload.
+pub const CURRENT_TIME_SCHEMA_V1: &str = "pi.tool.current_time.v1";
+
+/// Model-facing wall-clock time.
+///
+/// The system prompt deliberately carries only the current *date* so the
+/// cached prompt prefix stays stable within a day (#103). Anything that
+/// depends on the time of day — "how long until 8 PM", "has 3 PM passed",
+/// "remind me in 30 minutes" — needs an on-demand source instead, which is
+/// this tool: it is called only when a task actually needs the clock, so it
+/// never perturbs the prompt cache.
+///
+/// Time zones are `local` (default), `UTC`/`Z`, or a fixed offset such as
+/// `+08:00` / `-0530`. IANA names are not supported (no tz database is
+/// linked); the error names the accepted forms.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CurrentTimeTool;
+
+impl CurrentTimeTool {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CurrentTimeInput {
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+/// Which clock presentation a `current_time` call asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentTimeZone {
+    Local,
+    Utc,
+    /// Fixed offset east of UTC, in seconds.
+    Fixed(i32),
+}
+
+impl CurrentTimeZone {
+    const HELP: &'static str =
+        "expected \"local\", \"UTC\", or a fixed offset like \"+08:00\", \"-0530\", or \"+5\"";
+
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        let raw = raw.map(str::trim).unwrap_or_default();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("local") {
+            return Ok(Self::Local);
+        }
+        if raw.eq_ignore_ascii_case("utc") || raw.eq_ignore_ascii_case("z") {
+            return Ok(Self::Utc);
+        }
+        Self::parse_fixed_offset(raw)
+            .map(Self::Fixed)
+            .ok_or_else(|| {
+                Error::validation(format!(
+                    "Unsupported timezone {raw:?}: {}. IANA zone names are not supported.",
+                    Self::HELP
+                ))
+            })
+    }
+
+    /// Parse `+HH:MM`, `+HHMM`, `+HH`, or `+H` (and `-` variants) into seconds
+    /// east of UTC. Rejects anything outside ±23:59 or with a bad minute.
+    fn parse_fixed_offset(raw: &str) -> Option<i32> {
+        let (sign, digits) = match raw.as_bytes().first()? {
+            b'+' => (1, &raw[1..]),
+            b'-' => (-1, &raw[1..]),
+            _ => return None,
+        };
+        let (hours, minutes) = match digits.split_once(':') {
+            // The colon form is `+HH:MM` only: `+8:00` is rejected so the
+            // accepted grammar stays exactly what the error message lists.
+            Some((h, m)) if h.len() == 2 => (h, m),
+            Some(_) => return None,
+            None => match digits.len() {
+                1 | 2 => (digits, "00"),
+                4 => digits.split_at(2),
+                _ => return None,
+            },
+        };
+        if hours.is_empty()
+            || hours.len() > 2
+            || minutes.len() != 2
+            || !hours.bytes().all(|b| b.is_ascii_digit())
+            || !minutes.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let hours: i32 = hours.parse().ok()?;
+        let minutes: i32 = minutes.parse().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        Some(sign * (hours * 3600 + minutes * 60))
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Local => "local".to_string(),
+            Self::Utc => "UTC".to_string(),
+            Self::Fixed(seconds) => format_utc_offset(seconds),
+        }
+    }
+}
+
+/// `+HH:MM` / `-HH:MM` for an offset in seconds east of UTC.
+fn format_utc_offset(seconds: i32) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let abs = seconds.abs();
+    format!("{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60)
+}
+
+/// Render `now` in `zone`, returning `(iso8601, utc_offset_seconds, weekday)`.
+fn render_current_time(
+    now: chrono::DateTime<chrono::Utc>,
+    zone: CurrentTimeZone,
+) -> (String, i32, String) {
+    use chrono::{Datelike as _, Offset as _, SecondsFormat, TimeZone as _};
+    match zone {
+        CurrentTimeZone::Local => {
+            let local = now.with_timezone(&chrono::Local);
+            (
+                local.to_rfc3339_opts(SecondsFormat::Secs, true),
+                local.offset().fix().local_minus_utc(),
+                local.weekday().to_string(),
+            )
+        }
+        CurrentTimeZone::Utc => (
+            now.to_rfc3339_opts(SecondsFormat::Secs, true),
+            0,
+            now.weekday().to_string(),
+        ),
+        CurrentTimeZone::Fixed(seconds) => {
+            // Validated to ±23:59 by the parser, so this cannot fail.
+            let offset = chrono::FixedOffset::east_opt(seconds)
+                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("zero offset is valid"));
+            let shifted = offset.from_utc_datetime(&now.naive_utc());
+            (
+                shifted.to_rfc3339_opts(SecondsFormat::Secs, true),
+                seconds,
+                shifted.weekday().to_string(),
+            )
+        }
+    }
+}
+
+/// Build the tool output for `now` in `zone` (pure; shared by tests).
+fn current_time_output(now: chrono::DateTime<chrono::Utc>, zone: CurrentTimeZone) -> ToolOutput {
+    use chrono::SecondsFormat;
+    let (iso8601, utc_offset_seconds, weekday) = render_current_time(now, zone);
+    let utc = now.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let unix = now.timestamp();
+    let text = format!("{iso8601} ({weekday})\nUTC: {utc}\nUnix: {unix}");
+    ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(text))],
+        details: Some(serde_json::json!({
+            "schema": CURRENT_TIME_SCHEMA_V1,
+            "iso8601": iso8601,
+            "utc": utc,
+            "unix": unix,
+            "timezone": zone.label(),
+            "utcOffsetSeconds": utc_offset_seconds,
+            "weekday": weekday,
+        })),
+        is_error: false,
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for CurrentTimeTool {
+    fn name(&self) -> &str {
+        "current_time"
+    }
+    fn label(&self) -> &str {
+        "current_time"
+    }
+    fn description(&self) -> &str {
+        "Get the current wall-clock date and time. Call this whenever a task depends on the actual time of day (deadlines, \"how long until\", \"has X already passed\", reminders); the system prompt only carries the date. Returns an ISO-8601 timestamp with UTC offset in the requested zone (default: local), plus the same instant in UTC and as a Unix timestamp."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "timezone": {
+                    "type": "string",
+                    "description": "Zone to render in: \"local\" (default), \"UTC\", or a fixed offset like \"+08:00\" / \"-0530\". IANA names are not supported."
+                }
+            }
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::read()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: CurrentTimeInput = if input.is_null() {
+            CurrentTimeInput::default()
+        } else {
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?
+        };
+        let zone = CurrentTimeZone::parse(input.timezone.as_deref())?;
+        Ok(current_time_output(chrono::Utc::now(), zone))
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -21138,7 +21356,206 @@ mod tests {
         });
     }
 
-    // === current_time (#207): registry membership of the essential-tier clock tool ===
+    // === current_time (#207) ===
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        // 2026-09-01T22:55:32Z, a Tuesday.
+        chrono::DateTime::from_timestamp(1_788_303_332, 0).expect("valid timestamp")
+    }
+
+    #[test]
+    fn current_time_zone_parse_accepts_local_utc_and_fixed_offsets() {
+        assert_eq!(
+            CurrentTimeZone::parse(None).unwrap(),
+            CurrentTimeZone::Local
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("")).unwrap(),
+            CurrentTimeZone::Local
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some(" Local ")).unwrap(),
+            CurrentTimeZone::Local
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("UTC")).unwrap(),
+            CurrentTimeZone::Utc
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("utc")).unwrap(),
+            CurrentTimeZone::Utc
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("Z")).unwrap(),
+            CurrentTimeZone::Utc
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("+08:00")).unwrap(),
+            CurrentTimeZone::Fixed(8 * 3600)
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("-0530")).unwrap(),
+            CurrentTimeZone::Fixed(-(5 * 3600 + 30 * 60))
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("+5")).unwrap(),
+            CurrentTimeZone::Fixed(5 * 3600)
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("-12")).unwrap(),
+            CurrentTimeZone::Fixed(-12 * 3600)
+        );
+        assert_eq!(
+            CurrentTimeZone::parse(Some("+00:00")).unwrap(),
+            CurrentTimeZone::Fixed(0)
+        );
+    }
+
+    #[test]
+    fn current_time_zone_parse_rejects_iana_and_malformed_offsets() {
+        for raw in [
+            "Asia/Shanghai",
+            "EST",
+            "+24:00",
+            "+08:60",
+            "+8:00",
+            "08:00",
+            "+",
+            "+123",
+            "+12345",
+            "+ab:cd",
+            "++08:00",
+        ] {
+            let err = CurrentTimeZone::parse(Some(raw)).expect_err(raw);
+            let msg = err.to_string();
+            assert!(msg.contains(raw), "error names the input {raw:?}: {msg}");
+            assert!(
+                msg.contains("+08:00"),
+                "error shows an accepted form: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_time_output_utc_is_iso8601_with_z_and_matching_unix() {
+        let out = current_time_output(fixed_now(), CurrentTimeZone::Utc);
+        assert!(!out.is_error);
+        let text = get_text(&out.content);
+        assert_eq!(
+            text,
+            "2026-09-01T22:55:32Z (Tue)\nUTC: 2026-09-01T22:55:32Z\nUnix: 1788303332"
+        );
+        let details = out.details.expect("details");
+        assert_eq!(details["schema"], CURRENT_TIME_SCHEMA_V1);
+        assert_eq!(details["iso8601"], "2026-09-01T22:55:32Z");
+        assert_eq!(details["utc"], "2026-09-01T22:55:32Z");
+        assert_eq!(details["unix"], 1_788_303_332_i64);
+        assert_eq!(details["timezone"], "UTC");
+        assert_eq!(details["utcOffsetSeconds"], 0);
+        assert_eq!(details["weekday"], "Tue");
+    }
+
+    #[test]
+    fn current_time_output_fixed_offset_shifts_clock_and_keeps_instant() {
+        let out = current_time_output(fixed_now(), CurrentTimeZone::Fixed(8 * 3600));
+        let details = out.details.expect("details");
+        // 22:55 UTC is 06:55 the next day at +08:00.
+        assert_eq!(details["iso8601"], "2026-09-02T06:55:32+08:00");
+        assert_eq!(details["weekday"], "Wed");
+        assert_eq!(details["timezone"], "+08:00");
+        assert_eq!(details["utcOffsetSeconds"], 8 * 3600);
+        // The instant itself is unchanged.
+        assert_eq!(details["utc"], "2026-09-01T22:55:32Z");
+        assert_eq!(details["unix"], 1_788_303_332_i64);
+        let parsed = chrono::DateTime::parse_from_rfc3339("2026-09-02T06:55:32+08:00").unwrap();
+        assert_eq!(parsed.timestamp(), 1_788_303_332);
+
+        let out = current_time_output(fixed_now(), CurrentTimeZone::Fixed(-(5 * 3600 + 30 * 60)));
+        let details = out.details.expect("details");
+        assert_eq!(details["iso8601"], "2026-09-01T17:25:32-05:30");
+        assert_eq!(details["timezone"], "-05:30");
+    }
+
+    #[test]
+    fn current_time_output_local_round_trips_to_the_same_instant() {
+        let now = fixed_now();
+        let out = current_time_output(now, CurrentTimeZone::Local);
+        let details = out.details.expect("details");
+        let iso = details["iso8601"].as_str().expect("iso8601 string");
+        let parsed = chrono::DateTime::parse_from_rfc3339(iso).expect("rfc3339 local time");
+        assert_eq!(parsed.timestamp(), now.timestamp());
+        assert_eq!(
+            i64::from(parsed.offset().local_minus_utc()),
+            details["utcOffsetSeconds"].as_i64().unwrap()
+        );
+        assert_eq!(details["timezone"], "local");
+    }
+
+    #[test]
+    fn current_time_tool_schema_and_effects() {
+        let tool = CurrentTimeTool::new();
+        assert_eq!(tool.name(), "current_time");
+        assert!(tool.effects().parallel_safe());
+        assert!(!tool.effects().writes());
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"]["timezone"].is_object());
+        assert!(params.get("required").is_none(), "timezone is optional");
+        assert!(
+            tool.description()
+                .contains("system prompt only carries the date")
+        );
+    }
+
+    #[test]
+    fn current_time_tool_execute_defaults_to_local_and_validates_timezone() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = CurrentTimeTool::new();
+            let before = chrono::Utc::now().timestamp();
+            let out = tool
+                .execute("t", serde_json::json!({}), None)
+                .await
+                .unwrap();
+            let after = chrono::Utc::now().timestamp();
+            let details = out.details.expect("details");
+            let unix = details["unix"].as_i64().unwrap();
+            assert!(
+                (before..=after).contains(&unix),
+                "{before} <= {unix} <= {after}"
+            );
+            assert_eq!(details["timezone"], "local");
+
+            let out = tool
+                .execute("t", serde_json::Value::Null, None)
+                .await
+                .unwrap();
+            assert_eq!(out.details.unwrap()["timezone"], "local");
+
+            let out = tool
+                .execute("t", serde_json::json!({ "timezone": "UTC" }), None)
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.starts_with("20"), "iso first: {text}");
+            assert!(text.contains("Z ("), "utc marker: {text}");
+
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "timezone": "Europe/Berlin" }),
+                    None,
+                )
+                .await
+                .expect_err("IANA names are rejected");
+            assert!(err.to_string().contains("Europe/Berlin"));
+
+            let err = tool
+                .execute("t", serde_json::json!({ "timezone": 5 }), None)
+                .await
+                .expect_err("non-string timezone is a validation error");
+            assert!(!err.to_string().is_empty());
+        });
+    }
 
     #[test]
     fn current_time_is_registered_and_in_the_live_schema() {
