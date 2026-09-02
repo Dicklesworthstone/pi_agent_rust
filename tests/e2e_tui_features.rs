@@ -74,6 +74,38 @@ impl Drop for TmuxE2eLock {
     }
 }
 
+/// Send `/share`, resending while each attempt draws a fresh "Session is busy"
+/// refusal (the documented client contract while a session update is still
+/// persisting), and return the pane once the success message's last paragraph
+/// ("Share URL:") is on screen, plus the attempt and refusal counts.
+fn send_share_until_ready(session: &TuiSession) -> (String, usize, usize) {
+    let share_deadline = std::time::Instant::now() + SHARE_RETRY_BUDGET;
+    let mut busy_replies = 0usize;
+    let mut attempts = 0usize;
+    let pane = loop {
+        attempts += 1;
+        session.tmux.send_literal("/share");
+        session.tmux.send_key("Enter");
+        let pane = session
+            .tmux
+            .wait_for_pane_contains_any(&["Share URL:", "Session is busy"], SHARE_TIMEOUT);
+        if pane.contains("Share URL:") {
+            break pane;
+        }
+        let busy_now = pane.matches("Session is busy").count();
+        if busy_now > busy_replies && std::time::Instant::now() < share_deadline {
+            busy_replies = busy_now;
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        // No fresh refusal: the share is in flight, wait for its URL.
+        break session
+            .tmux
+            .wait_for_pane_contains("Share URL:", SHARE_TIMEOUT);
+    };
+    (pane, attempts, busy_replies)
+}
+
 fn new_locked_tui_session(name: &str) -> Option<(TmuxE2eLock, TuiSession)> {
     let lock = TmuxE2eLock::acquire();
     let session = TuiSession::new(name)?;
@@ -205,30 +237,7 @@ fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
     // resend while each attempt draws a fresh refusal, then wait for the last
     // paragraph of the success message ("Share URL:") so the capture is not
     // taken between two frames of the same message.
-    let share_deadline = std::time::Instant::now() + SHARE_RETRY_BUDGET;
-    let mut busy_replies = 0usize;
-    let mut attempts = 0usize;
-    let pane = loop {
-        attempts += 1;
-        session.tmux.send_literal("/share");
-        session.tmux.send_key("Enter");
-        let pane = session
-            .tmux
-            .wait_for_pane_contains_any(&["Share URL:", "Session is busy"], SHARE_TIMEOUT);
-        if pane.contains("Share URL:") {
-            break pane;
-        }
-        let busy_now = pane.matches("Session is busy").count();
-        if busy_now > busy_replies && std::time::Instant::now() < share_deadline {
-            busy_replies = busy_now;
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
-        }
-        // No fresh refusal: the share is in flight, wait for its URL.
-        break session
-            .tmux
-            .wait_for_pane_contains("Share URL:", SHARE_TIMEOUT);
-    };
+    let (pane, attempts, busy_replies) = send_share_until_ready(&session);
     log_test_event(
         test_name,
         "share_sent",

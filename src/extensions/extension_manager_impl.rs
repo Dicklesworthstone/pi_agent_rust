@@ -3418,7 +3418,7 @@ impl ExtensionManager {
         &self,
         host: &WasmExtensionHost,
         specs: Vec<WasmExtensionLoadSpec>,
-        tools: Arc<ToolRegistry>,
+        tools: crate::tools::SharedToolRegistry,
     ) -> Result<()> {
         let entry_paths = specs
             .iter()
@@ -3436,7 +3436,7 @@ impl ExtensionManager {
             let mut instance = host
                 .instantiate_with(
                     &extension,
-                    Arc::clone(&tools),
+                    tools.clone(),
                     Some(self.handle()),
                     &extension_id,
                 )

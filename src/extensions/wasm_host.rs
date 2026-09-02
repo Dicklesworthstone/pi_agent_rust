@@ -21,7 +21,7 @@ use self::pi::extension::host;
 pub(super) struct HostState {
     policy: ExtensionPolicy,
     cwd: PathBuf,
-    tools: Arc<crate::tools::ToolRegistry>,
+    tools: crate::tools::SharedToolRegistry,
     manager: Option<ExtensionManagerHandle>,
     http: HttpConnector,
     fs: FsConnector,
@@ -44,7 +44,7 @@ impl HostState {
     pub(super) fn new_with_tools(
         policy: ExtensionPolicy,
         cwd: PathBuf,
-        tools: Arc<crate::tools::ToolRegistry>,
+        tools: impl Into<crate::tools::SharedToolRegistry>,
         manager: Option<ExtensionManagerHandle>,
         extension_id: Option<String>,
     ) -> Result<Self> {
@@ -53,7 +53,7 @@ impl HostState {
         Ok(Self {
             policy,
             cwd,
-            tools,
+            tools: tools.into(),
             manager,
             http: HttpConnector::new(HttpConnectorConfig {
                 enforce_allowlist: true,
@@ -468,7 +468,8 @@ impl HostState {
             }
         }
 
-        let tool = self.tools.get(tool_name).ok_or_else(|| {
+        let registry = self.tools.snapshot();
+        let tool = registry.get(tool_name).ok_or_else(|| {
             Self::host_error_json(
                 HostCallErrorCode::InvalidRequest,
                 format!("Unknown tool: {tool_name}"),
@@ -930,10 +931,11 @@ impl host::Host for HostState {
                                 .await
                             }
                             "events" => {
+                                let registry = self.tools.snapshot();
                                 dispatch_hostcall_events(
                                     &payload.call_id,
                                     &manager,
-                                    self.tools.as_ref(),
+                                    registry.as_ref(),
                                     &op,
                                     payload.params.clone(),
                                 )

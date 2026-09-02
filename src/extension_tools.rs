@@ -677,6 +677,141 @@ mod tests {
         });
     }
 
+    /// Tool the agent mounts after the JS runtime has already booted.
+    struct LateEchoTool;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::tools::Tool for LateEchoTool {
+        fn name(&self) -> &str {
+            "late_echo"
+        }
+        fn label(&self) -> &str {
+            "late_echo"
+        }
+        fn description(&self) -> &str {
+            "echoes its input; mounted after the extension runtime started"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({ "type": "object", "properties": { "text": { "type": "string" } } })
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(crate::tools::ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<crate::tools::ToolOutput> {
+            let text = input
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            Ok(crate::tools::ToolOutput {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(format!("echo:{text}")),
+                )],
+                details: None,
+                is_error: false,
+            })
+        }
+    }
+
+    /// Production-path check for the shared registry (bd-4t6oz): the JS
+    /// runtime boots on the same [`crate::tools::SharedToolRegistry`] the
+    /// agent is built over, a Rust tool is mounted through the agent AFTER
+    /// boot, and a `pi.tool` hostcall issued by an extension tool reaches it.
+    /// Under the previous split registry the runtime kept its pre-warm copy
+    /// and answered "Unknown tool: late_echo".
+    #[test]
+    fn hostcall_sees_tool_mounted_after_runtime_start() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "call_late_tool",
+                    description: "calls a tool the agent mounted after boot",
+                    parameters: { type: "object" },
+                    execute: async () => {
+                      const result = await pi.tool("late_echo", { text: "mounted-late" });
+                      return {
+                        content: [{ type: "text", text: JSON.stringify(result) }],
+                        isError: false
+                      };
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+            let manager = ExtensionManager::new();
+            let shared = crate::tools::SharedToolRegistry::new(ToolRegistry::new(
+                &[],
+                temp_dir.path(),
+                None,
+            ));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: temp_dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                shared.clone(),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load js extensions");
+
+            // The agent shares the registry handle and mounts a tool now that
+            // the runtime is already up.
+            let provider = Arc::new(ToolCallingProvider);
+            let mut agent =
+                Agent::with_shared_tools(provider, shared.clone(), AgentConfig::default());
+            assert!(!agent.has_tool("late_echo"));
+            agent.extend_tools(vec![Box::new(LateEchoTool) as Box<dyn crate::tools::Tool>]);
+            assert!(agent.has_tool("late_echo"));
+
+            let wrappers = collect_extension_tool_wrappers(
+                &manager,
+                json!({ "cwd": temp_dir.path().display().to_string() }),
+            )
+            .await
+            .expect("collect wrappers");
+            let wrapper = wrappers
+                .into_iter()
+                .find(|wrapper| wrapper.name() == "call_late_tool")
+                .expect("extension tool wrapper");
+            let output = wrapper
+                .execute("call-late", json!({}), None)
+                .await
+                .expect("extension tool executes");
+            let text = output
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !output.is_error && text.contains("echo:mounted-late"),
+                "the hostcall must reach the tool mounted after boot: is_error={} text={text}",
+                output.is_error
+            );
+        });
+    }
+
     // -- Constructor & builder tests --
 
     #[test]

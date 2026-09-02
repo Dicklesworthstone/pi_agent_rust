@@ -1616,6 +1616,58 @@ impl AgentSessionHandle {
         self.session.agent.extend_tools(wrappers);
     }
 
+    /// Bring MCP servers that extensions registered after startup into the
+    /// live session (bd-8m21l).
+    ///
+    /// Startup copies the extension-registered server definitions into the
+    /// MCP manager once; a `registerMcpServer` call from a later extension
+    /// callback only updated the extension manager's snapshot and stayed
+    /// unreachable until restart. This drains the snapshot: every definition
+    /// whose name the MCP manager does not know yet is registered under the
+    /// same trust gate as at startup, and when anything was new the trusted
+    /// servers are connected and only tool names not already mounted are
+    /// added. Returns the number of newly registered definitions. Called at
+    /// the start of every prompt; cheap when nothing changed.
+    pub async fn sync_extension_mcp_registrations(&mut self) -> usize {
+        let Some(manager) = self.mcp_manager.clone() else {
+            return 0;
+        };
+        let specs = match self.extension_manager() {
+            Some(extensions) => extensions.extension_mcp_servers(),
+            None => return 0,
+        };
+        if specs.is_empty() {
+            return 0;
+        }
+        let known: std::collections::HashSet<String> = manager
+            .list()
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+        let mut registered = 0usize;
+        for spec in specs {
+            let name = spec
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if name.is_empty() || known.contains(name) {
+                continue;
+            }
+            manager.register_extension_server(name, &spec);
+            registered += 1;
+        }
+        if registered > 0 {
+            tracing::info!(
+                event = "pi.mcp.extension_registrations_synced",
+                registered,
+                "registered extension MCP servers contributed after startup"
+            );
+            self.activate_mcp().await;
+        }
+        registered
+    }
+
     /// Send one user prompt through the agent loop.
     ///
     /// The `on_event` callback receives events for this prompt only.
@@ -1626,6 +1678,7 @@ impl AgentSessionHandle {
         input: impl Into<String>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.sync_extension_mcp_registrations().await;
         let combined = self.make_combined_callback(on_event);
         self.session.run_text(input.into(), combined).await
     }
@@ -1637,6 +1690,7 @@ impl AgentSessionHandle {
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.sync_extension_mcp_registrations().await;
         let combined = self.make_combined_callback(on_event);
         self.session
             .run_text_with_abort(input.into(), Some(abort_signal), combined)

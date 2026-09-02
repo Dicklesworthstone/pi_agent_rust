@@ -5288,7 +5288,7 @@ pub(crate) fn resize_image_if_needed(
 /// - Looking up a tool implementation by name during tool-call execution.
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     /// Shared by bash/jobs/hub and rebound by [`crate::agent::AgentSession`]
     /// to the live session handle.
     job_session_scope: crate::jobs::JobSessionScope,
@@ -5574,7 +5574,7 @@ impl ToolRegistry {
         }
 
         Self {
-            tools,
+            tools: tools.into_iter().map(Arc::from).collect(),
             job_session_scope,
             discoverable: discoverable_names,
             mutation_recorder,
@@ -5588,15 +5588,28 @@ impl ToolRegistry {
             tool.bind_job_session_scope(job_session_scope.clone());
         }
         Self {
-            tools,
+            tools: tools.into_iter().map(Arc::from).collect(),
             job_session_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
         }
     }
 
+    /// Shallow copy: the same tool handles, job scope, discoverability set,
+    /// and undo recorder. [`SharedToolRegistry::update`] publishes a new
+    /// snapshot from it without disturbing readers of the previous one.
+    #[must_use]
+    pub fn clone_shallow(&self) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            job_session_scope: self.job_session_scope.clone(),
+            discoverable: self.discoverable.clone(),
+            mutation_recorder: self.mutation_recorder.clone(),
+        }
+    }
+
     /// Convert the registry into the owned tool list.
-    pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
+    pub fn into_tools(self) -> Vec<Arc<dyn Tool>> {
         self.tools
     }
 
@@ -5631,7 +5644,7 @@ impl ToolRegistry {
     /// Append a tool.
     pub fn push(&mut self, mut tool: Box<dyn Tool>) {
         tool.bind_job_session_scope(self.job_session_scope.clone());
-        self.tools.push(tool);
+        self.tools.push(Arc::from(tool));
     }
 
     /// Extend the registry with additional tools.
@@ -5641,7 +5654,7 @@ impl ToolRegistry {
     {
         for mut tool in tools {
             tool.bind_job_session_scope(self.job_session_scope.clone());
-            self.tools.push(tool);
+            self.tools.push(Arc::from(tool));
         }
     }
 
@@ -5657,7 +5670,7 @@ impl ToolRegistry {
     }
 
     /// Get all tools.
-    pub fn tools(&self) -> &[Box<dyn Tool>] {
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
     }
 
@@ -5666,7 +5679,76 @@ impl ToolRegistry {
         self.tools
             .iter()
             .find(|t| t.name() == name)
-            .map(std::convert::AsRef::as_ref)
+            .map(|tool| &**tool)
+    }
+}
+
+/// One tool registry shared by the agent and every extension host.
+///
+/// Readers take an immutable snapshot and never hold a lock across an
+/// `await`; mounting tools publishes a new snapshot (clone-and-swap), so a
+/// `pi.tool` hostcall issued after a later mount sees the mounted tool on its
+/// next snapshot. Before this handle existed the extension runtime was given
+/// its own plain registry at pre-warm and never saw tools mounted later
+/// (bd-4t6oz).
+#[derive(Clone)]
+pub struct SharedToolRegistry {
+    inner: Arc<std::sync::RwLock<Arc<ToolRegistry>>>,
+}
+
+impl SharedToolRegistry {
+    #[must_use]
+    pub fn new(registry: ToolRegistry) -> Self {
+        Self::from_arc(Arc::new(registry))
+    }
+
+    #[must_use]
+    pub fn from_arc(registry: Arc<ToolRegistry>) -> Self {
+        Self {
+            inner: Arc::new(std::sync::RwLock::new(registry)),
+        }
+    }
+
+    /// Current snapshot. Cheap to take; hold it for one lookup plus the
+    /// tool's execution so the tool handle stays alive.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<ToolRegistry> {
+        match self.inner.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Publish a modified registry: shallow-copy the current snapshot, apply
+    /// `mutate`, and swap the result in atomically.
+    pub fn update(&self, mutate: impl FnOnce(&mut ToolRegistry)) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.clone_shallow();
+        mutate(&mut next);
+        *guard = Arc::new(next);
+    }
+}
+
+impl From<ToolRegistry> for SharedToolRegistry {
+    fn from(registry: ToolRegistry) -> Self {
+        Self::new(registry)
+    }
+}
+
+impl From<Arc<ToolRegistry>> for SharedToolRegistry {
+    fn from(registry: Arc<ToolRegistry>) -> Self {
+        Self::from_arc(registry)
+    }
+}
+
+impl std::fmt::Debug for SharedToolRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedToolRegistry")
+            .field("tools", &self.snapshot().tools().len())
+            .finish()
     }
 }
 

@@ -1045,7 +1045,36 @@ whose pane finally explained itself: `/share` was sent while the preceding
 `/name` update was still persisting and the product answered "Session is
 busy; retry `/share` after the current session update finishes". That is
 the documented retry contract, so the test retries on that message instead
-of racing it. Parked with
+of racing it.
+
+Round 6 (2026-09-02 evening) turned to the wiring gaps the reality check had
+anchored. bd-4t6oz slice 2: the extension runtimes no longer get their own
+plain tool registry at pre-warm. One `SharedToolRegistry` (a snapshot-swap
+handle: readers take an `Arc` snapshot and never hold a lock across a tool's
+execution; mounts clone-and-swap) is built once in `main` before the
+pre-warm, handed to the JS/native pre-warm and to the Agent
+(`Agent::with_shared_tools`), and the inline enable path used by the SDK and
+FrankenTUI sessions reuses the agent's handle instead of building a fresh
+registry without a workspace. Every hostcall context, the WASM host, the
+manager's WASM loader, and the dispatcher take a per-call snapshot, so a
+`pi.tool` hostcall sees tools mounted after boot (extension wrappers, MCP
+tools, plan tools) under the same undo recorder and workspace roots as the
+agent's own calls. The production-path test
+`hostcall_sees_tool_mounted_after_runtime_start` boots the runtime on the
+shared handle, mounts a Rust tool through the agent afterwards, and drives a
+`pi.tool` hostcall from an extension tool to it; under the split registry it
+fails with "Unknown tool". The atomic `setActiveTools` allow-set is the
+remaining slice on the bead. bd-8m21l followed on the same seam: an MCP
+server registered by an extension after startup only ever reached the
+extension manager's snapshot; the SDK session handle now drains that
+snapshot at the start of every prompt (`sync_extension_mcp_registrations`),
+registers unknown definitions through the startup trust gate, and reuses
+the existing connect-and-mount path that skips tool names already present.
+The feature-free test in `tests/mcp.rs` registers a late definition the way
+the hostcall does and checks: registered once, extension provenance, pending
+trust (nothing mounts), second sync registers nothing. The FrankenTUI and
+SDK paths get this; the classic TUI and RPC loops do not go through the SDK
+prompt entry and still need the same call. Parked with
 reasons: the ext-conformance artifact cluster is blocked by a stray ignored
 file (`tests/ext_conformance/artifacts/doom-overlay/tiny.wad`, bd-n4ov9,
 deletion needs written approval); eight orchestrate contract tests fail

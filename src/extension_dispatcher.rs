@@ -41,7 +41,9 @@ use crate::resource_governor::{
     AdmissionAction, AdmissionDecision, ResourceGovernor, ResourceOperationKind, ResourceRequest,
 };
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
+#[cfg(test)]
 use crate::tools::ToolRegistry;
+use crate::tools::SharedToolRegistry;
 
 struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for CancelGuard {
@@ -376,8 +378,9 @@ fn handle_exec_capture_frame(
 pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     /// Runtime bridge used by the dispatcher.
     runtime: Rc<dyn ExtensionDispatcherRuntime<C>>,
-    /// Registry of available tools (built-in + extension-registered).
-    tool_registry: Arc<ToolRegistry>,
+    /// Registry of available tools (built-in + extension-registered), shared
+    /// with the agent so later mounts are visible.
+    tool_registry: SharedToolRegistry,
     /// HTTP connector for pi.http() calls.
     http_connector: Arc<HttpConnector>,
     /// Session access for pi.session() calls.
@@ -2109,7 +2112,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     #[allow(clippy::too_many_arguments)]
     pub fn new<R>(
         runtime: Rc<R>,
-        tool_registry: Arc<ToolRegistry>,
+        tool_registry: impl Into<SharedToolRegistry>,
         http_connector: Arc<HttpConnector>,
         session: Arc<dyn ExtensionSession + Send + Sync>,
         ui_handler: Arc<dyn ExtensionUiHandler + Send + Sync>,
@@ -2132,7 +2135,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_policy<R>(
         runtime: Rc<R>,
-        tool_registry: Arc<ToolRegistry>,
+        tool_registry: impl Into<SharedToolRegistry>,
         http_connector: Arc<HttpConnector>,
         session: Arc<dyn ExtensionSession + Send + Sync>,
         ui_handler: Arc<dyn ExtensionUiHandler + Send + Sync>,
@@ -2157,7 +2160,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     #[allow(clippy::too_many_arguments)]
     fn new_with_policy_and_oracle_config<R>(
         runtime: Rc<R>,
-        tool_registry: Arc<ToolRegistry>,
+        tool_registry: impl Into<SharedToolRegistry>,
         http_connector: Arc<HttpConnector>,
         session: Arc<dyn ExtensionSession + Send + Sync>,
         ui_handler: Arc<dyn ExtensionUiHandler + Send + Sync>,
@@ -2175,7 +2178,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         let io_uring_force_compat = io_uring_force_compat_from_env();
         Self {
             runtime,
-            tool_registry,
+            tool_registry: tool_registry.into(),
             http_connector,
             session,
             ui_handler,
@@ -3006,7 +3009,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         name: &str,
         payload: serde_json::Value,
     ) -> HostcallOutcome {
-        let Some(tool) = self.tool_registry.get(name) else {
+        let registry = self.tool_registry.snapshot();
+        let Some(tool) = registry.get(name) else {
             return HostcallOutcome::Error {
                 code: "invalid_request".to_string(),
                 message: format!("Unknown tool: {name}"),

@@ -9949,7 +9949,7 @@ impl WasmExtensionHost {
     async fn instantiate_with(
         &self,
         extension: &WasmExtension,
-        tools: Arc<ToolRegistry>,
+        tools: crate::tools::SharedToolRegistry,
         manager: Option<ExtensionManagerHandle>,
         extension_id: &str,
     ) -> Result<wasm_host::Instance> {
@@ -11005,7 +11005,7 @@ pub trait HostcallInterceptor: Send + Sync {
 
 #[derive(Clone)]
 struct JsRuntimeHost {
-    tools: Arc<ToolRegistry>,
+    tools: crate::tools::SharedToolRegistry,
     /// Weak reference to avoid Arc cycle with the runtime thread.
     /// The thread holds a `JsRuntimeHost` which would otherwise prevent
     /// `ExtensionManager` from being dropped (and the channel from closing).
@@ -11653,7 +11653,7 @@ impl JsExtensionRuntimeHandle {
     #[allow(clippy::too_many_lines)]
     pub async fn start(
         config: PiJsRuntimeConfig,
-        tools: Arc<ToolRegistry>,
+        tools: impl Into<crate::tools::SharedToolRegistry>,
         manager: ExtensionManager,
     ) -> Result<Self> {
         Self::start_inner(config, tools, manager, None, None).await
@@ -11662,7 +11662,7 @@ impl JsExtensionRuntimeHandle {
     /// Like [`start`](Self::start) but uses a specific [`ExtensionPolicy`].
     pub async fn start_with_policy(
         config: PiJsRuntimeConfig,
-        tools: Arc<ToolRegistry>,
+        tools: impl Into<crate::tools::SharedToolRegistry>,
         manager: ExtensionManager,
         policy: ExtensionPolicy,
     ) -> Result<Self> {
@@ -11674,7 +11674,7 @@ impl JsExtensionRuntimeHandle {
     /// Used by conformance tests to provide deterministic exec/http/ui stubs.
     pub async fn start_with_interceptor(
         config: PiJsRuntimeConfig,
-        tools: Arc<ToolRegistry>,
+        tools: impl Into<crate::tools::SharedToolRegistry>,
         manager: ExtensionManager,
         interceptor: Arc<dyn HostcallInterceptor>,
     ) -> Result<Self> {
@@ -11685,7 +11685,7 @@ impl JsExtensionRuntimeHandle {
     /// an explicit [`ExtensionPolicy`].
     pub async fn start_with_interceptor_and_policy(
         config: PiJsRuntimeConfig,
-        tools: Arc<ToolRegistry>,
+        tools: impl Into<crate::tools::SharedToolRegistry>,
         manager: ExtensionManager,
         interceptor: Arc<dyn HostcallInterceptor>,
         policy: ExtensionPolicy,
@@ -11696,7 +11696,7 @@ impl JsExtensionRuntimeHandle {
     #[allow(clippy::too_many_lines)]
     async fn start_inner(
         mut config: PiJsRuntimeConfig,
-        tools: Arc<ToolRegistry>,
+        tools: impl Into<crate::tools::SharedToolRegistry>,
         manager: ExtensionManager,
         interceptor: Option<Arc<dyn HostcallInterceptor>>,
         policy: Option<ExtensionPolicy>,
@@ -11712,7 +11712,7 @@ impl JsExtensionRuntimeHandle {
 
         let manager_ref = Arc::downgrade(&manager.inner);
         let host = JsRuntimeHost {
-            tools,
+            tools: tools.into(),
             manager_ref: manager_ref.clone(),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
@@ -17883,11 +17883,14 @@ async fn dispatch_hostcall_with_runtime(
     // Convert JS request to canonical payload.
     let canonical = hostcall_request_to_payload(&request);
 
-    // Build the shared dispatch context from the JsRuntimeHost.
+    // Build the shared dispatch context from the JsRuntimeHost. The registry
+    // snapshot is taken per call so tools mounted after the runtime booted
+    // are visible to this hostcall.
+    let tools = host.tools.snapshot();
     let ctx = HostCallContext {
         runtime_name: "js",
         extension_id: request.extension_id.as_deref(),
-        tools: &host.tools,
+        tools: &tools,
         http: &host.http,
         manager: host.manager(),
         policy: &host.policy,

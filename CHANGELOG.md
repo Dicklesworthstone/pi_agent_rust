@@ -35,6 +35,28 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Changed
 
+- **Extension hostcalls share the agent's tool registry**: the JS, native,
+  and WASM extension runtimes used to be handed their own plain copy of the
+  tool registry at pre-warm, so a `pi.tool` hostcall could not see tools
+  mounted later (extension-registered tools, MCP tools, the plan tools) and,
+  on the SDK and FrankenTUI paths, ran without the session's workspace
+  confinement. One shared registry (`SharedToolRegistry`, snapshot-swap; no
+  lock is held across a tool's execution) now backs the agent and every
+  extension host: mounts publish a new snapshot, and each hostcall resolves
+  against the current one under the same undo recorder and workspace roots
+  as the agent's own tool calls. `Agent::with_shared_tools` and
+  `Agent::shared_tools` expose the handle; `Agent::new` keeps working.
+
+- **MCP servers registered by extensions after startup reach the live
+  session**: startup copied extension-registered MCP definitions into the
+  session's MCP manager once, so a `registerMcpServer` call from a later
+  extension callback only updated the extension manager's snapshot and stayed
+  unreachable until restart. SDK and FrankenTUI sessions now sync at the
+  start of every prompt (`sync_extension_mcp_registrations`): definitions the
+  MCP manager does not know yet are registered under the same trust gate as
+  at startup, trusted servers are connected, and only tool names not already
+  mounted are added.
+
 - **Docs now describe the shipped TUI**: README, AGENTS.md, and `docs/tui.md`
   document FrankenTUI as the default interactive stack with `--inline` and
   `--classic`, list the settings-gated `browser`, `computer`,
