@@ -19,7 +19,9 @@
 //!   status / growing `TextArea` editor / footer), tail-follow scroll,
 //!   spinner ticks, theme-derived [`FtuiPalette`], the shared keybinding
 //!   catalog via `KeyBinding::from_ftui_key`, inline ask cards, a modal
-//!   picker overlay (`/theme`), and input routing for `/model`, `/help`, and
+//!   picker overlay (`/theme`), the slash-command completion popup above the
+//!   editor (issue #208; shares [`crate::autocomplete`] with the charmed
+//!   stack), and input routing for `/model`, `/help`, and
 //!   display-only `!`/`!!` bash. All agent/tool-originated text passes
 //!   through `ftui::render::sanitize` before it can reach a frame.
 //! - [`run`]: the `pi --ftui` launch path — a driver thread owns an
@@ -1338,16 +1340,20 @@ impl PiFtuiModel {
     }
 
     /// Rows the popup reserves above the editor: one per visible suggestion
-    /// (capped at `max_visible`) plus the keyboard hint line.
+    /// (capped at `max_visible`) plus the keyboard hint line. The popup
+    /// never takes more than a third of the terminal so a short or inline
+    /// viewport keeps its conversation rows.
     fn completion_rows(&self) -> u16 {
         if !self.completion_visible() {
             return 0;
         }
+        let budget = usize::from(self.term.1 / 3).max(2);
         let items = self
             .autocomplete
             .items
             .len()
-            .min(self.autocomplete.max_visible);
+            .min(self.autocomplete.max_visible)
+            .min(budget - 1);
         u16::try_from(items + 1).unwrap_or(u16::MAX)
     }
 
@@ -2933,6 +2939,33 @@ impl PiFtuiModel {
         Paragraph::new(Text::from_lines(lines)).render(area, frame);
     }
 
+    /// Modal picker body + footer hint. Lines borrow the picker's strings —
+    /// no per-frame allocation.
+    fn render_picker(&self, picker: &PickerOverlay, regions: &Regions, frame: &mut Frame) {
+        let mut lines = vec![ftui::text::Line::styled(
+            picker.title.as_str(),
+            ftui::Style::new().bold().fg(self.palette.accent),
+        )];
+        for (i, item) in picker.items.iter().enumerate() {
+            let (marker, style) = if i == picker.selected {
+                ("▸ ", ftui::Style::new().bold().fg(self.palette.accent))
+            } else {
+                ("  ", ftui::Style::new())
+            };
+            lines.push(ftui::text::Line::from_spans([
+                ftui::text::Span::styled(marker, style),
+                ftui::text::Span::styled(item.as_str(), style),
+            ]));
+        }
+        Paragraph::new(Text::from_lines(lines)).render(regions.body, frame);
+        let footer_style = ftui::Style::new().dim().fg(self.palette.muted);
+        Paragraph::new(Text::from_lines([ftui::text::Line::styled(
+            PICKER_HINT,
+            footer_style,
+        )]))
+        .render(regions.footer, frame);
+    }
+
     fn render_frame(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let regions = layout_regions(
@@ -2951,31 +2984,9 @@ impl PiFtuiModel {
         )]))
         .render(regions.header, frame);
 
-        // Modal picker takes over the conversation body while open. Lines
-        // borrow the picker's strings — no per-frame allocation.
+        // Modal picker takes over the conversation body while open.
         if let Some(picker) = &self.picker {
-            let mut lines = vec![ftui::text::Line::styled(
-                picker.title.as_str(),
-                ftui::Style::new().bold().fg(self.palette.accent),
-            )];
-            for (i, item) in picker.items.iter().enumerate() {
-                let (marker, style) = if i == picker.selected {
-                    ("▸ ", ftui::Style::new().bold().fg(self.palette.accent))
-                } else {
-                    ("  ", ftui::Style::new())
-                };
-                lines.push(ftui::text::Line::from_spans([
-                    ftui::text::Span::styled(marker, style),
-                    ftui::text::Span::styled(item.as_str(), style),
-                ]));
-            }
-            Paragraph::new(Text::from_lines(lines)).render(regions.body, frame);
-            let footer_style = ftui::Style::new().dim().fg(self.palette.muted);
-            Paragraph::new(Text::from_lines([ftui::text::Line::styled(
-                PICKER_HINT,
-                footer_style,
-            )]))
-            .render(regions.footer, frame);
+            self.render_picker(picker, &regions, frame);
             return;
         }
 

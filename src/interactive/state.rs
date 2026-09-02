@@ -120,24 +120,24 @@ pub enum PendingInput {
 
 /// Autocomplete dropdown state.
 #[derive(Debug)]
-pub(crate) struct AutocompleteState {
+pub struct AutocompleteState {
     /// The autocomplete provider that generates suggestions.
-    pub(crate) provider: AutocompleteProvider,
+    pub provider: AutocompleteProvider,
     /// Whether the dropdown is currently visible.
-    pub(crate) open: bool,
+    pub open: bool,
     /// Current list of suggestions.
-    pub(crate) items: Vec<AutocompleteItem>,
+    pub items: Vec<AutocompleteItem>,
     /// Index of the currently selected item, or `None` when the popup is open
     /// but the user has not yet navigated with arrow keys / Tab.
-    pub(crate) selected: Option<usize>,
+    pub selected: Option<usize>,
     /// The range of text to replace when accepting a suggestion.
-    pub(crate) replace_range: std::ops::Range<usize>,
+    pub replace_range: std::ops::Range<usize>,
     /// Maximum number of items to display in the dropdown.
-    pub(crate) max_visible: usize,
+    pub max_visible: usize,
 }
 
 impl AutocompleteState {
-    pub(crate) const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
+    pub const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
         Self {
             provider: AutocompleteProvider::new(cwd, catalog),
             open: false,
@@ -155,14 +155,14 @@ impl AutocompleteState {
         self.close();
     }
 
-    pub(crate) fn close(&mut self) {
+    pub fn close(&mut self) {
         self.open = false;
         self.items.clear();
         self.selected = None;
         self.replace_range = 0..0;
     }
 
-    pub(crate) fn open_with(&mut self, response: AutocompleteResponse) {
+    pub fn open_with(&mut self, response: AutocompleteResponse) {
         if response.items.is_empty() {
             self.close();
             return;
@@ -189,7 +189,7 @@ impl AutocompleteState {
         self.replace_range = response.replace;
     }
 
-    pub(crate) const fn select_next(&mut self) {
+    pub const fn select_next(&mut self) {
         if !self.items.is_empty() {
             self.selected = Some(match self.selected {
                 Some(idx) => (idx + 1) % self.items.len(),
@@ -198,7 +198,7 @@ impl AutocompleteState {
         }
     }
 
-    pub(crate) fn select_prev(&mut self) {
+    pub fn select_prev(&mut self) {
         if !self.items.is_empty() {
             self.selected = Some(match self.selected {
                 Some(idx) => idx.checked_sub(1).unwrap_or(self.items.len() - 1),
@@ -207,7 +207,7 @@ impl AutocompleteState {
         }
     }
 
-    pub(crate) fn selected_item(&self) -> Option<&AutocompleteItem> {
+    pub fn selected_item(&self) -> Option<&AutocompleteItem> {
         self.selected.and_then(|idx| self.items.get(idx))
     }
 
@@ -215,7 +215,7 @@ impl AutocompleteState {
     /// rows actually visible (which the renderer may clamp below
     /// `max_visible` on short terminals — using `max_visible` here would let
     /// the highlighted item scroll out of the rendered window).
-    pub(crate) const fn scroll_offset(&self, visible: usize) -> usize {
+    pub const fn scroll_offset(&self, visible: usize) -> usize {
         match self.selected {
             Some(idx) if visible > 0 && idx >= visible => idx - visible + 1,
             _ => 0,

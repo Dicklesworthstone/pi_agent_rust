@@ -6,7 +6,7 @@ use super::ext_session::{format_extension_ui_prompt, parse_extension_ui_response
 use super::*;
 use crate::extension_events::{BeforeAgentStartOutcome, apply_before_agent_start_response};
 
-pub(crate) fn extension_commands_for_catalog(
+pub fn extension_commands_for_catalog(
     manager: &ExtensionManager,
 ) -> Vec<crate::autocomplete::NamedEntry> {
     manager
