@@ -759,8 +759,10 @@ changes alone. **Complexity.** S. **Beads.** None → new.
 
 #### Gap P2 — Repository leftovers from this session (need your permission)
 
-- `src/current_time.rs`: orphaned duplicate; delete (Rule 1: permission
-  required), then remove its row from `docs/TEST_COVERAGE_MATRIX.md`.
+- `src/current_time.rs`: was an orphaned duplicate; superseded on
+  2026-09-02 when the maintainer's 416cabe9 dropped the `src/tools.rs` copy
+  in favour of this module, so it is now the shipped implementation and
+  nothing here needs deleting (matrix row updated).
 - `/data/projects/pi_agent_rust_baseline`: throwaway clone at 08485a20 used
   for the baseline classification; delete.
 - `<scratchpad>/gate-wt`: git worktree (registered in `git worktree list`);

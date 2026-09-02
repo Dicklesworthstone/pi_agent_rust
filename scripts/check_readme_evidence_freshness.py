@@ -45,6 +45,15 @@ PERF_BUDGET_SUMMARY_SCHEMA = "pi.perf.budget_summary.v2"
 PERF_BUDGET_INVENTORY_SHA256 = (
     "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6"
 )
+# `--self-test` points this at the hash of its own fixture inventory so the
+# validator's logic can be exercised regardless of whether the repository's
+# live artifact currently matches the pinned producer contract above. Real
+# checks never set it; they always compare against the pinned constant.
+_ACTIVE_INVENTORY_SHA256: str | None = None
+
+
+def expected_inventory_sha256() -> str:
+    return _ACTIVE_INVENTORY_SHA256 or PERF_BUDGET_INVENTORY_SHA256
 PERF_SUMMARY_FIELDS = frozenset(
     {
         "schema",
@@ -1400,11 +1409,12 @@ def performance_budget_claim_errors(
 
         inventory_json = _canonical_budget_inventory_json(budgets)
         inventory_sha256 = hashlib.sha256(inventory_json.encode("utf-8")).hexdigest()
-        if inventory_sha256 != PERF_BUDGET_INVENTORY_SHA256:
+        expected_sha256 = expected_inventory_sha256()
+        if inventory_sha256 != expected_sha256:
             fail(
                 "budget inventory does not match the canonical producer contract "
                 f"(observed_sha256={inventory_sha256}, "
-                f"expected_sha256={PERF_BUDGET_INVENTORY_SHA256})"
+                f"expected_sha256={expected_sha256})"
             )
 
         results_by_name: dict[str, dict[str, object]] = {}
@@ -2130,6 +2140,15 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
 
 def run_self_test() -> int:
     """Exercise citation, path, detailed budget, and Git-binding contracts."""
+    global _ACTIVE_INVENTORY_SHA256
+    try:
+        return _run_self_test_cases()
+    finally:
+        _ACTIVE_INVENTORY_SHA256 = None
+
+
+def _run_self_test_cases() -> int:
+    global _ACTIVE_INVENTORY_SHA256
     now = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
     canonical_generated_at = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
     fresh_ts = now.timestamp()
@@ -2145,6 +2164,25 @@ def run_self_test() -> int:
     if not isinstance(canonical_budgets, list):
         print("SELF-TEST FAIL: canonical budget fixture must contain a budgets array")
         return 2
+    # The live artifact only lends its inventory as fixture content. Whether
+    # that inventory matches the pinned producer contract is the real check's
+    # verdict (it fails closed on the README), not this self-test's; before
+    # 2026-09-02 the two were coupled, so the self-test went red with the
+    # evidence instead of testing the validator.
+    try:
+        fixture_inventory_sha256 = hashlib.sha256(
+            _canonical_budget_inventory_json(canonical_budgets).encode("utf-8")
+        ).hexdigest()
+    except (KeyError, TypeError, ValueError, PerformanceContractError) as exc:
+        print(f"SELF-TEST FAIL: canonical budget fixture is not a valid inventory: {exc}")
+        return 2
+    _ACTIVE_INVENTORY_SHA256 = fixture_inventory_sha256
+    if fixture_inventory_sha256 != PERF_BUDGET_INVENTORY_SHA256:
+        print(
+            "SELF-TEST NOTE: the live tests/perf/reports/budget_summary.json inventory "
+            f"({fixture_inventory_sha256}) differs from the pinned producer contract "
+            f"({PERF_BUDGET_INVENTORY_SHA256}); the real README check reports that."
+        )
 
     def cloned(value: object) -> object:
         return json.loads(json.dumps(value))
@@ -2874,7 +2912,7 @@ def run_self_test() -> int:
             now,
             "tests/perf/reports/budget_summary.json",
         )
-        if not any(PERF_BUDGET_INVENTORY_SHA256 in error for error in errors):
+        if not any(fixture_inventory_sha256 in error for error in errors):
             print(errors)
             print("SELF-TEST FAIL: canonical budget inventory order/hash must be exact")
             return 2
