@@ -6,6 +6,25 @@ Pi release builds use the exact `nightly-2026-07-05` toolchain pinned in
 `rust-toolchain.toml`. The locked dependency graph requires Rust 1.95 or newer;
 use the repository pin so compiler and Clippy results remain reproducible.
 
+The one authoritative quality entry point is the registered DSR recipe; it
+owns formatting, compiler checks, Clippy, tests, the installer regression, and
+module reachability, and it routes Cargo through `rch` so a shared host never
+compiles locally:
+
+```bash
+# Authoritative gate (registry entry in ~/.config/dsr/repos.yaml, or the
+# checked-in copy in .dsr/repos.yaml on a host that has not registered it)
+dsr quality --tool pi_agent_rust
+DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust
+
+# Cross-platform release artifacts (release operator's machine only)
+dsr build pi_agent_rust
+```
+
+The `rch exec -- cargo ...` commands below are the same invocations the recipe
+runs; use them for a tight inner development loop, never as a substitute for
+the DSR result when closing a Bead or making a quality claim.
+
 ```bash
 # Build dev binary
 rch exec -- cargo build
@@ -42,7 +61,11 @@ We enforce a strict "no mocks" policy for core logic. Tests use real filesystem 
 ### Unit & Integration Tests
 
 ```bash
-# Run all tests
+# Authoritative: the DSR recipe runs `cargo test --locked --all-targets`
+# through rch together with fmt/check/clippy/installer/reachability
+dsr quality --tool pi_agent_rust
+
+# Inner loop only (not a quality claim)
 rch exec -- cargo test
 
 # Run specific module

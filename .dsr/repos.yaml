@@ -1,0 +1,52 @@
+# Portable DSR registry entry for pi_agent_rust.
+#
+# Doodlestein Self-Releaser (dsr) is the only quality/build/release authority
+# for this repository (AGENTS.md "Build, Quality, and Release Authority").
+# `dsr quality` reads its checks from the registry file only, so a host whose
+# ~/.config/dsr/repos.yaml lacks this entry cannot run the gate at all. This
+# file makes the recipe part of the source tree:
+#
+#   # one-off, no registry merge:
+#   DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust
+#
+#   # or merge it into the host registry once (yq >= 4):
+#   yq -i '.tools.pi_agent_rust = load(".dsr/repos.yaml").tools.pi_agent_rust' \
+#     ~/.config/dsr/repos.yaml
+#
+# Cross-platform builds/releases still need the per-host build authority in
+# ~/.config/dsr/repos.d/pi_agent_rust.yaml on the release operator's machine
+# (docs/releasing.md "Canonical DSR release lane"); the keys below are the
+# registry subset and must stay identical to that file where they overlap.
+#
+# Check list = AGENTS.md "Compiler and Test Checks". Cargo runs through rch so
+# a shared swarm host never compiles locally; rch owns the remote target dir
+# (docs/perf-budgets-recipe.md section 3 explains why the old
+# /tmp/pi-agent-rust-dsr hardcode was dropped). RCH_REQUIRE_REMOTE=1 is rch's
+# fail-closed proof mode: if no worker can take the job the check fails
+# instead of rch silently compiling on the local host (which happened on
+# 2026-09-01 when the checkout lived under a path rch could not normalize).
+# RCH_FORCE_REMOTE, used by older scripts, still fails open. The timeout
+# overrides cover a cold all-targets check/test of this crate; rch's defaults
+# (300 s build / 1800 s test) are too small for it.
+
+schema_version: "1.0.0"
+
+tools:
+  pi_agent_rust:
+    repo: Dicklesworthstone/pi_agent_rust
+    local_path: /data/projects/pi_agent_rust
+    language: rust
+    binary_name: pi
+    targets:
+      - linux/amd64
+      - linux/arm64
+      - darwin/amd64
+      - darwin/arm64
+      - windows/amd64
+    checks:
+      - cargo fmt --check
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 rch exec -- cargo check --locked --all-targets
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 rch exec -- cargo clippy --locked --all-targets -- -D warnings
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 rch exec -- cargo test --locked --all-targets
+      - bash tests/installer_regression.sh
+      - python3 scripts/check_module_reachability.py

@@ -17,6 +17,34 @@ only as historical design context. It is non-authoritative and must not be
 executed. The canonical operational path is the DSR lane in this document,
 using the registered `pi_agent_rust` recipe.
 
+Repository enforcement: GitHub Actions was switched off at the repository
+level on 2026-09-01 (`gh api repos/Dicklesworthstone/pi_agent_rust/actions/permissions`
+now reports `"enabled": false`), so the retained workflow files cannot run on
+push, tag, schedule, or dispatch even though their `on:` triggers are still
+written. Do not re-enable it.
+
+### Registering the quality recipe on a new host
+
+`dsr quality` reads checks only from the registry file, so a host without the
+`pi_agent_rust` entry cannot run the gate. The registry subset of the recipe
+is checked in at `.dsr/repos.yaml` (six checks: fmt, `cargo check`, Clippy,
+`cargo test`, installer regression, module reachability; Cargo runs through
+`rch` under `RCH_REQUIRE_REMOTE=1`, so a missing fleet fails the check instead
+of silently compiling on the host, with build/test timeouts raised to fit a
+cold all-targets run). Either point DSR at it for a one-off run or merge it
+into the host registry once:
+
+```bash
+DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust --dry-run   # expect 6 planned
+yq -i '.tools.pi_agent_rust = load(".dsr/repos.yaml").tools.pi_agent_rust' ~/.config/dsr/repos.yaml
+dsr quality --tool pi_agent_rust
+```
+
+Per-check logs land under `~/.local/state/dsr/quality-logs/pi_agent_rust/`.
+Cross-platform builds and releases additionally need the build authority file
+`~/.config/dsr/repos.d/pi_agent_rust.yaml` on the release operator's machine;
+keys that appear in both files must stay identical (`dsr repos validate`).
+
 The Cargo source package also retains the internal `pi_legacy_capture`
 conformance utility because integration tests execute it through
 `CARGO_BIN_EXE_pi_legacy_capture`. It is gated by the non-default

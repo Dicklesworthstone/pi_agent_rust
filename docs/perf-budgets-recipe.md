@@ -65,8 +65,28 @@ DSR routes cargo invocations through `rch` (per the AGENTS.md
 - `rch diagnose` must show at least one healthy worker.
 - The worker must support the host target triple
   (the recipes are x86_64-linux-gnu and aarch64-darwin).
-- If the fleet is unreachable, DSR falls back to local cargo
+- If the fleet is unreachable, plain `rch exec` falls back to local cargo
   silently; the resulting evidence is **invalid per AGENTS.md**.
+
+Observed 2026-09-01: running the recipe from a git worktree under
+`/data/tmp/...` made every worker refuse with "Project path normalization
+failed", and `rch exec` then compiled `cargo check --all-targets` locally on a
+load-50 swarm host while DSR kept reporting the check as running. Two
+mitigations are now baked into the recipe (`.dsr/repos.yaml` and the host
+registry):
+
+- Every cargo check is prefixed with `RCH_REQUIRE_REMOTE=1`, rch's
+  fail-closed proof mode: no eligible worker means the check fails with an
+  rch refusal instead of a local compile. (`RCH_FORCE_REMOTE`, which older
+  scripts use, still fails open.)
+- `RCH_BUILD_TIMEOUT_SEC=3600` / `RCH_TEST_TIMEOUT_SEC=7200` raise rch's
+  300 s / 1800 s defaults, which a cold all-targets check or test of this
+  crate exceeds.
+
+Run the recipe from the primary checkout path (`/data/projects/pi_agent_rust`
+on the swarm host), not from a temporary worktree, and do not edit the tree
+while it runs: DSR snapshots `HEAD`, the porcelain status, and `Cargo.lock`
+before and after and marks the run `invalidated-moving-source` on any change.
 
 The preflight runs `rch diagnose` and refuses to proceed with
 `RCH_QUIET=1` or empty fleet.

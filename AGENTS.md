@@ -224,8 +224,9 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 | `src/providers/cohere.rs` | Cohere API implementation |
 | `src/providers/azure.rs` | Azure OpenAI API implementation |
 | `src/providers/mod.rs` | Provider factory and extension stream-simple bridge |
-| `src/tools.rs` | 9 built-in tools (`subagent` is opt-in) |
-| `src/interactive.rs` | Interactive TUI application state and event loop |
+| `src/tools.rs` | Tool trait, registry, and the core file/shell/search tools; other built-ins live in their own modules (35 total, tiered in `src/xdev.rs`; `subagent` is opt-in) |
+| `src/interactive_ftui.rs` | Default FrankenTUI interactive stack (feature `ftui`, on by default) |
+| `src/interactive.rs` | Classic charmed_rust TUI application state and event loop (`--classic`) |
 | `src/rpc.rs` | RPC/stdin server mode |
 | `src/extensions.rs` | Stable extension facade, public contracts, manager state, and shared entry points |
 | `src/extensions/` | Focused manager, protocol, policy, connector, runtime, and behavior-domain test modules |
@@ -252,16 +253,13 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 - Extension-provided providers via stream-simple bridge
 - Tool definitions with JSON Schema
 
-**Built-in Tools:**
-- `read` - Read files with line numbers, image support
-- `write` - Create/overwrite files
-- `edit` - String replacement editing
-- `bash` - Shell command execution with timeout
-- `grep` - Content search with context
-- `find` - File discovery with glob patterns
-- `ls` - Directory listing
-- `hashline_edit` - Precise edits using `LINE#HASH` tags from `read`/`grep` with `hashline=true`
-- `subagent` - Native isolated Rust Pi child-agent delegation (opt-in via `--tools ...subagent`)
+**Built-in Tools** (35 total; the tier table is `ESSENTIAL_DEFAULTS` / `OPT_IN_ONLY` in `src/xdev.rs`, the default `--tools` list is in `src/cli.rs`, and README "35 Built-in Tools" is the user-facing inventory — keep all three in sync):
+- Essential, always in the schema: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`, `web_search`, `submit_plan`, `current_time`, `xdev`
+- Discoverable behind `xdev`: `ast_grep`, `ast_edit`, `lsp`, `debug`, `manage_skill`, plus the memory bank (`retain`, `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is `local`
+- Default-enabled: `jobs`, `hub`
+- `--tools` opt-in: `eval`, `github`, `security_scan`
+- Settings-gated: `browser`, `computer`, `inspect_image`, `generate_image`, `tts`
+- `subagent` - Native isolated Rust Pi child-agent delegation (opt-in only via `--tools ...subagent`)
 
 **Session Management:**
 - JSONL format (version 3)

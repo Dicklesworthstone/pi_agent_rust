@@ -42,7 +42,7 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 28 built-in tools (18 live in a default session; 13 always in the model's schema, the rest reachable through the `xdev` dispatcher).
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 35 built-in tools (19 in the default `--tools` list; 14 always in the model's schema, the rest reachable through the `xdev` dispatcher or enabled in settings).
 
 ### Current product direction
 
@@ -203,8 +203,8 @@ If you want full details, see:
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
 | **Startup** | Native single-binary path (Fresh `v0.3.0` measurement pending; pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
-| **Binary size** | Size-budgeted release profile (Fresh `v0.3.0` measurement pending; pre-v0.3.0 target: 23-32 MB, <48MB budget; see `tests/perf/reports/budget_summary.json` `binary_size_release` and `docs/perf-budgets-recipe.md`) | Runtime-dependent |
-| **Memory (idle)** | Bounded-resource design (Fresh `v0.3.0` measurement pending; pre-v0.3.0 claim: ~4.9 MB RSS interactive idle, <50MB target; see `tests/perf/reports/budget_summary.json` `idle_memory_rss` and `docs/perf-budgets-recipe.md` for the canonical 5-measurement taxonomy) | Runtime-dependent |
+| **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state-auto-generated), never promoted here until claim readiness is `ready` | Runtime-dependent |
+| **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state-auto-generated) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
 | **Tool execution** | Process tree management | Basic subprocess |
 | **Sessions** | JSONL with branching | Varies |
@@ -388,22 +388,30 @@ pi "Write a quicksort implementation"
 
 Watch the response appear incrementally, with thinking blocks shown inline.
 
-### 28 Built-in Tools
+### 35 Built-in Tools
 
 Tools are tiered so the model's live schema stays small while everything
-remains reachable:
+remains reachable. The tier table lives in `src/xdev.rs`; the default
+`--tools` list lives in `src/cli.rs`:
 
 - **Essential** (always in the provider schema): `read`, `write`, `edit`,
   `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`,
-  `web_search`, `submit_plan`, `xdev`
+  `web_search`, `submit_plan`, `current_time`, `xdev`
 - **Discoverable** (registered, hidden from the schema until promoted via
   `xdev list/describe/run/promote`): `ast_grep`, `ast_edit`, `lsp`,
   `debug`, `manage_skill` — plus the memory-bank tools (`retain`,
   `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is
   `local`
 - **Default-enabled**: `jobs` (background bash job control) and `hub` (PTY
-  service supervision), alongside the essential tier
+  service supervision), alongside the essential tier. The default `--tools`
+  list names 19 tools; the registry always adds `manage_skill` and, when any
+  discoverable tool is enabled, the `xdev` dispatcher
 - **`--tools` opt-in extras**: `eval`, `github`, `security_scan`
+- **Settings-gated extras** (off until enabled in `settings.json`):
+  `browser` (`browser.enableBrowser`), `computer`
+  (`computer.enableComputer`), and the media trio `inspect_image`,
+  `generate_image`, `tts` (`media.enableInspectImage` /
+  `media.enableGenerateImage` / `media.enableTts`)
 - **Opt-in only**: `subagent` (it can start additional coding-agent
   processes)
 
@@ -416,6 +424,7 @@ remains reachable:
 | `web_search` | Ranked multi-provider web search with circuit breaking |
 | `ask` / `todo` | Structured mid-turn option cards; persistent session task list |
 | `submit_plan` | Submit a completed plan for approval when plan mode is active |
+| `current_time` | Host wall-clock: UTC and local ISO-8601, offset, Unix epoch, weekday, ISO week (no arguments) |
 | `xdev` | Dispatcher exposing the discoverable tier (`list/describe/run/promote`) |
 | `ast_grep` / `ast_edit` | Structural code search and rewrite |
 | `lsp` / `debug` | Language-server (14 ops) and DAP debugging (29 ops) bridges |
@@ -424,6 +433,9 @@ remains reachable:
 | `github` | `gh`-backed PR/issue/run operations |
 | `security_scan` | Rule-pack security scanning to SARIF (`plan`/`run`/`disposition`/`compare`) |
 | `manage_skill` + memory tools | Managed skills CRUD; opt-in project memory bank |
+| `browser` | Headless Chromium automation over CDP (navigate, snapshot, click, type, screenshot) with a domain allowlist; settings-gated |
+| `computer` | Desktop automation (displays, windows, screenshots, mouse/keyboard, clipboard); mutating actions require approval; settings-gated |
+| `inspect_image` / `generate_image` / `tts` | Vision analysis of local images, image generation/editing, and text-to-speech through provider adapters; settings-gated |
 | `subagent` | Delegate isolated work to named Rust Pi child agents |
 
 All tools include automatic truncation for large outputs (2000 lines /
@@ -543,7 +555,7 @@ Pi runs in four modes, each suited to different workflows:
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
-**Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking.
+**Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking. Since v0.4.0 the default interactive stack is the FrankenTUI (`ftui`) runtime; `pi --inline` keeps your shell scrollback by drawing the UI at the bottom of the screen instead of on the alternate screen, and `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`) selects the previous charmed_rust stack until it is removed.
 
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
 
@@ -690,7 +702,7 @@ From:
 - Historical verdict blob at `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8`; the live file may contain a later verdict)
 
 - Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.3.0`)*
-- Unified evidence bundle, as regenerated `2026-08-04`: `29` total sections, `27` present, `0` missing, `2` invalid (bundle verdict: `insufficient`) *(from tests/evidence_bundle/index.json; historical snapshot)*
+- Unified evidence bundle, as regenerated `2026-08-28`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
 - Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed — the May 2026 `123/123` snapshot predates the expanded corpus *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
 - Extension health delta, as regenerated `2026-08-17`: `226` extensions tested at `95.6%` pass rate with `0` regressions vs the 2026-02-07 baseline *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
 - Extension journey coverage, as regenerated `2026-08-17`: `125/125` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
@@ -769,8 +781,11 @@ For migration adoption, packaging and invocation compatibility follows this cont
 - If you keep TypeScript `pi` as canonical (`--keep-existing-pi`), Rust Pi is installed as `pi-rust`.
 - On Apple Silicon, the installer prefers the native arm64 artifact even when launched from a Rosetta-translated shell.
 - Version-pinned installs are supported via `install.sh --version vX.Y.Z` for deterministic rollouts.
-- Every DSR release ships each platform archive with a same-name `.sha256`
-  sidecar for integrity validation.
+- DSR releases ship each platform archive with a same-name `.sha256` sidecar
+  for integrity validation. The v0.3.0 release predates that contract and
+  ships an aggregate `SHA256SUMS` instead; the installer verifies the
+  per-asset sidecar first and falls back to `SHA256SUMS` only when the
+  sidecar is absent.
 
 Representative smoke checks:
 
@@ -1679,9 +1694,11 @@ These pieces are intentionally conservative: if confidence is weak, Pi holds ste
 
 ### Interactive TUI Architecture
 
-The interactive mode uses the **Elm Architecture** (Model-Update-View) via the `charmed_rust` library family, which is a Rust port of Go's [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework.
+The default interactive stack is **FrankenTUI** (`src/interactive_ftui.rs`, feature `ftui`, on by default since the 2026-08-25 cutover). It keeps the **Elm Architecture** (Model-Update-View): a driver thread owns an asupersync runtime plus an SDK agent session, agent events arrive through an `AgentEventSubscription`, and `PiFtuiModel` renders header, markdown conversation, status line, growing editor, and footer regions with tail-follow scrolling, per-entry render caching, inline ask cards, and modal overlays. All agent- and tool-originated text is sanitized before it reaches a frame. `pi --inline` draws the UI at the bottom of the terminal and preserves shell scrollback.
 
-**Component stack:**
+The previous stack, built on the `charmed_rust` library family (a Rust port of Go's [Bubble Tea](https://github.com/charmbracelet/bubbletea)), lives in `src/interactive.rs` and is still selectable with `pi --classic` until it is deleted. The diagram below describes that classic stack; the FrankenTUI stack keeps the same agent/UI split and the same `PiMsg` event vocabulary.
+
+**Component stack (classic `--classic` stack):**
 
 ```
 ┌────────────────────────────────────────────────────┐
@@ -2079,13 +2096,15 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
 - Current strict budget summary (run `beige-evidence-refresh-20260823`, source
-  `2697f21d`): `19` declared budgets — `12` PASS, `5` FAIL, `2` NO_DATA;
-  claim readiness is `blocked` and performance claims are NOT authorized.
-  The FAIL set: extension cold-load p95 over budget, tool-call latency and
-  throughput inputs missing (fail-closed), idle-memory RSS artifact absent,
-  and binary size measured against the wrong (unstripped perf-profile)
-  artifact — harness fix landed, re-measurement pending.
-  Current counts are value-bound to the artifact:
+  `2697f21d`): `19` declared budgets. Its per-budget `budget_results` rows
+  show `16` PASS and `3` FAIL (extension simple cold-load p95 over budget,
+  tool-call latency and throughput inputs missing, fail-closed); claim
+  readiness is `blocked` and performance claims are NOT authorized. The
+  artifact's aggregate header still reports `12` PASS, `5` FAIL, `2`
+  NO_DATA from before the 2026-08-28 idle-memory, binary-size,
+  complex-cold-load, and event-dispatch re-measurements, so the header and
+  the rows disagree until the summary is regenerated (bd-sog97.20).
+  Counts are value-bound to the artifact:
   *(from tests/perf/reports/budget_summary.json)*
 - Before spending time on a definitive refresh, run
   `python3 scripts/perf/preflight_budget_inputs.py` to list missing budget
@@ -2114,7 +2133,7 @@ Current checked-in performance evidence state:
   throughput, memory, or startup numbers to this README.
 
 - Full-suite gate at its latest regeneration (`2026-08-04`): `17/20` gates passed with `12/14` blocking gates. The `ext_must_pass` blocker is now substantive rather than staleness-only: the `2026-08-17` regeneration recorded `206/208` with two marckrenn-pi-sub family failures (tracked for remediation), alongside the practical-finish checkpoint *(from tests/full_suite_gate/full_suite_verdict.json; historical snapshot)*
-- Unified evidence bundle, as regenerated `2026-08-04`: `29` total sections, `27` present, `0` missing, `2` invalid (bundle verdict: `insufficient`) *(from tests/evidence_bundle/index.json; historical snapshot)*
+- Unified evidence bundle, as regenerated `2026-08-28`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
 - Historical drop-in result: `22/22` certification gates passed, overall verdict `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the verdict blob stored at Git revision `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91`, not from the live verdict file)*
 - Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
 - Context-intelligence closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, redaction posture, perf-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/context-intelligence-closeout-gate.json; historical snapshot)*
@@ -2785,7 +2804,7 @@ A: Memory safety is non-negotiable for a tool that executes arbitrary commands. 
 A: Pi has a full extension system with two runtime families: JS/TS entrypoints run in embedded QuickJS, and `*.native.json` descriptors run in the native-rust descriptor runtime. Both are capability-gated and audited through the same policy system. One session uses one runtime family at a time. Extensions can register tools, slash commands, event hooks, flags, and custom providers. See [EXTENSIONS.md](docs/planning/EXTENSIONS.md) for details. For built-in tool changes, implement the `Tool` trait in `src/tools.rs`.
 
 **Q: Why isn't X feature included?**
-A: Pi focuses on core coding assistance. Features like web browsing, image generation, etc. are out of scope. Use specialized tools for those.
+A: Pi focuses on core coding assistance, and the default tool set reflects that. Browser automation, desktop control, image analysis/generation, and text-to-speech exist as settings-gated tools (`browser`, `computer`, `inspect_image`, `generate_image`, `tts`) so they cost nothing in the model's schema unless you turn them on. Anything beyond that is out of scope; use specialized tools.
 
 **Q: How does compaction work?**
 A: When a conversation exceeds the model's context window, Pi summarizes older messages using the LLM itself, storing the summary as a session entry. Recent messages are kept verbatim. The cut point is chosen at a turn boundary, and the summary includes a record of which files were read or modified so the model retains that awareness. Compaction runs automatically after each agent turn when needed, or manually via `/compact`.
@@ -2812,7 +2831,7 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 | **Startup** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
 | **Memory** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
 | **Providers** | 11 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
-| **Tools** | 28 built-in (18 default-enabled) | Many | File-focused | IDE-integrated |
+| **Tools** | 35 built-in (19 in the default `--tools` list) | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |
 
@@ -2965,8 +2984,9 @@ src/
 ├── session_index.rs        # SQLite session metadata index/cache
 ├── session_sqlite.rs       # Default-enabled sqlite-sessions backend support
 ├── compaction.rs           # Context compaction algorithm
-├── interactive.rs          # Interactive TUI app loop/state
-├── interactive/            # Bubble Tea-style TUI submodules
+├── interactive_ftui.rs     # Default FrankenTUI interactive stack (feature `ftui`)
+├── interactive.rs          # Classic charmed_rust TUI app loop/state (`--classic`)
+├── interactive/            # Bubble Tea-style TUI submodules shared by both stacks
 ├── rpc.rs                  # RPC/stdio mode
 ├── extensions.rs           # Stable extension facade + manager/lifecycle
 ├── extensions/

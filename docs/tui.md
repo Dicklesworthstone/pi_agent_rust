@@ -3,6 +3,17 @@
 Pi's interactive mode provides a full-screen terminal UI for chatting, streaming
 responses, and managing sessions.
 
+## Stacks and launch flags
+
+| Invocation | Stack | Notes |
+|---|---|---|
+| `pi` | FrankenTUI (`ftui`, default since v0.4.0) | Alternate screen; markdown render cache; busy spinner chain; inline ask cards |
+| `pi --inline` | FrankenTUI, inline | UI drawn at the bottom of the terminal; shell scrollback preserved |
+| `pi --classic` | charmed_rust / bubbletea (`src/interactive.rs`) | Previous stack, kept until removal; aliases `--classic-tui`, `--charmed`, `--bubbletea` |
+
+Both stacks share the agent-event vocabulary (`PiMsg`), keybinding catalog,
+slash commands, autocomplete, overlays, and session persistence.
+
 ## Layout
 
 ### Header

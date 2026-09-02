@@ -14,6 +14,30 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+### Added
+
+- **`current_time` tool** (gh
+  [#207](https://github.com/Dicklesworthstone/pi_agent_rust/issues/207)):
+  a zero-argument, read-only built-in that returns the host clock as UTC and
+  local ISO-8601 timestamps, UTC offset, Unix epoch seconds/millis, weekday,
+  and ISO week (plus `TZ` when set). It is essential-tier and in the default
+  `--tools` list, so the model can anchor date reasoning to a real clock
+  instead of guessing.
+
+- **Portable DSR quality recipe**: `.dsr/repos.yaml` carries the registered
+  `pi_agent_rust` quality checks so any host can run
+  `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` (or
+  merge the entry into `~/.config/dsr/repos.yaml`) instead of depending on
+  one machine's registry.
+
+### Changed
+
+- **Docs now describe the shipped TUI**: README, AGENTS.md, and `docs/tui.md`
+  document FrankenTUI as the default interactive stack with `--inline` and
+  `--classic`, list the settings-gated `browser`, `computer`,
+  `inspect_image`, `generate_image`, and `tts` tools, and retire the FAQ
+  line that called web browsing and image generation out of scope.
+
 ---
 
 ## [v0.4.0] — 2026-09-01 — Release

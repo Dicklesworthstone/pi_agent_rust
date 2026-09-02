@@ -272,3 +272,38 @@ A → (B, C, D in parallel) → E (docs written against gated reality) → F.
 - `br list --status=in_progress` empty; every closed bead from the Aug 24-27 wave cites the run id.
 - `gh api repos/.../actions/permissions` returns `enabled: false`.
 - README tool inventory test and FTUI section present; `rg -c ftui README.md > 0`.
+
+---
+
+## 9. What changed on 2026-09-01 after this check (same session)
+
+Done and pushed with the commit that carries this section:
+
+- **Gap A, partially.** The DSR quality recipe is now portable: `.dsr/repos.yaml`
+  (registry subset, six checks) plus `docs/releasing.md` /
+  `docs/development.md` / `docs/perf-budgets-recipe.md` instructions;
+  registered on hetzner2; dry-run plans 6/6. First real run exposed that
+  `rch exec` from a `/data/tmp` git worktree fails worker path normalization
+  and silently compiles locally, so the recipe now runs Cargo under
+  `RCH_REQUIRE_REMOTE=1` (fail-closed) with raised timeouts. A recorded green
+  run against a release SHA is still outstanding (see the commit message and
+  bead comments for the run that was attempted).
+- **Gap B, governance half.** GitHub Actions disabled at the repository level
+  (`actions/permissions` → `enabled: false`); recorded in `docs/releasing.md`.
+  Publishing v0.4.0 is now tracked by bd-ghfu4.
+- **Gap C.** Exact header-vs-rows inconsistency recorded on bd-sog97.20;
+  README prose states it. Three evidence beads that had been closed on
+  "script shipped" were reopened with incident comments
+  (bd-provider-live-validation-11-xme9d, bd-tool-call-throughput-canonical-o3ubk,
+  bd-ri-phase1-full-refresh-rndeg).
+- **Gap D, sizing only.** bd-2crrf and bd-4t6oz carry exact file/line anchors
+  and candidate fixes; not implemented (no fast ftui/extension test loop on
+  this host).
+- **Gap E.** README, AGENTS.md, `docs/tui.md`, `docs/development.md`, and the
+  FTUI module doc now describe the shipped product (FTUI default, `--inline`,
+  `--classic`, 35-tool inventory incl. settings-gated tools, FAQ, distribution
+  contract, evidence numbers). `scripts/check_readme_evidence_freshness.py`
+  went from FAIL (2 uncited rows, 2 mismatched bindings) to PASS.
+- **Gap F.** GH #207 shipped as the `current_time` essential-tier tool
+  (`src/current_time.rs`, wired into registry/tiers/default list/goldens,
+  unit-tested); GH #182 scoped into bd-oyckr.
