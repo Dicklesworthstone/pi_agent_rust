@@ -4722,18 +4722,21 @@ mod stream_delta_batcher_tests {
             "session-bound input must also fail closed while a transition owns the UI"
         );
         app.agent_state = AgentState::Idle;
-        let command = app.handle_pi_message(PiMsg::EnqueuePendingInput {
+        let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput {
             session_id: session_id.clone(),
             input: PendingInput::GeneratedText("current input".to_string()),
         });
+        // Submissions run the turn on a spawned task and return no `Cmd`
+        // (`submit_content_with_display_and_keyword_source` ends with `None`),
+        // so the observable effect of an accepted input is the state change.
+        assert!(
+            matches!(app.agent_state, AgentState::Processing),
+            "current idle-session input must still run"
+        );
         let _ = app.handle_pi_message(PiMsg::SessionSystemNote {
             owner_session_id: session_id,
             message: "current tan card".to_string(),
         });
-        assert!(
-            command.is_some(),
-            "current idle-session input must still run"
-        );
         assert!(matches!(
             app.messages.last(),
             Some(ConversationMessage { role: MessageRole::System, content, .. })

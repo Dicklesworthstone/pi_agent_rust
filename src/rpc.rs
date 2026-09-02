@@ -1835,7 +1835,13 @@ pub async fn run(
                     }
                 };
                 if let Some(reason) = quarantine_reason {
-                    let quarantine_error = Error::session_persistence(reason);
+                    // Same shape as the other quarantine rejections ("RPC input
+                    // admission is quarantined ...", "provider re-entry is
+                    // quarantined ...") so clients can recognise the state
+                    // instead of parsing the underlying persistence failure.
+                    let quarantine_error = Error::session_persistence(format!(
+                        "{command_type} is quarantined after an indeterminate transition: {reason}"
+                    ));
                     let _ = out_tx.send(response_error_with_hints(
                         id.clone(),
                         command_type,
