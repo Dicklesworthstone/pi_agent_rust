@@ -817,6 +817,11 @@ git push                # Push to remote
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
+- Stage only the files YOU changed (`git add <files>`, never `git add -A` or
+  `git add .`). Other sessions' uncommitted work must stay uncommitted until
+  they commit it; sweeping it into your commit under your message hides what
+  was tested and by whom (on 2026-09-01 this committed an ineffective fix
+  mid-edit and two implementations of the same tool within an hour)
 
 
 ---
