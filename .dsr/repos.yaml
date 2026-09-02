@@ -27,7 +27,11 @@
 # 2026-09-01 when the checkout lived under a path rch could not normalize).
 # RCH_FORCE_REMOTE, used by older scripts, still fails open. The timeout
 # overrides cover a cold all-targets check/test of this crate; rch's defaults
-# (300 s build / 1800 s test) are too small for it.
+# (300 s build / 1800 s test) are too small for it. `--no-fail-fast` makes
+# cargo run every test binary and report all failures in one run instead of
+# stopping at the first red binary; the check still fails on any failure.
+# Without it the integration/conformance binaries never executed while the
+# lib binary carried pre-existing failures (runs 3-6, 2026-09-01/02).
 
 schema_version: "1.0.0"
 
@@ -47,6 +51,6 @@ tools:
       - cargo fmt --check
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 rch exec -- cargo check --locked --all-targets
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 rch exec -- cargo clippy --locked --all-targets -- -D warnings
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 rch exec -- cargo test --locked --all-targets
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 rch exec -- cargo test --locked --all-targets --no-fail-fast
       - bash tests/installer_regression.sh
       - python3 scripts/check_module_reachability.py

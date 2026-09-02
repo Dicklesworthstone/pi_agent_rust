@@ -17401,10 +17401,14 @@ export default function init(pi) {
                 gated_compactions, 1,
                 "exactly one compaction mutation may survive the exclusion window"
             );
+            // One turn call plus the split-turn compaction, which issues two
+            // provider calls (history summary + turn-prefix summary; see
+            // `compaction::generate_llm_summary`). A duplicate compaction
+            // slipping through the exclusion window would add two more.
             assert_eq!(
                 calls.load(Ordering::SeqCst),
-                2,
-                "the completed exclusion window must use one turn call and one compaction call"
+                3,
+                "the completed exclusion window must use one turn call and one split-turn compaction (two provider calls)"
             );
         });
     }

@@ -61,7 +61,7 @@ We enforce a strict "no mocks" policy for core logic. Tests use real filesystem 
 ### Unit & Integration Tests
 
 ```bash
-# Authoritative: the DSR recipe runs `cargo test --locked --all-targets`
+# Authoritative: the DSR recipe runs `cargo test --locked --all-targets --no-fail-fast`
 # through rch together with fmt/check/clippy/installer/reachability
 dsr quality --tool pi_agent_rust
 

@@ -826,6 +826,29 @@ flush + unit test); bd-ikl7j and bd-0x31m sized with exact requirements on the
 beads (both need maintainer-held inputs); AGENTS.md also gained the
 "stage only your own files" rule.
 
+Run6 of the gate (0c68d1b4, run dir `20260901T233513-3206383`, receipt in
+the run dir, source snapshot identical before and after): 4/6 checks passed.
+fmt, `cargo check --all-targets`, `clippy -D warnings` and module reachability
+green; `cargo test --all-targets` red on 8 lib tests (8340 passed), all in
+the owner-decided set on bd-x8mn7, and cargo stopped there, so the
+integration/conformance binaries still never executed; and
+`tests/installer_regression.sh` red on 5 of 69 the first time it ever ran.
+The same 5 fail at the v0.4.0 tag (reproduced in a scratch worktree), so
+they predate this session: the preflight HEAD-probed the aggregate
+`SHA256SUMS` manifest even when the per-asset sidecar was canonical (product
+fix in `install.sh`: probe the release tag page); two naming fixtures served
+a bare binary for the canonical `.tar.xz` candidate (fixtures now serve it for
+the bare-binary candidate only); and one doc-guard test grepped the disabled
+release workflow for a sentence it never contained (workflow assertions
+dropped, runbook assertions kept). Local suite after the fixes: 69/69. Two
+gate-facing edits are disclosed here rather than buried: the cargo test
+check now carries `--no-fail-fast` so every test binary runs and reports in
+one pass (the check still fails on any failure), and the cluster B
+"overlapping turn" test now expects three provider calls because a split-turn
+compaction issues two (history + turn prefix; design unchanged since
+February). My earlier note that the summary-filter change had fixed that test
+was wrong: it only advanced the failure to the call-count assertion.
+
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 
 1. `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` → 6/6

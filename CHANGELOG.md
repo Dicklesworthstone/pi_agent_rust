@@ -41,6 +41,21 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   `inspect_image`, `generate_image`, and `tts` tools, and retire the FAQ
   line that called web browsing and image generation out of scope.
 
+- **DSR quality recipe runs every test binary**: the `cargo test` check now
+  passes `--no-fail-fast`, so the integration and conformance binaries execute
+  and report in the same run even when an earlier binary is red (the check
+  still fails on any failure).
+
+### Fixed
+
+- **Installer no longer depends on `SHA256SUMS`**: the network preflight
+  probed the aggregate checksum manifest, which DSR releases may not ship at
+  all, so canonical releases warned during preflight and the installer touched
+  `SHA256SUMS` even when the per-asset `.sha256` sidecar was authoritative. It
+  now probes the release page. `tests/installer_regression.sh` is green again
+  (69/69; five cases had been failing since 2026-08-06 without any gate
+  running them).
+
 ---
 
 ## [v0.4.0] — 2026-09-01 — Tag-only

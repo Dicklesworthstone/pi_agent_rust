@@ -1359,7 +1359,12 @@ check_network_preflight() {
   elif [ -n "$ARTIFACT_URL" ]; then
     probe_url="$ARTIFACT_URL"
   else
-    probe_url="$SHA_URL"
+    # Probe the release page, not the aggregate SHA256SUMS manifest. DSR
+    # publishes a per-asset `.sha256` sidecar and may ship no manifest at
+    # all, so a manifest probe would warn on every canonical release and,
+    # worse, made the installer touch SHA256SUMS even when the sidecar was
+    # authoritative (tests/installer_regression.sh sidecar cases).
+    probe_url="https://github.com/${OWNER}/${REPO}/releases/tag/${VERSION}"
   fi
 
   if [ -z "$probe_url" ]; then
