@@ -314,6 +314,18 @@ Done and pushed with the commit that carries this section:
 - **Gate evidence.** DSR run `20260901T201627-2472296` at f97387cd: fmt PASS,
   `cargo check --locked --all-targets` PASS (first recorded compile of the
   tree since v0.3.0), clippy FAIL on two `format_push_string` errors in the
-  since-removed `src/current_time.rs` (nothing else in the crate tripped
-  `-D warnings`), test lane cancelled after 22 lib-test failures and a
-  38-minute output stall (see the follow-up run recorded on bd-csywa).
+  since-removed `src/current_time.rs`, test lane cancelled after 22 lib-test
+  failures and a 38-minute stall. Run `20260901T211852-2715600` at 762fd8d5:
+  fmt PASS, check PASS, clippy FAIL on three `unnecessary_literal_bound`
+  errors in the maintainer's new `CurrentTimeTool` impl, test lane 8327 ok /
+  20 FAILED and then stuck on
+  `rpc::tests::auto_compaction_rejects_stale_session_snapshot_with_paired_end_event`
+  (unbounded wait). A baseline re-run of the failing set at 08485a20 (the
+  v0.4.0 tree before this session) shows **20 of those failures already
+  present in v0.4.0**; the other 2 were this session's and are fixed. The 20
+  are classified by root cause on **bd-x8mn7** (ask-card guard ×12,
+  compaction admission ×2, RPC persistence surfacing ×2, approval
+  dual-confirm ×1, stale JS receipts ×1, perf-build control paths ×2). The
+  receipt, perf-build, parser-contract, clippy, and hang-to-failure fixes are
+  in the follow-up commit; the ask-card, compaction-admission, RPC, and
+  approval clusters are left to their owning beads with exact anchors.
