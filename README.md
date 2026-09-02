@@ -424,7 +424,7 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
 | `web_search` | Ranked multi-provider web search with circuit breaking |
 | `ask` / `todo` | Structured mid-turn option cards; persistent session task list |
 | `submit_plan` | Submit a completed plan for approval when plan mode is active |
-| `current_time` | Host wall-clock: UTC and local ISO-8601, offset, Unix epoch, weekday, ISO week (no arguments) |
+| `current_time` | Wall-clock time as ISO-8601 with UTC offset plus UTC and Unix time; optional `timezone` of `local` (default), `UTC`, or a fixed offset such as `+08:00`. The system prompt carries only the date so the cached prefix stays stable; this tool is the clock |
 | `xdev` | Dispatcher exposing the discoverable tier (`list/describe/run/promote`) |
 | `ast_grep` / `ast_edit` | Structural code search and rewrite |
 | `lsp` / `debug` | Language-server (14 ops) and DAP debugging (29 ops) bridges |

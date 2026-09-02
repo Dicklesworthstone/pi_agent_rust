@@ -62,7 +62,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/connectors/mod.rs` | Connector registry | Unit; `tests/rpc_session_connector.rs`, `tests/pi_connector_shims.rs`. |
 | `src/context_files.rs` | Context file loading | Covered through agent/session suites and `tests/config_precedence.rs`. |
 | `src/crypto_shim.rs` | Node crypto shim | Unit; `tests/node_crypto_shim.rs`. |
-| `src/current_time.rs` | `current_time` clock tool (gh #207) | Unit (pinned-clock rendering, live execute); default-list goldens in `tests/conformance/goldens/cli_flags/defaults.json`. |
+| `src/current_time.rs` | Superseded duplicate of the `current_time` tool (not declared in `lib.rs`; the shipped implementation is `CurrentTimeTool` in `src/tools.rs`); file kept only until its deletion is approved | Not compiled; the live tool is covered by `src/tools.rs` unit tests and the CLI default-list goldens. |
 | `src/debug.rs` | Debug (DAP) facade | `tests/debug.rs`. |
 | `src/debug/adapters.rs` | DAP adapters | `tests/debug.rs`. |
 | `src/debug/dap.rs` | DAP protocol | `tests/debug.rs`. |

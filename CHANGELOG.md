@@ -17,12 +17,15 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 ### Added
 
 - **`current_time` tool** (gh
-  [#207](https://github.com/Dicklesworthstone/pi_agent_rust/issues/207)):
-  a zero-argument, read-only built-in that returns the host clock as UTC and
-  local ISO-8601 timestamps, UTC offset, Unix epoch seconds/millis, weekday,
-  and ISO week (plus `TZ` when set). It is essential-tier and in the default
-  `--tools` list, so the model can anchor date reasoning to a real clock
-  instead of guessing.
+  [#207](https://github.com/Dicklesworthstone/pi_agent_rust/issues/207),
+  [#103](https://github.com/Dicklesworthstone/pi_agent_rust/issues/103)):
+  a read-only built-in that returns the wall-clock time as ISO-8601 with UTC
+  offset plus UTC and Unix time, with an optional `timezone` of `local`
+  (default), `UTC`, or a fixed offset such as `+08:00`; details carry the
+  `pi.tool.current_time.v1` schema. The system prompt keeps carrying only the
+  date so the cached prefix stays stable within a day, and now tells the model
+  to call `current_time` for anything time-of-day dependent. Essential tier
+  and in the default `--tools` list.
 
 - **Portable DSR quality recipe**: `.dsr/repos.yaml` carries the registered
   `pi_agent_rust` quality checks so any host can run

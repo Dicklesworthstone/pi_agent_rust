@@ -304,6 +304,16 @@ Done and pushed with the commit that carries this section:
   `--classic`, 35-tool inventory incl. settings-gated tools, FAQ, distribution
   contract, evidence numbers). `scripts/check_readme_evidence_freshness.py`
   went from FAIL (2 uncited rows, 2 mismatched bindings) to PASS.
-- **Gap F.** GH #207 shipped as the `current_time` essential-tier tool
-  (`src/current_time.rs`, wired into registry/tiers/default list/goldens,
-  unit-tested); GH #182 scoped into bd-oyckr.
+- **Gap F.** GH #207 shipped as the `current_time` essential-tier tool. Two
+  implementations landed within an hour (this session's `src/current_time.rs`
+  and the maintainer's `CurrentTimeTool` in `src/tools.rs`, commit d39d3366,
+  which adds a `timezone` parameter and the system-prompt clock guideline);
+  the registry now uses the maintainer's, `src/current_time.rs` is no longer
+  declared in `lib.rs` and awaits deletion approval. GH #182 scoped into
+  bd-oyckr.
+- **Gate evidence.** DSR run `20260901T201627-2472296` at f97387cd: fmt PASS,
+  `cargo check --locked --all-targets` PASS (first recorded compile of the
+  tree since v0.3.0), clippy FAIL on two `format_push_string` errors in the
+  since-removed `src/current_time.rs` (nothing else in the crate tripped
+  `-D warnings`), test lane cancelled after 22 lib-test failures and a
+  38-minute output stall (see the follow-up run recorded on bd-csywa).
