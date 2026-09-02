@@ -1366,7 +1366,7 @@ impl PackageManager {
 
     #[allow(clippy::unused_self)]
     fn global_npm_root(&self) -> Result<PathBuf> {
-        let output = Command::new("npm")
+        let output = Command::new(npm_program())
             .args(["root", "-g"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1526,7 +1526,7 @@ impl PackageManager {
         } else {
             // `--` so a spec beginning with '-' cannot be parsed as an npm
             // flag (the prefix/uninstall branches already do this).
-            run_command("npm", ["install", "-g", "--", spec], None)
+            run_command(npm_program(), ["install", "-g", "--", spec], None)
                 .map_err(|err| enrich_global_npm_install_error(err, spec))?;
         }
 
@@ -1547,7 +1547,7 @@ impl PackageManager {
 
     fn uninstall_npm(&self, name: &str, scope: PackageScope) -> Result<()> {
         let Some(install_root) = self.npm_prefix_root(scope) else {
-            run_command("npm", ["uninstall", "-g", "--", name], None)?;
+            run_command(npm_program(), ["uninstall", "-g", "--", name], None)?;
             return Ok(());
         };
         if !install_root.exists() {
@@ -1612,7 +1612,7 @@ impl PackageManager {
         }
 
         if target_dir.join("package.json").exists() {
-            run_command("npm", ["install"], Some(&target_dir))?;
+            run_command(npm_program(), ["install"], Some(&target_dir))?;
         }
 
         Ok(())
@@ -1640,7 +1640,7 @@ impl PackageManager {
         run_command("git", ["clean", "-fdx"], Some(&target_dir))?;
 
         if target_dir.join("package.json").exists() {
-            run_command("npm", ["install"], Some(&target_dir))?;
+            run_command(npm_program(), ["install"], Some(&target_dir))?;
         }
 
         Ok(())
@@ -3976,6 +3976,16 @@ fn enrich_global_npm_install_error(err: Error, spec: &str) -> Error {
     )
 }
 
+/// The npm executable name for this platform.
+///
+/// On Windows, npm ships as `npm.cmd` (a batch wrapper), and `CreateProcess`
+/// does not resolve `npm` to it the way a shell would, so spawning `"npm"`
+/// fails with "program not found" even though `npm` works in the terminal
+/// (#182). Batch files are spawned through `cmd.exe` by the standard library.
+const fn npm_program() -> &'static str {
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
+}
+
 fn run_command<I, S>(program: &str, args: I, cwd: Option<&Path>) -> Result<()>
 where
     I: IntoIterator<Item = S>,
@@ -4594,6 +4604,16 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn npm_program_is_the_batch_wrapper_on_windows() {
+        // #182: `CreateProcess` does not resolve `npm` to `npm.cmd`.
+        if cfg!(windows) {
+            assert_eq!(npm_program(), "npm.cmd");
+        } else {
+            assert_eq!(npm_program(), "npm");
+        }
+    }
     use std::future::Future;
 
     fn run_async<T>(future: impl Future<Output = T>) -> T {

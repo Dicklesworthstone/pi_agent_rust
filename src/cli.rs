@@ -1348,6 +1348,7 @@ mod tests {
                 "submit_plan",
                 "jobs",
                 "hub",
+                "current_time",
             ]
         );
     }

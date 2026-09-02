@@ -293,6 +293,10 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
             "subagent",
             "Delegate isolated work to a named Rust Pi child agent; supports single, bounded parallel, and chained workflows",
         ),
+        (
+            "current_time",
+            "Get the current wall-clock date and time (ISO-8601 with UTC offset, plus UTC and Unix time)",
+        ),
     ];
 
     let mut tools = Vec::new();
@@ -346,6 +350,13 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     if has_edit || has_write {
         guidelines_list.push(
             "When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did",
+        );
+    }
+    if has_tool("current_time") {
+        // The prompt carries only the date (#103); point the model at the
+        // clock for anything time-of-day dependent (#207).
+        guidelines_list.push(
+            "The date below is not a clock: call current_time whenever a task depends on the current time of day",
         );
     }
 

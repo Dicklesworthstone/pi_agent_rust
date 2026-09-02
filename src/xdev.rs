@@ -72,8 +72,8 @@ const ESSENTIAL_DEFAULTS: &[&str] = &[
     "web_search",
     // Tiny schema, required the moment plan mode activates (bd-cv653.3.5).
     "submit_plan",
-    // Zero-parameter clock read (gh #207); cheaper to keep in the schema than
-    // to make the model discover it through xdev before every date question.
+    // Zero-parameter clock read (gh #207, #103); cheaper to keep in the schema than
+    // to make the model discover it through xdev before every date/time question.
     "current_time",
 ];
 
@@ -132,6 +132,7 @@ pub fn default_enabled_tools() -> Vec<&'static str> {
         "submit_plan",
         "jobs",
         "hub",
+        "current_time",
     ]
 }
 
@@ -168,6 +169,7 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "ask" => "Ask the user structured questions mid-turn instead of guessing",
         "todo" => "Maintain the session task list",
         "xdev" => "Discover and run rarely-used tools that are not in the live schema",
+        "current_time" => "Get the current wall-clock date and time",
         _ => return None,
     })
 }
