@@ -62,7 +62,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/connectors/mod.rs` | Connector registry | Unit; `tests/rpc_session_connector.rs`, `tests/pi_connector_shims.rs`. |
 | `src/context_files.rs` | Context file loading | Covered through agent/session suites and `tests/config_precedence.rs`. |
 | `src/crypto_shim.rs` | Node crypto shim | Unit; `tests/node_crypto_shim.rs`. |
-| `src/current_time.rs` | `current_time` tool (wall-clock snapshot; the shipped implementation since 416cabe9 dropped the duplicate in `src/tools.rs`) | Unit tests in the module (offset rendering, snapshot fields); registry membership in `src/tools.rs` tests; CLI default-list goldens; `tests/readme_tool_inventory.rs`. |
+| `src/current_time.rs` | Superseded duplicate of the `current_time` tool (not declared in `lib.rs`; the shipped implementation is `CurrentTimeTool` in `src/tools.rs`, briefly swapped for this module by 416cabe9 and restored by the revert 74490cb8 on 2026-09-02); file kept only until its deletion is approved | Not compiled; the live tool is covered by `src/tools.rs` unit tests, the CLI default-list goldens, and `tests/readme_tool_inventory.rs`. |
 | `src/debug.rs` | Debug (DAP) facade | `tests/debug.rs`. |
 | `src/debug/adapters.rs` | DAP adapters | `tests/debug.rs`. |
 | `src/debug/dap.rs` | DAP protocol | `tests/debug.rs`. |
