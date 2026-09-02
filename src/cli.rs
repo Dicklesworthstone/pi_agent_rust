@@ -514,7 +514,7 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "TOOLS",
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan,jobs,hub"
+        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan,jobs,hub,current_time"
     )]
     pub tools: String,
 

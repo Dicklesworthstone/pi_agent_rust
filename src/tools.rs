@@ -5377,6 +5377,10 @@ impl ToolRegistry {
                 )),
                 "jobs" => tools.push(Box::new(JobsTool::new())),
                 "hub" => tools.push(Box::new(HubTool::new(cwd))),
+                // Wall-clock awareness (gh #207): no parameters, read effects only.
+                "current_time" => {
+                    tools.push(Box::new(crate::current_time::CurrentTimeTool::new()));
+                }
                 "security_scan" => {
                     tools.push(Box::new(crate::security_scan::SecurityScanTool::new(cwd)));
                 }

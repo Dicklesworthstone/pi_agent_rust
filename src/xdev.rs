@@ -72,6 +72,9 @@ const ESSENTIAL_DEFAULTS: &[&str] = &[
     "web_search",
     // Tiny schema, required the moment plan mode activates (bd-cv653.3.5).
     "submit_plan",
+    // Zero-parameter clock read (gh #207); cheaper to keep in the schema than
+    // to make the model discover it through xdev before every date question.
+    "current_time",
 ];
 
 /// Tools that are opt-in ONLY (never in the default enabled set, never

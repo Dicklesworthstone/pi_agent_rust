@@ -1,12 +1,13 @@
-//! FrankenTUI migration stack (bd-cv653.9.1) — feature-gated preview.
+//! FrankenTUI interactive stack (bd-cv653.9.1) — the default TUI since the
+//! 2026-08-25 cutover (bd-ti0tq).
 //!
-//! This module hosts the ftui-runtime port of the interactive front-end. It is
-//! compiled only with `--features ftui` (default OFF) so the charmed_rust
-//! stack in [`crate::interactive`] stays the shipped TUI while the port
-//! proceeds module by module. The bubbletea stack is deleted at cutover — no
-//! permanent duality. Run it with `pi --ftui` (add `--inline` to keep shell
-//! scrollback), or try the fake-agent demo: `cargo run --example ftui_preview
-//! --features ftui`.
+//! This module hosts the ftui-runtime port of the interactive front-end. The
+//! `ftui` feature is on by default, so plain `pi` launches this stack; the
+//! charmed_rust/bubbletea stack in [`crate::interactive`] remains selectable
+//! with `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`)
+//! until it is deleted. Add `--inline` to keep shell scrollback instead of
+//! the alternate screen, or try the fake-agent demo:
+//! `cargo run --example ftui_preview --features ftui`.
 //!
 //! What is real today:
 //! - [`PiFtuiMsg`]: the typed Elm message wrapping terminal events and the
