@@ -142,9 +142,13 @@ Two additional machine-recognized citation forms exist:
   existence and validity are still checked, but staleness is not enforced
   because such claims never satisfy current release-facing requirements.
 
-DSR quality checks both file freshness and artifact content so stale, no-data, or
-correlation-mismatched evidence cannot back user-facing performance claims.
-The README evidence checker reports line-numbered proof obligations for cited
+`scripts/check_readme_evidence_freshness.py` (a pre-release check listed in
+[docs/releasing.md](docs/releasing.md), not part of the code quality recipe)
+checks file freshness and artifact content so stale, no-data, or
+correlation-mismatched evidence cannot back user-facing performance claims;
+for release-facing citations of `budget_summary.json` it validates the full
+`pi.perf.budget_summary.v2` contract, including that the header counts equal
+the per-budget rows. It reports line-numbered proof obligations for cited
 claims and extracts claim-gated performance phrases for reviewer audit.
 Historical snapshot citations are mapped separately and do not satisfy current
 release-facing claims.

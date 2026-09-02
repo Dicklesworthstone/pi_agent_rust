@@ -403,6 +403,7 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 - **Single source of truth:** Beads for task status/priority/dependencies; Agent Mail for conversation and audit
 - **Shared identifiers:** Use Beads issue ID (e.g., `br-123`) as Mail `thread_id` and prefix subjects with `[br-123]`
 - **Reservations:** When starting a task, call `file_reservation_paths()` with the issue ID in `reason`
+- **Outcome beads close on the outcome, not on the tooling:** a bead whose title names a run, a measurement, a published artifact, or a gate result closes only with that artifact's path and source SHA in the close reason. A shipped script, a dry run, a "blocked on RCH/DSR" note, or a static review closes nothing; leave the bead open with the exact hold recorded (this rule exists because three evidence beads were closed that way on 2026-08-28 and reopened on 2026-09-01)
 
 ### Typical Agent Flow
 

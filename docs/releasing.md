@@ -4009,6 +4009,12 @@ For branches opened before this gate was introduced:
   packaging, signing, publication, and verification receipts.
 - No workflow was queried, dispatched, rerun, canceled, or used as evidence.
 - `dsr quality --tool pi_agent_rust` is green for the frozen source commit.
+- `python3 scripts/check_readme_evidence_freshness.py` exits 0 for the frozen
+  source commit. It is not part of the code quality recipe; it validates every
+  README evidence citation, including the full v2 contract of
+  `tests/perf/reports/budget_summary.json` for release-facing citations (as of
+  2026-09-02 that summary fails its own contract and must be regenerated
+  before any performance prose is promoted).
 - Feature PRs merged since the previous tag satisfy the DoD evidence checklist (unit + e2e + extension + repro commands).
 - `CHANGELOG.md` updated for the version you’re tagging.
 - Benchmarks run if this release is performance-sensitive (see the

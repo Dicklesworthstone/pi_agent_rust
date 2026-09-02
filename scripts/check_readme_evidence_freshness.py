@@ -1317,7 +1317,15 @@ def performance_budget_claim_errors(
         return value
 
     try:
-        data = exact_fields(payload, PERF_SUMMARY_FIELDS, "performance summary")
+        # `git_commit` is the harness's source-binding provenance (added by the
+        # 2026-08 rebind work); tolerate it without letting other unknown
+        # fields through.
+        data = exact_fields(
+            payload,
+            PERF_SUMMARY_FIELDS,
+            "performance summary",
+            optional=frozenset({"git_commit"}),
+        )
         if data["schema"] != PERF_BUDGET_SUMMARY_SCHEMA:
             fail(f"unsupported performance summary schema: {data['schema']!r}")
 
@@ -1633,6 +1641,21 @@ def check_artifact_content(
         # provenance value to match. Existence, decodability, and JSON
         # validity above are the contract; staleness is governed by
         # claim_surface classification.
+        if (
+            artifact_path == "tests/perf/reports/budget_summary.json"
+            and claim_surface == "release_facing"
+        ):
+            # A path-only citation of the release-facing performance summary
+            # must still satisfy the full v2 contract (schema, header counts
+            # derived from budget_results, readiness reasons). Before
+            # 2026-09-02 this early return skipped it, so a summary whose
+            # header said 12/5/2 while its rows said 16/3/0 passed as
+            # "content-valid".
+            errors.extend(
+                performance_budget_claim_errors(
+                    repo_root, payload, now, cited_artifact_path
+                )
+            )
         return tuple(errors)
 
     if citation_kind == "run":

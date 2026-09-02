@@ -43,7 +43,12 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ---
 
-## [v0.4.0] — 2026-09-01 — Release
+## [v0.4.0] — 2026-09-01 — Tag-only
+
+> Tagged on 2026-09-01 but not yet published: no GitHub Release exists for
+> `v0.4.0` as of 2026-09-02 (the latest published release is v0.3.0). The
+> heading flips back to "Release" in the commit that publishes it through
+> DSR (bd-ghfu4).
 
 ### Added
 
