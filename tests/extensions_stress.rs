@@ -3074,11 +3074,8 @@ fn stress_extension_load_unload_cycle() {
         }
 
         // Shutdown
-        common::run_async({
-            let manager = manager.clone();
-            async move {
-                let _ = manager.shutdown(Duration::from_secs(1)).await;
-            }
+        common::run_async(async move {
+            let _ = manager.shutdown(Duration::from_secs(1)).await;
         });
     };
     // Warm-up: the first load pays one-time costs (engine pages, allocator
