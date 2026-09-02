@@ -17387,10 +17387,13 @@ export default function init(pi) {
                 .entries_for_current_path()
                 .iter()
                 .filter(|entry| {
+                    // The split-turn strategy appends a "Turn Context (split
+                    // turn)" section after the gated summary, so match the
+                    // prefix rather than the whole string.
                     matches!(
                         entry,
                         crate::session::SessionEntry::Compaction(compaction)
-                            if compaction.summary == "gated auto-compaction summary"
+                            if compaction.summary.starts_with("gated auto-compaction summary")
                     )
                 })
                 .count();
