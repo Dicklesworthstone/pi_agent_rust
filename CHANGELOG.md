@@ -46,6 +46,13 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   and report in the same run even when an earlier binary is red (the check
   still fails on any failure).
 
+- **README evidence checker is exercised by the gate**: its `--self-test`
+  now validates against its own fixture inventory instead of borrowing the
+  live performance artifact (it had been failing silently since the
+  2026-08-28 evidence refresh), and `tests/readme_evidence_checker.rs` runs
+  the self-test plus the live README verdict under `cargo test`. The live
+  check still fails closed on the current performance summary.
+
 ### Fixed
 
 - **Installer no longer depends on `SHA256SUMS`**: the network preflight
