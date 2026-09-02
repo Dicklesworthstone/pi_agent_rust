@@ -91,6 +91,7 @@ files = [
     "provider_session_coverage",
     "provider_unit_checklist",
     "qa_docs_policy_validation",
+    "readme_evidence_checker",
     "readme_tool_inventory",
     "redaction_test",
     "resource_edge_cases",
