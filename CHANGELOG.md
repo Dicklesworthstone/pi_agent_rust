@@ -77,6 +77,17 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   instead of parsing the underlying persistence failure. Closing stdin while
   quarantined still ends the server loop with the surfaced error.
 
+- **A stray `.codex` file no longer blocks startup**: the workspace-trust
+  scan treated "Not a directory" on `.codex/config.toml` as a configuration
+  error and refused to start pi in any directory containing a regular file
+  named `.codex`; a file where a surface directory is expected now counts as
+  "no surface", like a missing path.
+
+- **Perf orchestrator no longer aborts on `ROOT_DIR`**:
+  `scripts/perf/orchestrate.sh` referenced an undefined `ROOT_DIR` in the
+  extension-benchmark validation path (since 2026-08-26), which under
+  `set -u` aborted every orchestration that reached it.
+
 - **Installer no longer depends on `SHA256SUMS`**: the network preflight
   probed the aggregate checksum manifest, which DSR releases may not ship at
   all, so canonical releases warned during preflight and the installer touched

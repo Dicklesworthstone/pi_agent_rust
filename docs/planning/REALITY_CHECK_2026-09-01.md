@@ -905,6 +905,22 @@ maintainer's `rpc_retry_restore_save_failure_latches_without_live_mutation`
 change was reverted and the two RPC loop tests now expect the surfaced error;
 only the rejection wording change survives.
 
+Round 3 (after cancelling run9, whose cold worker projected past the lane
+timeout while repeating run8's clusters): two of the "owner" clusters turned
+out to be single-line defects. `scripts/perf/orchestrate.sh` referenced an
+undefined `ROOT_DIR` (since 2026-08-26) and aborted under `set -u` in every
+orchestration that reached the extension-benchmark validation, which is what
+the 31 harness failures were; and a zero-byte regular file named `.codex` at
+the repository root (git-ignored, synced to the workers) made the
+workspace-trust scan fail startup with "Not a directory" on
+`.codex/config.toml`, which is what eleven url-read, web-search, advisor and
+failover e2e failures were. Both fixed, the second with a unit test. The 28
+`tui_snapshot` diffs were reviewed line by line: every one is the OSC title
+prefix and the new status line (four zero-usage cases swap the old token
+footer for it), i.e. the deliberate #200/#201 rendering; the goldens were
+regenerated on a worker and re-checked against that classification before
+committing.
+
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 
 1. `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` → 6/6

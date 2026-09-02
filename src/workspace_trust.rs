@@ -172,7 +172,17 @@ impl WorkspaceTrustSurface {
 fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A missing path and a regular file where a directory was expected
+        // (`.codex` as a file makes `.codex/config.toml` ENOTDIR) both mean
+        // the surface does not exist; neither is a reason to refuse startup.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(err) => {
             return Err(Error::config(format!(
                 "Failed to inspect {}: {err}",
@@ -549,6 +559,20 @@ mod tests {
             env_override: None,
             interactive: false,
         }
+    }
+
+    #[test]
+    fn scan_treats_a_file_where_a_surface_directory_is_expected_as_absent() {
+        // A stray regular file named `.codex` (this repository carried one)
+        // used to abort startup with "Failed to inspect .codex/config.toml:
+        // Not a directory"; a file cannot contain a trust surface.
+        let dir = tempfile::tempdir().expect("tempdir"); // ubs:ignore test fixture
+        std::fs::write(dir.path().join(".codex"), b"").expect("write .codex file"); // ubs:ignore test fixture
+        assert!(
+            WorkspaceTrustSurface::scan(dir.path())
+                .expect("scan") // ubs:ignore test assertion
+                .is_none()
+        );
     }
 
     #[test]

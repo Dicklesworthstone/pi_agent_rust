@@ -2439,7 +2439,7 @@ run_test_suite() {
                  "$source_path" \
                  "$retrieved_result_dir/ext_bench_harness_report.json" \
                  "$producer_bench_mode" \
-                 "$ROOT_DIR/tests/ext_conformance/VALIDATED_MANIFEST.json" \
+                 "$PROJECT_ROOT/tests/ext_conformance/VALIDATED_MANIFEST.json" \
                  "$GIT_COMMIT_FULL"; }; then
           log_fail "$suite_name returned invalid extension benchmark evidence"
           exit_code=88

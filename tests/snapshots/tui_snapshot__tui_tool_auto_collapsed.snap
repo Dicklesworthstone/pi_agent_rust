@@ -1,9 +1,8 @@
 ---
 source: tests/tui_snapshot.rs
-assertion_line: 216
 expression: view
 ---
-  Pi (dummy/dummy-model)
+]0;Pi · dummy/dummy-model · ready  Pi (dummy/dummy-model)
   ctrl+l: model  ctrl+p: next  ctrl+shift+p: prev  ctrl+o: tools  shift+tab: ...
   resources: 0 skills, 0 prompts, 0 themes, 0 extensions
 
@@ -26,4 +25,4 @@ expression: view
   │ >
   │ >
 
-  Tokens: 0 in / 0 out  |  Persist: balanced  |  /help  |  Ctrl+C: quit
+  󰚩 dummy/dummy-model / ACT / ctx: 0%
