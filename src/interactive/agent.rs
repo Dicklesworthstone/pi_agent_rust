@@ -6,7 +6,7 @@ use super::ext_session::{format_extension_ui_prompt, parse_extension_ui_response
 use super::*;
 use crate::extension_events::{BeforeAgentStartOutcome, apply_before_agent_start_response};
 
-pub(super) fn extension_commands_for_catalog(
+pub(crate) fn extension_commands_for_catalog(
     manager: &ExtensionManager,
 ) -> Vec<crate::autocomplete::NamedEntry> {
     manager
@@ -951,7 +951,7 @@ impl PiApp {
             // it defensively. TerminalTitle: driver-pushed title updates are
             // an ftui affordance (issue #200) — the charmed stack re-emits
             // the terminal title from render_header every frame.
-            PiMsg::UiShutdown | PiMsg::TerminalTitle(_) => {}
+            PiMsg::UiShutdown | PiMsg::TerminalTitle(_) | PiMsg::AutocompleteCatalog(_) => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();

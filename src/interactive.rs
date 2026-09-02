@@ -85,7 +85,8 @@ mod tree;
 mod tree_ui;
 mod view;
 
-use self::agent::{build_user_message, extension_commands_for_catalog};
+use self::agent::build_user_message;
+pub(crate) use self::agent::extension_commands_for_catalog;
 pub use self::commands::{
     SlashCommand, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
     strip_thinking_level_suffix,
@@ -109,12 +110,14 @@ use self::perf::{
     RenderBuffers, TuiPressureController, micros_as_u64,
 };
 pub use self::state::{AgentState, InputMode, PendingInput};
+// Shared with the ftui stack (issue #208): one dropdown state machine, one
+// command catalog, so slash-command completion cannot drift between surfaces.
+pub(crate) use self::state::AutocompleteState;
 use self::state::{
-    AutocompleteState, BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay,
-    ExtensionCustomOverlay, HistoryList, InjectedMessageQueue, InteractiveMessageQueue,
-    PendingLoginKind, PendingOAuth, QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry,
-    SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay,
-    ToolProgress, format_count,
+    BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay, ExtensionCustomOverlay,
+    HistoryList, InjectedMessageQueue, InteractiveMessageQueue, PendingLoginKind, PendingOAuth,
+    QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry, SettingsUiState,
+    TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay, ToolProgress, format_count,
 };
 pub use self::state::{ConversationMessage, MessageRole};
 use self::text_utils::{queued_message_preview, truncate};
@@ -1954,6 +1957,11 @@ pub enum PiMsg {
     TerminalTitle(String),
     /// Periodic autocomplete refresh tick (background file index).
     AutocompleteRefresh,
+    /// Replacement completion catalog (issue #208). The ftui driver sends it
+    /// once its session exists, so extension-contributed commands join the
+    /// built-in list; the charmed stack builds its catalog inline and
+    /// ignores this.
+    AutocompleteCatalog(crate::autocomplete::AutocompleteCatalog),
     /// Text delta from assistant.
     TextDelta(String),
     /// Thinking delta from assistant.

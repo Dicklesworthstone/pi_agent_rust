@@ -2342,6 +2342,14 @@ async fn run(
                 ftui_models,
                 ftui_sessions,
                 config.markdown_spacing(),
+                pi::interactive_ftui::AutocompleteLaunch {
+                    catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
+                    cwd: cwd.clone(),
+                    max_visible: config
+                        .autocomplete_max_visible
+                        .and_then(|n| usize::try_from(n.clamp(3, 20)).ok())
+                        .unwrap_or(5),
+                },
             )
             .map_err(Into::into)
         }

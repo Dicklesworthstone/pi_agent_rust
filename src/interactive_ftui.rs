@@ -53,8 +53,9 @@ use ftui::widgets::textarea::TextArea;
 use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
 use crate::ask::{AskAnswer, AskResponse, AskUiRequest, QuestionReply};
+use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
 use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
-use crate::interactive::PiMsg;
+use crate::interactive::{AutocompleteState, PiMsg, extension_commands_for_catalog};
 use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use std::collections::VecDeque;
@@ -1012,6 +1013,10 @@ pub struct PiFtuiModel {
     rendered_total_lines: std::cell::Cell<usize>,
     /// The input editor (ftui-widgets TextArea replaces bubbles TextArea).
     input: TextArea,
+    /// Slash-command completion popup (issue #208). Shares the dropdown
+    /// state machine and the [`crate::autocomplete`] provider with the
+    /// charmed stack, so both surfaces complete from the same command list.
+    autocomplete: AutocompleteState,
     /// Where submitted user input goes. The launch path hands the sending
     /// half of the channel its agent loop consumes; tests read the receiver
     /// directly. `None` falls back to echoing into the transcript only.
@@ -1091,9 +1096,31 @@ struct Regions {
     /// Pinned error banner row (present only while an error is undissmissed).
     banner: Rect,
     status: Rect,
+    /// Slash-command completion popup, directly above the editor (issue
+    /// #208); zero rows while no suggestions are showing.
+    completion: Rect,
     input: Rect,
     footer: Rect,
 }
+
+/// Launch-time inputs for the completion popup (issue #208).
+#[derive(Debug, Clone, Default)]
+pub struct AutocompleteLaunch {
+    /// Prompt templates, skills, and the skill-command toggle from the
+    /// resource loader; extension commands are filled in by the driver.
+    pub catalog: AutocompleteCatalog,
+    /// Working directory for the provider (path/@-file resolution).
+    pub cwd: std::path::PathBuf,
+    /// Maximum suggestion rows shown at once (`autocompleteMaxVisible`).
+    pub max_visible: usize,
+}
+
+/// Default popup height when settings don't override it (matches the
+/// charmed stack's `autocompleteMaxVisible` default).
+const DEFAULT_COMPLETION_ROWS: usize = 5;
+
+/// Keyboard hint rendered under the suggestion rows.
+const COMPLETION_HINT: &str = "↑↓ move · Tab/Enter accept · Esc dismiss";
 
 /// Rows of single-line chrome around the conversation body: header, status,
 /// footer. The input region's height is dynamic (see
@@ -1103,16 +1130,17 @@ const FIXED_CHROME_ROWS: u16 = 3;
 /// The input editor grows with its content up to this many rows.
 const MAX_INPUT_ROWS: u16 = 5;
 
-fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16) -> Regions {
+fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16, completion_rows: u16) -> Regions {
     use ftui::layout::{Constraint, Flex};
     let rects = Flex::vertical()
         .constraints([
-            Constraint::Fixed(1),           // header
-            Constraint::Fill,               // conversation body
-            Constraint::Fixed(banner_rows), // pinned error banner (0 = none)
-            Constraint::Fixed(1),           // status line (tool/todo/messages)
-            Constraint::Fixed(input_rows),  // input editor
-            Constraint::Fixed(1),           // footer (usage)
+            Constraint::Fixed(1),               // header
+            Constraint::Fill,                   // conversation body
+            Constraint::Fixed(banner_rows),     // pinned error banner (0 = none)
+            Constraint::Fixed(1),               // status line (tool/todo/messages)
+            Constraint::Fixed(completion_rows), // completion popup (0 = closed)
+            Constraint::Fixed(input_rows),      // input editor
+            Constraint::Fixed(1),               // footer (usage)
         ])
         .split(area);
     Regions {
@@ -1120,8 +1148,9 @@ fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16) -> Regions {
         body: rects[1],
         banner: rects[2],
         status: rects[3],
-        input: rects[4],
-        footer: rects[5],
+        completion: rects[4],
+        input: rects[5],
+        footer: rects[6],
     }
 }
 
@@ -1170,8 +1199,29 @@ impl PiFtuiModel {
                 .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
                 .with_focus(true)
                 .with_soft_wrap(true),
+            autocomplete: {
+                let mut state = AutocompleteState::new(
+                    std::path::PathBuf::from("."),
+                    AutocompleteCatalog::default(),
+                );
+                state.max_visible = DEFAULT_COMPLETION_ROWS;
+                state
+            },
             submit_tx: None,
         }
+    }
+
+    /// Install the launch-time completion catalog (prompt templates, skills)
+    /// plus the working directory and popup height (issue #208). Extension
+    /// commands arrive later via [`PiMsg::AutocompleteCatalog`] once the
+    /// driver's session exists.
+    #[must_use]
+    pub fn with_autocomplete(mut self, launch: AutocompleteLaunch) -> Self {
+        self.autocomplete.provider.set_cwd(launch.cwd);
+        self.autocomplete.provider.set_catalog(launch.catalog);
+        self.autocomplete.max_visible = launch.max_visible.clamp(1, 20);
+        self.autocomplete.close();
+        self
     }
 
     /// Route submitted input to the agent loop via this channel. The launch
@@ -1267,12 +1317,131 @@ impl PiFtuiModel {
     /// Visible conversation rows given the tracked terminal size.
     fn body_height(&self) -> usize {
         let banner = u16::from(self.error_banner.is_some());
-        usize::from(
-            self.term
-                .1
-                .saturating_sub(FIXED_CHROME_ROWS + banner + self.input_rows()),
-        )
+        usize::from(self.term.1.saturating_sub(
+            FIXED_CHROME_ROWS + banner + self.input_rows() + self.completion_rows(),
+        ))
         .max(1)
+    }
+
+    /// Whether the editor is in plain prompt-composition mode: idle agent,
+    /// no card or picker owning the keys. Only then may completion open.
+    fn completion_allowed(&self) -> bool {
+        self.state == AgentUiState::Ready
+            && self.active_ask.is_none()
+            && self.active_ext.is_none()
+            && self.picker.is_none()
+    }
+
+    /// Whether the completion popup should capture keys and take rows.
+    fn completion_visible(&self) -> bool {
+        self.autocomplete.open && !self.autocomplete.items.is_empty() && self.completion_allowed()
+    }
+
+    /// Rows the popup reserves above the editor: one per visible suggestion
+    /// (capped at `max_visible`) plus the keyboard hint line.
+    fn completion_rows(&self) -> u16 {
+        if !self.completion_visible() {
+            return 0;
+        }
+        let items = self
+            .autocomplete
+            .items
+            .len()
+            .min(self.autocomplete.max_visible);
+        u16::try_from(items + 1).unwrap_or(u16::MAX)
+    }
+
+    /// Recompute the completion popup from the editor contents (issue #208).
+    /// Runs after every editor mutation; the popup only ever opens for a
+    /// slash-command draft so ordinary prose never grows a dropdown.
+    fn maybe_trigger_autocomplete(&mut self) {
+        if !self.completion_allowed() {
+            self.autocomplete.close();
+            return;
+        }
+        let text = self.input.text();
+        if !text.trim_start().starts_with('/') {
+            self.autocomplete.close();
+            return;
+        }
+        let editor = self.input.editor();
+        let cursor = ftui::text::CursorNavigator::new(editor.rope()).to_byte_index(editor.cursor());
+        let response = self.autocomplete.provider.suggest(&text, cursor);
+        // Bare filesystem-path matches are Tab-triggered in the charmed
+        // stack; the popup here is for commands and their arguments.
+        if response
+            .items
+            .iter()
+            .all(|item| item.kind == AutocompleteItemKind::Path)
+        {
+            self.autocomplete.close();
+            return;
+        }
+        self.autocomplete.open_with(response);
+    }
+
+    /// Splice the accepted suggestion over the token it completes and park
+    /// the cursor at the end of the draft.
+    fn accept_autocomplete(&mut self, item: &AutocompleteItem) {
+        let text = self.input.text();
+        let range = &self.autocomplete.replace_range;
+        // The range was computed against the text at trigger time; clamp to
+        // char boundaries in case the editor moved on since.
+        let mut start = range.start.min(text.len());
+        while start > 0 && !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = range.end.min(text.len()).max(start);
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        let mut next = String::with_capacity(text.len() + item.insert.len());
+        next.push_str(&text[..start]);
+        next.push_str(&item.insert);
+        next.push_str(&text[end..]);
+        self.input.set_text(&next);
+        self.input.move_to_document_end();
+    }
+
+    /// Keys the open popup owns (issue #208). Returns `true` when the key was
+    /// consumed; Enter without a highlighted row closes the popup and falls
+    /// through so the draft submits exactly as typed, matching the charmed
+    /// stack (Tab always accepts, defaulting to the first row).
+    fn handle_completion_key(&mut self, key: &ftui::KeyEvent, submit: bool) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                self.autocomplete.select_prev();
+                true
+            }
+            KeyCode::Down => {
+                self.autocomplete.select_next();
+                true
+            }
+            KeyCode::Tab => {
+                if self.autocomplete.selected.is_none() {
+                    self.autocomplete.select_next();
+                }
+                if let Some(item) = self.autocomplete.selected_item().cloned() {
+                    self.accept_autocomplete(&item);
+                }
+                self.autocomplete.close();
+                true
+            }
+            KeyCode::Escape => {
+                self.autocomplete.close();
+                true
+            }
+            _ if submit => {
+                if let Some(item) = self.autocomplete.selected_item().cloned() {
+                    self.accept_autocomplete(&item);
+                    self.autocomplete.close();
+                    return true;
+                }
+                self.autocomplete.close();
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Total rendered conversation lines (transcript + in-flight stream).
@@ -1459,6 +1628,7 @@ impl PiFtuiModel {
             && !matches!(
                 msg,
                 PiMsg::AutocompleteRefresh
+                    | PiMsg::AutocompleteCatalog(_)
                     | PiMsg::ToolStart { .. }
                     | PiMsg::ToolInvocation { .. }
                     | PiMsg::ToolUpdate { .. }
@@ -1469,6 +1639,7 @@ impl PiFtuiModel {
         match msg {
             PiMsg::AgentStart => {
                 self.state = AgentUiState::Working;
+                self.autocomplete.close();
                 // Start the spinner tick chain; it dies naturally once the
                 // agent goes idle (Tick reschedules only while Working —
                 // same self-limiting pattern as the bubbletea spinner gate).
@@ -1614,6 +1785,7 @@ impl PiFtuiModel {
                     // already reachable modal and stranding its waiter.
                     self.send_ask_reply(request.id, Vec::new(), true);
                 } else {
+                    self.autocomplete.close();
                     self.capture_preexisting_card_draft();
                     self.push_ask_card(&request, 0);
                     self.active_ask = Some(ActiveAsk {
@@ -1635,6 +1807,14 @@ impl PiFtuiModel {
                 }
             }
             PiMsg::UiShutdown => return Cmd::quit(),
+            PiMsg::AutocompleteCatalog(catalog) => {
+                // Issue #208: extension commands join the popup's command
+                // list once the driver's session (and its extension
+                // runtime) exists. Any open popup was computed against the
+                // old list; drop it, the next keystroke recomputes.
+                self.autocomplete.provider.set_catalog(catalog);
+                self.autocomplete.close();
+            }
             PiMsg::TerminalTitle(title) => {
                 // Issue #200: the cell-grid renderer can't carry OSC escapes
                 // in frame content, so write the title directly. This runs on
@@ -1743,6 +1923,7 @@ impl PiFtuiModel {
         // still goes through sanitize: paste can smuggle control sequences.
         let clean = sanitize(trimmed).into_owned();
         self.input.set_text("");
+        self.autocomplete.close();
         self.scroll_from_tail = 0;
         self.push_entry(EntryRole::User, clean.clone());
 
@@ -2219,6 +2400,14 @@ impl PiFtuiModel {
                 let actions = KeyBinding::from_ftui_key(key)
                     .map(|binding| self.keybindings.matching_actions(&binding))
                     .unwrap_or_default();
+                // The completion popup owns navigation/accept/dismiss keys
+                // while it shows (issue #208); anything it doesn't consume
+                // continues through the catalog and the editor as usual.
+                if self.completion_visible()
+                    && self.handle_completion_key(key, actions.contains(&AppAction::Submit))
+                {
+                    return Cmd::none();
+                }
                 let pick = |wanted: AppAction| actions.contains(&wanted).then_some(wanted);
                 // Suspend wins over everything (vim semantics): ctrl+z is
                 // unambiguous, and backgrounding must work mid-edit too.
@@ -2302,6 +2491,7 @@ impl PiFtuiModel {
                     }
                     Some(AppAction::NewLine) if self.input_active() => {
                         self.input.insert_newline();
+                        self.maybe_trigger_autocomplete();
                         return Cmd::none();
                     }
                     Some(AppAction::CursorLineEnd) if self.input.is_empty() => {
@@ -2312,10 +2502,11 @@ impl PiFtuiModel {
                     }
                     _ => {}
                 }
-                if self.input_active() {
+                if self.input_active() && self.input.handle_event(event) {
                     // Unrouted keys reach the editor (its own emacs-style
-                    // bindings cover cursor/delete/kill-ring behavior).
-                    self.input.handle_event(event);
+                    // bindings cover cursor/delete/kill-ring behavior); every
+                    // edit or cursor move re-derives the completion popup.
+                    self.maybe_trigger_autocomplete();
                 }
             }
             Event::Mouse(mouse) => match mouse.kind {
@@ -2338,9 +2529,9 @@ impl PiFtuiModel {
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
             }
             _ => {
-                if self.input_active() {
+                if self.input_active() && self.input.handle_event(event) {
                     // Paste and other editor-relevant events flow through.
-                    self.input.handle_event(event);
+                    self.maybe_trigger_autocomplete();
                 }
             }
         }
@@ -2447,6 +2638,7 @@ impl PiFtuiModel {
     /// Render an extension UI prompt into the transcript and make it the
     /// active reply target.
     fn activate_ext_request(&mut self, request: ExtensionUiRequest) {
+        self.autocomplete.close();
         self.capture_preexisting_card_draft();
         let card = format_extension_ui_prompt(&request);
         let text = sanitize(card.trim_end()).into_owned();
@@ -2678,12 +2870,76 @@ impl PiFtuiModel {
     /// The real render pass. Split out of [`Model::view`] so the watchdog can
     /// time it without an extra guard type.
     #[allow(clippy::too_many_lines)]
+    /// Suggestion rows plus a keyboard hint (issue #208). The highlighted
+    /// row is kept inside the window via the shared `scroll_offset`, so a
+    /// short terminal that clamps the region below `max_visible` still
+    /// shows what Up/Down selected.
+    fn render_completion(&self, area: Rect, frame: &mut Frame) {
+        use ftui::text::{Line, Span};
+
+        let items = &self.autocomplete.items;
+        let height = usize::from(area.height);
+        // The hint takes the last row whenever at least one suggestion fits
+        // above it; a single-row region shows one suggestion instead.
+        let show_hint = height >= 2;
+        let visible = height
+            .saturating_sub(usize::from(show_hint))
+            .min(items.len());
+        let offset = self.autocomplete.scroll_offset(visible);
+        let end = (offset + visible).min(items.len());
+        let window = &items[offset..end];
+        let label_width = window
+            .iter()
+            .map(|item| item.label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(32);
+        let selected_style = ftui::Style::new().bold().fg(self.palette.accent);
+        let plain_style = ftui::Style::new();
+        let muted_style = ftui::Style::new().dim().fg(self.palette.muted);
+        let mut lines = Vec::with_capacity(window.len() + 1);
+        for (row, item) in window.iter().enumerate() {
+            let selected = self.autocomplete.selected == Some(offset + row);
+            let (marker, style) = if selected {
+                ("▸ ", selected_style)
+            } else {
+                ("  ", plain_style)
+            };
+            let mut spans = vec![
+                Span::styled(marker, style),
+                Span::styled(format!("{:<label_width$}", item.label), style),
+            ];
+            // Descriptions come from templates, skills, and extensions —
+            // untrusted text, so they go through sanitize like everything
+            // else that reaches a frame.
+            if let Some(desc) = item
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|desc| !desc.is_empty())
+            {
+                spans.push(Span::styled(format!("  {}", sanitize(desc)), muted_style));
+            }
+            lines.push(Line::from_spans(spans));
+        }
+        if show_hint {
+            let hint = if items.len() > visible {
+                format!("{COMPLETION_HINT} · {end}/{} shown", items.len())
+            } else {
+                String::from(COMPLETION_HINT)
+            };
+            lines.push(Line::styled(hint, muted_style));
+        }
+        Paragraph::new(Text::from_lines(lines)).render(area, frame);
+    }
+
     fn render_frame(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let regions = layout_regions(
             area,
             self.input_rows(),
             u16::from(self.error_banner.is_some()),
+            self.completion_rows(),
         );
 
         // Header: identity + agent state.
@@ -2786,6 +3042,11 @@ impl PiFtuiModel {
                 status_style,
             )]))
             .render(regions.status, frame);
+        }
+
+        // Slash-command completion popup (issue #208), pinned to the editor.
+        if regions.completion.height > 0 {
+            self.render_completion(regions.completion, frame);
         }
 
         // Input editor while idle or answering an ask card; processing note
@@ -4108,8 +4369,12 @@ pub fn run(
     available_models: Vec<String>,
     available_sessions: Vec<(String, String)>,
     markdown_spacing: crate::config::MarkdownSpacing,
+    autocomplete: AutocompleteLaunch,
 ) -> std::io::Result<()> {
     const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
+    // Issue #208: the driver re-sends the catalog with extension commands
+    // once its session exists; the model starts from the resource catalog.
+    let driver_catalog = autocomplete.catalog.clone();
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
@@ -4153,6 +4418,13 @@ pub fn run(
                     "ftui preview stack — experimental (bd-cv653.9.1)",
                 )
                 .await;
+                // Issue #208: extension-contributed slash commands become
+                // completable now that the extension runtime is up.
+                if let Some(manager) = handle.extension_manager() {
+                    let mut catalog = driver_catalog;
+                    catalog.extension_commands = extension_commands_for_catalog(manager);
+                    let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog));
+                }
                 // Issue #200: a session opened named at launch (--session)
                 // titles the terminal tab after itself immediately.
                 if let Ok(Some(name)) = handle.with_session(crate::session::Session::get_name).await
@@ -4312,6 +4584,7 @@ pub fn run(
         .with_available_sessions(available_sessions)
         .with_alt_screen(!inline)
         .with_markdown_spacing(markdown_spacing)
+        .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
@@ -6417,6 +6690,322 @@ mod tests {
         type_str(&mut sim, "/Q");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert!(sim.model().pending_quit, "uppercase /Q must quit");
+    }
+
+    // ── Slash-command completion popup (issue #208) ─────────────────────
+
+    #[test]
+    fn slash_prefix_opens_completion_popup_with_descriptions() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/he");
+        let model = sim.model();
+        assert!(
+            model.completion_visible(),
+            "a slash prefix must open the popup"
+        );
+        assert_eq!(model.autocomplete.items[0].label, "/help");
+        assert_eq!(
+            model.autocomplete.selected, None,
+            "nothing is highlighted until the user navigates"
+        );
+        let rendered = buffer_text(sim.capture_frame(80, 12), 80, 12);
+        assert!(
+            rendered.contains("/help"),
+            "popup row missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Show help for interactive commands"),
+            "description missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Tab/Enter accept"),
+            "keyboard hint missing: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn plain_text_never_opens_completion_popup() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "hello");
+        assert!(
+            !sim.model().autocomplete.open,
+            "prose must not open the popup"
+        );
+        assert_eq!(sim.model().completion_rows(), 0);
+        // A slash mid-message is not a command either.
+        type_str(&mut sim, " /he");
+        assert!(!sim.model().autocomplete.open, "mid-message slash is prose");
+        let rendered = buffer_text(sim.capture_frame(80, 12), 80, 12);
+        assert!(
+            !rendered.contains("Tab/Enter accept"),
+            "no popup chrome for prose: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn tab_accepts_first_completion_and_enter_then_submits_the_command() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/he");
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/help", "Tab completes the token");
+        assert!(!sim.model().autocomplete.open, "accepting closes the popup");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "Tab must not submit anything"
+        );
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model().input.is_empty(),
+            "Enter submits the completed draft"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("ftui preview commands")),
+            "the completed /help must route like a typed one"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_navigate_and_enter_accepts_the_highlighted_row() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/");
+        assert!(
+            sim.model().autocomplete.items.len() > 2,
+            "bare slash lists commands"
+        );
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().autocomplete.selected, Some(0));
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().autocomplete.selected, Some(1));
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().autocomplete.selected, Some(0));
+        // Up from the top wraps to the last row.
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        let last = sim.model().autocomplete.items.len() - 1;
+        assert_eq!(sim.model().autocomplete.selected, Some(last));
+        let expected = sim.model().autocomplete.items[last].insert.clone();
+        let rendered = buffer_text(sim.capture_frame(80, 14), 80, 14);
+        assert!(
+            rendered.contains(&format!("▸ {expected}")),
+            "highlighted row must stay in the rendered window: {rendered:?}"
+        );
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            sim.model().input.text(),
+            expected,
+            "Enter accepts the highlight"
+        );
+        assert!(!sim.model().autocomplete.open);
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "accepting a row must not submit the draft"
+        );
+        assert!(sim.model().transcript.is_empty());
+    }
+
+    #[test]
+    fn enter_without_highlight_submits_the_draft_verbatim() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/help");
+        assert!(
+            sim.model().completion_visible(),
+            "exact command still lists matches"
+        );
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().input.is_empty());
+        assert!(!sim.model().autocomplete.open);
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("ftui preview commands")),
+            "Enter with no highlight submits what was typed"
+        );
+    }
+
+    #[test]
+    fn escape_dismisses_popup_and_typing_reopens_it() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/he");
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(!sim.model().autocomplete.open, "Esc closes the popup");
+        assert_eq!(sim.model().input.text(), "/he", "Esc keeps the draft");
+        assert_eq!(sim.model().completion_rows(), 0);
+        type_str(&mut sim, "l");
+        assert!(sim.model().completion_visible(), "the next edit recomputes");
+        assert_eq!(sim.model().autocomplete.items[0].label, "/help");
+    }
+
+    #[test]
+    fn fuzzy_query_still_offers_the_command() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/hlp");
+        assert!(
+            sim.model()
+                .autocomplete
+                .items
+                .iter()
+                .any(|item| item.label == "/help"),
+            "subsequence matches ride the shared fuzzy matcher: {:?}",
+            sim.model().autocomplete.items
+        );
+    }
+
+    #[test]
+    fn popup_closes_when_the_agent_starts_working() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/he");
+        assert!(sim.model().completion_visible());
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        assert!(!sim.model().autocomplete.open, "a turn owns the editor");
+        assert_eq!(sim.model().completion_rows(), 0);
+        let rendered = buffer_text(sim.capture_frame(80, 12), 80, 12);
+        assert!(!rendered.contains("Tab/Enter accept"), "{rendered:?}");
+    }
+
+    #[test]
+    fn catalog_message_makes_extension_commands_completable() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/dep");
+        assert!(
+            !sim.model()
+                .autocomplete
+                .items
+                .iter()
+                .any(|i| i.label == "/deploy"),
+            "unknown command before the catalog arrives"
+        );
+        let catalog = AutocompleteCatalog {
+            extension_commands: vec![crate::autocomplete::NamedEntry {
+                name: String::from("deploy"),
+                description: Some(String::from("Ship the current branch")),
+            }],
+            ..AutocompleteCatalog::default()
+        };
+        sim.send(PiFtuiMsg::Agent(PiMsg::AutocompleteCatalog(catalog)));
+        assert!(!sim.model().autocomplete.open, "a stale popup is dropped");
+        type_str(&mut sim, "l");
+        let model = sim.model();
+        assert!(model.completion_visible());
+        assert_eq!(model.autocomplete.items[0].label, "/deploy");
+        assert_eq!(
+            model.autocomplete.items[0].kind,
+            AutocompleteItemKind::ExtensionCommand
+        );
+        let rendered = buffer_text(sim.capture_frame(80, 12), 80, 12);
+        assert!(rendered.contains("Ship the current branch"), "{rendered:?}");
+    }
+
+    #[test]
+    fn popup_height_caps_at_max_visible_and_scrolls_to_the_highlight() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx).with_autocomplete(AutocompleteLaunch {
+            catalog: AutocompleteCatalog::default(),
+            cwd: std::path::PathBuf::from("."),
+            max_visible: 3,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 80,
+            height: 20,
+        });
+        let body_before = sim.model().body_height();
+        type_str(&mut sim, "/");
+        let total = sim.model().autocomplete.items.len();
+        assert!(total > 3, "need more commands than rows for this test");
+        assert_eq!(sim.model().completion_rows(), 4, "3 rows + hint");
+        assert_eq!(
+            sim.model().body_height(),
+            body_before - 4,
+            "the popup takes its rows from the conversation body"
+        );
+        let rendered = buffer_text(sim.capture_frame(80, 20), 80, 20);
+        assert!(
+            rendered.contains(&format!("3/{total} shown")),
+            "overflow counter missing: {rendered:?}"
+        );
+        // Highlight the fourth row: the window scrolls so it stays visible.
+        for _ in 0..4 {
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        }
+        assert_eq!(sim.model().autocomplete.selected, Some(3));
+        let fourth = sim.model().autocomplete.items[3].label.clone();
+        let first = sim.model().autocomplete.items[0].label.clone();
+        let rendered = buffer_text(sim.capture_frame(80, 20), 80, 20);
+        assert!(
+            rendered.contains(&format!("▸ {fourth}")),
+            "scrolled window must show the highlight: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&format!("  {first} ")),
+            "first row scrolled out of the window: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&format!("4/{total} shown")),
+            "counter follows the window: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn accepting_a_completion_replaces_only_the_command_token() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // The provider's token range covers `/he`; the accepted insert must
+        // replace exactly that span even with the cursor mid-token.
+        type_str(&mut sim, "/he");
+        sim.inject_event(key(KeyCode::Left, Modifiers::empty()));
+        assert!(
+            sim.model().completion_visible(),
+            "cursor moves recompute the popup"
+        );
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/help");
+        assert_eq!(
+            sim.model().input.cursor().grapheme,
+            "/help".len(),
+            "cursor parks at the end of the accepted draft"
+        );
+    }
+
+    #[test]
+    fn layout_reserves_the_completion_rows_above_the_editor() {
+        let area = Rect::new(0, 0, 80, 20);
+        let regions = layout_regions(area, 1, 0, 4);
+        assert_eq!(regions.completion.height, 4);
+        assert_eq!(
+            regions.completion.y + regions.completion.height,
+            regions.input.y
+        );
+        assert_eq!(regions.status.y + 1, regions.completion.y);
+        let closed = layout_regions(area, 1, 0, 0);
+        assert_eq!(closed.completion.height, 0);
+        assert_eq!(closed.body.height, regions.body.height + 4);
     }
 
     #[test]
