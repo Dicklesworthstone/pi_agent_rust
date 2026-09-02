@@ -295,7 +295,7 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         ),
         (
             "current_time",
-            "Get the current wall-clock date and time (ISO-8601 with UTC offset, plus UTC and Unix time)",
+            "Get the host's current wall-clock time (UTC and local ISO-8601, offset, Unix epoch, weekday); takes no arguments",
         ),
     ];
 

@@ -169,7 +169,9 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "ask" => "Ask the user structured questions mid-turn instead of guessing",
         "todo" => "Maintain the session task list",
         "xdev" => "Discover and run rarely-used tools that are not in the live schema",
-        "current_time" => "Get the current wall-clock date and time",
+        "current_time" => {
+            "Return the host's current wall-clock time: UTC and local ISO-8601 timestamps, UTC offset,…"
+        }
         _ => return None,
     })
 }
