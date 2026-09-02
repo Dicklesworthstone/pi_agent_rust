@@ -551,6 +551,22 @@ impl AskTool {
                 .contains_key(id)
     }
 
+    /// Test-only: mark `id` pending exactly as the installed channel handler
+    /// does before it emits an `AskUiRequest`, so cards that tests inject
+    /// directly pass the pending-id guard in the interactive hosts. The reply
+    /// receiver is dropped on purpose: answering such a card reports expiry,
+    /// which is what the direct-injection tests assert.
+    #[cfg(test)]
+    pub(crate) fn register_channel_ui_request_for_tests(&self, id: &str) {
+        let (reply_tx, _reply_rx) = asupersync::channel::oneshot::channel();
+        self.channel_ui_open
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.pending_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_string(), reply_tx);
+    }
+
     /// Close the installed channel UI and dismiss every outstanding card.
     ///
     /// Hosts call this when their reply surface disconnects so an agent turn

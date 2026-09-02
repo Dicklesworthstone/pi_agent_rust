@@ -17408,145 +17408,145 @@ export default function init(pi) {
 
     #[test]
     fn auto_compaction_rejects_stale_session_snapshot_with_paired_end_event() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        let runtime_handle = runtime.handle();
+        // Watchdog: on 2026-09-01 this test hung forever (the compaction
+        // provider was never entered) and stalled the whole lib test binary,
+        // which blocked the DSR test lane twice. The body runs on its own
+        // thread so a regression fails after 120 s instead of hanging every
+        // test scheduled after it.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let body = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            let runtime_handle = runtime.handle();
 
-        runtime.block_on(async move {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let (compaction_entered, mut wait_for_compaction) =
-                asupersync::channel::oneshot::channel::<()>();
-            let (release_compaction, compaction_gate) =
-                asupersync::channel::oneshot::channel::<()>();
-            let provider: Arc<dyn Provider> = Arc::new(GatedAutoCompactionProvider {
-                calls: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-                compaction_entered: Mutex::new(Some(compaction_entered)),
-                compaction_gate: Mutex::new(Some(compaction_gate)),
-            });
-            let agent = Agent::new(
-                provider,
-                ToolRegistry::new(&[], temp.path(), None),
-                AgentConfig {
-                    stream_options: crate::provider::StreamOptions {
-                        api_key: Some("test-key".to_string()),
-                        ..crate::provider::StreamOptions::default()
+            runtime.block_on(async move {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let (compaction_entered, mut wait_for_compaction) =
+                    asupersync::channel::oneshot::channel::<()>();
+                let (release_compaction, compaction_gate) =
+                    asupersync::channel::oneshot::channel::<()>();
+                let provider: Arc<dyn Provider> = Arc::new(GatedAutoCompactionProvider {
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                    compaction_entered: Mutex::new(Some(compaction_entered)),
+                    compaction_gate: Mutex::new(Some(compaction_gate)),
+                });
+                let agent = Agent::new(
+                    provider,
+                    ToolRegistry::new(&[], temp.path(), None),
+                    AgentConfig {
+                        stream_options: crate::provider::StreamOptions {
+                            api_key: Some("test-key".to_string()),
+                            ..crate::provider::StreamOptions::default()
+                        },
+                        ..AgentConfig::default()
                     },
-                    ..AgentConfig::default()
-                },
-            );
-            let session = Arc::new(asupersync::sync::Mutex::new(seed_auto_compaction_session(
-                Session::in_memory(),
-            )));
-            let agent_session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
-                agent,
-                Arc::clone(&session),
-                false,
-                crate::compaction::ResolvedCompactionSettings::default(),
-            )));
-            let mut options =
-                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
-            let mut model = dummy_entry("test-model", false);
-            model.model.provider = "test-provider".to_string();
-            options.available_models = vec![model];
-            options.config.compaction = Some(crate::config::CompactionSettings {
-                enabled: Some(true),
-                reserve_tokens: Some(2),
-                keep_recent_tokens: Some(1),
-                mode: None,
-            });
+                );
+                let session = Arc::new(asupersync::sync::Mutex::new(seed_auto_compaction_session(
+                    Session::in_memory(),
+                )));
+                let agent_session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
+                    agent,
+                    Arc::clone(&session),
+                    false,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                )));
+                let mut options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let mut model = dummy_entry("test-model", false);
+                model.model.provider = "test-provider".to_string();
+                options.available_models = vec![model];
+                options.config.compaction = Some(crate::config::CompactionSettings {
+                    enabled: Some(true),
+                    reserve_tokens: Some(2),
+                    keep_recent_tokens: Some(1),
+                    mode: None,
+                });
 
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
-            let compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
-                &options.config,
-            )));
-            let compact_task = runtime_handle.spawn(maybe_auto_compact(
-                Arc::clone(&agent_session),
-                shared_state,
-                options,
-                Arc::clone(&compacting),
-                out_tx,
-            ));
-            let entered_cx = AgentCx::for_request();
-            // Bounded by the wall clock: when compaction admission refuses or
-            // stalls, this test must fail instead of hanging the whole lib test
-            // binary (which is what stalled the DSR test lane on 2026-09-01).
-            // `asupersync::time::timeout` does not fire on this bare
-            // current-thread runtime, so poll manually against a deadline while
-            // yielding so the spawned compaction task keeps running.
-            let entered = wait_for_compaction.recv(entered_cx.cx());
-            futures::pin_mut!(entered);
-            let deadline = Instant::now() + Duration::from_secs(60);
-            loop {
-                match futures::poll!(entered.as_mut()) {
-                    std::task::Poll::Ready(result) => {
-                        result.expect("auto-compaction provider entered");
-                        break;
-                    }
-                    std::task::Poll::Pending => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "auto-compaction provider was not entered within 60s (admission refused or stalled)"
-                        );
-                        asupersync::runtime::yield_now().await;
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                }
-            }
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+                let compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &options.config,
+                )));
+                let compact_task = runtime_handle.spawn(maybe_auto_compact(
+                    Arc::clone(&agent_session),
+                    shared_state,
+                    options,
+                    Arc::clone(&compacting),
+                    out_tx,
+                ));
+                let entered_cx = AgentCx::for_request();
+                wait_for_compaction
+                    .recv(entered_cx.cx())
+                    .await
+                    .expect("auto-compaction provider entered");
 
-            let replacement_id = {
-                let guard = agent_session
+                let replacement_id = {
+                    let guard = agent_session
+                        .lock(&entered_cx)
+                        .await
+                        .expect("agent session lock");
+                    let mut inner = guard.session.lock(&entered_cx).await.expect("session lock");
+                    let replacement = Session::in_memory();
+                    let replacement_id = replacement.header.id.clone();
+                    *inner = replacement;
+                    replacement_id
+                };
+                release_compaction
+                    .send(entered_cx.cx(), ())
+                    .expect("release auto-compaction provider");
+                compact_task.await;
+
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["type"] == "auto_compaction_start")
+                        .count(),
+                    1
+                );
+                let ends = events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_compaction_end")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ends.len(),
+                    1,
+                    "start must have exactly one terminal end: {events:?}"
+                );
+                assert!(
+                    ends[0]["errorMessage"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("Active session changed")),
+                    "stale snapshot must fail closed: {ends:?}"
+                );
+                assert!(ends[0].get("result").is_none());
+                assert!(!compacting.load(Ordering::SeqCst));
+
+                let inner = session
                     .lock(&entered_cx)
                     .await
-                    .expect("agent session lock");
-                let mut inner = guard.session.lock(&entered_cx).await.expect("session lock");
-                let replacement = Session::in_memory();
-                let replacement_id = replacement.header.id.clone();
-                *inner = replacement;
-                replacement_id
-            };
-            release_compaction
-                .send(entered_cx.cx(), ())
-                .expect("release auto-compaction provider");
-            compact_task.await;
-
-            let events = out_rx
-                .try_iter()
-                .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event["type"] == "auto_compaction_start")
-                    .count(),
-                1
-            );
-            let ends = events
-                .iter()
-                .filter(|event| event["type"] == "auto_compaction_end")
-                .collect::<Vec<_>>();
-            assert_eq!(
-                ends.len(),
-                1,
-                "start must have exactly one terminal end: {events:?}"
-            );
-            assert!(
-                ends[0]["errorMessage"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("Active session changed")),
-                "stale snapshot must fail closed: {ends:?}"
-            );
-            assert!(ends[0].get("result").is_none());
-            assert!(!compacting.load(Ordering::SeqCst));
-
-            let inner = session
-                .lock(&entered_cx)
-                .await
-                .expect("replacement session lock");
-            assert_eq!(inner.header.id, replacement_id);
-            assert_eq!(provider_compaction_count(&inner), 0);
+                    .expect("replacement session lock");
+                assert_eq!(inner.header.id, replacement_id);
+                assert_eq!(provider_compaction_count(&inner), 0);
+            });
+            let _ = done_tx.send(());
         });
+        match done_rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(()) => body.join().expect("test body thread panicked"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The body panicked before signalling: surface that panic.
+                body.join().expect("test body thread panicked");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "auto_compaction_rejects_stale_session_snapshot_with_paired_end_event hung for 120s: \
+                 the compaction provider was never entered or the RPC loop never finished \
+                 (see bd-x8mn7 cluster B)"
+            ),
+        }
     }
 
     // -----------------------------------------------------------------------

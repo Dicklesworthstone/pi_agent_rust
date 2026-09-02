@@ -689,10 +689,12 @@ mod tests {
             vec![DangerousCommandClass::RecursiveDelete],
         );
 
-        // rm -rf / without prior confirmation should require dual confirmation even under YOLO
+        // rm -rf / without prior confirmation should require dual confirmation even under YOLO.
+        // The classifier deliberately matches only root/broad targets (`/`, `/*`, `~`), not
+        // arbitrary subdirectories such as /tmp/test.
         let eval_dc = state.evaluate(
             "bash",
-            &json!({"command": "rm -rf /tmp/test"}),
+            &json!({"command": "rm -rf /"}),
             ToolEffects::process(),
             None,
             None,

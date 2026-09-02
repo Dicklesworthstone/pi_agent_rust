@@ -805,6 +805,9 @@ fn ask_card_consumes_input_and_advances_questions() {
         ]
     }))
     .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("req-1");
+    }
     app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
         id: "req-1".to_string(),
         request,
@@ -832,6 +835,9 @@ fn ask_card_consumes_input_and_advances_questions() {
         "questions": [{"question": "Again?", "options": [{"label": "A"}, {"label": "B"}]}]
     }))
     .expect("ask request 2");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("req-2");
+    }
     app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
         id: "req-2".to_string(),
         request,
@@ -860,6 +866,9 @@ fn ask_card_answer_is_not_queued_as_steering_while_agent_busy() {
         ]
     }))
     .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("req-busy");
+    }
     app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
         id: "req-busy".to_string(),
         request,
@@ -909,6 +918,9 @@ fn ask_card_answer_is_not_queued_as_steering_while_agent_busy() {
         "questions": [{"question": "Again?", "options": [{"label": "A"}, {"label": "B"}]}]
     }))
     .expect("ask request 2");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("req-busy-2");
+    }
     app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
         id: "req-busy-2".to_string(),
         request,
@@ -959,6 +971,9 @@ fn mixed_cards_extension_then_ask_serialize_in_arrival_order() {
         "questions": [{"question": "Which?", "options": [{"label": "A"}]}]
     }))
     .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a1");
+    }
     app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
         id: "a1".to_string(),
         request,
@@ -1003,6 +1018,9 @@ fn mixed_cards_ask_then_ext_preserve_drafts_across_resolution_paths() {
         "questions": [{"question": "Run tests?", "options": [{"label": "Yes"}, {"label": "No"}]}]
     }))
     .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-order");
+    }
     app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
         id: "a-order".to_string(),
         request,
@@ -1060,6 +1078,9 @@ fn normal_card_resolution_restores_only_the_preexisting_draft() {
         "questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}]
     }))
     .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-normal");
+    }
     app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
         id: "a-normal".to_string(),
         request,
@@ -1096,6 +1117,9 @@ fn escape_advances_one_card_at_a_time_across_ask_ask_extension() {
             "questions": [{"question": label, "options": [{"label": "Yes"}]}]
         }))
         .expect("ask request");
+        if let Some(tool) = app.ask_tool.as_ref() {
+            tool.register_channel_ui_request_for_tests(id);
+        }
         app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
             id: id.to_string(),
             request,
@@ -1170,6 +1194,10 @@ fn agent_done_invalidates_all_outstanding_cards_before_idle() {
         "questions": [{"question": "Active?", "options": [{"label": "A"}]}]
     }))
     .expect("active ask");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-done");
+        tool.register_channel_ui_request_for_tests("a-queued");
+    }
     app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
         id: "a-done".to_string(),
         request,
