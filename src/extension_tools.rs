@@ -175,6 +175,10 @@ impl Tool for ExtensionToolWrapper {
         self.def.parameters.clone()
     }
 
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Extension
+    }
+
     async fn execute(
         &self,
         tool_call_id: &str,
@@ -219,6 +223,10 @@ impl Tool for WasmExtensionToolWrapper {
 
     fn parameters(&self) -> Value {
         self.def.parameters.clone()
+    }
+
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Extension
     }
 
     async fn execute(
@@ -715,6 +723,46 @@ mod tests {
         }
     }
 
+    /// Boot a JS runtime on a fresh shared registry and load `source`. The
+    /// `tool` capability needs an approval prompt under the default policy,
+    /// and tests cannot answer one; the permissive profile grants it, which
+    /// is what the classic startup path does for trusted workspaces.
+    async fn start_extension_on_shared_registry(
+        source: &str,
+    ) -> (
+        tempfile::TempDir,
+        ExtensionManager,
+        JsExtensionRuntimeHandle,
+        crate::tools::SharedToolRegistry,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let entry_path = temp_dir.path().join("ext.mjs");
+        std::fs::write(&entry_path, source).expect("write extension entry");
+        let manager = ExtensionManager::new();
+        let shared =
+            crate::tools::SharedToolRegistry::new(ToolRegistry::new(&[], temp_dir.path(), None));
+        let js_runtime = JsExtensionRuntimeHandle::start_with_policy(
+            PiJsRuntimeConfig {
+                cwd: temp_dir.path().display().to_string(),
+                ..Default::default()
+            },
+            shared.clone(),
+            manager.clone(),
+            crate::extensions::ExtensionPolicy::from_profile(
+                crate::extensions::PolicyProfile::Permissive,
+            ),
+        )
+        .await
+        .expect("start js runtime");
+        manager.set_js_runtime(js_runtime.clone());
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec");
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .expect("load js extensions");
+        (temp_dir, manager, js_runtime, shared)
+    }
+
     /// Production-path check for the shared registry (bd-4t6oz): the JS
     /// runtime boots on the same [`crate::tools::SharedToolRegistry`] the
     /// agent is built over, a Rust tool is mounted through the agent AFTER
@@ -727,10 +775,7 @@ mod tests {
             .build()
             .expect("runtime build");
         runtime.block_on(async {
-            let temp_dir = tempfile::tempdir().expect("tempdir");
-            let entry_path = temp_dir.path().join("ext.mjs");
-            std::fs::write(
-                &entry_path,
+            let (temp_dir, manager, _js_runtime, shared) = start_extension_on_shared_registry(
                 r#"
                 export default function init(pi) {
                   pi.registerTool({
@@ -748,29 +793,7 @@ mod tests {
                 }
                 "#,
             )
-            .expect("write extension entry");
-            let manager = ExtensionManager::new();
-            let shared = crate::tools::SharedToolRegistry::new(ToolRegistry::new(
-                &[],
-                temp_dir.path(),
-                None,
-            ));
-            let js_runtime = JsExtensionRuntimeHandle::start(
-                PiJsRuntimeConfig {
-                    cwd: temp_dir.path().display().to_string(),
-                    ..Default::default()
-                },
-                shared.clone(),
-                manager.clone(),
-            )
-            .await
-            .expect("start js runtime");
-            manager.set_js_runtime(js_runtime.clone());
-            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec");
-            manager
-                .load_js_extensions(vec![spec])
-                .await
-                .expect("load js extensions");
+            .await;
 
             // The agent shares the registry handle and mounts a tool now that
             // the runtime is already up.
@@ -809,6 +832,116 @@ mod tests {
                 "the hostcall must reach the tool mounted after boot: is_error={} text={text}",
                 output.is_error
             );
+        });
+    }
+
+    /// bd-4t6oz slice 3: `pi.setActiveTools` changes what the live agent can
+    /// see and execute in one published registry swap. Before, the hostcall
+    /// only rewrote extension-manager metadata consulted when wrappers were
+    /// collected, so an already-mounted tool stayed callable and in the
+    /// provider schema.
+    #[test]
+    fn set_active_tools_shelves_and_restores_mounted_extension_tools() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            // Extension tool `execute` receives (callId, input, onUpdate,
+            // abort, ctx); the active list travels in `input.names`.
+            let (temp_dir, manager, _js_runtime, shared) = start_extension_on_shared_registry(
+                r#"
+                export default function init(pi) {
+                  const ok = (text) => ({ content: [{ type: "text", text }], isError: false });
+                  pi.registerTool({
+                    name: "keep_tool",
+                    description: "stays active",
+                    parameters: { type: "object" },
+                    execute: async () => ok("keep")
+                  });
+                  pi.registerTool({
+                    name: "drop_tool",
+                    description: "gets shelved",
+                    parameters: { type: "object" },
+                    execute: async () => ok("drop")
+                  });
+                  pi.registerTool({
+                    name: "toggle_tool",
+                    description: "applies an active-tool list",
+                    parameters: { type: "object", properties: { names: { type: "array" } } },
+                    execute: async (_callId, input) => {
+                      await pi.setActiveTools(input.names);
+                      return ok("toggled");
+                    }
+                  });
+                }
+                "#,
+            )
+            .await;
+
+            let provider = Arc::new(ToolCallingProvider);
+            let mut agent =
+                Agent::with_shared_tools(provider, shared.clone(), AgentConfig::default());
+            let wrappers = collect_extension_tool_wrappers(
+                &manager,
+                json!({ "cwd": temp_dir.path().display().to_string() }),
+            )
+            .await
+            .expect("collect wrappers");
+            assert_eq!(wrappers.len(), 3);
+            agent.extend_tools(wrappers);
+            assert!(agent.has_tool("keep_tool") && agent.has_tool("drop_tool"));
+            let version_before = shared.version();
+
+            // The extension narrows its active set: the shelved tool leaves
+            // the live registry in the same swap, the others stay.
+            let registry = shared.snapshot();
+            let toggle = registry.get("toggle_tool").expect("toggle_tool mounted");
+            let output = toggle
+                .execute(
+                    "toggle-1",
+                    json!({ "names": ["keep_tool", "toggle_tool"] }),
+                    None,
+                )
+                .await
+                .expect("toggle executes");
+            assert!(!output.is_error, "toggle must succeed: {output:?}");
+            assert!(
+                shared.version() > version_before,
+                "the swap must be published"
+            );
+            assert!(agent.has_tool("keep_tool"));
+            assert!(
+                !agent.has_tool("drop_tool"),
+                "a de-activated extension tool must be unreachable for the agent"
+            );
+            assert_eq!(
+                shared
+                    .snapshot()
+                    .inactive_tools()
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>(),
+                vec!["drop_tool".to_string()]
+            );
+
+            // Naming it again restores it; built-ins are never part of this.
+            let registry = shared.snapshot();
+            let toggle = registry
+                .get("toggle_tool")
+                .expect("toggle_tool still mounted");
+            toggle
+                .execute(
+                    "toggle-2",
+                    json!({ "names": ["keep_tool", "drop_tool", "toggle_tool"] }),
+                    None,
+                )
+                .await
+                .expect("toggle executes again");
+            assert!(
+                agent.has_tool("drop_tool"),
+                "a re-activated tool must come back"
+            );
+            assert!(shared.snapshot().inactive_tools().is_empty());
         });
     }
 

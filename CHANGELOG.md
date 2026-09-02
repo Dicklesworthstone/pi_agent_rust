@@ -46,6 +46,12 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   against the current one under the same undo recorder and workspace roots
   as the agent's own tool calls. `Agent::with_shared_tools` and
   `Agent::shared_tools` expose the handle; `Agent::new` keeps working.
+  `pi.setActiveTools` now applies to the live registry in the same published
+  swap: extension tools left out of the list are shelved (unreachable for
+  the agent's next provider schema and for execution) and come back when
+  named again; built-in and MCP tools are untouched. Previously the call only
+  updated extension-manager metadata consulted when wrappers were collected,
+  so an already-mounted tool stayed callable.
 
 - **MCP servers registered by extensions after startup reach the live
   session**: startup copied extension-registered MCP definitions into the

@@ -197,6 +197,22 @@ pub trait Tool: Send + Sync {
     /// Attach the owning registry's live background-job session scope.
     /// Non-job tools intentionally ignore it.
     fn bind_job_session_scope(&mut self, _scope: crate::jobs::JobSessionScope) {}
+
+    /// Where the tool comes from. Extension-registered tools answer
+    /// [`ToolOrigin::Extension`] so `setActiveTools` can shelve and restore
+    /// them without touching built-in or MCP tools.
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::BuiltIn
+    }
+}
+
+/// Provenance of a registered tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOrigin {
+    /// Built-in, MCP, plan, or other host-provided tools.
+    BuiltIn,
+    /// Registered by an extension (JS, native, or WASM wrapper).
+    Extension,
 }
 
 /// Tool execution output.
@@ -5289,6 +5305,9 @@ pub(crate) fn resize_image_if_needed(
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
+    /// Extension tools shelved by `setActiveTools`; restored when a later
+    /// call names them again.
+    inactive: Vec<Arc<dyn Tool>>,
     /// Shared by bash/jobs/hub and rebound by [`crate::agent::AgentSession`]
     /// to the live session handle.
     job_session_scope: crate::jobs::JobSessionScope,
@@ -5299,6 +5318,9 @@ pub struct ToolRegistry {
     /// Session undo recorder shared with write/edit/hashline_edit
     /// (bd-cv653.3.13); the interactive host reads it back for /undo //redo.
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    /// Back-pointer to the [`SharedToolRegistry`] this snapshot belongs to,
+    /// so a hostcall holding only a snapshot can publish an update.
+    shared: Option<std::sync::Weak<SharedToolRegistryInner>>,
 }
 
 impl ToolRegistry {
@@ -5575,9 +5597,11 @@ impl ToolRegistry {
 
         Self {
             tools: tools.into_iter().map(Arc::from).collect(),
+            inactive: Vec::new(),
             job_session_scope,
             discoverable: discoverable_names,
             mutation_recorder,
+            shared: None,
         }
     }
 
@@ -5589,9 +5613,11 @@ impl ToolRegistry {
         }
         Self {
             tools: tools.into_iter().map(Arc::from).collect(),
+            inactive: Vec::new(),
             job_session_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
+            shared: None,
         }
     }
 
@@ -5602,10 +5628,49 @@ impl ToolRegistry {
     pub fn clone_shallow(&self) -> Self {
         Self {
             tools: self.tools.clone(),
+            inactive: self.inactive.clone(),
             job_session_scope: self.job_session_scope.clone(),
             discoverable: self.discoverable.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
+            shared: self.shared.clone(),
         }
+    }
+
+    /// The shared handle this snapshot was published from, if any. Lets a
+    /// hostcall that only holds a snapshot publish an update (for example
+    /// `setActiveTools`) that the agent's next lookup will observe.
+    #[must_use]
+    pub fn shared_handle(&self) -> Option<SharedToolRegistry> {
+        self.shared
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|inner| SharedToolRegistry { inner })
+    }
+
+    /// Apply an extension's `setActiveTools` list: extension-origin tools
+    /// not named are shelved (invisible to `get`/`tools`, so neither the
+    /// provider schema nor execution can reach them), and shelved tools that
+    /// are named again come back. Built-in and MCP tools are never touched.
+    pub fn set_active_extension_tools(&mut self, active: &[String]) {
+        let is_active = |name: &str| active.iter().any(|candidate| candidate == name);
+        let (keep, shelve): (Vec<_>, Vec<_>) = self
+            .tools
+            .drain(..)
+            .partition(|tool| tool.origin() != ToolOrigin::Extension || is_active(tool.name()));
+        let (restore, still_inactive): (Vec<_>, Vec<_>) = self
+            .inactive
+            .drain(..)
+            .partition(|tool| is_active(tool.name()));
+        self.tools = keep;
+        self.tools.extend(restore);
+        self.inactive = shelve;
+        self.inactive.extend(still_inactive);
+    }
+
+    /// Extension tools currently shelved by `setActiveTools`.
+    #[must_use]
+    pub fn inactive_tools(&self) -> &[Arc<dyn Tool>] {
+        &self.inactive
     }
 
     /// Convert the registry into the owned tool list.
@@ -5693,42 +5758,73 @@ impl ToolRegistry {
 /// (bd-4t6oz).
 #[derive(Clone)]
 pub struct SharedToolRegistry {
-    inner: Arc<std::sync::RwLock<Arc<ToolRegistry>>>,
+    inner: Arc<SharedToolRegistryInner>,
+}
+
+/// The cell every handle and every snapshot's back-pointer share: the
+/// current registry and the update counter live together so a handle
+/// rebuilt from a snapshot observes and bumps the same version.
+pub struct SharedToolRegistryInner {
+    registry: std::sync::RwLock<Arc<ToolRegistry>>,
+    /// Bumped on every published update; the agent folds it into its tool
+    /// schema cache key so a swap made from a hostcall (for example
+    /// `setActiveTools`) reaches the next provider request without any
+    /// out-of-band invalidation.
+    version: std::sync::atomic::AtomicU64,
 }
 
 impl SharedToolRegistry {
     #[must_use]
-    pub fn new(registry: ToolRegistry) -> Self {
-        Self::from_arc(Arc::new(registry))
+    pub fn new(mut registry: ToolRegistry) -> Self {
+        let inner = Arc::new_cyclic(|weak| {
+            registry.shared = Some(weak.clone());
+            SharedToolRegistryInner {
+                registry: std::sync::RwLock::new(Arc::new(registry)),
+                version: std::sync::atomic::AtomicU64::new(0),
+            }
+        });
+        Self { inner }
     }
 
     #[must_use]
     pub fn from_arc(registry: Arc<ToolRegistry>) -> Self {
-        Self {
-            inner: Arc::new(std::sync::RwLock::new(registry)),
-        }
+        let registry = Arc::try_unwrap(registry).unwrap_or_else(|shared| shared.clone_shallow());
+        Self::new(registry)
     }
 
     /// Current snapshot. Cheap to take; hold it for one lookup plus the
     /// tool's execution so the tool handle stays alive.
     #[must_use]
     pub fn snapshot(&self) -> Arc<ToolRegistry> {
-        match self.inner.read() {
+        match self.inner.registry.read() {
             Ok(guard) => Arc::clone(&guard),
             Err(poisoned) => Arc::clone(&poisoned.into_inner()),
         }
     }
 
+    /// Number of updates published so far (see the `version` field).
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.inner.version.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Publish a modified registry: shallow-copy the current snapshot, apply
     /// `mutate`, and swap the result in atomically.
     pub fn update(&self, mutate: impl FnOnce(&mut ToolRegistry)) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut next = guard.clone_shallow();
-        mutate(&mut next);
-        *guard = Arc::new(next);
+        {
+            let mut guard = self
+                .inner
+                .registry
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut next = guard.clone_shallow();
+            next.shared = Some(Arc::downgrade(&self.inner));
+            mutate(&mut next);
+            *guard = Arc::new(next);
+        }
+        self.inner
+            .version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

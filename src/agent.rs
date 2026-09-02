@@ -2150,9 +2150,13 @@ impl Agent {
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
         // Load modes (bd-cv653.1.6): discoverable-tier tools are excluded
         // until promoted; the generation counter invalidates on promotion.
+        // The registry version covers every published swap, including the
+        // ones made from extension hostcalls (`setActiveTools`), so those
+        // reach the next provider request without out-of-band invalidation.
         let generation = self
             .tool_defs_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
+            .load(std::sync::atomic::Ordering::SeqCst)
+            ^ self.tools.version().rotate_left(32);
         let cache_fresh = self
             .cached_tool_defs
             .as_ref()

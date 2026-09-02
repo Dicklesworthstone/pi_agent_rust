@@ -19134,7 +19134,7 @@ async fn dispatch_hostcall_events_ref(
             HostcallOutcome::Success(json!({ "tools": result }))
         }
         EventsHostcallOp::SetActiveTools => {
-            let tools = payload
+            let requested = payload
                 .get("tools")
                 .and_then(Value::as_array)
                 .map(|items| {
@@ -19145,7 +19145,14 @@ async fn dispatch_hostcall_events_ref(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            manager.set_active_tools(tools);
+            manager.set_active_tools(requested.clone());
+            // Apply the same allow-set to the live shared registry so the
+            // agent's next provider schema and execution allow-set change in
+            // one published swap (bd-4t6oz slice 3); the manager metadata
+            // alone only affected wrappers collected later.
+            if let Some(shared) = tools.shared_handle() {
+                shared.update(|registry| registry.set_active_extension_tools(&requested));
+            }
             HostcallOutcome::Success(Value::Null)
         }
         EventsHostcallOp::AppendEntry => {

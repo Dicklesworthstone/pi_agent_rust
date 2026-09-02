@@ -1063,8 +1063,16 @@ agent's own calls. The production-path test
 `hostcall_sees_tool_mounted_after_runtime_start` boots the runtime on the
 shared handle, mounts a Rust tool through the agent afterwards, and drives a
 `pi.tool` hostcall from an extension tool to it; under the split registry it
-fails with "Unknown tool". The atomic `setActiveTools` allow-set is the
-remaining slice on the bead. bd-8m21l followed on the same seam: an MCP
+fails with "Unknown tool". Slice 3 closed the `setActiveTools` gap on the
+same handle: tools carry an origin (extension wrappers answer
+`Extension`), the registry keeps a shelf for de-activated extension tools,
+each snapshot carries a weak back-pointer to its shared handle so the events
+hostcall can publish the swap it needs without threading a new field
+through the hostcall context, and the shared handle's version is folded
+into the agent's tool-schema cache key so the next provider request sees
+the change without any out-of-band invalidation. The test drives
+`pi.setActiveTools` from an extension tool and checks that the agent loses
+and regains the shelved tool. bd-8m21l followed on the same seam: an MCP
 server registered by an extension after startup only ever reached the
 extension manager's snapshot; the SDK session handle now drains that
 snapshot at the start of every prompt (`sync_extension_mcp_registrations`),
