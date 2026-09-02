@@ -17469,10 +17469,31 @@ export default function init(pi) {
                 out_tx,
             ));
             let entered_cx = AgentCx::for_request();
-            wait_for_compaction
-                .recv(entered_cx.cx())
-                .await
-                .expect("auto-compaction provider entered");
+            // Bounded by the wall clock: when compaction admission refuses or
+            // stalls, this test must fail instead of hanging the whole lib test
+            // binary (which is what stalled the DSR test lane on 2026-09-01).
+            // `asupersync::time::timeout` does not fire on this bare
+            // current-thread runtime, so poll manually against a deadline while
+            // yielding so the spawned compaction task keeps running.
+            let entered = wait_for_compaction.recv(entered_cx.cx());
+            futures::pin_mut!(entered);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                match futures::poll!(entered.as_mut()) {
+                    std::task::Poll::Ready(result) => {
+                        result.expect("auto-compaction provider entered");
+                        break;
+                    }
+                    std::task::Poll::Pending => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "auto-compaction provider was not entered within 60s (admission refused or stalled)"
+                        );
+                        asupersync::runtime::yield_now().await;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
 
             let replacement_id = {
                 let guard = agent_session

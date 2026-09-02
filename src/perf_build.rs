@@ -1202,7 +1202,10 @@ mod tests {
     #[test]
     fn binary_size_control_binds_exact_release_binary_and_profile() {
         let temp = tempfile::tempdir().expect("create test directory");
-        let binary_path = temp.path().join("pi");
+        // The verifier binds controls to the producer path `release/pi`.
+        let binary_path = temp.path().join("release").join("pi");
+        std::fs::create_dir_all(binary_path.parent().expect("release dir"))
+            .expect("create release dir");
         std::fs::write(&binary_path, b"shipping release binary").expect("write release binary");
         let binary_path = std::fs::canonicalize(binary_path).expect("canonical binary path");
         let binary_sha256 = super::sha256_file(&binary_path).expect("hash release binary");
@@ -1402,7 +1405,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn idle_rss_control_binds_pi_process_allocator_and_executable() {
         let temp = tempfile::tempdir().expect("create test directory");
-        let binary_path = temp.path().join("pi");
+        // The verifier binds controls to the producer path `release/pi`.
+        let binary_path = temp.path().join("release").join("pi");
+        std::fs::create_dir_all(binary_path.parent().expect("release dir"))
+            .expect("create release dir");
         std::fs::write(&binary_path, b"measured pi executable").expect("write Pi executable");
         let binary_path = std::fs::canonicalize(binary_path).expect("canonical Pi path");
         let binary_sha256 = super::sha256_file(&binary_path).expect("hash Pi executable");

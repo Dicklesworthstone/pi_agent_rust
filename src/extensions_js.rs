@@ -25261,7 +25261,9 @@ mod tests {
             "node:fs",
             "@mariozechner/pi-ai",
             "node:child_process",
+            "node:stream",
             "@mariozechner/pi-coding-agent",
+            "@mariozechner/pi-tui",
         ] {
             let source = modules.get(name).expect("receipt module must exist");
             eprintln!(
@@ -25270,10 +25272,14 @@ mod tests {
                 sha256_hex(source.as_bytes())
             );
         }
-        assert_eq!(bridge.len(), 201_242);
+        // Receipts re-pinned 2026-09-01 after the 2026-08-25..27 bridge changes
+        // (context-overflow detection, SessionActionOrigin binding, MCP spec
+        // preservation) landed without updating them; the previous pin was
+        // 201_242 / 2e3cadbe… from dea48721.
+        assert_eq!(bridge.len(), 202_987);
         assert_eq!(
             sha256_hex(bridge.as_bytes()),
-            "2e3cadbe89d8361dfafa9cb9c836ed0a9b1ebc93fd6d8f73a1379f44fcd0590b"
+            "fdfa107dc7d7d9edabba347886cf8be031fe6ee25c653ea840c29ae16f8d8980"
         );
 
         for (name, expected_len, expected_sha256) in [
@@ -25284,8 +25290,8 @@ mod tests {
             ),
             (
                 "@mariozechner/pi-ai",
-                21_658,
-                "26fee747831ab26565ca358b5d8e3aae61c0ff63c51e6489d4cae56ca4ea2142",
+                24_612,
+                "33423d306e358a879c8b9e763dfc7e9fddf628ea275855aa2a89d1e52411547a",
             ),
             (
                 "node:child_process",

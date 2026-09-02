@@ -14431,7 +14431,10 @@ impl CurrentTimeZone {
             _ => return None,
         };
         let (hours, minutes) = match digits.split_once(':') {
-            Some((h, m)) => (h, m),
+            // The colon form is `+HH:MM` only: `+8:00` is rejected so the
+            // accepted grammar stays exactly what the error message lists.
+            Some((h, m)) if h.len() == 2 => (h, m),
+            Some(_) => return None,
             None => match digits.len() {
                 1 | 2 => (digits, "00"),
                 4 => digits.split_at(2),
@@ -14527,6 +14530,7 @@ fn current_time_output(now: chrono::DateTime<chrono::Utc>, zone: CurrentTimeZone
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for CurrentTimeTool {
     fn name(&self) -> &str {
         "current_time"
