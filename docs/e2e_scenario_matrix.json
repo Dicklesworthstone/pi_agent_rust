@@ -1217,7 +1217,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite agent_hub"
     },
     {
       "workflow_id": "wf-ssh-workspace-fixture-sshd",
@@ -1248,7 +1248,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_ssh_workspace"
     },
     {
       "workflow_id": "wf-security-scan-seeded-vulnerabilities",
@@ -1279,7 +1279,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite security_scan"
     },
     {
       "workflow_id": "wf-math-technique-reachability",
@@ -1310,7 +1310,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite math_reachability_e2e_test"
     }
   ]
 }

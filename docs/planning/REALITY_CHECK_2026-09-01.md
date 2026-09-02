@@ -1006,7 +1006,24 @@ attribution in `src/extensions.rs`, where it never lived (it is the perf
 orchestrator's computation, validated by the phase-1 matrix tests); and the
 interruption "fresh run after abort" test resumed a session with a different
 mock provider, which the session-bound model selection rule now refuses (the
-fresh provider reports the bound identity). Parked with
+fresh provider reports the bound identity). Run12 (2518c8c1, run dir
+`20260902T121239-1740587`) then reported fmt/check/installer/reachability
+green, the test lane at 37716 pass / 72 fail (run11: 119 fail), and clippy
+red on three lints from the FTUI autocomplete commit (75493a02) that landed
+between run11 and this round; DSR also invalidated the receipt because
+recording the launch on the beads changed tracked `.beads` files mid-run
+(lesson: no tracker writes while a DSR run is in flight). Four of the 72
+were new and mine: the February context-filter test still expected hidden
+messages to be dropped (realigned to the hidden-messages-reach-the-model
+rule, with the provenance exclusion pinned), two replay-bundle checks caught
+that the four new scenario rows had copied the `/tan` replay command (now
+point at their own suites), and the embedded-changelog byte test tripped on
+the worker's stale build-script output (the known rsync-mtime hazard; the
+file is touched again before the next run). The three clippy lints (and a
+fourth on the stress test's warm-up refactor, masked until the lib was
+clean) were fixed concurrently by the maintainer's own commits (8d965337,
+a06fe698) while equivalent fixes were being verified here; the rebase kept
+the maintainer's versions. Parked with
 reasons: the ext-conformance artifact cluster is blocked by a stray ignored
 file (`tests/ext_conformance/artifacts/doom-overlay/tiny.wad`, bd-n4ov9,
 deletion needs written approval); eight orchestrate contract tests fail

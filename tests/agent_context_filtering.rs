@@ -93,6 +93,17 @@ mod tests {
                 timestamp: 0,
             }));
 
+            // Add pi's own hidden provenance record: its payload travels in
+            // the system prompt, so it is the one hidden message the model
+            // must not see twice.
+            agent.add_message(Message::Custom(CustomMessage {
+                content: "provenance".to_string(),
+                custom_type: "semantic_context_bundle".to_string(),
+                display: false,
+                details: None,
+                timestamp: 0,
+            }));
+
             // Trigger a run to force context build
             // We use run_continue_with_abort just to trigger the loop without adding a new user prompt
             let _ = agent.run_continue_with_abort(None, |_| {}).await;
@@ -103,7 +114,10 @@ mod tests {
                 .clone()
                 .expect("stream called");
 
-            assert_eq!(messages.len(), 2);
+            // `display: false` only hides a message from the TUI; extension
+            // messages injected with it still reach the model. Only pi's
+            // provenance record is excluded.
+            assert_eq!(messages.len(), 3, "context: {messages:?}");
 
             // Check contents
             match &messages[0] {
@@ -116,11 +130,28 @@ mod tests {
 
             match &messages[1] {
                 Message::Custom(c) => {
+                    assert_eq!(c.content, "hidden");
+                    assert!(!c.display);
+                }
+                _ => panic!("Expected the hidden custom message to reach the model"), // ubs:ignore test assertion
+            }
+
+            let visible_custom = &messages[2]; // ubs:ignore length asserted above
+            match visible_custom {
+                Message::Custom(c) => {
                     assert_eq!(c.content, "visible_custom");
                     assert!(c.display);
                 }
                 _ => panic!("Expected visible custom message"),
             }
+
+            assert!(
+                !messages.iter().any(|message| matches!(
+                    message,
+                    Message::Custom(c) if c.custom_type == "semantic_context_bundle"
+                )),
+                "provenance record must stay out of the provider context"
+            );
         });
     }
 }
