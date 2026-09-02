@@ -78,18 +78,14 @@ impl TimeSnapshot {
     /// The text block handed to the model.
     #[must_use]
     pub fn render_text(&self) -> String {
-        let mut out = format!(
-            "UTC: {}\nLocal: {} (UTC{})",
-            self.utc, self.local, self.offset
-        );
-        if let Some(tz) = &self.timezone {
-            out.push_str(&format!(" [{tz}]"));
-        }
-        out.push_str(&format!(
-            "\nUnix: {}\nWeekday: {}\nISO week: {}",
-            self.unix_seconds, self.weekday, self.iso_week
-        ));
-        out
+        let timezone = self
+            .timezone
+            .as_deref()
+            .map_or_else(String::new, |tz| format!(" [{tz}]"));
+        format!(
+            "UTC: {}\nLocal: {} (UTC{}){timezone}\nUnix: {}\nWeekday: {}\nISO week: {}",
+            self.utc, self.local, self.offset, self.unix_seconds, self.weekday, self.iso_week
+        )
     }
 
     /// Structured `details` payload persisted with the tool result.
