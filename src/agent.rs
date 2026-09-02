@@ -1428,6 +1428,20 @@ pub enum AgentEvent {
     },
     /// Advisor verdict delivered into the session (bd-cv653.3.3).
     AdvisorNote { level: String, rationale: String },
+    /// A provider request failed and ended the turn (#209). Emitted right
+    /// before the `TurnEnd`/`AgentEnd` pair so consumers get the provider,
+    /// HTTP status, and retryability as structured fields rather than having
+    /// to parse `AgentEnd.error`. Retry lifecycle (`AutoRetryStart`/`End`)
+    /// is reported separately by the caller that owns the retry budget.
+    ProviderError {
+        #[serde(rename = "sessionId")]
+        session_id: Arc<str>,
+        provider: String,
+        model: String,
+        #[serde(flatten)]
+        summary: crate::error::ProviderErrorSummary,
+        message: String,
+    },
     /// Extension error during event dispatch or execution.
     ExtensionError {
         #[serde(rename = "extensionId", skip_serializing_if = "Option::is_none")]
@@ -2461,6 +2475,19 @@ impl Agent {
         message
     }
 
+    /// Structured turn-ending provider failure (#209), classified from the
+    /// flattened error text and stamped with the provider the request went to.
+    fn build_provider_error_event(&self, session_id: &Arc<str>, message: &str) -> AgentEvent {
+        let provider = self.provider.name().to_string();
+        AgentEvent::ProviderError {
+            session_id: Arc::clone(session_id),
+            summary: crate::error::ProviderErrorSummary::from_error_text(Some(&provider), message),
+            provider,
+            model: self.provider.model_id().to_string(),
+            message: message.to_string(),
+        }
+    }
+
     /// The main agent loop. Magic keywords (bd-cv653.3.6) mutate the
     /// thinking level and system prompt for *this turn only*; snapshot and
     /// restore them here so a single `ultrathink` does not pin every later
@@ -2870,6 +2897,7 @@ impl Agent {
                         on_event(AgentEvent::MessageEnd {
                             message: assistant_event_message.clone(),
                         });
+                        on_event(self.build_provider_error_event(&session_id, &err_string));
 
                         let turn_end_event = AgentEvent::TurnEnd {
                             session_id: session_id.clone(),
@@ -2917,6 +2945,18 @@ impl Agent {
                             message: message.clone(),
                         });
                         new_messages.push(message);
+                    }
+
+                    // A provider-side failure (stream `Error` event, dropped
+                    // stream, truncated tool call) surfaces as a stop reason of
+                    // `Error`; an abort is the user's doing and not reported
+                    // as a provider error.
+                    if assistant_arc.stop_reason == StopReason::Error {
+                        let message = assistant_arc
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "Request failed".to_string());
+                        on_event(self.build_provider_error_event(&session_id, &message));
                     }
 
                     let turn_end_event = AgentEvent::TurnEnd {
@@ -10486,6 +10526,7 @@ mod abort_tests {
             AgentEvent::FailoverStart { .. } => "failover_start",
             AgentEvent::FailoverEnd { .. } => "failover_end",
             AgentEvent::AdvisorNote { .. } => "advisor_note",
+            AgentEvent::ProviderError { .. } => "provider_error",
             AgentEvent::ExtensionError { .. } => "extension_error",
         }
     }

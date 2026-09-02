@@ -293,6 +293,10 @@ struct UiStreamDeltaBatcher {
     pending_tool_update_bytes: usize,
     pending_tool_update_events: usize,
     last_tool_update_flush: std::time::Instant,
+    /// Set once `AgentEnd` carried a provider error for this run (#209): the
+    /// turn-end card is already in the transcript, so the task must not add
+    /// a second `AgentError` block for the same failure.
+    turn_error_surfaced: bool,
 }
 
 impl UiStreamDeltaBatcher {
@@ -316,6 +320,7 @@ impl UiStreamDeltaBatcher {
             pending_tool_update: None,
             pending_tool_update_bytes: 0,
             pending_tool_update_events: 0,
+            turn_error_surfaced: false,
             last_tool_update_flush: now,
         }
     }
@@ -465,12 +470,26 @@ fn build_agent_done_pi_msg(messages: &[ModelMessage]) -> PiMsg {
             add_usage(&mut usage, &assistant.usage);
         }
     }
+    let stop_reason = last
+        .as_ref()
+        .map_or(StopReason::Stop, |msg| msg.stop_reason);
+    // #209: a provider failure ends the turn as a structured card (provider ·
+    // HTTP status · retry status · bounded detail); aborts keep their plain
+    // message so the "Request aborted" status stays untouched.
+    let error_message = last.as_ref().and_then(|msg| {
+        msg.error_message.as_ref().map(|raw| {
+            if stop_reason == StopReason::Error {
+                crate::error::ProviderErrorSummary::from_error_text(Some(&msg.provider), raw)
+                    .turn_end_card(raw, None)
+            } else {
+                raw.clone()
+            }
+        })
+    });
     PiMsg::AgentDone {
         usage: Some(usage),
-        stop_reason: last
-            .as_ref()
-            .map_or(StopReason::Stop, |msg| msg.stop_reason),
-        error_message: last.as_ref().and_then(|msg| msg.error_message.clone()),
+        stop_reason,
+        error_message,
     }
 }
 
@@ -561,11 +580,35 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
                 output: None,
             });
         }
-        AgentEvent::AgentEnd { messages, .. } => {
-            batcher.send_immediate(build_agent_done_pi_msg(messages));
+        AgentEvent::AgentEnd {
+            messages, error, ..
+        } => {
+            let done = build_agent_done_pi_msg(messages);
+            if error.is_some()
+                && matches!(
+                    &done,
+                    PiMsg::AgentDone {
+                        stop_reason: StopReason::Error,
+                        error_message: Some(_),
+                        ..
+                    }
+                )
+            {
+                batcher.turn_error_surfaced = true;
+            }
+            batcher.send_immediate(done);
         }
         _ => {}
     }
+}
+
+/// Whether the run already ended with a provider-error card via `AgentEnd`
+/// (#209), so an `Err` from the agent loop must not be surfaced twice.
+fn turn_error_already_surfaced(batcher: &Arc<StdMutex<UiStreamDeltaBatcher>>) -> bool {
+    batcher
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .turn_error_surfaced
 }
 
 /// Strategy used to derive the head of a TUI tool card from its invocation.
@@ -1104,15 +1147,23 @@ impl PiApp {
                     self.status_message = Some("Request aborted".to_string());
                 } else if stop_reason == StopReason::Error {
                     let message = error_message.unwrap_or_else(|| "Request failed".to_string());
-                    self.status_message = Some(message.clone());
-                    if !had_response {
-                        self.messages.push(ConversationMessage {
-                            role: MessageRole::System,
-                            content: format!("Error: {message}"),
-                            thinking: None,
-                            collapsed: false,
-                        });
-                    }
+                    // The status bar is one line: show the headline there and
+                    // the full card in the transcript. The card is pushed even
+                    // when partial text streamed first (#209) — a mid-stream
+                    // 503 used to leave only the status line behind, which is
+                    // invisible once anything else overwrites it.
+                    self.status_message = message.lines().next().map(str::to_string);
+                    let content = if message.starts_with("Provider error:") {
+                        message
+                    } else {
+                        format!("Error: {message}")
+                    };
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content,
+                        thinking: None,
+                        collapsed: false,
+                    });
                 }
 
                 // Re-focus input BEFORE syncing the viewport — focus()
@@ -3039,7 +3090,9 @@ After approving access in the browser, press Enter in Pi to complete login."
                 .await;
             }
 
-            if let Err(err) = result {
+            if let Err(err) = result
+                && !turn_error_already_surfaced(&ui_stream_batcher)
+            {
                 let formatted = crate::error_hints::format_error_with_hints(&err);
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
@@ -3319,7 +3372,9 @@ After approving access in the browser, press Enter in Pi to complete login."
                 .await;
             }
 
-            if let Err(err) = result {
+            if let Err(err) = result
+                && !turn_error_already_surfaced(&ui_stream_batcher)
+            {
                 let formatted = crate::error_hints::format_error_with_hints(&err);
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
@@ -3701,7 +3756,9 @@ After approving access in the browser, press Enter in Pi to complete login."
                 .await;
             }
 
-            if let Err(err) = result {
+            if let Err(err) = result
+                && !turn_error_already_surfaced(&ui_stream_batcher)
+            {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &Cx::for_request(),
@@ -3849,6 +3906,143 @@ mod stream_delta_batcher_tests {
         > {
             Ok(Box::pin(stream::empty()))
         }
+    }
+
+    /// Provider double whose every request fails with an HTTP 503 (#209).
+    struct Overloaded503Provider;
+
+    const OVERLOADED_503_BODY: &str = "OpenAI API error (HTTP 503): \
+{\"error\":{\"code\":\"service_unavailable_error\",\"message\":\"Server Overloaded\"}}";
+
+    #[async_trait::async_trait]
+    impl Provider for Overloaded503Provider {
+        fn name(&self) -> &'static str {
+            "continue-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "continue-probe-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Err(crate::error::Error::provider(
+                "continue-probe",
+                OVERLOADED_503_BODY,
+            ))
+        }
+    }
+
+    /// #209: a terminal provider error (HTTP 503) ends the turn with exactly
+    /// one structured card in the transcript plus a one-line status, and the
+    /// task's `Err` path does not add a duplicate `AgentError` block.
+    #[test]
+    fn provider_503_surfaces_one_turn_end_card_and_no_duplicate() {
+        let (mut app, mut event_rx) = build_test_app_with_provider(Arc::new(Overloaded503Provider));
+        let _ = app.submit_message("hello");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline {
+            match event_rx.try_recv() {
+                Ok(msg) => {
+                    let is_done = matches!(msg, PiMsg::AgentDone { .. });
+                    if let PiMsg::AgentError(err) = &msg {
+                        panic!("error must surface via the turn-end card, got AgentError: {err}");
+                    }
+                    let _ = app.handle_pi_message(msg);
+                    if is_done {
+                        saw_done = true;
+                        break;
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(saw_done, "turn did not finish before the deadline");
+
+        // The task sends its (deduplicated) Err notice after AgentDone; give
+        // it a moment and make sure nothing extra arrives.
+        let settle = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < settle {
+            match event_rx.try_recv() {
+                Ok(PiMsg::AgentError(err)) => {
+                    panic!("duplicate error block after the turn-end card: {err}")
+                }
+                Ok(msg) => {
+                    let _ = app.handle_pi_message(msg);
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+
+        let headline =
+            "Provider error: continue-probe: HTTP 503 (service unavailable / overloaded)";
+        let cards: Vec<&str> = app
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::System && m.content.starts_with("Provider error:"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(cards.len(), 1, "expected one turn-end card, got {cards:?}");
+        let card = cards[0];
+        assert!(card.starts_with(headline), "headline missing: {card}");
+        assert!(
+            card.contains("not auto-retried"),
+            "retry status missing: {card}"
+        );
+        assert!(
+            card.contains("Detail: OpenAI API error (HTTP 503)"),
+            "detail missing: {card}"
+        );
+        assert_eq!(app.status_message.as_deref(), Some(headline));
+        assert_eq!(app.agent_state, AgentState::Idle);
+    }
+
+    /// #209: a mid-stream failure after partial text used to leave only the
+    /// status line behind; the card must be pushed regardless.
+    #[test]
+    fn agent_done_error_after_partial_text_still_pushes_card() {
+        let mut app = build_test_app();
+        app.agent_state = AgentState::Processing;
+        app.current_response = "partial answer".to_string();
+        let card = crate::error::ProviderErrorSummary::from_error_text(
+            Some("deepseek"),
+            OVERLOADED_503_BODY,
+        )
+        .turn_end_card(OVERLOADED_503_BODY, None);
+        let _ = app.handle_pi_message(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Error,
+            error_message: Some(card),
+        });
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.role == MessageRole::Assistant && m.content == "partial answer"),
+            "partial text must be kept"
+        );
+        assert!(
+            app.messages.iter().any(|m| m.role == MessageRole::System
+                && m.content.starts_with("Provider error: deepseek: HTTP 503")),
+            "turn-end card missing: {:?}",
+            app.messages
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Provider error: deepseek: HTTP 503 (service unavailable / overloaded)")
+        );
+        assert_eq!(app.agent_state, AgentState::Idle);
     }
 
     #[test]

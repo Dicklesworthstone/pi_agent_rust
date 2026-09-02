@@ -142,6 +142,7 @@ exit 2
 
 /// E2E: `/share` creates a secret, unlisted gist and shows viewer URL.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
     let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_share_creates_gist") else {
         eprintln!("Skipping: tmux not available");

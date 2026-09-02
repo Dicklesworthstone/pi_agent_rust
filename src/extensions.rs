@@ -20370,6 +20370,7 @@ pub fn extension_event_from_agent(
         | AgentEvent::FailoverStart { .. }
         | AgentEvent::FailoverEnd { .. }
         | AgentEvent::AdvisorNote { .. }
+        | AgentEvent::ProviderError { .. }
         | AgentEvent::ExtensionError { .. } => return None,
     };
 
@@ -20399,6 +20400,7 @@ pub const fn extension_event_name_from_agent(event: &AgentEvent) -> Option<Exten
         | AgentEvent::FailoverStart { .. }
         | AgentEvent::FailoverEnd { .. }
         | AgentEvent::AdvisorNote { .. }
+        | AgentEvent::ProviderError { .. }
         | AgentEvent::ExtensionError { .. } => None,
     }
 }
