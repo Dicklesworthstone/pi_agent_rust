@@ -199,6 +199,17 @@ ctrlc = "3.5.2"
 # PTY allocation for isatty-requiring bash commands (bd-cv653.1.7)
 portable-pty = "0.9"
 
+# OS-level bash sandbox (`sandbox.*`): defims fork, line-level Rust port of
+# anthropic-experimental/sandbox-runtime. Behavior baseline pinned per the
+# fork's UPSTREAM_BASE.md; bump the rev only through an alignment pass.
+# Prerequisite: defims/sandbox-runtime-rs@1e194a2 must be pushed (cargo
+# fetches git deps from the remote). For local builds before the push, a
+# workspace-root [patch] entry redirects to the local checkout.
+sandbox-runtime = { git = "https://github.com/defims/sandbox-runtime-rs", rev = "f662a4c5be5c23a9c720ce7a2b53101ca799073b" }
+# Dedicated runtime hosting the sandbox crate's proxy tasks (kept separate
+# from asupersync; rt-only features, no networking of our own).
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread"] }
+
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }

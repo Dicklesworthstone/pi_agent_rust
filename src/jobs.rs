@@ -195,6 +195,7 @@ pub fn spawn_background(
     command: &str,
     timeout_secs: Option<u64>,
     artifact_root: Option<&Path>,
+    sandbox: Option<&crate::config::SandboxSettings>,
 ) -> Result<JobSnapshot> {
     if !cwd.exists() {
         return Err(Error::tool(
@@ -227,6 +228,15 @@ pub fn spawn_background(
         "sh"
     });
 
+    // OS sandbox: same wrap-after-composition contract as the pipe path.
+    let prepared = match sandbox {
+        Some(settings) => crate::sandbox::prepare(settings, &shell, &command, cwd)?,
+        None => None,
+    };
+    let command = prepared
+        .as_ref()
+        .map_or_else(|| command.to_string(), |p| p.command_line.clone());
+
     let mut cmd = crate::tools::command_with_default_sigpipe_in_dir(shell, cwd)
         .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
     cmd.arg("-c")
@@ -236,6 +246,9 @@ pub fn spawn_background(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     crate::tools::isolate_command_process_group(&mut cmd);
+    if let Some(prepared) = &prepared {
+        prepared.apply_to_command(&mut cmd);
+    }
 
     let artifact_dir = artifact_root.map_or_else(
         || crate::config::Config::global_dir().join("tool-output-artifacts"),
@@ -630,6 +643,7 @@ mod tests {
             "echo job-output-marker",
             Some(30),
             Some(&root),
+            None,
         )
         .expect("spawn");
         assert_eq!(snapshot.status, "running");
@@ -651,7 +665,7 @@ mod tests {
     fn cancel_kills_running_job() {
         let root = temp_root();
         let snapshot =
-            spawn_background(&root, None, None, "sleep 60", Some(120), Some(&root)).expect("spawn");
+            spawn_background(&root, None, None, "sleep 60", Some(120), Some(&root), None).expect("spawn");
         let cancelled = cancel(&snapshot.id).expect("cancel");
         assert_eq!(cancelled.status, "killed");
         // Drain the completion notice (pushed asynchronously by the monitor

@@ -68,6 +68,8 @@ pub struct Config {
     pub read: Option<ReadSettings>,
     /// Bash-tool mediation settings (bd-cv653.1.7).
     pub bash: Option<BashSettings>,
+    /// Bash-tool OS-level sandbox settings (`sandbox.*`, experimental).
+    pub sandbox: Option<SandboxSettings>,
     /// Memory-bank settings (bd-cv653.4.1).
     pub memory: Option<MemorySettings>,
     /// Secrets vault settings (bd-cv653.7.9).
@@ -549,6 +551,70 @@ pub struct BashSettings {
     pub pty: Option<String>,
 }
 
+/// Bash-tool OS-level sandbox settings (`sandbox.*`).
+///
+/// Semantics follow the upstream `anthropic-experimental/sandbox-runtime`
+/// ("srt") configuration; enforcement is provided by the vendored Rust port
+/// (`sandbox-runtime-rs`, defims fork). Experimental: the sandbox is a risk
+/// mitigation layer, not a security boundary — see the upstream limitations
+/// (domain fronting, unix sockets, non-proxy-aware tools) reproduced in the
+/// picrab sandbox docs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SandboxSettings {
+    /// `off` (default) | `auto` (sandbox when the platform supports it,
+    /// silently degrade with a warning otherwise) | `on` (fail closed when
+    /// unavailable).
+    pub mode: Option<String>,
+    /// `off` (no network layer: unrestricted egress, no proxy) |
+    /// `allowlist` (all egress routes through the local filtering proxy).
+    /// Default follows `mode`: `auto`/`on` imply `allowlist`.
+    pub network: Option<String>,
+    /// Domains reachable through the proxy. Default: `["*"]` (everything
+    /// allowed, still routed through the filter).
+    #[serde(alias = "allowedDomains")]
+    pub allowed_domains: Option<Vec<String>>,
+    /// Domains denied before the allow list is consulted.
+    #[serde(alias = "deniedDomains")]
+    pub denied_domains: Option<Vec<String>>,
+    /// Unix socket paths the sandboxed command may reach.
+    #[serde(alias = "allowUnixSockets")]
+    pub allow_unix_sockets: Option<Vec<String>>,
+    /// Allow binding on localhost (default false).
+    #[serde(alias = "allowLocalBinding")]
+    pub allow_local_binding: Option<bool>,
+    /// Paths denied for reading. Default: `~/.ssh`, `~/.gnupg`, `~/.aws`
+    /// plus the upstream mandatory-deny write protections.
+    #[serde(alias = "denyRead")]
+    pub deny_read: Option<Vec<String>>,
+    /// Paths allowed for writing. Default: cwd, `/tmp`, `/private/tmp`,
+    /// and the picrab global state dir.
+    #[serde(alias = "allowWrite")]
+    pub allow_write: Option<Vec<String>>,
+    /// Paths denied for writing (overrides `allowWrite`).
+    #[serde(alias = "denyWrite")]
+    pub deny_write: Option<Vec<String>>,
+}
+
+impl SandboxSettings {
+    /// Parse `sandbox.mode` (default `off`).
+    #[must_use]
+    pub fn mode(&self) -> crate::sandbox::SandboxMode {
+        crate::sandbox::SandboxMode::from_setting(self.mode.as_deref())
+    }
+
+    /// Whether the network filtering layer is active. Default follows the
+    /// sandbox mode: `auto`/`on` enable the allowlist proxy.
+    #[must_use]
+    pub fn network_restricted(&self) -> bool {
+        match self.network.as_deref() {
+            Some("off") => false,
+            Some("allowlist") => true,
+            _ => !matches!(self.mode(), crate::sandbox::SandboxMode::Off),
+        }
+    }
+}
+
 /// `memory.backend` (bd-cv653.4.1).
 ///
 /// `off` (default while experimental, omp's setting-gated posture) |
@@ -834,6 +900,7 @@ impl Config {
             plan: merge_plan(base.plan, other.plan),
             read: merge_read(base.read, other.read),
             bash: merge_bash(base.bash, other.bash),
+            sandbox: merge_sandbox(base.sandbox, other.sandbox),
             memory: merge_memory(base.memory, other.memory),
             secrets: other.secrets.or(base.secrets),
             keywords: other.keywords.or(base.keywords),
@@ -1660,6 +1727,29 @@ fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option
             mediation_forced: other.mediation_forced.or(base.mediation_forced),
             mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
             pty: other.pty.or(base.pty),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge sandbox settings field-wise (`sandbox.*`).
+fn merge_sandbox(
+    base: Option<SandboxSettings>,
+    other: Option<SandboxSettings>,
+) -> Option<SandboxSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(SandboxSettings {
+            mode: other.mode.or(base.mode),
+            network: other.network.or(base.network),
+            allowed_domains: other.allowed_domains.or(base.allowed_domains),
+            denied_domains: other.denied_domains.or(base.denied_domains),
+            allow_unix_sockets: other.allow_unix_sockets.or(base.allow_unix_sockets),
+            allow_local_binding: other.allow_local_binding.or(base.allow_local_binding),
+            deny_read: other.deny_read.or(base.deny_read),
+            allow_write: other.allow_write.or(base.allow_write),
+            deny_write: other.deny_write.or(base.deny_write),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

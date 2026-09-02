@@ -5269,7 +5269,8 @@ impl ToolRegistry {
                 )),
                 "bash" => tools.push(Box::new(
                     BashTool::with_shell(cwd, shell_path.clone(), shell_command_prefix.clone())
-                        .with_mediation(config.and_then(|c| c.bash.clone())),
+                        .with_mediation(config.and_then(|c| c.bash.clone()))
+                        .with_sandbox(config.and_then(|c| c.sandbox.clone())),
                 )),
                 "edit" => tools.push(Box::new(
                     EditTool::new(cwd)
@@ -6284,6 +6285,8 @@ pub struct BashTool {
     artifact_root: Option<PathBuf>,
     /// Mediation settings (`bash.mediation*`, bd-cv653.1.7).
     mediation: Option<crate::config::BashSettings>,
+    /// OS-level sandbox settings (`sandbox.*`, experimental).
+    sandbox: Option<Arc<crate::config::SandboxSettings>>,
 }
 
 #[derive(Debug, Clone)]
@@ -6344,6 +6347,7 @@ async fn execute_bash_spawn(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     use_pty: bool,
+    sandbox: Option<&crate::config::SandboxSettings>,
 ) -> Result<BashRunResult> {
     if use_pty {
         run_bash_command_pty(
@@ -6353,6 +6357,7 @@ async fn execute_bash_spawn(
             command,
             timeout_secs,
             on_update,
+            sandbox,
         )
         .await
     } else {
@@ -6363,9 +6368,53 @@ async fn execute_bash_spawn(
             command,
             timeout_secs,
             on_update,
+            sandbox,
         )
         .await
     }
+}
+
+/// Heuristic scan for sandbox-blocked outcomes in command output. Seatbelt
+/// denials surface as EPERM/EACCES text; the proxy answers denied CONNECTs
+/// with 403. Best-effort: macOS violations land in the system log, not
+/// necessarily in the command's own stderr.
+fn sandbox_block_markers(output: &str) -> Vec<&'static str> {
+    const MARKERS: &[&str] = &[
+        "Operation not permitted",
+        "blocked by network allowlist",
+        "CONNECT tunnel failed, response 403",
+        "Connection blocked",
+    ];
+    MARKERS
+        .iter()
+        .copied()
+        .filter(|m| output.contains(m))
+        .collect()
+}
+
+/// Append model-facing guidance when the sandbox likely blocked the command.
+fn annotate_sandbox_block(output: &str, sandbox: Option<&crate::config::SandboxSettings>) -> String {
+    let Some(settings) = sandbox else {
+        return output.to_string();
+    };
+    if settings.mode() == crate::sandbox::SandboxMode::Off {
+        return output.to_string();
+    }
+    let hits = sandbox_block_markers(output);
+    if hits.is_empty() {
+        return output.to_string();
+    }
+    let network_hint = if settings.network_restricted() {
+        "Network: the command's egress is restricted to the sandbox proxy allowlist          (sandbox.allowedDomains); use reachable hosts or ask the user to adjust them."
+    } else {
+        "Network: unrestricted (sandbox.network=off)."
+    };
+    format!(
+        "{output}
+
+[SANDBOX] This output likely contains sandbox denials ({}).          Filesystem: reads outside the workspace (e.g. credential directories) and          writes outside sandbox.allowWrite are denied; work inside the workspace or          ask the user to extend sandbox.allowWrite. {network_hint} Configure via          `sandbox` in ~/.pi/agent/settings.json or --sandbox <off|auto|on>.",
+        hits.join(", ")
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6376,6 +6425,7 @@ pub(crate) async fn run_bash_command(
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    sandbox: Option<&crate::config::SandboxSettings>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
@@ -6407,6 +6457,17 @@ pub(crate) async fn run_bash_command(
         "sh"
     });
 
+    // OS sandbox (`sandbox.*`): wrap AFTER trap/prefix composition so the
+    // whole pipeline runs inside the sandbox. The prepared line is executed
+    // by the same shell (sh -> sandbox-exec -> bash -c <command>).
+    let prepared = match sandbox {
+        Some(settings) => crate::sandbox::prepare(settings, &shell, &command, cwd)?,
+        None => None,
+    };
+    let command = prepared
+        .as_ref()
+        .map_or_else(|| command.to_string(), |p| p.command_line.clone());
+
     let mut cmd = command_with_default_sigpipe_in_dir(shell, cwd)
         .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
     cmd.arg("-c")
@@ -6421,6 +6482,12 @@ pub(crate) async fn run_bash_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Sandbox proxy env lands after the filtered host env so it wins over any
+    // inherited HTTP(S)_PROXY; NO_PROXY is dropped (it would bypass the proxy).
+    if let Some(prepared) = &prepared {
+        prepared.apply_to_command(&mut cmd);
+    }
 
     // Place the shell in its own process group so background children
     // can be killed reliably even if the shell exits first.
@@ -6741,6 +6808,7 @@ pub(crate) async fn run_bash_command_pty(
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    sandbox: Option<&crate::config::SandboxSettings>,
 ) -> Result<BashRunResult> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -6774,6 +6842,15 @@ pub(crate) async fn run_bash_command_pty(
         "sh"
     });
 
+    // OS sandbox: same wrap-after-composition contract as the pipe path.
+    let prepared = match sandbox {
+        Some(settings) => crate::sandbox::prepare(settings, &shell, &command, cwd)?,
+        None => None,
+    };
+    let command = prepared
+        .as_ref()
+        .map_or_else(|| command.to_string(), |p| p.command_line.clone());
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -6788,6 +6865,9 @@ pub(crate) async fn run_bash_command_pty(
     pty_cmd.arg("-c");
     pty_cmd.arg(&command);
     pty_cmd.cwd(cwd);
+    if let Some(prepared) = &prepared {
+        prepared.apply_to_pty_command(&mut pty_cmd);
+    }
 
     // portable-pty puts the child in its own session (setsid) on unix, so the
     // child pid is its process-group id and the shared tree-kill helpers work
@@ -6946,6 +7026,7 @@ impl BashTool {
             command_prefix: None,
             artifact_root: None,
             mediation: None,
+            sandbox: None,
         }
     }
 
@@ -6960,6 +7041,7 @@ impl BashTool {
             command_prefix,
             artifact_root: None,
             mediation: None,
+            sandbox: None,
         }
     }
 
@@ -6967,6 +7049,13 @@ impl BashTool {
     #[must_use]
     pub fn with_mediation(mut self, mediation: Option<crate::config::BashSettings>) -> Self {
         self.mediation = mediation;
+        self
+    }
+
+    /// Attach OS-level sandbox settings (`sandbox.*`, experimental).
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: Option<crate::config::SandboxSettings>) -> Self {
+        self.sandbox = sandbox.map(Arc::new);
         self
     }
 
@@ -6978,6 +7067,7 @@ impl BashTool {
             command_prefix: None,
             artifact_root: Some(artifact_root.to_path_buf()),
             mediation: None,
+            sandbox: None,
         }
     }
 }
@@ -7104,6 +7194,7 @@ impl Tool for BashTool {
                                     &input.command,
                                     input.timeout,
                                     self.artifact_root.as_deref(),
+                                    self.sandbox.as_deref(),
                                 )?;
                                 let mut details = serde_json::to_value(&job)?;
                                 details["mediation"] = payload;
@@ -7131,10 +7222,13 @@ impl Tool for BashTool {
                                 input.timeout,
                                 on_update.as_deref(),
                                 use_pty,
+                                self.sandbox.as_deref(),
                             )
                             .await?;
-                            result.output =
-                                format!("[MEDIATION WARN: {rules}]\n\n{}", result.output);
+                            result.output = annotate_sandbox_block(
+                                &format!("[MEDIATION WARN: {rules}]\n\n{}", result.output),
+                                self.sandbox.as_deref(),
+                            );
                             return Ok(ToolOutput {
                                 content: vec![ContentBlock::Text(TextContent::new(result.output))],
                                 details: Some(payload),
@@ -7191,6 +7285,7 @@ impl Tool for BashTool {
                 &input.command,
                 input.timeout,
                 self.artifact_root.as_deref(),
+                self.sandbox.as_deref(),
             ) {
                 Ok(job) => job,
                 Err(err) => {
@@ -7219,7 +7314,7 @@ impl Tool for BashTool {
             });
         }
 
-        let result = execute_bash_spawn(
+        let mut result = execute_bash_spawn(
             &self.cwd,
             self.shell_path.as_deref(),
             self.command_prefix.as_deref(),
@@ -7227,8 +7322,10 @@ impl Tool for BashTool {
             input.timeout,
             on_update.as_deref(),
             use_pty,
+            self.sandbox.as_deref(),
         )
         .await?;
+        result.output = annotate_sandbox_block(&result.output, self.sandbox.as_deref());
 
         let mut details_map = serde_json::Map::new();
         if let Some(truncation) = result.truncation.as_ref() {

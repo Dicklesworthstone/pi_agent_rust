@@ -242,6 +242,8 @@ pub mod review;
 #[doc(hidden)]
 pub mod rpc;
 #[doc(hidden)]
+pub mod sandbox;
+#[doc(hidden)]
 pub mod scheduler;
 pub mod sdk;
 #[doc(hidden)]

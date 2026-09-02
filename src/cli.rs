@@ -361,6 +361,12 @@ pub struct Cli {
     #[arg(long, alias = "auto-approve")]
     pub yolo: bool,
 
+    /// OS-level bash sandbox mode: off (default), auto, or on (experimental).
+    /// Overrides `sandbox.mode` from settings; `auto`/`on` enable the network
+    /// allowlist proxy (see `sandbox` docs).
+    #[arg(long, value_parser = ["off", "auto", "on"])]
+    pub sandbox: Option<String>,
+
     /// HTTP request timeout in seconds for provider API calls.
     ///
     /// Bounds connect + request + first-response-header latency for each

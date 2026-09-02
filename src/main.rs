@@ -1711,6 +1711,14 @@ async fn run(
     } else {
         pi::agent::resolved_max_tool_iterations_default()
     };
+    // Sandbox mode (`sandbox.*`, experimental): CLI flag overrides config.
+    // `auto`/`on` enable the network allowlist proxy unless `sandbox.network`
+    // is explicitly set in settings.
+    if let Some(mode) = cli.sandbox.as_deref() {
+        let settings = config.sandbox.get_or_insert_with(Default::default);
+        settings.mode = Some(mode.to_string());
+    }
+
     // Approval mode (bd-cv653.3.19): CLI flags override config.
     let approval_mode = if cli.yolo {
         pi::approval::ApprovalMode::Yolo
