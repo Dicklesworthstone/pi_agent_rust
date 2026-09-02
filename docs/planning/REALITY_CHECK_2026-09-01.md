@@ -1023,7 +1023,21 @@ file is touched again before the next run). The three clippy lints (and a
 fourth on the stress test's warm-up refactor, masked until the lib was
 clean) were fixed concurrently by the maintainer's own commits (8d965337,
 a06fe698) while equivalent fixes were being verified here; the rebase kept
-the maintainer's versions. Parked with
+the maintainer's versions. Run13 (197df581, run dir
+`20260902T132856-2042977`, valid receipt) is the first run of this round
+with a clean receipt: five of six gates green (fmt, check, clippy with
+`-D warnings`, installer, reachability) and the test lane at 37715 pass /
+73 fail. The 73 are the parked clusters (perf-evidence validators 47,
+orchestrate contract tests 11, ext-conformance and risk-review artifacts 8,
+drop-in slash differential 3) plus four singletons: the `/share` gist test
+captured the pane between two frames of the success message (it now waits
+for the last paragraph), the managed-skill "invalid name" test only ever
+passed on hosts with a leftover skill of the slugified name (the learn tool
+documents that an unusable requested name falls back to a lesson-derived
+one, and the test now pins that fallback plus the refusal on a repeat
+promotion), and two `/new`-cancellation
+TUI tests that had passed in every earlier run and ran on a root worker this
+time (re-run in isolation before deciding). Parked with
 reasons: the ext-conformance artifact cluster is blocked by a stray ignored
 file (`tests/ext_conformance/artifacts/doom-overlay/tiny.wad`, bd-n4ov9,
 deletion needs written approval); eight orchestrate contract tests fail

@@ -220,41 +220,71 @@ fn manage_skill_refuses_unmanaged_content() {
 }
 
 #[test]
-fn invalid_promote_keeps_lesson_with_warning() {
-    let case = "invalid_promote_keeps_lesson_with_warning";
+fn unusable_skill_name_falls_back_to_a_lesson_derived_name() {
+    let case = "unusable_skill_name_falls_back_to_a_lesson_derived_name";
     let harness = TestHarness::new(case);
     let cwd = harness.temp_path("proj");
     std::fs::create_dir_all(&cwd).expect("cwd");
 
     let store = std::sync::Arc::new(pi::memory::MemoryStore::open(&cwd).expect("open"));
     let learn = pi::tools::LearnTool::new(std::sync::Arc::clone(&store));
-    let out = block_on_local(learn.execute(
-        "call-1",
-        json!({
-            "lesson": "a lesson with an impossible skill name",
-            "promote": true,
-            "skillName": "INVALID NAME!!"
-        }),
-        None,
-    ))
-    .expect("learn");
+    // A requested name that slugifies to nothing is unusable, and the learn
+    // tool documents that the skill name is then derived from the lesson.
+    // (The previous fixture, "INVALID NAME!!", slugifies to the valid
+    // "invalid-name" and its "promotion skipped" expectation only held on
+    // hosts that already carried a leftover managed skill of that name.)
+    let derived = "a-lesson-with-an-impossible-skill-name";
+    let _ = pi::skills_managed::delete(derived);
+    let input = json!({
+        "lesson": "a lesson with an impossible skill name",
+        "promote": true,
+        "skillName": "!!!"
+    });
+    let out = block_on_local(learn.execute("call-1", input, None)).expect("learn");
     let text = first_text(&out);
     harness
         .log()
-        .info("verify", format!("invalid promote: {text}"));
-    assert!(
-        text.contains("Skill promotion skipped"),
-        "warning must surface: {text}"
-    );
+        .info("verify", format!("unusable-name promote: {text}"));
     assert!(text.contains("Lesson captured"), "{text}");
+    assert!(
+        text.contains(&format!("Promoted to managed skill '{derived}'")),
+        "the lesson-derived name must be used: {text}"
+    );
+    let listed = pi::skills_managed::list().expect("list");
+    assert!(
+        listed.iter().any(|skill| skill.name == derived),
+        "derived skill must be written: {listed:?}"
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|skill| skill.name != "!!!" && skill.name != "lesson"),
+        "neither the raw name nor the placeholder may be written: {listed:?}"
+    );
+
+    // Promoting a lesson that derives the same skill name is refused (the
+    // derived skill already exists) while the lesson itself is still
+    // captured. The wording differs by trailing punctuation only: the memory
+    // store rejects an identical lesson before promotion is attempted, and
+    // slugification drops the punctuation, so the derived name is the same.
+    let repeat = json!({
+        "lesson": "a lesson with an impossible skill name!",
+        "promote": true,
+        "skillName": "!!!"
+    });
+    let again = block_on_local(learn.execute("call-2", repeat, None)).expect("learn again");
+    let again_text = first_text(&again);
+    harness
+        .log()
+        .info("verify", format!("repeat promote: {again_text}"));
+    assert!(
+        again_text.contains("Skill promotion skipped") && again_text.contains("Lesson captured"),
+        "a refused promotion must keep the lesson: {again_text}"
+    );
 
     let hits = store.recall("impossible skill name", None).expect("recall");
     assert!(!hits.is_empty(), "lesson must be kept: {hits:?}");
-    let listed = pi::skills_managed::list().expect("list");
-    assert!(
-        listed.iter().all(|skill| skill.name != "INVALID NAME!!"),
-        "invalid draft must not be written: {listed:?}"
-    );
+    let _ = pi::skills_managed::delete(derived);
     finish_case(&harness, case);
 }
 

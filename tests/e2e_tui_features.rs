@@ -196,13 +196,14 @@ fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
     );
 
     // Issue /share command (secret/unlisted, but not access-controlled).
-    let pane = session.send_text_and_wait(
-        "share_secret",
-        "/share",
-        "Created secret gist",
-        SHARE_TIMEOUT,
-    );
+    // Wait for the last paragraph of the success message so the capture is
+    // not taken between two frames of the same message.
+    let pane = session.send_text_and_wait("share_secret", "/share", "Share URL:", SHARE_TIMEOUT);
 
+    assert!(
+        pane.contains("Created secret gist"),
+        "Expected the secret-gist notice in output: {pane}"
+    );
     assert!(pane.contains("Share URL:"), "Expected share URL in output");
     assert!(
         pane.contains("https://buildwithpi.ai/session/#e2e_share_id_123"),
