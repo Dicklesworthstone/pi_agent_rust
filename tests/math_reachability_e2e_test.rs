@@ -82,11 +82,14 @@ fn techniques() -> Vec<Technique> {
             source_file: "src/extensions.rs",
             has_unit_test: true,
         },
+        // Weighted bottleneck attribution lives in the perf orchestrator
+        // (scripts/perf/orchestrate.sh) and is validated by the phase-1 matrix
+        // validator tests, not by the extension runtime.
         Technique {
             name: "weighted_attribution",
-            test_marker: "weighted",
-            source_file: "src/extensions.rs",
-            has_unit_test: false,
+            test_marker: "phase1_matrix_validator_rejects_weighted",
+            source_file: "tests/bench_schema.rs",
+            has_unit_test: true,
         },
     ]
 }

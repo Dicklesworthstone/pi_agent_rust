@@ -46,7 +46,7 @@
         "repo": "owner-only"
       },
       "expect_error": true,
-      "error_contains": "GH_REPO: expected owner/repo",
+      "error_contains": "GH_REPO: expected a non-empty owner/repo slug",
       "expected": {}
     },
     {

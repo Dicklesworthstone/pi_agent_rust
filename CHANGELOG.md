@@ -19,13 +19,13 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 - **`current_time` tool** (gh
   [#207](https://github.com/Dicklesworthstone/pi_agent_rust/issues/207),
   [#103](https://github.com/Dicklesworthstone/pi_agent_rust/issues/103)):
-  a read-only built-in that returns the wall-clock time as ISO-8601 with UTC
-  offset plus UTC and Unix time, with an optional `timezone` of `local`
-  (default), `UTC`, or a fixed offset such as `+08:00`; details carry the
-  `pi.tool.current_time.v1` schema. The system prompt keeps carrying only the
-  date so the cached prefix stays stable within a day, and now tells the model
-  to call `current_time` for anything time-of-day dependent. Essential tier
-  and in the default `--tools` list.
+  a read-only built-in that returns the host's wall-clock time as UTC and
+  local ISO-8601 timestamps, the UTC offset, Unix epoch seconds, weekday, and
+  ISO week (the local zone follows `TZ`); it takes no arguments and its
+  details carry stable camelCase keys. The system prompt keeps carrying only
+  the date so the cached prefix stays stable within a day, and now tells the
+  model to call `current_time` for anything time-of-day dependent. Essential
+  tier and in the default `--tools` list.
 
 - **Portable DSR quality recipe**: `.dsr/repos.yaml` carries the registered
   `pi_agent_rust` quality checks so any host can run
@@ -50,6 +50,15 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   the test command with `env TMPDIR=/tmp` because the project-local temp
   directory rch exports can be owned by another uid on a worker, which pi's
   strict mode-class checks refuse.
+
+- **JSON-mode extension UI events use camelCase**: the `extension_ui_request`
+  envelope's `capability_prompt` flag is now `capabilityPrompt`, matching
+  the rest of the JSON-mode contract.
+
+- **Performance-evidence validators accept `git_commit`**: the Rust
+  validators in the release-readiness, release-evidence and semantic
+  workspace graph checks treat the perf harness's `git_commit` provenance
+  field as optional, like the README evidence checker already did.
 
 - **README evidence checker is exercised by the gate**: its `--self-test`
   now validates against its own fixture inventory instead of borrowing the
@@ -77,6 +86,20 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   instead of parsing the underlying persistence failure. Closing stdin while
   quarantined still ends the server loop with the surfaced error.
 
+- **MCP HTTP transport survives servers without a GET stream**: the optional
+  server-initiated event stream is opened in the background; a server that
+  answers that GET with anything but 405 or a `text/event-stream` body used
+  to retire the whole transport, so the next request or notification failed
+  with "HTTP transport was aborted before request dispatch". Such answers now
+  mean "no server stream" and are logged, while requests keep flowing.
+
+- **Hidden extension messages reach the model**: custom messages injected by
+  extensions (for example from `before_agent_start`) with `display: false`
+  are sent to the provider like visible ones; `display` only controls TUI
+  rendering. pi's own hidden provenance records (the semantic context bundle
+  entry) stay out of the provider context because their payload travels in
+  the system prompt.
+
 - **A stray `.codex` file no longer blocks startup**: the workspace-trust
   scan treated "Not a directory" on `.codex/config.toml` as a configuration
   error and refused to start pi in any directory containing a regular file
@@ -95,6 +118,27 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   now probes the release page. `tests/installer_regression.sh` is green again
   (69/69; five cases had been failing since 2026-08-06 without any gate
   running them).
+
+- **Verification lane realigned with the newer product contracts** (test and
+  evidence changes only, no product behaviour changed): the MCP HTTP transport
+  tests now expect the fail-closed retirement rule (a malformed, mismatched,
+  or 202-acknowledged request retires the transport; an indeterminate abort
+  sends one `notifications/cancelled`); the auto-compaction "stale snapshot"
+  test no longer deadlocks against the agent-session lock it was waiting on;
+  the `/share` TUI tests trust their own project settings via
+  `PI_WORKSPACE_TRUST`; the RPC plan-mode test retries `approve_plan` and
+  the follow-up prompt while the RPC loop answers "wait before running"
+  (it fired both into the still-streaming turn and then into the post-turn
+  compaction handoff, which is the documented client contract) and drains
+  the child's output pipes; the FrankenNode matrix check
+  ignores the generating host's Node/Bun versions; the extension stress test
+  measures RSS growth after a warm-up cycle; the OCO budget tuner gained real
+  regret and rollback unit tests; the traceability matrix, e2e scenario
+  matrix, and perf SLI contracts cover every classified suite again (incl.
+  the background `/tan` workflow); the swarm runpack golden was regenerated
+  after review. One user-visible touch: the `/share` success message now
+  puts the share URL and the gist link in their own paragraphs so the TUI
+  no longer soft-wraps them into the warning sentence.
 
 ---
 

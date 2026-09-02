@@ -3313,7 +3313,15 @@ fn performance_budget_inventory_sha256(budgets: &[V]) -> Result<String, String> 
 
 #[allow(clippy::too_many_lines)]
 fn validate_performance_budget_contract(v: &V) -> Result<AuthorizedPerformanceClaim, String> {
-    let top = performance_exact_object(v, PERF_TOP_LEVEL_FIELDS, &[], "performance summary")?;
+    // `git_commit` is optional source-binding provenance emitted by the perf
+    // harness since the 2026-08 rebind; scripts/check_readme_evidence_freshness.py
+    // and src/semantic_workspace_graph.rs accept it the same way.
+    let top = performance_exact_object(
+        v,
+        PERF_TOP_LEVEL_FIELDS,
+        &["git_commit"],
+        "performance summary",
+    )?;
     if top.get("schema").and_then(V::as_str) != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
         return Err(format!(
             "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {:?}",

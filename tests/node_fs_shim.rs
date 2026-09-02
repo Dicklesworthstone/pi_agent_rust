@@ -211,7 +211,9 @@ fn stat_sync_directory() {
 
 #[test]
 fn stat_sync_throws_on_missing() {
-    let result = eval_fs(r#"fs.statSync("/no/such/path")"#);
+    // In-root missing path: the error must be the Node-shaped ENOENT, not the
+    // confinement denial an absolute outside path would produce.
+    let result = eval_fs(r#"fs.statSync("no/such/path")"#);
     assert!(
         result.starts_with("ERROR:"),
         "expected error, got: {result}"
@@ -388,8 +390,20 @@ fn access_sync_missing() {
 
 #[test]
 fn read_file_sync_throws_enoent() {
-    let result = eval_fs(r#"fs.readFileSync("/no/such/file", "utf8")"#);
+    // A missing path inside the extension root reports ENOENT; an absolute
+    // path outside the root is refused by confinement before existence is
+    // checked (see read_file_sync_outside_root_is_denied).
+    let result = eval_fs(r#"fs.readFileSync("no/such/file", "utf8")"#);
     assert!(result.contains("ENOENT"), "expected ENOENT, got: {result}");
+}
+
+#[test]
+fn read_file_sync_outside_root_is_denied() {
+    let result = eval_fs(r#"fs.readFileSync("/no/such/file", "utf8")"#);
+    assert!(
+        result.contains("outside extension root"),
+        "expected a confinement denial, got: {result}"
+    );
 }
 
 // ─── mkdtempSync ────────────────────────────────────────────────────────────

@@ -1153,9 +1153,12 @@ impl PiApp {
                 }
             }
 
+            // Paragraph breaks: the TUI renders this as markdown, and a single
+            // newline soft-wraps into the warning sentence, which can split
+            // "Share URL:" or the link itself across two terminal lines.
             let message = format!(
-                "Created secret gist (not private; anyone with the URL can view it). Recognized secrets and the exact workspace cwd were redacted, but the transcript may still contain sensitive local context.\n\
-                 Share URL: {share_url}\nGist: {gist_url}"
+                "Created secret gist (not private; anyone with the URL can view it). Recognized secrets and the exact workspace cwd were redacted, but the transcript may still contain sensitive local context.\n\n\
+                 Share URL: {share_url}\n\nGist: {gist_url}"
             );
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,

@@ -1161,6 +1161,20 @@ fn verify_or_generate_compatibility_matrix(
         .ok_or_else(|| "computed compatibility matrix must be a JSON object".to_string())?
         .remove("generated_at")
         .ok_or_else(|| "computed compatibility matrix is missing generated_at".to_string())?;
+    // The runtime versions describe the machine that produced the matrix, not
+    // the compatibility verdicts. Comparing them made the check fail on every
+    // host whose Node/Bun differ from the generating host (the DSR workers do)
+    // while hiding nothing: verdicts and pass rates are still compared exactly.
+    for matrix_value in [&mut committed, &mut computed] {
+        let object = matrix_value
+            .as_object_mut()
+            .ok_or_else(|| "compatibility matrix must be a JSON object".to_string())?;
+        for env_field in ["node_version", "bun_version"] {
+            object.remove(env_field).ok_or_else(|| {
+                format!("compatibility matrix is missing environment field {env_field}")
+            })?;
+        }
+    }
     assert_eq!(
         committed, computed,
         "committed FrankenNode compatibility matrix is stale; regenerate explicitly with \

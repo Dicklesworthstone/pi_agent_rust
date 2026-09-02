@@ -38,6 +38,9 @@ fn minimal_interactive_args() -> Vec<&'static str> {
         "--no-prompt-templates",
         "--no-extensions",
         "--no-themes",
+        // Classic charmed stack: these scenarios assert its pane text; the
+        // default FTUI stack has its own coverage in tests/e2e_ftui.rs.
+        "--classic",
         "--thinking",
         "off",
         "--system-prompt",
@@ -170,6 +173,10 @@ fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
         "PI_CONFIG_PATH",
         &pi_dir.join("settings.json").display().to_string(),
     );
+    // `.pi/settings.json` inside the tmux working directory is a workspace
+    // trust surface; without the automation override the classic TUI shows
+    // the trust prompt instead of the welcome banner.
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
 
     session.harness.section("launch");
     session.launch(&minimal_interactive_args());
@@ -279,6 +286,10 @@ fn e2e_tui_share_rejects_public_argument_without_invoking_gh() {
         "PI_CONFIG_PATH",
         &pi_dir.join("settings.json").display().to_string(),
     );
+    // `.pi/settings.json` inside the tmux working directory is a workspace
+    // trust surface; without the automation override the classic TUI shows
+    // the trust prompt instead of the welcome banner.
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
 
     session.harness.section("launch");
     session.launch(&minimal_interactive_args());
@@ -343,6 +354,10 @@ fn e2e_tui_share_missing_gh_shows_install_instructions() {
         "PI_CONFIG_PATH",
         &pi_dir.join("settings.json").display().to_string(),
     );
+    // `.pi/settings.json` inside the tmux working directory is a workspace
+    // trust surface; without the automation override the classic TUI shows
+    // the trust prompt instead of the welcome banner.
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
 
     session.harness.section("launch");
     session.launch(&minimal_interactive_args());

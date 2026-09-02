@@ -2532,7 +2532,15 @@ fn performance_budget_inventory_sha256(budgets: &[Value]) -> Result<String, Stri
 fn validate_performance_budget_contract(
     value: &Value,
 ) -> Result<ValidatedPerformanceBudgetClaim, String> {
-    let top = performance_exact_object(value, PERF_TOP_LEVEL_FIELDS, &[], "performance summary")?;
+    // `git_commit` is the harness's source-binding provenance (2026-08 rebind
+    // work); the Python checker treats it the same way. Every other unknown
+    // field still fails closed.
+    let top = performance_exact_object(
+        value,
+        PERF_TOP_LEVEL_FIELDS,
+        &["git_commit"],
+        "performance summary",
+    )?;
     if top.get("schema").and_then(Value::as_str) != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
         return Err(format!(
             "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {:?}",

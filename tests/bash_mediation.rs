@@ -69,6 +69,11 @@ fn execute(tool: &pi::tools::BashTool, command: &str) -> ToolOutput {
 fn settings(mode: &str) -> BashSettings {
     BashSettings {
         mediation: Some(mode.to_string()),
+        // These tests pin the in-tree classifier's tiers. When a `dcg` binary
+        // is on PATH it is authoritative and its verdicts differ (the DSR
+        // workers carry one), so opt out of dcg here to keep the tests
+        // hermetic; dcg integration has its own coverage in src/bash_mediation.rs.
+        mediation_dcg: Some(false),
         ..Default::default()
     }
 }
