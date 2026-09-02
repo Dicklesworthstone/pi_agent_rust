@@ -329,3 +329,486 @@ Done and pushed with the commit that carries this section:
   receipt, perf-build, parser-contract, clippy, and hang-to-failure fixes are
   in the follow-up commit; the ask-card, compaction-admission, RPC, and
   approval clusters are left to their owning beads with exact anchors.
+
+---
+
+## 10. Bridge plan (Phase 2, full): every gap between the tree and the vision
+
+Written 2026-09-02 against origin/main after commit f709de6a, with the
+2026-09-01/02 gate evidence in hand. This section is the plan document for
+the reality-check flow; revise it in place (do not fork it). Phase 3a turns
+it into beads. Ordering is by vision impact, not by ease. Each gap names its
+current state with file anchors, the target state, success criteria a
+skeptic can re-execute, the implementation steps, dependencies, complexity
+(S/M/L/XL), the vision goals it serves (§2 numbering), and whether the beads
+that already exist would close it.
+
+Principles that shape every item below:
+
+- **Proof beats prose.** A gap is closed by a recorded run bound to a SHA
+  (DSR run dir, artifact with `git_commit`), never by a note that says
+  "implemented statically".
+- **One lane, fail-closed.** `dsr quality --tool pi_agent_rust` from
+  `.dsr/repos.yaml`, Cargo through `RCH_REQUIRE_REMOTE=1 rch exec`, run from
+  `/data/projects/pi_agent_rust` (or another normalizable checkout), tree
+  not edited while it runs.
+- **No ceremony.** No new certificates, ledgers, or dashboards. Where a check
+  is needed, it is a test in the gate or a line in an existing artifact.
+- **Owners decide semantics.** Where a failing test could be fixed by
+  changing code or the test, the plan names the decision and the anchor
+  instead of guessing.
+
+### 10.1 Critical gaps (the vision is undeliverable without these)
+
+#### Gap C1 — The quality gate is red at HEAD and has never completed
+
+**Current state.** The lane now runs (§9). fmt and `cargo check --locked
+--all-targets` pass at f97387cd/762fd8d5. `cargo clippy --all-targets
+-D warnings` passes with the follow-up fixes (remote run 2026-09-02, exit 0).
+The lib test binary had 20 failures that already exist in the v0.4.0 tree
+(bd-x8mn7) and hung on one test; after the follow-up commits the expected
+remaining lib failures are: cluster B compaction admission (1–2), cluster C
+RPC persistence surfacing (2), and 5 ask tests that install a real channel
+(`interactive::agent::stream_delta_batcher_tests` ×3,
+`interactive::keybindings::tests::quit_cmd_schedules_shutdown_when_event_queue_is_full`,
+`interactive_ftui::tests::installed_ftui_ask_forwarder_observes_close_before_dispatch`).
+The 369 integration test targets, the examples, and the benches have **never**
+been executed through the gate at any post-v0.3.0 SHA, so their state is
+unknown. `tests/installer_regression.sh` and
+`scripts/check_module_reachability.py` pass individually.
+
+**Target state.** `dsr quality --tool pi_agent_rust` reports `passed` (6/6
+checks executed) at a named SHA on origin/main, with the run dir retained,
+and the same SHA is what v0.4.x ships from.
+
+**Success criteria.**
+- [ ] `~/.local/state/dsr/quality-logs/pi_agent_rust/<run>/` shows
+      `check-1..6` all `exit_code: 0` and the run JSON `status: "passed"`,
+      `snapshot_before == snapshot_after`.
+- [ ] `check-4.log` contains a `test result: ok` line for the lib binary and
+      for every integration target, with zero `FAILED` lines and no test
+      reporting "has been running for over 60 seconds" without finishing.
+- [ ] The run's `git_commit` equals the SHA recorded on bd-csywa and the tag
+      that ships (Gap C2).
+
+**Implementation.**
+1. Lib suite (bd-x8mn7): resolve clusters B and C by owner decision
+   (`src/rpc.rs` compaction admission around `maybe_auto_compact` and the
+   conformal admission wiring from bd-conformal-drive-compaction-6hx16;
+   `src/rpc.rs:9404/9495` stdin-close persistence surfacing per bd-m83oo);
+   fix the 5 channel-based ask tests (they install `install_channel_ui` and
+   then see `execute` complete immediately — instrument `AskTool::execute`'s
+   early-return path under test to find which `Err` it returns).
+2. Integration lane: run the full gate once; expect a second wave of
+   failures (network-dependent, `rg`/`fd` absent on workers, provider
+   credential tests). Classify each into: real defect → fix; environment →
+   gate the test on a capability probe (not `#[ignore]`); credential-bound →
+   mark as the live-provider lane (Gap M2) and skip in the quality recipe via
+   an explicit feature/env, recorded in `docs/testing-policy.md`.
+3. Hang policy: any test that awaits an agent/runtime event gets a wall-clock
+   bound. Pattern: the watchdog thread in
+   `rpc::tests::auto_compaction_rejects_stale_session_snapshot_with_paired_end_event`
+   (the `asupersync::time::timeout` form does not fire on a bare
+   `RuntimeBuilder::current_thread()` runtime). Add the pattern to
+   `docs/testing-policy.md` and apply it to the other `block_on` tests in
+   `src/rpc.rs` that await provider entry.
+4. Make the lane the merge gate in practice: the auto-commit sessions push
+   to `main` without running it (Gap O1). Until that is fixed, run the gate
+   on every push that touches `src/` or `tests/` from the swarm host and
+   record the run id on the bead the commit cites.
+
+**Dependencies.** None for step 1–3; step 4 depends on Gap O1.
+**Complexity.** L (lib suite M; integration lane unknown, budget XL).
+**Vision goals.** 16, and indirectly 6, 7, 8, 9, 11.
+**Would existing beads close it?** Partially: bd-x8mn7 covers the lib
+failures; bd-q66i1 and bd-m83oo own two clusters. Nothing owns the
+integration lane run or the hang policy → new beads.
+
+#### Gap C2 — v0.4.0 is tagged and unpublished; the release pipeline is half built
+
+**Current state.** Tag `v0.4.0` = 5bd3e353, `Cargo.toml` 0.4.0, CHANGELOG
+heading says "Release", `gh release view v0.4.0` → not found. v0.3.0 is the
+only published release; it was DSR-built on operator hosts but ships an
+aggregate `SHA256SUMS`, no per-asset `.sha256`, no `.minisig`. `install.sh`
+has cosign support and no minisign support; DSR on hetzner2 has no signing
+keypair; the build authority file `~/.config/dsr/repos.d/pi_agent_rust.yaml`
+exists only on the release operator's machine. bd-ghfu4 tracks publish-or-
+relabel; bd-yj126 tracks minisign; bd-5by7n tracks the immutable-tag ruleset
+check; crates.io publication is HOLD by policy.
+
+**Target state.** v0.4.x published through DSR from a gate-green SHA with the
+strict inventory (5 archives + per-asset `.sha256` + `.minisig` +
+`install.sh`), DSR public verification green, installer verifying the
+signature, CHANGELOG heading truthful at every moment.
+
+**Success criteria.**
+- [ ] `gh release view v0.4.x --json assets` lists exactly the strict
+      inventory; `dsr verify` (public release verification) exits 0.
+- [ ] Clean-host `curl … install.sh | bash -s -- --version v0.4.x` installs a
+      binary whose `pi --version` prints that version, with the installer
+      log showing signature verification, not just checksum.
+- [ ] `git show <tag>:CHANGELOG.md` heading matches the published state
+      (Release) and no unpublished tag carries "Release".
+
+**Implementation.**
+1. Immediately: relabel the v0.4.0 CHANGELOG heading "Tag-only" (the
+   legend at the top of the file defines it) in a commit that says why, or
+   publish. Do not leave the contradiction.
+2. Provision the minisign trust root (operator action; no placeholder key —
+   bd-yj126's no-claim), pin the public key in the installer and in
+   `release_contract.minisign_public_key_file`, add fail-closed installer
+   regressions (missing/swapped/wrong-key/bad-signature) to
+   `tests/installer_regression.sh`.
+3. Check the build authority file into the repo next to `.dsr/repos.yaml`
+   (`.dsr/repos.d/pi_agent_rust.yaml`) so `dsr repos validate` can run on any
+   host; keep host-specific paths under `host_paths`.
+4. Cut v0.4.1 (not v0.4.0: the tag is already public and immutable by
+   ruleset) from the first gate-green SHA; run `dsr build`, `dsr release`,
+   `dsr verify`; then flip the CHANGELOG heading.
+5. Add the live ruleset check DSR needs (bd-5by7n) before the release, or
+   record explicitly that it was verified by hand for this release.
+
+**Dependencies.** C1 (green SHA); operator-held secrets for step 2.
+**Complexity.** M (mostly operator steps; installer regressions S).
+**Vision goals.** 1, 13.
+**Would existing beads close it?** Partially: bd-ghfu4 + bd-yj126 + bd-5by7n
+cover it if all three close; the checked-in build authority file is new.
+
+#### Gap C3 — 43 P0/P1 beads are "in progress" on static evidence only
+
+**Current state.** 42 beads (10 P0) created 2026-08-24..27 end in "static fix
+landed, executable proof HOLD". Their referenced files all exist at HEAD; the
+fixes are probably inside the Aug 24–27 wave. The security subset matters
+most: SSH URL router injection (bd-t2360), package-subcommand trust
+(bd-c1do1), MCP trust/transport/denial/delivery/discovery (bd-b2xdr,
+bd-c6cy9, bd-qv95g, bd-ubjal, bd-z847t), corrupt-JSONL fail-closed
+(bd-qxdfd), extension registry split (bd-4t6oz, also Gap C4), capability
+prompt queueing (bd-yllbn), hostcall deadline cancel (bd-2ojzi).
+
+**Target state.** Every one of the 42 is closed with a run id from Gap C1
+and the specific test names that prove its acceptance criteria, or reopened
+with a failing test, or formally waived by the owner.
+
+**Success criteria.**
+- [ ] `br list --status=in_progress` contains none of the 42, and each
+      closing comment names the DSR run dir and ≥1 test function that
+      exercises the bead's acceptance criteria (mutation-sensitive where the
+      bead demands it).
+- [ ] For the security subset, the named tests include a planted negative
+      (an injection/trust-bypass attempt that must fail closed).
+
+**Implementation.**
+1. Group the 42 by test file (the scan in this session found all referenced
+   files present; extend it to extract test function names from bead notes).
+2. After C1 step 1 lands, run the gate; for each bead, grep the run's
+   `check-4.log` for its named tests; close with evidence or reopen.
+3. For beads whose notes name no test, the owner writes one before closing;
+   "static review" closes nothing (AGENTS.md).
+
+**Dependencies.** C1.
+**Complexity.** M (mechanical once the gate is green; the security subset
+needs a reviewer to read the planted negatives).
+**Vision goals.** 6, 8, 9, 11.
+**Would existing beads close it?** Yes, they are the beads; what is missing
+is the evidence, which C1 supplies.
+
+#### Gap C4 — Finished code that is not wired (two product defects)
+
+**Current state.**
+- bd-2crrf: every default (`ftui`) launch builds a full classic
+  `AgentSession` with extension runtime + MCP (`src/main.rs:1738–1760`,
+  `1905–1960`), then `drop(agent_session)` at `src/main.rs:2228` and builds a
+  second SDK session in `interactive_ftui::run` (`src/main.rs:2308`). Double
+  extension boot on every start; init-time extension UI prompts can miss
+  the FTUI surface.
+- bd-4t6oz: the extension runtime's `pi.tool` hostcalls resolve against a
+  plain `ToolRegistry::new(...)` built for prewarm (`src/main.rs:1396`,
+  `1443`; `PreWarmedExtensionRuntime.tools`, `src/agent.rs:5166`,
+  `13389`), not the Agent's registry with the undo recorder and workspace
+  handle (`src/main.rs:1738`; `Agent.tools: ToolRegistry` by value,
+  `src/agent.rs:1503`). Extension writes bypass `/undo` and workspace
+  confinement; later-mounted MCP/extension tools are invisible to
+  extensions.
+
+**Target state.** One session owner on the default launch; one authoritative
+registry shared by the Agent and the extension runtime; `setActiveTools`
+changes the next schema atomically.
+
+**Success criteria.**
+- [ ] A launched-binary test (`tests/e2e_ftui.rs`) asserts the extension
+      runtime boots exactly once per launch (count
+      `pi.extension_runtime.prewarm.success` / `engine_decision` events in
+      the log) and that a startup hook `ctx.ui.confirm` reaches the FTUI ask
+      surface.
+- [ ] A production-path test: extension `pi.tool("write", …)` under the
+      default launch records a `/undo` entry and is confined by the
+      workspace handle; an MCP tool mounted after extension load is callable
+      from `pi.tool`.
+- [ ] Both tests fail against the pre-fix tree (planted negative recorded in
+      the bead).
+
+**Implementation.**
+1. bd-2crrf, option (a): gate the classic `AgentSession` construction and
+   `enable_extensions_with_policy` behind `!ftui_requested`; everything FTUI
+   needs (provider/model selection, resources, workspace trust, approval
+   state, enabled tools, extension flags) is already threaded into
+   `SessionOptions`. Audit the code between `main.rs:1760` and `2227` for
+   side effects FTUI relies on (extension-provided providers/models,
+   `--continue` resume, pre-start extension flags) and move those into the
+   SDK path. Option (b) — pass the built session into `interactive_ftui::run`
+   — is the fallback if (a) loses semantics.
+2. bd-4t6oz: build the recorder+workspace registry once before prewarm
+   (both are cheap and available at `main.rs:1388`), hand the same
+   `Arc<ToolRegistry>` to the prewarm runtime and to `Agent::new`; change
+   `Agent.tools` to `Arc<ToolRegistry>` (or `ArcSwap` for later mounts) and
+   delete the `pre_tools` constructions. Mirror in `src/sdk.rs:2344`.
+3. Land each behind its bead with the tests above; run the gate.
+
+**Dependencies.** C1 for proof; independent of each other.
+**Complexity.** L each (main.rs is 12k lines; agent.rs 20k).
+**Vision goals.** 7, 8, 11.
+**Would existing beads close it?** Yes (bd-2crrf, bd-4t6oz) — the beads are
+correct; they lacked a compile/test loop and anchors, both now supplied.
+
+### 10.2 Major gaps (the vision is significantly degraded)
+
+#### Gap M1 — Performance evidence is blocked and internally inconsistent
+
+**Current state.** `tests/perf/reports/budget_summary.json`: rows 16 PASS /
+3 FAIL, header 12/5/2, `claim_readiness.status = blocked`, source
+`e178a73d` (not a release SHA). Failing: `ext_cold_load_simple_p95` 11.9 ms
+vs 5 ms; `tool_call_latency_mean` and `tool_call_throughput_min` have no
+real data (the "canonical" script falls back to a synthetic stub —
+bd-tool-call-throughput-canonical-o3ubk reopened). README withholds numbers
+correctly. `scripts/check_readme_evidence_freshness.py` binds only header
+counts, so it cannot see the header/rows mismatch (bd-sog97.20).
+
+**Target state.** A strict `budget_summary.json` regenerated by the DSR perf
+lane at the release SHA whose header equals its rows, with real data for
+every CI-enforced budget; either all budgets pass or each failure has a
+dated waiver (RI-WAIVER, bd-sog97.12); `claim_readiness.status` is `ready`
+or `ready_with_advisories`; README prose rebound.
+
+**Success criteria.**
+- [ ] `jq '[.pass,.fail,.no_data]'` equals the histogram of
+      `.budget_results[].status`; enforce this in
+      `scripts/check_readme_evidence_freshness.py` (one assertion) so the
+      mismatch class cannot recur.
+- [ ] `tool_call_*` rows cite a `pijs_workload` artifact whose provenance
+      says `source_kind != synthetic`.
+- [ ] `ext_cold_load_simple_p95 ≤ 5.0 ms` or a waiver entry with expiry.
+
+**Implementation.**
+1. Add the header==rows assertion to the README checker (S).
+2. Build `examples/pijs_workload.rs` in the DSR perf lane and delete the
+   synthetic fallback path from `scripts/perf/run_pijs_workload.py` (a
+   fallback that fabricates data is the defect) (S).
+3. Profile simple cold load: transpile cache warm path, realm creation
+   (`src/extensions_js.rs` cold realm factory); target the 5 ms budget or
+   justify raising it via calibration (bd-sog97.15) (M–L).
+4. Run the DSR perf lane at the release SHA (bd-ri-phase1-full-refresh-rndeg
+   reopened; bd-sog97.19/.27) (operator, M).
+
+**Dependencies.** C1 (same lane); C2 for the release SHA.
+**Complexity.** M overall.
+**Vision goals.** 12, 14.
+**Would existing beads close it?** Mostly yes (bd-sog97 children + the two
+reopened beads); the checker assertion and the synthetic-fallback deletion
+are new.
+
+#### Gap M2 — Provider and extension corpora are not live-validated at HEAD
+
+**Current state.** 11 provider modules exist; the "fresh 11-provider live
+E2E" bead was closed with no credentials set (reopened). Extension must-pass
+gate: 206/208 at 2a8e0862 (marckrenn-pi-sub ×2, triaged), and bd-sog97.29
+reports a hermetic clean-checkout run yields 143/208 with empty-observation
+failures — meaning the 206/208 number depends on local state. Stretch set
+10/19.
+
+**Target state.** A live-provider run with credentials for all 11 modules
+recorded at the release SHA; must-pass 208/208 hermetic (or waived per
+extension with a reason); the release-binary E2E lane (README "Extension
+Validation Pipeline" step 3/4) executed once on the v0.4.x binary.
+
+**Success criteria.**
+- [ ] `pi.perf.provider_live_e2e.v1` artifact with 11 entries, each
+      `status: pass`, `git_commit` = release SHA, credentials resolved from
+      env (never stored).
+- [ ] `must_pass_gate_verdict.json` `status: pass` from a clean checkout
+      (`git clean`-equivalent worktree) with `must_pass_failed: 0`.
+- [ ] `tests/ext_conformance/reports/release_binary_e2e/*` regenerated for
+      the shipped binary with `fail=0`.
+
+**Implementation.**
+1. Operator supplies provider credentials to the swarm host env for one run
+   of `scripts/perf/run_provider_live_e2e.py`; fix what fails (bd-x23nj
+   GitLab wire contract and bd-fouvy early stream end are the known suspects).
+2. Make the must-pass corpus hermetic (bd-sog97.29): find the local-state
+   dependency (likely `.tmp-codex-unvendored-cache/` or fixture paths) and
+   pin it in the fixture set.
+3. Remediate or de-scope marckrenn-pi-sub (bd-sog97.28).
+4. Run the release-binary E2E on the v0.4.x archive (ollama + qwen2.5:0.5b
+   per README) and check the artifacts in.
+
+**Dependencies.** C2 for step 4; credentials for step 1.
+**Complexity.** M.
+**Vision goals.** 3, 8.
+**Would existing beads close it?** Yes: bd-provider-live-validation-11-xme9d
+(reopened), bd-sog97.28/.29/.6.
+
+#### Gap M3 — User-visible defects on the default stack and open issues
+
+**Current state.** Open: #195 (heading colours fixed in e0897567; table
+alignment with truncated cells not addressed), #198 (ask hang fixed in
+402ff9cd, unreleased), #182 (Windows, scoped in bd-oyckr), #178/#167
+(compaction bridge shipped in the v0.4.0 tree, unreleased), #207 (done,
+unreleased). The interactive ask-card machinery has 12 stale unit tests
+(Gap C1), which is itself a signal that the card lifecycle changed three
+times in a week (2cd3871e, 913d0eb3, 402ff9cd) without its tests following.
+
+**Target state.** Every open issue either closed by a released fix or
+answered with a bead id; ask-card lifecycle covered by tests that use the
+real channel path.
+
+**Success criteria.**
+- [ ] #195 table rendering: a gallery visual-regression case in
+      `src/gallery.rs`/`tests/e2e_ftui.rs` with a wide table and a narrow
+      terminal renders without truncated cells; fails before the fix.
+- [ ] #198 verified on the released binary by the reporter's steps (ask card
+      appears within the turn, not minutes later).
+- [ ] All 5 channel-based ask tests pass through the gate.
+
+**Implementation.**
+1. Table rendering in the FTUI markdown path (`src/markdown_rich.rs`,
+   `src/interactive_ftui.rs`): compute column widths against the viewport,
+   wrap or elide with an explicit marker instead of truncating cells.
+2. Rewrite the direct-injection ask tests to the channel path once the 5
+   channel-based failures are understood (Gap C1 step 1), then delete the
+   test-only registration hook if no longer needed.
+3. Reply on #195/#198/#207/#178/#167 with the release that carries the fix
+   (operator-facing; outward).
+
+**Dependencies.** C2 for verification on a release.
+**Complexity.** M.
+**Vision goals.** 7, 19.
+**Would existing beads close it?** Partially: bd-oyckr (Windows), bd-q66i1
+(cards). Table rendering has no bead → new.
+
+#### Gap M4 — Session and swarm hygiene is defeating the gate
+
+**Current state.** Auto-commit sessions sweep any working-tree change into
+generic commits and push to `main` within minutes ("chore(beads)…",
+"feat(src): …"). In this session that produced: my staged work committed
+under someone else's message, an ineffective timeout committed mid-fix, and
+two `current_time` implementations landing within an hour (14760976 vs
+d39d3366) with the registry pointing at the wrong one. AGENTS.md's
+Definition of Done (DSR green before integration) is not enforced by anything.
+
+**Target state.** Work reaches `main` only after the gate has run on that
+tree, and concurrent sessions coordinate on file ownership.
+
+**Success criteria.**
+- [ ] The auto-commit sweeper either runs `dsr quality` (or at minimum
+      `cargo fmt --check` + `RCH_REQUIRE_REMOTE=1 rch exec -- cargo check
+      --all-targets`) before pushing, or pushes to a branch that a gated
+      merge promotes.
+- [ ] `file_reservation_paths` (Agent Mail) is used for `src/**` edits by
+      every session, so a second implementation of the same feature is
+      refused at reservation time.
+
+**Implementation.**
+1. Find the sweeper (it commits as Dicklesworthstone from another session on
+   this host); add the gate call or the branch push. Owner decision — it is
+   the maintainer's automation.
+2. Add the reservation step to the session start macro every session runs
+   (AGENTS.md already prescribes it; make the tooling call it).
+
+**Dependencies.** None.
+**Complexity.** S–M (mostly policy + one script).
+**Vision goals.** 13, 16.
+**Would existing beads close it?** No bead exists → new.
+
+### 10.3 Minor gaps (polish and drift prevention)
+
+#### Gap P1 — README/code drift prevention
+
+**Current state.** README, AGENTS.md, docs/tui.md, docs/development.md,
+docs/releasing.md now match the code (§9). Counts (35 tools, 19 default,
+14 essential) are hand-maintained.
+
+**Target.** One test asserts the README tool bullets equal
+`xdev::ESSENTIAL_DEFAULTS` + `default_enabled_tools()` + the settings-gated
+and opt-in names from `ToolRegistry`, and that the README default-session
+count equals `default_enabled_tools().len()`.
+**Criteria.** `tests/readme_tool_inventory.rs` fails when either side
+changes alone. **Complexity.** S. **Beads.** None → new.
+
+#### Gap P2 — Repository leftovers from this session (need your permission)
+
+- `src/current_time.rs`: orphaned duplicate; delete (Rule 1: permission
+  required), then remove its row from `docs/TEST_COVERAGE_MATRIX.md`.
+- `/data/projects/pi_agent_rust_baseline`: throwaway clone at 08485a20 used
+  for the baseline classification; delete.
+- `<scratchpad>/gate-wt`: git worktree (registered in `git worktree list`);
+  `git worktree remove`.
+- Untracked `bead` (empty) and `scripts/agent_verify.sh` (hardcoded Mac path)
+  in the repo root: not mine; ask before touching.
+- Worker `hz3` drained in rch for disk pressure; re-enable when its disk is
+  reclaimed (`rch workers enable hz3`).
+
+#### Gap P3 — Closure discipline for evidence beads
+
+**Current state.** Three beads were closed on "script shipped" (reopened
+2026-09-01). The pattern is structural: the closer had no way to run the
+lane.
+**Target.** A bead whose title names an outcome closes only with the
+outcome's artifact path + SHA in the close reason. **Implementation.** One
+sentence in AGENTS.md "Beads" section; `br close` templates in the session
+macro. **Complexity.** S. **Beads.** None → new (docs).
+
+### 10.4 Order of work and dependency graph
+
+```
+C1 lib-suite green ──┐
+C1 hang policy ───────┼──► C1 full gate green ──► C3 adjudicate 42 beads
+C4 (2crrf, 4t6oz) ────┘            │
+                                    ├──► C2 v0.4.1 via DSR ──► M2 release-binary E2E
+M1 perf lane ───────────────────────┘            │
+M2 provider live E2E (creds) ────────────────────┘
+M4 sweeper gating ── independent, do first (it protects everything else)
+M3 #195 table fix ── independent
+P1, P3 ── independent, S
+P2 ── after your answer on deletions
+```
+
+Recommended sequence for the next sessions: **M4 → C1 (lib) → C4 → C1
+(integration) → C3 → C2 → M1/M2 → M3 → P1/P3**, with P2 whenever approved.
+
+### 10.5 "Would completing all existing beads close every gap?"
+
+No. Existing beads cover C3, C4, M1, most of M2, part of M3, and P2's
+current_time deletion is a permission question. **No bead exists for:** the
+integration-lane run and hang policy (C1 steps 2–3), making the sweeper
+respect the gate (M4), the checked-in DSR build authority file (C2 step 3),
+the header==rows checker assertion and synthetic-fallback deletion (M1
+steps 1–2), the table-rendering defect (M3), the README inventory test (P1),
+and closure discipline (P3). Those are the beads Phase 3a must create.
+
+### 10.6 Verification plan (what "done" looks like, re-executable)
+
+1. `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` → 6/6
+   executed, passed, at SHA S.
+2. `gh release view v0.4.1 --json assets,tagName` → strict inventory; `dsr
+   verify` green; clean-host install prints 0.4.1 and verifies a signature.
+3. `br list --status=in_progress` → empty of the 2026-08-24..27 wave; each
+   close cites S and test names.
+4. `tests/perf/reports/budget_summary.json` at S: header == rows, no
+   synthetic sources, `claim_readiness.status` ∈ {ready, ready_with_advisories}
+   or waivers with expiry.
+5. `pi.perf.provider_live_e2e.v1` at S: 11/11 pass;
+   `must_pass_gate_verdict.json` pass from a clean checkout.
+6. GH #195/#198/#182/#207/#178/#167 closed or answered with a bead id and
+   release.
+7. A commit that only edits README tool bullets fails
+   `tests/readme_tool_inventory.rs`; a commit that only edits
+   `default_enabled_tools()` fails it too.
