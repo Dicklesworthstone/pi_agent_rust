@@ -34,20 +34,13 @@
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
-/// Transport used to reach the proxy itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProxyScheme {
-    /// Plain HTTP hop to the proxy (`http://…`).
-    Http,
-    /// TLS hop to the proxy (`https://…`).
-    Https,
-}
-
 /// A resolved proxy endpoint for one request.
+///
+/// Always a plain-HTTP hop: the origin's TLS runs end-to-end inside a CONNECT
+/// tunnel, so the hop to the proxy itself is never TLS. A `https://` proxy URL
+/// is rejected by [`parse_proxy_url`] rather than silently downgraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyEndpoint {
-    /// Transport used to reach the proxy.
-    pub scheme: ProxyScheme,
     /// Proxy host (no brackets for IPv6 — ready for `TcpStream::connect`).
     pub host: String,
     /// Proxy port.
@@ -70,11 +63,7 @@ impl ProxyEndpoint {
     /// The proxy URL with any credentials removed — safe to log.
     #[must_use]
     pub fn redacted_url(&self) -> String {
-        let scheme = match self.scheme {
-            ProxyScheme::Http => "http",
-            ProxyScheme::Https => "https",
-        };
-        format!("{scheme}://{}", self.authority())
+        format!("http://{}", self.authority())
     }
 }
 
@@ -237,6 +226,10 @@ impl ProxyConfig {
                     .collect()
             },
         );
+        // The two `pick` passes share `http.proxy` and `ALL_PROXY`, so an
+        // unusable value would otherwise be reported twice.
+        warnings.dedup();
+
         let bypass_all = no_proxy_raw.iter().any(|entry| entry == "*");
         let no_proxy = no_proxy_raw
             .into_iter()
@@ -295,14 +288,29 @@ impl ProxyConfig {
     fn matches_no_proxy(&self, host: &str, port: u16) -> bool {
         let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
         self.no_proxy.iter().any(|entry| {
-            let (pattern, entry_port) = match entry.rsplit_once(':') {
-                // Only treat the tail as a port when it parses AND the head is
-                // not an unbracketed IPv6 literal.
-                Some((head, tail)) if !head.contains(':') => tail
-                    .parse::<u16>()
-                    .map_or((entry.as_str(), None), |value| (head, Some(value))),
-                _ => (entry.as_str(), None),
-            };
+            // `[::1]:8443` / `[::1]` — split the bracketed host from its port
+            // before the generic rule, which cannot tell an IPv6 colon from a
+            // port separator.
+            let (pattern, entry_port) = entry.strip_prefix('[').map_or_else(
+                || match entry.rsplit_once(':') {
+                    // Only treat the tail as a port when it parses AND the head
+                    // is not an unbracketed IPv6 literal.
+                    Some((head, tail)) if !head.contains(':') => tail
+                        .parse::<u16>()
+                        .map_or((entry.as_str(), None), |value| (head, Some(value))),
+                    _ => (entry.as_str(), None),
+                },
+                |rest| {
+                    rest.split_once(']')
+                        .map_or((entry.as_str(), None), |(host, tail)| {
+                            (
+                                host,
+                                tail.strip_prefix(':')
+                                    .and_then(|port| port.parse::<u16>().ok()),
+                            )
+                        })
+                },
+            );
             if entry_port.is_some_and(|expected| expected != port) {
                 return false;
             }
@@ -319,29 +327,31 @@ impl ProxyConfig {
 /// Parse a proxy URL. Accepts `host:port` shorthand (assumed `http://`), which
 /// is what people usually put in `HTTPS_PROXY`.
 ///
+/// Note that `HTTPS_PROXY=http://…` is the normal spelling: the variable names
+/// the traffic being proxied, not the hop to the proxy.
+///
 /// # Errors
 ///
-/// Returns a human-readable message for an unsupported scheme (SOCKS is not
-/// implemented), a missing host, or an unparseable port.
+/// Returns a human-readable message for an unsupported scheme (`https://`
+/// proxies would need TLS-in-TLS, and SOCKS is not implemented), a missing
+/// host, or an unparseable port.
 pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("empty proxy URL".to_string());
     }
-    let (scheme, rest) = match raw.split_once("://") {
+    let rest = match raw.split_once("://") {
         Some((scheme, rest)) => {
-            let scheme = match scheme.to_ascii_lowercase().as_str() {
-                "http" => ProxyScheme::Http,
-                "https" => ProxyScheme::Https,
-                other => {
-                    return Err(format!(
-                        "unsupported proxy scheme {other:?} (only http:// and https:// are supported)"
-                    ));
-                }
-            };
-            (scheme, rest)
+            if !scheme.eq_ignore_ascii_case("http") {
+                return Err(format!(
+                    "unsupported proxy scheme {:?} (only http:// proxy endpoints are supported; \
+                     https:// targets are proxied through an http:// proxy with CONNECT)",
+                    scheme.to_ascii_lowercase()
+                ));
+            }
+            rest
         }
-        None => (ProxyScheme::Http, raw),
+        None => raw,
     };
     // Drop any path/query the value carries; a proxy is an authority.
     let authority = rest
@@ -388,10 +398,7 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
         return Err("proxy URL has no host".to_string());
     }
 
-    let port = port.unwrap_or(match scheme {
-        ProxyScheme::Http => 80,
-        ProxyScheme::Https => 443,
-    });
+    let port = port.unwrap_or(80);
 
     let authorization = userinfo.filter(|info| !info.is_empty()).map(|info| {
         let decoded = percent_decode_userinfo(&info);
@@ -399,7 +406,6 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
     });
 
     Ok(ProxyEndpoint {
-        scheme,
         host,
         port,
         authorization,
@@ -548,7 +554,6 @@ mod tests {
     #[test]
     fn parses_scheme_host_and_port() {
         let endpoint = parse_proxy_url("http://127.0.0.1:2080").expect("parse");
-        assert_eq!(endpoint.scheme, ProxyScheme::Http);
         assert_eq!(endpoint.host, "127.0.0.1");
         assert_eq!(endpoint.port, 2080);
         assert_eq!(endpoint.authorization, None);
@@ -558,18 +563,21 @@ mod tests {
     #[test]
     fn bare_authority_defaults_to_http() {
         let endpoint = parse_proxy_url("proxy.corp:3128").expect("parse");
-        assert_eq!(endpoint.scheme, ProxyScheme::Http);
         assert_eq!(endpoint.host, "proxy.corp");
         assert_eq!(endpoint.port, 3128);
     }
 
     #[test]
-    fn scheme_default_ports_apply() {
+    fn port_defaults_to_80() {
         assert_eq!(parse_proxy_url("http://p.example").expect("http").port, 80);
-        assert_eq!(
-            parse_proxy_url("https://p.example").expect("https").port,
-            443
-        );
+    }
+
+    /// A TLS hop to the proxy would need TLS-in-TLS; reject it where the value
+    /// is read rather than at request time.
+    #[test]
+    fn https_proxy_endpoints_are_rejected_at_parse_time() {
+        let err = parse_proxy_url("https://proxy:8443").expect_err("https hop unsupported");
+        assert!(err.contains("only http:// proxy endpoints"), "{err}");
     }
 
     #[test]
@@ -826,6 +834,16 @@ mod tests {
         );
         assert!(config.endpoint_for(true, "::1", 443).is_none());
         assert!(config.endpoint_for(true, "[::1]", 443).is_none());
+
+        let with_port = resolve(
+            None,
+            &[("HTTPS_PROXY", "http://p:8080"), ("NO_PROXY", "[::1]:8443")],
+        );
+        assert!(with_port.endpoint_for(true, "::1", 8443).is_none());
+        assert!(
+            with_port.endpoint_for(true, "::1", 443).is_some(),
+            "a port-qualified bypass entry must not match other ports"
+        );
     }
 
     // ─── Child-process env ──────────────────────────────────────────────

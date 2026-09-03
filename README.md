@@ -970,10 +970,51 @@ is parsed as-is and is never rewritten to snake_case:
     "clear_on_shrink": false
   },
 
+  "http": {
+    "proxy": "http://127.0.0.1:2080",
+    "no_proxy": ["localhost", "127.0.0.1", ".internal.example"]
+  },
+
   "shell_path": "/bin/bash",
   "shell_command_prefix": "set -e"
 }
 ```
+
+### Network Proxy
+
+Every request Pi makes — provider APIs, OAuth logins, update checks, URL reads,
+package fetches — goes through the proxy resolved here. `https://` targets use a
+CONNECT tunnel, so TLS stays end-to-end to the origin and the proxy never sees
+plaintext; `http://` targets use an absolute-form request line. Credentials in
+the proxy URL (`http://user:pass@host:port`) become `Proxy-Authorization`, and
+are never logged or passed to child processes.
+
+Resolution order for a request, first match wins:
+
+1. A bypass match — `http.no_proxy` in settings.json, else `NO_PROXY` /
+   `no_proxy`. Entries follow the usual convention: `*` bypasses everything,
+   `example.com` or `.example.com` matches the domain and its subdomains, and
+   `example.com:8443` restricts the match to that port.
+2. `http.https_proxy` / `http.http_proxy` (scheme-specific settings).
+3. `http.proxy` (both schemes).
+4. `PI_HTTPS_PROXY` / `PI_HTTP_PROXY`.
+5. The standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` (lowercase spellings
+   accepted).
+
+Ambient proxy variables are honored by default, the same as `git` and `curl`.
+Where they are set for some other tool — a capture proxy, a stale VPN helper —
+turn the inheritance off with `"http": { "ignore_env_proxy": true }` or
+`PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. An
+unusable ambient value (e.g. a `socks5://` `ALL_PROXY` — SOCKS is not
+supported) is skipped with a warning rather than failing requests.
+
+The resolved proxy is also injected into every process the `bash` tool spawns
+(as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase spellings), so
+`git`, `curl`, and `npm` invocations reach the network the same way Pi does.
+The injection is a per-child copy: Pi's own environment and the system
+environment are never modified. Proxy credentials are deliberately left out of
+that copy, so an authenticated proxy needs its own configuration for those
+tools (e.g. `git config --global http.proxy`).
 
 ### Configuration Precedence
 

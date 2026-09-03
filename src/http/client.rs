@@ -5,7 +5,7 @@
 //! asupersync for TLS + cancel-correctness.
 
 use crate::error::{Error, Result};
-use crate::http::proxy::{ProxyEndpoint, ProxyScheme};
+use crate::http::proxy::ProxyEndpoint;
 use crate::vcr::{RecordedRequest, VcrRecorder};
 use asupersync::http::h1::ParsedUrl;
 use asupersync::http::h1::http_client::Scheme;
@@ -920,21 +920,6 @@ async fn connect_transport_once(
             retryable_not_connected: is_retryable_not_connected(&e),
             error: Error::from(e),
         })?;
-    // An `https://` proxy hop (TLS to the proxy itself) is not supported by
-    // the CONNECT path below: it would need a second TLS layer between the
-    // socket and the tunnel. Fail loudly rather than silently talking plain
-    // HTTP to a TLS listener.
-    if let Some(proxy) = proxy
-        && proxy.scheme == ProxyScheme::Https
-    {
-        return Err(ConnectAttemptError {
-            error: Error::api(format!(
-                "proxy {} uses https://, which this client cannot dial; use an http:// proxy endpoint",
-                proxy.redacted_url()
-            )),
-            retryable_not_connected: false,
-        });
-    }
     let tcp =
         match (proxy, parsed.scheme) {
             // Plain-HTTP origin through a proxy: no tunnel, absolute-form request.
