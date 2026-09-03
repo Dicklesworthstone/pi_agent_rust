@@ -2545,20 +2545,25 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
         write_json(&path, criterion_estimate);
     }
 
+    // The five semantic_context benches are staging contracts of their own
+    // (`context_artifact_groups` in scripts/perf/preflight_budget_inputs.py),
+    // each keyed on `new/estimates.json`; the phase-1 matrix additionally
+    // reads `new/sample.json`. Without the estimates the final artifact
+    // staging reports them as the five missing required artifacts and the
+    // post-generation gate blocks the whole stub run.
     let criterion_sample = r#"{"sampling_mode":"Linear","iters":[1.0,1.0],"times":[1.0,1.0]}"#;
-    for path in [
-        target_dir
-            .join("criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json"),
-        target_dir
-            .join("criterion/semantic_context/graph_build_warm/large_workspace/new/sample.json"),
-        target_dir
-            .join("criterion/semantic_context/incremental_update/large_workspace/new/sample.json"),
-        target_dir.join("criterion/semantic_context/planning/large_workspace/new/sample.json"),
-        target_dir.join(
-            "criterion/semantic_context/bundle_serialization/large_workspace/new/sample.json",
-        ),
+    for bench in [
+        "graph_build_cold",
+        "graph_build_warm",
+        "incremental_update",
+        "planning",
+        "bundle_serialization",
     ] {
-        write_json(&path, criterion_sample);
+        let bench_dir = target_dir.join(format!(
+            "criterion/semantic_context/{bench}/large_workspace/new"
+        ));
+        write_json(&bench_dir.join("sample.json"), criterion_sample);
+        write_json(&bench_dir.join("estimates.json"), criterion_estimate);
     }
 
     write_json(

@@ -1130,6 +1130,35 @@ PY
 summary_exit=$?
 set -e
 
+# A failed integrity summary must name its reason on stdout: the DSR lane and
+# the bench_schema harness only keep the runner's output, not the JSON, and a
+# bare "exit code 1" after two passing cases is not a diagnosable result.
+if [[ "$summary_exit" -ne 0 && -f "$ARTIFACT_DIR/.integrity-summary.pending.json" ]]; then
+    python3 - "$ARTIFACT_DIR/.integrity-summary.pending.json" <<'PY' || true
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    summary = json.load(handle)
+for case in summary.get("cases", []):
+    checks = case.get("checks", {})
+    failed = [name for name, ok in checks.items() if ok is not True]
+    if failed or case.get("evidence_error"):
+        print(
+            f"[fault-injection] Case '{case.get('case_id')}' evidence checks failed: "
+            f"{', '.join(failed) or 'n/a'}; error={case.get('evidence_error')}"
+        )
+if summary.get("source_tree_stable") is not True:
+    print(
+        "[fault-injection] Source tree moved during the run: "
+        f"commit {summary.get('source_commit')} -> {summary.get('source_commit_final')}, "
+        f"dirty {summary.get('source_dirty')} -> {summary.get('source_dirty_final')}, "
+        f"digest {str(summary.get('source_tree_sha256'))[:12]} -> "
+        f"{str(summary.get('source_tree_sha256_final'))[:12]}"
+    )
+PY
+fi
+
 overall_exit=0
 if [[ "$jsonl_exit" -ne 0 || "$sqlite_exit" -ne 0 || "$summary_exit" -ne 0 ]]; then
     overall_exit=1

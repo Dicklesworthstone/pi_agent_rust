@@ -7756,6 +7756,23 @@ PY
   else
     post_generation_exit=$?
     log_warn "Post-generation evidence contract blocked: results/$(basename "$POST_GENERATION_CONTRACT_PATH")"
+    # Name the failures in the log so a gate transcript explains itself
+    # without the JSON artifact (the DSR lane only keeps stdout).
+    if [[ -f "$POST_GENERATION_CONTRACT_PATH" ]]; then
+      python3 - "$POST_GENERATION_CONTRACT_PATH" <<'PY' | while IFS= read -r line; do log_warn "  $line"; done
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+for failure in payload.get("failures", [])[:12]:
+    if not isinstance(failure, dict):
+        continue
+    reason = failure.get("reason", "unknown")
+    detail = {k: v for k, v in failure.items() if k not in {"reason", "path"}}
+    print(f"contract failure: {reason} {json.dumps(detail, sort_keys=True)[:200]}")
+PY
+    fi
   fi
   artifact_count=$((artifact_count + 1))
 else
@@ -8609,6 +8626,19 @@ PY
       ARTIFACT_STAGING_BLOCKERS <<< "$staging_summary"
     log_ok "Final artifact staging: status=$ARTIFACT_STAGING_STATUS present=$ARTIFACT_STAGING_PRESENT_REQUIRED"
     log_ok "Final artifact blockers: missing=$ARTIFACT_STAGING_MISSING_REQUIRED stale=$ARTIFACT_STAGING_STALE_REQUIRED"
+    if [[ "$ARTIFACT_STAGING_BLOCKERS" -gt 0 ]]; then
+      # Name the blocked contracts so the gate transcript explains itself.
+      python3 - "$STAGING_MANIFEST_PATH" <<'PY' | while IFS= read -r line; do log_warn "  $line"; done
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+for blocker in payload.get("blockers", [])[:20]:
+    if isinstance(blocker, dict):
+        print(f"{blocker.get('status', 'blocked')}: {blocker.get('contract_id', '?')}")
+PY
+    fi
   else
     log_warn "Final artifact staging manifest was not generated"
   fi

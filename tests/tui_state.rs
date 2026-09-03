@@ -17,6 +17,7 @@ use pi::extensions::{
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::interactive::{ConversationMessage, MessageRole, PendingInput, PiApp, PiMsg};
 use pi::keybindings::KeyBindings;
+use pi::mcp::McpManager;
 use pi::model::{
     AssistantMessage, ContentBlock, Cost, ImageContent, StopReason, StreamEvent, TextContent,
     Usage, UserContent,
@@ -203,6 +204,29 @@ fn build_app_with_session_and_events_and_extension(
     config: Config,
     extension_source: &str,
 ) -> (PiApp, mpsc::Receiver<PiMsg>) {
+    let (app, event_rx, _manager) = build_app_with_extension_and_mcp(
+        harness,
+        pending_inputs,
+        session,
+        config,
+        extension_source,
+        None,
+    );
+    (app, event_rx)
+}
+
+/// Like `build_app_with_session_and_events_and_extension`, but the App also
+/// owns an MCP manager (the classic TUI's `mcp_manager` slot) and the loaded
+/// `ExtensionManager` is handed back so a test can register late servers the
+/// way the `registerMcpServer` hostcall does.
+fn build_app_with_extension_and_mcp(
+    harness: &TestHarness,
+    pending_inputs: Vec<PendingInput>,
+    session: Session,
+    config: Config,
+    extension_source: &str,
+    mcp_manager: Option<Arc<McpManager>>,
+) -> (PiApp, mpsc::Receiver<PiMsg>, ExtensionManager) {
     let config = common::hermetic_interactive_config(config);
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
@@ -271,14 +295,14 @@ fn build_app_with_session_and_events_and_extension(
         test_runtime_handle(),
         false,
         false,
-        Some(manager),
+        Some(manager.clone()),
         Some(KeyBindings::new()),
         messages,
         usage,
-        None,
+        mcp_manager,
     );
     app.set_terminal_size(80, 24);
-    (app, event_rx)
+    (app, event_rx, manager)
 }
 
 fn build_app_with_models(
@@ -936,6 +960,19 @@ fn assert_after_not_contains(harness: &TestHarness, step: &StepOutcome, needle: 
             harness,
             step,
             &format!("Expected view NOT to contain: {needle}"),
+        );
+    }
+}
+
+fn assert_after_count(harness: &TestHarness, step: &StepOutcome, needle: &str, expected: usize) {
+    let found = step.after.matches(needle).count();
+    if found != expected {
+        fail_step(
+            harness,
+            step,
+            &format!(
+                "Expected view to contain {needle:?} exactly {expected} time(s), found {found}"
+            ),
         );
     }
 }
@@ -2479,10 +2516,15 @@ fn tui_state_agent_done_error_without_response_adds_error_message() {
     assert_after_contains(&harness, &step, "boom");
 }
 
+/// #209 (ab888c82): a provider failure after partial text used to leave only
+/// the one-line status behind, so the transcript now keeps the partial answer
+/// AND exactly one error card. Before #209 this test asserted that no card
+/// appears once text had streamed; the newer contract wins, and "exactly one"
+/// is what still guards against a duplicated system message.
 #[test]
-fn tui_state_agent_done_error_with_response_does_not_duplicate_error_system_message() {
+fn tui_state_agent_done_error_with_response_keeps_partial_text_and_one_error_card() {
     let harness = TestHarness::new(
-        "tui_state_agent_done_error_with_response_does_not_duplicate_error_system_message",
+        "tui_state_agent_done_error_with_response_keeps_partial_text_and_one_error_card",
     );
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
@@ -2505,7 +2547,7 @@ fn tui_state_agent_done_error_with_response_does_not_duplicate_error_system_mess
         },
     );
     assert_after_contains(&harness, &step, "partial");
-    assert_after_not_contains(&harness, &step, "Error: boom");
+    assert_after_count(&harness, &step, "Error: boom", 1);
 }
 
 #[test]
@@ -4227,6 +4269,102 @@ export default function init(pi) {
     assert_after_contains(&harness, &step, "Started new session");
     assert_after_not_contains(&harness, &step, "You: hello");
     assert_after_not_contains(&harness, &step, "world");
+}
+
+/// bd-8m21l / bd-z7267: the classic TUI's turn tasks call
+/// `pi::mcp::sync_extension_registrations` right after locking the agent, so a
+/// server an extension registers after startup (what the `registerMcpServer`
+/// hostcall does) reaches the App's MCP manager at the next turn: once, with
+/// extension provenance, pending trust (nothing mounts), and never twice.
+/// Removing the sync calls from `src/interactive/agent.rs` fails this test.
+#[test]
+fn tui_state_late_extension_mcp_registration_reaches_the_manager_at_the_next_turn() {
+    let harness = TestHarness::new(
+        "tui_state_late_extension_mcp_registration_reaches_the_manager_at_the_next_turn",
+    );
+    let session = Session::in_memory();
+    let cwd = harness.temp_dir().to_path_buf();
+    let global_dir = harness.temp_path("mcp-global");
+    fs::create_dir_all(&global_dir).expect("create MCP global dir");
+    let mcp_manager = Arc::new(
+        pi::mcp::bootstrap_with_project_trust(&cwd, &global_dir, &[], true)
+            .expect("bootstrap MCP manager"),
+    );
+    let extension_source = r"
+export default function init(pi) {}
+";
+    let (mut app, mut event_rx, extensions) = build_app_with_extension_and_mcp(
+        &harness,
+        Vec::new(),
+        session,
+        Config::default(),
+        extension_source,
+        Some(Arc::clone(&mcp_manager)),
+    );
+    log_initial_state(&harness, &app);
+    assert!(
+        mcp_manager
+            .list()
+            .iter()
+            .all(|row| row.name != "late-fixture"),
+        "nothing is registered at startup"
+    );
+
+    // What the `registerMcpServer` hostcall does once startup is over.
+    extensions.register_mcp_server(json!({
+        "name": "late-fixture",
+        "command": "pi-mcp-late-fixture-does-not-exist",
+        "extension_id": "ext"
+    }));
+    assert!(
+        mcp_manager
+            .list()
+            .iter()
+            .all(|row| row.name != "late-fixture"),
+        "the extension snapshot alone must not reach the MCP manager"
+    );
+
+    let run_turn = |app: &mut PiApp, event_rx: &mut mpsc::Receiver<PiMsg>, label: &str| {
+        type_text(&harness, app, "hello");
+        press_enter(&harness, app);
+        let events = wait_for_pi_msgs(event_rx, Duration::from_secs(10), |msgs| {
+            msgs.iter()
+                .any(|msg| matches!(msg, PiMsg::AgentDone { .. }))
+        });
+        let done = events
+            .into_iter()
+            .find(|msg| matches!(msg, PiMsg::AgentDone { .. }))
+            .unwrap_or_else(|| panic!("expected AgentDone after {label}"));
+        apply_pi(&harness, app, "PiMsg::AgentDone", done);
+    };
+
+    run_turn(&mut app, &mut event_rx, "the first turn");
+    let rows: Vec<_> = mcp_manager
+        .list()
+        .into_iter()
+        .filter(|row| row.name == "late-fixture")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the first turn registers the late server once"
+    );
+    assert_eq!(rows[0].provenance, "extension");
+    assert_eq!(
+        rows[0].trust, "pending",
+        "a server first seen at runtime waits for acknowledgement exactly like at startup"
+    );
+
+    run_turn(&mut app, &mut event_rx, "the second turn");
+    assert_eq!(
+        mcp_manager
+            .list()
+            .iter()
+            .filter(|row| row.name == "late-fixture")
+            .count(),
+        1,
+        "a later turn must not register the same server again"
+    );
 }
 
 #[test]

@@ -390,6 +390,28 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 - `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
 - **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
 
+### Pre-Commit Guard (installed 2026-09-02, bd-0x31m)
+
+This checkout runs the agent-mail pre-commit guard: `.git/hooks/pre-commit` is
+the chain-runner and `.git/hooks/hooks.d/pre-commit/50-agent-mail.py` checks
+every commit against the active **exclusive** file reservations. It exists
+because an unattended sweeper committed another agent's unverified in-flight
+work five times in one day (last: `5d3eb35a`).
+
+- **Identify yourself:** the guard reads `AGENT_NAME` (falling back to the
+  registered pane identity). Commit and push as
+  `AGENT_NAME=<your registered agent name> git commit …`; an unidentified
+  commit is refused while any exclusive reservation is active.
+- **Never commit into someone else's reservation.** If the guard names a
+  holder, coordinate in the bead thread or wait for the lease to expire; do
+  not bypass it to land your slice.
+- **Release when you land:** `release_file_reservations` as soon as your
+  change is committed, so the guard stops blocking other agents.
+- **Human bypass only:** `AGENT_MAIL_GUARD_MODE=warn` (allow with a warning)
+  and `AGENT_MAIL_BYPASS=1` (skip) are for the operator, not for agents.
+- The hook files live under `.git/` and are not versioned; reinstall with the
+  agent-mail `install_precommit_guard` tool if a fresh clone lacks them.
+
 ---
 
 ## Beads (br) — Dependency-Aware Issue Tracking
