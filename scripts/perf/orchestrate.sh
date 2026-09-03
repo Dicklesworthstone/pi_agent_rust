@@ -7759,18 +7759,38 @@ PY
     # Name the failures in the log so a gate transcript explains itself
     # without the JSON artifact (the DSR lane only keeps stdout).
     if [[ -f "$POST_GENERATION_CONTRACT_PATH" ]]; then
-      python3 - "$POST_GENERATION_CONTRACT_PATH" <<'PY' | while IFS= read -r line; do log_warn "  $line"; done
+      python3 - "$POST_GENERATION_CONTRACT_PATH" "$STRATIFICATION_PATH" <<'PY' | while IFS= read -r line; do log_warn "  $line"; done
 import json
 import sys
+from pathlib import Path
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     payload = json.load(handle)
-for failure in payload.get("failures", [])[:12]:
-    if not isinstance(failure, dict):
-        continue
+failures = [f for f in payload.get("failures", []) if isinstance(f, dict)]
+for failure in failures[:40]:
     reason = failure.get("reason", "unknown")
     detail = {k: v for k, v in failure.items() if k not in {"reason", "path"}}
     print(f"contract failure: {reason} {json.dumps(detail, sort_keys=True)[:200]}")
+if len(failures) > 40:
+    print(f"contract failure: ... {len(failures) - 40} more")
+# The phase-1 cells inherit their node/bun ratios from the stratification's
+# full_e2e_long_session layer, so show every layer's evidence state.
+stratification_path = Path(sys.argv[2])
+if stratification_path.is_file():
+    with stratification_path.open(encoding="utf-8") as handle:
+        stratification = json.load(handle)
+    for layer in stratification.get("layers", []):
+        if not isinstance(layer, dict):
+            continue
+        relative = layer.get("relative_metrics") or {}
+        print(
+            f"layer {layer.get('layer_id')}: evidence={layer.get('evidence_state')} "
+            f"confidence={layer.get('confidence')} "
+            f"node_ratio={relative.get('rust_vs_node_ratio')} "
+            f"({relative.get('rust_vs_node_ratio_basis')}) "
+            f"bun_ratio={relative.get('rust_vs_bun_ratio')} "
+            f"({relative.get('rust_vs_bun_ratio_basis')})"
+        )
 PY
     fi
   fi
