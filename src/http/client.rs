@@ -5,6 +5,7 @@
 //! asupersync for TLS + cancel-correctness.
 
 use crate::error::{Error, Result};
+use crate::http::proxy::{ProxyEndpoint, ProxyScheme};
 use crate::vcr::{RecordedRequest, VcrRecorder};
 use asupersync::http::h1::ParsedUrl;
 use asupersync::http::h1::http_client::Scheme;
@@ -601,9 +602,19 @@ async fn send_parts(
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
     let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
-    let mut transport = connect_transport(&parsed, client).await?;
+    // #210: a configured proxy applies to every request this client makes.
+    // `https://` goes through a CONNECT tunnel (so TLS is still end-to-end to
+    // the origin); `http://` uses the absolute-form request line.
+    let proxy_config = crate::http::proxy::active();
+    let proxy = proxy_config.endpoint_for(
+        matches!(parsed.scheme, Scheme::Https),
+        &parsed.host,
+        parsed.port,
+    );
+    let mut transport = connect_transport(&parsed, client, proxy).await?;
 
-    let request_bytes = build_request_bytes(method, &parsed, &client.user_agent, headers, body);
+    let request_bytes =
+        build_request_bytes(method, &parsed, &client.user_agent, headers, body, proxy);
     write_all_with_retry(&mut transport, &request_bytes).await?;
     if !body.is_empty() {
         write_all_with_retry(&mut transport, body).await?;
@@ -895,14 +906,46 @@ struct ConnectAttemptError {
 async fn connect_transport_once(
     parsed: &ParsedUrl,
     client: &Client,
+    proxy: Option<&ProxyEndpoint>,
 ) -> std::result::Result<Transport, ConnectAttemptError> {
-    let addr = (parsed.host.clone(), parsed.port);
+    // With a proxy the TCP hop terminates at the proxy; the origin host is
+    // named in the CONNECT request (https) or the request line (http).
+    let addr = proxy.map_or_else(
+        || (parsed.host.clone(), parsed.port),
+        |proxy| (proxy.host.clone(), proxy.port),
+    );
     let tcp = TcpStream::connect(addr)
         .await
         .map_err(|e| ConnectAttemptError {
             retryable_not_connected: is_retryable_not_connected(&e),
             error: Error::from(e),
         })?;
+    // An `https://` proxy hop (TLS to the proxy itself) is not supported by
+    // the CONNECT path below: it would need a second TLS layer between the
+    // socket and the tunnel. Fail loudly rather than silently talking plain
+    // HTTP to a TLS listener.
+    if let Some(proxy) = proxy
+        && proxy.scheme == ProxyScheme::Https
+    {
+        return Err(ConnectAttemptError {
+            error: Error::api(format!(
+                "proxy {} uses https://, which this client cannot dial; use an http:// proxy endpoint",
+                proxy.redacted_url()
+            )),
+            retryable_not_connected: false,
+        });
+    }
+    let tcp =
+        match (proxy, parsed.scheme) {
+            // Plain-HTTP origin through a proxy: no tunnel, absolute-form request.
+            (Some(_), Scheme::Http) | (None, _) => tcp,
+            (Some(proxy), Scheme::Https) => proxy_connect_tunnel(tcp, parsed, proxy)
+                .await
+                .map_err(|error| ConnectAttemptError {
+                    error,
+                    retryable_not_connected: false,
+                })?,
+        };
     match parsed.scheme {
         Scheme::Http => Ok(Transport::Tcp(tcp)),
         Scheme::Https => {
@@ -923,12 +966,16 @@ async fn connect_transport_once(
     }
 }
 
-async fn connect_transport(parsed: &ParsedUrl, client: &Client) -> Result<Transport> {
+async fn connect_transport(
+    parsed: &ParsedUrl,
+    client: &Client,
+    proxy: Option<&ProxyEndpoint>,
+) -> Result<Transport> {
     use asupersync::time::{sleep, wall_now};
 
     let mut backoffs = NOT_CONNECTED_RETRY_BACKOFFS.iter();
     loop {
-        let failure = match connect_transport_once(parsed, client).await {
+        let failure = match connect_transport_once(parsed, client, proxy).await {
             Ok(transport) => return Ok(transport),
             Err(failure) => failure,
         };
@@ -1010,26 +1057,111 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
     })
 }
 
+/// Establish a CONNECT tunnel to `parsed`'s origin through `proxy` (#210).
+///
+/// Consumes the freshly connected TCP stream and hands it back once the proxy
+/// answers 2xx, at which point the caller layers TLS to the *origin* over it —
+/// so end-to-end TLS is preserved and the proxy never sees plaintext.
+async fn proxy_connect_tunnel(
+    tcp: TcpStream,
+    parsed: &ParsedUrl,
+    proxy: &ProxyEndpoint,
+) -> Result<TcpStream> {
+    let authority = origin_authority(parsed);
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if let Some(credentials) = proxy.authorization.as_deref() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut request,
+            format_args!(
+                "Proxy-Authorization: {}\r\n",
+                sanitize_header_value(credentials)
+            ),
+        );
+    }
+    request.push_str("Proxy-Connection: keep-alive\r\n\r\n");
+
+    // `read_response_head` works on a `Transport`; wrap the socket, run the
+    // handshake, then unwrap it again for the TLS layer.
+    let mut transport = Transport::Tcp(tcp);
+    write_all_with_retry(&mut transport, request.as_bytes()).await?;
+    transport.flush().await?;
+    let (status, _headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
+
+    if !(200..300).contains(&status) {
+        return Err(Error::api(format!(
+            "proxy {} refused CONNECT to {authority} (HTTP {status})",
+            proxy.redacted_url()
+        )));
+    }
+    if !leftover.is_empty() {
+        // Anything after the CONNECT response head would be origin bytes we
+        // are about to feed to the TLS handshake, and we have no way to push
+        // them back into the socket. A conforming proxy never sends them.
+        return Err(Error::api(format!(
+            "proxy {} sent {} unexpected bytes after the CONNECT response",
+            proxy.redacted_url(),
+            leftover.len()
+        )));
+    }
+    match transport {
+        Transport::Tcp(tcp) => Ok(tcp),
+        Transport::Tls(_) => Err(Error::api(
+            "internal error: CONNECT handshake transport changed type",
+        )),
+    }
+}
+
+/// `host:port` for the request's origin, always including the port (CONNECT
+/// requires an explicit port).
+fn origin_authority(parsed: &ParsedUrl) -> String {
+    if parsed.host.contains(':') && !parsed.host.starts_with('[') {
+        format!("[{}]:{}", parsed.host, parsed.port)
+    } else {
+        format!("{}:{}", parsed.host, parsed.port)
+    }
+}
+
 fn build_request_bytes(
     method: Method,
     parsed: &ParsedUrl,
     user_agent: &str,
     headers: &[(String, String)],
     body: &[u8],
+    proxy: Option<&ProxyEndpoint>,
 ) -> Vec<u8> {
     let mut out = String::new();
     let effective_user_agent =
         sanitize_header_value(header_value(headers, "user-agent").unwrap_or(user_agent));
     let host_header = host_header_value(parsed);
+    // #210: a plain-HTTP request through a proxy carries the absolute URI in
+    // the request line (RFC 9112 §3.2.2). An https request is already inside a
+    // CONNECT tunnel by this point and uses origin form as usual.
+    let proxy_absolute_form = proxy.is_some() && matches!(parsed.scheme, Scheme::Http);
+    let request_target = if proxy_absolute_form {
+        format!("http://{host_header}{}", parsed.path)
+    } else {
+        parsed.path.clone()
+    };
     let _ = std::fmt::Write::write_fmt(
         &mut out,
-        format_args!("{} {} HTTP/1.1\r\n", method.as_str(), parsed.path),
+        format_args!("{} {request_target} HTTP/1.1\r\n", method.as_str()),
     );
     let _ = std::fmt::Write::write_fmt(&mut out, format_args!("Host: {host_header}\r\n"));
     let _ = std::fmt::Write::write_fmt(
         &mut out,
         format_args!("User-Agent: {effective_user_agent}\r\n"),
     );
+    if proxy_absolute_form
+        && let Some(credentials) = proxy.and_then(|proxy| proxy.authorization.as_deref())
+    {
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "Proxy-Authorization: {}\r\n",
+                sanitize_header_value(credentials)
+            ),
+        );
+    }
     let _ =
         std::fmt::Write::write_fmt(&mut out, format_args!("Content-Length: {}\r\n", body.len()));
 
@@ -1042,6 +1174,9 @@ fn build_request_bytes(
             // This client only emits fixed-length request bodies, so
             // caller-supplied transfer codings would lie about the wire format.
             || clean_name.eq_ignore_ascii_case("transfer-encoding")
+            // The proxy hop owns this header (#210); a caller-supplied copy
+            // would duplicate or contradict the configured credentials.
+            || (proxy_absolute_form && clean_name.eq_ignore_ascii_case("proxy-authorization"))
         {
             continue;
         }
@@ -1914,11 +2049,104 @@ mod tests {
         ));
     }
 
+    // ── proxying (#210) ───────────────────────────────────────────────
+
+    fn test_proxy(url: &str) -> ProxyEndpoint {
+        crate::http::proxy::parse_proxy_url(url).expect("parse proxy url")
+    }
+
+    /// A plain-HTTP request through a proxy uses the absolute-form request
+    /// line (RFC 9112 §3.2.2) and carries the proxy credentials.
+    #[test]
+    fn build_request_bytes_uses_absolute_form_through_a_proxy() {
+        let parsed = ParsedUrl::parse("http://example.com/api/test?x=1").unwrap();
+        let proxy = test_proxy("http://user:pass@127.0.0.1:2080");
+        let bytes = build_request_bytes(Method::Get, &parsed, "test-agent", &[], &[], Some(&proxy));
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.starts_with("GET http://example.com/api/test?x=1 HTTP/1.1\r\n"),
+            "expected absolute-form request line, got: {text}"
+        );
+        assert!(text.contains("Host: example.com\r\n"));
+        // base64("user:pass")
+        assert!(
+            text.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"),
+            "missing proxy credentials: {text}"
+        );
+    }
+
+    /// A non-default origin port is preserved in the absolute form.
+    #[test]
+    fn absolute_form_keeps_the_origin_port() {
+        let parsed = ParsedUrl::parse("http://example.com:8080/x").unwrap();
+        let proxy = test_proxy("http://127.0.0.1:2080");
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[], Some(&proxy));
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.starts_with("GET http://example.com:8080/x HTTP/1.1\r\n"),
+            "{text}"
+        );
+    }
+
+    /// An https request is inside a CONNECT tunnel by the time the request is
+    /// serialized, so it stays origin-form with no proxy header.
+    #[test]
+    fn https_through_a_proxy_stays_origin_form() {
+        let parsed = ParsedUrl::parse("https://api.example.com/v1/messages").unwrap();
+        let proxy = test_proxy("http://user:pass@127.0.0.1:2080");
+        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &[], b"{}", Some(&proxy));
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("POST /v1/messages HTTP/1.1\r\n"), "{text}");
+        assert!(
+            !text.to_ascii_lowercase().contains("proxy-authorization"),
+            "tunnelled request must not leak proxy credentials to the origin: {text}"
+        );
+    }
+
+    /// A caller-supplied `Proxy-Authorization` never overrides or duplicates
+    /// the configured credentials on the proxied hop.
+    #[test]
+    fn caller_supplied_proxy_authorization_is_dropped_on_the_proxied_hop() {
+        let parsed = ParsedUrl::parse("http://example.com/x").unwrap();
+        let proxy = test_proxy("http://user:pass@127.0.0.1:2080");
+        let headers = vec![(
+            "Proxy-Authorization".to_string(),
+            "Basic c3B1cmlvdXM=".to_string(),
+        )];
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], Some(&proxy));
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            text.matches("Proxy-Authorization:").count(),
+            1,
+            "exactly one proxy auth header expected: {text}"
+        );
+        assert!(text.contains("Basic dXNlcjpwYXNz"), "{text}");
+    }
+
+    /// Without a proxy nothing changes: origin form, no proxy headers.
+    #[test]
+    fn direct_requests_are_unchanged() {
+        let parsed = ParsedUrl::parse("http://example.com/api/test").unwrap();
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[], None);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("GET /api/test HTTP/1.1\r\n"), "{text}");
+        assert!(!text.to_ascii_lowercase().contains("proxy-authorization"));
+    }
+
+    /// CONNECT targets always carry an explicit port, bracketing IPv6 hosts.
+    #[test]
+    fn origin_authority_is_connect_ready() {
+        let parsed = ParsedUrl::parse("https://api.example.com/v1").unwrap();
+        assert_eq!(origin_authority(&parsed), "api.example.com:443");
+        let parsed = ParsedUrl::parse("http://example.com:8080/x").unwrap();
+        assert_eq!(origin_authority(&parsed), "example.com:8080");
+    }
+
     // ── build_request_bytes ────────────────────────────────────────────
     #[test]
     fn build_request_bytes_get() {
         let parsed = ParsedUrl::parse("http://example.com/api/test").unwrap();
-        let bytes = build_request_bytes(Method::Get, &parsed, "test-agent", &[], &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "test-agent", &[], &[], None);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("GET /api/test HTTP/1.1\r\n"));
         assert!(text.contains("Host: example.com\r\n"));
@@ -1932,7 +2160,7 @@ mod tests {
         let parsed = ParsedUrl::parse("https://api.example.com/v1/messages").unwrap();
         let body = b"hello world";
         let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-        let bytes = build_request_bytes(Method::Post, &parsed, "pi/0.1", &headers, body);
+        let bytes = build_request_bytes(Method::Post, &parsed, "pi/0.1", &headers, body, None);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("POST /v1/messages HTTP/1.1\r\n"));
         assert!(text.contains("Host: api.example.com\r\n"));
@@ -1947,7 +2175,7 @@ mod tests {
             ("Authorization".to_string(), "Bearer sk-test".to_string()),
             ("X-Custom".to_string(), "value".to_string()),
         ];
-        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, &[], None);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("Authorization: Bearer sk-test\r\n"));
         assert!(text.contains("X-Custom: value\r\n"));
@@ -1963,7 +2191,8 @@ mod tests {
             ("X-Test".to_string(), "1".to_string()),
         ];
         let body = b"hello";
-        let bytes = build_request_bytes(Method::Post, &parsed, "default-agent", &headers, body);
+        let bytes =
+            build_request_bytes(Method::Post, &parsed, "default-agent", &headers, body, None);
         let text = String::from_utf8(bytes).unwrap();
 
         assert_eq!(text.matches("Host: ").count(), 1);
@@ -1984,7 +2213,7 @@ mod tests {
     #[test]
     fn build_request_bytes_non_default_port_includes_port_in_host_header() {
         let parsed = ParsedUrl::parse("http://example.com:8080/api/test").unwrap();
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[], None);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("Host: example.com:8080\r\n"));
@@ -1997,7 +2226,7 @@ mod tests {
             "User-Agent".to_string(),
             "custom-agent\r\nX-Injected: nope".to_string(),
         )];
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], None);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("User-Agent: custom-agentX-Injected: nope\r\n"));
@@ -2618,7 +2847,7 @@ mod tests {
     #[test]
     fn build_request_bytes_empty_path() {
         let parsed = ParsedUrl::parse("http://example.com").unwrap();
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[], None);
         let text = String::from_utf8(bytes).unwrap();
         // Should have "/" as path
         assert!(text.starts_with("GET /"));
@@ -2653,7 +2882,7 @@ mod tests {
             "X-Injected\r\nEvil".to_string(),
             "value\r\nX-Bad: smuggled".to_string(),
         )];
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], None);
         let text = String::from_utf8(bytes).unwrap();
         // CRLF should be stripped — no injected header line
         assert!(text.contains("X-InjectedEvil: valueX-Bad: smuggled\r\n"));
@@ -2665,7 +2894,7 @@ mod tests {
     fn build_request_bytes_strips_invalid_chars_from_header_names() {
         let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
         let headers = vec![("X:Injected Header".to_string(), "value".to_string())];
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], None);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("XInjectedHeader: value\r\n"));
@@ -2680,7 +2909,7 @@ mod tests {
             ("Content-Length ".to_string(), "999".to_string()),
             ("User-Agent:".to_string(), "spoofed".to_string()),
         ];
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], None);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("Host: example.com\r\n"));
@@ -2696,7 +2925,7 @@ mod tests {
         let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
         let headers = vec![("Transfer-Encoding".to_string(), "chunked".to_string())];
         let body = b"hello";
-        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, body);
+        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, body, None);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("Content-Length: 5\r\n"));
@@ -2813,7 +3042,7 @@ mod tests {
         // Simulate the antigravity user agent being used in request building.
         let ua = format!("{DEFAULT_USER_AGENT} Antigravity/42.0");
         let parsed = ParsedUrl::parse("http://example.com/api").unwrap();
-        let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[], None);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(&format!("User-Agent: {ua}\r\n")));
     }

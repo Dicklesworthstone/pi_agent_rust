@@ -1166,6 +1166,17 @@ async fn run(
     // Arc<RwLock> is shared across clones).
     let mut workspace = pi::workspace::WorkspaceHandle::single(&cwd);
 
+    // #210: install the effective proxy configuration before any HTTP client
+    // is constructed, so provider calls, OAuth, update checks, URL reads, and
+    // package fetches all take the same route. Settings-file failures are not
+    // fatal here (the ambient environment still applies) — the config load
+    // below reports them on its own path.
+    for warning in
+        pi::http::proxy::configure(Config::load().ok().and_then(|config| config.http).as_ref())
+    {
+        tracing::warn!("{warning}");
+    }
+
     // Resolve the HTTP request timeout before any provider HTTP client is
     // constructed so the client's single resolution path sees it. The
     // `--request-timeout` flag is bound to the PI_HTTP_REQUEST_TIMEOUT_SECS env

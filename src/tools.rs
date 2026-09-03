@@ -6809,6 +6809,13 @@ pub(crate) async fn run_bash_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // #210: a proxy configured for Pi also routes the tools Pi shells out to
+    // (git/curl/npm), via a per-child copy of the standard variables. Empty
+    // unless a proxy is actually configured, so the default path is unchanged.
+    for (key, value) in crate::http::proxy::child_process_env() {
+        cmd.env(key, value);
+    }
+
     // Place the shell in its own process group so background children
     // can be killed reliably even if the shell exits first.
     isolate_command_process_group(&mut cmd);
@@ -7176,6 +7183,10 @@ pub(crate) async fn run_bash_command_pty(
     pty_cmd.arg("-c");
     pty_cmd.arg(&command);
     pty_cmd.cwd(cwd);
+    // #210: same proxy propagation as the pipe path.
+    for (key, value) in crate::http::proxy::child_process_env() {
+        pty_cmd.env(key, value);
+    }
 
     // portable-pty puts the child in its own session (setsid) on unix, so the
     // child pid is its process-group id and the shared tree-kill helpers work

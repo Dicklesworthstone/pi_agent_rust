@@ -1,4 +1,5 @@
 pub mod client;
+pub mod proxy;
 pub mod sse;
 
 // Test modules - only compile when asupersync is working

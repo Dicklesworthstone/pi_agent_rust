@@ -87,6 +87,13 @@ pub struct Config {
     /// Approval mode settings (bd-cv653.3.19).
     pub approval: Option<ApprovalSettings>,
 
+    /// HTTP transport settings — proxy configuration (#210).
+    ///
+    /// ```json
+    /// "http": { "proxy": "http://127.0.0.1:2080", "noProxy": ["localhost"] }
+    /// ```
+    pub http: Option<crate::http::proxy::HttpSettings>,
+
     /// HTTP request timeout in seconds for provider API calls.
     ///
     /// Bounds connect + request + first-response-header latency for each
@@ -875,6 +882,7 @@ impl Config {
             lsp: merge_lsp(base.lsp, other.lsp),
             approval: merge_approval(base.approval, other.approval),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
+            http: merge_http_settings(base.http, other.http),
 
             // Message Handling
             steering_mode: other.steering_mode.or(base.steering_mode),
@@ -1618,6 +1626,26 @@ fn merge_branch_summary(
     match (base, other) {
         (Some(base), Some(other)) => Some(BranchSummarySettings {
             reserve_tokens: other.reserve_tokens.or(base.reserve_tokens),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Field-wise merge of the `[http]` section (#210): a project config can set
+/// just `proxy` without dropping a global `noProxy`.
+fn merge_http_settings(
+    base: Option<crate::http::proxy::HttpSettings>,
+    other: Option<crate::http::proxy::HttpSettings>,
+) -> Option<crate::http::proxy::HttpSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::http::proxy::HttpSettings {
+            proxy: other.proxy.or(base.proxy),
+            https_proxy: other.https_proxy.or(base.https_proxy),
+            http_proxy: other.http_proxy.or(base.http_proxy),
+            no_proxy: other.no_proxy.or(base.no_proxy),
+            ignore_env_proxy: other.ignore_env_proxy.or(base.ignore_env_proxy),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
