@@ -5308,6 +5308,10 @@ pub struct AgentSession {
     /// Extension lifecycle region — ensures the JS runtime thread is shut
     /// down when the session ends.
     pub extensions: Option<ExtensionRegion>,
+    /// MCP client registry serving this session, when MCP is enabled. Turn
+    /// runners that own the session (RPC loop, classic TUI) use it to pick up
+    /// servers extensions register after startup (`registerMcpServer`).
+    mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     extensions_is_streaming: Arc<AtomicBool>,
     extensions_is_compacting: Arc<AtomicBool>,
     extensions_turn_active: Arc<AtomicBool>,
@@ -11987,6 +11991,7 @@ impl AgentSession {
             save_enabled,
             input_source: InputSource::Interactive,
             extensions: None,
+            mcp_manager: None,
             extensions_is_streaming: Arc::new(AtomicBool::new(false)),
             extensions_is_compacting: Arc::new(AtomicBool::new(false)),
             extensions_turn_active: Arc::new(AtomicBool::new(false)),
@@ -12010,6 +12015,17 @@ impl AgentSession {
 
     pub const fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
+    }
+
+    /// Attach the MCP client registry that serves this session so its turn
+    /// runner can sync servers extensions register after startup.
+    pub fn set_mcp_manager(&mut self, manager: Arc<crate::mcp::McpManager>) {
+        self.mcp_manager = Some(manager);
+    }
+
+    #[must_use]
+    pub fn mcp_manager(&self) -> Option<Arc<crate::mcp::McpManager>> {
+        self.mcp_manager.clone()
     }
 
     #[must_use]

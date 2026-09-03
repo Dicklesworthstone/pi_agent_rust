@@ -2232,6 +2232,13 @@ async fn run(
                 thinking_level: sm.thinking_level,
             })
             .collect::<Vec<_>>();
+        // The RPC loop owns the session for the whole process, so it also
+        // owns the MCP manager: servers extensions register after startup are
+        // synced into the session at the next prompt (bd-1wr1n).
+        let mut agent_session = agent_session;
+        if let Some(manager) = mcp_manager.clone() {
+            agent_session.set_mcp_manager(manager);
+        }
         // Boxed: this future is large (clippy::large_futures); boxing keeps the
         // enclosing future small.
         Box::pin(run_rpc_mode(

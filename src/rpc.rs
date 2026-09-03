@@ -5324,6 +5324,15 @@ async fn run_prompt_with_retry(
                 }
             };
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
+            // Servers an extension registered after startup (`registerMcpServer`
+            // from a later callback) reach the session-owned MCP manager at the
+            // next turn, exactly like the SDK and classic TUI turn runners; a
+            // retry of the same turn does not repeat the sync.
+            if !first_attempt_done
+                && let (Some(mcp), Some(ext)) = (guard.mcp_manager(), extensions.as_ref())
+            {
+                crate::mcp::sync_extension_registrations(&mcp, ext, &mut guard.agent).await;
+            }
             let event_handler = rpc_agent_event_handler(
                 out_tx.clone(),
                 runtime_for_events,
