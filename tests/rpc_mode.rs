@@ -196,7 +196,8 @@ fn rpc_get_state_and_prompt() {
         let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // get_state
         let cx = asupersync::Cx::for_testing();
@@ -505,7 +506,8 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
         let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let cx = asupersync::Cx::for_testing();
         in_tx

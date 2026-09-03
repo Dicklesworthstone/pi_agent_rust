@@ -605,7 +605,8 @@ async fn run_rpc_swarm_session(
     let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
     let (out_tx, out_rx) = rpc_output_channel();
     let out_rx = Arc::new(Mutex::new(out_rx));
-    let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+    let server =
+        handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
     let marker_content = format!("session-{session_idx}-filesystem-side-effect");
     let bash_cmd = format!(
@@ -1361,7 +1362,8 @@ fn run_crash_interrupt_recovery_active_worker(
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
-        let _server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let _server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let marker_path = artifact_dir.join(format!("active-{cycle}-{}.txt", mode.as_str()));
         let marker_content = format!("active-cycle-{cycle}-{}", mode.as_str());
@@ -1545,7 +1547,7 @@ fn run_crash_interrupt_recovery_restart_worker(
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server = handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let marker_path = artifact_dir.join(format!("restart-{cycle}-{}.txt", mode.as_str()));
         let marker_content = format!("restart-cycle-{cycle}-{}", mode.as_str());
@@ -2149,7 +2151,8 @@ fn rpc_set_steering_mode_valid() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Set to "all"
         let resp = send_recv(
@@ -2194,7 +2197,8 @@ fn rpc_set_steering_mode_invalid() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Missing mode
         let resp = send_recv(
@@ -2240,7 +2244,8 @@ fn rpc_set_follow_up_mode_valid_and_invalid() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Valid
         let resp = send_recv(
@@ -2296,7 +2301,8 @@ fn rpc_set_auto_compaction_and_retry() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // set_auto_compaction true
         let resp = send_recv(
@@ -2376,7 +2382,8 @@ fn rpc_get_available_models_empty() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2415,7 +2422,8 @@ fn rpc_get_available_models_populated() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2454,7 +2462,8 @@ fn rpc_set_thinking_level_success() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Set to high
         let resp = send_recv(
@@ -2498,7 +2507,8 @@ fn rpc_set_thinking_level_errors() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Missing level
         let resp = send_recv(
@@ -2551,7 +2561,8 @@ fn rpc_get_messages_empty_session() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2597,7 +2608,8 @@ fn rpc_get_messages_with_user_messages() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2634,7 +2646,8 @@ fn rpc_get_last_assistant_text_empty() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2688,7 +2701,8 @@ fn rpc_get_last_assistant_text_with_assistant() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2722,7 +2736,8 @@ fn rpc_get_commands_empty() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2763,7 +2778,8 @@ fn rpc_set_session_name_success() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2796,7 +2812,8 @@ fn rpc_set_session_name_missing_name() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2834,7 +2851,8 @@ fn rpc_bash_echo() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2902,7 +2920,8 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -2992,7 +3011,8 @@ fn rpc_bash_missing_command() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -3026,7 +3046,8 @@ fn rpc_bash_nonzero_exit() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -3061,7 +3082,7 @@ fn rpc_abort_bash_kills_background_children() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server = handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let marker = harness.temp_path("rpc_bash_survived.txt");
         let marker_str = marker.to_string_lossy();
@@ -3139,7 +3160,8 @@ fn rpc_request_id_preserved() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // With string ID
         let resp = send_recv(
@@ -3188,7 +3210,8 @@ fn rpc_request_without_id() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Request without id field
         let resp = send_recv(
@@ -3232,7 +3255,8 @@ fn rpc_rapid_sequence_of_sync_commands() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let cx = asupersync::Cx::for_testing();
 
@@ -3341,7 +3365,8 @@ fn rpc_get_state_reflects_session_stats() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // get_session_stats should reflect pre-populated messages
         let resp = send_recv(
@@ -3418,7 +3443,8 @@ fn rpc_prompt_missing_message() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -3458,7 +3484,8 @@ fn rpc_prompt_dispatches_registered_extension_command() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -3511,7 +3538,8 @@ fn rpc_steer_missing_message() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -3545,7 +3573,8 @@ fn rpc_follow_up_missing_message() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -3579,7 +3608,8 @@ fn rpc_set_model_missing_model_id() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Missing provider
         let resp = send_recv(
@@ -3641,7 +3671,8 @@ fn rpc_fork_missing_entry_id() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -3675,7 +3706,8 @@ fn rpc_export_html_empty_session() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let output = harness.temp_path("export.html");
         let cmd = serde_json::json!({
@@ -3714,7 +3746,8 @@ fn rpc_abort_when_idle() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Abort when nothing is streaming should still succeed.
         let resp = send_recv(
@@ -3989,7 +4022,8 @@ fn rpc_new_session_can_be_cancelled_by_extension() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let resp = send_recv(
             &in_tx,
@@ -4055,7 +4089,8 @@ fn rpc_switch_session_can_be_cancelled_by_extension() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let cmd = json!({
             "id": "1",
@@ -4131,7 +4166,8 @@ fn rpc_session_switch_events_are_emitted_for_new_and_resume() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let new_resp = send_recv(
             &in_tx,
@@ -4218,7 +4254,8 @@ fn rpc_extension_ui_confirm_roundtrip() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Give the server a moment to set up the UI channel.
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
@@ -4298,7 +4335,8 @@ fn rpc_extension_ui_confirm_denied() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let mgr = manager.clone();
@@ -4362,7 +4400,8 @@ fn rpc_extension_ui_select_roundtrip() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let mgr = manager.clone();
@@ -4434,7 +4473,8 @@ fn rpc_extension_ui_input_roundtrip() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let mgr = manager.clone();
@@ -4504,7 +4544,8 @@ fn rpc_extension_ui_editor_roundtrip() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let mgr = manager.clone();
@@ -4573,7 +4614,8 @@ fn rpc_extension_ui_cancel_response() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let mgr = manager.clone();
@@ -4636,7 +4678,7 @@ fn rpc_extension_ui_response_without_extensions() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server = handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Sending extension_ui_response when no extensions are configured
         // should return a success noop (no data).
@@ -4681,7 +4723,8 @@ fn rpc_extension_ui_mismatched_request_id() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let mgr = manager.clone();
@@ -4755,7 +4798,8 @@ fn rpc_extension_ui_missing_request_id() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Send extension_ui_response without requestId OR id — the parser
         // falls back to "id" as an alias, so we must omit both to trigger
@@ -4805,7 +4849,8 @@ fn rpc_extension_ui_id_alias_roundtrip() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let mgr = manager.clone();
@@ -4871,7 +4916,8 @@ fn rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse() {
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let first_manager = manager.clone();
@@ -4963,7 +5009,8 @@ fn rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves() {
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         let active_manager = manager.clone();
@@ -5057,7 +5104,8 @@ fn rpc_extension_ui_sequential_ordering() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         // Fire two requests concurrently.
@@ -5162,7 +5210,7 @@ fn rpc_extension_ui_no_active_request() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server = handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Send a response when no UI request is active.
         let resp = send_recv(
@@ -5210,7 +5258,8 @@ fn rpc_extension_ui_notify_fire_and_forget() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
 
         // Send a "notify" request — fire-and-forget, no response expected.
@@ -5275,7 +5324,7 @@ fn rpc_checkpoint_rewind_fresh_retry_cycle() {
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server = handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // A turn so there is something to checkpoint around.
         let prompt = json!({
@@ -5420,7 +5469,8 @@ fn rpc_late_extension_mcp_registration_reaches_the_session_at_the_next_prompt() 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // What the `registerMcpServer` hostcall does once startup is over.
         manager.register_mcp_server(json!({

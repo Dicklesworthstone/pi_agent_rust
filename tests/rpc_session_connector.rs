@@ -138,8 +138,8 @@ fn setup_rpc_with_save(
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
     let out_rx = Arc::new(Mutex::new(out_rx));
 
-    let server =
-        runtime_handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+    let server = runtime_handle
+        .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
     (in_tx, out_rx, server)
 }

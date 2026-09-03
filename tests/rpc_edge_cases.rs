@@ -135,7 +135,8 @@ fn rpc_get_state_returns_initial_state() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -199,7 +200,8 @@ fn rpc_get_session_stats_returns_stats() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -239,7 +241,8 @@ fn rpc_get_available_models_returns_list() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -285,7 +288,8 @@ fn rpc_set_session_name_success() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -346,7 +350,8 @@ fn rpc_get_last_assistant_text_with_messages() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -389,7 +394,8 @@ fn rpc_get_last_assistant_text_empty_session() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -432,7 +438,8 @@ fn rpc_get_commands_returns_command_list() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -478,7 +485,8 @@ fn rpc_export_html_with_messages() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -517,7 +525,8 @@ fn rpc_set_steering_mode_accepts_valid_mode() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -557,7 +566,8 @@ fn rpc_set_auto_compaction_toggle() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -597,7 +607,8 @@ fn rpc_set_auto_retry_toggle() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -637,7 +648,8 @@ fn rpc_multiple_commands_preserve_id_ordering() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         // Send 3 quick commands
@@ -697,7 +709,8 @@ fn rpc_steer_missing_message_returns_error() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -738,7 +751,8 @@ fn rpc_follow_up_missing_message_returns_error() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -777,7 +791,8 @@ fn rpc_follow_up_aliases_missing_message_return_error() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         let aliases = [
@@ -823,7 +838,8 @@ fn rpc_kebab_and_camel_aliases_dispatch_to_canonical_commands() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         in_tx
@@ -923,7 +939,8 @@ fn rpc_empty_line_is_skipped_gracefully() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
         let cx = asupersync::Cx::for_testing();
 
         // Send empty string, then a valid command
@@ -987,7 +1004,8 @@ fn rpc_server_exits_cleanly_when_input_channel_closes() {
         let (out_tx, out_rx) = rpc_output_channel();
         let _out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         // Immediately close input
         drop(in_tx);

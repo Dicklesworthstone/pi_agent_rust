@@ -597,8 +597,9 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
             let out_rx = Arc::new(Mutex::new(out_rx));
-            let server =
-                handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
+            let server = handle.spawn(async move {
+                Box::pin(run_rpc(agent_session, options, in_rx, out_tx)).await
+            });
             let cx = asupersync::Cx::for_testing();
             in_tx
             .send(
@@ -724,7 +725,7 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
             let out_rx = Arc::new(Mutex::new(out_rx));
             let server =
-                handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
+                handle.spawn(async move { Box::pin(run_rpc(agent_session, options, in_rx, out_tx)).await });
             let cx = asupersync::Cx::for_testing();
             let mut observed_events = Vec::new();
 

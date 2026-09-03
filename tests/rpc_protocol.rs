@@ -105,7 +105,8 @@ fn rpc_rejects_invalid_json_and_missing_type() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let cx = asupersync::Cx::for_testing();
 
@@ -178,7 +179,8 @@ fn rpc_errors_on_unknown_command_and_missing_params() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let cx = asupersync::Cx::for_testing();
 
@@ -302,7 +304,8 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
         let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
 
         let cx = asupersync::Cx::for_testing();
         in_tx
