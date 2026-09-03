@@ -1091,7 +1091,11 @@ hostcall suite green unfiltered; bd-4t6oz closed on it. The 73 are the four
 parked clusters plus five singletons in the interactive layer, two of which
 (`/new` cancellation) now look flaky across workers rather than root-bound,
 and three of which appeared with the maintainer's same-day interactive
-changes. Parked with
+changes. Run18 (c56c08ca, run dir `20260902T201410-3472526`, valid
+receipt) confirmed the classic-TUI sync in the full lane: five of six gates
+green, 37736 pass / 69 fail, the residual being exactly the four parked
+clusters plus the one provider-error rendering singleton; bd-8m21l closed
+on it. Parked with
 reasons: the ext-conformance artifact cluster is blocked by a stray ignored
 file (`tests/ext_conformance/artifacts/doom-overlay/tiny.wad`, bd-n4ov9,
 deletion needs written approval); eight orchestrate contract tests fail
