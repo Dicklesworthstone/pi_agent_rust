@@ -2973,6 +2973,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let extensions = self.extensions.clone();
+        let mcp_manager = self.mcp_manager.clone();
         let runtime_handle = self.runtime_handle.clone();
         let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
         let (abort_handle, abort_signal) = AbortHandle::new();
@@ -3005,6 +3006,11 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
+            // MCP servers an extension registered after startup reach this
+            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
+            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
+                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
+            }
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
@@ -3164,6 +3170,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let extensions = self.extensions.clone();
+        let mcp_manager = self.mcp_manager.clone();
         let runtime_handle = self.runtime_handle.clone();
         let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
         let (abort_handle, abort_signal) = AbortHandle::new();
@@ -3263,6 +3270,11 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
+            // MCP servers an extension registered after startup reach this
+            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
+            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
+                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
+            }
             let BeforeAgentStartOutcome {
                 messages: before_messages,
                 system_prompt,
@@ -3525,6 +3537,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let extensions = self.extensions.clone();
+        let mcp_manager = self.mcp_manager.clone();
         let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
@@ -3648,6 +3661,11 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
+            // MCP servers an extension registered after startup reach this
+            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
+            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
+                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
+            }
             let BeforeAgentStartOutcome {
                 messages: before_messages,
                 system_prompt,

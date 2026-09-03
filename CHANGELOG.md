@@ -58,9 +58,10 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   session's MCP manager once, so a `registerMcpServer` call from a later
   extension callback only updated the extension manager's snapshot and stayed
   unreachable until restart. SDK and FrankenTUI sessions now sync at the
-  start of every prompt (`sync_extension_mcp_registrations`): definitions the
-  MCP manager does not know yet are registered under the same trust gate as
-  at startup, trusted servers are connected, and only tool names not already
+  start of every prompt (`sync_extension_mcp_registrations`), and the classic
+  TUI runs the same sync at the start of each turn: definitions the MCP
+  manager does not know yet are registered under the same trust gate as at
+  startup, trusted servers are connected, and only tool names not already
   mounted are added.
 
 - **Docs now describe the shipped TUI**: README, AGENTS.md, and `docs/tui.md`

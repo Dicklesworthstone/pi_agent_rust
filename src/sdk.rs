@@ -1632,40 +1632,11 @@ impl AgentSessionHandle {
         let Some(manager) = self.mcp_manager.clone() else {
             return 0;
         };
-        let specs = match self.extension_manager() {
-            Some(extensions) => extensions.extension_mcp_servers(),
-            None => return 0,
-        };
-        if specs.is_empty() {
+        let Some(extensions) = self.extension_manager().cloned() else {
             return 0;
-        }
-        let known: std::collections::HashSet<String> = manager
-            .list()
-            .into_iter()
-            .map(|server| server.name)
-            .collect();
-        let mut registered = 0usize;
-        for spec in specs {
-            let name = spec
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-            if name.is_empty() || known.contains(name) {
-                continue;
-            }
-            manager.register_extension_server(name, &spec);
-            registered += 1;
-        }
-        if registered > 0 {
-            tracing::info!(
-                event = "pi.mcp.extension_registrations_synced",
-                registered,
-                "registered extension MCP servers contributed after startup"
-            );
-            self.activate_mcp().await;
-        }
-        registered
+        };
+        crate::mcp::sync_extension_registrations(&manager, &extensions, &mut self.session.agent)
+            .await
     }
 
     /// Send one user prompt through the agent loop.

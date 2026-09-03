@@ -256,6 +256,58 @@ pub async fn connect_trusted_and_mount_tools(
     mount_tools(manager)
 }
 
+/// Bring MCP servers that extensions registered after startup into a live
+/// agent (bd-8m21l).
+///
+/// Startup copies the extension-registered server definitions into the MCP
+/// manager once; a `registerMcpServer` call from a later extension callback
+/// only updates the extension manager's snapshot. This drains that snapshot:
+/// every definition whose name the manager does not know yet is registered
+/// under the same trust gate as at startup, and when anything was new the
+/// trusted servers are connected and only tool names the agent does not
+/// already have are mounted. Returns the number of newly registered
+/// definitions; cheap when nothing changed, so callers run it at every turn
+/// start (SDK/FrankenTUI prompts and the classic TUI's turn task).
+pub async fn sync_extension_registrations(
+    manager: &std::sync::Arc<McpManager>,
+    extensions: &crate::extensions::ExtensionManager,
+    agent: &mut crate::agent::Agent,
+) -> usize {
+    let specs = extensions.extension_mcp_servers();
+    if specs.is_empty() {
+        return 0;
+    }
+    let known: std::collections::HashSet<String> = manager
+        .list()
+        .into_iter()
+        .map(|server| server.name)
+        .collect();
+    let mut registered = 0usize;
+    for spec in specs {
+        let name = spec
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if name.is_empty() || known.contains(name) {
+            continue;
+        }
+        manager.register_extension_server(name, &spec);
+        registered += 1;
+    }
+    if registered > 0 {
+        tracing::info!(
+            event = "pi.mcp.extension_registrations_synced",
+            registered,
+            "registered extension MCP servers contributed after startup"
+        );
+        let mut wrappers = connect_trusted_and_mount_tools(manager).await;
+        wrappers.retain(|tool| !agent.has_tool(tool.name()));
+        agent.extend_tools(wrappers);
+    }
+    registered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

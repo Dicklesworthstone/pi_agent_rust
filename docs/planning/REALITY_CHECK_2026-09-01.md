@@ -1081,8 +1081,17 @@ the existing connect-and-mount path that skips tool names already present.
 The feature-free test in `tests/mcp.rs` registers a late definition the way
 the hostcall does and checks: registered once, extension provenance, pending
 trust (nothing mounts), second sync registers nothing. The FrankenTUI and
-SDK paths get this; the classic TUI and RPC loops do not go through the SDK
-prompt entry and still need the same call. Parked with
+SDK paths got it first; the classic TUI's three turn tasks now run the same
+shared implementation (`pi::mcp::sync_extension_registrations`) right after
+locking the agent, and only the RPC loop, which owns no MCP manager, still
+lacks it. Run17 (099c4b43, run dir `20260902T182315-3052505`, valid
+receipt) is the evidence for the registry work: five of six gates green and
+the test lane at 37731 pass / 73 fail with every extension, MCP, and
+hostcall suite green unfiltered; bd-4t6oz closed on it. The 73 are the four
+parked clusters plus five singletons in the interactive layer, two of which
+(`/new` cancellation) now look flaky across workers rather than root-bound,
+and three of which appeared with the maintainer's same-day interactive
+changes. Parked with
 reasons: the ext-conformance artifact cluster is blocked by a stray ignored
 file (`tests/ext_conformance/artifacts/doom-overlay/tiny.wad`, bd-n4ov9,
 deletion needs written approval); eight orchestrate contract tests fail
