@@ -5361,3 +5361,111 @@ fn rpc_checkpoint_rewind_fresh_retry_cycle() {
         let _ = server.await;
     });
 }
+
+// ---------------------------------------------------------------------------
+// Tests: late extension MCP registrations reach the RPC session (bd-1wr1n)
+// ---------------------------------------------------------------------------
+
+/// The RPC loop owns the session and, when MCP is enabled, the session-owned
+/// MCP manager. A server an extension registers after startup (what the
+/// `registerMcpServer` hostcall does from a later callback) must reach that
+/// manager at the next prompt: once, with extension provenance, pending trust
+/// (nothing mounts), and never twice. Removing the sync from
+/// `run_prompt_with_retry` fails this test.
+#[test]
+fn rpc_late_extension_mcp_registration_reaches_the_session_at_the_next_prompt() {
+    let harness = TestHarness::new(
+        "rpc_late_extension_mcp_registration_reaches_the_session_at_the_next_prompt",
+    );
+    let cwd = harness.temp_dir().to_path_buf();
+    let global_dir = harness.temp_path("mcp-global");
+    std::fs::create_dir_all(&global_dir).expect("create MCP global dir");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let mut session = Session::in_memory();
+        session.header.cwd = cwd.display().to_string();
+        session.header.provider = Some("keyless-replay".to_string());
+        session.header.model_id = Some("keyless-rpc-replay".to_string());
+        let provider: Arc<dyn Provider> = Arc::new(KeylessReplayProvider::new(
+            "keyless-rpc-replay",
+            Duration::from_millis(10),
+        ));
+        let tools = ToolRegistry::new(&[], &cwd, None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(asupersync::sync::Mutex::new(session));
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            false,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
+        let manager = ExtensionManager::default();
+        agent_session.extensions = Some(ExtensionRegion::new(manager.clone()));
+        let mcp_manager = Arc::new(
+            pi::mcp::bootstrap_with_project_trust(&cwd, &global_dir, &[], true)
+                .expect("bootstrap MCP manager"),
+        );
+        agent_session.set_mcp_manager(Arc::clone(&mcp_manager));
+
+        let options = build_options(
+            &handle,
+            harness.temp_path("auth_late_mcp.json"),
+            vec![],
+            vec![],
+        );
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        // What the `registerMcpServer` hostcall does once startup is over.
+        manager.register_mcp_server(json!({
+            "name": "late-fixture",
+            "command": "pi-mcp-late-fixture-does-not-exist",
+            "extension_id": "late-extension"
+        }));
+        assert!(
+            mcp_manager
+                .list()
+                .iter()
+                .all(|row| row.name != "late-fixture"),
+            "the extension snapshot alone must not reach the MCP manager"
+        );
+
+        for (id, label) in [("late-1", "first prompt"), ("late-2", "second prompt")] {
+            let prompt = json!({
+                "id": id,
+                "type": "prompt",
+                "message": format!("late mcp {label}"),
+            })
+            .to_string();
+            let send_cx = asupersync::Cx::for_testing();
+            require_send(in_tx.send(&send_cx, prompt).await, label);
+            let (response, _agent_end) = recv_response_and_agent_end(&out_rx, id, label).await;
+            assert_ok(&response, "prompt");
+            let rows = mcp_manager
+                .list()
+                .into_iter()
+                .filter(|row| row.name == "late-fixture")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{label}: the late server is registered exactly once"
+            );
+            assert_eq!(rows[0].provenance, "extension", "{label}");
+            assert_eq!(
+                rows[0].trust, "pending",
+                "{label}: a server first seen at runtime waits for acknowledgement"
+            );
+        }
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}

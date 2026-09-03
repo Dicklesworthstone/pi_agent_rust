@@ -1104,6 +1104,33 @@ toolchain (bd-b3yao); the drop-in slash differential needs the legacy tsx
 runner on the workers; the perf-evidence cluster needs a real regeneration
 bound to a clean committed HEAD (bd-ri-phase1-full-refresh-rndeg).
 
+Round 9 (2026-09-03, executing the Phase 3a bead set in dependency order).
+Twenty granular beads were created through `br` (children of bd-b3yao,
+bd-n4ov9, bd-2vmu6, bd-oqo03, bd-gm481, bd-0x31m plus bd-werhk, bd-tt1g6,
+bd-7n3y7, bd-z7267, bd-ydz1t, bd-qonnl) with twelve blocking edges, and the
+ready ones were worked. Product: the RPC loop's session now carries the MCP
+manager and syncs late extension registrations on the first attempt of each
+prompt (bd-1wr1n); print JSON mode and the RPC loop emit exactly one
+`failover_end { restoredPrimary: false }` for a fallback turn before its
+terminal `agent_end` (bd-2vmu6.1); the persistence fault runner compares
+each case's result against the cargo test name instead of the harness id
+(bd-b3yao.3); the orchestrator logs contract failures, blocked staging ids
+and per-layer evidence when it blocks. Tests: the provider-error rendering
+singleton was a deliberate #209 contract change and the test now asserts one
+card after partial text (bd-tt1g6); a classic-TUI test and an RPC test prove
+late MCP registration reaches the session at the next turn (bd-z7267); the
+orchestrate stub fixtures were realigned to the current staging, comparison,
+fence and validator contracts (bd-b3yao.1/.2/.4: semantic_context estimates,
+the Criterion-produced pijs comparison contract, invocation-keyed drift,
+suite-level lineage refusal, captured consumer stdout); the three drop-in
+parity tests are ignored with their reason (bd-werhk). Found on the way:
+nothing in the repo produces `pi.perf.cross_runtime_comparison.v1`, so a real
+full orchestration can never pass Phase 5g until a producer exists
+(bd-ri-phase1-full-refresh-rndeg.1, now blocking the refresh). The
+concurrent sweeper session committed five intermediate states of this work
+(2b30e8c9..9ef2784e) while exclusive reservations were active; recorded on
+bd-0x31m. Run19 evidence for all of the above is recorded on the beads.
+
 ### 10.6 Verification plan (what "done" looks like, re-executable)
 
 1. `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` → 6/6

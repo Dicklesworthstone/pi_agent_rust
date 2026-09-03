@@ -229,6 +229,204 @@ fn e2e_failover_429_walks_chain_and_completes() {
     harness.record_artifact("e2e_failover_429.jsonl", &path);
 }
 
+/// Run `pi --print --mode json` against the mock server and return the parsed
+/// event stream plus the raw stdout/stderr for diagnostics.
+fn run_print_json_failover(
+    harness: &TestHarness,
+    server: &common::harness::MockHttpServer,
+    label: &str,
+) -> (Vec<serde_json::Value>, String, String) {
+    let env = PiEnv::new(harness);
+    env.write_models(&server.base_url());
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let mut command = env.command(&binary);
+    command.args([
+        "--print",
+        "--mode",
+        "json",
+        "--no-session",
+        "--provider",
+        "e2eprimary",
+        "--model",
+        "primary-model",
+        "ping",
+    ]);
+    harness.log().info("action", label);
+    let child = command.spawn().expect("spawn pi");
+    let (stdout, stderr) = run_and_collect(child, 90);
+    let events = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    harness.log().info_ctx("verify", "process finished", |ctx| {
+        ctx.push(("event_count".to_string(), events.len().to_string()));
+        ctx.push((
+            "stderr_tail".to_string(),
+            stderr.chars().take(400).collect(),
+        ));
+    });
+    (events, stdout, stderr)
+}
+
+fn event_kinds(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| event.get("type").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// bd-2vmu6.1: in JSON mode a turn that walks the fallback chain closes its
+/// `failover_start` with exactly one `failover_end { restoredPrimary: false }`
+/// naming the fallback, emitted with the other lifecycle closers after the
+/// fallback attempt's `agent_end`, on the success path.
+#[test]
+fn e2e_failover_json_mode_closes_lifecycle_after_backup_success() {
+    let harness = TestHarness::new("e2e_failover_json_mode_closes_lifecycle_after_backup_success");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/backup/v1/chat/completions",
+        sse_response(text_sse_body("backup ok")),
+    );
+
+    let (events, stdout, stderr) = run_print_json_failover(
+        &harness,
+        &server,
+        "spawning pi --print --mode json on 429 primary",
+    );
+    let kinds = event_kinds(&events);
+    let start = kinds
+        .iter()
+        .position(|k| k == "failover_start")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_start missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let end = kinds
+        .iter()
+        .position(|k| k == "failover_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let agent_end = kinds
+        .iter()
+        .rposition(|k| k == "agent_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("agent_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    // Print JSON mode streams the agent loop's own `agent_end` as each attempt
+    // finishes and emits the retry loop's lifecycle closers (`auto_retry_end`,
+    // `failover_end`) after the last one, so the close lands after the final
+    // `agent_end`, never before the `failover_start` it closes. (The RPC loop
+    // defers its terminal `agent_end` and closes the lifecycle before it.)
+    assert!(
+        start < end && agent_end < end,
+        "failover lifecycle must close after the fallback attempt's agent_end: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "failover_end").count(),
+        1,
+        "exactly one failover_end per failover_start: {kinds:?}"
+    );
+    let end_event = &events[end]; // ubs:ignore index proven by position() above
+    assert_eq!(end_event["success"], serde_json::Value::Bool(true));
+    assert_eq!(end_event["restoredPrimary"], serde_json::Value::Bool(false));
+    assert_eq!(end_event["provider"], "e2ebackup");
+    assert_eq!(end_event["model"], "backup-model");
+    assert!(
+        events[agent_end]["error"].is_null(), // ubs:ignore index proven by rposition() above
+        "the backup completes the turn: {}",
+        events[agent_end]
+    );
+
+    let path = harness.temp_path("e2e_failover_json_success.jsonl");
+    harness.write_jsonl_logs(&path).expect("write logs");
+    let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
+    assert!(errors.is_empty(), "JSONL violations: {errors:?}");
+    harness.record_artifact("e2e_failover_json_success.jsonl", &path);
+}
+
+/// bd-2vmu6.1: the lifecycle also closes when the fallback entry itself
+/// fails, with `success: false`, in the same position.
+#[test]
+fn e2e_failover_json_mode_closes_lifecycle_after_backup_failure() {
+    let harness = TestHarness::new("e2e_failover_json_mode_closes_lifecycle_after_backup_failure");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/backup/v1/chat/completions",
+        error_response(
+            503,
+            r#"{"error":{"type":"overloaded_error","message":"backup overloaded"}}"#,
+        ),
+    );
+
+    let (events, stdout, stderr) = run_print_json_failover(
+        &harness,
+        &server,
+        "spawning pi --print --mode json on 429 primary and 503 backup",
+    );
+    let kinds = event_kinds(&events);
+    let start = kinds
+        .iter()
+        .position(|k| k == "failover_start")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_start missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let end = kinds
+        .iter()
+        .position(|k| k == "failover_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let agent_end = kinds
+        .iter()
+        .rposition(|k| k == "agent_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("agent_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    // Print JSON mode streams the agent loop's own `agent_end` as each attempt
+    // finishes and emits the retry loop's lifecycle closers (`auto_retry_end`,
+    // `failover_end`) after the last one, so the close lands after the final
+    // `agent_end`, never before the `failover_start` it closes. (The RPC loop
+    // defers its terminal `agent_end` and closes the lifecycle before it.)
+    assert!(
+        start < end && agent_end < end,
+        "failover lifecycle must close after the fallback attempt's agent_end: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "failover_end").count(),
+        1,
+        "exactly one failover_end per failover_start: {kinds:?}"
+    );
+    let end_event = &events[end]; // ubs:ignore index proven by position() above
+    assert_eq!(end_event["success"], serde_json::Value::Bool(false));
+    assert_eq!(end_event["restoredPrimary"], serde_json::Value::Bool(false));
+    assert_eq!(end_event["provider"], "e2ebackup");
+    assert_eq!(end_event["model"], "backup-model");
+    assert!(
+        !events[agent_end]["error"].is_null(), // ubs:ignore index proven by rposition() above
+        "the backup failure ends the turn with an error: {}",
+        events[agent_end]
+    );
+
+    let path = harness.temp_path("e2e_failover_json_failure.jsonl");
+    harness.write_jsonl_logs(&path).expect("write logs");
+    let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
+    assert!(errors.is_empty(), "JSONL violations: {errors:?}");
+    harness.record_artifact("e2e_failover_json_failure.jsonl", &path);
+}
+
 #[test]
 fn e2e_failover_401_never_fails_over() {
     let harness = TestHarness::new("e2e_failover_401_never_fails_over");

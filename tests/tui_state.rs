@@ -45,6 +45,13 @@ fn make_executable(path: &std::path::Path) {
     fs::set_permissions(path, perms).expect("set permissions");
 }
 
+/// Upper bound for events produced by an extension hook running on the
+/// `QuickJS` runtime thread (bd-7n3y7): the wait returns as soon as the event
+/// arrives, so a generous bound costs nothing on a quiet host, while the old
+/// one-second bound made the `/new` and `/resume` cancellation tests flaky
+/// under a loaded full-lane worker.
+const EXTENSION_HOOK_WAIT: Duration = Duration::from_secs(20);
+
 fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
     static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -3990,7 +3997,7 @@ export default function init(pi) {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Loading session...");
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, EXTENSION_HOOK_WAIT, |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::System(_)))
     });
     let system = events
@@ -4034,7 +4041,7 @@ export default function init(pi) {
     press_enter(&harness, &mut app);
     press_enter(&harness, &mut app);
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, EXTENSION_HOOK_WAIT, |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
     });
@@ -4212,7 +4219,7 @@ export default function init(pi) {
     type_text(&harness, &mut app, "/new");
     press_enter(&harness, &mut app);
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, EXTENSION_HOOK_WAIT, |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::System(_)))
     });
     let system = events
@@ -4257,7 +4264,7 @@ export default function init(pi) {
     type_text(&harness, &mut app, "/new");
     press_enter(&harness, &mut app);
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, EXTENSION_HOOK_WAIT, |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
     });

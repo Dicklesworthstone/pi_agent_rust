@@ -8714,6 +8714,28 @@ fn emit_json_event(event: &AgentEvent) {
     }
 }
 
+/// Failover lifecycle (bd-2vmu6.1): a turn that swapped to a fallback chain
+/// entry closes its `FailoverStart` before the turn's terminal output,
+/// whether the fallback succeeded, failed, or was aborted. Restoring the
+/// primary after cooldown is a separate lifecycle (`restoredPrimary: true`).
+fn emit_print_failover_end(
+    is_json: bool,
+    failed_over: bool,
+    session: &AgentSession,
+    success: bool,
+) {
+    if !is_json || !failed_over {
+        return;
+    }
+    let provider = session.agent.provider();
+    emit_json_event(&AgentEvent::FailoverEnd {
+        success,
+        provider: provider.name().to_string(),
+        model: provider.model_id().to_string(),
+        restored_primary: false,
+    });
+}
+
 /// Terminal marker check (bd-8188r): a session-persistence failure means
 /// provider/tool side effects may already have happened while the durable
 /// record is missing or stale. Re-entering the provider (retry, credential
@@ -8831,11 +8853,28 @@ async fn try_print_failover(
     else {
         return Ok(None);
     };
-    let cap = config.max_failovers_per_turn() as usize;
     let mut cursor = *position;
 
-    while cursor < chain.entries.len() && cursor < cap {
+    // The walk is bounded by the chain, not by `max_failovers_per_turn`: the
+    // caller counts successful swaps against that cap (bd-oqo03.1). Bounding
+    // the cursor by the cap let malformed, uncredentialed, unconstructible,
+    // current, or duplicate entries consume the budget and hide a later valid
+    // entry.
+    while cursor < chain.entries.len() {
         let spec = &chain.entries[cursor];
+        let is_current = pi::provider_metadata::split_provider_model_spec(spec).is_some_and(
+            |(provider, model_id)| {
+                pi::provider_metadata::provider_ids_match(&from_provider, provider)
+                    && from_model.eq_ignore_ascii_case(model_id)
+            },
+        );
+        let is_duplicate = chain.entries[..cursor]
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(spec));
+        if is_current || is_duplicate {
+            cursor += 1;
+            continue;
+        }
         let candidate = (|| {
             let (provider, model_id) = pi::provider_metadata::split_provider_model_spec(spec)?;
             ctx.available_models
@@ -9038,6 +9077,12 @@ where
 
     let mut retry_count: u32 = 0;
     let mut failover_position: usize = 0;
+    // Set once a fallback chain entry has been installed for this turn; every
+    // exit below then closes the failover lifecycle before returning.
+    let mut failed_over = false;
+    // Successful fallback swaps this turn; only these count against
+    // `max_failovers_per_turn` (the chain walk itself is bounded by the chain).
+    let mut failovers_this_turn: u32 = 0;
     let mut current_result = first_result;
 
     loop {
@@ -9050,6 +9095,7 @@ where
                         final_error: Some("Aborted".to_string()),
                     });
                 }
+                emit_print_failover_end(is_json, failed_over, session, false);
                 return Ok(msg);
             }
             Ok(msg)
@@ -9084,6 +9130,7 @@ where
                 // (pi_agent_rust#125). Matches RPC retry behaviour.
                 if let Err(restore_err) = restore_print_retry_tail(session, true).await {
                     emit_print_restore_failure(is_json, retry_count, &restore_err);
+                    emit_print_failover_end(is_json, failed_over, session, false);
                     return Err(restore_err);
                 }
                 current_result = session
@@ -9108,29 +9155,37 @@ where
                                 final_error: msg.error_message.clone(),
                             });
                         }
+                        emit_print_failover_end(is_json, failed_over, session, false);
                         return Ok(msg);
                     }
                     // Failover (bd-cv653.3.2): a classified transient failure
                     // on the final retry walks the fallback chain.
-                    let failover_result = try_print_failover(
-                        session,
-                        config,
-                        failover_ctx,
-                        &mut failover_position,
-                        msg.error_message.as_deref(),
-                        is_json,
-                        true,
-                        (retry_count > 0).then_some(retry_count),
-                    )
-                    .await;
+                    let failover_result = if failovers_this_turn < config.max_failovers_per_turn() {
+                        try_print_failover(
+                            session,
+                            config,
+                            failover_ctx,
+                            &mut failover_position,
+                            msg.error_message.as_deref(),
+                            is_json,
+                            true,
+                            (retry_count > 0).then_some(retry_count),
+                        )
+                        .await
+                    } else {
+                        Ok(None)
+                    };
                     let swapped = match failover_result {
                         Ok(swapped) => swapped,
                         Err(restore_err) => {
                             emit_print_restore_failure(is_json, retry_count, &restore_err);
+                            emit_print_failover_end(is_json, failed_over, session, false);
                             return Err(restore_err);
                         }
                     };
                     if swapped.is_some() {
+                        failed_over = true;
+                        failovers_this_turn += 1;
                         retry_count = 0;
                         current_result = session
                             .run_continue_with_abort(
@@ -9152,6 +9207,7 @@ where
                         },
                     });
                 }
+                emit_print_failover_end(is_json, failed_over, session, success);
                 return Ok(msg);
             }
             Err(err) => {
@@ -9167,6 +9223,7 @@ where
                             final_error: Some(err.to_string()),
                         });
                     }
+                    emit_print_failover_end(is_json, failed_over, session, false);
                     return Err(anyhow::Error::new(err));
                 }
                 let err_str = err.to_string();
@@ -9210,6 +9267,7 @@ where
                             "retry restoration failed before provider re-entry: {restore_err}"
                         ));
                         emit_print_restore_failure(is_json, retry_count, &terminal_err);
+                        emit_print_failover_end(is_json, failed_over, session, false);
                         return Err(terminal_err);
                     }
                     // Rotation bookkeeping (bd-cv653.3.2): restoration is the
@@ -9240,17 +9298,21 @@ where
                     // Failover (bd-cv653.3.2): HTTP/transport errors surface on
                     // the Err path, so the chain walk must live here too —
                     // not only on the Ok-with-error-result path.
-                    let failover_result = try_print_failover(
-                        session,
-                        config,
-                        failover_ctx,
-                        &mut failover_position,
-                        Some(err_str.as_str()),
-                        is_json,
-                        false,
-                        (retry_count > 0).then_some(retry_count),
-                    )
-                    .await;
+                    let failover_result = if failovers_this_turn < config.max_failovers_per_turn() {
+                        try_print_failover(
+                            session,
+                            config,
+                            failover_ctx,
+                            &mut failover_position,
+                            Some(err_str.as_str()),
+                            is_json,
+                            false,
+                            (retry_count > 0).then_some(retry_count),
+                        )
+                        .await
+                    } else {
+                        Ok(None)
+                    };
                     let swapped = match failover_result {
                         Ok(swapped) => swapped,
                         Err(restore_err) => {
@@ -9258,6 +9320,7 @@ where
                                 "failover transition failed before provider re-entry: {restore_err}"
                             ));
                             emit_print_restore_failure(is_json, retry_count, &terminal_err);
+                            emit_print_failover_end(is_json, failed_over, session, false);
                             return Err(terminal_err);
                         }
                     };
@@ -9265,6 +9328,8 @@ where
                         if let Some((provider_name, Some(key))) = quota_credential.as_ref() {
                             pi::auth::report_provider_rate_limit(provider_name, key);
                         }
+                        failed_over = true;
+                        failovers_this_turn += 1;
                         retry_count = 0;
                         current_result = session
                             .run_continue_with_abort(
@@ -9284,6 +9349,7 @@ where
                             final_error: Some(err_str),
                         });
                     }
+                    emit_print_failover_end(is_json, failed_over, session, false);
                     return Err(anyhow::Error::new(err));
                 }
             }
@@ -11711,6 +11777,173 @@ mod tests {
                             )
                     ))
             );
+        });
+    }
+
+    /// bd-oqo03.1: the print chain walk is bounded by the chain, not by the
+    /// per-turn cap, and entries that cannot be a swap (the current model, a
+    /// duplicate of an earlier entry, an entry without a configured credential)
+    /// are skipped without consuming anything. With a cap of one, a chain that
+    /// names the current model first, or a keyless entry then a duplicate,
+    /// still reaches the valid fallback; a second walk from the advanced cursor
+    /// finds nothing more.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_failover_walk_skips_current_keyless_and_duplicate_entries() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let model_entry =
+                |provider: &str, model_id: &str, api: &str, key: Option<&str>| ModelEntry {
+                    model: pi::provider::Model {
+                        id: model_id.to_string(),
+                        name: model_id.to_string(),
+                        api: api.to_string(),
+                        provider: provider.to_string(),
+                        base_url: if provider == "openai" {
+                            "https://api.openai.com/v1".to_string()
+                        } else {
+                            "https://api.anthropic.com".to_string()
+                        },
+                        reasoning: false,
+                        input: vec![InputType::Text],
+                        cost: pi::provider::ModelCost {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        context_window: 8_192,
+                        max_tokens: 1_024,
+                        headers: std::collections::HashMap::new(),
+                    },
+                    api_key: key.map(str::to_string),
+                    headers: std::collections::HashMap::new(),
+                    auth_header: true,
+                    compat: None,
+                    oauth_config: None,
+                };
+            let primary = model_entry(
+                "openai",
+                "primary-model",
+                "openai-completions",
+                Some("primary-key"),
+            );
+            let keyless = model_entry("anthropic", "keyless-model", "anthropic", None);
+            let fallback = model_entry(
+                "anthropic",
+                "fallback-model",
+                "anthropic",
+                Some("fallback-key"),
+            );
+
+            let build_session = || {
+                let provider =
+                    providers::create_provider(&primary, None).expect("primary provider");
+                let tools = ToolRegistry::new(&[], Path::new("."), None);
+                let mut agent = Agent::new(provider, tools, AgentConfig::default());
+                agent.stream_options_mut().api_key = Some("primary-key".to_string());
+                let session_temp = tempfile::tempdir().expect("session tempdir");
+                let stored = Session::create_with_dir(Some(session_temp.path().join("sessions")));
+                let agent_session = AgentSession::new(
+                    agent,
+                    Arc::new(Mutex::new(stored)),
+                    true,
+                    ResolvedCompactionSettings::default(),
+                );
+                (agent_session, session_temp)
+            };
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let auth = AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load");
+            let available_models = vec![primary.clone(), keyless, fallback];
+            let failover_ctx = Some(FailoverResolution {
+                available_models: &available_models,
+                auth: &auth,
+                cli_api_key: None,
+            });
+            let config_with_chain = |entries: &[&str]| {
+                let mut config = Config::default();
+                config.retry = Some(pi::config::RetrySettings {
+                    fallback_chains: Some(std::collections::HashMap::from([(
+                        "default".to_string(),
+                        entries.iter().map(|entry| (*entry).to_string()).collect(),
+                    )])),
+                    max_failovers_per_turn: Some(1),
+                    ..Default::default()
+                });
+                config
+            };
+
+            // Cap one, current model first: the current entry is skipped, not
+            // swapped to itself, and the valid fallback is installed.
+            let (mut session, _keep) = build_session();
+            let config = config_with_chain(&["openai/primary-model", "anthropic/fallback-model"]);
+            let mut position = 0;
+            let swapped = try_print_failover(
+                &mut session,
+                &config,
+                failover_ctx,
+                &mut position,
+                Some("server error"),
+                false,
+                false,
+                None,
+            )
+            .await
+            .expect("walk past the current entry");
+            assert_eq!(
+                swapped,
+                Some(("anthropic".to_string(), "fallback-model".to_string())),
+                "the current model must not consume the walk"
+            );
+            assert_eq!(position, 2);
+            assert_eq!(session.agent.provider().name(), "anthropic");
+            assert_eq!(session.agent.provider().model_id(), "fallback-model");
+
+            // Keyless entry, then a duplicate of it, then the valid fallback:
+            // neither the credential refusal nor the duplicate consumes the
+            // walk, and a second walk from the advanced cursor finds nothing.
+            let (mut session, _keep) = build_session();
+            let config = config_with_chain(&[
+                "anthropic/keyless-model",
+                "anthropic/keyless-model",
+                "anthropic/fallback-model",
+                "anthropic/fallback-model",
+            ]);
+            let mut position = 0;
+            let swapped = try_print_failover(
+                &mut session,
+                &config,
+                failover_ctx,
+                &mut position,
+                Some("server error"),
+                false,
+                false,
+                None,
+            )
+            .await
+            .expect("walk past keyless and duplicate entries");
+            assert_eq!(
+                swapped,
+                Some(("anthropic".to_string(), "fallback-model".to_string()))
+            );
+            assert_eq!(position, 3);
+            let again = try_print_failover(
+                &mut session,
+                &config,
+                failover_ctx,
+                &mut position,
+                Some("server error"),
+                false,
+                false,
+                None,
+            )
+            .await
+            .expect("second walk");
+            assert_eq!(again, None, "the trailing duplicate is not a new swap");
+            assert_eq!(position, 4, "the walk is bounded by the chain length");
         });
     }
 

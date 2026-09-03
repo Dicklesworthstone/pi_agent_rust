@@ -90,7 +90,13 @@ fn assert_real_mirrored_result(scenario_name: &str, result: &TestResult) {
 }
 
 /// The harness must distinguish real mirrored parity from fail-closed policy exclusions.
+///
+/// Needs the legacy pi-mono tsx runner (`legacy_pi_mono_code/pi-mono/node_modules`),
+/// which is git-ignored and never synced to the DSR workers; the drop-in parity
+/// program is retired (AGENTS.md "Historical Drop-In Ledger"), so the gate does
+/// not carry it. Run with `--ignored` on a host that provisioned pi-mono.
 #[test]
+#[ignore = "retired drop-in parity program: needs the legacy pi-mono tsx runner (bd-werhk)"]
 fn test_slash_command_differential_harness_fails_closed_without_mirrored_success()
 -> Result<(), String> {
     let tester = DifferentialTester::new()
@@ -127,6 +133,7 @@ fn test_slash_command_differential_harness_fails_closed_without_mirrored_success
 
 /// Release evidence must not certify slash-command parity until every scenario has real pass evidence.
 #[test]
+#[ignore = "retired drop-in parity program: needs the legacy pi-mono tsx runner (bd-werhk)"]
 fn test_certification_artifacts_fail_closed_until_full_runner_pass() -> Result<(), String> {
     let tester = DifferentialTester::new()
         .map_err(|err| format!("failed to create differential tester: {err:?}"))?;
@@ -352,6 +359,7 @@ fn test_response_canonicalization() {
 
 /// Test combinatorial slash command scenarios.
 #[test]
+#[ignore = "retired drop-in parity program: needs the legacy pi-mono tsx runner (bd-werhk)"]
 fn test_combinatorial_slash_commands() {
     let mut tester = DifferentialTester::new().expect("Failed to create tester");
 

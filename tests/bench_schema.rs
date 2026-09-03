@@ -1350,6 +1350,38 @@ for tool_calls in (1, 10):
             "binary_sha256": binary_sha256,
         }
     )
+# The exclusive post-generation gate promotes this Criterion-produced file to
+# results/pijs_workload.jsonl and ignores the later target/perf copy, so the
+# matched full-session comparison (what the stratification's
+# full_e2e_long_session layer and every phase-1 cell ratio derive from) must
+# be stamped here, with the same host fingerprint the legacy rows carry.
+for record in records:
+    if record["tool_calls_per_iteration"] != 10:
+        continue
+    record.update(
+        {
+            "comparison_scenario": "full_e2e_long_session",
+            "session_turns": 2000,
+            "extension_loads_per_iteration": 2,
+            "event_hooks_per_iteration": 1,
+            "tool_executions": 20000,
+            "event_executions": 2000,
+            "comparison_contract": {
+                "schema": "pi.perf.cross_runtime_comparison.v1",
+                "claim_scope": "full_e2e_long_session",
+                "measurement_boundary": "matched_full_session_workflow",
+                "release_claim_eligible": True,
+                "host_fingerprint_sha256": "b" * 64,
+                "workload_shape": {
+                    "session_turns": 2000,
+                    "extension_loads_per_iteration": 2,
+                    "tool_calls_per_iteration": 10,
+                    "event_hooks_per_iteration": 1,
+                    "statistic": "elapsed",
+                },
+            },
+        }
+    )
 evidence_path.write_text(
     "\n".join(json.dumps(record, separators=(",", ":")) for record in records) + "\n",
     encoding="utf-8",
@@ -2252,11 +2284,18 @@ for relative_path, correlation_field in artifacts:
     path = artifact_output_dir / relative_path
     if not path.is_file():
         continue
-    records = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    # Keep unparseable lines (the malformed-row negative control) verbatim:
+    # the fixture re-runs this pass on every invocation and the orchestrator,
+    # not the fake toolchain, must be the one that refuses them.
+    records = []
+    raw_lines = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            raw_lines.append(line)
     if (
         relative_path == "legacy_extension_workloads.jsonl"
         and os.environ.get("PI_FAKE_DROP_LEGACY_BENCH_COVERAGE") == "1"
@@ -2348,12 +2387,15 @@ for relative_path, correlation_field in artifacts:
             stale["total_ms"] = 0.002
             records.append(stale)
     path.write_text(
-        "\n".join(json.dumps(record, separators=(",", ":")) for record in records)
+        "\n".join(
+            [json.dumps(record, separators=(",", ":")) for record in records] + raw_lines
+        )
         + "\n",
         encoding="utf-8",
     )
 PY
-  if [[ "${PI_FAKE_INJECT_MALFORMED_SCENARIO_ROW:-0}" == "1" ]]; then
+  if [[ "${PI_FAKE_INJECT_MALFORMED_SCENARIO_ROW:-0}" == "1" ]] \
+    && ! grep -qx '{not-json' "$artifact_output_dir/scenario_runner.jsonl" 2>/dev/null; then
     printf '{not-json\n' >>"$artifact_output_dir/scenario_runner.jsonl"
   fi
 fi
@@ -10869,7 +10911,7 @@ fn orchestrate_rch_perf_harness_rejects_wrong_source_commit() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("git commit does not match")
+        combined.contains("source_commit does not match")
             && combined.contains("RCH retrieved an invalid extension_bench.jsonl"),
         "wrong-commit failure must identify both the lineage mismatch and rejected artifact: {combined}"
     );
@@ -10982,9 +11024,16 @@ fn orchestrate_rch_perf_harness_rejects_head_drift_before_invocation() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_rch_perf_harness_rejects_head_drift_after_invocation() {
+    // Drift is keyed on the benchmark invocation itself (its stdout capture
+    // exists only once the runner has been started), not on a `git rev-parse`
+    // call count: every source-identity fence the orchestrator gains shifts
+    // the count and turns a post-invocation drift into a pre-invocation one.
     let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
         ("PI_FAKE_PERF_ONLY", "1"),
-        ("PI_FAKE_GIT_DRIFT_FROM_REV_PARSE_CALL", "6"),
+        (
+            "PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE",
+            "results/perf_bench_harness/stdout.log",
+        ),
     ]);
     assert!(
         !output.status.success(),
@@ -11024,8 +11073,13 @@ fn orchestrate_rejects_head_drift_before_post_generation_staging() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // The exclusive post-generation admission fence now runs before the
+    // staging precondition, so a drift that appears after the phase-1 matrix
+    // is written trips the earlier fence; either message proves the evidence
+    // was refused before packaging.
     assert!(
-        combined.contains("RCH post-generation staging precondition: Git HEAD drifted"),
+        combined.contains("Exclusive post-generation evidence admission: Git HEAD drifted")
+            || combined.contains("RCH post-generation staging precondition: Git HEAD drifted"),
         "late pre-staging source drift must fail before packaging evidence: {combined}"
     );
 }
@@ -11052,7 +11106,7 @@ fn orchestrate_rejects_head_drift_before_checksums() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_rejects_post_generation_consumer_package_mutation() {
-    let (output, _) = run_orchestrate_with_fake_toolchain_with_env(&[(
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
         "PI_FAKE_MUTATE_POST_GENERATION_PACKAGE",
         "1",
     )]);
@@ -11065,9 +11119,15 @@ fn orchestrate_rejects_post_generation_consumer_package_mutation() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // The orchestrator captures the remote consumer's output into the run's
+    // results instead of echoing it, so the invocation marker is read from
+    // that capture.
+    let consumer_stdout =
+        fs::read_to_string(temp_root.join("run/results/perf_budgets_post_generation/stdout.log"))
+            .unwrap_or_default();
     assert!(
-        combined.contains("pi.perf.fake_post_generation_invocation.v1"),
-        "the mutation fixture must prove the remote consumer reached the exact budget test: {combined}"
+        consumer_stdout.contains("pi.perf.fake_post_generation_invocation.v1"),
+        "the mutation fixture must prove the remote consumer reached the exact budget test: {consumer_stdout}\n{combined}"
     );
     assert!(
         combined.contains("changed during remote consumption")
@@ -11717,17 +11777,54 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
 }
 
 #[cfg(unix)]
-fn assert_orchestrate_rejects_scenario_mutation(env_name: &str, expected_reason: &str) {
+/// A mutated scenario row must be refused before finalization. Two fences
+/// can refuse it: the suite-level evidence validator
+/// (`validate_retrieved_rust_bench_jsonl`) fails the producing suite as soon
+/// as it returns, before any phase-1 matrix exists, for rows it can classify
+/// on its own (foreign lineage, invalid JSON); rows it cannot (a stale
+/// timestamp of the current lineage) reach Phase 5f, where `admit_dataset`
+/// records the rejection in the matrix and fails the consumption contract.
+/// `suite_level_reason` names the validator message for the first kind;
+/// `None` requires the matrix path.
+fn assert_orchestrate_rejects_scenario_mutation(
+    env_name: &str,
+    expected_reason: &str,
+    suite_level_reason: Option<&str>,
+) {
     let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(env_name, "1")]);
     assert!(
         !output.status.success(),
         "strict orchestration must fail when a mutated source row is present"
     );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let results_dir = temp_root.join("run/results");
+    let matrix_path = results_dir.join("phase1_matrix_validation.json");
+    if let Some(reason) = suite_level_reason {
+        assert!(
+            combined.contains("returned invalid scenario benchmark evidence")
+                && combined.contains(reason),
+            "the producing suite must refuse the mutated row with its causal reason ({reason}): {combined}"
+        );
+        assert!(
+            !matrix_path.exists(),
+            "a suite-level refusal must stop the run before the phase-1 matrix is written"
+        );
+        assert!(
+            !results_dir
+                .join("post_generation_evidence_contract.json")
+                .exists(),
+            "a suite-level refusal must stop the run before the post-generation contract"
+        );
+        return;
+    }
     let matrix: Value = serde_json::from_str(
-        &fs::read_to_string(results_dir.join("phase1_matrix_validation.json"))
-            .expect("read phase1 matrix artifact"),
+        &fs::read_to_string(&matrix_path)
+            .unwrap_or_else(|err| panic!("read phase1 matrix artifact: {err}\n{combined}")),
     )
     .expect("parse phase1 matrix artifact");
     let scenario_dataset = matrix["source_datasets"]
@@ -11794,6 +11891,7 @@ fn orchestrate_rejects_foreign_source_lineage_before_finalization() {
     assert_orchestrate_rejects_scenario_mutation(
         "PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW",
         "correlation_id_mismatch",
+        Some("orchestration_correlation_id mismatch"),
     );
 }
 
@@ -11803,6 +11901,7 @@ fn orchestrate_rejects_stale_same_lineage_before_finalization() {
     assert_orchestrate_rejects_scenario_mutation(
         "PI_FAKE_INJECT_STALE_SCENARIO_ROW",
         "timestamp_before_run_start",
+        None,
     );
 }
 
@@ -11812,6 +11911,7 @@ fn orchestrate_rejects_malformed_source_row_before_finalization() {
     assert_orchestrate_rejects_scenario_mutation(
         "PI_FAKE_INJECT_MALFORMED_SCENARIO_ROW",
         "invalid_json",
+        Some("invalid JSON"),
     );
 }
 

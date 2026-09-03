@@ -58,11 +58,13 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   session's MCP manager once, so a `registerMcpServer` call from a later
   extension callback only updated the extension manager's snapshot and stayed
   unreachable until restart. SDK and FrankenTUI sessions now sync at the
-  start of every prompt (`sync_extension_mcp_registrations`), and the classic
-  TUI runs the same sync at the start of each turn: definitions the MCP
-  manager does not know yet are registered under the same trust gate as at
-  startup, trusted servers are connected, and only tool names not already
-  mounted are added.
+  start of every prompt (`sync_extension_mcp_registrations`), the classic
+  TUI runs the same sync at the start of each turn, and the RPC loop runs it
+  on the first attempt of every prompt (the session it owns now carries the
+  MCP manager, `AgentSession::set_mcp_manager`): definitions the MCP manager
+  does not know yet are registered under the same trust gate as at startup,
+  trusted servers are connected, and only tool names not already mounted are
+  added.
 
 - **Docs now describe the shipped TUI**: README, AGENTS.md, and `docs/tui.md`
   document FrankenTUI as the default interactive stack with `--inline` and
@@ -79,6 +81,13 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   the test command with `env TMPDIR=/tmp` because the project-local temp
   directory rch exports can be owned by another uid on a worker, which pi's
   strict mode-class checks refuse.
+
+- **Drop-in slash-command parity tests are ignored in the gate**: the three
+  `tests/dropin_slash_differential.rs` tests that need the legacy pi-mono
+  tsx runner (a git-ignored `node_modules` tree that never reaches the DSR
+  workers) are marked `#[ignore]` with that reason. They report as ignored,
+  never as passed, and still run with `-- --ignored` on a host that
+  provisioned pi-mono; the strict drop-in program itself is retired.
 
 - **JSON-mode extension UI events use camelCase**: the `extension_ui_request`
   envelope's `capability_prompt` flag is now `capabilityPrompt`, matching
@@ -121,6 +130,45 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   to retire the whole transport, so the next request or notification failed
   with "HTTP transport was aborted before request dispatch". Such answers now
   mean "no server stream" and are logged, while requests keep flowing.
+
+- **Failover lifecycle closes on fallback turns**: a turn that swapped to a
+  fallback-chain entry emitted `failover_start` but no matching end, so JSON
+  and RPC consumers saw the lifecycle stay open through `agent_end`. Print
+  JSON mode and the RPC loop now emit exactly one
+  `failover_end { restoredPrimary: false }` naming the fallback, whether the
+  fallback succeeded, failed, or the turn was aborted or its restoration
+  failed: the RPC loop emits it before its deferred terminal `agent_end`;
+  print JSON mode emits it with the other lifecycle closers
+  (`auto_retry_end`) after the fallback attempt's `agent_end`. Cooldown
+  restoration keeps its own `failover_end { restoredPrimary: true }`.
+
+- **Fallback chain walks skip no-op entries and stop spending the cap on
+  them**: print mode bounded its chain cursor by `maxFailoversPerTurn`, so a
+  malformed, uncredentialed, or unconstructible entry consumed the budget and
+  hid a later valid entry; both print and RPC would also install a chain
+  entry equal to the live model or a duplicate of an earlier entry, emitting a
+  phantom `failover_start` for a swap to itself. The walk is now bounded by
+  the chain, skips the current model and duplicate specs, and only a
+  successful swap counts against the per-turn cap on both surfaces.
+
+- **Persistence fault-injection runner checks the right test identity**:
+  `scripts/e2e/run_persistence_fault_injection.sh` compared each case's
+  `result.json` `test_name` (the cargo test function it ran) against the
+  harness test id the Rust test stamps on its JSONL diagnostics, so the
+  integrity summary failed `result_identity_current` after both cases
+  passed. The two identities are now checked separately, and a failed
+  summary prints the failing check names and any source-tree movement on
+  stdout instead of a bare exit code.
+
+- **Perf orchestrator names its blockers**: when the post-generation evidence
+  contract or the final artifact staging blocks a run, the log now lists the
+  contract failures, the blocked staging contract ids, and each
+  stratification layer's evidence state and node/bun ratios, so a gate
+  transcript explains the refusal without the JSON artifacts. The fake
+  toolchain fixtures in `tests/bench_schema.rs` were brought back in line
+  with the current staging and comparison contracts (semantic_context
+  Criterion estimates, the Criterion-produced pijs comparison contract, the
+  newer fence ordering and validator wording).
 
 - **Hidden extension messages reach the model**: custom messages injected by
   extensions (for example from `before_agent_start`) with `display: false`

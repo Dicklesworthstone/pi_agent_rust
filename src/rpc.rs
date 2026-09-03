@@ -5723,6 +5723,28 @@ async fn run_prompt_with_retry(
         }));
     }
 
+    // Failover lifecycle (bd-2vmu6.1): a turn that swapped to a fallback chain
+    // entry closes its `FailoverStart` here, before the terminal `agent_end`,
+    // whether the fallback succeeded, failed, or was aborted. Restoring the
+    // primary after cooldown is a separate lifecycle (`restoredPrimary: true`
+    // from `maybe_restore_primary`). The turn context may already be
+    // cancelled, so the shared state is read with a fresh request context.
+    if failovers_this_turn > 0 {
+        let lifecycle_cx = AgentCx::for_request();
+        let (provider, model) = OwnedMutexGuard::lock(Arc::clone(&shared_state), &lifecycle_cx)
+            .await
+            .map_or_else(
+                |_| (String::new(), String::new()),
+                |state| state.active_failover_model.clone().unwrap_or_default(),
+            );
+        let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
+            success,
+            provider,
+            model,
+            restored_primary: false,
+        }));
+    }
+
     if !success {
         // Close the admission window before preserving any acknowledged input
         // that the terminal provider error/abort left in the shared queues.
@@ -6112,6 +6134,23 @@ async fn try_failover_to_next_chain_entry(
     // per-turn budget, or a cap of one permanently blocks chain entry two.
     while position < chain.entries.len() {
         let spec = &chain.entries[position];
+        // The live model itself and a spec already walked earlier in this chain
+        // cannot be a swap: installing them would emit a phantom
+        // FailoverStart/End pair and spend a unit of the per-turn cap on a
+        // no-op (bd-oqo03.1).
+        let is_current = crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
+            |(provider, model_id)| {
+                crate::provider_metadata::provider_ids_match(&current_provider, provider)
+                    && current_model.eq_ignore_ascii_case(model_id)
+            },
+        );
+        let is_duplicate = chain.entries[..position]
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(spec));
+        if is_current || is_duplicate {
+            position += 1;
+            continue;
+        }
         let candidate = (|| {
             let (provider, model_id) = crate::provider_metadata::split_provider_model_spec(spec)?;
             options
@@ -8016,6 +8055,261 @@ mod retry_tests {
                         )
                 )),
                 "the failed assistant tail must be absent from the active path"
+            );
+        });
+    }
+
+    /// bd-2vmu6.1: a turn that swaps to a fallback chain entry closes its
+    /// `FailoverStart` with exactly one `FailoverEnd { restoredPrimary: false }`
+    /// before the terminal `agent_end`, here on the failure path (the fallback
+    /// entry points at an unreachable local port, so its turn fails
+    /// deterministically without a network). Removing the emission from the
+    /// terminal section of `run_prompt_with_retry` fails this test.
+    #[test]
+    fn rpc_fallback_turn_emits_exactly_one_failover_end_before_agent_end() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(Arc::new(AlwaysErrorProvider), tools, AgentConfig::default());
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                session_temp.path().join("sessions"),
+            ))));
+            let agent_session = AgentSession::new(
+                agent,
+                inner_session,
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let fallback = crate::models::ModelEntry {
+                model: Model {
+                    id: "fallback-model".to_string(),
+                    name: "fallback-model".to_string(),
+                    api: "openai-completions".to_string(),
+                    provider: "openai".to_string(),
+                    // Nothing listens here: the fallback turn fails fast.
+                    base_url: "http://127.0.0.1:1/v1".to_string(),
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: HashMap::new(),
+                },
+                api_key: Some("fallback-key".to_string()),
+                headers: HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(0),
+                fallback_chains: Some(HashMap::from([(
+                    "default".to_string(),
+                    vec!["openai/fallback-model".to_string()],
+                )])),
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let mut shared = RpcSharedState::new(&config);
+            shared.auto_compaction_enabled = false;
+            let shared_state = Arc::new(Mutex::new(shared));
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: vec![fallback],
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
+                runtime_handle,
+                ask_tool: None,
+            };
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+
+            run_prompt_with_retry(
+                Arc::clone(&session),
+                Arc::clone(&shared_state),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(std::sync::Mutex::new(())),
+                Arc::new(Mutex::new(None)),
+                out_tx,
+                Arc::new(AtomicBool::new(false)),
+                options,
+                "hello".to_string(),
+                None,
+                Vec::new(),
+                AgentCx::for_request(),
+            )
+            .await;
+
+            let events: Vec<Value> = out_rx
+                .try_iter()
+                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                .collect();
+            let kinds: Vec<&str> = events
+                .iter()
+                .filter_map(|value| value.get("type").and_then(Value::as_str))
+                .collect();
+            let position = |kind: &str| kinds.iter().position(|k| *k == kind);
+            let start = position("failover_start")
+                .unwrap_or_else(|| panic!("failover_start must be emitted; saw {kinds:?}"));
+            let end = position("failover_end")
+                .unwrap_or_else(|| panic!("failover_end must be emitted; saw {kinds:?}"));
+            let agent_end = position("agent_end")
+                .unwrap_or_else(|| panic!("agent_end must be emitted; saw {kinds:?}"));
+            assert!(start < end && end < agent_end, "lifecycle order: {kinds:?}");
+            assert_eq!(
+                kinds.iter().filter(|k| **k == "failover_end").count(),
+                1,
+                "exactly one failover_end per failover_start: {kinds:?}"
+            );
+            let end_event = &events[end];
+            assert_eq!(end_event["success"], Value::Bool(false));
+            assert_eq!(end_event["restoredPrimary"], Value::Bool(false));
+            assert_eq!(end_event["provider"], "openai");
+            assert_eq!(end_event["model"], "fallback-model");
+            assert!(
+                !events[agent_end]["error"].is_null(),
+                "the fallback turn fails: {}",
+                events[agent_end]
+            );
+        });
+    }
+
+    /// bd-oqo03.1 (RPC side): a chain that names the live model first, then a
+    /// duplicate, must not install a phantom swap or spend the walk on it; the
+    /// first real fallback is installed with exactly one `FailoverStart`.
+    #[test]
+    fn rpc_failover_walk_skips_current_and_duplicate_entries() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(Arc::new(AlwaysErrorProvider), tools, AgentConfig::default());
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                session_temp.path().join("sessions"),
+            ))));
+            let agent_session = AgentSession::new(
+                agent,
+                inner_session,
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let fallback = crate::models::ModelEntry {
+                model: Model {
+                    id: "fallback-model".to_string(),
+                    name: "fallback-model".to_string(),
+                    api: "openai-completions".to_string(),
+                    provider: "openai".to_string(),
+                    base_url: "http://127.0.0.1:1/v1".to_string(),
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: HashMap::new(),
+                },
+                api_key: Some("fallback-key".to_string()),
+                headers: HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                fallback_chains: Some(HashMap::from([(
+                    "default".to_string(),
+                    vec![
+                        "test-provider/test-model".to_string(),
+                        "test-provider/test-model".to_string(),
+                        "openai/fallback-model".to_string(),
+                    ],
+                )])),
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: vec![fallback],
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
+                runtime_handle,
+                ask_tool: None,
+            };
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+            let cx = AgentCx::for_request();
+
+            assert!(
+                try_failover_to_next_chain_entry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    out_tx,
+                    &options,
+                    Some("server error"),
+                    false,
+                    None,
+                    &cx,
+                )
+                .await
+                .expect("walk past the current and duplicate entries"),
+                "the real fallback must be installed"
+            );
+
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            assert_eq!(guard.agent.provider().name(), "openai");
+            assert_eq!(guard.agent.provider().model_id(), "fallback-model");
+            drop(guard);
+
+            let starts: Vec<Value> = out_rx
+                .try_iter()
+                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                .filter(|value| value.get("type").and_then(Value::as_str) == Some("failover_start"))
+                .collect();
+            assert_eq!(
+                starts.len(),
+                1,
+                "exactly one swap was announced: {starts:?}"
+            );
+            assert_eq!(starts[0]["toProvider"], "openai");
+            assert_eq!(starts[0]["toModel"], "fallback-model");
+
+            let state = shared_state.lock(&cx).await.expect("shared state lock");
+            assert_eq!(
+                state.failover_chain_position,
+                Some(3),
+                "the cursor advanced past the skipped entries and the swap"
             );
         });
     }
