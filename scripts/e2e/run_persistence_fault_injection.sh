@@ -871,10 +871,14 @@ def canonical_summary_artifact_is_valid(
 def case_checks(
     case_id: str,
     expected_test_name: str,
+    expected_cargo_test: str,
     expected_feature: str,
     expected_fault_message: str,
     expected_summary_artifact: str,
 ) -> dict:
+    # Two identities per case: `expected_test_name` is the harness test id the
+    # Rust test stamps on its JSONL diagnostics; `expected_cargo_test` is the
+    # cargo test function `run_case` executed and recorded in result.json.
     case_dir = artifact_dir / case_id
     result = load_json(case_dir / "result.json")
     diagnostic_records = load_jsonl(case_dir / "test-log.jsonl")
@@ -1000,7 +1004,7 @@ def case_checks(
             and result.get("source_tree_sha256") == source_tree_digest
             and result.get("case_id") == case_id
             and result.get("suite") == "e2e_session_persistence"
-            and result.get("test_name") == expected_test_name
+            and result.get("test_name") == expected_cargo_test
             and result.get("feature") == expected_feature
         ),
         "fault_log_emitted": has_fault_log,
@@ -1064,6 +1068,7 @@ def guarded_case_checks(*args: str) -> dict:
 jsonl_case = guarded_case_checks(
     "jsonl",
     "e2e_jsonl_fault_injection_flush_windows",
+    "jsonl_fault_injection_flush_windows_preserve_integrity",
     "internal-persistence-fault-injection",
     "jsonl mid-flush failure",
     "jsonl-fault-window-summary.json",
@@ -1071,6 +1076,7 @@ jsonl_case = guarded_case_checks(
 sqlite_case = guarded_case_checks(
     "sqlite",
     "e2e_sqlite_fault_injection_flush_windows",
+    "sqlite_fault_injection_flush_windows_preserve_integrity",
     "sqlite-sessions,internal-persistence-fault-injection",
     "sqlite mid-flush failure",
     "sqlite-fault-window-summary.json",
