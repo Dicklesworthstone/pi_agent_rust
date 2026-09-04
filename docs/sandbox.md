@@ -12,6 +12,12 @@ crate——`anthropic-experimental/sandbox-runtime`（srt）的行级 Rust 移�
 广域白名单下数据仍可外泄（domain fronting 可绕过域名过滤）。它与 approval / mediation
 （spawn 前分类）正交互补。
 
+## 默认值（重要）
+
+**未写 `sandbox` 段 = 默认开启**：`mode=auto` + `network=off`，即文件系统防护兜底生效（凭据目录拒读、工作区外拒写），网络不限。域名白名单是 opt-in（写 `network: "allowlist"`）。这是 moho-mate fork 的默认；上游 picrab CLI 用户如需旧行为，显式写 `"sandbox": { "mode": "off" }`。
+
+**写段即显式控制**：只要存在 `sandbox` 段，未写的字段回到字段级默认（`mode` 缺省 = `off`）。
+
 ## 配置
 
 `~/.pi/agent/settings.json`（项目级 `.pi/settings.json` 同样支持）：
@@ -33,8 +39,8 @@ CLI 等价开关（优先级高于配置）：`pi --sandbox <off|auto|on>`。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `mode` | `off` | `off` 不沙箱；`auto` 平台不支持时告警降级；`on` 不支持即报错（fail-closed） |
-| `network` | 跟随 `mode` | `auto`/`on` 默认 `allowlist`（全部出网走本地过滤代理）；`off` 为不设网络层（直连放行） |
+| `mode` | 段缺失=auto；段存在时缺省=off | `off` 不沙箱；`auto` 平台不支持时告警降级；`on` 不支持即报错（fail-closed） |
+| `network` | 段缺失=off；段存在时跟随 `mode` | `auto`/`on` 默认 `allowlist`（全部出网走本地过滤代理）；`off` 为不设网络层（直连放行） |
 | `allowedDomains` | `["*"]` | 代理白名单，`*` 全放行；被拒连接返回 403/EPERM |
 | `deniedDomains` | 空 | 优先于白名单 |
 | `denyRead` | `~/.ssh` `~/.gnupg` `~/.aws` | 额外继承上游 mandatory deny 写保护（`.zshrc`/`.gitconfig`/`.git/hooks` 等） |

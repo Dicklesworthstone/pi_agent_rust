@@ -104,6 +104,18 @@ fn runtimes() -> &'static std::sync::Mutex<HashMap<u64, Arc<SandboxRuntime>>> {
     RUNTIMES.get_or_init(std::sync::Mutex::default)
 }
 
+/// Default sandbox applied when `sandbox.*` is absent from settings:
+/// filesystem protection on (`auto`), network layer off (the domain
+/// allowlist proxy would 403 unlisted hosts — opt-in, not default).
+#[must_use]
+pub fn default_settings() -> crate::config::SandboxSettings {
+    crate::config::SandboxSettings {
+        mode: Some("auto".to_string()),
+        network: Some("off".to_string()),
+        ..Default::default()
+    }
+}
+
 /// Prepare `command` for sandboxed execution.
 ///
 /// Returns `Ok(None)` when the sandbox is not active for this call — either

@@ -5270,7 +5270,13 @@ impl ToolRegistry {
                 "bash" => tools.push(Box::new(
                     BashTool::with_shell(cwd, shell_path.clone(), shell_command_prefix.clone())
                         .with_mediation(config.and_then(|c| c.bash.clone()))
-                        .with_sandbox(config.and_then(|c| c.sandbox.clone())),
+                        // sandbox 默认 auto + network off：无配置时文件系统防护兜底开，
+                        // 网络白名单保持 opt-in（白名单会 403 未列域名，不适合默认）。
+                        .with_sandbox(Some(
+                            config
+                                .and_then(|c| c.sandbox.clone())
+                                .unwrap_or_else(crate::sandbox::default_settings),
+                        )),
                 )),
                 "edit" => tools.push(Box::new(
                     EditTool::new(cwd)
