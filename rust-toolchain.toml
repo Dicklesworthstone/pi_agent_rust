@@ -14,5 +14,5 @@
 # (Sibling projects may use different pins because they do not consume this
 # repository's locked asupersync/sysinfo graph.)
 [toolchain]
-channel = "nightly-2026-07-05"
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
