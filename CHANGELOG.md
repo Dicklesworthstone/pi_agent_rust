@@ -107,6 +107,33 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Fixed
 
+- **Secret masking catches API keys that contain dots** (gh
+  [#211](https://github.com/Dicklesworthstone/pi_agent_rust/issues/211)):
+  the `sk-` rule and the generic `KEY=value` rule rejected `.` inside the
+  token, so dotted OpenAI-compatible keys (Alibaba BaiLian `sk-sp-H.EEDDM…`)
+  reached the model in plaintext while the same key with the dots replaced
+  by digits was vaulted. Ruleset v2 accepts single dots *between* token
+  characters only — a key at the end of a sentence no longer swallows the
+  period, dots do not count toward the minimum length, and a dotted generic
+  value without any digit (`apiKey: process.env.OPENAI_API_KEY`) is left
+  alone. Same audit added `gho_`/`ghu_`/`ghs_`/`ghr_` GitHub tokens and a
+  signed-JWT rule, and orders `sk-ant-` ahead of `sk-` so the audit label
+  names the tightest rule. Rotate any dotted key that was pasted into a
+  session on an earlier build.
+
+- **Gemini / Vertex AI no longer report a cut-off stream as a complete
+  answer** (gh
+  [#213](https://github.com/Dicklesworthstone/pi_agent_rust/issues/213)):
+  a transport close before the chunk carrying `finishReason` (proxy reset,
+  idle timeout, dropped connection) was emitted as a clean `Done`/`Stop`, so
+  the truncated text was committed to the session and the transient-error
+  retry never ran. Both providers now surface a retryable `unexpected EOF`
+  error like the Anthropic and OpenAI streams already did, and a refused
+  prompt (`promptFeedback.blockReason`) becomes a named provider error
+  instead of an empty success. The HTTP body-idle timeout that bounds a
+  stalled provider stream gained direct tests (stall fires, live-but-slow
+  streams reset the bound, transport errors pass through).
+
 - **FTUI launches boot the extension runtime once**: the classic startup
   path no longer pre-warms, enables, and then discards a second extension
   runtime (with a second `startup`/`session_start` hook dispatch) before the
