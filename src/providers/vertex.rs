@@ -383,11 +383,8 @@ impl Provider for VertexProvider {
                             return Some((Err(err), state));
                         }
                         None => {
-                            // Stream ended naturally.
-                            state.finished = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            let outcome = state.finish_at_eof();
+                            return Some((outcome, state));
                         }
                     }
                 }
@@ -413,6 +410,10 @@ where
     finished: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    /// Whether a chunk carried a terminal marker (`finishReason` on the
+    /// candidate, or a `promptFeedback.blockReason`). The final chunk always
+    /// carries one; a transport close without it is a truncated stream.
+    saw_terminal: bool,
 }
 
 impl<S> StreamState<S>
@@ -437,7 +438,23 @@ where
             started: false,
             finished: false,
             transient_error_count: 0,
+            saw_terminal: false,
         }
+    }
+
+    /// Terminal outcome once the transport closes: `Done` after a terminal
+    /// marker, otherwise a retryable error so a cut-off response is never
+    /// committed as a clean `Stop` (mirrors `gemini::StreamState`).
+    fn finish_at_eof(&mut self) -> Result<StreamEvent> {
+        self.finished = true;
+        if !self.saw_terminal {
+            return Err(Error::api(
+                "Vertex AI stream ended before finishReason (unexpected EOF)",
+            ));
+        }
+        let reason = self.partial.stop_reason;
+        let message = std::mem::take(&mut self.partial);
+        Ok(StreamEvent::Done { reason, message })
     }
 
     fn process_event(&mut self, data: &str) -> Result<()> {
@@ -449,6 +466,18 @@ where
             self.partial.usage.input = metadata.prompt_token_count.unwrap_or(0);
             self.partial.usage.output = metadata.candidates_token_count.unwrap_or(0);
             self.partial.usage.total_tokens = metadata.total_token_count.unwrap_or(0);
+        }
+
+        // A blocked prompt: `promptFeedback.blockReason`, no candidates, no
+        // finishReason. Terminal, and an error rather than an empty success.
+        if let Some(reason) = response
+            .prompt_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.block_reason.as_deref())
+        {
+            self.saw_terminal = true;
+            self.partial.stop_reason = StopReason::Error;
+            self.partial.error_message = Some(format!("Vertex AI blocked the prompt: {reason}"));
         }
 
         // Process candidates.
@@ -463,6 +492,7 @@ where
 
     #[allow(clippy::unnecessary_wraps)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
+        self.saw_terminal |= candidate.finish_reason.is_some();
         // Handle finish reason.
         if let Some(ref reason) = candidate.finish_reason {
             self.partial.stop_reason = match reason.as_str() {
@@ -1017,6 +1047,59 @@ mod tests {
         );
     }
 
+    /// gh #213 (truncated streams): a transport close before any chunk with
+    /// `finishReason` must be an error, never a `Done` that commits the
+    /// partial text as a clean stop.
+    #[test]
+    fn test_stream_eof_before_finish_reason_is_an_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let error =
+            runtime.block_on(async move {
+                let event = serde_json::json!({
+                    "candidates": [{"content": {"parts": [{"text": "partial"}]}}]
+                });
+                let byte_stream = stream::iter(vec![Ok(format!("data: {event}\n\n").into_bytes())]);
+                let mut state = StreamState::new(
+                    crate::sse::SseStream::new(Box::pin(byte_stream)),
+                    "gemini-test".to_string(),
+                    "google-vertex".to_string(),
+                    "google-vertex".to_string(),
+                );
+                while let Some(item) = state.event_source.next().await {
+                    let msg = item.expect("SSE event");
+                    state.process_event(&msg.data).expect("process_event");
+                }
+                assert!(state.pending_events.iter().any(
+                    |e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "partial")
+                ));
+                state.finish_at_eof().expect_err("EOF without finishReason")
+            });
+        let text = error.to_string();
+        assert!(text.contains("unexpected EOF"), "{text}");
+        assert!(
+            crate::error::is_retryable_error(&text, None, None),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_blocked_prompt_is_terminal_error() {
+        let events = vec![serde_json::json!({
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}
+        })];
+        let stream_events = collect_events(&events);
+        let Some(StreamEvent::Done { reason, message }) = stream_events.last() else {
+            panic!("expected Done: {stream_events:?}");
+        };
+        assert_eq!(*reason, StopReason::Error);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("Vertex AI blocked the prompt: PROHIBITED_CONTENT")
+        );
+    }
+
     // ─── Test helpers ────────────────────────────────────────────────────
 
     fn collect_events(events: &[Value]) -> Vec<StreamEvent> {
@@ -1045,11 +1128,7 @@ mod tests {
             loop {
                 let Some(item) = state.event_source.next().await else {
                     if !state.finished {
-                        state.finished = true;
-                        out.push(StreamEvent::Done {
-                            reason: state.partial.stop_reason,
-                            message: std::mem::take(&mut state.partial),
-                        });
+                        out.push(state.finish_at_eof().expect("terminal chunk seen"));
                     }
                     break;
                 };

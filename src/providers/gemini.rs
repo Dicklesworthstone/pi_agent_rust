@@ -470,11 +470,8 @@ impl Provider for GeminiProvider {
                                 return Some((Err(err), state));
                             }
                             None => {
-                                // Stream ended naturally
-                                state.finished = true;
-                                let reason = state.partial.stop_reason;
-                                let message = std::mem::take(&mut state.partial);
-                                return Some((Ok(StreamEvent::Done { reason, message }), state));
+                                let outcome = state.finish_at_eof();
+                                return Some((outcome, state));
                             }
                         }
                     }
@@ -613,11 +610,8 @@ impl Provider for GeminiProvider {
                             return Some((Err(err), state));
                         }
                         None => {
-                            // Stream ended naturally
-                            state.finished = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            let outcome = state.finish_at_eof();
+                            return Some((outcome, state));
                         }
                     }
                 }
@@ -643,6 +637,11 @@ where
     finished: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    /// Whether a chunk carried a terminal marker (`finishReason` on the
+    /// candidate, or a `promptFeedback.blockReason`). Gemini's final chunk
+    /// always carries one; a transport close without it is a truncated
+    /// stream, not a complete answer.
+    saw_terminal: bool,
 }
 
 impl<S> StreamState<S>
@@ -667,7 +666,24 @@ where
             started: false,
             finished: false,
             transient_error_count: 0,
+            saw_terminal: false,
         }
+    }
+
+    /// Terminal outcome once the transport closes. A close without a
+    /// terminal marker means the response was cut off mid-stream (proxy
+    /// reset, idle timeout, dropped connection): surface a retryable error
+    /// instead of committing the partial text as a clean `Stop`.
+    fn finish_at_eof(&mut self) -> Result<StreamEvent> {
+        self.finished = true;
+        if !self.saw_terminal {
+            return Err(Error::api(
+                "Gemini stream ended before finishReason (unexpected EOF)",
+            ));
+        }
+        let reason = self.partial.stop_reason;
+        let message = std::mem::take(&mut self.partial);
+        Ok(StreamEvent::Done { reason, message })
     }
 
     fn process_event(&mut self, data: &str) -> Result<()> {
@@ -682,6 +698,19 @@ where
             self.partial.usage.input = metadata.prompt_token_count.unwrap_or(0);
             self.partial.usage.output = metadata.candidates_token_count.unwrap_or(0);
             self.partial.usage.total_tokens = metadata.total_token_count.unwrap_or(0);
+        }
+
+        // A blocked prompt arrives as `promptFeedback.blockReason` with no
+        // candidates and no finishReason: terminal, and an error rather
+        // than an empty success.
+        if let Some(reason) = response
+            .prompt_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.block_reason.as_deref())
+        {
+            self.saw_terminal = true;
+            self.partial.stop_reason = StopReason::Error;
+            self.partial.error_message = Some(format!("Gemini blocked the prompt: {reason}"));
         }
 
         // Process candidates
@@ -703,12 +732,14 @@ where
         self.process_response(GeminiStreamResponse {
             candidates: response.candidates,
             usage_metadata: response.usage_metadata,
+            prompt_feedback: response.prompt_feedback,
         })
     }
 
     #[allow(clippy::unnecessary_wraps)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
         let has_finish_reason = candidate.finish_reason.is_some();
+        self.saw_terminal |= has_finish_reason;
 
         // Handle finish reason
         if let Some(reason) = candidate.finish_reason.as_deref() {
@@ -955,6 +986,17 @@ pub(crate) struct GeminiStreamResponse {
     pub(crate) candidates: Option<Vec<GeminiCandidate>>,
     #[serde(default)]
     pub(crate) usage_metadata: Option<GeminiUsageMetadata>,
+    #[serde(default)]
+    pub(crate) prompt_feedback: Option<GeminiPromptFeedback>,
+}
+
+/// `promptFeedback` on a chunk: present with `blockReason` when the prompt
+/// itself was refused (no candidates follow).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeminiPromptFeedback {
+    #[serde(default)]
+    pub(crate) block_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -971,6 +1013,8 @@ struct CloudCodeAssistResponse {
     candidates: Option<Vec<GeminiCandidate>>,
     #[serde(default)]
     usage_metadata: Option<GeminiUsageMetadata>,
+    #[serde(default)]
+    prompt_feedback: Option<GeminiPromptFeedback>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1207,6 +1251,128 @@ mod tests {
         }
     }
 
+    /// Drive the real `Provider::stream` against a canned SSE body and
+    /// collect every item, including the terminal error.
+    fn collect_stream_items_from_body(body: &str) -> Vec<Result<StreamEvent>> {
+        let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
+        let provider = GeminiProvider::new("gemini-2.0-flash").with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer test".to_string());
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(
+                    &context,
+                    &StreamOptions {
+                        headers,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("stream");
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                out.push(item);
+            }
+            out
+        })
+    }
+
+    /// gh #213 (truncated streams): a transport close before the chunk that
+    /// carries `finishReason` is a cut-off response — it must surface as a
+    /// retryable error, never as a clean `Done`/`Stop` that commits the
+    /// partial text to the session.
+    #[test]
+    fn test_stream_rejects_transport_eof_before_finish_reason() {
+        let body = [
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}"#,
+            "",
+            "",
+        ]
+        .join("\n");
+        let out = collect_stream_items_from_body(&body);
+        assert!(
+            out.iter().any(|item| matches!(
+                item,
+                Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial"
+            )),
+            "partial content is still streamed before the terminal error: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "premature EOF must never be reported as Done: {out:?}"
+        );
+        let error = out
+            .last()
+            .expect("terminal stream item")
+            .as_ref()
+            .expect_err("premature EOF must be a stream error")
+            .to_string();
+        assert!(error.contains("finishReason"), "{error}");
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert!(
+            crate::error::is_retryable_error(&error, None, None),
+            "a cut-off stream must be retryable: {error}"
+        );
+    }
+
+    /// The happy path through the same driver: `finishReason` seen, then the
+    /// transport closes → exactly one `Done` and no error.
+    #[test]
+    fn test_stream_eof_after_finish_reason_is_done() {
+        let out = collect_stream_items_from_body(&success_sse_body());
+        assert!(out.iter().all(Result::is_ok), "{out:?}");
+        let done = out
+            .iter()
+            .filter(|item| matches!(item, Ok(StreamEvent::Done { .. })))
+            .count();
+        assert_eq!(done, 1, "{out:?}");
+        assert!(
+            matches!(
+                out.last(),
+                Some(Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    ..
+                }))
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// A refused prompt (`promptFeedback.blockReason`, no candidates) is
+    /// terminal and an error — not an empty successful turn, and not a
+    /// truncated-stream retry.
+    #[test]
+    fn test_blocked_prompt_is_terminal_error_not_empty_success() {
+        let body = [
+            r#"data: {"promptFeedback":{"blockReason":"SAFETY","safetyRatings":[]}}"#,
+            "",
+            "",
+        ]
+        .join("\n");
+        let out = collect_stream_items_from_body(&body);
+        let Some(Ok(StreamEvent::Done { reason, message })) = out.last() else {
+            panic!("expected Done: {out:?}");
+        };
+        assert_eq!(*reason, StopReason::Error);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("Gemini blocked the prompt: SAFETY")
+        );
+        assert!(message.content.is_empty());
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         headers: HashMap<String, String>,
@@ -1386,11 +1552,7 @@ mod tests {
             loop {
                 let Some(item) = state.event_source.next().await else {
                     if !state.finished {
-                        state.finished = true;
-                        out.push(StreamEvent::Done {
-                            reason: state.partial.stop_reason,
-                            message: std::mem::take(&mut state.partial),
-                        });
+                        out.push(state.finish_at_eof().expect("terminal chunk seen"));
                     }
                     break;
                 };

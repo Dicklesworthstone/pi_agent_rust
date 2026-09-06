@@ -3031,4 +3031,123 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(&format!("User-Agent: {ua}\r\n")));
     }
+
+    // ── body-idle timeout (gh #213: stalled / disconnected provider streams) ──
+
+    type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
+
+    fn now() -> asupersync::Time {
+        asupersync::Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now())
+    }
+
+    /// Build the wrapped stream *inside* the runtime (so `now()` and the
+    /// wrapper's clock agree) and collect items, stopping after the first
+    /// error: the wrapper keeps reporting the timeout on every poll after
+    /// it fires, and a consumer that kept polling would be the bug.
+    fn drain(build: impl FnOnce() -> ByteStream + Send + 'static) -> Vec<std::io::Result<Vec<u8>>> {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let mut stream = build();
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                let failed = item.is_err();
+                out.push(item);
+                if failed {
+                    break;
+                }
+            }
+            out
+        })
+    }
+
+    /// A provider that sends one chunk and then goes silent forever (a
+    /// stalled upstream, a half-open connection) must not hang the turn:
+    /// the idle bound fires and surfaces a named timeout error.
+    #[test]
+    fn idle_timeout_fires_when_body_stalls() {
+        let items = drain(|| {
+            let stalled: ByteStream = Box::pin(
+                futures::stream::once(async { Ok(b"data: hello\n\n".to_vec()) })
+                    .chain(futures::stream::pending()),
+            );
+            wrap_stream_with_idle_timeout(
+                stalled,
+                Some((now(), std::time::Duration::from_millis(50))),
+            )
+        });
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].as_ref().expect("first chunk"), b"data: hello\n\n");
+        let err = items[1]
+            .as_ref()
+            .expect_err("stall must surface as an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(
+            err.to_string()
+                .contains("Request timed out reading body stream"),
+            "{err}"
+        );
+    }
+
+    /// The bound is an *idle* bound, not a total-duration bound: a slow but
+    /// live stream whose gaps each stay under the limit must run to
+    /// completion even when the whole body takes longer than the limit.
+    #[test]
+    fn idle_timeout_resets_on_each_chunk() {
+        let items = drain(|| {
+            let slow: ByteStream = Box::pin(futures::stream::unfold(0u8, |i| async move {
+                if i == 5 {
+                    return None;
+                }
+                asupersync::time::sleep(now(), std::time::Duration::from_millis(30)).await;
+                Some((Ok(vec![i]), i + 1))
+            }));
+            wrap_stream_with_idle_timeout(
+                slow,
+                Some((now(), std::time::Duration::from_millis(100))),
+            )
+        });
+        let chunks: Vec<Vec<u8>> = items
+            .into_iter()
+            .map(|item| item.expect("live stream must not time out"))
+            .collect();
+        assert_eq!(chunks, vec![vec![0], vec![1], vec![2], vec![3], vec![4]]);
+    }
+
+    /// A transport error from the underlying stream passes through
+    /// unchanged (kind and message); with no timeout configured the stream
+    /// is returned untouched and ends on EOF without a synthetic item.
+    #[test]
+    fn idle_timeout_wrapper_passes_through_errors_and_eof() {
+        let items = drain(|| {
+            let reset: ByteStream = Box::pin(futures::stream::iter(vec![
+                Ok(b"a".to_vec()),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "peer reset",
+                )),
+            ]));
+            wrap_stream_with_idle_timeout(reset, Some((now(), std::time::Duration::from_secs(5))))
+        });
+        assert_eq!(items.len(), 2, "{items:?}");
+        let err = items[1].as_ref().expect_err("reset must pass through");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        assert_eq!(err.to_string(), "peer reset");
+
+        let items = drain(|| {
+            let plain: ByteStream = Box::pin(futures::stream::iter(vec![
+                Ok(b"x".to_vec()),
+                Ok(b"y".to_vec()),
+            ]));
+            wrap_stream_with_idle_timeout(plain, None)
+        });
+        let chunks: Vec<Vec<u8>> = items
+            .into_iter()
+            .map(|item| item.expect("plain stream"))
+            .collect();
+        assert_eq!(chunks, vec![b"x".to_vec(), b"y".to_vec()]);
+    }
 }
