@@ -6,11 +6,12 @@
 //! session and dies with it — session files and compaction summaries carry
 //! placeholders only.
 //!
-//! Detection: versioned pattern rules (sk-ant-*, sk-*, ghp_*, AKIA*,
-//! xox[bap]-*, private-key headers, DSN/connection strings, generic
-//! KEY=value high-entropy assignments) with a measured false-positive
-//! budget. This module is the SINGLE detector for the whole program
-//! (bd-cv653.4.1's memory screener composes with it).
+//! Detection: versioned pattern rules (sk-ant-*, sk-* including dotted
+//! BaiLian-style keys, gh?_*, AKIA*, AIza*, xox[bap]-*, JWTs, private-key
+//! headers, DSN/connection strings, generic KEY=value high-entropy
+//! assignments) with a measured false-positive budget. This module is the
+//! SINGLE detector for the whole program (bd-cv653.4.1's memory screener
+//! composes with it).
 //!
 //! Modes (`secrets.mode`): `off` | `obfuscate` (default) | `block`
 //! (refuse to send, loud named error). Audit events per transform are
@@ -75,58 +76,113 @@ pub struct SecretsSettings {
 // Detector (single source of truth for the whole program)
 // ---------------------------------------------------------------------------
 
-/// One detector rule: name + regex + placeholder label.
+/// One detector rule: name + regex + placeholder label, plus an optional
+/// post-filter that can veto a regex hit on the captured value.
 struct Rule {
     name: &'static str,
     regex: regex::Regex,
     label: &'static str,
+    reject: Option<fn(&str) -> bool>,
+}
+
+/// Veto for the generic rule's dotted values: a dotted value with no digit
+/// is far more often a code path (`apiKey: process.env.OPENAI_API_KEY`,
+/// `password: self.config.password`) than a credential, while real dotted
+/// keys carry digits. Undotted values keep the pre-v2 behavior.
+fn dotted_without_digit(value: &str) -> bool {
+    value.contains('.') && !value.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// Versioned in-tree rules (bump SECRETS_RULESET_VERSION when editing).
-pub const SECRETS_RULESET_VERSION: u32 = 1;
+///
+/// v2 (gh #211): provider keys may carry `.` inside the token (Alibaba
+/// BaiLian issues `sk-sp-H.EEDDM.…` keys through the OpenAI-compatible
+/// surface; JWTs are three dot-separated base64url segments). Dots are
+/// accepted only *between* token characters — never leading, trailing, or
+/// doubled — so a key at the end of a sentence does not swallow the period,
+/// and dots do not count toward the minimum length, so `sk-a.b.c` shapes
+/// stay below the bar. Rules are ordered most-specific first: overlapping
+/// hits are resolved by start offset and then rule order, so the audit
+/// label names the tightest rule.
+pub const SECRETS_RULESET_VERSION: u32 = 2;
+
+/// Token body: `min` or more characters from `class`, with single dots
+/// permitted between characters, ending on a `tail_class` character (the
+/// callers pass alphanumerics so trailing punctuation is never captured).
+/// `min` must be ≥ 2.
+fn dotted_body(class: &str, tail_class: &str, min: usize) -> String {
+    debug_assert!(min >= 2, "dotted_body needs room for head + tail");
+    let middle = min - 2;
+    format!("[{class}](?:\\.?[{class}]){{{middle},}}\\.?[{tail_class}]")
+}
 
 fn rules() -> &'static Vec<Rule> {
     static RULES: std::sync::LazyLock<Vec<Rule>> = std::sync::LazyLock::new(|| {
+        const TOKEN: &str = r"A-Za-z0-9_\-";
+        const ALNUM: &str = "A-Za-z0-9";
+        let sk_body = dotted_body(TOKEN, ALNUM, 16);
         vec![
-            Rule {
-                name: "openai-key",
-                regex: regex::Regex::new(r"sk-[A-Za-z0-9_\-]{16,}").expect("rule"),
-                label: "openai_key",
-            },
+            // Before `openai-key`: same prefix, tighter shape.
             Rule {
                 name: "anthropic-key",
-                regex: regex::Regex::new(r"sk-ant-[A-Za-z0-9_\-]{16,}").expect("rule"),
+                regex: regex::Regex::new(&format!(r"sk-ant-{sk_body}")).expect("rule"),
                 label: "anthropic_key",
+                reject: None,
             },
             Rule {
+                name: "openai-key",
+                regex: regex::Regex::new(&format!(r"sk-{sk_body}")).expect("rule"),
+                label: "openai_key",
+                reject: None,
+            },
+            // Classic PATs plus the OAuth/user/server/refresh prefixes that
+            // share the `gh?_` shape.
+            Rule {
                 name: "github-pat",
-                regex: regex::Regex::new(r"ghp_[A-Za-z0-9]{20,}").expect("rule"),
+                regex: regex::Regex::new(r"gh[pousr]_[A-Za-z0-9]{20,}").expect("rule"),
                 label: "github_pat",
+                reject: None,
             },
             Rule {
                 name: "github-pat-fine",
                 regex: regex::Regex::new(r"github_pat_[A-Za-z0-9_]{20,}").expect("rule"),
                 label: "github_pat",
+                reject: None,
             },
             Rule {
                 name: "aws-access-key",
                 regex: regex::Regex::new(r"AKIA[0-9A-Z]{16}").expect("rule"),
                 label: "aws_access_key",
+                reject: None,
             },
             Rule {
                 name: "private-key",
                 regex: regex::Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").expect("rule"),
                 label: "private_key",
+                reject: None,
             },
             Rule {
                 name: "google-api-key",
                 regex: regex::Regex::new(r"AIza[0-9A-Za-z_\-]{20,}").expect("rule"),
                 label: "google_api_key",
+                reject: None,
             },
             Rule {
                 name: "slack-token",
                 regex: regex::Regex::new(r"xox[baprs]-[A-Za-z0-9\-]{10,}").expect("rule"),
                 label: "slack_token",
+                reject: None,
+            },
+            // Signed JWT: `eyJ` (base64url of `{"`) header, payload,
+            // signature — three dot-separated base64url segments.
+            Rule {
+                name: "jwt",
+                regex: regex::Regex::new(
+                    r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+                )
+                .expect("rule"),
+                label: "jwt",
+                reject: None,
             },
             Rule {
                 name: "dsn",
@@ -137,16 +193,20 @@ fn rules() -> &'static Vec<Rule> {
                 )
                 .expect("rule"),
                 label: "dsn",
+                reject: None,
             },
             // Generic KEY=value assignments with a high-entropy value:
-            // 16+ chars with mixed classes, no spaces.
+            // 16+ token characters (dots allowed between them), no spaces,
+            // ending on a base64/alphanumeric character.
             Rule {
                 name: "generic-assignment",
-                regex: regex::Regex::new(
-                    r#"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd)\s*[=:]\s*['"]?([A-Za-z0-9+/=_\-]{16,})['"]?"#,
-                )
+                regex: regex::Regex::new(&format!(
+                    r#"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd)\s*[=:]\s*['"]?({})['"]?"#,
+                    dotted_body(r"A-Za-z0-9+/=_\-", "A-Za-z0-9+/=", 16)
+                ))
                 .expect("rule"),
                 label: "generic_secret",
+                reject: Some(dotted_without_digit),
             },
         ]
     });
@@ -173,6 +233,9 @@ pub fn scan(text: &str, extra_patterns: &[regex::Regex]) -> Vec<Detection> {
             // `KEY=value` corrupts inbound restores (`export X=KEY=value`)
             // and leaves a bare echo of the value unmasked.
             let m = caps.get(1).or_else(|| caps.get(0)).expect("match group 0");
+            if rule.reject.is_some_and(|reject| reject(m.as_str())) {
+                continue;
+            }
             out.push(Detection {
                 start: m.start(),
                 end: m.end(),
@@ -424,6 +487,187 @@ mod tests {
         // A whole-match rule (DSN) still vaults the full credential.
         let (dsn_out, _) = obfuscate("postgres://user:pw@host/db", &mut vault, &[]);
         assert!(dsn_out.starts_with("<pi-secret:"), "{dsn_out}");
+    }
+
+    /// Synthetic credential shapes per provider (never real keys), each with
+    /// the "plain" form and — where the provider issues them — the dotted
+    /// form that #211 reported slipping through. `expect` names the rule
+    /// that must fire.
+    #[test]
+    fn detector_matrix_positive_shapes() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "openai plain",
+                "sk-proj-abcdefghijklmnopqrstuvwxyz0123",
+                "openai-key",
+            ),
+            (
+                "openai dotted (BaiLian sk-sp)",
+                "sk-sp-H.EEDDM.JOZh.MEQ.aBcDeFgHiJ.kLmNoPqRsTuV.wXyZ01234",
+                "openai-key",
+            ),
+            (
+                "openai dotted short segments",
+                "sk-ab.cd.ef.gh.ij.kl.mn.op.qr",
+                "openai-key",
+            ),
+            (
+                "anthropic",
+                "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz_0123456789-AbCdEfGh",
+                "anthropic-key",
+            ),
+            (
+                "github classic",
+                "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+                "github-pat",
+            ),
+            (
+                "github oauth",
+                "gho_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+                "github-pat",
+            ),
+            (
+                "github fine-grained",
+                "github_pat_11ABCDEFG0abcdefghijklmn_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+                "github-pat-fine",
+            ),
+            ("aws", concat!("AKIA", "IOSFODNN7EXAMPLE"), "aws-access-key"),
+            (
+                "google",
+                "AIzaSyA-bCdEfGhIjKlMnOpQrStUvWxYz0123456",
+                "google-api-key",
+            ),
+            (
+                "slack bot",
+                "xoxb-1234567890-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx",
+                "slack-token",
+            ),
+            (
+                "jwt",
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+                "jwt",
+            ),
+            (
+                "private key header",
+                concat!("-----BEGIN ", "RSA PRIVATE KEY-----"),
+                "private-key",
+            ),
+            (
+                "dsn dotted password",
+                "postgres://svc:p.ass.word@db.internal:5432/prod",
+                "dsn",
+            ),
+            (
+                "generic plain",
+                "API_KEY=hunter2hunter2hunter2",
+                "generic-assignment",
+            ),
+            (
+                "generic dotted",
+                "apiKey: \"H.EEDDM1.JOZh.MEQ.aBcDeFgHiJ.kLmNoPqRsTuV\"",
+                "generic-assignment",
+            ),
+            (
+                "generic dotted, digit only in the last segment",
+                "token=abcdefgh.ijklmnop.qrstuvwxyz.42",
+                "generic-assignment",
+            ),
+        ];
+        for (name, text, expect) in cases {
+            let hits = scan(text, &[]);
+            assert!(
+                hits.iter().any(|d| d.rule == *expect),
+                "{name}: expected rule {expect} to fire on {text:?}, got {:?}",
+                hits.iter().map(|d| d.rule).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Shapes that must NOT be vaulted: prose, hostnames, version strings,
+    /// the vault's own placeholders, and too-short dotted values.
+    #[test]
+    fn detector_matrix_negative_shapes() {
+        let cases: &[&str] = &[
+            "sk-foo.example.com",
+            "sk-8 is the Skoda model. Not a key.",
+            "sk-",
+            "sk-abc.def",
+            "<pi-secret:000001>",
+            "restored <pi-secret:00000a> and <pi-secret:0000ff> fine",
+            "version: 1.2.3.4",
+            "token: docs.example.com",
+            // Dotted identifier paths in code (no digits) are not vaulted.
+            "apiKey: process.env.OPENAI_API_KEY",
+            "const token = process.env.GITHUB_TOKEN;",
+            "password: self.config.database.password",
+            "secret = settings.integrations.slack.signing_secret",
+            "password: correct horse battery staple",
+            "eyJhbGciOiJIUzI1NiJ9 alone is not a jwt",
+            "let x = a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p;",
+        ];
+        for text in cases {
+            let hits = scan(text, &[]);
+            assert!(
+                hits.is_empty(),
+                "false positive on {text:?}: {:?}",
+                hits.iter()
+                    .map(|d| (d.rule, &text[d.start..d.end]))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A key at the end of a sentence must not swallow the closing period,
+    /// and the vaulted value must be exactly the key.
+    #[test]
+    fn dotted_keys_do_not_capture_trailing_punctuation() {
+        let key = "sk-sp-H.EEDDM.JOZh.MEQ.aBcDeFgHiJ.kLmNoPqRsTuV";
+        for (text, expected_tail) in [
+            (format!("the key is {key}."), "."),
+            (format!("the key is {key}..."), "..."),
+            (format!("the key is {key}.\nnext line"), ".\nnext line"),
+            (format!("(\"{key}\")"), "\")"),
+        ] {
+            let hits = scan(&text, &[]);
+            assert_eq!(hits.len(), 1, "{text:?}: {hits:?}");
+            assert_eq!(&text[hits[0].start..hits[0].end], key, "{text:?}");
+            assert!(text[hits[0].end..].starts_with(expected_tail), "{text:?}");
+        }
+        // Generic assignment: the value ends on the last alphanumeric.
+        let text = "password: H.EEDDM1.JOZh.MEQ.aBcDeFgHiJ.kLmNoPqRsTuV.";
+        let hits = scan(text, &[]);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            &text[hits[0].start..hits[0].end],
+            "H.EEDDM1.JOZh.MEQ.aBcDeFgHiJ.kLmNoPqRsTuV"
+        );
+    }
+
+    /// Round trip for a dotted key: outbound placeholder, inbound restore,
+    /// echo re-mask, and the placeholder itself is never re-detected.
+    #[test]
+    fn dotted_key_round_trips_through_the_vault() {
+        let key = "sk-sp-H.EEDDM.JOZh.MEQ.aBcDeFgHiJ.kLmNoPqRsTuV.wXyZ01234";
+        let mut vault = SecretVault::default();
+        let (out, audit) = obfuscate(&format!("\"apiKey\": \"{key}\""), &mut vault, &[]);
+        assert_eq!(out, "\"apiKey\": \"<pi-secret:000001>\"", "{out}");
+        assert_eq!(audit.detections, 1, "one detection, not one per segment");
+        assert!(
+            scan(&out, &[]).is_empty(),
+            "placeholder must not be re-detected"
+        );
+        assert_eq!(
+            vault.restore("export KEY=<pi-secret:000001>"),
+            format!("export KEY={key}")
+        );
+        assert_eq!(
+            vault.mask(&format!("echo {key}")),
+            "echo <pi-secret:000001>"
+        );
+        // The digit-substituted variant is a different value → a new slot.
+        let (again, _) = obfuscate(&key.replace('.', "1"), &mut vault, &[]);
+        assert_eq!(again, "<pi-secret:000002>");
+        assert_eq!(vault.len(), 2);
     }
 
     #[test]

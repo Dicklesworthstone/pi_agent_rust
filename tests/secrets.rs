@@ -217,6 +217,65 @@ fn inbound_restore_writes_real_value_and_masks_echo() {
     finish_case(&harness, case);
 }
 
+/// gh #211: a dotted OpenAI-compatible key (Alibaba BaiLian `sk-sp-…`)
+/// must take the same path as a plain one — vaulted outbound, restored
+/// inbound, re-masked in tool output — and the placeholder must survive a
+/// second outbound pass unchanged (it is not itself credential-shaped).
+#[test]
+fn dotted_key_round_trips_through_the_agent() {
+    const DOTTED: &str = "sk-sp-H.EEDDM.JOZh.MEQ.aBcDeFgHiJ.kLmNoPqRsTuV.wXyZ01234";
+    let case = "dotted_key_round_trips_through_the_agent";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+
+    // Two turns: the second carries the placeholder from the first back
+    // through the outbound transform (assistant/user history is re-scanned
+    // every turn).
+    block_on_local(agent.run(format!("\"apiKey\": \"{DOTTED}\"."), |_| {})).expect("run"); // ubs:ignore test run
+    block_on_local(agent.run("and again?", |_| {})).expect("run"); // ubs:ignore test run
+    let payloads = capture.lock().expect("capture").payloads.clone(); // ubs:ignore test capture
+    let joined = payloads.join("\n");
+    harness.log().info(
+        "verify",
+        format!("payloads: {}", joined.chars().take(400).collect::<String>()),
+    );
+    assert_eq!(payloads.len(), 2);
+    assert!(
+        joined.contains("<pi-secret:000001>\\\"."),
+        "trailing period must stay outside the placeholder: {joined}"
+    );
+    assert!(!joined.contains(DOTTED), "raw dotted key leaked: {joined}");
+    assert!(
+        !joined.contains("<pi-secret:000002>"),
+        "placeholder must not be re-vaulted on the second turn: {joined}"
+    );
+
+    let restored = agent.restore_secrets_inbound(pi::model::ToolCall {
+        id: "t1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({ "command": "curl -H 'Authorization: Bearer <pi-secret:000001>'" }),
+        thought_signature: None,
+    });
+    let args = serde_json::to_string(&restored.arguments).expect("args");
+    assert!(
+        args.contains(DOTTED),
+        "restore must substitute the dotted key: {args}"
+    );
+
+    let mut output = ToolOutput {
+        content: vec![pi::model::ContentBlock::Text(pi::model::TextContent::new(
+            format!("OPENAI_API_KEY={DOTTED}\n"),
+        ))],
+        details: None,
+        is_error: false,
+    };
+    agent.mask_secrets_in_output(&mut output);
+    let masked = first_text(&output);
+    assert_eq!(masked, "OPENAI_API_KEY=<pi-secret:000001>\n", "{masked}");
+    finish_case(&harness, case);
+}
+
 #[test]
 fn block_mode_refuses_the_send() {
     let case = "block_mode_refuses_the_send";
