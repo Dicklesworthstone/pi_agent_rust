@@ -1153,6 +1153,82 @@ fn escape_advances_one_card_at_a_time_across_ask_ask_extension() {
     assert!(app.input_card_order.is_empty());
 }
 
+/// gh #198: an approval/ask card arrives while the tool that raised it is
+/// still running, so the agent is never `Idle` while the card is pending. The
+/// editor used to be hidden (and its rows dropped from the layout budget) for
+/// the whole time the card asked the user to type an answer, so the prompt
+/// looked like an inert transcript line and timed out unanswered. While a
+/// card is pending the editor must render and be budgeted exactly as when
+/// idle; once the card resolves mid-turn it goes back to hidden.
+#[test]
+fn pending_ask_card_keeps_editor_visible_while_turn_is_running() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+    app.agent_state = AgentState::ToolRunning;
+    app.current_tool = Some("bash".to_string());
+
+    assert!(
+        !app.editor_input_is_available(),
+        "no card pending: a running turn hides the editor"
+    );
+    let busy_height = app.view_effective_conversation_height();
+    let busy_view = app.view();
+    assert!(
+        !busy_view.contains("Enter: send"),
+        "no card pending: the editor header must not render mid-turn"
+    );
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{
+            "question": "Allow the `bash` tool to run?",
+            "options": [{"label": "Allow"}, {"label": "Deny"}]
+        }]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-approval");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-approval".to_string(),
+        request,
+    }));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+
+    assert!(
+        app.editor_input_is_available(),
+        "a pending card must expose the editor even though the turn is running"
+    );
+    assert!(
+        app.view_effective_conversation_height() < busy_height,
+        "the editor rows must come out of the conversation budget so the card and editor both fit"
+    );
+    let card_view = app.view();
+    assert!(
+        card_view.contains("Allow the `bash` tool to run?"),
+        "the card itself renders in the conversation"
+    );
+    assert!(
+        card_view.contains("Enter: send"),
+        "the editor header renders alongside the pending card"
+    );
+
+    // Answer through the real Enter path: the card resolves, the turn is
+    // still running, and the editor hides again.
+    app.input.set_value("1");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_ask_ui.is_none());
+    assert!(app.active_input_card_kind.is_none());
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+    assert!(
+        !app.editor_input_is_available(),
+        "card resolved mid-turn: the editor hides until the turn ends"
+    );
+    app.agent_state = AgentState::Idle;
+}
+
 /// bd-q66i1: turn-end invalidation treats partial card input as consumed and
 /// restores the genuine draft captured before the card burst.
 #[test]

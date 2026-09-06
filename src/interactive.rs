@@ -1208,8 +1208,14 @@ impl PiApp {
     ///
     /// Keeping this in one place prevents overlay/input drift between
     /// rendering, viewport sizing, and keyboard dispatch.
+    ///
+    /// The editor is normally hidden while a turn is running, but an ask or
+    /// approval card only ever arrives mid-turn (the tool that raised it is
+    /// still executing) and is answered through this same editor. Hiding it
+    /// then left the card's "enter a number" instruction pointing at nothing
+    /// (gh #198): keystrokes were accepted invisibly and the card timed out.
     const fn editor_input_is_available(&self) -> bool {
-        matches!(self.agent_state, AgentState::Idle)
+        (matches!(self.agent_state, AgentState::Idle) || self.has_pending_input_card())
             && self.tree_ui.is_none()
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
