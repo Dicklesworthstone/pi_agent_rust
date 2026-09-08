@@ -1512,8 +1512,38 @@ async fn run(
             ))
         };
 
-    let mut auth = auth_result?;
-    auth.refresh_expired_oauth_tokens().await?;
+    // gh #217: an explicit `--api-key` makes the stored credentials optional,
+    // so an unreadable auth store degrades to "no stored credentials" instead
+    // of aborting a run that never needed them.
+    let mut auth = match auth_result {
+        Ok(auth) => auth,
+        Err(err) if has_cli_api_key_override(cli.api_key.as_deref()) => {
+            eprintln!(
+                "Warning: stored credentials are unavailable ({err}); continuing with the explicit --api-key only"
+            );
+            AuthStorage::empty_at(Config::auth_path())
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    // gh #218: refresh stored OAuth credentials without letting an unrelated
+    // provider's stale login abort the run. An explicit `--api-key` for an
+    // explicit provider/model needs nothing from the store, so the pass is
+    // skipped entirely; otherwise every expiring credential is refreshed
+    // independently and only a failure for the *selected* provider becomes
+    // an error (checked once the model is known, below).
+    let startup_oauth_refresh = if startup_oauth_refresh_required(&cli) {
+        let report = auth.refresh_expired_oauth_tokens_report().await;
+        if !report.failed.is_empty() {
+            eprintln!(
+                "Warning: OAuth token refresh failed for: {} (stale credentials for providers this run does not use are ignored; run `pi auth login <provider>` to renew them)",
+                report.failed_provider_ids().join(", ")
+            );
+        }
+        report
+    } else {
+        pi::auth::OAuthRefreshReport::default()
+    };
 
     // Prune stale credentials that are well past expiry and lack refresh metadata.
     // 7-day cutoff (in milliseconds).
@@ -1523,7 +1553,11 @@ async fn run(
             pruned_providers = ?pruned,
             "Pruned stale credentials during startup"
         );
-        auth.save()?;
+        // A read-only store (gh #217) cannot persist the prune; the in-memory
+        // view is already clean, so this is not worth failing startup over.
+        if let Err(err) = auth.save() {
+            tracing::warn!(error = %err, "could not persist pruned credentials");
+        }
     }
 
     let global_dir = Config::global_dir();
@@ -1699,6 +1733,17 @@ async fn run(
             }
         }
     };
+    // gh #218: now that the model is known, a failed refresh matters only if
+    // this run would actually send that provider's stale OAuth token.
+    if !has_cli_api_key_override(cli.api_key.as_deref())
+        && let Some(failure) =
+            startup_oauth_refresh.failure_for(&selection.model_entry.model.provider)
+    {
+        return Err(anyhow::Error::new(pi::error::Error::auth(format!(
+            "OAuth token refresh failed for: {} ({}) — run `pi auth login {}` to renew it",
+            failure.provider, failure.error, failure.provider
+        ))));
+    }
 
     let enabled_tools = cli.enabled_tools();
     let skills_prompt = if enabled_tools.contains(&"read") {
@@ -8306,6 +8351,19 @@ fn has_cli_api_key_override(api_key: Option<&str>) -> bool {
     api_key.is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Whether startup should touch the stored OAuth credentials at all (gh #218).
+///
+/// An explicit `--api-key` for an explicit `--provider`/`--model` satisfies
+/// the run's only credential need, so the store is left alone: no refresh
+/// requests for providers the invocation never selected, and no dependence
+/// on whatever a person logged into on this machine. Every other shape
+/// (interactive default model, config-selected model, `--models` scopes)
+/// may resolve a stored OAuth credential later, so it is refreshed up front.
+fn startup_oauth_refresh_required(cli: &cli::Cli) -> bool {
+    !(has_cli_api_key_override(cli.api_key.as_deref())
+        && (cli.provider.is_some() || cli.model.is_some()))
+}
+
 fn rpc_available_models(registry: &ModelRegistry, cli_api_key: Option<&str>) -> Vec<ModelEntry> {
     if has_cli_api_key_override(cli_api_key) {
         registry.models().to_vec()
@@ -10240,6 +10298,52 @@ mod tests {
                 .any(|entry| entry.model.provider.eq("openai") && entry.model.id.eq("gpt-4o")),
             "CLI API-key override should expose remote models to RPC model switching"
         );
+    }
+
+    /// gh #218: an explicit key for an explicit model must not reach for the
+    /// stored credentials; everything else still refreshes up front.
+    #[test]
+    fn startup_oauth_refresh_skipped_only_for_explicit_key_and_model() {
+        use clap::Parser as _;
+        let parse =
+            |args: &[&str]| cli::Cli::parse_from(std::iter::once("pi").chain(args.iter().copied()));
+        assert!(!startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "sk-run",
+            "--model",
+            "openrouter/deepseek/deepseek-v4-pro"
+        ])));
+        assert!(!startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "sk-run",
+            "--provider",
+            "openrouter",
+            "--model",
+            "deepseek/deepseek-v4-pro"
+        ])));
+        assert!(!startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "sk-run",
+            "--provider",
+            "openrouter"
+        ])));
+        // A key without a selected provider/model may still fall back to the
+        // store (scoped models, extension providers): refresh.
+        assert!(startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "sk-run"
+        ])));
+        assert!(startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "   ",
+            "--model",
+            "openrouter/deepseek/deepseek-v4-pro"
+        ])));
+        assert!(startup_oauth_refresh_required(&parse(&[
+            "--model",
+            "anthropic/claude-sonnet-4-6"
+        ])));
+        assert!(startup_oauth_refresh_required(&parse(&[])));
     }
 
     #[test]

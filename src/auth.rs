@@ -470,6 +470,62 @@ pub(crate) fn reset_credential_rings_for_tests() {
     }
 }
 
+/// One provider whose stored OAuth credential could not be refreshed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthRefreshFailure {
+    /// Provider id exactly as stored in `auth.json`.
+    pub provider: String,
+    /// Refresh error text. May quote a provider error body, so treat it as
+    /// diagnostic output rather than something to persist.
+    pub error: String,
+}
+
+/// Per-provider outcome of an OAuth refresh pass (gh #218).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OAuthRefreshReport {
+    /// Providers whose credential was refreshed and stored.
+    pub refreshed: Vec<String>,
+    /// Providers whose refresh failed; their stale credential is left in place.
+    pub failed: Vec<OAuthRefreshFailure>,
+}
+
+impl OAuthRefreshReport {
+    /// The failure for `provider`, matching canonical ids and aliases
+    /// case-insensitively (`open-router` finds an `openrouter` entry).
+    #[must_use]
+    pub fn failure_for(&self, provider: &str) -> Option<&OAuthRefreshFailure> {
+        self.failed
+            .iter()
+            .find(|failure| provider_ids_match(&failure.provider, provider))
+    }
+
+    /// Provider ids of every failed refresh, for a one-line diagnostic.
+    #[must_use]
+    pub fn failed_provider_ids(&self) -> Vec<&str> {
+        self.failed
+            .iter()
+            .map(|failure| failure.provider.as_str())
+            .collect()
+    }
+
+    /// Collapse into the historical aggregate result: an error naming every
+    /// failed provider, `Ok` when nothing failed.
+    pub fn into_result(self) -> Result<()> {
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        let failed = self
+            .failed
+            .iter()
+            .map(|failure| format!("{} ({})", failure.provider, failure.error))
+            .collect::<Vec<_>>();
+        Err(Error::auth(format!(
+            "OAuth token refresh failed for: {}",
+            failed.join(", ")
+        )))
+    }
+}
+
 impl AuthStorageLoadFailure {
     #[must_use]
     pub fn into_error(self) -> Error {
@@ -949,22 +1005,57 @@ fn classify_auth_lock_error(error: std::io::Error) -> AuthStorageLoadFailure {
     }
 }
 
+/// True when the read lock could not be created because the credential
+/// directory is not writable (`EACCES`/`EPERM`/`EROFS`): a read-only
+/// `~/.pi/agent`, typical of sandboxed or jailed deployments (gh #217).
+fn lock_denied_by_read_only_store(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    ) || matches!(error.raw_os_error(), Some(1 | 13 | 30))
+}
+
+/// Acquire the auth read lock, degrading to an unlocked read when the store
+/// is read-only (gh #217). Nothing can be persisted into a read-only
+/// directory, so the lock protects against nothing there; reading the
+/// credentials as-is keeps `--api-key`/env-key runs working instead of
+/// aborting at startup with `auth lock: Permission denied`.
+fn acquire_auth_read_lock<L>(
+    path: &Path,
+    acquire: impl FnOnce() -> std::io::Result<L>,
+) -> std::result::Result<Option<L>, AuthStorageLoadFailure> {
+    match acquire() {
+        Ok(lock) => Ok(Some(lock)),
+        Err(error) if lock_denied_by_read_only_store(&error) => {
+            tracing::warn!(
+                event = "pi.auth.read_only_store",
+                path = %path.display(),
+                error = %error,
+                "credential directory is not writable; reading auth.json without a lock (credentials cannot be persisted or refreshed on disk)"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(classify_auth_lock_error(error)),
+    }
+}
+
 fn auth_load_other_error(context: &str, error: &std::io::Error) -> AuthStorageLoadFailure {
     AuthStorageLoadFailure::Other(Error::auth(format!("{context}: {error}")))
 }
 
+/// `_lock` is `None` only for a read-only credential store (gh #217).
 #[cfg(unix)]
 struct GuardedAuthRead {
     content: Option<String>,
     parent_directory: File,
-    _lock: crate::file_lock::DirLockAt,
+    _lock: Option<crate::file_lock::DirLockAt>,
 }
 
 #[cfg(windows)]
 struct GuardedAuthRead {
     content: Option<String>,
     operation_path: PathBuf,
-    _lock: crate::file_lock::DirLock,
+    _lock: Option<crate::file_lock::DirLock>,
     _parent_guards: Vec<WindowsAuthDirectoryGuard>,
 }
 
@@ -972,7 +1063,7 @@ struct GuardedAuthRead {
 struct GuardedAuthRead {
     content: Option<String>,
     operation_path: PathBuf,
-    _lock: crate::file_lock::DirLock,
+    _lock: Option<crate::file_lock::DirLock>,
 }
 
 #[cfg(unix)]
@@ -992,9 +1083,9 @@ where
         Err(error) => return Err(auth_load_other_error("auth.json parent directory", &error)),
     };
     let target_name = target_name.to_os_string();
-    let lock =
+    let lock = acquire_auth_read_lock(path, || {
         crate::file_lock::DirLockAt::acquire_for(&parent_directory, &target_name, lock_timeout)
-            .map_err(classify_auth_lock_error)?;
+    })?;
     before_read().map_err(|error| auth_load_other_error("auth read preparation", &error))?;
     if !auth_parent_identity_matches(path, &parent_directory)
         .map_err(|error| auth_load_other_error("auth.json parent identity", &error))?
@@ -1027,8 +1118,9 @@ where
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(auth_load_other_error("auth.json parent directory", &error)),
     };
-    let lock = crate::file_lock::DirLock::acquire_for(&operation_path, lock_timeout)
-        .map_err(classify_auth_lock_error)?;
+    let lock = acquire_auth_read_lock(path, || {
+        crate::file_lock::DirLock::acquire_for(&operation_path, lock_timeout)
+    })?;
     validate_windows_auth_parent(&parent_guards)
         .map_err(|error| auth_load_other_error("auth.json parent identity", &error))?;
     before_read().map_err(|error| auth_load_other_error("auth read preparation", &error))?;
@@ -1066,8 +1158,9 @@ where
     {
         return Ok(None);
     }
-    let lock = crate::file_lock::DirLock::acquire_for(&operation_path, lock_timeout)
-        .map_err(classify_auth_lock_error)?;
+    let lock = acquire_auth_read_lock(path, || {
+        crate::file_lock::DirLock::acquire_for(&operation_path, lock_timeout)
+    })?;
     before_read().map_err(|error| auth_load_other_error("auth read preparation", &error))?;
     let content = read_auth_file_bounded(&operation_path)
         .map_err(|error| auth_load_other_error("auth.json", &error))?;
@@ -1370,6 +1463,19 @@ impl AuthStorage {
     /// Load auth.json asynchronously (creates empty if missing).
     pub async fn load_async(path: PathBuf) -> Result<Self> {
         asupersync::runtime::spawn_blocking(move || Self::load(path)).await
+    }
+
+    /// An empty store bound to `path` without touching the filesystem.
+    ///
+    /// Used when the stored credentials are unavailable but the run does not
+    /// need them (an explicit `--api-key`, gh #217): every lookup misses and
+    /// a later `save` writes to `path` like a freshly created store would.
+    #[must_use]
+    pub fn empty_at(path: PathBuf) -> Self {
+        Self {
+            path,
+            entries: HashMap::new(),
+        }
     }
 
     /// Persist auth.json (atomic write + permissions).
@@ -1729,15 +1835,43 @@ impl AuthStorage {
         self.refresh_expired_oauth_tokens_with_client(&client).await
     }
 
+    /// Like [`Self::refresh_expired_oauth_tokens`] but never fails as a
+    /// whole: returns the per-provider [`OAuthRefreshReport`] (gh #218).
+    pub async fn refresh_expired_oauth_tokens_report(&mut self) -> OAuthRefreshReport {
+        let client = crate::http::client::Client::new();
+        self.refresh_expired_oauth_tokens_report_with_client(&client)
+            .await
+    }
+
     /// Refresh any expired OAuth tokens using the provided HTTP client.
     ///
     /// This is primarily intended for tests and deterministic harnesses (e.g. VCR playback),
     /// but is also useful for callers that want to supply a custom HTTP implementation.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// Returns an error naming every provider whose refresh failed (after
+    /// attempting all of them). Callers that must not abort on an unrelated
+    /// provider's stale credential use
+    /// [`Self::refresh_expired_oauth_tokens_report_with_client`] instead.
     pub async fn refresh_expired_oauth_tokens_with_client(
         &mut self,
         client: &crate::http::client::Client,
     ) -> Result<()> {
+        self.refresh_expired_oauth_tokens_report_with_client(client)
+            .await
+            .into_result()
+    }
+
+    /// Refresh every stored OAuth credential that is expired or about to
+    /// expire, reporting the outcome per provider (gh #218).
+    ///
+    /// Each refresh is attempted independently; one provider's failure never
+    /// prevents another's refresh, and the caller decides which failures
+    /// matter (typically only the provider the run actually selected).
+    #[allow(clippy::too_many_lines)]
+    pub async fn refresh_expired_oauth_tokens_report_with_client(
+        &mut self,
+        client: &crate::http::client::Client,
+    ) -> OAuthRefreshReport {
         let now = chrono::Utc::now().timestamp_millis();
         let proactive_deadline = now + PROACTIVE_REFRESH_WINDOW_MS;
         let mut refreshes: Vec<OAuthRefreshRequest> = Vec::new();
@@ -1766,7 +1900,7 @@ impl AuthStorage {
             }
         }
 
-        let mut failed_providers = Vec::new();
+        let mut report = OAuthRefreshReport::default();
         let mut needs_save = false;
 
         for (provider, access_token, refresh_token, stored_token_url, stored_client_id) in refreshes
@@ -1832,12 +1966,16 @@ impl AuthStorage {
 
             match result {
                 Ok(refreshed) => {
-                    self.entries.insert(provider, refreshed);
+                    self.entries.insert(provider.clone(), refreshed);
                     needs_save = true;
+                    report.refreshed.push(provider);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to refresh OAuth token for {provider}: {e}");
-                    failed_providers.push(format!("{provider} ({e})"));
+                    report.failed.push(OAuthRefreshFailure {
+                        provider,
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -1846,16 +1984,7 @@ impl AuthStorage {
             tracing::warn!("Failed to save auth.json after refreshing OAuth tokens: {e}");
         }
 
-        if !failed_providers.is_empty() {
-            // Return an error to signal that at least some refreshes failed,
-            // but only after attempting all of them.
-            return Err(Error::auth(format!(
-                "OAuth token refresh failed for: {}",
-                failed_providers.join(", ")
-            )));
-        }
-
-        Ok(())
+        report
     }
 
     /// Refresh expired OAuth tokens for extension-registered providers.
@@ -6826,6 +6955,105 @@ mod tests {
             AuthStorage::load_with_lock_timeout_classified(auth_path, Duration::from_secs(1))
                 .expect_err("an unreadable auth file must be a non-contention failure");
         assert!(matches!(read_failure, AuthStorageLoadFailure::Other(_)));
+    }
+
+    /// gh #217: a read-only credential directory (sandbox/jail) must not be
+    /// fatal — the store is read without a lock and stored keys still resolve.
+    #[test]
+    #[cfg(unix)]
+    fn test_auth_storage_loads_from_read_only_directory_without_lock() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping: root ignores directory permissions");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store_dir = dir.path().join("agent");
+        std::fs::create_dir(&store_dir).expect("create store dir");
+        let auth_path = store_dir.join("auth.json");
+        let mut seeded = AuthStorage::load(auth_path.clone()).expect("load fresh store");
+        seeded.set(
+            "openai",
+            AuthCredential::ApiKey {
+                // ubs:ignore test fixture credential, not live secret.
+                key: "stored-openai-key".to_string(),
+            },
+        );
+        seeded.save().expect("seed auth.json");
+
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("make store dir read-only");
+        let loaded =
+            AuthStorage::load_with_lock_timeout_classified(auth_path, Duration::from_millis(200));
+        let restore = std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o755));
+
+        let loaded = loaded.expect("read-only store must load without a lock");
+        assert_eq!(
+            loaded.api_key("openai").as_deref(),
+            Some("stored-openai-key"),
+            "credentials in a read-only store must still resolve"
+        );
+        assert!(
+            !store_dir.join("auth.json.lock").exists(),
+            "no lock entry can exist in a read-only directory"
+        );
+        restore.expect("restore store dir permissions");
+    }
+
+    /// gh #218: a refresh pass reports each provider on its own; one
+    /// provider's dead refresh token neither blocks the others nor hides which
+    /// provider failed.
+    #[test]
+    fn test_refresh_report_isolates_failed_providers() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let auth_path = dir.path().join("auth.json");
+            let good_url = spawn_json_server(
+                200,
+                r#"{"access_token":"fresh-b","refresh_token":"next-b","expires_in":3600}"#,
+            );
+            let bad_url = spawn_json_server(401, r#"{"error":"invalid_grant"}"#);
+            let oauth = |token_url: String| AuthCredential::OAuth {
+                extra: HashMap::new(),
+                // ubs:ignore test fixture credential, not live secret.
+                access_token: "expired".to_string(),
+                // ubs:ignore test fixture credential, not live secret.
+                refresh_token: "old".to_string(),
+                expires: 0,
+                token_url: Some(token_url),
+                client_id: Some("client".to_string()),
+            };
+            let mut auth = AuthStorage {
+                path: auth_path,
+                entries: HashMap::new(),
+            };
+            auth.entries
+                .insert("custom-stale".to_string(), oauth(bad_url));
+            auth.entries
+                .insert("custom-live".to_string(), oauth(good_url));
+
+            let client = crate::http::client::Client::new();
+            let report = auth
+                .refresh_expired_oauth_tokens_report_with_client(&client)
+                .await;
+
+            assert_eq!(report.refreshed, vec!["custom-live".to_string()]);
+            assert_eq!(report.failed_provider_ids(), vec!["custom-stale"]);
+            assert!(report.failure_for("CUSTOM-STALE").is_some());
+            assert!(report.failure_for("custom-live").is_none());
+            assert_eq!(
+                auth.api_key("custom-live").as_deref(),
+                Some("fresh-b"),
+                "the live provider must be refreshed despite the sibling failure"
+            );
+            let err = report
+                .into_result()
+                .expect_err("aggregate result still reports the failure");
+            assert!(err.to_string().contains("custom-stale"), "{err}");
+            assert!(!err.to_string().contains("custom-live"), "{err}");
+        });
     }
 
     #[test]

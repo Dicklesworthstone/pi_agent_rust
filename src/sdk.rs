@@ -2263,7 +2263,15 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     )?;
 
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
-    auth.refresh_expired_oauth_tokens().await?;
+    // gh #218: refresh per provider; only a failure for the provider this
+    // session actually selects is an error (checked after selection below).
+    let oauth_refresh = auth.refresh_expired_oauth_tokens_report().await;
+    if !oauth_refresh.failed.is_empty() {
+        tracing::warn!(
+            providers = ?oauth_refresh.failed_provider_ids(),
+            "stored OAuth credentials could not be refreshed; ignored unless the session selects one of them"
+        );
+    }
 
     let raw_package_dir = options
         .package_dir
@@ -2339,6 +2347,14 @@ pub(crate) async fn create_agent_session_deferred_mcp(
 
     let api_key = app::resolve_api_key(&auth, &cli, &selection.model_entry)
         .map_err(|err| Error::validation(err.to_string()))?;
+    if cli.api_key.is_none()
+        && let Some(failure) = oauth_refresh.failure_for(&selection.model_entry.model.provider)
+    {
+        return Err(Error::auth(format!(
+            "OAuth token refresh failed for: {} ({})",
+            failure.provider, failure.error
+        )));
+    }
 
     let stream_options =
         build_stream_options_with_optional_key(&config, api_key, &selection, &session);
