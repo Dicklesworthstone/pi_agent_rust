@@ -9,7 +9,7 @@
 > the baseline for filling missing in_process methods and detecting changes when tracking
 > upstream releases.
 >
-> - **Alignment target**: earendil-works/pi's `AgentSessionLike` interface (agegr/pi-web `lib/pi-types.ts`)
+> - **Alignment target**: earendil-works/pi's `AgentSessionLike` interface (agegr/pi-web `lib/pi-types.ts`, tracked at **v0.84.4**)
 > - **Aligned object**: defims/picrab's `AgentSessionHandle` (in_process path, `src/sdk.rs`)
 > - **Rust crate lib name**: `pi` (Cargo package name `pi_agent_rust`)
 
@@ -40,7 +40,7 @@ requirements the fork must uphold while filling gaps / tracking upstream:
 
 | TS SDK (`AgentSessionLike`) | Rust (`AgentSessionHandle`) | Notes |
 |---|---|---|
-| `prompt(text, options?)` | `prompt(input, on_event)` / `prompt_with_abort(input, signal, on_event)` | 🟡 Rust splits into with/without-abort variants; options (images/streamingBehavior) go through SessionOptions |
+| `prompt(text, options?)` | `prompt(input, on_event)` / `prompt_with_abort(input, signal, on_event)` / `prompt_images_with_abort(input, images, signal, on_event)` | 🟡 Rust has 3 variants; TS images go through options.images, Rust has a dedicated variant (fork commit e285868e) |
 | `abort()` | `new_abort_handle()` + `AbortHandle.abort()` | 🟡 Rust requires a pre-built AbortHandle+Signal |
 | `subscribe(listener)` | `subscribe(listener)` / `unsubscribe(id)` | ✅ Rust adds an explicit unsubscribe |
 | `dispose()` | `into_inner()` | 🟡 Rust consumes the handle to take the inner session |
@@ -129,6 +129,9 @@ pi-web-rust wires this via `pi::sdk::SessionIndex` + `pi::sdk::SessionMeta` + `p
 |---|---|---|
 | `settingsManager` (readonly) | none | ❌ missing settings manager |
 | `modelRuntime` (readonly) | `agent.model_registry()` / `agent.auth_storage()` | ✅ pub getters added |
+| `agent.prepareNextTurnWithContext(context, signal?)` | none | ❌ new in upstream 0.84.4 |
+
+> **Upstream 0.84.4 type expansions** (no new rows): `ToolInfo` now has `parameters?`, `promptGuidelines?`, `sourceInfo?`; `ResourceLoaderLike` added `getAgentsFiles()`; `executeBash` options added `operations?: BashOperations`. These are return-type/param-type expansions without new handle methods.
 
 ## 9. Extension system (✅ wired 2026-08-20/22)
 
@@ -144,32 +147,43 @@ over `respond_ui`.
 | `resourceLoader` (readonly) | auto-load:skills 四源(`f74dd3a8`)+ 扩展自动发现(`88abc5f1`, `SessionOptions::no_extensions`) | ✅ |
 | `bindExtensions?` | `enable_extensions_with_policy`(显式路径注入面) | ✅ |
 
+## 10. Custom messages (❌ new gap in 0.84.4)
+
+Upstream `@earendil-works/pi-coding-agent` v0.84.4 (2026-08-28) added a new method to
+`AgentSessionLike` for sending arbitrary custom messages through the session.
+
+| TS SDK | Rust | Status |
+|---|---|---|
+| `sendCustomMessage<T>(message, options?)` | none | ❌ new method in upstream 0.84.4; no Rust equivalent yet |
+
 ---
 
 ## Handle-only extras (not in AgentSessionLike)
 
 The in_process handle also exposes Rust-side additions with no TS SDK counterpart:
 `messages()`, `state()`, `thinking()` / `thinking_level()`, `max_tokens()` / `set_max_tokens()`,
-`listeners()` / `listeners_mut()`, `session()` / `session_mut()`, `extension_manager()` /
+`listeners()` / `listeners_mut()`, `session()` / `session_mut()`, `compaction_settings()`,
+`ask_tool()`, `with_session()`, `extension_manager()` /
 `has_extensions()` / `extension_region()`, `from_session_with_listeners()`. They mirror RPC
 names or serve Rust-native wiring; additive, not counted in alignment.
 
-## Alignment progress
+## Alignment progress (incl. upstream 0.84.4)
 
 | Category | Total | ✅ aligned | ❌ gap |
 |---|---|---|---|
-| Session core | 16 | 14 | 2 (isStreaming / isCompacting — snap 侧已有,SDK getter 待加) |
-| Stats/bash/compaction | 6 | 6 | 0 (compact 现返 CompactionResultInfo 统计) |
-| Queue management | 4 | 3 | 1 (set_steering_mode/set_follow_up_mode 已有;queue 查询 getter 待加) |
-| Tool management | 3 | 2 | 1 (`Agent::tools()` + extension_tool_defs;`setTools` 走 rpc 面) |
-| Navigation | 1 | 1 | 0 (`fork`/`switch_session`) |
-| Bash helpers | 2 | 2 | 0 (`bash`/`abort_bash`) |
-| Compaction/retry/context | 4 | 4 | 0 (`set_auto_retry`/`set_auto_compaction`/`abort_retry`/`continue_turn`) |
-| Settings/model | 2 | 2 | 0 |
+| Session core | 16 | 12 | 4 |
+| Stats/bash/compaction | 6 | 5 | 1 |
+| Queue management | 4 | 0 | 4 |
+| Tool management | 3 | 2 | 1 |
+| Navigation | 1 | 1 | 0 |
+| Bash helpers | 2 | 1 | 1 |
+| Compaction/retry/context | 4 | 4 | 0 |
+| Settings/model (incl. agent hook) | 3 | 1 | 2 |
 | Extensions | 4 | 4 | 0 |
-| **Total** | **42** | **38** | **4** |
+| Custom messages (§10) | 1 | 0 | 1 |
+| **Total** | **44** | **30** | **14** |
 
-**Aligned rate: 90%** (38/42;剩余 4 项为 getter 型小面,均有运行时等价物在 picrab-web snap 层)。
+**Aligned rate: 68%** (30/44; upstream `@earendil-works/pi-coding-agent` tracked at **v0.84.4**).
 
 ## Fork fill log (defims/picrab)
 
@@ -187,12 +201,20 @@ names or serve Rust-native wiring; additive, not counted in alignment.
 | `86e8cac6` | SessionMeta extension (first_message/parent_session_path/modified_ms) + build_session_context free function + sdk exports SessionIndex/SessionMeta | SessionManager.listAll / buildSessionContext |
 | `adfdc96c` | resolve_model_scope_with_diagnostics + AgentSession model_registry()/auth_storage() getters | resolveModelScopeWithDiagnostics / modelRuntime readonly |
 | `36fdac58` | createAgentSessionServices / FromServices split | createAgentSessionServices / createAgentSessionFromServices |
+| `e285868e` | prompt_images_with_abort — text+image content blocks | prompt with images (upstream parity) |
+| `87af990e` | get_messages / get_state RPC-name aliases on in_process handle | RPC compatibility aliases |
+| `4f292bba` | SessionOptions::secrets — embedded credential hygiene seam | secrets management |
+| `40e48d4c` | SessionOptions::models_path — registry override for test isolation | models path override |
 
 ## Upstream tracking flow
 
+This document tracks **`@earendil-works/pi-coding-agent` v0.84.4** (2026-08-28).
+The local `picrab-web` submodule pins these dependencies at **v0.84.2**
+(`lib/pi-types.ts` at commit `4d26aeb`).
+
 ```bash
 # 1. When earendil-works/pi cuts a release, update the AgentSessionLike interface
-#    and check §1-9 of this document for added/changed methods
+#    and check §1-10 of this document for added/changed methods
 
 # 2. Fill the gaps in this repository (defims/picrab)
 # add methods to the AgentSessionHandle impl block in src/sdk.rs

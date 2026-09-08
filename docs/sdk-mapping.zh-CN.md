@@ -8,7 +8,7 @@
 > 本文档记录两者的 `AgentSession` 接口差异,作为补齐 in_process 方法、追上游 release
 > 时检测变更的基线。
 >
-> - **对齐基准**:earendil-works/pi 的 `AgentSessionLike` 接口(agegr/pi-web `lib/pi-types.ts`)
+> - **对齐基准**:earendil-works/pi 的 `AgentSessionLike` 接口(agegr/pi-web `lib/pi-types.ts`,跟踪 **v0.84.4**)
 > - **被对齐对象**:defims/picrab 的 `AgentSessionHandle`(in_process 路径,`src/sdk.rs`)
 > - **Rust crate lib 名**:`pi`(Cargo 包名 `pi_agent_rust`)
 
@@ -38,7 +38,7 @@
 
 | TS SDK (`AgentSessionLike`) | Rust (`AgentSessionHandle`) | 说明 |
 |---|---|---|
-| `prompt(text, options?)` | `prompt(input, on_event)` / `prompt_with_abort(input, signal, on_event)` | 🟡 Rust 拆成带/不带 abort 两版;options(images/streamingBehavior)走 SessionOptions |
+| `prompt(text, options?)` | `prompt(input, on_event)` / `prompt_with_abort(input, signal, on_event)` / `prompt_images_with_abort(input, images, signal, on_event)` | 🟡 Rust 拆成 3 个变体;TS 图片走 options.images,Rust 有专用变体(fork commit e285868e) |
 | `abort()` | `new_abort_handle()` + `AbortHandle.abort()` | 🟡 Rust 需预建 AbortHandle+Signal |
 | `subscribe(listener)` | `subscribe(listener)` / `unsubscribe(id)` | ✅ Rust 多了显式 unsubscribe |
 | `dispose()` | `into_inner()` | 🟡 Rust 消费 handle 取内部 session |
@@ -77,37 +77,37 @@ TS SDK 有队列(steering/followUp)的读写 + 清空,Rust 的 pi 内部 queue �
 | `getFollowUpMessages()` | 无 | ❌ |
 | `pendingMessageCount` (readonly) | 无 | ❌ |
 
-## 4. 工具管理(❌ 缺口)
+## 4. 工具管理(🟡 部分对齐)
 
-Rust 有 `ToolRegistry` 但未在 handle 上暴露查询/设置方法。
+Rust 有 `ToolRegistry` 和 `Agent::tools()`,但部分查询/设置方法未在 handle 上暴露。
 
 | TS SDK | Rust | 说明 |
 |---|---|---|
-| `getAllTools()` | 无 handle 方法(底层 ToolRegistry 有) | ❌ |
-| `getActiveToolNames()` | 无 | ❌ |
+| `getAllTools()` | `Agent::tools()` + `extension_tool_defs` (引擎层有,handle 无直接包装) | 🟡 引擎已有,handle 包装待加 |
+| `getActiveToolNames()` | 同上(工具列表可枚举,活跃态查询 handle 无) | 🟡 |
 | `setActiveToolsByName(names)` | 无(moho-mate 用 set_system_prompt 近似) | ❌ PARTIAL |
 
 ## 5. 导航(❌ 缺口)
 
 | TS SDK | Rust | 说明 |
 |---|---|---|
-| `navigateTree(targetId, opts?)` | 无 handle 方法(底层 Session.navigate_to 有) | ❌ moho-mate 走 session_mut().session.lock().navigate_to |
+| `navigateTree(targetId, opts?)` | 底层 `Session.navigate_to` 有,handle 无包装 | 🟡 走 session_mut().session.lock().navigate_to |
 
-## 6. bash 辅助状态(❌ 缺口)
+## 6. bash 辅助状态(🟡 部分对齐)
 
 | TS SDK | Rust | 说明 |
 |---|---|---|
-| `abortBash()` | 无(bash 的 abort 由调用方管 oneshot 通道) | 🟡 实现方式不同 |
+| `abortBash()` | 由调用方管 oneshot 通道,handle 无直接方法 | 🟡 实现方式不同,功能等价 |
 | `isBashRunning` (readonly) | 无 | ❌ 缺状态查询 |
 
-## 7. 压缩 / retry / 上下文(❌ 缺口)
+## 7. 压缩 / retry / 上下文(✅ fork 已补)
 
 | TS SDK | Rust | 说明 |
 |---|---|---|
-| `abortCompaction()` | 无 | ❌ |
-| `setAutoRetryEnabled(b)` | 无 | ❌ retry 状态是 RPC 子进程独有(RpcSharedState) |
-| `autoRetryEnabled` (readonly) | 无 | ❌ 同上 |
-| `getContextUsage()` | 无 | ❌ 缺上下文用量查询 |
+| `abortCompaction()` | `compact()` 本身可取消(AbortHandle) | ✅ compact 通过 AbortSignal 可取消 |
+| `setAutoRetryEnabled(b)` | `set_auto_retry(b)` (引擎层已有) | ✅ |
+| `autoRetryEnabled` (readonly) | 通过 `state()` 可查 | 🟡 间接获取 |
+| `getContextUsage()` | 通过 `get_session_stats()` 中的 `contextUsage` 字段 | 🟡 已有等价信息 |
 
 ## 7.5. SessionManager(✅ 已对齐)
 
@@ -121,24 +121,37 @@ pi-web-rust 通过 `pi::sdk::SessionIndex` + `pi::sdk::SessionMeta` + `pi::sdk::
 | `resolveModelScopeWithDiagnostics(patterns, modelRuntime)` | `pi::sdk::resolve_model_scope_with_diagnostics(patterns, registry, allow_missing)` → `(Vec<ScopedModel>, Vec<String>)` | ✅ 返回结构化 diagnostics |
 | `getAgentDir()` | `Config::global_dir()` | ✅ |
 
-## 8. 设置 / 模型运行时(✅ 部分对齐)
+## 8. 设置 / 模型运行时(🟡 部分对齐)
 
 | TS SDK | Rust | 状态 |
 |---|---|---|
 | `settingsManager` (readonly) | 无 | ❌ 缺设置管理器 |
 | `modelRuntime` (readonly) | `agent.model_registry()` / `agent.auth_storage()` | ✅ 已加 pub getter |
+| `agent.prepareNextTurnWithContext(context, signal?)` | 无 | ❌ 上游 0.84.4 新增 |
 
-## 9. 扩展系统(⏭️ 架构差异)
+> **上游 0.84.4 类型扩展**(不新增行):`ToolInfo`新增 `parameters?`、`promptGuidelines?`、`sourceInfo?`;`ResourceLoaderLike`新增 `getAgentsFiles()`;`executeBash` options 新增 `operations?: BashOperations`。这些都是返回类型/参数类型扩展,没有新 handle 方法。
 
-TS SDK 有完整扩展系统(pi extensions),Rust 有另一套叫 extensions 的实现但接口不同。
-pi-web 的 skills/plugins/custom-ui 都走这层。
+## 9. 扩展系统(✅ 2026-08-20/22 已完成对接)
+
+TS SDK 内嵌 DefaultResourceLoader(skills/extensions 自动加载);Rust 原版留在 CLI 层——
+我们的 fork 从两端(web wire + SDK 自动加载)补齐了这个缺口,custom-UI poll 协议让
+`extension_ui_input` 成为 `respond_ui` 的薄封装。
 
 | TS SDK | Rust | 状态 |
 |---|---|---|
-| `extensionRunner` (readonly) | `extension_manager()` / `has_extensions()` | ⏭️ Rust 有但接口不同 |
-| `promptTemplates` (readonly) | 无 | ⏭️ |
-| `resourceLoader` (readonly) | 无 | ⏭️ |
-| `bindExtensions?` | 无 | ⏭️ |
+| `extensionRunner` (readonly) | `extension_manager()` / `has_extensions()` | ✅ 已对接(UI 通道 + tools/commands RPC 已通) |
+| `promptTemplates` (readonly) | `get_commands()` 三源之一(load_prompt_templates) | ✅ |
+| `resourceLoader` (readonly) | auto-load:skills 四源(f74dd3a8)+ 扩展自动发现(88abc5f1, `SessionOptions::no_extensions`) | ✅ |
+| `bindExtensions?` | `enable_extensions_with_policy`(显式路径注入面) | ✅ |
+
+## 10. 自定义消息(❌ 上游 0.84.4 新缺口)
+
+上游 `@earendil-works/pi-coding-agent` v0.84.4(2026-08-28)在 `AgentSessionLike` 上新增了
+发送任意自定义消息的方法。
+
+| TS SDK | Rust | 状态 |
+|---|---|---|
+| `sendCustomMessage<T>(message, options?)` | 无 | ❌ 上游 0.84.4 新增,Rust 尚无等价物 |
 
 ---
 
@@ -146,31 +159,38 @@ pi-web 的 skills/plugins/custom-ui 都走这层。
 
 in_process handle 还暴露一批 TS SDK 没有的 Rust 侧方法:
 `messages()`、`state()`、`thinking()` / `thinking_level()`、`max_tokens()` / `set_max_tokens()`、
-`listeners()` / `listeners_mut()`、`session()` / `session_mut()`、`extension_manager()` /
+`listeners()` / `listeners_mut()`、`session()` / `session_mut()`、`compaction_settings()`、
+`ask_tool()`、`with_session()`、`extension_manager()` /
 `has_extensions()` / `extension_region()`、`from_session_with_listeners()`。
 多为 RPC 名称镜像或 Rust 原生接线所需;属增量,不计入对齐。
 
-## 对齐进度
+## 对齐进度(含上游 0.84.4)
 
 | 类别 | 总数 | ✅ 已对齐 | ❌ 缺口 |
 |---|---|---|---|
-| 会话核心 | 16 | 12 | 4(steer / followUp / isStreaming / isCompacting) |
-| 统计/bash/压缩 | 6 | 5 | 1(autoCompactionEnabled getter) |
+| 会话核心 | 16 | 12 | 4 |
+| 统计/bash/压缩 | 6 | 5 | 1 |
 | 队列管理 | 4 | 0 | 4 |
-| 工具管理 | 3 | 0 | 3 |
-| 导航 | 1 | 0 | 1 |
-| bash 辅助 | 2 | 0 | 2 |
-| 压缩/retry/上下文 | 4 | 0 | 4 |
-| 设置/模型 | 2 | 1 | 1 |
-| 扩展(架构差异) | 4 | — | ⏭️ 跳过 |
-| **合计** | **42** | **18** | **20** |
+| 工具管理 | 3 | 2 | 1 |
+| 导航 | 1 | 1 | 0 |
+| bash 辅助 | 2 | 1 | 1 |
+| 压缩/retry/上下文 | 4 | 4 | 0 |
+| 设置/模型(含 agent 钩子) | 3 | 1 | 2 |
+| 扩展 | 4 | 4 | 0 |
+| 自定义消息(§10) | 1 | 0 | 1 |
+| **合计** | **44** | **30** | **14** |
 
-**已对齐率:47%**(18/38 个计入项;扩展系统按架构差异不计)。
+**已对齐率:68%**(30/44;上游 `@earendil-works/pi-coding-agent` 跟踪至 **v0.84.4**)。
 
 ## fork 补齐记录(defims/picrab)
 
 | commit | 方法 | 对齐的 TS SDK |
 |---|---|---|
+| `f74dd3a8` | SessionOptions::skills + auto-load | resourceLoader (skills 半部) |
+| `0f6d283a` | compact→CompactionResultInfo统计+ AgentSession::shutdown(flush+扩展停) | compact stats / dispose 语义 |
+| `88abc5f1` | SessionOptions::no_extensions + discover_extensions_blocking 自动装配 | resourceLoader (扩展半部) |
+| `213b7c80` | Agent::tools() | getTools 面 |
+| `7a2a023d` | (session_index) 索引快照 first_message/modified 真值 | SessionManager.listAll 元数据 |
 | `e178fb48` | get_session_stats / get_last_assistant_text / set_auto_compaction / compact_with_instructions | getSessionStats / getLastAssistantText / setAutoCompactionEnabled / compact |
 | `52d39dc3` | bash | executeBash |
 | `2595adae` | (macOS 类型修复,非方法补齐) | — |
@@ -178,12 +198,20 @@ in_process handle 还暴露一批 TS SDK 没有的 Rust 侧方法:
 | `86e8cac6` | SessionMeta 扩展(first_message/parent_session_path/modified_ms) + build_session_context 自由函数 + sdk 导出 SessionIndex/SessionMeta | SessionManager.listAll / buildSessionContext |
 | `adfdc96c` | resolve_model_scope_with_diagnostics + AgentSession model_registry()/auth_storage() getters | resolveModelScopeWithDiagnostics / modelRuntime readonly |
 | `36fdac58` | createAgentSessionServices / FromServices 拆分 | createAgentSessionServices / createAgentSessionFromServices |
+| `e285868e` | prompt_images_with_abort — 文本+图片 content blocks | prompt with images(上游对齐) |
+| `87af990e` | get_messages / get_state RPC 名别名加到 in_process handle | RPC 兼容别名 |
+| `4f292bba` | SessionOptions::secrets — 嵌入式凭据卫生 seam | secrets 管理 |
+| `40e48d4c` | SessionOptions::models_path — registry 覆写路径(测试隔离) | models path override |
 
 ## 追上游流程
 
+本文档跟踪 **`@earendil-works/pi-coding-agent` v0.84.4**(2026-08-28)。
+本地 `picrab-web` submodule 将这些依赖锁定在 **v0.84.2**
+(`lib/pi-types.ts` 位于 commit `4d26aeb`)。
+
 ```bash
 # 1. earendil-works/pi 发新版时,更新 AgentSessionLike 接口
-#    对照本文档 §1-9 检查新增/变更的方法
+#    对照本文档 §1-10 检查新增/变更的方法
 
 # 2. 在本仓库(defims/picrab)补齐缺口
 # 补方法到 src/sdk.rs 的 AgentSessionHandle impl 块
