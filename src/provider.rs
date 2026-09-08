@@ -301,6 +301,38 @@ pub struct Model {
 pub enum InputType {
     Text,
     Image,
+    /// Inline video input (`ContentBlock::Media` with a `video/*` MIME type).
+    /// Declared by Gemini-family models (gh #212).
+    Video,
+    /// Inline audio input (`ContentBlock::Media` with an `audio/*` MIME type).
+    /// Declared by Gemini-family models (gh #212).
+    Audio,
+}
+
+impl InputType {
+    /// Catalog spelling of this input type (`"text"`, `"image"`, `"video"`,
+    /// `"audio"`) — the inverse of [`InputType::parse`].
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Audio => "audio",
+        }
+    }
+
+    /// Parse a catalog / `models.json` / extension-registration input type.
+    /// Unknown labels return `None` so callers can decide between dropping
+    /// and warning.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "image" => Some(Self::Image),
+            "video" => Some(Self::Video),
+            "audio" => Some(Self::Audio),
+            _ => None,
+        }
+    }
 }
 
 /// Model pricing per million tokens.
