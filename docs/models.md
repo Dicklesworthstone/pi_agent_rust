@@ -54,11 +54,33 @@ The root object contains a `providers` map.
 | `api` | string | Protocol adapter (e.g. `openai-completions`, `openai-responses`, `anthropic-messages`, `google-generative-ai`, `google-vertex`) |
 | `apiKey` | string | Fallback API key, env var name, or shell command after normal runtime credential resolution (see Secret Resolution) |
 | `models` | object[] | List of models. If omitted, provider settings override built-in config for that provider. |
+| `modelOverrides` | object | Per-model patches keyed by model id (any Model Config field except `id`, plus `compat`). Never replaces the catalog: a known id is patched, an unknown id under a bundled provider is added from that provider's defaults. |
 | `headers` | object | Custom HTTP headers |
 | `authHeader` | boolean | If true, sends key in `Authorization: Bearer <key>` |
 | `compat` | object | Compatibility flags |
 
 If `models` is provided, built-in models for that provider are replaced with the list in `models.json`.
+
+`modelOverrides` is the way to tune one model of a bundled provider without redefining the provider. The common case is pinning OpenRouter routing for an account with an upstream-provider allow-list (same spelling as upstream pi, so a shared `models.json` works for both):
+
+```json
+{
+  "providers": {
+    "openrouter": {
+      "modelOverrides": {
+        "deepseek/deepseek-v4-pro": {
+          "maxTokens": 65536,
+          "compat": {
+            "openRouterRouting": { "provider": { "only": ["deepseek"], "allow_fallbacks": false } }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Every key of `compat.openRouterRouting` is copied verbatim onto the top level of the OpenRouter request body (`provider`, `models`, `route`, …). `pi --model openrouter/deepseek/deepseek-v4-pro` then resolves to the patched entry.
 
 ### Model Config
 
@@ -81,7 +103,9 @@ If `models` is provided, built-in models for that provider are replaced with the
 | `supportsReasoningEffort` | Send `reasoning_effort` param (OpenAI) |
 | `supportsUsageInStreaming` | Expect usage fields in streaming responses |
 | `maxTokensField` | Override param name (e.g., `max_completion_tokens`) |
-| `openRouterRouting` | OpenRouter routing metadata (JSON object) |
+| `systemRoleName` | Role used for the system prompt message (e.g. `developer`) |
+| `customHeaders` | Extra HTTP headers for every request to this model/provider |
+| `openRouterRouting` | OpenRouter routing metadata (JSON object), merged verbatim into the request body top level (e.g. `{"provider": {"only": ["deepseek"], "allow_fallbacks": false}}`) |
 | `vercelGatewayRouting` | Vercel gateway routing metadata (JSON object) |
 
 ## Bundled Provider Registry
