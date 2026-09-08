@@ -88,6 +88,7 @@
 |------|-------|---------|-------|
 | `--skill <path>` | Y | Y | Load skill (repeatable) |
 | `--no-skills` | Y | Y | Disable skill discovery |
+| `--no-context-files` | Y | Y | Disable AGENTS.md / CLAUDE.md discovery |
 | `--prompt-template <path>` | Y | Y | Load template (repeatable) |
 | `--no-prompt-templates` | Y | Y | Disable template discovery |
 

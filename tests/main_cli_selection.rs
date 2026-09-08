@@ -479,6 +479,75 @@ fn build_system_prompt_test_mode_suppresses_ambient_project_context() {
     assert!(prompt.contains("Current working directory: <CWD>"));
 }
 
+/// gh #216: `--no-context-files` suppresses AGENTS.md / CLAUDE.md discovery
+/// (global dir, cwd, and every ancestor) outside test mode, while skills and
+/// the custom/append prompts still apply. `--no-skills` alone does not.
+#[test]
+fn build_system_prompt_no_context_files_flag_suppresses_ambient_project_context() {
+    let harness =
+        TestHarness::new("build_system_prompt_no_context_files_flag_suppresses_ambient_context");
+    let global_dir = harness.create_dir("global-no-context-files");
+    harness.create_file("global-no-context-files/CLAUDE.md", "GLOBAL\n");
+
+    let project_dir = harness.create_dir("project-no-context-files");
+    std::fs::create_dir_all(project_dir.join("sub")).expect("create project/sub");
+    std::fs::write(project_dir.join("AGENTS.md"), "ROOT\n").expect("write project AGENTS");
+    std::fs::write(project_dir.join("sub").join("AGENTS.md"), "SUB\n").expect("write sub AGENTS");
+    let package_dir = harness.create_dir("package-no-context-files");
+    let skills_prompt = "\n\n# Skills\n- foo\n";
+
+    // `--no-skills` by itself must leave context-file discovery untouched.
+    let cli = cli::Cli::parse_from(["pi", "--system-prompt", "CUSTOM PROMPT", "--no-skills"]);
+    let prompt = build_system_prompt(
+        &cli,
+        &project_dir.join("sub"),
+        &["read"],
+        Some(skills_prompt),
+        &global_dir,
+        &package_dir,
+        false,
+        true,
+        None,
+        &Config::default(),
+    )
+    .expect("build system prompt");
+    assert!(prompt.contains("# Project Context"));
+    assert!(prompt.contains("GLOBAL"));
+    assert!(prompt.contains("ROOT"));
+    assert!(prompt.contains("SUB"));
+
+    let cli = cli::Cli::parse_from([
+        "pi",
+        "--system-prompt",
+        "CUSTOM PROMPT",
+        "--append-system-prompt",
+        "APPEND PROMPT",
+        "--no-context-files",
+    ]);
+    let prompt = build_system_prompt(
+        &cli,
+        &project_dir.join("sub"),
+        &["read"],
+        Some(skills_prompt),
+        &global_dir,
+        &package_dir,
+        false,
+        true,
+        None,
+        &Config::default(),
+    )
+    .expect("build system prompt");
+
+    assert!(prompt.contains("CUSTOM PROMPT"));
+    assert!(prompt.contains("APPEND PROMPT"));
+    assert!(prompt.contains("# Skills"));
+    assert!(!prompt.contains("# Project Context"));
+    assert!(!prompt.contains("GLOBAL"));
+    assert!(!prompt.contains("ROOT"));
+    assert!(!prompt.contains("SUB"));
+    assert!(prompt.contains("Current date and time:"));
+}
+
 #[test]
 fn prepare_initial_message_wraps_files_and_appends_first_message() {
     let harness = TestHarness::new("prepare_initial_message_wraps_files_and_appends_first_message");

@@ -84,6 +84,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "explain-extension-policy"
         | "explain-repair-policy"
         | "no-skills"
+        | "no-context-files"
         // bd-cv653.3.12 / bd-cv653.7.12 / bd-cv653.7.12.1: the pre-parser
         // must pass these through to clap — any top-level long missing from
         // this match gets silently diverted to extension-flag extraction.
@@ -564,6 +565,15 @@ pub struct Cli {
     #[arg(long)]
     pub no_skills: bool,
 
+    // === Context files ===
+    /// Disable AGENTS.md / CLAUDE.md discovery and loading (the global
+    /// agent-dir file, the cwd, and every ancestor directory), plus the
+    /// foreign-format workspace rules import. Use it when a host composes the
+    /// whole system prompt itself (`--system-prompt`) and must not pick up
+    /// ambient project instructions. Separate from `--no-skills` (gh #216).
+    #[arg(long, env = "PI_NO_CONTEXT_FILES")]
+    pub no_context_files: bool,
+
     // === Prompt Templates ===
     /// Load prompt template file/directory (can use multiple times)
     #[arg(long, action = clap::ArgAction::Append)]
@@ -683,7 +693,7 @@ pub struct Cli {
 mod tests {
     use super::{
         Cli, Commands, ExtensionCliFlag, ROOT_SUBCOMMANDS, known_long_option,
-        parse_with_extension_flags,
+        parse_with_extension_flags, preprocess_extension_flags,
     };
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use std::path::PathBuf;
@@ -1682,6 +1692,23 @@ mod tests {
     fn no_skills_flag() {
         let cli = Cli::parse_from(["pi", "--no-skills"]);
         assert!(cli.no_skills);
+        // gh #216: skills and context files are independent switches.
+        assert!(!cli.no_context_files);
+    }
+
+    #[test]
+    fn no_context_files_flag() {
+        let cli = Cli::parse_from(["pi", "--no-context-files"]);
+        assert!(cli.no_context_files);
+        assert!(!cli.no_skills);
+    }
+
+    #[test]
+    fn no_context_files_flag_is_not_diverted_to_extension_flags() {
+        let args: Vec<String> = vec!["pi".to_string(), "--no-context-files".to_string()];
+        let (kept, extracted) = preprocess_extension_flags(&args);
+        assert!(extracted.is_empty());
+        assert_eq!(kept, args);
     }
 
     #[test]
@@ -1705,6 +1732,7 @@ mod tests {
         assert!(!cli.no_tools);
         assert!(!cli.no_extensions);
         assert!(!cli.no_skills);
+        assert!(!cli.no_context_files);
         assert!(!cli.no_prompt_templates);
         assert!(!cli.no_themes);
         assert!(cli.provider.is_none());
@@ -2066,7 +2094,8 @@ mod tests {
             fn preprocess_known_flags_never_extracted(
                 flag in prop::sample::select(vec![
                     "--version", "--verbose", "--print", "--no-tools",
-                    "--no-extensions", "--no-skills", "--no-prompt-templates",
+                    "--no-extensions", "--no-skills", "--no-context-files",
+                    "--no-prompt-templates",
                     "--no-mouse-capture", "--rpc", "--list-providers",
                 ]),
             ) {

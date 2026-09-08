@@ -174,7 +174,9 @@ pub fn build_system_prompt(
     let has_custom_prompt = custom_prompt.is_some();
     let append_prompt =
         resolve_prompt_input(cli.append_system_prompt.as_deref(), "append system prompt")?;
-    let context_files = if test_mode {
+    // `--no-context-files` (gh #216): the host owns the whole prompt, so no
+    // AGENTS.md / CLAUDE.md from the global dir, the cwd, or any ancestor.
+    let context_files = if test_mode || cli.no_context_files {
         Vec::new()
     } else {
         load_project_context_files(cwd, global_dir)

@@ -1709,8 +1709,9 @@ async fn run(
     let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
     // Foreign-format workspace rules (bd-cv653.6.2): discovered once here,
     // shared by the system prompt (always-apply block) and the agent
-    // (scoped-rule activation).
-    let foreign_rules = if config.foreign_rules_enabled() && !test_mode {
+    // (scoped-rule activation). `--no-context-files` (gh #216) disables the
+    // import too: they are ambient project instructions like AGENTS.md.
+    let foreign_rules = if config.foreign_rules_enabled() && !test_mode && !cli.no_context_files {
         pi::context_files::discover_foreign_rules(&cwd)
     } else {
         pi::context_files::ForeignRules::default()

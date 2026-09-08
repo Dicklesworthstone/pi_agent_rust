@@ -2314,7 +2314,8 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let sdk_test_mode = std::env::var_os("PI_TEST_MODE").is_some();
     // Foreign-format workspace rules (bd-cv653.6.2), shared with the agent's
     // scoped-rule activation below.
-    let foreign_rules = if config.foreign_rules_enabled() && !sdk_test_mode {
+    let foreign_rules = if config.foreign_rules_enabled() && !sdk_test_mode && !cli.no_context_files
+    {
         crate::context_files::discover_foreign_rules(&cwd)
     } else {
         crate::context_files::ForeignRules::default()

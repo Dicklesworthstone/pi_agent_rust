@@ -275,6 +275,18 @@
       "notes": "Both support no-skills flag"
     },
     {
+      "name": "no-context-files",
+      "short": null,
+      "takes_value": false,
+      "optional_value": false,
+      "default_value": null,
+      "env_var": "PI_NO_CONTEXT_FILES",
+      "description": "Disable AGENTS.md / CLAUDE.md discovery and loading",
+      "classification": "identical",
+      "action": "MATCH",
+      "notes": "Both support no-context-files flag (gh #216); upstream also accepts -nc"
+    },
+    {
       "name": "prompt-template",
       "short": null,
       "takes_value": true,
