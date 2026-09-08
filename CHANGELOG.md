@@ -16,6 +16,21 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Added
 
+- **`--no-context-files`** (gh
+  [#216](https://github.com/Dicklesworthstone/pi_agent_rust/issues/216)):
+  disables `AGENTS.md`/`CLAUDE.md` discovery (global agent dir, cwd, and
+  every ancestor) and the foreign-format workspace-rules import, so a host
+  that composes the whole system prompt gets exactly that prompt. Also
+  `PI_NO_CONTEXT_FILES=1`. `--no-skills` remains a separate switch.
+
+- **`providers.<id>.modelOverrides` in `models.json`** (gh
+  [#220](https://github.com/Dicklesworthstone/pi_agent_rust/issues/220)):
+  per-model patches with upstream pi's spelling. A known catalog id is
+  patched in place; an unknown id under a bundled provider is added from the
+  provider's ad-hoc defaults, so `compat.openRouterRouting` (and
+  `maxTokens`, `cost`, …) can be pinned for a gateway model such as
+  `openrouter/deepseek/deepseek-v4-pro` without redefining the provider.
+
 - **`current_time` tool** (gh
   [#207](https://github.com/Dicklesworthstone/pi_agent_rust/issues/207),
   [#103](https://github.com/Dicklesworthstone/pi_agent_rust/issues/103)):
@@ -106,6 +121,40 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   check still fails closed on the current performance summary.
 
 ### Fixed
+
+- **`--mode json` stdout is linear in the response length** (gh
+  [#222](https://github.com/Dicklesworthstone/pi_agent_rust/issues/222)):
+  every `message_update` line carried the whole accumulated assistant
+  message twice (`message` and `assistantMessageEvent.partial`), so a
+  50 KB reply produced ~500 MB of stdout. `message_update` records are now
+  delta-only, matching upstream pi 0.84; `message_start`/`message_end`
+  still carry the full message. RPC mode is unchanged.
+
+- **`usage.cost` is populated** (gh
+  [#221](https://github.com/Dicklesworthstone/pi_agent_rust/issues/221)):
+  nothing ever priced a finished turn, so `usage.cost.*` was `0.0` on every
+  provider. Finished assistant messages are now priced from the model's
+  catalog rates; OpenRouter requests ask for usage accounting
+  (`usage: {include: true}`) and the billed `cost` is kept as the total —
+  the only cost source for ad-hoc gateway model ids.
+
+- **`before_provider_request` handlers chain** (gh
+  [#219](https://github.com/Dicklesworthstone/pi_agent_rust/issues/219)):
+  with several handlers (or several extensions) only the last-registered
+  handler's rewrite reached the wire. Handlers now run in load order, each
+  sees the previous handler's payload, and in-place mutations of
+  `event.payload` are honored.
+
+- **Startup no longer aborts on unrelated OAuth credentials or a read-only
+  store** (gh
+  [#218](https://github.com/Dicklesworthstone/pi_agent_rust/issues/218),
+  [#217](https://github.com/Dicklesworthstone/pi_agent_rust/issues/217)):
+  an explicit `--api-key` for an explicit model skips the stored-credential
+  refresh entirely; otherwise expiring OAuth credentials are refreshed per
+  provider and only a failure for the selected provider is an error. A
+  non-writable `~/.pi/agent` is read without a lock instead of failing
+  with `auth lock: Permission denied`, and the stale-credential prune can
+  no longer fail startup.
 
 - **Secret masking catches API keys that contain dots** (gh
   [#211](https://github.com/Dicklesworthstone/pi_agent_rust/issues/211)):
