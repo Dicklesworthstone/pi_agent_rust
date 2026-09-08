@@ -8448,9 +8448,7 @@ async fn run_print_mode(
             .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
         move |event: AgentEvent| {
             if emit_json_events {
-                if let Ok(serialized) = serde_json::to_string(&event) {
-                    println!("{serialized}");
-                }
+                emit_json_event(&event);
             } else if stream_text_events
                 && let Some(delta) = streamed_text_delta(&event)
                 && emit_text_delta(delta).is_ok()
@@ -8721,9 +8719,16 @@ async fn sleep_with_current_timer(duration: Duration) {
 
 /// Emit a JSON-serialized [`AgentEvent`] to stdout (for JSON print mode).
 fn emit_json_event(event: &AgentEvent) {
-    if let Ok(serialized) = serde_json::to_string(event) {
+    if let Ok(serialized) = print_mode_json_record(event) {
         println!("{serialized}");
     }
+}
+
+/// Serialize one `--mode json` stdout record (gh #222): delta-only
+/// `message_update` records, everything else verbatim. See
+/// [`AgentEvent::to_json_stream_line`].
+fn print_mode_json_record(event: &AgentEvent) -> serde_json::Result<String> {
+    event.to_json_stream_line()
 }
 
 /// Failover lifecycle (bd-2vmu6.1): a turn that swapped to a fallback chain
@@ -12263,6 +12268,109 @@ mod tests {
             }),
         };
         assert_eq!(streamed_text_delta(&start_event), None);
+    }
+
+    fn accumulated_assistant_message(text: &str) -> Arc<AssistantMessage> {
+        Arc::new(AssistantMessage {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(text))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            usage: pi::model::Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        })
+    }
+
+    /// gh #222: `message_update` JSON records must not carry the accumulated
+    /// message (neither as `message` nor as `assistantMessageEvent.partial`).
+    #[test]
+    fn print_mode_json_record_message_update_is_delta_only() {
+        let partial = accumulated_assistant_message(&"x".repeat(10_000));
+        let event = AgentEvent::MessageUpdate {
+            message: pi::model::Message::Assistant(Arc::clone(&partial)),
+            assistant_message_event: pi::model::AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "tail".to_string(),
+                partial: Arc::clone(&partial),
+            },
+        };
+        let record = print_mode_json_record(&event).expect("serialize record");
+        let value: Value = serde_json::from_str(&record).expect("valid json");
+        assert_eq!(value["type"], "message_update");
+        assert!(value.get("message").is_none(), "record: {record}");
+        assert_eq!(value["assistantMessageEvent"]["type"], "text_delta");
+        assert_eq!(value["assistantMessageEvent"]["delta"], "tail");
+        assert_eq!(value["assistantMessageEvent"]["contentIndex"], 0);
+        assert!(
+            value["assistantMessageEvent"].get("partial").is_none(),
+            "record: {record}"
+        );
+        assert!(
+            record.len() < 200,
+            "record must not scale with the partial: {record}"
+        );
+
+        // Terminal variants keep their once-per-message payload.
+        let done = AgentEvent::MessageUpdate {
+            message: pi::model::Message::Assistant(Arc::clone(&partial)),
+            assistant_message_event: pi::model::AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message: Arc::clone(&partial),
+            },
+        };
+        let value: Value = serde_json::from_str(&print_mode_json_record(&done).unwrap()).unwrap();
+        assert_eq!(value["assistantMessageEvent"]["type"], "done");
+        assert_eq!(value["assistantMessageEvent"]["reason"], "stop");
+        assert_eq!(
+            value["assistantMessageEvent"]["message"]["stopReason"],
+            "stop"
+        );
+        assert!(value["assistantMessageEvent"]["message"]["content"].is_array());
+
+        // Other events are untouched.
+        let end = AgentEvent::MessageEnd {
+            message: pi::model::Message::Assistant(partial),
+        };
+        assert_eq!(
+            print_mode_json_record(&end).unwrap(),
+            serde_json::to_string(&end).unwrap()
+        );
+    }
+
+    /// gh #222: total stdout for a streamed response must grow linearly with
+    /// the number of deltas. Doubling the delta count must (roughly) double
+    /// the emitted bytes; the quadratic form grew ~4x.
+    #[test]
+    fn print_mode_json_stream_size_is_linear_in_delta_count() {
+        fn emitted_bytes(deltas: usize) -> usize {
+            let mut text = String::new();
+            let mut total = 0;
+            for index in 0..deltas {
+                let delta = format!("token{index} ");
+                text.push_str(&delta);
+                let partial = accumulated_assistant_message(&text);
+                let event = AgentEvent::MessageUpdate {
+                    message: pi::model::Message::Assistant(Arc::clone(&partial)),
+                    assistant_message_event: pi::model::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta,
+                        partial,
+                    },
+                };
+                total += print_mode_json_record(&event).expect("record").len() + 1;
+            }
+            total
+        }
+
+        let small = emitted_bytes(500);
+        let large = emitted_bytes(1000);
+        assert!(
+            large < small * 5 / 2,
+            "stream is super-linear: {small} bytes for 500 deltas, {large} for 1000"
+        );
     }
 
     #[test]

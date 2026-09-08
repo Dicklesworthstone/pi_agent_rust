@@ -314,20 +314,33 @@ fn json_parity_message_update_schema() {
             partial,
         },
     };
+    // The in-process event keeps the cumulative message for SDK/TUI consumers.
     let json = event_to_json(&event);
-
     assert_event_type(&json, "message_update");
     assert_has_field(&json, "message");
+    assert_has_field(&json, "assistantMessageEvent");
+    assert!(json.get("assistant_message_event").is_none());
+
+    // The `--mode json` stdout record is delta-only (upstream pi 0.84 contract,
+    // gh #222): no cumulative `message`, no `assistantMessageEvent.partial`,
+    // so the stream stays linear in the response length.
+    let line = event
+        .to_json_stream_line()
+        .expect("serialize json stream line");
+    let json: Value = serde_json::from_str(&line).expect("stream line is JSON");
+    assert_event_type(&json, "message_update");
+    assert!(json.get("message").is_none(), "delta-only record: {json}");
     assert_has_field(&json, "assistantMessageEvent");
 
     // Verify camelCase
     assert!(json.get("assistant_message_event").is_none());
 
-    // Verify nested event has correct type tag
+    // Verify nested event has correct type tag and no partial snapshot
     let ame = &json["assistantMessageEvent"];
     assert_eq!(ame["type"], "text_delta");
     assert_has_field(ame, "contentIndex");
     assert_has_field(ame, "delta");
+    assert!(ame.get("partial").is_none(), "delta-only record: {json}");
 
     harness
         .log()

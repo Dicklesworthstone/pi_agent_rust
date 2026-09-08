@@ -446,6 +446,165 @@ pub enum AssistantMessageEvent {
     },
 }
 
+impl AssistantMessageEvent {
+    /// Delta-only projection for line-delimited JSON streams (gh #222).
+    ///
+    /// Every streaming variant carries `partial`, the whole accumulated
+    /// assistant message, so serializing the event verbatim once per token
+    /// makes the stream quadratic in the response length. This view keeps the
+    /// per-event fields (`contentIndex`, `delta`, `content`, `toolCall`) and
+    /// drops `partial`; the terminal `done`/`error` variants are emitted once
+    /// per message and keep their full message, matching upstream pi's
+    /// `message_update` contract.
+    #[must_use]
+    pub fn delta_only(&self) -> AssistantMessageEventDelta<'_> {
+        match self {
+            Self::Start { .. } => AssistantMessageEventDelta::Start,
+            Self::TextStart { content_index, .. } => AssistantMessageEventDelta::TextStart {
+                content_index: *content_index,
+            },
+            Self::TextDelta {
+                content_index,
+                delta,
+                ..
+            } => AssistantMessageEventDelta::TextDelta {
+                content_index: *content_index,
+                delta,
+            },
+            Self::TextEnd {
+                content_index,
+                content,
+                ..
+            } => AssistantMessageEventDelta::TextEnd {
+                content_index: *content_index,
+                content,
+            },
+            Self::ThinkingStart { content_index, .. } => {
+                AssistantMessageEventDelta::ThinkingStart {
+                    content_index: *content_index,
+                }
+            }
+            Self::ThinkingDelta {
+                content_index,
+                delta,
+                ..
+            } => AssistantMessageEventDelta::ThinkingDelta {
+                content_index: *content_index,
+                delta,
+            },
+            Self::ThinkingEnd {
+                content_index,
+                content,
+                ..
+            } => AssistantMessageEventDelta::ThinkingEnd {
+                content_index: *content_index,
+                content,
+            },
+            Self::ToolCallStart { content_index, .. } => {
+                AssistantMessageEventDelta::ToolCallStart {
+                    content_index: *content_index,
+                }
+            }
+            Self::ToolCallDelta {
+                content_index,
+                delta,
+                ..
+            } => AssistantMessageEventDelta::ToolCallDelta {
+                content_index: *content_index,
+                delta,
+            },
+            Self::ToolCallEnd {
+                content_index,
+                tool_call,
+                ..
+            } => AssistantMessageEventDelta::ToolCallEnd {
+                content_index: *content_index,
+                tool_call,
+            },
+            Self::Done { reason, message } => AssistantMessageEventDelta::Done {
+                reason: *reason,
+                message,
+            },
+            Self::Error { reason, error } => AssistantMessageEventDelta::Error {
+                reason: *reason,
+                error,
+            },
+        }
+    }
+}
+
+/// Borrowed, `partial`-free view of an [`AssistantMessageEvent`]; see
+/// [`AssistantMessageEvent::delta_only`]. Tags and field names match the full
+/// event so consumers only lose the cumulative snapshot.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum AssistantMessageEventDelta<'a> {
+    #[serde(rename = "start")]
+    Start,
+    #[serde(rename = "text_start")]
+    TextStart {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+    },
+    #[serde(rename = "text_delta")]
+    TextDelta {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        delta: &'a str,
+    },
+    #[serde(rename = "text_end")]
+    TextEnd {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        content: &'a str,
+    },
+    #[serde(rename = "thinking_start")]
+    ThinkingStart {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+    },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        delta: &'a str,
+    },
+    #[serde(rename = "thinking_end")]
+    ThinkingEnd {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        content: &'a str,
+    },
+    #[serde(rename = "toolcall_start")]
+    ToolCallStart {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+    },
+    #[serde(rename = "toolcall_delta")]
+    ToolCallDelta {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        delta: &'a str,
+    },
+    #[serde(rename = "toolcall_end")]
+    ToolCallEnd {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        #[serde(rename = "toolCall")]
+        tool_call: &'a ToolCall,
+    },
+    #[serde(rename = "done")]
+    Done {
+        reason: StopReason,
+        message: &'a AssistantMessage,
+    },
+    #[serde(rename = "error")]
+    Error {
+        reason: StopReason,
+        error: &'a AssistantMessage,
+    },
+}
+
 // ============================================================================
 // Thinking Level
 // ============================================================================

@@ -1298,6 +1298,40 @@ impl MessageQueue {
 // Agent Event
 // ============================================================================
 
+impl AgentEvent {
+    /// Serialize this event as one line of a JSON event stream (`--mode json`,
+    /// gh #222).
+    ///
+    /// `message_update` records are delta-only: they omit the cumulative
+    /// `message` field and `assistantMessageEvent.partial`, both of which carry
+    /// the whole accumulated assistant message and would make the stream
+    /// quadratic in the response length (measured at ~500 MB of stdout for a
+    /// 50 KB reply). `message_start` / `message_end` still carry the full
+    /// message, so consumers reconstruct text by concatenating deltas or by
+    /// reading `message_end`. This matches upstream pi's 0.84 JSON contract.
+    /// Every other event serializes exactly like the plain `Serialize` impl.
+    pub fn to_json_stream_line(&self) -> serde_json::Result<String> {
+        #[derive(Serialize)]
+        struct DeltaOnlyMessageUpdate<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            #[serde(rename = "assistantMessageEvent")]
+            assistant_message_event: crate::model::AssistantMessageEventDelta<'a>,
+        }
+
+        match self {
+            Self::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => serde_json::to_string(&DeltaOnlyMessageUpdate {
+                kind: "message_update",
+                assistant_message_event: assistant_message_event.delta_only(),
+            }),
+            other => serde_json::to_string(other),
+        }
+    }
+}
+
 /// Events emitted by the agent during execution.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

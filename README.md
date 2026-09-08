@@ -868,7 +868,7 @@ Interactive file references:
 | `--session-durability strict|balanced|throughput` | Tune persistence durability mode |
 | `--no-session` | Don't persist conversation |
 | `-p, --print` | Single response, no interaction |
-| `--mode text|json|rpc` | Output/protocol mode |
+| `--mode text|json|rpc` | Output/protocol mode. `json` streams one event per line; `message_update` records are delta-only (no cumulative `message` / `partial`), so stdout stays linear in the response length — read the full message from `message_end` |
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
 | `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
