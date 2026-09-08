@@ -36,6 +36,14 @@ pub trait Provider: Send + Sync {
     /// Get the model identifier used by this provider.
     fn model_id(&self) -> &str;
 
+    /// Catalog pricing for the model this provider serves, when known
+    /// (gh #221). The agent prices `usage` on every finished assistant
+    /// message with these rates; `None` leaves any provider-reported cost
+    /// (e.g. OpenRouter's `usage.cost`) as the only source.
+    fn model_cost(&self) -> Option<ModelCost> {
+        None
+    }
+
     /// Start streaming a completion.
     ///
     /// Implementations should yield [`StreamEvent`] items as soon as they are decoded, and should
@@ -303,6 +311,38 @@ pub struct ModelCost {
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+}
+
+impl ModelCost {
+    /// True when at least one rate is non-zero, i.e. the catalog actually
+    /// knows this model's pricing.
+    #[must_use]
+    pub fn is_priced(&self) -> bool {
+        [self.input, self.output, self.cache_read, self.cache_write]
+            .iter()
+            .any(|rate| *rate > 0.0)
+    }
+
+    /// Fill `usage.cost` from these per-million-token rates (gh #221).
+    ///
+    /// The component costs always come from the catalog rates. A provider-
+    /// reported total (OpenRouter's `usage.cost`, the amount actually billed)
+    /// is authoritative and kept as `total`; otherwise `total` is the sum of
+    /// the components. Mirrors upstream pi's `calculateCost`.
+    #[allow(clippy::cast_precision_loss)] // Token counts within practical range won't lose precision
+    pub fn price_usage(&self, usage: &mut crate::model::Usage) {
+        let per_million = |rate: f64, tokens: u64| (rate / 1_000_000.0) * tokens as f64;
+        let provider_reported_total = usage.cost.total;
+        usage.cost.input = per_million(self.input, usage.input);
+        usage.cost.output = per_million(self.output, usage.output);
+        usage.cost.cache_read = per_million(self.cache_read, usage.cache_read);
+        usage.cost.cache_write = per_million(self.cache_write, usage.cache_write);
+        usage.cost.total = if provider_reported_total > 0.0 {
+            provider_reported_total
+        } else {
+            usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write
+        };
+    }
 }
 
 impl Model {
@@ -632,6 +672,63 @@ mod tests {
             max_tokens: 8192,
             headers: HashMap::new(),
         }
+    }
+
+    /// gh #221: usage pricing fills every cost component from catalog rates.
+    #[test]
+    fn price_usage_fills_components_and_total_from_catalog_rates() {
+        let model = test_model();
+        let mut usage = crate::model::Usage {
+            input: 1000,
+            output: 500,
+            cache_read: 2000,
+            cache_write: 1000,
+            total_tokens: 4500,
+            cost: crate::model::Cost::default(),
+        };
+        model.cost.price_usage(&mut usage);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        assert!(close(usage.cost.input, 0.003));
+        assert!(close(usage.cost.output, 0.0075));
+        assert!(close(usage.cost.cache_read, 0.0006));
+        assert!(close(usage.cost.cache_write, 0.00375));
+        assert!(close(
+            usage.cost.total,
+            model.calculate_cost(1000, 500, 2000, 1000)
+        ));
+        assert!(model.cost.is_priced());
+        assert!(
+            !ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            }
+            .is_priced()
+        );
+    }
+
+    /// gh #221: a provider-reported total (OpenRouter `usage.cost`) is the
+    /// billed amount and wins over the catalog sum; components still come
+    /// from the catalog so the breakdown stays available.
+    #[test]
+    fn price_usage_keeps_provider_reported_total() {
+        let model = test_model();
+        let mut usage = crate::model::Usage {
+            input: 1000,
+            output: 500,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 1500,
+            cost: crate::model::Cost {
+                total: 0.0421,
+                ..crate::model::Cost::default()
+            },
+        };
+        model.cost.price_usage(&mut usage);
+        assert!((usage.cost.total - 0.0421).abs() < 1e-12);
+        assert!((usage.cost.input - 0.003).abs() < 1e-12);
+        assert!((usage.cost.output - 0.0075).abs() < 1e-12);
     }
 
     #[test]

@@ -4299,10 +4299,16 @@ impl Agent {
 
     fn finalize_assistant_message(
         &mut self,
-        message: AssistantMessage,
+        mut message: AssistantMessage,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         added_partial: bool,
     ) -> AssistantMessage {
+        // gh #221: price the finished turn from the catalog rates. Transports
+        // only fill token counts (plus OpenRouter's billed total); without
+        // this every `usage.cost` stayed 0.0 on every provider.
+        if let Some(rates) = self.provider.model_cost() {
+            rates.price_usage(&mut message.usage);
+        }
         let arc = Arc::new(message);
         if added_partial {
             if let Some(target) = self
@@ -15520,6 +15526,123 @@ mod tests {
                 message: assistant_message("done"),
             })])))
         }
+    }
+
+    /// Reports token usage (and optionally a billed total) plus catalog
+    /// pricing, so a finished turn must carry a priced `usage.cost` (gh #221).
+    #[derive(Debug)]
+    struct PricedUsageProvider {
+        provider_reported_total: Option<f64>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for PricedUsageProvider {
+        fn name(&self) -> &str {
+            "priced-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+            Some(crate::provider::ModelCost {
+                input: 2.0,
+                output: 10.0,
+                cache_read: 0.2,
+                cache_write: 2.5,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let mut message = assistant_message("done");
+            message.usage = Usage {
+                input: 1_000_000,
+                output: 100_000,
+                cache_read: 500_000,
+                cache_write: 0,
+                total_tokens: 1_600_000,
+                cost: crate::model::Cost {
+                    total: self.provider_reported_total.unwrap_or(0.0),
+                    ..crate::model::Cost::default()
+                },
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            })])))
+        }
+    }
+
+    fn run_priced_turn(provider_reported_total: Option<f64>) -> crate::model::Usage {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = StdArc::new(PricedUsageProvider {
+                provider_reported_total,
+            });
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let ended = StdArc::new(std::sync::Mutex::new(None));
+            let ended_for_events = StdArc::clone(&ended);
+            agent
+                .run("price me", move |event| {
+                    if let AgentEvent::MessageEnd {
+                        message: Message::Assistant(message),
+                    } = event
+                    {
+                        *ended_for_events.lock().unwrap() = Some(message.usage.clone());
+                    }
+                })
+                .await
+                .expect("agent run");
+            let usage = ended.lock().unwrap().clone().expect("message_end usage");
+            let stored = match agent.messages().last() {
+                Some(Message::Assistant(message)) => message.usage.clone(),
+                other => panic!("expected assistant message, got {other:?}"),
+            };
+            assert!(
+                (stored.cost.total - usage.cost.total).abs() < 1e-12,
+                "history and message_end must agree"
+            );
+            usage
+        })
+    }
+
+    /// gh #221: `usage.cost` is priced from catalog rates on every finished
+    /// assistant message; previously it stayed 0.0 for every provider.
+    #[test]
+    fn finished_turn_prices_usage_from_catalog_rates() {
+        let usage = run_priced_turn(None);
+        assert!((usage.cost.input - 2.0).abs() < 1e-9);
+        assert!((usage.cost.output - 1.0).abs() < 1e-9);
+        assert!((usage.cost.cache_read - 0.1).abs() < 1e-9);
+        assert!(usage.cost.cache_write.abs() < 1e-12);
+        assert!((usage.cost.total - 3.1).abs() < 1e-9);
+    }
+
+    /// gh #221: a billed total reported by the provider (OpenRouter
+    /// `usage.cost`) survives pricing as the authoritative total.
+    #[test]
+    fn finished_turn_keeps_provider_reported_cost_total() {
+        let usage = run_priced_turn(Some(2.75));
+        assert!((usage.cost.total - 2.75).abs() < 1e-12);
+        assert!((usage.cost.input - 2.0).abs() < 1e-9);
     }
 
     #[test]

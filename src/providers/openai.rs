@@ -314,6 +314,12 @@ impl OpenAIProvider {
             .unwrap_or(true);
 
         let stream_options = Some(OpenAIStreamOptions { include_usage });
+        // OpenRouter usage accounting (gh #221): `usage.include` makes the
+        // final usage chunk carry the billed `cost`, which is the only cost
+        // source for models the local catalog has no pricing for.
+        let usage = self
+            .is_openrouter()
+            .then_some(OpenAIUsageAccounting { include: true });
 
         // Forward the reasoning level for providers with a request-side reasoning
         // dialect. Only DeepSeek today; all other transports get `(None, None)`,
@@ -360,10 +366,20 @@ impl OpenAIProvider {
             tools,
             stream: true,
             stream_options,
+            usage,
             thinking,
             reasoning_effort,
             prompt_cache_key: options.prompt_cache_key.clone(),
         }
+    }
+
+    /// True for the OpenRouter gateway, by provider id (canonical or alias)
+    /// or by base URL for custom providers pointed at `openrouter.ai`.
+    fn is_openrouter(&self) -> bool {
+        self.provider.eq_ignore_ascii_case("openrouter")
+            || canonical_provider_id(&self.provider)
+                .is_some_and(|canonical| canonical == "openrouter")
+            || self.base_url.to_ascii_lowercase().contains("openrouter.ai")
     }
 
     fn build_request_json(
@@ -1005,6 +1021,12 @@ where
                 .unwrap_or_else(|| usage.prompt_tokens.saturating_sub(cached));
             self.partial.usage.output = usage.completion_tokens.unwrap_or(0);
             self.partial.usage.total_tokens = usage.total_tokens;
+            // Provider-reported billed total (OpenRouter). The agent fills the
+            // per-component breakdown from catalog rates when it has them and
+            // keeps this figure as the authoritative total (gh #221).
+            if let Some(cost) = usage.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+                self.partial.usage.cost.total = cost;
+            }
         }
 
         if let Some(error) = chunk.error {
@@ -1327,6 +1349,10 @@ pub struct OpenAIRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAIStreamOptions>,
+    /// OpenRouter usage accounting (`{"include": true}`), gh #221. Omitted for
+    /// every other provider so their wire format is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<OpenAIUsageAccounting>,
     /// DeepSeek-only thinking toggle (`{"type": "enabled" | "disabled"}`). Other
     /// OpenAI-compatible providers never set this, so it serializes away.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1348,6 +1374,12 @@ pub struct OpenAIRequest<'a> {
 #[derive(Debug, Serialize)]
 struct OpenAIStreamOptions {
     include_usage: bool,
+}
+
+/// OpenRouter request-level usage accounting toggle (gh #221).
+#[derive(Debug, Serialize)]
+struct OpenAIUsageAccounting {
+    include: bool,
 }
 
 /// DeepSeek's `thinking` request object on the chat-completions transport.
@@ -1492,6 +1524,10 @@ struct OpenAIUsage {
     /// When present it is the authoritative source for `usage.input`.
     #[serde(default)]
     prompt_cache_miss_tokens: Option<u64>,
+    /// OpenRouter usage accounting: the billed cost in USD for this request
+    /// (present when the request asked for `usage: {include: true}`, gh #221).
+    #[serde(default)]
+    cost: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2451,6 +2487,47 @@ mod tests {
             "Event 5 should be Done with Stop reason, got {:?}",
             out[5]
         );
+    }
+
+    /// gh #221: OpenRouter requests opt into usage accounting so the final
+    /// usage chunk carries the billed cost; other providers never see the
+    /// field.
+    #[test]
+    fn test_build_request_requests_openrouter_usage_accounting() {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+
+        let openrouter = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1");
+        let request = openrouter
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert_eq!(request["usage"]["include"], true);
+        assert_eq!(request["stream_options"]["include_usage"], true);
+
+        // A custom provider pointed at the OpenRouter gateway counts too.
+        let custom_gateway = OpenAIProvider::new("openai/gpt-4o-mini")
+            .with_provider_name("my-router")
+            .with_base_url("https://openrouter.ai/api/v1");
+        let request = custom_gateway
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert_eq!(request["usage"]["include"], true);
+
+        let openai = OpenAIProvider::new("gpt-4o-mini");
+        let request = openai
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert!(request.get("usage").is_none(), "request: {request}");
     }
 
     #[test]
@@ -3649,6 +3726,31 @@ mod tests {
 
             assert_eq!(state.partial.usage.input, 0);
             assert_eq!(state.partial.usage.cache_read, 250);
+        }
+
+        /// gh #221: OpenRouter usage accounting reports the billed `cost`
+        /// on the final usage chunk; it must land in `usage.cost.total`
+        /// (captured shape: `usage: {…, "cost": 0.0123, "is_byok": false,
+        /// "cost_details": {"upstream_inference_cost": …}}`).
+        #[test]
+        fn openrouter_usage_cost_populates_cost_total() {
+            let mut state = make_state();
+            let chunk = r#"{"id":"gen-1","choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":3624,"completion_tokens":1,"total_tokens":3625,"cost":0.001087,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0},"cost_details":{"upstream_inference_cost":null},"completion_tokens_details":{"reasoning_tokens":0}}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+
+            assert_eq!(state.partial.usage.input, 3624);
+            assert_eq!(state.partial.usage.output, 1);
+            assert!((state.partial.usage.cost.total - 0.001_087).abs() < 1e-12);
+        }
+
+        /// Providers that do not report a cost leave `usage.cost` at zero
+        /// for the agent to fill from catalog rates.
+        #[test]
+        fn usage_without_cost_leaves_cost_total_zero() {
+            let mut state = make_state();
+            let chunk = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":500,"completion_tokens":10,"total_tokens":510}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+            assert!(state.partial.usage.cost.total.abs() < f64::EPSILON);
         }
 
         /// No cache details: `input` equals `prompt_tokens` and `cache_read`

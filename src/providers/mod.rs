@@ -1044,8 +1044,67 @@ impl Provider for ExtensionStreamSimpleProvider {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Wraps a transport provider with the catalog pricing of the model entry it
+/// was created from, so the agent can price usage (gh #221). Everything else
+/// delegates to the inner provider.
+struct PricedProvider {
+    inner: Arc<dyn Provider>,
+    cost: crate::provider::ModelCost,
+}
+
+#[async_trait]
+impl Provider for PricedProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn api(&self) -> &str {
+        self.inner.api()
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+        Some(self.cost.clone())
+    }
+
+    async fn stream(
+        &self,
+        context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        self.inner.stream(context, options).await
+    }
+
+    async fn compact_native(&self, request_body: &Value, options: &StreamOptions) -> Result<Value> {
+        self.inner.compact_native(request_body, options).await
+    }
+}
+
+/// Create the provider for a model entry (gh #221: with its catalog pricing).
+///
+/// Priced entries are wrapped so the agent can price usage; unpriced entries
+/// (ad-hoc `provider/model` ids, custom models without `cost`) are returned
+/// bare so only a provider-reported cost can populate `usage.cost`.
 pub fn create_provider(
+    entry: &ModelEntry,
+    extensions: Option<&ExtensionManager>,
+) -> Result<Arc<dyn Provider>> {
+    let provider = create_transport_provider(entry, extensions)?;
+    if entry.model.cost.is_priced() {
+        Ok(Arc::new(PricedProvider {
+            inner: provider,
+            cost: entry.model.cost.clone(),
+        }))
+    } else {
+        Ok(provider)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_transport_provider(
     entry: &ModelEntry,
     extensions: Option<&ExtensionManager>,
 ) -> Result<Arc<dyn Provider>> {
@@ -2364,6 +2423,38 @@ export default function init(pi) {
             compat: None,
             oauth_config: None,
         }
+    }
+
+    /// gh #221: the factory attaches catalog pricing to priced entries and
+    /// leaves unpriced (ad-hoc) entries bare.
+    #[test]
+    fn create_provider_carries_catalog_pricing_only_when_priced() {
+        let priced = model_entry(
+            "openai",
+            "openai-completions",
+            "gpt-4o-mini",
+            "https://api.openai.com/v1",
+        );
+        let provider = create_provider(&priced, None).expect("priced provider");
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.model_id(), "gpt-4o-mini");
+        assert_eq!(provider.api(), "openai-completions");
+        assert_eq!(provider.model_cost(), Some(priced.model.cost.clone()));
+
+        let mut unpriced = model_entry(
+            "openrouter",
+            "openai-completions",
+            "deepseek/deepseek-v4-pro",
+            "https://openrouter.ai/api/v1",
+        );
+        unpriced.model.cost = ModelCost {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        };
+        let provider = create_provider(&unpriced, None).expect("unpriced provider");
+        assert_eq!(provider.model_cost(), None);
     }
 
     #[test]
