@@ -22295,6 +22295,41 @@ function __pi_project_model_entry(raw) {
 	        return undefined;
 	    }
 
+	    if (eventName === 'before_provider_request') {
+	        // gh #219: handlers chain in load order. Each handler sees the
+	        // payload as rewritten by the handlers before it; returning
+	        // undefined/null keeps that payload, returning an object replaces
+	        // it (the payload itself or `{ payload }`, the two shapes the host
+	        // normalizer accepts). The final payload is always handed back so
+	        // in-place mutations of `event.payload` reach the wire too.
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        let currentPayload = base.payload;
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            const event = Object.assign({}, base, { payload: currentPayload });
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            if (result === undefined || result === null) {
+	                currentPayload = event.payload;
+	                continue;
+	            }
+	            if (typeof result !== 'object' || Array.isArray(result)) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('before_provider_request handler returned a non-object rewrite (ignored):', entry.extensionId); } catch (_e) {}
+	                currentPayload = event.payload;
+	                continue;
+	            }
+	            const next = Object.prototype.hasOwnProperty.call(result, 'payload') ? result.payload : result;
+	            currentPayload = (next && typeof next === 'object' && !Array.isArray(next)) ? next : event.payload;
+	        }
+	        return { payload: currentPayload };
+	    }
+
 	    let last = undefined;
 	    for (const entry of handlers) {
 	        const handler = entry && entry.handler;

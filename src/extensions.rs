@@ -14423,6 +14423,56 @@ async fn dispatch_extension_event_across_shards_until(
         });
     }
 
+    if event_name == "before_provider_request" {
+        // gh #219: the request-body rewrite chains across realms exactly as it
+        // chains across handlers inside one realm (see the JS dispatcher):
+        // each shard receives the payload as rewritten by the shards before
+        // it, and the final payload is handed back to the provider. A shard's
+        // reply is `{ payload }` (or, from an older bootstrap, the payload
+        // object itself); anything else keeps the current payload.
+        let mut current_payload = event_payload.get("payload").cloned().unwrap_or(Value::Null);
+        let mut saw_handler_result = false;
+        for phase in ["direct", "event_bus"] {
+            for &shard_index in &owners {
+                let mut payload = event_payload.clone();
+                if let Value::Object(map) = &mut payload {
+                    map.insert("payload".to_string(), current_payload.clone());
+                }
+                let Some(value) = dispatch_extension_event_phase_sharded(
+                    shards,
+                    host,
+                    JsEventPhaseDispatch {
+                        shard_index,
+                        event_name,
+                        event_payload: payload,
+                        ctx_payload,
+                        phase,
+                        batch_id,
+                        origin,
+                        deadline,
+                    },
+                )
+                .await?
+                else {
+                    continue;
+                };
+                saw_handler_result = true;
+                let Value::Object(mut reply) = value else {
+                    continue;
+                };
+                let next = reply.remove("payload").unwrap_or(Value::Object(reply));
+                if next.is_object() {
+                    current_payload = next;
+                }
+            }
+        }
+        return Ok(if saw_handler_result {
+            json!({ "payload": current_payload })
+        } else {
+            Value::Null
+        });
+    }
+
     let mut last = None;
     for phase in ["direct", "event_bus"] {
         for &shard_index in &owners {

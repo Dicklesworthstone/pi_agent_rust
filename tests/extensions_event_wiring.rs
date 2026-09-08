@@ -1203,3 +1203,175 @@ fn dispatch_tool_call_without_runtime_returns_none() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// before_provider_request chaining (gh #219)
+// ---------------------------------------------------------------------------
+
+/// Load several JS extensions (in the given order) into one manager.
+fn load_js_extensions(harness: &common::TestHarness, sources: &[(&str, &str)]) -> ExtensionManager {
+    let cwd = harness.temp_dir().to_path_buf();
+    let specs = sources
+        .iter()
+        .map(|(name, source)| {
+            let path = harness.create_file(format!("extensions/{name}.mjs"), source.as_bytes());
+            JsExtensionLoadSpec::from_entry_path(&path).expect("load spec")
+        })
+        .collect::<Vec<_>>();
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        ..Default::default()
+    };
+    let runtime = common::run_async({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+    common::run_async({
+        let manager = manager.clone();
+        async move {
+            manager
+                .load_js_extensions(specs)
+                .await
+                .expect("load extensions");
+        }
+    });
+    manager
+}
+
+/// Raises `max_tokens` and returns the payload object directly.
+const RAISE_MAX_TOKENS_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("before_provider_request", (event, ctx) => {
+        return { ...event.payload, max_tokens: 65536, seen_by: ["raise"] };
+    });
+}
+"#;
+
+/// Injects `OpenRouter` routing and returns the `{ payload }` wrapper. It must
+/// observe the previous handler's rewrite (the raised `max_tokens`).
+const ROUTING_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("before_provider_request", (event, ctx) => {
+        const seen = Array.isArray(event.payload.seen_by) ? event.payload.seen_by : [];
+        return {
+            payload: {
+                ...event.payload,
+                provider: { only: ["deepseek"], allow_fallbacks: false },
+                seen_by: [...seen, "routing"],
+                observed_max_tokens: event.payload.max_tokens,
+            },
+        };
+    });
+}
+"#;
+
+/// Mutates the payload in place and returns nothing.
+const IN_PLACE_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("before_provider_request", (event, ctx) => {
+        event.payload.store = false;
+        event.payload.seen_by = [...(event.payload.seen_by || []), "in-place"];
+    });
+}
+"#;
+
+fn dispatch_before_provider_request(manager: &ExtensionManager, payload: Value) -> Value {
+    common::run_async({
+        let manager = manager.clone();
+        async move {
+            manager
+                .dispatch_event_with_response(
+                    ExtensionEventName::BeforeProviderRequest,
+                    Some(json!({
+                        "provider": "openrouter",
+                        "api": "openai-completions",
+                        "model": "deepseek/deepseek-v4-pro",
+                        "baseUrl": "https://openrouter.ai/api/v1",
+                        "payload": payload,
+                    })),
+                    5000,
+                )
+                .await
+                .expect("dispatch before_provider_request")
+                .expect("chained handlers return a payload")
+        }
+    })
+}
+
+/// gh #219: handlers run in load order and each one sees the payload as
+/// rewritten by earlier handlers; the final request carries every rewrite,
+/// not just the last handler's.
+#[test]
+fn before_provider_request_handlers_chain_in_load_order() {
+    let harness = common::TestHarness::new("before_provider_request_handlers_chain_in_load_order");
+    let manager = load_js_extensions(
+        &harness,
+        &[
+            ("a_raise_max_tokens", RAISE_MAX_TOKENS_EXT),
+            ("b_routing", ROUTING_EXT),
+            ("c_in_place", IN_PLACE_EXT),
+        ],
+    );
+
+    let response = dispatch_before_provider_request(
+        &manager,
+        json!({"model": "deepseek/deepseek-v4-pro", "max_tokens": 8192, "stream": true}),
+    );
+    let payload = response
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| response.clone());
+
+    assert_eq!(
+        payload["max_tokens"], 65536,
+        "first handler's rewrite lost: {payload}"
+    );
+    assert_eq!(
+        payload["provider"]["only"][0], "deepseek",
+        "second handler's rewrite lost"
+    );
+    assert_eq!(payload["provider"]["allow_fallbacks"], false);
+    assert_eq!(
+        payload["observed_max_tokens"], 65536,
+        "second handler must see the first handler's payload"
+    );
+    assert_eq!(
+        payload["store"], false,
+        "in-place mutation with no return must reach the wire"
+    );
+    assert_eq!(payload["seen_by"], json!(["raise", "routing", "in-place"]));
+    assert_eq!(payload["model"], "deepseek/deepseek-v4-pro");
+    assert_eq!(payload["stream"], true);
+}
+
+/// A lone handler that returns nothing keeps the original payload intact.
+#[test]
+fn before_provider_request_single_passive_handler_keeps_payload() {
+    let harness =
+        common::TestHarness::new("before_provider_request_single_passive_handler_keeps_payload");
+    let manager = load_js_extensions(
+        &harness,
+        &[(
+            "passive",
+            r#"
+export default function init(pi) {
+    pi.on("before_provider_request", (event, ctx) => { return undefined; });
+}
+"#,
+        )],
+    );
+
+    let original =
+        json!({"model": "m", "max_tokens": 8192, "messages": [{"role": "user", "content": "hi"}]});
+    let response = dispatch_before_provider_request(&manager, original.clone());
+    assert_eq!(response["payload"], original);
+}
