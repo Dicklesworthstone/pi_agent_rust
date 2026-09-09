@@ -39,6 +39,23 @@
 # deny every temp-dir write (run7, 2026-09-02: 370+ session/tools failures
 # with "Unix group mode class 1700 on .../.rch-tmp does not allow path
 # traversal"). /tmp is owned by root on every worker.
+#
+# `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0` bound the target dir so the
+# test lane can actually finish on a shared worker. This crate builds 100+
+# test binaries under `--all-targets`, and its debug target tree measured
+# 72 GB on vmi1227854 (2026-09-09). Fleet workers sit at 89-100% full, so the
+# lane kept dying part-way through with
+#   couldn't create a temp dir: No space left on device (os error 28)
+# and, on a worker that filled completely mid-link,
+#   collect2: fatal error: ld terminated with signal 7 [Bus error]
+# which is a memory-mapped write hitting a full filesystem, not a code fault.
+# Dropping test debuginfo removes the bulk of that tree. Every sibling project
+# on this fleet already does something equivalent: frankenterm runs with
+# CARGO_INCREMENTAL=0 and CARGO_PROFILE_TEST_DEBUG=0, and frankensqlite,
+# frankensim and eidetic_engine_cli all scope to specific packages/tests
+# rather than building every target. The cost is that panic backtraces carry
+# symbol names but not line numbers; re-run a failing binary locally with the
+# default profile when a line number is actually needed. See bd-0iw92.
 
 schema_version: "1.0.0"
 
@@ -58,6 +75,6 @@ tools:
       - cargo fmt --check
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 rch exec -- cargo check --locked --all-targets
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 rch exec -- cargo clippy --locked --all-targets -- -D warnings
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 rch exec -- env TMPDIR=/tmp cargo test --locked --all-targets --no-fail-fast
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --locked --all-targets --no-fail-fast
       - bash tests/installer_regression.sh
       - python3 scripts/check_module_reachability.py
