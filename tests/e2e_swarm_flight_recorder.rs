@@ -1,5 +1,12 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::too_many_lines)]
+// Integration tests are their own crates, so the crate-level
+// `recursion_limit` raised in src/lib.rs does not reach here. This file's
+// nested async blocks exceed the default 128 while the compiler proves `Send`
+// for the replayed session future (line ~898), which nightly-2026-08-31
+// reports as a `future_incompatible` warning and `-D warnings` makes fatal.
+// Same reasoning and same value as the library crate.
+#![recursion_limit = "256"]
 
 //! E2E: deterministic swarm flight-recorder replay harness.
 //!
