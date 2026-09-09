@@ -2423,24 +2423,62 @@ fn positioned_file_read(
     std::os::unix::fs::FileExt::read_at(file, buffer, offset)
 }
 
+/// Restore `resume` as the handle's position after a positioned read that
+/// moved it, and fold the two fallible steps into one result.
+///
+/// A failure to restore is reported even when the read itself succeeded: the
+/// cursor is then at an unknown offset, and callers that share it would read
+/// from the wrong place rather than fail. The read's own error wins when both
+/// fail, because it is the more informative one.
+#[cfg(not(unix))]
+fn restore_file_position(
+    file: &std::fs::File,
+    resume: u64,
+    read: std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    // `Seek` is implemented for `&File`, so seeking needs `&mut &File` and
+    // never `&mut File`; the handle itself stays shared.
+    let mut handle: &std::fs::File = file;
+    let restored = std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(resume));
+    match (read, restored) {
+        (Ok(read), Ok(_)) => Ok(read),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+// `seek_read` sets the cursor to the end of the read, unlike the Unix `read_at`
+// above, which never touches it. Callers treat this function as cursor-neutral
+// on every platform, and at least one of them fingerprints through a
+// `try_clone()` that shares its cursor with the handle doing the real read
+// (`ReadTool::execute`). Leaving the cursor at EOF there made `read` return an
+// empty file with no error for every file on Windows (bd-kgkrq, GH #182), so
+// put the position back where we found it.
 #[cfg(windows)]
 fn positioned_file_read(
     file: &std::fs::File,
     buffer: &mut [u8],
     offset: u64,
 ) -> std::io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+    let mut handle: &std::fs::File = file;
+    let resume = std::io::Seek::stream_position(&mut handle)?;
+    let read = std::os::windows::fs::FileExt::seek_read(file, buffer, offset);
+    restore_file_position(file, resume, read)
 }
 
+// `try_clone` shares the OS file position with the original handle, so seeking
+// the clone moves the caller's cursor exactly as `seek_read` does above. Same
+// contract, same restore.
 #[cfg(not(any(unix, windows)))]
 fn positioned_file_read(
     file: &std::fs::File,
     buffer: &mut [u8],
     offset: u64,
 ) -> std::io::Result<usize> {
-    let mut cloned = file.try_clone()?;
-    std::io::Seek::seek(&mut cloned, std::io::SeekFrom::Start(offset))?;
-    cloned.read(buffer)
+    let mut handle: &std::fs::File = file;
+    let resume = std::io::Seek::stream_position(&mut handle)?;
+    let read = std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(offset))
+        .and_then(|_| handle.read(buffer));
+    restore_file_position(file, resume, read)
 }
 
 fn fingerprint_directory_immediate(path: &Path) -> Option<[u8; 32]> {
@@ -17200,6 +17238,75 @@ mod tests {
             assert!(!out.is_error);
         });
     }
+
+    #[test]
+    fn positioned_file_read_leaves_the_cursor_where_it_found_it() {
+        // bd-kgkrq / GH #182. Callers treat `positioned_file_read` as
+        // cursor-neutral on every platform: Unix `read_at` never moves the
+        // cursor, but Windows `seek_read` sets it to the end of the read and
+        // the portable fallback seeks a `try_clone()` that shares it. This
+        // asserts the contract itself rather than a platform symptom, so it
+        // passes trivially on Unix and fails on Windows without the restore.
+        let tmp = tempfile::tempdir().expect("cursor fixture");
+        let path = tmp.path().join("cursor.txt");
+        std::fs::write(&path, b"abcdefghij").expect("write cursor fixture");
+
+        let file = std::fs::File::open(&path).expect("open cursor fixture");
+        let mut handle: &std::fs::File = &file;
+        std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(3)).expect("seek to 3");
+        assert_eq!(
+            std::io::Seek::stream_position(&mut handle).expect("position before"),
+            3
+        );
+
+        let mut buffer = [0_u8; 4];
+        let read = positioned_file_read(&file, &mut buffer, 0).expect("positioned read");
+        assert_eq!(read, 4);
+        assert_eq!(&buffer, b"abcd");
+
+        assert_eq!(
+            std::io::Seek::stream_position(&mut handle).expect("position after"),
+            3,
+            "positioned_file_read must not move the caller's cursor"
+        );
+
+        // The consequence that actually broke `read`: a sequential read after
+        // a positioned read must continue from where the caller was, not EOF.
+        let mut rest = String::new();
+        handle.read_to_string(&mut rest).expect("sequential read");
+        assert_eq!(rest, "defghij");
+    }
+
+    #[test]
+    fn fingerprinting_a_cloned_handle_leaves_the_original_readable() {
+        // The exact shape of ReadTool::execute (bd-kgkrq / GH #182): open the
+        // file once, clone the handle for the tool-output-cache fingerprint,
+        // then read the content through the original. `try_clone` shares the
+        // OS file position, so a fingerprint that moves the clone's cursor
+        // leaves the real read at EOF and returns an empty file with no error.
+        let tmp = tempfile::tempdir().expect("fingerprint fixture");
+        let path = tmp.path().join("shared.txt");
+        let body = b"alpha\nbeta\ngamma\n";
+        std::fs::write(&path, body).expect("write fingerprint fixture");
+
+        let file = std::fs::File::open(&path).expect("open fingerprint fixture");
+        let clone = file.try_clone().expect("clone fingerprint handle");
+        assert!(
+            fingerprint_open_file_content(&clone).is_some(),
+            "fixture must be small enough to fingerprint"
+        );
+
+        let mut contents = Vec::new();
+        let mut handle: &std::fs::File = &file;
+        handle
+            .read_to_end(&mut contents)
+            .expect("read through the original handle");
+        assert_eq!(
+            contents, body,
+            "fingerprinting through a shared clone must not consume the original handle"
+        );
+    }
+
     #[test]
     fn write_tool_persists_inside_additional_root() {
         // /add-dir grants read AND write: the atomic-replace containment
