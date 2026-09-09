@@ -12022,6 +12022,24 @@ fn orchestrate_phase1_matrix_rejects_synthetic_seed_rows_as_release_evidence() {
     );
 }
 
+/// Dropping a required stage sample must make the matrix report incomplete
+/// cells and block Phase 5, under the stub toolchain (bd-b3yao.4).
+///
+/// Chosen semantics, because this is easy to misread: the assertions below are
+/// about CELL COMPLETENESS and fail-closed readiness, deliberately not about
+/// `weighted_bottleneck_attribution.status == "computed"`. A cell only counts
+/// as valid in orchestrate.sh when `status == "pass"` and `total_stage_ms > 0`,
+/// and under the fake toolchain no cell has complete `primary_e2e` data to
+/// begin with. So once `index_ms` is dropped there is no passing cell left and
+/// the attribution is legitimately `missing` — the stub cannot express "one
+/// valid cell remains", and asserting `computed` here would be asserting
+/// something the fixture never had.
+///
+/// What that leaves untested, and it is a real gap rather than an oversight:
+/// nothing here proves that a REAL matrix with two passing cells and one
+/// dropped stage still yields `computed`. That case needs a fixture with
+/// complete primary data, or a validator-level unit case exercising the
+/// attribution directly. Tracked on bd-b3yao.4.
 #[cfg(unix)]
 #[test]
 fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
