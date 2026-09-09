@@ -2265,8 +2265,20 @@ run_test_suite() {
         || exit_code=$?
     fi
 
-    if [[ "$exit_code" -eq 0 ]] \
-      && ! verify_current_clean_source_identity "RCH extension benchmark postcondition"; then
+    # Re-verify source identity whether or not the benchmark succeeded.
+    #
+    # This used to be gated on `exit_code -eq 0`, which skipped the check in
+    # exactly the case it exists to catch: drift DURING the invocation makes
+    # the invocation itself fail, because rch rejects the now-stale
+    # `--base` pin (the fake toolchain models this with exit 67, "strict RCH
+    # execution used an invalid clean committed-source pin"). The orchestrator
+    # then read that as an ordinary suite failure, carried on through artifact
+    # collection and Phases 5 through 5g, and finalized seven artifacts
+    # derived from a tree whose HEAD had already moved. Only the much later
+    # `RCH checksum precondition` noticed, long after the evidence was
+    # written. A source-identity violation outranks whatever the benchmark
+    # reported, so it overrides the exit code unconditionally (bd-b3yao).
+    if ! verify_current_clean_source_identity "RCH extension benchmark postcondition"; then
       exit_code=91
     fi
 
