@@ -85,10 +85,9 @@ async fn run_scenario(scenario: Scenario) {
         let message = format!("Missing cassette {}", cassette_path.display());
         if vcr_strict() {
             panic!("{message}");
-        } else {
-            harness.log().warn("vcr", message);
-            return;
         }
+        harness.log().warn("vcr", message);
+        return;
     }
 
     let request_schema_hash = provider_request_schema_hash(

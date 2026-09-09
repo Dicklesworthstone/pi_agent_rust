@@ -1,3 +1,10 @@
+// Integration tests are separate crates, so the crate-level `recursion_limit`
+// raised in src/lib.rs does not reach here. This file's nested async blocks
+// exceed the default 128 while the compiler proves `Send` for the session
+// future (line ~428), which nightly-2026-08-31 reports as a
+// `future_incompatible` warning and `-D warnings` makes fatal.
+#![recursion_limit = "256"]
+
 //! E2E: Message injection + session control with verbose logging (bd-2ok9).
 //!
 //! This test loads JS extensions that call message injection and session control

@@ -4426,13 +4426,9 @@ fn e2e_cli_json_mode_read_only_state_dir_and_bad_api_key_emit_run_error_record()
         result.stdout
     );
     assert_eq!(lines[0]["type"], "session", "{}", result.stdout);
-    let error_records = lines
-        .iter()
-        .filter(|line| line["type"] == "error")
-        .collect::<Vec<_>>();
+    let error_record_count = lines.iter().filter(|line| line["type"] == "error").count();
     assert_eq!(
-        error_records.len(),
-        1,
+        error_record_count, 1,
         "exactly one fatal record: {}",
         result.stdout
     );
@@ -5268,7 +5264,10 @@ fn e2e_print_mode_default_approval_denies_tools_and_fails_loudly() {
         Some("approval.surface_unavailable"),
         "fatal record must name the approval cause, got {fatal}"
     );
-    assert_eq!(fatal.get("exit_code").and_then(|c| c.as_i64()), Some(3));
+    assert_eq!(
+        fatal.get("exit_code").and_then(serde_json::Value::as_i64),
+        Some(3)
+    );
 }
 
 /// gh #224 control: the same run with `--yolo` auto-approves, so it must still
