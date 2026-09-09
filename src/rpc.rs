@@ -40,7 +40,7 @@ use crate::resources::ResourceLoader;
 use crate::session::{AutosaveFlushTrigger, Session, SessionEntry, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
-use asupersync::runtime::RuntimeHandle;
+use asupersync::runtime::{JoinHandle, RuntimeHandle};
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use memchr::memchr_iter;
@@ -1721,14 +1721,16 @@ pub async fn run(
 
                     if let Some((admitted, emit_now, cancel_rx)) = admitted {
                         if let Some(cancel_rx) = cancel_rx {
-                            rpc_schedule_extension_ui_timeout(
+                            // Detach: the timer task owns everything it needs and
+                            // resolves (or is cancelled) on its own.
+                            drop(rpc_schedule_extension_ui_timeout(
                                 &runtime_handle_ui,
                                 Arc::clone(&ui_state),
                                 manager_ui.clone(),
                                 out_tx_ui.clone(),
                                 &admitted,
                                 cancel_rx,
-                            );
+                            ));
                         }
                         if emit_now {
                             rpc_publish_extension_ui_request(
@@ -6598,6 +6600,14 @@ fn rpc_try_send_extension_ui_frame(
     out_tx_ui.try_send(frame).is_ok()
 }
 
+/// Arm the deadline timer for an admitted bridge request.
+///
+/// Returns the timer task's join handle, or `None` when the request carries no
+/// deadline and no task was spawned. The task owns everything it needs, so the
+/// RPC loop drops the handle and lets it run detached; dropping a handle
+/// detaches rather than cancels. Tests await it instead, which is what makes
+/// "the deadline fired and the bridge has settled" an event rather than a
+/// wall-clock guess.
 fn rpc_schedule_extension_ui_timeout(
     runtime_handle: &RuntimeHandle,
     ui_state: Arc<std::sync::Mutex<RpcUiBridgeState>>,
@@ -6605,13 +6615,11 @@ fn rpc_schedule_extension_ui_timeout(
     out_tx_ui: std::sync::mpsc::SyncSender<String>,
     admitted: &RpcUiBridgeRequest,
     cancel_rx: oneshot::Receiver<()>,
-) {
-    let Some(deadline) = admitted.request.deadline() else {
-        return;
-    };
+) -> Option<JoinHandle<()>> {
+    let deadline = admitted.request.deadline()?;
     let request_id = admitted.request.id.clone();
     let generation = admitted.generation;
-    runtime_handle.spawn(async move {
+    Some(runtime_handle.spawn(async move {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let cancelled = Box::pin(async move {
             let mut cancel_rx = cancel_rx;
@@ -6626,7 +6634,7 @@ fn rpc_schedule_extension_ui_timeout(
             return;
         }
         rpc_resolve_extension_ui_default(ui_state, manager, out_tx_ui, request_id, generation);
-    });
+    }))
 }
 
 fn rpc_resolve_extension_ui_default(
@@ -6869,6 +6877,21 @@ fn rpc_parse_extension_ui_response(
 #[cfg(test)]
 mod ui_bridge_tests {
     use super::*;
+
+    /// Await a bridge deadline-timer task and fail loudly if it never finishes.
+    ///
+    /// The join handle is the completion event these tests key off: the task
+    /// resolves the expiry (or observes its cancellation) and only then
+    /// returns, so awaiting it observes a settled bridge without any
+    /// wall-clock guess. The bound is a liveness backstop rather than a timing
+    /// assumption — a correct task finishes as soon as its deadline fires or
+    /// its cancel channel is signalled — and it keeps a regression surfacing
+    /// as a named failure instead of a hung test binary.
+    async fn join_bridge_timer(timer: JoinHandle<()>, what: &str) {
+        asupersync::time::timeout(wall_now(), Duration::from_secs(30), timer)
+            .await
+            .unwrap_or_else(|_| panic!("the {what} bridge timer task never completed"));
+    }
 
     #[test]
     fn parse_extension_ui_response_id_prefers_request_id() {
@@ -7439,23 +7462,38 @@ mod ui_bridge_tests {
             let cancel_rx = cancel_rx.expect("bounded request owns a waiter");
 
             let state = Arc::new(std::sync::Mutex::new(bridge));
-            let (out_tx, _out_rx) = std::sync::mpsc::sync_channel(4);
-            rpc_schedule_extension_ui_timeout(
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(4);
+            let timer = rpc_schedule_extension_ui_timeout(
                 &runtime_handle,
                 Arc::clone(&state),
                 ExtensionManager::new(),
                 out_tx,
                 &queued,
                 cancel_rx,
-            );
-            sleep(wall_now(), Duration::from_millis(50)).await;
+            )
+            .expect("a bounded request arms a deadline timer");
+
+            // The timer task performs the expiry itself and only then returns,
+            // so its join handle *is* the completion event. Awaiting it makes
+            // the observation deterministic: no wall-clock sleep racing the
+            // 10 ms deadline, and no upper bound to tune on a loaded machine.
+            join_bridge_timer(timer, "bounded queued successor").await;
 
             let guard = state.lock().expect("bridge lock");
             assert_eq!(
                 guard.active.as_ref().map(|active| active.generation),
-                Some(active.generation)
+                Some(active.generation),
+                "expiring a queued successor must not disturb the unbounded active request"
             );
-            assert!(guard.queue.is_empty());
+            assert!(
+                guard.queue.is_empty(),
+                "the bounded successor must have been expired out of the queue"
+            );
+            drop(guard);
+            assert!(
+                out_rx.try_recv().is_err(),
+                "a queued expiry promotes nothing, so no frame may be published"
+            );
         });
     }
 
@@ -7480,20 +7518,26 @@ mod ui_bridge_tests {
             let cancel_rx = cancel_rx.expect("bounded request owns a waiter");
             let state = Arc::new(std::sync::Mutex::new(bridge));
             let (out_tx, _out_rx) = std::sync::mpsc::sync_channel(4);
-            rpc_schedule_extension_ui_timeout(
+            let timer = rpc_schedule_extension_ui_timeout(
                 &runtime_handle,
                 Arc::clone(&state),
                 ExtensionManager::new(),
                 out_tx,
                 &active,
                 cancel_rx,
-            );
+            )
+            .expect("a bounded request arms a deadline timer");
 
             {
                 let mut guard = state.lock().expect("bridge lock");
                 assert!(guard.finish_active().is_none());
             }
-            sleep(wall_now(), Duration::from_millis(20)).await;
+            // Normal resolution cancels the timer, so the task takes its
+            // cancellation branch and returns. Awaiting the handle is the
+            // event that says so; a future completes by dropping the state it
+            // captured, so the bridge Arc is already released here. Without
+            // the cancellation the task would sit on its 30 s deadline.
+            join_bridge_timer(timer, "promptly answered active request").await;
             assert_eq!(
                 Arc::strong_count(&state),
                 1,
@@ -7536,22 +7580,24 @@ mod ui_bridge_tests {
             let state = Arc::new(std::sync::Mutex::new(bridge));
             let manager = ExtensionManager::new();
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel(4);
-            rpc_schedule_extension_ui_timeout(
+            let active_timer = rpc_schedule_extension_ui_timeout(
                 &runtime_handle,
                 Arc::clone(&state),
                 manager.clone(),
                 out_tx.clone(),
                 &active,
                 active_cancel_rx,
-            );
-            rpc_schedule_extension_ui_timeout(
+            )
+            .expect("a bounded request arms a deadline timer");
+            let queued_timer = rpc_schedule_extension_ui_timeout(
                 &runtime_handle,
                 Arc::clone(&state),
                 manager.clone(),
                 out_tx.clone(),
                 &queued,
                 queued_cancel_rx,
-            );
+            )
+            .expect("a bounded request arms a deadline timer");
 
             let close_guard = ExtensionUiCloseGuard {
                 manager: manager.clone(),
@@ -7621,7 +7667,11 @@ mod ui_bridge_tests {
                 post_close_active,
             );
 
-            sleep(wall_now(), Duration::from_millis(20)).await;
+            // Terminal close cancelled both 30 s timers; awaiting their join
+            // handles is the event that proves each task woke and returned,
+            // releasing the bridge Arc it captured.
+            join_bridge_timer(active_timer, "terminal-close active request").await;
+            join_bridge_timer(queued_timer, "terminal-close queued request").await;
             assert_eq!(
                 Arc::strong_count(&state),
                 1,

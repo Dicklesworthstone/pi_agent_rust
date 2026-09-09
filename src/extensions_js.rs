@@ -25283,107 +25283,159 @@ mod tests {
         hex_lower(&Sha256::digest(bytes))
     }
 
+    /// Receipt name for `pi_bridge_js()`, which is not a virtual module.
+    const BRIDGE_RECEIPT: &str = "<bridge>";
+
+    /// Golden receipts for the compile-time-compressed JavaScript sources:
+    /// `(name, byte length, SHA-256 of the decompressed source)`.
+    ///
+    /// `compressed_js_literal!` LZSS-compresses each source literal at compile
+    /// time and `lzss_decompress` restores it on first use. Decompression
+    /// already enforces the *length* — `RAW_LEN` is derived from the same
+    /// literal, and a mismatch is a hard error — so the byte counts here
+    /// cannot catch a codec bug on their own. The SHA-256 is the assertion
+    /// that can: it is the only thing standing between a codec that decodes
+    /// the right number of wrong bytes and a silently corrupted bridge. The
+    /// lengths ride along because they turn "hash drift" into a readable
+    /// delta.
+    ///
+    /// The receipts are therefore change detectors: any deliberate edit to the
+    /// bridge or to a virtual module moves them and has to re-pin them in the
+    /// same commit. On drift the test prints the complete regenerated table,
+    /// so re-pinning is one copy-paste instead of one test run per receipt.
+    ///
+    /// Re-pinned 2026-09-09: only `<bridge>` moved, 202_987 -> 205_065
+    /// (+2_078 bytes, sha `fdfa107d…` -> `992b7def…`). `e0ce03b0d`
+    /// ("fix(extensions): chain `before_provider_request` handlers in load
+    /// order", gh #219) added a 35-line chaining branch to the bridge source
+    /// and changed nothing else: `git show e0ce03b0d -- src/extensions_js.rs`
+    /// adds exactly 2_078 bytes and removes none, which accounts for the whole
+    /// delta. Every virtual-module receipt is unchanged. The pin before this
+    /// one rotted the same way, so this drift is bridge edits landing without
+    /// the receipt update, not bundle corruption.
+    const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
+        (
+            BRIDGE_RECEIPT,
+            205_065,
+            "992b7def6f53d7d18690bd748f0df0b4f73b31058bc9676ce6c6aa107deaf17b",
+        ),
+        (
+            "node:fs",
+            56_916,
+            "5007b4eba74659801fff93fdb60da9b6b83457049459cdb9882ee93550b0be48",
+        ),
+        (
+            "@mariozechner/pi-ai",
+            24_612,
+            "33423d306e358a879c8b9e763dfc7e9fddf628ea275855aa2a89d1e52411547a",
+        ),
+        (
+            "node:child_process",
+            20_034,
+            "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
+        ),
+        (
+            "node:stream",
+            17_837,
+            "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
+        ),
+        (
+            "@mariozechner/pi-coding-agent",
+            25_208,
+            "f74b473ecf0df9a826c21be3863c10a28f65b439b08c7dc49da43e2be7c6c4b5",
+        ),
+        (
+            "@mariozechner/pi-tui",
+            8_395,
+            "e51cefc340ec148e6202c7cf8f57b429a34357559c504130e962a5c947f36a84",
+        ),
+        (
+            "typebox/compile",
+            8_189,
+            "a4b25b282d3a8d4dea5b22a12cb790975691a3202390827385680c2d9000652e",
+        ),
+        (
+            "node:module",
+            7_418,
+            "0f16b8ba098a98bf96d6ef19ff1222a7e29a820211ed7703a925157066144fd7",
+        ),
+        (
+            "jsonwebtoken",
+            6_806,
+            "ff82b2f65aace15593451d8dfa3e25e06131d7016bbf02b6bba5a8fa593fd80b",
+        ),
+        (
+            "node:net",
+            5_894,
+            "9fb7d79bf0118d8c57bbc8ac41fa1b99ce6bf6fcea05f71c20e068fe2eae49cd",
+        ),
+        (
+            "node:url",
+            5_637,
+            "c4b419ff37056fa9abdb446d0497e70841ba4df7572e8bbe80ada580cebf650c",
+        ),
+    ];
+
+    /// Render a byte length the way `JS_SOURCE_RECEIPTS` spells it, so the
+    /// table the test prints on drift is a literal copy-paste.
+    fn grouped_digits(value: usize) -> String {
+        let digits = value.to_string();
+        let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+        for (index, digit) in digits.char_indices() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                out.push('_');
+            }
+            out.push(digit);
+        }
+        out
+    }
+
+    /// Every embedded JavaScript source must decompress to exactly the bytes
+    /// pinned in [`JS_SOURCE_RECEIPTS`]; see that constant for what the
+    /// receipts do and do not prove, and how to re-pin them.
     #[test]
     fn compressed_javascript_sources_preserve_exact_bytes() {
         let bridge = pi_bridge_js();
         let modules = default_virtual_modules();
-        eprintln!(
-            "PiJS source receipt: bridge len={} sha256={}",
-            bridge.len(),
-            sha256_hex(bridge.as_bytes())
-        );
-        for name in [
-            "node:fs",
-            "@mariozechner/pi-ai",
-            "node:child_process",
-            "node:stream",
-            "@mariozechner/pi-coding-agent",
-            "@mariozechner/pi-tui",
-        ] {
-            let source = modules.get(name).expect("receipt module must exist");
-            eprintln!(
-                "PiJS source receipt: {name} len={} sha256={}",
-                source.len(),
-                sha256_hex(source.as_bytes())
-            );
-        }
-        // Receipts re-pinned 2026-09-01 after the 2026-08-25..27 bridge changes
-        // (context-overflow detection, SessionActionOrigin binding, MCP spec
-        // preservation) landed without updating them; the previous pin was
-        // 201_242 / 2e3cadbe… from dea48721.
-        assert_eq!(bridge.len(), 202_987);
-        assert_eq!(
-            sha256_hex(bridge.as_bytes()),
-            "fdfa107dc7d7d9edabba347886cf8be031fe6ee25c653ea840c29ae16f8d8980"
-        );
 
-        for (name, expected_len, expected_sha256) in [
-            (
-                "node:fs",
-                56_916,
-                "5007b4eba74659801fff93fdb60da9b6b83457049459cdb9882ee93550b0be48",
-            ),
-            (
-                "@mariozechner/pi-ai",
-                24_612,
-                "33423d306e358a879c8b9e763dfc7e9fddf628ea275855aa2a89d1e52411547a",
-            ),
-            (
-                "node:child_process",
-                20_034,
-                "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
-            ),
-            (
-                "node:stream",
-                17_837,
-                "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
-            ),
-            (
-                "@mariozechner/pi-coding-agent",
-                25_208,
-                "f74b473ecf0df9a826c21be3863c10a28f65b439b08c7dc49da43e2be7c6c4b5",
-            ),
-            (
-                "@mariozechner/pi-tui",
-                8_395,
-                "e51cefc340ec148e6202c7cf8f57b429a34357559c504130e962a5c947f36a84",
-            ),
-            (
-                "typebox/compile",
-                8_189,
-                "a4b25b282d3a8d4dea5b22a12cb790975691a3202390827385680c2d9000652e",
-            ),
-            (
-                "node:module",
-                7_418,
-                "0f16b8ba098a98bf96d6ef19ff1222a7e29a820211ed7703a925157066144fd7",
-            ),
-            (
-                "jsonwebtoken",
-                6_806,
-                "ff82b2f65aace15593451d8dfa3e25e06131d7016bbf02b6bba5a8fa593fd80b",
-            ),
-            (
-                "node:net",
-                5_894,
-                "9fb7d79bf0118d8c57bbc8ac41fa1b99ce6bf6fcea05f71c20e068fe2eae49cd",
-            ),
-            (
-                "node:url",
-                5_637,
-                "c4b419ff37056fa9abdb446d0497e70841ba4df7572e8bbe80ada580cebf650c",
-            ),
-        ] {
-            let source = modules
-                .get(name)
-                .unwrap_or_else(|| panic!("missing {name}"));
-            assert_eq!(source.len(), expected_len, "length drift for {name}");
-            assert_eq!(
-                sha256_hex(source.as_bytes()),
-                expected_sha256,
-                "content drift for {name}"
-            );
+        let mut regenerated = Vec::with_capacity(JS_SOURCE_RECEIPTS.len());
+        let mut drift = Vec::new();
+        for &(name, expected_len, expected_sha256) in JS_SOURCE_RECEIPTS {
+            let source: &str = if name == BRIDGE_RECEIPT {
+                bridge
+            } else {
+                modules
+                    .get(name)
+                    .unwrap_or_else(|| panic!("receipt module {name} must exist"))
+                    .as_str()
+            };
+            let len = source.len();
+            let sha256 = sha256_hex(source.as_bytes());
+            let name_literal = if name == BRIDGE_RECEIPT {
+                "BRIDGE_RECEIPT".to_string()
+            } else {
+                format!("{name:?}")
+            };
+            regenerated.push(format!(
+                "        (\n            {name_literal},\n            {},\n            {sha256:?},\n        ),",
+                grouped_digits(len)
+            ));
+            if len != expected_len || sha256 != expected_sha256 {
+                drift.push(format!(
+                    "  {name}: len {expected_len} -> {len}, sha256 {expected_sha256} -> {sha256}"
+                ));
+            }
         }
+
+        let regenerated = regenerated.join("\n");
+        eprintln!("PiJS source receipts:\n{regenerated}");
+        assert!(
+            drift.is_empty(),
+            "compressed JavaScript source receipts drifted:\n{}\n\n\
+             If the JavaScript really did change, review that diff and re-pin \
+             JS_SOURCE_RECEIPTS to:\n{regenerated}",
+            drift.join("\n")
+        );
     }
 
     #[test]
