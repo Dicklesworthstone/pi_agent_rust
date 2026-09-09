@@ -119,3 +119,14 @@ Communication is via **JSON Lines** over stdin/stdout. Each line must be a valid
 - `auto_retry_start` / `auto_retry_end`: Transient error retries.
 - `auto_compaction_start` / `auto_compaction_end`: Auto-compaction status.
 - `extension_error`: Extension event dispatch/runtime error.
+- `error`: Fatal process error (gh #217). Printed exactly once on stdout
+  before a non-zero exit, in both `--mode rpc` and `--mode json`:
+  `{"type":"error","phase":"startup","code":"auth.missing_api_key","message":"…","exit_code":1}`.
+  `phase` is `startup` when the loop never opened (config/auth/state-dir
+  failures) and `run` after it did; `code` is a stable family name
+  (`config`, `session`, `provider`, `auth`, `tool`, `usage`, `extension`,
+  `io`, `json`, `state_store`, `aborted`, `api`, `internal`) or one of the
+  finer `auth.*` / `config.*` diagnostic codes (`auth.missing_api_key`,
+  `auth.no_models_available`, `auth.invalid_api_key`, …). It is not a `response`
+  envelope — there is no request to answer — so clients should treat it as
+  a terminal event.

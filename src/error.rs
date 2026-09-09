@@ -500,6 +500,8 @@ fn classify_auth_diagnostic(provider: Option<&str>, message: &str) -> Option<Aut
             "api key is required",
             "you didn't provide an api key",
             "no api key provided",
+            // pi's own startup wording (`StartupError::MissingApiKey`, gh #217).
+            "no api key found",
             "missing bearer",
             "authorization header missing",
         ],

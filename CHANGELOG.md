@@ -16,6 +16,15 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Added
 
+- **Machine-readable fatal-error record in `--mode json` / `--mode rpc`**
+  (gh [#217](https://github.com/Dicklesworthstone/pi_agent_rust/issues/217)):
+  a startup failure (config, credentials, state directory, usage) used to
+  exit non-zero with only stderr prose. Both modes now print exactly one
+  `{"type":"error","phase":"startup","code":"<stable code>","message":"…","exit_code":N}`
+  line on stdout first (`phase: "run"` if the stream had already opened).
+  `code` reuses the auth diagnostic codes (`auth.missing_api_key`, …) and
+  otherwise names the error family; text mode is unchanged.
+
 - **OpenRouter reasoning forwarding** (gh
   [#220](https://github.com/Dicklesworthstone/pi_agent_rust/issues/220)):
   `compat.thinkingFormat: "openrouter"` maps pi's thinking level onto the

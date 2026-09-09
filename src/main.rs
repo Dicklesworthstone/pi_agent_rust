@@ -171,10 +171,131 @@ fn main() {
     }
 
     if let Err(err) = result {
-        let exit_code = exit_code_for_error(&err);
-        print_error_with_hints(&err);
-        std::process::exit(exit_code);
+        report_fatal_error_and_exit(&err);
     }
+}
+
+/// Which machine-readable output mode this process was started in, recorded
+/// as soon as the CLI is parsed (gh #217). `None` for text/interactive runs.
+static MACHINE_OUTPUT_MODE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+
+/// Whether the JSON session header (print mode) or the RPC loop has already
+/// written to stdout. Decides the `phase` of a fatal-error record.
+static MACHINE_STREAM_OPENED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_machine_output_mode(mode: Option<&str>) {
+    let mode = match mode {
+        Some("json") => Some("json"),
+        Some("rpc") => Some("rpc"),
+        _ => None,
+    };
+    let _ = MACHINE_OUTPUT_MODE.set(mode);
+}
+
+fn note_machine_stream_opened() {
+    MACHINE_STREAM_OPENED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Best-effort `--mode` recovery for failures that happen before clap has
+/// produced a `Cli` (argument errors): only `--mode json`, `--mode=json`,
+/// `--mode rpc`, `--mode=rpc`, and `--rpc` count. Anything after `--` is
+/// positional and ignored.
+fn machine_output_mode_from_args(args: &[String]) -> Option<&'static str> {
+    let mut mode = None;
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        let value = if arg == "--mode" {
+            iter.next().map(String::as_str)
+        } else if let Some(value) = arg.strip_prefix("--mode=") {
+            Some(value)
+        } else if arg == "--rpc" {
+            Some("rpc")
+        } else {
+            None
+        };
+        match value {
+            Some("json") => mode = Some("json"),
+            Some("rpc") => mode = Some("rpc"),
+            Some(_) => mode = None,
+            None => {}
+        }
+    }
+    mode
+}
+
+/// Stable `code` for a fatal error: the `pi::error::Error` (or startup
+/// error) in the chain classifies it; a clap error is `usage`; anything else
+/// is `internal`.
+fn fatal_error_code(err: &anyhow::Error) -> &'static str {
+    if let Some(pi_error) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<pi::error::Error>())
+    {
+        return pi::error_hints::error_code(pi_error);
+    }
+    if let Some(startup) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StartupError>())
+    {
+        return match startup {
+            StartupError::MissingApiKey { .. } => "auth.missing_api_key",
+            StartupError::NoModelsAvailable { .. } => "auth.no_models_available",
+        };
+    }
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<clap::Error>().is_some())
+    {
+        return "usage";
+    }
+    if is_usage_error(err) {
+        return "usage";
+    }
+    "internal"
+}
+
+/// The one stdout line a `--mode json` / `--mode rpc` host gets before a
+/// non-zero exit (gh #217), or `None` in text/interactive modes.
+fn fatal_error_record_line(err: &anyhow::Error, exit_code: i32) -> Option<String> {
+    let mode = MACHINE_OUTPUT_MODE
+        .get()
+        .copied()
+        .unwrap_or_else(|| machine_output_mode_from_args(&std::env::args().collect::<Vec<_>>()));
+    mode?;
+    let phase = if MACHINE_STREAM_OPENED.load(std::sync::atomic::Ordering::SeqCst) {
+        pi::error_hints::FATAL_ERROR_PHASE_RUN
+    } else {
+        pi::error_hints::FATAL_ERROR_PHASE_STARTUP
+    };
+    // `{err:#}` joins the context chain ("Failed to load configuration:
+    // Configuration error: …"), which is what the stderr diagnosis shows too.
+    Some(
+        pi::error_hints::fatal_error_record(
+            fatal_error_code(err),
+            phase,
+            &format!("{err:#}"),
+            exit_code,
+        )
+        .to_string(),
+    )
+}
+
+/// Terminal error path shared by every exit: the machine-readable record on
+/// stdout when a JSON/RPC host is listening, the human diagnosis with hints on
+/// stderr, then the classified exit code.
+fn report_fatal_error_and_exit(err: &anyhow::Error) -> ! {
+    let exit_code = exit_code_for_error(err);
+    if let Some(line) = fatal_error_record_line(err, exit_code) {
+        let mut stdout = io::stdout().lock();
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
+    }
+    print_error_with_hints(err);
+    std::process::exit(exit_code);
 }
 
 fn parse_cli_args(raw_args: Vec<String>) -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>> {
@@ -529,6 +650,7 @@ fn main_impl() -> Result<()> {
     if cli.rpc && cli.mode.is_none() {
         cli.mode = Some("rpc".to_string());
     }
+    note_machine_output_mode(cli.mode.as_deref());
 
     let package_subcommand_trust = cli
         .command
@@ -840,11 +962,7 @@ fn main_impl() -> Result<()> {
     pi::hub::kill_session_services();
     match result {
         Ok(()) => std::process::exit(0),
-        Err(err) => {
-            let exit_code = exit_code_for_error(&err);
-            print_error_with_hints(&err);
-            std::process::exit(exit_code);
-        }
+        Err(err) => report_fatal_error_and_exit(&err),
     }
 }
 
@@ -8393,6 +8511,9 @@ async fn run_rpc_mode(
     }) {
         eprintln!("Warning: Failed to install Ctrl+C handler for RPC mode: {err}");
     }
+    // From here on the RPC loop owns stdout; a later fatal error is a
+    // run-phase record, not a startup one (gh #217).
+    note_machine_stream_opened();
     let rpc_task = pi::rpc::run_stdio(
         session,
         pi::rpc::RpcOptions {
@@ -8482,6 +8603,7 @@ async fn run_print_mode(
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         println!("{}", serde_json::to_string(&session.header)?);
+        note_machine_stream_opened();
     }
     if initial.is_none() && messages.is_empty() {
         if mode.eq("json") {
@@ -9718,6 +9840,81 @@ mod tests {
         let extension_output = String::from_utf8(extension_output).expect("UTF-8 diagnostics");
         assert!(extension_output.contains(&second.display().to_string()));
         assert!(!extension_output.contains(&first.display().to_string()));
+    }
+
+    /// gh #217: the stdout record's `code` comes from the typed error in the
+    /// chain, clap/usage failures are `usage`, and untyped errors are
+    /// `internal`.
+    #[test]
+    fn fatal_error_code_classifies_by_error_kind() {
+        let missing_key = anyhow::Error::new(pi::error::Error::auth(
+            "No API key found for provider anthropic (set ANTHROPIC_API_KEY)",
+        ));
+        assert_eq!(fatal_error_code(&missing_key), "auth.missing_api_key");
+        let wrapped = anyhow::Error::new(pi::error::Error::config("settings.json: bad json"))
+            .context("Failed to load configuration");
+        assert_eq!(fatal_error_code(&wrapped), "config");
+        let validation = anyhow::Error::new(pi::error::Error::validation("bad --only"));
+        assert_eq!(fatal_error_code(&validation), "usage");
+        let startup_missing_key = anyhow::Error::new(StartupError::MissingApiKey {
+            provider: "anthropic".to_string(),
+        });
+        assert_eq!(
+            fatal_error_code(&startup_missing_key),
+            "auth.missing_api_key"
+        );
+        let startup_no_models = anyhow::Error::new(StartupError::NoModelsAvailable {
+            models_path: PathBuf::from("/tmp/models.json"),
+        })
+        .context("startup");
+        assert_eq!(
+            fatal_error_code(&startup_no_models),
+            "auth.no_models_available"
+        );
+        let clap_err = anyhow::Error::new(clap::Error::raw(
+            clap::error::ErrorKind::UnknownArgument,
+            "unknown --bogus",
+        ));
+        assert_eq!(fatal_error_code(&clap_err), "usage");
+        let usage_text = anyhow::anyhow!("theme file not found: x");
+        assert_eq!(fatal_error_code(&usage_text), "usage");
+        let plain = anyhow::anyhow!("something else entirely");
+        assert_eq!(fatal_error_code(&plain), "internal");
+    }
+
+    #[test]
+    fn machine_output_mode_from_args_recognizes_json_and_rpc_only() {
+        let args = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--mode", "json", "-p", "hi"])),
+            Some("json")
+        );
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--mode=rpc"])),
+            Some("rpc")
+        );
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--rpc"])),
+            Some("rpc")
+        );
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--mode", "text"])),
+            None
+        );
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "-p", "hi"])),
+            None
+        );
+        // Positional text after `--` is not a flag.
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--", "--mode", "json"])),
+            None
+        );
+        // Last explicit mode wins.
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--mode", "json", "--mode", "text"])),
+            None
+        );
     }
 
     #[test]

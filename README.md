@@ -870,7 +870,7 @@ Interactive file references:
 | `--session-durability strict|balanced|throughput` | Tune persistence durability mode |
 | `--no-session` | Don't persist conversation |
 | `-p, --print` | Single response, no interaction |
-| `--mode text|json|rpc` | Output/protocol mode. `json` streams one event per line; `message_update` records are delta-only (no cumulative `message` / `partial`), so stdout stays linear in the response length — read the full message from `message_end` |
+| `--mode text|json|rpc` | Output/protocol mode. `json` streams one event per line; `message_update` records are delta-only (no cumulative `message` / `partial`), so stdout stays linear in the response length — read the full message from `message_end`. A fatal error in `json` or `rpc` mode prints exactly one `{"type":"error","phase":"startup","code":"<stable code>","message":"…","exit_code":N}` record on stdout before the non-zero exit (`phase` is `run` once the stream had opened) |
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
 | `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
@@ -1844,6 +1844,14 @@ The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin
 {"type": "agent_end", "sessionId": "...", "messages": [...]}
 {"type": "response", "id": "req-001", "command": "prompt", "success": true, "data": {"status": "ok"}}
 ```
+
+**Fatal errors** (JSON and RPC modes): a failure that ends the process — a bad config file, no credentials for the selected model, an unwritable state directory, a usage error — prints exactly one record on stdout before the non-zero exit, so a host never has to parse stderr prose:
+
+```json
+{"type": "error", "phase": "startup", "code": "auth.missing_api_key", "message": "No API key found for provider anthropic. Set env var or use --api-key.", "exit_code": 1}
+```
+
+`phase` is `startup` when nothing had been written to stdout yet (no session header, no RPC loop) and `run` otherwise. `code` is stable: the auth diagnostic codes (`auth.missing_api_key`, `auth.no_models_available`, `auth.invalid_api_key`, `auth.quota_exceeded`, `auth.oauth.token_refresh_failed`, …) when the failure classifies as one, else the family — `config`, `session`, `provider`, `auth`, `tool`, `usage` (argument/validation errors, exit code 2), `extension`, `io`, `json`, `state_store`, `aborted`, `api`, or `internal`. The human-readable diagnosis with hints still goes to stderr. Text mode prints nothing on stdout.
 
 **I/O architecture**: Two dedicated threads handle stdin reading and stdout writing, bridged to the async agent runtime via channels. The stdin thread retries on transient errors to prevent dropped input. The stdout thread flushes after every line to prevent buffering delays.
 

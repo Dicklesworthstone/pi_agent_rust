@@ -571,9 +571,139 @@ pub fn format_error_with_hints(error: &Error) -> String {
     output
 }
 
+/// `type` of the machine-readable fatal-error record (gh #217).
+pub const FATAL_ERROR_RECORD_TYPE: &str = "error";
+
+/// `phase` of a fatal-error record emitted before the JSON/RPC stream opened.
+pub const FATAL_ERROR_PHASE_STARTUP: &str = "startup";
+
+/// `phase` of a fatal-error record emitted after the stream had opened.
+pub const FATAL_ERROR_PHASE_RUN: &str = "run";
+
+/// Stable machine-readable class for a fatal [`Error`] (gh #217).
+///
+/// Auth and provider failures reuse the auth diagnostic codes
+/// (`auth.missing_api_key`, `auth.invalid_api_key`, …) when the message
+/// classifies; every other variant maps to a fixed family name. Hosts key
+/// on this string, so values only ever get added, never renamed.
+#[must_use]
+pub fn error_code(error: &Error) -> &'static str {
+    if let Some(diagnostic) = error.auth_diagnostic() {
+        return diagnostic.code.as_str();
+    }
+    match error {
+        Error::Config(_) => "config",
+        Error::Session(_) | Error::SessionNotFound { .. } => "session",
+        Error::Provider { .. } => "provider",
+        Error::Auth(_) => "auth",
+        Error::Tool { .. } => "tool",
+        Error::Validation(_) => "usage",
+        Error::Extension(_) => "extension",
+        Error::Io(_) => "io",
+        Error::Json(_) => "json",
+        Error::Sqlite(_) => "state_store",
+        Error::Aborted => "aborted",
+        Error::Api(_) => "api",
+    }
+}
+
+/// The single machine-readable record `--mode json` / `--mode rpc` print on
+/// stdout before a non-zero exit (gh #217):
+/// `{"type":"error","phase":"startup","code":"…","message":"…","exit_code":N}`.
+///
+/// `phase` is [`FATAL_ERROR_PHASE_STARTUP`] when the failure happened before
+/// the session header / RPC loop opened the stream, [`FATAL_ERROR_PHASE_RUN`]
+/// otherwise. The field set is the contract; new fields may be added, these
+/// five never change.
+#[must_use]
+pub fn fatal_error_record(
+    code: &str,
+    phase: &str,
+    message: &str,
+    exit_code: i32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": FATAL_ERROR_RECORD_TYPE,
+        "phase": phase,
+        "code": code,
+        "message": message,
+        "exit_code": exit_code,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gh #217: every variant has a stable code, and auth-classifiable
+    /// messages surface the finer auth diagnostic code.
+    #[test]
+    fn error_code_is_stable_per_variant() {
+        assert_eq!(error_code(&Error::config("bad settings")), "config");
+        assert_eq!(error_code(&Error::session("corrupt")), "session");
+        assert_eq!(
+            error_code(&Error::SessionNotFound {
+                path: "x".to_string()
+            }),
+            "session"
+        );
+        assert_eq!(error_code(&Error::validation("bad flag")), "usage");
+        assert_eq!(error_code(&Error::extension("boom")), "extension");
+        assert_eq!(error_code(&Error::api("500")), "api");
+        assert_eq!(error_code(&Error::Aborted), "aborted");
+        assert_eq!(error_code(&Error::tool("read", "missing")), "tool");
+        assert_eq!(
+            error_code(&Error::Io(Box::new(std::io::Error::other("disk")))),
+            "io"
+        );
+        assert_eq!(
+            error_code(&Error::auth(
+                "No API key found for provider anthropic (set ANTHROPIC_API_KEY)"
+            )),
+            "auth.missing_api_key"
+        );
+        // An auth message the diagnostic classifier does not recognize falls
+        // back to the family name rather than guessing a finer code.
+        assert_eq!(
+            error_code(&Error::auth("something nobody classifies")),
+            "auth"
+        );
+        assert_eq!(
+            error_code(&Error::Provider {
+                provider: "openai".to_string(),
+                message: "401 unauthorized: invalid api key".to_string(),
+            }),
+            "auth.invalid_api_key"
+        );
+        assert_eq!(
+            error_code(&Error::Provider {
+                provider: "openai".to_string(),
+                message: "connection reset".to_string(),
+            }),
+            "provider"
+        );
+    }
+
+    #[test]
+    fn fatal_error_record_has_exactly_the_contract_fields() {
+        let record = fatal_error_record(
+            "auth.missing_api_key",
+            FATAL_ERROR_PHASE_STARTUP,
+            "Authentication error: No API key",
+            1,
+        );
+        let object = record.as_object().expect("object");
+        let mut keys = object.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["code", "exit_code", "message", "phase", "type"]);
+        assert_eq!(record["type"], "error");
+        assert_eq!(record["phase"], "startup");
+        assert_eq!(record["code"], "auth.missing_api_key");
+        assert_eq!(record["message"], "Authentication error: No API key");
+        assert_eq!(record["exit_code"], 1);
+        // One line on the wire.
+        assert!(!record.to_string().contains('\n'));
+    }
 
     #[test]
     fn test_config_error_hints() {

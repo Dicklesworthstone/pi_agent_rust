@@ -3514,6 +3514,26 @@ fn setup_vcr_anthropic_with_chunks(
     request_body: &serde_json::Value,
     chunks: &[String],
 ) {
+    setup_vcr_anthropic_response(
+        harness,
+        cassette_name,
+        request_body,
+        200,
+        "text/event-stream; charset=utf-8",
+        chunks,
+    );
+}
+
+/// Cassette with an arbitrary response status/content type, for replaying a
+/// provider failure (e.g. a 401 for a bad key) without touching the network.
+fn setup_vcr_anthropic_response(
+    harness: &mut CliTestHarness,
+    cassette_name: &str,
+    request_body: &serde_json::Value,
+    status: u16,
+    content_type: &str,
+    chunks: &[String],
+) {
     let mut request_body = request_body.clone();
     apply_prompt_cache_wire_shape(&mut request_body);
     let request_body = &request_body;
@@ -3537,9 +3557,9 @@ fn setup_vcr_anthropic_with_chunks(
                 "body": request_body
             },
             "response": {
-                "status": 200,
+                "status": status,
                 "headers": [
-                    ["Content-Type", "text/event-stream; charset=utf-8"]
+                    ["Content-Type", content_type]
                 ],
                 "body_chunks": chunks
             }
@@ -4229,6 +4249,207 @@ fn e2e_cli_json_mode_missing_api_key_fails_startup() {
     let result = harness.run(&args);
     assert_exit_code(&harness.harness, &result, 1);
     assert_contains(&harness.harness, &result.stderr, "No API key");
+
+    // gh #217: exactly one machine-readable record on stdout, nothing else.
+    let record = assert_single_fatal_error_record(&harness.harness, &result, "startup");
+    assert_eq!(record["code"], "auth.missing_api_key", "{record}");
+    assert!(
+        record["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("No API key")),
+        "{record}"
+    );
+}
+
+/// gh #217: parse stdout as exactly one `{"type":"error",…}` record and
+/// check the contract fields against the process exit code.
+fn assert_single_fatal_error_record(
+    harness: &TestHarness,
+    result: &CliResult,
+    expected_phase: &str,
+) -> serde_json::Value {
+    harness.assert_log("assert single fatal error record on stdout");
+    let lines = parse_json_mode_stdout_lines(&result.stdout);
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one stdout record, got {}:\n{}",
+        lines.len(),
+        result.stdout
+    );
+    let record = lines.into_iter().next().expect("one record");
+    assert_eq!(record["type"], "error", "{record}");
+    assert_eq!(record["phase"], expected_phase, "{record}");
+    assert!(
+        record["code"].as_str().is_some_and(|code| !code.is_empty()),
+        "{record}"
+    );
+    assert!(
+        record["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "{record}"
+    );
+    assert_eq!(
+        record["exit_code"].as_i64(),
+        Some(i64::from(result.exit_code)),
+        "record exit_code must match the process exit code: {record}"
+    );
+    let mut keys = record
+        .as_object()
+        .expect("record object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(keys, ["code", "exit_code", "message", "phase", "type"]);
+    record
+}
+
+/// gh #217: the same record reaches an RPC host, since the loop never opened.
+#[test]
+fn e2e_cli_rpc_mode_missing_api_key_emits_startup_error_record() {
+    let harness =
+        CliTestHarness::new("e2e_cli_rpc_mode_missing_api_key_emits_startup_error_record");
+
+    let mut args: Vec<&str> = vec![
+        "--mode",
+        "rpc",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+    ];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+
+    let result = harness.run_with_stdin(&args, Some(b""));
+    assert_exit_code(&harness.harness, &result, 1);
+    let record = assert_single_fatal_error_record(&harness.harness, &result, "startup");
+    assert_eq!(record["code"], "auth.missing_api_key", "{record}");
+}
+
+/// gh #217: a usage error is a `usage` record with exit code 2.
+#[test]
+fn e2e_cli_json_mode_usage_error_emits_startup_error_record() {
+    let harness = CliTestHarness::new("e2e_cli_json_mode_usage_error_emits_startup_error_record");
+
+    // `--api-key` without a model is rejected before any startup work.
+    let mut args: Vec<&str> = vec!["--mode", "json", "--api-key", "k"];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.push("hello");
+    let result = harness.run(&args);
+    assert_exit_code(&harness.harness, &result, 2);
+    let record = assert_single_fatal_error_record(&harness.harness, &result, "startup");
+    assert_eq!(record["code"], "usage", "{record}");
+    assert_eq!(record["exit_code"], 2, "{record}");
+}
+
+/// gh #217: the report's shape — read-only `~/.pi`, key on argv — no longer
+/// fails at startup (the store degrades), so the run reaches the provider;
+/// when that provider rejects the key, the JSON stream ends with a single
+/// `phase: "run"` record carrying the auth diagnostic code, after the
+/// regular lifecycle events, and the exit code is non-zero.
+#[cfg(unix)]
+#[test]
+fn e2e_cli_json_mode_read_only_state_dir_and_bad_api_key_emit_run_error_record() {
+    if running_as_root() {
+        eprintln!("skipping: a read-only directory is writable by root");
+        return;
+    }
+    let mut harness = CliTestHarness::new(
+        "e2e_cli_json_mode_read_only_state_dir_and_bad_api_key_emit_run_error_record",
+    );
+
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ],
+        "system": expected_system_prompt("Bad key test."),
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
+        "stream": true
+    });
+    setup_vcr_anthropic_response(
+        &mut harness,
+        "e2e_json_mode_bad_api_key",
+        &request_body,
+        401,
+        "application/json",
+        &[r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#
+            .to_string()],
+    );
+
+    // A read-only parent whose `agent` / `sessions` children do not exist yet.
+    let readonly_root = harness.harness.temp_path("readonly-home");
+    fs::create_dir_all(&readonly_root).expect("create readonly root");
+    let mut perms = fs::metadata(&readonly_root)
+        .expect("stat readonly root")
+        .permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(&readonly_root, perms).expect("set readonly perms");
+    harness.env.insert(
+        "PI_CODING_AGENT_DIR".to_string(),
+        readonly_root.join("agent").display().to_string(),
+    );
+    harness.env.insert(
+        "PI_SESSIONS_DIR".to_string(),
+        readonly_root.join("sessions").display().to_string(),
+    );
+
+    let mut args: Vec<&str> = vec![
+        "--mode",
+        "json",
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--api-key",
+        "test-vcr-key",
+    ];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.extend_from_slice(&["--system-prompt", "Bad key test.", "hello"]);
+
+    let result = harness.run(&args);
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "read-only state dir + bad key", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+        });
+    assert_exit_code(&harness.harness, &result, 1);
+
+    let lines = parse_json_mode_stdout_lines(&result.stdout);
+    assert!(
+        lines.len() > 1,
+        "startup must succeed with a read-only state dir: {}",
+        result.stdout
+    );
+    assert_eq!(lines[0]["type"], "session", "{}", result.stdout);
+    let error_records = lines
+        .iter()
+        .filter(|line| line["type"] == "error")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        error_records.len(),
+        1,
+        "exactly one fatal record: {}",
+        result.stdout
+    );
+    let record = lines.last().expect("last line");
+    assert_eq!(
+        record["type"], "error",
+        "record is the final line: {record}"
+    );
+    assert_eq!(record["phase"], "run", "{record}");
+    assert_eq!(record["code"], "auth.invalid_api_key", "{record}");
+    assert_eq!(record["exit_code"], 1, "{record}");
+    assert!(
+        record["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("401")),
+        "{record}"
+    );
 }
 
 #[test]
@@ -4536,6 +4757,12 @@ fn e2e_cli_missing_api_key_error() {
             || stderr_lower.contains("anthropic_api_key"),
         "expected stderr to mention API key/auth issue, got:\n{}",
         result.stderr,
+    );
+    // gh #217: the machine-readable record is gated on --mode json/rpc.
+    assert!(
+        result.stdout.trim().is_empty(),
+        "text mode must not print a fatal-error record on stdout, got:\n{}",
+        result.stdout
     );
 }
 

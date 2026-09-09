@@ -1085,6 +1085,70 @@ fn json_parity_session_header_schema() {
 // 20. Event type string stability
 // ============================================================================
 
+/// gh #217: a startup failure in `--mode json` / `--mode rpc` prints exactly
+/// one `{"type":"error","phase":"startup","code":…,"message":…,"exit_code":N}`
+/// record on stdout before the non-zero exit. The five fields are the
+/// contract; `type` must not collide with any agent event type string.
+#[test]
+fn json_parity_startup_error_record_schema() {
+    let harness = TestHarness::new("json_parity_startup_error_record_schema");
+
+    let error =
+        pi::error::Error::auth("No API key found for provider anthropic (set ANTHROPIC_API_KEY)");
+    let record = pi::error_hints::fatal_error_record(
+        pi::error_hints::error_code(&error),
+        pi::error_hints::FATAL_ERROR_PHASE_STARTUP,
+        &error.to_string(),
+        1,
+    );
+
+    assert_event_type(&record, "error");
+    assert_eq!(record["phase"], "startup");
+    assert_eq!(record["code"], "auth.missing_api_key");
+    assert_non_empty_string(&record, "message");
+    assert_eq!(record["exit_code"], 1);
+    let mut keys = record
+        .as_object()
+        .expect("record is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["code", "exit_code", "message", "phase", "type"],
+        "the record's field set is the contract"
+    );
+    assert_eq!(
+        pi::error_hints::FATAL_ERROR_RECORD_TYPE,
+        "error",
+        "hosts key on the literal type string"
+    );
+    assert_eq!(pi::error_hints::FATAL_ERROR_PHASE_RUN, "run");
+
+    // The record's type string is reserved: no AgentEvent serializes as it.
+    for event in [
+        AgentEvent::AgentStart {
+            session_id: "s".to_string().into(),
+        },
+        AgentEvent::ExtensionError {
+            extension_id: Some("ext".to_string()),
+            event: "boom".to_string(),
+            error: "failed".to_string(),
+        },
+    ] {
+        let json = event_to_json(&event);
+        assert_ne!(json["type"], "error", "{json}");
+    }
+
+    harness
+        .log()
+        .info_ctx("json_parity", "startup error record schema ok", |ctx| {
+            ctx.push(("type".to_string(), "error".to_string()));
+            ctx.push(("code".to_string(), "auth.missing_api_key".to_string()));
+        });
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn json_parity_all_event_type_strings() {
