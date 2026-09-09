@@ -41,9 +41,43 @@ dsr quality --tool pi_agent_rust
 ```
 
 Per-check logs land under `~/.local/state/dsr/quality-logs/pi_agent_rust/`.
-Cross-platform builds and releases additionally need the build authority file
-`~/.config/dsr/repos.d/pi_agent_rust.yaml` on the release operator's machine;
-keys that appear in both files must stay identical (`dsr repos validate`).
+
+### Registering the build authority on a new host
+
+`dsr quality` needs only the registry entry above. `dsr build` and
+`dsr release` read the cross-platform target inventory, per-host build
+routing, artifact naming, and the fail-closed release contract from a second
+file, `~/.config/dsr/repos.d/pi_agent_rust.yaml`, and from nowhere else. That
+file is checked in at `.dsr/repos.d/pi_agent_rust.yaml` (bd-ikl7j), so any
+host can validate and reproduce the cross-platform recipe:
+
+```bash
+mkdir -p ~/.config/dsr/repos.d
+cp .dsr/repos.d/pi_agent_rust.yaml ~/.config/dsr/repos.d/pi_agent_rust.yaml
+dsr repos validate --repo pi_agent_rust
+dsr build pi_agent_rust --dry-run          # expect the five-target plan
+```
+
+`dsr repos validate` compares the two files key by key and fails when they
+disagree, reporting `repos.yaml and repos.d/pi_agent_rust.yaml disagree on:
+<key> (repos.d wins for builds; align the two files)`. `local_path` is
+included in that comparison, so it is not a per-host escape hatch: both
+checked-in files ship `/data/projects/pi_agent_rust`, and a host whose
+checkout lives elsewhere must re-point **both** of them in one edit
+(`local_path` in the authority file, `tools.pi_agent_rust.local_path` in the
+registry). `host_paths` is the separate per-host map naming each SSH build
+host's checkout and does not need editing.
+
+`release_contract.minisign_public_key_file` is deliberately absent until
+bd-yj126 provisions a real repo-owned public key; a placeholder there would
+let the fail-closed contract pass against key material the project does not
+pin.
+
+Two gates run before per-target planning and are expected to fail outside a
+release: the strict contract requires a completely clean tree (tracked **and**
+untracked) and requires `HEAD` to equal the peeled local tag for the detected
+version. A shared multi-agent checkout satisfies neither, so validate planning
+from a clean clone checked out at the tag rather than from the working tree.
 
 The Cargo source package also retains the internal `pi_legacy_capture`
 conformance utility because integration tests execute it through

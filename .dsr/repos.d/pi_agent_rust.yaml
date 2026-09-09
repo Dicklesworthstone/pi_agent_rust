@@ -1,0 +1,136 @@
+# Portable DSR build authority for pi_agent_rust.
+#
+# Companion to `.dsr/repos.yaml`. That file is the *registry* subset that
+# `dsr quality` reads (checks only). This file is the *build authority*:
+# `dsr build` and `dsr release` read the cross-platform target inventory,
+# per-host build routing, artifact naming, and the fail-closed release
+# contract from `~/.config/dsr/repos.d/<tool>.yaml` and nowhere else
+# (docs/releasing.md, "Registering the quality recipe on a new host").
+#
+# Until this file was checked in it existed only on the release operator's
+# machine, so no other host could run `dsr repos validate` or reproduce a
+# cross-platform build (docs/planning/REALITY_CHECK_2026-09-01.md section 10,
+# gap C2 step 3). Install it on a new host with:
+#
+#   mkdir -p ~/.config/dsr/repos.d
+#   cp .dsr/repos.d/pi_agent_rust.yaml ~/.config/dsr/repos.d/pi_agent_rust.yaml
+#   yq -i '.tools.pi_agent_rust = load(".dsr/repos.yaml").tools.pi_agent_rust' \
+#     ~/.config/dsr/repos.yaml
+#   # If this checkout is not at the path below, set it in BOTH installed files:
+#   #   ~/.config/dsr/repos.d/pi_agent_rust.yaml  ->  local_path
+#   #   ~/.config/dsr/repos.yaml                  ->  tools.pi_agent_rust.local_path
+#   dsr repos validate --repo pi_agent_rust
+#   dsr build pi_agent_rust --dry-run
+#
+# Every key that also appears in `.dsr/repos.yaml` (repo, local_path, language,
+# binary_name, targets) is byte-identical here and must stay that way.
+# `dsr repos validate` enforces this literally: a divergence is reported as
+#
+#   repos.yaml and repos.d/pi_agent_rust.yaml disagree on: local_path
+#   (repos.d wins for builds; align the two files)
+#
+# and fails validation, so `local_path` is NOT an allowed per-host exception.
+# Both checked-in files therefore ship the same value, and a host that keeps
+# its checkout elsewhere must re-point BOTH of them together, in one edit.
+#
+# `host_paths` is the separate per-host map: it names the checkout of every
+# machine DSR drives over SSH for a cross-platform build, resolved through
+# ~/.config/dsr/hosts.yaml. It is not host-specific to the operator and does
+# not need editing.
+#
+# No secrets live in this file. `github_tag_ruleset` records public GitHub
+# identifiers, both re-verified live on 2026-09-09:
+#   gh api repos/Dicklesworthstone/pi_agent_rust --jq .id          -> 1148330949
+#   gh api repos/.../rulesets --jq '.[] | {id,name,enforcement}'   -> 20418963
+#     "Immutable release tags", target tag, enforcement active (bd-5by7n).
+#
+# `release_contract.minisign_public_key_file` is deliberately ABSENT. Signing
+# key provisioning is bd-yj126 and is still open; a placeholder value here
+# would make the fail-closed contract pass against key material the project
+# does not actually pin. Add the key only when bd-yj126 lands a real
+# repo-owned public key file.
+
+tool_name: pi_agent_rust
+repo: Dicklesworthstone/pi_agent_rust
+
+# HOST-SPECIFIC: must equal tools.pi_agent_rust.local_path in .dsr/repos.yaml.
+local_path: /data/projects/pi_agent_rust
+
+language: rust
+binary_name: pi
+build_cmd: cargo build --locked --release --bin pi
+build_profile: release
+
+# DSR is the only quality/build/release authority for this repository.
+# Null mappings force native/local or SSH execution and prohibit act/GitHub
+# Actions from entering the build path.
+targets:
+  - linux/amd64
+  - linux/arm64
+  - darwin/amd64
+  - darwin/arm64
+  - windows/amd64
+
+act_job_map:
+  linux/amd64: null
+  linux/arm64: null
+  darwin/amd64: null
+  darwin/arm64: null
+  windows/amd64: null
+
+host_paths:
+  mmini: /Users/jemanuel/projects/pi_agent_rust
+  ts1: /home/ubuntu/pi_agent_rust
+  wsurf: C:/Users/jeffr/pi_agent_rust
+
+target_triples:
+  linux/amd64: x86_64-unknown-linux-gnu
+  linux/arm64: aarch64-unknown-linux-gnu
+  darwin/amd64: x86_64-apple-darwin
+  darwin/arm64: aarch64-apple-darwin
+  windows/amd64: x86_64-pc-windows-msvc
+
+cross_compile:
+  linux/amd64:
+    host: ts1
+  linux/arm64:
+    host: ts1
+  darwin/amd64:
+    host: mmini
+  darwin/arm64:
+    host: mmini
+  windows/amd64:
+    host: wsurf
+    build_cmd: call C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat && cargo build --locked --release --bin pi
+
+artifact_naming: "pi-${os}-${arch}"
+install_script_compat: "pi-${os}-${arch}"
+install_script_path: install.sh
+archive_format:
+  linux: tar.xz
+  darwin: tar.xz
+  windows: zip
+
+# Fail closed on the exact public inventory. DSR stages each native binary into
+# the named archive and creates a matching `.sha256` sidecar; install.sh accepts
+# those sidecars when the historical aggregate SHA256SUMS file is absent.
+release_contract:
+  checksum_sidecar: sha256
+  github_tag_ruleset:
+    repository_id: 1148330949
+    ruleset_id: 20418963
+  exact_primary_assets:
+    linux/amd64: pi-linux-amd64.tar.xz
+    linux/arm64: pi-linux-arm64.tar.xz
+    darwin/amd64: pi-darwin-amd64.tar.xz
+    darwin/arm64: pi-darwin-arm64.tar.xz
+    windows/amd64: pi-windows-amd64.zip
+
+include_files:
+  - README.md
+  - LICENSE
+  - AGENTS.md
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RCH_DISABLED: "1"
