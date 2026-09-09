@@ -4595,6 +4595,21 @@ else
 fi
 
 # ─── Phase 5f: Phase-1 matrix validation ────────────────────────────────────
+#
+# CONTRACT (bd-b3yao.2): the phase-1 matrix artifact is DIAGNOSTIC, and is
+# written before the lineage and malformed-source-row rejections that follow.
+# A run rejected for foreign lineage or a bad source row still leaves
+# results/phase1_matrix_validation.json behind, so the rejection can be
+# explained from the artifacts rather than only from the console. This is why
+# orchestrate_rejects_foreign_source_lineage_before_finalization and
+# orchestrate_rejects_malformed_source_row_before_finalization both assert the
+# artifact EXISTS on a rejected run; a rejection that left no artifacts would
+# be the opposite contract and would fail them.
+#
+# Being diagnostic is exactly why it is not evidence: writing it says nothing
+# about whether the run was admitted. The post-generation gate in Phase 5g is
+# what decides admission, and the source-identity fences are what decide
+# whether the tree can be vouched for at all.
 
 log_phase "Phase 5f: Phase-1 Matrix Validation"
 
