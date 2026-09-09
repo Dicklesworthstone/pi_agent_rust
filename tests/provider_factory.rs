@@ -2544,7 +2544,17 @@ fn stream_options_default_is_empty_and_safe() {
 #[test]
 fn input_type_rejects_unknown_values() {
     let harness = TestHarness::new("input_type_rejects_unknown_values");
-    let err = serde_json::from_str::<InputType>("\"audio\"")
+    // `"audio"` used to be the stand-in for an unknown variant here. It stopped
+    // being unknown when Video and Audio landed (gh #212, src/provider.rs:301-310)
+    // and the test then failed for the opposite of the reason it exists. Pin the
+    // real variants as accepted, and use a value that is not one, so the next
+    // InputType addition cannot silently turn this assertion inside out again.
+    for accepted in ["text", "image", "video", "audio"] {
+        serde_json::from_str::<InputType>(&format!("\"{accepted}\""))
+            .unwrap_or_else(|err| panic!("`{accepted}` must be a valid input type: {err}"));
+    }
+
+    let err = serde_json::from_str::<InputType>("\"holovid\"")
         .expect_err("expected unknown input type to fail");
     harness
         .log()

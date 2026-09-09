@@ -140,6 +140,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/hostcall_trace_jit.rs` | Hostcall trace JIT | Unit; `tests/streaming_hostcall.rs`. |
 | `src/http/client.rs` | HTTP client | Unit; `tests/http_client.rs`; branch export baseline marks `src/http/*.rs` as branch-SIGSEGV fallback. |
 | `src/http/mod.rs` | HTTP module glue | Waived glue: re-export/test-module wiring. |
+| `src/http/proxy.rs` | Outbound HTTP/HTTPS proxy resolution (gh #210) | Unit (21 in-module tests covering precedence, `no_proxy` bypass matching, and credential handling); `tests/http_proxy.rs`. |
 | `src/http/sse.rs` | HTTP SSE | Unit; `tests/repro_sse_flush.rs`. |
 | `src/http/test_api.rs` | HTTP test support | Waived test-only support module; compiled only for tests. |
 | `src/http/test_asupersync.rs` | HTTP test support | Waived test-only support module; compiled only for tests. |
