@@ -16,6 +16,20 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Added
 
+- **OpenRouter reasoning forwarding** (gh
+  [#220](https://github.com/Dicklesworthstone/pi_agent_rust/issues/220)):
+  `compat.thinkingFormat: "openrouter"` maps pi's thinking level onto the
+  gateway's normalized `reasoning: {"effort": …}` object (or
+  `{"max_tokens": …}` when the model's `thinkingLevelMap` maps a level to
+  an integer budget; `{"off": "none"}` forces thinking off). It is the
+  default for reasoning models on the `openrouter` provider or any
+  `openrouter.ai` base URL, so `--thinking high` now reaches the model
+  instead of being dropped; non-reasoning models send no `reasoning` key,
+  and vendor dialects (`thinking`/`reasoning_effort`) are never sent
+  through the gateway. `xhigh`/`max` are no longer clamped for those
+  models, and `compat.openRouterRouting` keys (including a `reasoning` or
+  `store` of your own) still merge on top.
+
 - **Inline video and audio input for Gemini-family models** (gh
   [#212](https://github.com/Dicklesworthstone/pi_agent_rust/issues/212)):
   a `media` content block (`{"type":"media","data":…,"mimeType":…,"name":…}`),

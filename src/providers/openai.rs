@@ -223,13 +223,20 @@ impl OpenAIProvider {
 
     /// Detect a provider-specific reasoning dialect for this transport.
     ///
-    /// An explicit catalog `compat.thinkingFormat` declaration wins (gh #166):
-    /// `"deepseek"` opts any custom OpenAI-compatible provider into the
-    /// DeepSeek dialect regardless of provider id or base URL, while any other
+    /// The OpenRouter gateway (by provider id or an `openrouter.ai` base URL)
+    /// always uses its normalized `reasoning` object (gh #220): with no
+    /// declared `thinkingFormat` it defaults on for reasoning models, and a
+    /// declared format other than `"openrouter"` opts out entirely — vendor
+    /// dialects such as DeepSeek's `thinking`/`reasoning_effort` never go
+    /// through the gateway, which translates `reasoning` itself.
+    ///
+    /// Elsewhere an explicit catalog `compat.thinkingFormat` declaration wins
+    /// (gh #166): `"deepseek"` opts any custom OpenAI-compatible provider into
+    /// the DeepSeek dialect regardless of provider id or base URL,
+    /// `"openrouter"` opts a proxy into the OpenRouter shape, while any other
     /// declared format (the legacy catalog also carries `"openai"`, `"zai"`,
-    /// `"qwen"`) explicitly opts out of it — this transport only models the
-    /// DeepSeek dialect today, so those serialize with no
-    /// `thinking`/`reasoning_effort`, exactly like providers with no dialect.
+    /// `"qwen"`) explicitly opts out — those serialize with no reasoning
+    /// controls, exactly like providers with no dialect.
     ///
     /// When no `thinkingFormat` is declared, DeepSeek is identified the same
     /// way `ModelEntry::is_deepseek_reasoning_model` does it — by the
@@ -242,16 +249,29 @@ impl OpenAIProvider {
         if !self.reasoning {
             return None;
         }
-        if let Some(format) = self
+        let declared = self
             .compat
             .as_ref()
             .and_then(|c| c.thinking_format.as_deref())
             .map(str::trim)
-            .filter(|format| !format.is_empty())
-        {
-            return format
-                .eq_ignore_ascii_case("deepseek")
-                .then_some(ReasoningStyle::DeepSeek);
+            .filter(|format| !format.is_empty());
+        if self.is_openrouter() {
+            return match declared {
+                None => Some(ReasoningStyle::OpenRouter),
+                Some(format) if format.eq_ignore_ascii_case("openrouter") => {
+                    Some(ReasoningStyle::OpenRouter)
+                }
+                Some(_) => None,
+            };
+        }
+        if let Some(format) = declared {
+            if format.eq_ignore_ascii_case("deepseek") {
+                return Some(ReasoningStyle::DeepSeek);
+            }
+            if format.eq_ignore_ascii_case("openrouter") {
+                return Some(ReasoningStyle::OpenRouter);
+            }
+            return None;
         }
         let provider_is_deepseek = canonical_provider_id(&self.provider)
             .is_some_and(|canonical| canonical == "deepseek")
@@ -322,8 +342,9 @@ impl OpenAIProvider {
             .then_some(OpenAIUsageAccounting { include: true });
 
         // Forward the reasoning level for providers with a request-side reasoning
-        // dialect. Only DeepSeek today; all other transports get `(None, None)`,
-        // so their serialized body is unchanged. DeepSeek collapses `low`/`medium`
+        // dialect: DeepSeek's vendor fields, or OpenRouter's normalized
+        // `reasoning` object (gh #220). Every other transport gets all-`None`,
+        // so its serialized body is unchanged. DeepSeek collapses `low`/`medium`
         // into `high` itself, so we only emit the values it documents and let
         // `off` request the explicit non-thinking path. Both `xhigh` and `max`
         // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
@@ -331,11 +352,11 @@ impl OpenAIProvider {
         // `thinkingLevelMap` overrides the emitted `reasoning_effort` value for
         // enabled levels (gh #117/#165), matching the anthropic-messages and
         // openai-responses transports; `off` never emits an effort.
-        let (thinking, reasoning_effort) = match self.reasoning_style() {
+        let (thinking, reasoning_effort, reasoning) = match self.reasoning_style() {
             Some(ReasoningStyle::DeepSeek) => {
                 let level = options.thinking_level.unwrap_or_default();
                 if level == ThinkingLevel::Off {
-                    (Some(OpenAIThinking { kind: "disabled" }), None)
+                    (Some(OpenAIThinking { kind: "disabled" }), None, None)
                 } else {
                     let mapped = self
                         .compat
@@ -351,10 +372,15 @@ impl OpenAIProvider {
                         | ThinkingLevel::Low
                         | ThinkingLevel::Medium => None,
                     });
-                    (Some(OpenAIThinking { kind: "enabled" }), effort)
+                    (Some(OpenAIThinking { kind: "enabled" }), effort, None)
                 }
             }
-            None => (None, None),
+            Some(ReasoningStyle::OpenRouter) => (
+                None,
+                None,
+                self.openrouter_reasoning(options.thinking_level.unwrap_or_default()),
+            ),
+            None => (None, None, None),
         };
 
         OpenAIRequest {
@@ -369,7 +395,47 @@ impl OpenAIProvider {
             usage,
             thinking,
             reasoning_effort,
+            reasoning,
             prompt_cache_key: options.prompt_cache_key.clone(),
+        }
+    }
+
+    /// OpenRouter's normalized `reasoning` request object for a thinking
+    /// level (gh #220; https://openrouter.ai/docs/use-cases/reasoning-tokens).
+    ///
+    /// pi's level names are OpenRouter's `effort` vocabulary
+    /// (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), so the level is sent
+    /// as-is and the gateway translates it for models that take a token
+    /// budget instead. A catalog `thinkingLevelMap` entry overrides the value
+    /// per level: a positive integer becomes `reasoning.max_tokens` (the two
+    /// are mutually exclusive on the wire), anything else is sent as
+    /// `reasoning.effort` (e.g. `{"off": "none"}` to force thinking off on a
+    /// model that reasons by default). Unmapped `off` sends no `reasoning`
+    /// key, leaving the model's default.
+    fn openrouter_reasoning(&self, level: ThinkingLevel) -> Option<OpenRouterReasoning<'_>> {
+        let mapped = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.thinking_level_map.as_ref())
+            .and_then(|map| map.get(level.to_string().as_str()))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        match mapped {
+            Some(value) => match value.parse::<u32>() {
+                Ok(max_tokens) if max_tokens > 0 => Some(OpenRouterReasoning {
+                    effort: None,
+                    max_tokens: Some(max_tokens),
+                }),
+                _ => Some(OpenRouterReasoning {
+                    effort: Some(Cow::Borrowed(value)),
+                    max_tokens: None,
+                }),
+            },
+            None if level == ThinkingLevel::Off => None,
+            None => Some(OpenRouterReasoning {
+                effort: Some(Cow::Owned(level.to_string())),
+                max_tokens: None,
+            }),
         }
     }
 
@@ -1364,6 +1430,12 @@ pub struct OpenAIRequest<'a> {
     /// compat config) is sent verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    /// OpenRouter's normalized reasoning control (`{"effort": …}` or
+    /// `{"max_tokens": …}`), gh #220. Only the OpenRouter dialect sets it; a
+    /// `compat.openRouterRouting` object carrying its own `reasoning` key
+    /// still wins because routing overrides are merged after serialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenRouterReasoning<'a>>,
     /// Cache-affinity key (OpenAI `prompt_cache_key`, gh #188). Omitted when
     /// unset so backends that reject unknown params never see it. See
     /// `StreamOptions::prompt_cache_key`.
@@ -1382,6 +1454,17 @@ struct OpenAIUsageAccounting {
     include: bool,
 }
 
+/// OpenRouter's `reasoning` request object (gh #220). `effort` and
+/// `max_tokens` are mutually exclusive per the OpenRouter docs, so exactly one
+/// is populated.
+#[derive(Debug, Serialize)]
+struct OpenRouterReasoning<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+}
+
 /// DeepSeek's `thinking` request object on the chat-completions transport.
 /// `{"type": "enabled"}` turns on thinking mode; `{"type": "disabled"}` forces
 /// the non-thinking path. Serialized only for DeepSeek (see `ReasoningStyle`).
@@ -1393,15 +1476,18 @@ struct OpenAIThinking {
 
 /// Request-side reasoning dialect for OpenAI-compatible providers that take
 /// non-standard reasoning controls. The plain Chat Completions transport has no
-/// reasoning toggle, so this is `None` for OpenAI/Groq/OpenRouter/etc. and the
-/// emitted body is byte-for-byte unchanged for them. Kept as an enum so other
-/// dialects (zai/qwen/openrouter "reasoning") can be added without touching the
-/// `build_request` call site.
+/// reasoning toggle, so this is `None` for OpenAI/Groq/etc. and the emitted
+/// body is byte-for-byte unchanged for them. Kept as an enum so other dialects
+/// (zai/qwen) can be added without touching the `build_request` call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReasoningStyle {
     /// DeepSeek: `thinking: {type: enabled|disabled}` + `reasoning_effort`
     /// (`high`|`max`). Mirrors the legacy `@earendil-works/pi-ai` `thinkingFormat`.
     DeepSeek,
+    /// OpenRouter: the gateway's normalized `reasoning: {effort | max_tokens}`
+    /// object (`compat.thinkingFormat: "openrouter"`, the default on the
+    /// OpenRouter transport; gh #220).
+    OpenRouter,
 }
 
 #[derive(Debug, Serialize)]
@@ -2540,6 +2626,222 @@ mod tests {
             "Event 5 should be Done with Stop reason, got {:?}",
             out[5]
         );
+    }
+
+    /// Serialized request body for one thinking level, as the wire sees it
+    /// (routing overrides applied).
+    fn openrouter_body(provider: &OpenAIProvider, level: crate::model::ThinkingLevel) -> Value {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Solve it".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(level),
+            ..Default::default()
+        };
+        provider
+            .build_request_json(&context, &options)
+            .expect("serialize request")
+    }
+
+    /// gh #220: on the OpenRouter transport a reasoning model's thinking
+    /// level goes out as the gateway's normalized `reasoning: {effort}`
+    /// object — one fixture per level — and never as a vendor field.
+    #[test]
+    fn test_build_request_openrouter_reasoning_effort_per_level() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true);
+
+        let off = openrouter_body(&provider, ThinkingLevel::Off);
+        assert!(
+            off.get("reasoning").is_none(),
+            "unmapped off leaves the model default: {off}"
+        );
+
+        for (level, effort) in [
+            (ThinkingLevel::Minimal, "minimal"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, "xhigh"),
+            (ThinkingLevel::Max, "max"),
+        ] {
+            let body = openrouter_body(&provider, level);
+            assert_eq!(
+                body["reasoning"],
+                json!({ "effort": effort }),
+                "level {level}: {body}"
+            );
+            assert!(
+                body.get("reasoning_effort").is_none() && body.get("thinking").is_none(),
+                "vendor fields must never be sent through the gateway: {body}"
+            );
+        }
+        // The rest of the OpenRouter shape is unchanged.
+        let high = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(high["usage"], json!({ "include": true }));
+        assert_eq!(high["model"], "deepseek/deepseek-v4-pro");
+    }
+
+    /// gh #220: a non-reasoning OpenRouter model never carries a `reasoning`
+    /// key, whatever level was requested.
+    #[test]
+    fn test_build_request_openrouter_non_reasoning_model_has_no_reasoning_key() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("openai/gpt-4o")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(false);
+        for level in [ThinkingLevel::Off, ThinkingLevel::High, ThinkingLevel::Max] {
+            let body = openrouter_body(&provider, level);
+            assert!(body.get("reasoning").is_none(), "{body}");
+            assert!(body.get("reasoning_effort").is_none(), "{body}");
+            assert!(body.get("thinking").is_none(), "{body}");
+        }
+    }
+
+    /// gh #220: `thinkingLevelMap` steers the OpenRouter object per level —
+    /// an integer becomes `max_tokens` (mutually exclusive with `effort`),
+    /// any other string is sent as `effort`, and mapping `off` lets a
+    /// model that reasons by default be switched off explicitly.
+    #[test]
+    fn test_build_request_openrouter_thinking_level_map_budget_and_overrides() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("anthropic/claude-sonnet-4.6")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_level_map: Some(HashMap::from([
+                    ("high".to_string(), "8000".to_string()),
+                    ("max".to_string(), " 32000 ".to_string()),
+                    ("low".to_string(), "minimal".to_string()),
+                    ("off".to_string(), "none".to_string()),
+                    ("medium".to_string(), "0".to_string()),
+                ])),
+                ..Default::default()
+            }));
+
+        let high = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(high["reasoning"], json!({ "max_tokens": 8000 }), "{high}");
+        let max = openrouter_body(&provider, ThinkingLevel::Max);
+        assert_eq!(max["reasoning"], json!({ "max_tokens": 32000 }), "{max}");
+        let low = openrouter_body(&provider, ThinkingLevel::Low);
+        assert_eq!(low["reasoning"], json!({ "effort": "minimal" }), "{low}");
+        let off = openrouter_body(&provider, ThinkingLevel::Off);
+        assert_eq!(off["reasoning"], json!({ "effort": "none" }), "{off}");
+        // A zero budget is not a budget; it is passed through as an effort
+        // string so the gateway rejects it loudly instead of us guessing.
+        let medium = openrouter_body(&provider, ThinkingLevel::Medium);
+        assert_eq!(medium["reasoning"], json!({ "effort": "0" }), "{medium}");
+        // Unmapped levels keep the pass-through name.
+        let xhigh = openrouter_body(&provider, ThinkingLevel::XHigh);
+        assert_eq!(xhigh["reasoning"], json!({ "effort": "xhigh" }), "{xhigh}");
+    }
+
+    /// gh #220: `compat.thinkingFormat` selects the dialect explicitly —
+    /// `"openrouter"` opts a custom proxy into the normalized object, any
+    /// other declared format on the OpenRouter transport opts out, and a
+    /// bare `openrouter.ai` base URL is enough to enable it by default.
+    #[test]
+    fn test_build_request_openrouter_thinking_format_declarations() {
+        use crate::model::ThinkingLevel;
+
+        // Custom provider that speaks the OpenRouter dialect by declaration.
+        let proxy = OpenAIProvider::new("some/model")
+            .with_provider_name("my-gateway")
+            .with_base_url("https://gateway.example.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("OpenRouter".to_string()),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&proxy, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }), "{body}");
+        assert!(
+            body.get("usage").is_none(),
+            "usage accounting stays gateway-only"
+        );
+
+        // Explicit opt-out on the OpenRouter transport: no reasoning controls
+        // at all, and in particular no DeepSeek vendor dialect even when
+        // declared.
+        for format in ["openai", "deepseek", "zai"] {
+            let opted_out = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+                .with_provider_name("openrouter")
+                .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+                .with_reasoning(true)
+                .with_compat(Some(CompatConfig {
+                    thinking_format: Some(format.to_string()),
+                    ..Default::default()
+                }));
+            let body = openrouter_body(&opted_out, ThinkingLevel::High);
+            assert!(body.get("reasoning").is_none(), "{format}: {body}");
+            assert!(body.get("reasoning_effort").is_none(), "{format}: {body}");
+            assert!(body.get("thinking").is_none(), "{format}: {body}");
+        }
+
+        // Detected by base URL alone (custom provider pointed at OpenRouter).
+        let by_url = OpenAIProvider::new("x/y")
+            .with_provider_name("custom-or")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true);
+        let body = openrouter_body(&by_url, ThinkingLevel::Low);
+        assert_eq!(body["reasoning"], json!({ "effort": "low" }), "{body}");
+
+        // The direct DeepSeek transport is untouched by all of this.
+        let deepseek = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let body = openrouter_body(&deepseek, ThinkingLevel::High);
+        assert!(body.get("reasoning").is_none(), "{body}");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    /// gh #220: `compat.openRouterRouting` keeps merging onto the top level
+    /// next to `reasoning`, and a routing object that carries its own
+    /// `reasoning` key wins over the level-derived one.
+    #[test]
+    fn test_build_request_openrouter_reasoning_coexists_with_routing_passthrough() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                open_router_routing: Some(json!({
+                    "provider": { "only": ["deepseek"], "allow_fallbacks": false },
+                    "store": false,
+                })),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert_eq!(
+            body["provider"],
+            json!({ "only": ["deepseek"], "allow_fallbacks": false })
+        );
+        assert_eq!(body["store"], false);
+
+        let pinned = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                open_router_routing: Some(json!({ "reasoning": { "exclude": true } })),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&pinned, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "exclude": true }));
     }
 
     /// gh #221: OpenRouter requests opt into usage accounting so the final

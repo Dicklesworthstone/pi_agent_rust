@@ -105,8 +105,30 @@ Every key of `compat.openRouterRouting` is copied verbatim onto the top level of
 | `maxTokensField` | Override param name (e.g., `max_completion_tokens`) |
 | `systemRoleName` | Role used for the system prompt message (e.g. `developer`) |
 | `customHeaders` | Extra HTTP headers for every request to this model/provider |
-| `openRouterRouting` | OpenRouter routing metadata (JSON object), merged verbatim into the request body top level (e.g. `{"provider": {"only": ["deepseek"], "allow_fallbacks": false}}`) |
+| `openRouterRouting` | OpenRouter routing metadata (JSON object), merged verbatim into the request body top level (e.g. `{"provider": {"only": ["deepseek"], "allow_fallbacks": false}}`). Merged after everything else, so a `reasoning` or `store` key here overrides what pi would send |
 | `vercelGatewayRouting` | Vercel gateway routing metadata (JSON object) |
+| `thinkingFormat` | Request-side reasoning dialect on the `openai-completions` transport. `"deepseek"` sends DeepSeek's `thinking: {type}` + `reasoning_effort`; `"openrouter"` sends OpenRouter's normalized `reasoning: {effort}` object (the default for reasoning models on the `openrouter` provider or any `openrouter.ai` base URL); any other value (`"openai"`, `"zai"`, `"qwen"`) sends no reasoning controls. Vendor dialects are never sent through the OpenRouter gateway |
+| `thinkingLevelMap` | Per-level override of the value a transport emits for pi's `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`, e.g. `{"xhigh": "max"}`. Declaring `xhigh`/`max` also unclamps them for that model. On OpenRouter a positive integer becomes `reasoning.max_tokens` (for models that take a budget), any other string is sent as `reasoning.effort`, and mapping `off` (e.g. `{"off": "none"}`) forces thinking off on a model that reasons by default |
+
+#### OpenRouter reasoning
+
+Reasoning models on the `openrouter` provider forward pi's thinking level as OpenRouter's normalized `reasoning` object — `--thinking high` sends `"reasoning": {"effort": "high"}`; `off` sends nothing unless mapped. To hand a token budget to a model that takes one instead:
+
+```json
+{
+  "providers": {
+    "openrouter": {
+      "modelOverrides": {
+        "anthropic/claude-sonnet-4.6": {
+          "thinkingLevelMap": { "low": "2048", "medium": "8192", "high": "16000", "off": "none" }
+        }
+      }
+    }
+  }
+}
+```
+
+A custom OpenAI-compatible proxy that speaks the same shape can opt in with `"compat": {"thinkingFormat": "openrouter"}`.
 
 ## Bundled Provider Registry
 

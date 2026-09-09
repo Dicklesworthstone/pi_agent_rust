@@ -124,8 +124,44 @@ impl ModelEntry {
                 | "gpt-5.3-codex"
                 | "gpt-5.3-codex-spark"
         ) || self.is_deepseek_reasoning_model()
+            || self.is_openrouter_reasoning_model()
             || self.is_anthropic_xhigh_effort_model()
             || self.thinking_level_map_declares("xhigh")
+    }
+
+    /// Whether this model's thinking level is forwarded as OpenRouter's
+    /// normalized `reasoning: {effort}` object (gh #220).
+    ///
+    /// The gateway accepts every pi level name as an `effort` value and
+    /// translates it for models that take a token budget, so `xhigh`/`max`
+    /// must not be clamped away before `OpenAIProvider::build_request` runs.
+    /// Mirrors `OpenAIProvider::reasoning_style` on the `openai-completions`
+    /// transport: the OpenRouter gateway (canonical provider id or an
+    /// `openrouter.ai` base URL) with either no declared
+    /// `compat.thinkingFormat` or an explicit `"openrouter"`, or any other
+    /// provider that explicitly declares `"openrouter"`.
+    fn is_openrouter_reasoning_model(&self) -> bool {
+        // Only the chat-completions transport implements the dialect.
+        if !self.model.reasoning || self.model.api != "openai-completions" {
+            return false;
+        }
+        let declared = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_format.as_deref())
+            .map(str::trim)
+            .filter(|format| !format.is_empty());
+        let transport_is_openrouter = canonical_provider_id(&self.model.provider)
+            .is_some_and(|canonical| canonical == "openrouter")
+            || self.model.provider.eq_ignore_ascii_case("openrouter")
+            || self
+                .model
+                .base_url
+                .to_ascii_lowercase()
+                .contains("openrouter.ai");
+        declared.map_or(transport_is_openrouter, |format| {
+            format.eq_ignore_ascii_case("openrouter")
+        })
     }
 
     /// Whether the catalog's per-model `thinkingLevelMap` declares a mapping
@@ -194,6 +230,7 @@ impl ModelEntry {
             self.model.id.as_str(),
             "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
         ) || self.is_deepseek_reasoning_model()
+            || self.is_openrouter_reasoning_model()
             || self.is_anthropic_max_effort_model()
             || self.thinking_level_map_declares("max")
     }
@@ -8558,6 +8595,101 @@ mod tests {
     /// gh #165: a catalog `thinkingLevelMap` declaring `xhigh`/`max` marks the
     /// tier as supported, so custom models outside the hard-coded id lists are
     /// not silently clamped down.
+    /// gh #220: OpenRouter forwards every pi level as `reasoning.effort`, so
+    /// the registry must not clamp `xhigh`/`max` for reasoning models on that
+    /// transport — by provider id, alias, base URL, or an explicit
+    /// `thinkingFormat: "openrouter"` on a custom proxy. A declared non-OpenRouter
+    /// format opts out, and non-reasoning models stay `Off`.
+    #[test]
+    fn openrouter_reasoning_models_keep_xhigh_and_max() {
+        use crate::model::ThinkingLevel;
+        let make = |id: &str, reasoning: bool, provider: &str, base_url: &str| {
+            let mut entry = make_model_entry_with_provider(id, reasoning, provider, base_url);
+            entry.model.api = "openai-completions".to_string();
+            entry
+        };
+        let mut other_api = make_model_entry_with_provider(
+            "deepseek/deepseek-v4-pro",
+            true,
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+        );
+        other_api.model.api = "openai-responses".to_string();
+        assert!(
+            !other_api.supports_xhigh(),
+            "only the chat-completions transport implements the dialect"
+        );
+
+        let by_provider = make(
+            "deepseek/deepseek-v4-pro",
+            true,
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+        );
+        assert!(by_provider.supports_xhigh());
+        assert!(by_provider.supports_max());
+        assert_eq!(
+            by_provider.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::Max
+        );
+        assert_eq!(
+            by_provider.available_thinking_levels().last(),
+            Some(&ThinkingLevel::Max)
+        );
+
+        let by_url = make(
+            "x/y",
+            true,
+            "custom-or",
+            "https://openrouter.ai/api/v1/chat/completions",
+        );
+        assert!(by_url.supports_xhigh() && by_url.supports_max());
+
+        let mut proxy = make(
+            "some/model",
+            true,
+            "my-gateway",
+            "https://gateway.example.com/v1",
+        );
+        assert!(
+            !proxy.supports_xhigh(),
+            "plain custom provider still clamps"
+        );
+        proxy.compat = Some(CompatConfig {
+            thinking_format: Some("openrouter".to_string()),
+            ..Default::default()
+        });
+        assert!(proxy.supports_xhigh() && proxy.supports_max());
+
+        let mut opted_out = make(
+            "deepseek/deepseek-v4-pro",
+            true,
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+        );
+        opted_out.compat = Some(CompatConfig {
+            thinking_format: Some("openai".to_string()),
+            ..Default::default()
+        });
+        assert!(!opted_out.supports_xhigh());
+        assert_eq!(
+            opted_out.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::High
+        );
+
+        let non_reasoning = make(
+            "openai/gpt-4o",
+            false,
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+        );
+        assert!(!non_reasoning.supports_xhigh());
+        assert_eq!(
+            non_reasoning.clamp_thinking_level(ThinkingLevel::High),
+            ThinkingLevel::Off
+        );
+    }
+
     #[test]
     fn thinking_level_map_prevents_xhigh_and_max_clamping() {
         use crate::model::ThinkingLevel;
