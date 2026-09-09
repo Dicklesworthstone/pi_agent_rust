@@ -5,7 +5,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="${ROOT}/install.sh"
 UNINSTALLER="${ROOT}/uninstall.sh"
 SKILL_SMOKE="${ROOT}/scripts/skill-smoke.sh"
-WORK_ROOT="${TMPDIR:-/tmp}/pi-installer-regression-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+# Strip a trailing slash before composing, because macOS sets TMPDIR with one
+# (/var/folders/.../T/) while Linux does not. Without this, WORK_ROOT contains
+# a `//` and every path derived from it inherits the doubled separator — which
+# install.sh's own lock-directory validator correctly rejects as unsafe
+# (`*//*` in validate_options), so test_installer_retain_temp_mode_preserves_
+# owned_scratch and test_stale_lock_recovery_preserves_the_old_lock_receipt
+# both failed with "PI_INSTALLER_LOCK_DIR is unsafe" on darwin and passed on
+# linux. The installer was right; the harness was building the bad path.
+INSTALLER_REGRESSION_TMPDIR="${TMPDIR:-/tmp}"
+WORK_ROOT="${INSTALLER_REGRESSION_TMPDIR%/}/pi-installer-regression-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 PASS_COUNT=0
 FAIL_COUNT=0
