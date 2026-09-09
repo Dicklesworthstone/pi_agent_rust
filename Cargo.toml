@@ -562,6 +562,31 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 
+# Both of the following arrived with the nightly-2026-08-31 pin (e403485b3),
+# which was a fleet-wide housekeeping change that touched no source and, as
+# rust-toolchain.toml's own comment warns can happen, strengthened the
+# pedantic/nursery groups underneath us. Between them they were 294 of the 296
+# errors blocking `cargo clippy -- -D warnings`, i.e. the entire quality gate.
+# Decided deliberately rather than reverted (bd-39x9z).
+
+# 288 hits, essentially all in test assertions. The lint wants
+#   assert_eq!(plan_tool_effect_batches(&effect_plan(&cases)), [] as [agent::ToolEffectBatch; 0])
+# in place of
+#   assert!(plan_tool_effect_batches(&effect_plan(&cases)).is_empty())
+# which needs the element type spelled out at every site, is longer, and reads
+# worse. Its real argument — that assert_eq! shows the value on failure — is
+# fair, but not worth 288 rewrites of that shape. Prefer assert_eq! in NEW
+# assertions where the value is cheap to render.
+assert_is_empty = "allow"
+
+# 6 hits. The lint wants f64::mul_add, which is a FUSED multiply-add with no
+# intermediate rounding, so applying it changes results bit-for-bit. The sites
+# are bandit loss/regret accumulation (src/extensions.rs) and risk calibration
+# (src/resource_governor.rs, src/provider.rs), with tests pinning values
+# downstream. Changing risk arithmetic to satisfy a micro-optimisation lint is
+# the wrong trade; a sibling project on the same build fleet allows it too.
+suboptimal_flops = "allow"
+
 # ---------------------------------------------------------------------------
 # Local development with sibling crates
 # ---------------------------------------------------------------------------
