@@ -5211,7 +5211,10 @@ fn e2e_print_mode_default_approval_denies_tools_and_fails_loudly() {
         ],
     );
 
-    let mut args: Vec<&str> = vec![
+    // Deliberately NOT PRINT_MODE_ISOLATION_FLAGS: that list contains
+    // `--no-tools`, which would disable the very tool this test needs to have
+    // gated. Same isolation otherwise, minus the tool switch.
+    let result = harness.run(&[
         "-p",
         "--mode",
         "json",
@@ -5219,18 +5222,18 @@ fn e2e_print_mode_default_approval_denies_tools_and_fails_loudly() {
         "anthropic",
         "--model",
         "claude-sonnet-4-5",
-    ];
-    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
-    args.extend_from_slice(&[
-        "--tools",
-        "bash,ask",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
         "--thinking",
         "off",
+        "--tools",
+        "bash,ask",
         "--system-prompt",
         "You are a test harness model.",
         "Run echo hi.",
     ]);
-    let result = harness.run(&args);
 
     harness
         .harness
@@ -5290,7 +5293,9 @@ fn e2e_print_mode_yolo_approves_tools_and_exits_zero() {
         ],
     );
 
-    let mut args: Vec<&str> = vec![
+    // Same flag set as the failing case above, plus --yolo. See the comment
+    // there for why PRINT_MODE_ISOLATION_FLAGS is not used.
+    let result = harness.run(&[
         "-p",
         "--mode",
         "json",
@@ -5299,18 +5304,18 @@ fn e2e_print_mode_yolo_approves_tools_and_exits_zero() {
         "--model",
         "claude-sonnet-4-5",
         "--yolo",
-    ];
-    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
-    args.extend_from_slice(&[
-        "--tools",
-        "bash,ask",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
         "--thinking",
         "off",
+        "--tools",
+        "bash,ask",
         "--system-prompt",
         "You are a test harness model.",
         "Run echo hi.",
     ]);
-    let result = harness.run(&args);
 
     assert_eq!(
         result.exit_code, 0,
