@@ -749,7 +749,6 @@ impl Response {
         &self.headers
     }
 
-    #[must_use]
     pub fn bytes_stream(self) -> Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>> {
         wrap_stream_with_idle_timeout(self.stream, self.timeout_info)
     }

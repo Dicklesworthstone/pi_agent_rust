@@ -18,6 +18,15 @@
 //! - [`sdk`] module
 
 #![forbid(unsafe_code)]
+// Raised from the default 128 because the RPC command dispatcher's nested
+// async blocks exceed it while the compiler proves `Send` for the spawned
+// future (src/rpc.rs:2057, `run_extension_command` inside
+// `future_with_current_cx`). nightly-2026-08-31 promoted that overflow to a
+// `recursion_depth_exceeding_limit` warning under `future_incompatible`, which
+// `-D warnings` in the DSR clippy lane turns into a hard error, and the
+// compiler's own suggestion is to raise this limit. It bounds trait-solving
+// depth only; it is not a runtime stack limit.
+#![recursion_limit = "256"]
 // rch clippy probes without these allowances still expose broad, cross-module
 // dormant surfaces in extension/session/SDK paths. The no-allow inventory is
 // tracked in bd-63x3v.5.1; keep this crate-wide guard until the remaining

@@ -841,7 +841,6 @@ impl MemoryMonitor {
 }
 
 impl PiApp {
-    #[allow(clippy::too_many_lines)]
     /// `/checkpoint [name] [note...]` (bd-cv653.3.7): cheap restore-point
     /// marker on the current leaf.
     #[allow(clippy::too_many_lines)]
