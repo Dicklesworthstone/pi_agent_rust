@@ -549,6 +549,9 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
             ContentBlock::Image(image) => {
                 push_line(&mut output, &format!("[image: {}]", image.mime_type));
             }
+            ContentBlock::Media(media) => {
+                push_line(&mut output, &format!("[media: {}]", media.mime_type));
+            }
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
             }

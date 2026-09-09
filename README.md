@@ -565,6 +565,30 @@ Pi runs in four modes, each suited to different workflows:
 
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
 
+**Print mode and tool approval.** The approval mode defaults to `always-ask` on
+every surface, including `-p`. The absence of a terminal is not treated as
+consent, so Pi does not quietly auto-approve a scripted run. Print mode also has
+no way to prompt, which means a gated tool call in a default `-p` run is denied.
+Pass `--approval-mode yolo` (or `--yolo`) to auto-approve tool calls, or set
+`approval.mode` in `settings.json`:
+
+```bash
+echo "list the files here" | pi -p --mode json --yolo
+```
+
+When a run does end with tool calls denied for want of an approval surface, Pi
+exits **3** and explains why on stderr, rather than exiting 0 on a turn that
+silently did nothing. In `--mode json` and `--mode rpc` the same failure also
+arrives as the single machine-readable record described under `--mode`, with
+`"code": "approval.surface_unavailable"`. Exit 3 means specifically "the model
+could not use tools"; exit 1 remains an ordinary failure and exit 2 a usage
+error.
+
+This is a deliberate divergence from the Node Pi CLI, which auto-approves in
+print mode. Legacy Pi is historical context here, not a compatibility
+authority, and inheriting its default would silently grant `bash` and write
+access to any script that never opted in.
+
 **RPC mode** exposes a line-delimited JSON protocol for programmatic control. Clients send commands (`prompt`, `steer`, `follow-up`, `abort`, `get-state`, `compact`) and receive streaming events. This is how IDE extensions and custom frontends integrate with Pi. See [RPC Protocol](#rpc-protocol) for the wire format.
 
 ### Extensions

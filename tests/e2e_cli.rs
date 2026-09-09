@@ -5053,6 +5053,272 @@ fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
     assert_contains(&harness.harness, &result.stdout, "none are available");
 }
 
+/// SSE frames for an Anthropic response that calls one tool and stops with
+/// `stop_reason: "tool_use"`.
+fn build_anthropic_tool_use_chunks(tool_name: &str, tool_input: &serde_json::Value) -> Vec<String> {
+    let message_start = json!({
+        "type": "message_start",
+        "message": {
+            "model": "claude-sonnet-4-5",
+            "id": "msg_mock_tool_use_001",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 1,
+                "service_tier": "standard"
+            }
+        }
+    });
+    let content_start = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_use",
+            "id": "toolu_mock_approval_001",
+            "name": tool_name,
+            "input": {}
+        }
+    });
+    let content_delta = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+            "type": "input_json_delta",
+            "partial_json": serde_json::to_string(tool_input).expect("serialize tool input")
+        }
+    });
+    let message_delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+        "usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 5
+        }
+    });
+
+    vec![
+        format!("event: message_start\ndata: {message_start}\n\n"),
+        format!("event: content_block_start\ndata: {content_start}\n\n"),
+        format!("event: content_block_delta\ndata: {content_delta}\n\n"),
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            .to_string(),
+        format!("event: message_delta\ndata: {message_delta}\n\n"),
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+    ]
+}
+
+/// Cassette with several interactions replayed in order.
+///
+/// Request bodies are matched as templates (extra incoming keys are fine), so
+/// each entry only needs to pin the fields the test actually cares about.
+fn setup_vcr_anthropic_sequence(
+    harness: &mut CliTestHarness,
+    cassette_name: &str,
+    interactions: &[(serde_json::Value, Vec<String>)],
+) {
+    let cassette_dir = harness.harness.temp_path("vcr-cassettes");
+    fs::create_dir_all(&cassette_dir).expect("create cassette dir");
+    let recorded = interactions
+        .iter()
+        .map(|(request_body, chunks)| {
+            json!({
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.anthropic.com/v1/messages",
+                    "headers": [
+                        ["Content-Type", "application/json"],
+                        ["Accept", "text/event-stream"]
+                    ],
+                    "body": request_body
+                },
+                "response": {
+                    "status": 200,
+                    "headers": [["Content-Type", "text/event-stream; charset=utf-8"]],
+                    "body_chunks": chunks
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let cassette = json!({
+        "version": "1.0",
+        "test_name": cassette_name,
+        "recorded_at": "2026-09-09T00:00:00.000Z",
+        "interactions": recorded
+    });
+    let cassette_path = cassette_dir.join(format!("{cassette_name}.json"));
+    fs::write(
+        &cassette_path,
+        serde_json::to_string_pretty(&cassette).expect("serialize cassette"),
+    )
+    .expect("write cassette");
+
+    harness
+        .env
+        .insert("VCR_MODE".to_string(), "playback".to_string());
+    harness.env.insert(
+        "VCR_CASSETTE_DIR".to_string(),
+        cassette_dir.display().to_string(),
+    );
+    harness
+        .env
+        .insert("PI_VCR_TEST_NAME".to_string(), cassette_name.to_string());
+    harness
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "test-vcr-key".to_string());
+    harness
+        .env
+        .insert("PI_TEST_MODE".to_string(), "1".to_string());
+    harness
+        .env
+        .insert("VCR_DEBUG_BODY".to_string(), "1".to_string());
+}
+
+/// gh #224: print mode has no surface that can grant approval, and the
+/// approval mode defaults to `always-ask`. A gated tool call is therefore
+/// denied, and the run used to finish with exit 0 and a normal stop reason —
+/// a silent, total loss of tool use for any script that did not pass
+/// `--approval-mode yolo`. It must now fail loudly instead.
+///
+/// Mutation sensitivity: dropping the `surface_was_unavailable` check at the
+/// end of `run_print_mode` returns this to exit 0 and fails the assertion.
+#[test]
+fn e2e_print_mode_default_approval_denies_tools_and_fails_loudly() {
+    let mut harness =
+        CliTestHarness::new("e2e_print_mode_default_approval_denies_tools_and_fails_loudly");
+
+    let first = json!({"model": "claude-sonnet-4-5", "stream": true});
+    let second = json!({"model": "claude-sonnet-4-5", "stream": true});
+    setup_vcr_anthropic_sequence(
+        &mut harness,
+        "e2e_print_approval_surface_unavailable",
+        &[
+            (
+                first,
+                build_anthropic_tool_use_chunks("bash", &json!({"command": "echo hi"})),
+            ),
+            (
+                second,
+                build_anthropic_response_chunks("I could not run that command."),
+            ),
+        ],
+    );
+
+    let mut args: Vec<&str> = vec![
+        "-p",
+        "--mode",
+        "json",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+    ];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.extend_from_slice(&[
+        "--tools",
+        "bash,ask",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "You are a test harness model.",
+        "Run echo hi.",
+    ]);
+    let result = harness.run(&args);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "approval surface unavailable", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+        });
+
+    assert_eq!(
+        result.exit_code, 3,
+        "a run whose tool calls were all denied for lack of an approval surface must exit 3, \
+         not 0.\nstderr:\n{}\nstdout:\n{}",
+        result.stderr, result.stdout
+    );
+    assert_contains_case_insensitive(&harness.harness, &result.stderr, "approval");
+    // The machine-readable record a JSON host reads instead of stderr prose.
+    let fatal = result
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected one fatal-error record on stdout.\nstdout:\n{}",
+                result.stdout
+            )
+        });
+    assert_eq!(
+        fatal.get("code").and_then(|c| c.as_str()),
+        Some("approval.surface_unavailable"),
+        "fatal record must name the approval cause, got {fatal}"
+    );
+    assert_eq!(fatal.get("exit_code").and_then(|c| c.as_i64()), Some(3));
+}
+
+/// gh #224 control: the same run with `--yolo` auto-approves, so it must still
+/// exit 0. Without this, a fix that simply failed whenever a tool was gated
+/// would look correct.
+#[test]
+fn e2e_print_mode_yolo_approves_tools_and_exits_zero() {
+    let mut harness = CliTestHarness::new("e2e_print_mode_yolo_approves_tools_and_exits_zero");
+
+    setup_vcr_anthropic_sequence(
+        &mut harness,
+        "e2e_print_approval_yolo",
+        &[
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_tool_use_chunks("bash", &json!({"command": "echo hi"})),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_response_chunks("Done."),
+            ),
+        ],
+    );
+
+    let mut args: Vec<&str> = vec![
+        "-p",
+        "--mode",
+        "json",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--yolo",
+    ];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.extend_from_slice(&[
+        "--tools",
+        "bash,ask",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "You are a test harness model.",
+        "Run echo hi.",
+    ]);
+    let result = harness.run(&args);
+
+    assert_eq!(
+        result.exit_code, 0,
+        "an auto-approved run must still exit 0.\nstderr:\n{}\nstdout:\n{}",
+        result.stderr, result.stdout
+    );
+}
+
 // ============================================================================
 // Session lifecycle tests (bd-idw)
 // ============================================================================

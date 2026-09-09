@@ -324,6 +324,7 @@ fn describe_entry(entry: &SessionEntry) -> String {
                         ContentBlock::Thinking(_) => "thinking",
                         ContentBlock::RedactedThinking(_) => "redacted_thinking",
                         ContentBlock::Image(_) => "image",
+                        ContentBlock::Media(_) => "media",
                         ContentBlock::ToolCall(_) => "tool_call",
                     })
                     .collect::<Vec<_>>()

@@ -197,6 +197,9 @@ pub struct ApprovalState {
     plan_yolo: Arc<AtomicBool>,
     dual_confirm_classes: Arc<RwLock<Vec<DangerousCommandClass>>>,
     confirmed_tokens: Arc<Mutex<HashSet<String>>>,
+    /// Set when a tool call needed approval and the session had no surface
+    /// that could ever grant it (gh #224).
+    surface_unavailable: Arc<AtomicBool>,
 }
 
 impl Default for ApprovalState {
@@ -218,7 +221,27 @@ impl ApprovalState {
             plan_yolo: Arc::new(AtomicBool::new(plan_yolo)),
             dual_confirm_classes: Arc::new(RwLock::new(dual_confirm_classes)),
             confirmed_tokens: Arc::new(Mutex::new(HashSet::new())),
+            surface_unavailable: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Record that a tool call required approval while this session had no
+    /// surface capable of granting it (gh #224).
+    ///
+    /// A denial for that reason is not a decision anyone made: it means the
+    /// run could never have used tools at all. Non-interactive hosts read this
+    /// back at the end of the run so they can fail loudly instead of exiting
+    /// zero on a turn that silently did nothing.
+    pub fn mark_surface_unavailable(&self) {
+        self.surface_unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether any approval was denied purely because no surface existed.
+    #[must_use]
+    pub fn surface_was_unavailable(&self) -> bool {
+        self.surface_unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Get current active approval mode.

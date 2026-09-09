@@ -91,6 +91,25 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Changed
 
+- **Print mode fails loudly when tool calls were denied for want of an
+  approval surface** (gh
+  [#224](https://github.com/Dicklesworthstone/pi_agent_rust/issues/224)):
+  the approval mode defaults to `always-ask` on every surface, and print mode
+  cannot prompt, so a default `-p` run had every gated tool call denied while
+  the process still exited 0 with a normal stop reason. A caller reading the
+  exit code, or the final `stop_reason`, saw a successful run that had
+  silently lost all tool use. Such a run now ends with exit code **3**, a
+  stderr explanation naming `--approval-mode yolo` as the fix, and — in
+  `--mode json` / `--mode rpc` — the usual single fatal-error record with
+  `"code": "approval.surface_unavailable"`. The stream is flushed first, so a
+  JSON host still receives the whole transcript before the failure.
+
+  **This is a breaking change for `--mode json` callers** that relied on exit
+  0 regardless of outcome. The default itself is deliberately unchanged: the
+  absence of a TTY is not consent, and auto-approving to match the Node CLI
+  would silently grant `bash` and write access to any script that never opted
+  in. An ordinary user denial is unaffected and still exits 0.
+
 - **Extension hostcalls share the agent's tool registry**: the JS, native,
   and WASM extension runtimes used to be handed their own plain copy of the
   tool registry at pre-warm, so a `pi.tool` hostcall could not see tools
@@ -162,6 +181,22 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   check still fails closed on the current performance summary.
 
 ### Fixed
+
+- **`read` returned empty content for every file on Windows** (gh
+  [#182](https://github.com/Dicklesworthstone/pi_agent_rust/issues/182)):
+  `ReadTool` opens a file once and clones the handle to fingerprint it for
+  the tool-output cache, but `File::try_clone` shares the OS file position.
+  The fingerprint read through `positioned_file_read`, which is cursor-neutral
+  on Unix (`read_at`) and *not* on Windows (`seek_read` leaves the cursor at
+  the end of the read) or in the portable fallback (it seeks a shared clone).
+  The real read therefore started at EOF, returned zero bytes, and the empty
+  file branch answered with empty content and `is_error: false` — a silent
+  wrong answer for any file up to the 2 MiB fingerprint limit. `grep` was
+  unaffected because it fingerprints through its own handle. The primitive
+  now restores the position it found on every platform, which fixes the same
+  latent hazard at every other call site, and reports a failed restore rather
+  than leaving the cursor at an unknown offset. Invisible on Linux and macOS
+  by construction, so it shipped in two releases.
 
 - **`--mode json` stdout is linear in the response length** (gh
   [#222](https://github.com/Dicklesworthstone/pi_agent_rust/issues/222)):

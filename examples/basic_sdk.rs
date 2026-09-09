@@ -142,6 +142,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ContentBlock::Image(_) => {
                 eprintln!("[image block]");
             }
+            ContentBlock::Media(media) => {
+                // Never print `media.data`: it is the whole base64 payload.
+                eprintln!(
+                    "[media block] {} ({})",
+                    media.name.as_deref().unwrap_or("unnamed"),
+                    media.mime_type
+                );
+            }
             ContentBlock::RedactedThinking(_) => {
                 eprintln!("[thinking] (redacted)");
             }

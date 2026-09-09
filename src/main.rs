@@ -82,6 +82,35 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CODE_FAILURE: i32 = 1;
 const EXIT_CODE_USAGE: i32 = 2;
+/// A non-interactive run in which every gated tool call was denied for lack of
+/// an approval surface (gh #224). Distinct from a provider or usage failure so
+/// a script can tell "the model could not use tools" from "the request broke".
+const EXIT_CODE_APPROVAL_UNAVAILABLE: i32 = 3;
+
+/// Raised at the end of a print-mode run that needed approval it could never
+/// obtain (gh #224).
+///
+/// The approval default is `always-ask` on every surface, deliberately: the
+/// absence of a TTY is not consent. But a `-p` run has no way to prompt, so
+/// each gated call is denied, the model gives up, and the process used to exit
+/// zero with a normal stop reason — a silent, total loss of tool use for any
+/// script that did not pass `--approval-mode yolo`. Failing here turns that
+/// into a signal a caller can actually see.
+#[derive(Debug)]
+struct ApprovalSurfaceUnavailable;
+
+impl std::fmt::Display for ApprovalSurfaceUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "tool calls were denied because this session has no approval surface. \
+             Print mode cannot prompt, and the approval mode is `always-ask`. \
+             Re-run with --approval-mode yolo to auto-approve tool calls, \
+             set approval.mode in settings.json, or use an interactive session.",
+        )
+    }
+}
+
+impl std::error::Error for ApprovalSurfaceUnavailable {}
 const USAGE_ERROR_PATTERNS: &[&str] = &[
     "@file arguments are not supported in rpc mode",
     "--api-key requires a model to be specified via --provider/--model or --models",
@@ -245,6 +274,12 @@ fn fatal_error_code(err: &anyhow::Error) -> &'static str {
             StartupError::MissingApiKey { .. } => "auth.missing_api_key",
             StartupError::NoModelsAvailable { .. } => "auth.no_models_available",
         };
+    }
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ApprovalSurfaceUnavailable>().is_some())
+    {
+        return "approval.surface_unavailable";
     }
     if err
         .chain()
@@ -987,6 +1022,12 @@ fn format_error_with_hints(err: &anyhow::Error) -> String {
 }
 
 fn exit_code_for_error(err: &anyhow::Error) -> i32 {
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ApprovalSurfaceUnavailable>().is_some())
+    {
+        return EXIT_CODE_APPROVAL_UNAVAILABLE;
+    }
     if is_usage_error(err) {
         EXIT_CODE_USAGE
     } else {
@@ -2050,12 +2091,16 @@ async fn run(
     // Approval prompts (issue #196): route calls the approval mode gates
     // through the ask surface the interactive/RPC hosts install, instead of
     // silently denying because no `tool_approval` handler existed. Surfaces
-    // that never install an ask UI (print/JSON mode) still fail closed, now
-    // with an explicit "prompt unavailable" reason.
+    // that never install an ask UI (print/JSON mode) still fail closed, and
+    // record that on the shared approval state so the print driver can end the
+    // run with a real error instead of exit 0 (gh #224).
     if let Some(ask) = &ask_tool {
         agent_session
             .agent
-            .set_tool_approval(Some(pi::ask::approval_handler_via_ask(ask.clone())));
+            .set_tool_approval(Some(pi::ask::approval_handler_via_ask(
+                ask.clone(),
+                approval_state.clone(),
+            )));
     }
 
     // The /btw side-question client (bd-cv653.3.16): bound to the smol
@@ -2609,6 +2654,7 @@ async fn run(
             &resources,
             runtime_handle.clone(),
             &config,
+            &approval_state,
             Some(FailoverResolution {
                 available_models: &model_registry.get_available(),
                 auth: &auth,
@@ -8589,6 +8635,7 @@ async fn run_print_mode(
     resources: &ResourceLoader,
     runtime_handle: RuntimeHandle,
     config: &Config,
+    approval_state: &pi::approval::ApprovalState,
     failover_ctx: Option<FailoverResolution<'_>>,
 ) -> Result<()> {
     if mode.ne("text") && mode.ne("json") {
@@ -8752,6 +8799,14 @@ async fn run_print_mode(
     }
 
     io::stdout().flush()?;
+    // gh #224: the turn may have "completed" having had every tool call denied
+    // for want of a surface that could approve it. Flush the stream first so a
+    // JSON host still receives the whole transcript, then fail: the caller gets
+    // a distinct exit code, a stderr explanation, and the machine-readable
+    // error record, instead of an exit-0 run that quietly did nothing.
+    if approval_state.surface_was_unavailable() {
+        return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
+    }
     Ok(())
 }
 
@@ -9842,6 +9897,33 @@ mod tests {
         assert!(!extension_output.contains(&first.display().to_string()));
     }
 
+    /// gh #224: the approval-surface failure carries its own exit code, so a
+    /// caller can distinguish "the model could not use tools" from an ordinary
+    /// failure (1) or a usage error (2). Collapsing it back into
+    /// `EXIT_CODE_FAILURE` must fail this.
+    #[test]
+    fn approval_surface_unavailable_has_its_own_exit_code() {
+        let approval = anyhow::Error::new(ApprovalSurfaceUnavailable);
+        assert_eq!(
+            exit_code_for_error(&approval),
+            EXIT_CODE_APPROVAL_UNAVAILABLE
+        );
+        assert_ne!(EXIT_CODE_APPROVAL_UNAVAILABLE, EXIT_CODE_FAILURE);
+        assert_ne!(EXIT_CODE_APPROVAL_UNAVAILABLE, EXIT_CODE_USAGE);
+
+        // Still classified through a context chain, which is how it reaches
+        // `report_fatal_error_and_exit` from `run_print_mode`.
+        let wrapped = anyhow::Error::new(ApprovalSurfaceUnavailable).context("print mode");
+        assert_eq!(
+            exit_code_for_error(&wrapped),
+            EXIT_CODE_APPROVAL_UNAVAILABLE
+        );
+
+        // An unrelated failure is unaffected.
+        let other = anyhow::anyhow!("provider stream closed");
+        assert_eq!(exit_code_for_error(&other), EXIT_CODE_FAILURE);
+    }
+
     /// gh #217: the stdout record's `code` comes from the typed error in the
     /// chain, clap/usage failures are `usage`, and untyped errors are
     /// `internal`.
@@ -9871,6 +9953,11 @@ mod tests {
             fatal_error_code(&startup_no_models),
             "auth.no_models_available"
         );
+        // gh #224: a run whose tool calls were all denied for want of an
+        // approval surface gets its own code, so a JSON host can tell it from
+        // a provider failure without parsing prose.
+        let approval = anyhow::Error::new(ApprovalSurfaceUnavailable).context("print mode");
+        assert_eq!(fatal_error_code(&approval), "approval.surface_unavailable");
         let clap_err = anyhow::Error::new(clap::Error::raw(
             clap::error::ErrorKind::UnknownArgument,
             "unknown --bogus",

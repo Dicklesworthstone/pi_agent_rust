@@ -2452,13 +2452,16 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // through the ask surface the host installs (`install_channel_ui`). The
     // bridge never auto-answers — with no surface installed it denies with an
     // explicit reason instead of prompting nobody and denying silently.
-    if options.approval_state.is_some()
+    if let Some(approval_state) = &options.approval_state
         && options.tool_approval.is_none()
         && let Some(ask) = &ask_tool_handle
     {
         agent_session
             .agent
-            .set_tool_approval(Some(crate::ask::approval_handler_via_ask(ask.clone())));
+            .set_tool_approval(Some(crate::ask::approval_handler_via_ask(
+                ask.clone(),
+                approval_state.clone(),
+            )));
     }
 
     if !options.extension_paths.is_empty() {
