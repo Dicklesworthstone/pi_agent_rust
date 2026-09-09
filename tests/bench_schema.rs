@@ -2545,6 +2545,19 @@ case "${1:-}" in
       && -e "${PERF_OUTPUT_DIR:?}/${PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE}" ]]; then
       full_commit='ffffffffffffffffffffffffffffffffffffffff'
     fi
+    # Drift keyed on the benchmark having ACTUALLY run, rather than on an
+    # output path existing. A redirect like >"$result_dir/stdout.log" creates
+    # its target the instant the command starts, so keying on that file drifts
+    # HEAD before the rch stub's source-pin check and the run dies with exit 67
+    # ("invalid clean committed-source pin") without ever reaching the
+    # benchmark — a pre-invocation drift wearing a post-invocation name. The
+    # invocation marker is written by the cargo stub's perf_bench_harness case
+    # itself, so it cannot exist until the benchmark really started.
+    if [[ "${PI_FAKE_GIT_DRIFT_AFTER_BENCH_INVOCATION:-0}" == "1" \
+      && -n "${PI_FAKE_PERF_BENCH_INVOCATION_MARKER:-}" \
+      && -e "${PI_FAKE_PERF_BENCH_INVOCATION_MARKER}" ]]; then
+      full_commit='ffffffffffffffffffffffffffffffffffffffff'
+    fi
     if [[ "${2:-}" == "--short" && "${3:-}" == "HEAD" ]]; then
       printf '%s\n' "${full_commit:0:8}"
     elif [[ "${2:-}" == "HEAD" ]]; then
@@ -11030,10 +11043,13 @@ fn orchestrate_rch_perf_harness_rejects_head_drift_after_invocation() {
     // the count and turns a post-invocation drift into a pre-invocation one.
     let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
         ("PI_FAKE_PERF_ONLY", "1"),
-        (
-            "PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE",
-            "results/perf_bench_harness/stdout.log",
-        ),
+        // Keyed on the invocation marker, not on the stdout capture. The
+        // orchestrator's `>"$result_dir/stdout.log"` redirect creates that file
+        // before the command runs, so the old trigger drifted HEAD ahead of the
+        // rch stub's source-pin check: the run died with exit 67 and the
+        // benchmark never executed, which is a pre-invocation drift despite the
+        // name. The marker is written by the benchmark case itself.
+        ("PI_FAKE_GIT_DRIFT_AFTER_BENCH_INVOCATION", "1"),
     ]);
     assert!(
         !output.status.success(),
