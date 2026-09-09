@@ -4095,10 +4095,17 @@ impl ExtensionManager {
                         |arr| {
                             arr.iter()
                                 .filter_map(Value::as_str)
-                                .filter_map(|s| match s {
-                                    "text" => Some(InputType::Text),
-                                    "image" => Some(InputType::Image),
-                                    _ => None,
+                                .filter_map(|s| {
+                                    let parsed = InputType::parse(s);
+                                    if parsed.is_none() {
+                                        tracing::warn!(
+                                            provider = %provider_id,
+                                            model = %model_id,
+                                            input = %s,
+                                            "Extension-registered model declares an unknown input type (known: text, image, video, audio)"
+                                        );
+                                    }
+                                    parsed
                                 })
                                 .collect::<Vec<_>>()
                         },

@@ -413,9 +413,10 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
 - **`--tools` opt-in extras**: `eval`, `github`, `security_scan`
 - **Settings-gated extras** (off until enabled in `settings.json`):
   `browser` (`browser.enableBrowser`), `computer`
-  (`computer.enableComputer`), and the media trio `inspect_image`,
+  (`computer.enableComputer`), the media trio `inspect_image`,
   `generate_image`, `tts` (`media.enableInspectImage` /
-  `media.enableGenerateImage` / `media.enableTts`)
+  `media.enableGenerateImage` / `media.enableTts`), and `read_media`
+  (`media.enableReadMedia`; inline video/audio for Gemini-family models)
 - **Opt-in only**: `subagent` (it can start additional coding-agent
   processes)
 
@@ -440,6 +441,7 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
 | `browser` | Headless Chromium automation over CDP (navigate, snapshot, click, type, screenshot) with a domain allowlist; settings-gated |
 | `computer` | Desktop automation (displays, windows, screenshots, mouse/keyboard, clipboard); mutating actions require approval; settings-gated |
 | `inspect_image` / `generate_image` / `tts` | Vision analysis of local images, image generation/editing, and text-to-speech through provider adapters; settings-gated |
+| `read_media` | Attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Gemini, Gemini CLI, and Vertex Gemini models receive it natively as `inline_data`; every other provider sees `[media omitted: <name>, <mime>, <size>]`. Hard cap 5 MiB per file (`media.maxBytes`); settings-gated |
 | `subagent` | Delegate isolated work to named Rust Pi child agents |
 
 All tools include automatic truncation for large outputs (2000 lines /

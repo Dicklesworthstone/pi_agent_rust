@@ -7192,6 +7192,13 @@ fn render_blocks(blocks: &[ContentBlock]) -> String {
                     escape_html(&image.data)
                 );
             }
+            ContentBlock::Media(media) => {
+                let _ = write!(
+                    html,
+                    "<p class=\"media\">{}</p>",
+                    escape_html(&media.placeholder())
+                );
+            }
             ContentBlock::ToolCall(tool_call) => {
                 let args = serde_json::to_string_pretty(&tool_call.arguments)
                     .unwrap_or_else(|_| tool_call.arguments.to_string());
@@ -7245,6 +7252,7 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
             ContentBlock::Image(image) => {
                 push_line(&mut output, &format!("[image: {}]", image.mime_type));
             }
+            ContentBlock::Media(media) => push_line(&mut output, &media.placeholder()),
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
             }

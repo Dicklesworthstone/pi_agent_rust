@@ -91,7 +91,7 @@ Every key of `compat.openRouterRouting` is copied verbatim onto the top level of
 | `contextWindow` | number | Context window size in tokens |
 | `maxTokens` | number | Max output tokens |
 | `reasoning` | boolean | True if model supports extended thinking |
-| `input` | string[] | `["text", "image"]` |
+| `input` | string[] | Any of `"text"`, `"image"`, `"video"`, `"audio"`. Unknown labels are dropped with a warning. `video`/`audio` are honored only by the Gemini-family transports (`google-generative-ai`, `google-gemini-cli`, `google-vertex`), which get them added automatically for bundled Gemini models; other transports degrade media blocks to a text placeholder |
 | `cost` | object | Cost per million tokens |
 
 ### Compatibility Flags (`compat`)

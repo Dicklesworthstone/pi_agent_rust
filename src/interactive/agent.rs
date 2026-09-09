@@ -272,6 +272,11 @@ fn content_blocks_estimated_output_bytes(content: &[ContentBlock]) -> usize {
             ContentBlock::Thinking(thinking) => thinking.thinking.len(),
             ContentBlock::RedactedThinking(redacted) => redacted.data.len(),
             ContentBlock::Image(image) => image.data.len().saturating_add(image.mime_type.len()),
+            ContentBlock::Media(media) => media
+                .data
+                .len()
+                .saturating_add(media.mime_type.len())
+                .saturating_add(media.name.as_ref().map_or(0, String::len)),
             ContentBlock::ToolCall(tool) => tool
                 .id
                 .len()
@@ -652,7 +657,9 @@ fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
 
     Some(match tool_name {
         "bash" => Field("command"),
-        "read" | "write" | "edit" | "hashline_edit" | "inspect_image" => Field("path"),
+        "read" | "write" | "edit" | "hashline_edit" | "inspect_image" | "read_media" => {
+            Field("path")
+        }
         "ls" => FieldOrDefault {
             field: "path",
             default: ".",
@@ -7263,6 +7270,7 @@ mod tool_invocation_summary_coverage {
             "lsp",
             "debug",
             "inspect_image",
+            "read_media",
             "generate_image",
             "tts",
             "computer",

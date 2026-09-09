@@ -10922,10 +10922,7 @@ fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
         .model
         .input
         .iter()
-        .map(|t| match t {
-            crate::provider::InputType::Text => "text",
-            crate::provider::InputType::Image => "image",
-        })
+        .map(|t| t.as_str())
         .collect::<Vec<_>>();
 
     json!({

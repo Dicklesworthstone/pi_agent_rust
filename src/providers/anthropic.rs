@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::pin::Pin;
@@ -1254,7 +1255,7 @@ struct AnthropicMessage<'a> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContent<'a> {
     Text {
-        text: &'a str,
+        text: Cow<'a, str>,
         /// Prompt-cache breakpoint for incremental conversation caching.
         /// Set only on the final block of the last user-role message.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1294,7 +1295,7 @@ struct AnthropicImageSource<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicToolResultContent<'a> {
-    Text { text: &'a str },
+    Text { text: Cow<'a, str> },
     Image { source: AnthropicImageSource<'a> },
 }
 
@@ -1466,7 +1467,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
         Message::Custom(custom) => AnthropicMessage {
             role: "user",
             content: vec![AnthropicContent::Text {
-                text: &custom.content,
+                text: Cow::Borrowed(&custom.content),
                 cache_control: None,
             }],
         },
@@ -1486,15 +1487,20 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::Text(t) => {
-                            Some(AnthropicToolResultContent::Text { text: &t.text })
-                        }
+                        ContentBlock::Text(t) => Some(AnthropicToolResultContent::Text {
+                            text: Cow::Borrowed(&t.text),
+                        }),
                         ContentBlock::Image(img) => Some(AnthropicToolResultContent::Image {
                             source: AnthropicImageSource {
                                 r#type: "base64",
                                 media_type: &img.mime_type,
                                 data: &img.data,
                             },
+                        }),
+                        // Messages API has no video/audio block; degrade to
+                        // the text placeholder (gh #212).
+                        ContentBlock::Media(media) => Some(AnthropicToolResultContent::Text {
+                            text: Cow::Owned(media.placeholder()),
                         }),
                         _ => None,
                     })
@@ -1509,14 +1515,14 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
 fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
     match content {
         UserContent::Text(text) => vec![AnthropicContent::Text {
-            text,
+            text: Cow::Borrowed(text),
             cache_control: None,
         }],
         UserContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Text(t) => Some(AnthropicContent::Text {
-                    text: &t.text,
+                    text: Cow::Borrowed(&t.text),
                     cache_control: None,
                 }),
                 ContentBlock::Image(img) => Some(AnthropicContent::Image {
@@ -1525,6 +1531,10 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
                         media_type: &img.mime_type,
                         data: &img.data,
                     },
+                    cache_control: None,
+                }),
+                ContentBlock::Media(media) => Some(AnthropicContent::Text {
+                    text: Cow::Owned(media.placeholder()),
                     cache_control: None,
                 }),
                 _ => None,
@@ -1536,7 +1546,7 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
 fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicContent<'_>> {
     match block {
         ContentBlock::Text(t) => Some(AnthropicContent::Text {
-            text: &t.text,
+            text: Cow::Borrowed(&t.text),
             cache_control: None,
         }),
         ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
@@ -1567,7 +1577,7 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
         // Images and redacted-thinking markers don't round-trip back to the
         // Anthropic input surface — Anthropic discards redacted-thinking on
         // subsequent turns, so we do the same.
-        ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => None,
+        ContentBlock::Image(_) | ContentBlock::Media(_) | ContentBlock::RedactedThinking(_) => None,
     }
 }
 
@@ -1659,6 +1669,46 @@ mod tests {
         assert_eq!(home, Some(PathBuf::from("D:\\Users\\Grace")));
     }
 
+    /// gh #212: the Messages API has text/image/document blocks only, so a
+    /// media block degrades to a text placeholder in user content and tool
+    /// results and the payload never reaches the wire.
+    #[test]
+    fn test_convert_media_block_degrades_to_placeholder() {
+        let media = crate::model::MediaContent {
+            data: "AAAA".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some("voice.wav".to_string()),
+        };
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("listen")),
+            ContentBlock::Media(media.clone()),
+        ]);
+        let wire = serde_json::to_value(convert_user_content(&content)).expect("serialize");
+        assert_eq!(
+            wire,
+            json!([
+                { "type": "text", "text": "listen" },
+                { "type": "text", "text": "[media omitted: voice.wav, audio/wav, 3 B]" },
+            ])
+        );
+
+        let result = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![ContentBlock::Media(media)],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let wire = serde_json::to_value(convert_message_to_anthropic(&result)).expect("serialize");
+        assert_eq!(wire["content"][0]["type"], "tool_result");
+        assert_eq!(
+            wire["content"][0]["content"],
+            json!([{ "type": "text", "text": "[media omitted: voice.wav, audio/wav, 3 B]" }])
+        );
+        assert!(!wire.to_string().contains("AAAA"));
+    }
+
     #[test]
     fn test_convert_user_text_message() {
         let message = Message::User(crate::model::UserMessage {
@@ -1740,7 +1790,7 @@ mod tests {
         assert_eq!(request.messages[0].role, "user");
         assert_eq!(request.messages[0].content.len(), 1);
         match &request.messages[0].content[0] {
-            AnthropicContent::Text { text, .. } => assert_eq!(*text, "Ping"),
+            AnthropicContent::Text { text, .. } => assert_eq!(text.as_ref(), "Ping"),
             other => panic!(),
         }
 

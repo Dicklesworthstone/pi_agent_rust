@@ -1619,12 +1619,12 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
             messages
         }
         Message::ToolResult(result) => {
-            let mut text_parts = Vec::new();
+            let mut text_parts: Vec<Cow<'_, str>> = Vec::new();
             let mut image_parts = Vec::new();
 
             for block in &result.content {
                 match block {
-                    ContentBlock::Text(t) => text_parts.push(t.text.as_str()),
+                    ContentBlock::Text(t) => text_parts.push(Cow::Borrowed(t.text.as_str())),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
                         image_parts.push(OpenAIContentPart::ImageUrl {
@@ -1633,6 +1633,9 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                                 _phantom: std::marker::PhantomData,
                             },
                         });
+                    }
+                    ContentBlock::Media(media) => {
+                        text_parts.push(Cow::Owned(media.placeholder()));
                     }
                     _ => {}
                 }
@@ -1693,6 +1696,11 @@ fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
                             },
                         })
                     }
+                    // Chat Completions has no video/audio input part; degrade
+                    // to the text placeholder (gh #212).
+                    ContentBlock::Media(media) => Some(OpenAIContentPart::Text {
+                        text: Cow::Owned(media.placeholder()),
+                    }),
                     _ => None,
                 })
                 .collect();
@@ -1799,6 +1807,51 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// gh #212: Chat Completions has no video/audio part, so a media block
+    /// degrades to the `[media omitted: …]` text part (user content and tool
+    /// results alike) and never leaks the base64 payload.
+    #[test]
+    fn test_convert_media_block_degrades_to_placeholder() {
+        let media = crate::model::MediaContent {
+            data: "AAAA".to_string(),
+            mime_type: "video/mp4".to_string(),
+            name: Some("clip.mp4".to_string()),
+        };
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("look")),
+            ContentBlock::Media(media.clone()),
+        ]);
+        let wire = serde_json::to_value(convert_user_content(&content)).expect("serialize");
+        assert_eq!(
+            wire,
+            json!([
+                { "type": "text", "text": "look" },
+                { "type": "text", "text": "[media omitted: clip.mp4, video/mp4, 3 B]" },
+            ])
+        );
+        assert!(!wire.to_string().contains("AAAA"));
+
+        let result = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("Read media file clip.mp4")),
+                ContentBlock::Media(media),
+            ],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let messages = convert_message_to_openai(&result);
+        assert_eq!(messages.len(), 1, "no trailing image turn for media");
+        let wire = serde_json::to_value(&messages[0]).expect("serialize");
+        assert_eq!(wire["role"], "tool");
+        assert_eq!(
+            wire["content"],
+            "Read media file clip.mp4\n[media omitted: clip.mp4, video/mp4, 3 B]"
+        );
+    }
 
     #[test]
     fn test_convert_user_text_message() {

@@ -63,6 +63,7 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
                         crate::model::ContentBlock::Thinking(thinking) => thinking.thinking.len(),
                         crate::model::ContentBlock::RedactedThinking(_)
                         | crate::model::ContentBlock::Image(_)
+                        | crate::model::ContentBlock::Media(_)
                         | crate::model::ContentBlock::ToolCall(_) => 0,
                     })
                     .sum(),
@@ -75,6 +76,7 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
                     crate::model::ContentBlock::Thinking(thinking) => thinking.thinking.len(),
                     crate::model::ContentBlock::RedactedThinking(_)
                     | crate::model::ContentBlock::Image(_)
+                    | crate::model::ContentBlock::Media(_)
                     | crate::model::ContentBlock::ToolCall(_) => 0,
                 })
                 .sum(),
@@ -86,6 +88,7 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
                     crate::model::ContentBlock::Thinking(thinking) => thinking.thinking.len(),
                     crate::model::ContentBlock::RedactedThinking(_)
                     | crate::model::ContentBlock::Image(_)
+                    | crate::model::ContentBlock::Media(_)
                     | crate::model::ContentBlock::ToolCall(_) => 0,
                 })
                 .sum(),

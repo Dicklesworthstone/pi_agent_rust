@@ -33,6 +33,20 @@ const IMAGE_TOKEN_ESTIMATE: usize = 1200;
 /// Character-equivalent estimate for an image (IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE).
 const IMAGE_CHAR_ESTIMATE: usize = IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE;
 
+/// Decoded media bytes per estimated token (gh #212). Gemini bills video at
+/// roughly 260 tokens/s and audio at 32 tokens/s; at typical bitrates
+/// (~1 Mbit/s video, ~128 kbit/s audio) both land near 1 token per 512 bytes,
+/// which is what this divisor encodes. Floored at `MEDIA_TOKEN_ESTIMATE_MIN`.
+const MEDIA_BYTES_PER_TOKEN_ESTIMATE: u64 = 512;
+/// Lower bound on a media block's token estimate.
+const MEDIA_TOKEN_ESTIMATE_MIN: u64 = 256;
+
+/// Token estimate for an inline video/audio block, derived from its decoded
+/// size (the duration is not known without decoding the container).
+fn media_token_estimate(media: &crate::model::MediaContent) -> u64 {
+    (media.decoded_size_bytes() / MEDIA_BYTES_PER_TOKEN_ESTIMATE).max(MEDIA_TOKEN_ESTIMATE_MIN)
+}
+
 /// Count the serialized JSON byte length of a [`Value`] without allocating a `String`.
 ///
 /// Uses `serde_json::to_writer` with a sink that only counts bytes – this gives the
@@ -1172,6 +1186,9 @@ fn accumulate_block_estimate(block: &ContentBlock, text: &mut String, flat_token
             *flat_tokens =
                 flat_tokens.saturating_add((IMAGE_CHAR_ESTIMATE / CHARS_PER_TOKEN_ESTIMATE) as u64);
         }
+        ContentBlock::Media(media) => {
+            *flat_tokens = flat_tokens.saturating_add(media_token_estimate(media));
+        }
         ContentBlock::ToolCall(call) => {
             text.push_str(&call.name);
             text.push('\n');
@@ -1461,7 +1478,8 @@ fn assistant_content_flags(assistant: &AssistantMessage) -> (bool, bool, bool) {
             // Redacted thinking has no surfaceable content, so don't flip
             // has_thinking — that would produce an empty `[Assistant thinking]:`
             // section in the compaction output.
-            ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => {}
+            ContentBlock::Image(_) | ContentBlock::Media(_) | ContentBlock::RedactedThinking(_) => {
+            }
         }
     }
     (has_thinking, has_text, has_tools)
@@ -2965,7 +2983,8 @@ pub mod semantic_marker_scan_quality {
             ContentBlock::ToolCall(call) => {
                 let _ = write!(out, "{} {}", call.name, call.arguments);
             }
-            ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => {}
+            ContentBlock::Image(_) | ContentBlock::Media(_) | ContentBlock::RedactedThinking(_) => {
+            }
         }
     }
 

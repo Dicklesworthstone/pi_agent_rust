@@ -1499,7 +1499,9 @@ where
                 ContentBlock::ToolCall(_) => {
                     Some(TerminalContentSnapshot::ToolCall { content_index })
                 }
-                ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => None,
+                ContentBlock::Image(_)
+                | ContentBlock::Media(_)
+                | ContentBlock::RedactedThinking(_) => None,
             })
             .collect()
     }
@@ -2014,6 +2016,13 @@ fn convert_user_message_to_responses(content: &UserContent) -> OpenAIResponsesIn
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
                         parts.push(OpenAIResponsesUserContentPart::InputImage { image_url: url });
+                    }
+                    // No `input_video`/`input_audio` part on this transport;
+                    // degrade to the text placeholder (gh #212).
+                    ContentBlock::Media(media) => {
+                        parts.push(OpenAIResponsesUserContentPart::InputText {
+                            text: media.placeholder(),
+                        });
                     }
                     _ => {}
                 }

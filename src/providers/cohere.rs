@@ -764,6 +764,7 @@ fn extract_text_user_content(content: &UserContent) -> String {
                         let _ =
                             write!(out, "[Image: {} ({} bytes)]", img.mime_type, img.data.len());
                     }
+                    ContentBlock::Media(media) => out.push_str(&media.placeholder()),
                     _ => {}
                 }
             }

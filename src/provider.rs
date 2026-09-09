@@ -872,6 +872,30 @@ mod tests {
         assert_eq!(image, InputType::Image);
     }
 
+    #[test]
+    fn input_type_video_audio_serde_and_parse() {
+        assert_eq!(
+            serde_json::to_string(&InputType::Video).unwrap(),
+            "\"video\""
+        );
+        assert_eq!(
+            serde_json::to_string(&InputType::Audio).unwrap(),
+            "\"audio\""
+        );
+        let video: InputType = serde_json::from_str("\"video\"").unwrap();
+        assert_eq!(video, InputType::Video);
+        for kind in [
+            InputType::Text,
+            InputType::Image,
+            InputType::Video,
+            InputType::Audio,
+        ] {
+            assert_eq!(InputType::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(InputType::parse(" AUDIO "), Some(InputType::Audio));
+        assert_eq!(InputType::parse("hologram"), None);
+    }
+
     // ========================================================================
     // ModelCost serde
     // ========================================================================

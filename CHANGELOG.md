@@ -16,6 +16,24 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Added
 
+- **Inline video and audio input for Gemini-family models** (gh
+  [#212](https://github.com/Dicklesworthstone/pi_agent_rust/issues/212)):
+  a `media` content block (`{"type":"media","data":…,"mimeType":…,"name":…}`),
+  `InputType::Video`/`Audio` (`input: ["video", "audio"]` in `models.json`
+  and extension model registration; unknown labels now warn instead of
+  vanishing), and a settings-gated `read_media` tool
+  (`media.enableReadMedia`, or `--tools read_media`) that attaches a local
+  mp4/webm/mov/mp3/wav/m4a/ogg/flac file. Gemini, Gemini CLI, and Vertex
+  Gemini models receive the block natively as an `inline_data` part and
+  declare `video`/`audio` in their bundled catalog entries; every other
+  provider degrades it to `[media omitted: <name>, <mime>, <size>]` and the
+  payload never leaves the machine. One file is capped at 5 MiB
+  (`media.maxBytes`) because the block is base64-inlined into the session;
+  blob sidecar storage for larger inputs is tracked in
+  [#225](https://github.com/Dicklesworthstone/pi_agent_rust/issues/225).
+  Gemini tool results that carry images or media now attach them on a
+  trailing user turn instead of dropping them as `[Image (…) omitted]`.
+
 - **`--no-context-files`** (gh
   [#216](https://github.com/Dicklesworthstone/pi_agent_rust/issues/216)):
   disables `AGENTS.md`/`CLAUDE.md` discovery (global agent dir, cwd, and

@@ -291,12 +291,10 @@ fn user_content_text(content: &UserContent) -> String {
         UserContent::Text(text) => text.clone(),
         UserContent::Blocks(blocks) => blocks
             .iter()
-            .filter_map(|block| {
-                if let ContentBlock::Text(text) = block {
-                    Some(text.text.as_str())
-                } else {
-                    None
-                }
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.clone()),
+                ContentBlock::Media(media) => Some(media.placeholder()),
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -307,13 +305,16 @@ fn text_block_bytes<'a>(blocks: impl Iterator<Item = &'a ContentBlock>) -> usize
     let mut total = 0usize;
     let mut text_blocks = 0usize;
     for block in blocks {
-        if let ContentBlock::Text(text) = block {
-            if text_blocks > 0 {
-                total = total.saturating_add(1);
-            }
-            total = total.saturating_add(text.text.len());
-            text_blocks = text_blocks.saturating_add(1);
+        let len = match block {
+            ContentBlock::Text(text) => text.text.len(),
+            ContentBlock::Media(media) => media.placeholder().len(),
+            _ => continue,
+        };
+        if text_blocks > 0 {
+            total = total.saturating_add(1);
         }
+        total = total.saturating_add(len);
+        text_blocks = text_blocks.saturating_add(1);
     }
     total
 }

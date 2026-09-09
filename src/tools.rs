@@ -2286,6 +2286,7 @@ fn cacheable_tool_output_weight(output: &ToolOutput) -> Option<usize> {
                 }
             }
             ContentBlock::Image(_)
+            | ContentBlock::Media(_)
             | ContentBlock::Thinking(_)
             | ContentBlock::RedactedThinking(_)
             | ContentBlock::ToolCall(_) => return None,
@@ -5435,6 +5436,14 @@ impl ToolRegistry {
                         ),
                     ));
                 }
+                "read_media" => {
+                    let max_bytes = config
+                        .and_then(|c| c.media.as_ref())
+                        .and_then(|m| m.max_bytes);
+                    tools.push(Box::new(
+                        crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(max_bytes),
+                    ));
+                }
                 "generate_image" => {
                     let provider = config
                         .and_then(|c| c.media.as_ref())
@@ -5519,6 +5528,13 @@ impl ToolRegistry {
                         media_cfg.vision_provider.clone(),
                         media_cfg.vision_model.clone(),
                     ),
+                ));
+            }
+            if media_cfg.enable_read_media.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "read_media")
+            {
+                tools.push(Box::new(
+                    crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(media_cfg.max_bytes),
                 ));
             }
             if media_cfg.enable_generate_image.unwrap_or(false)

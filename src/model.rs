@@ -1374,7 +1374,10 @@ mod tests {
             panic!("expected media block");
         };
         assert!(unnamed.name.is_none());
-        assert_eq!(unnamed.input_type(), Some(crate::provider::InputType::Audio));
+        assert_eq!(
+            unnamed.input_type(),
+            Some(crate::provider::InputType::Audio)
+        );
         assert_eq!(unnamed.decoded_size_bytes(), 3);
         assert!(
             !serde_json::to_string(&ContentBlock::Media(unnamed))
@@ -2057,7 +2060,10 @@ mod tests {
             })
     }
 
-    fn content_block_strategy() -> impl Strategy<Value = ContentBlock> {
+    // Boxed: the message-level value trees nest several of these per block,
+    // and keeping them inline on the 2 MiB test-thread stack overflowed once
+    // the media variant was added (gh #212).
+    fn content_block_strategy() -> BoxedStrategy<ContentBlock> {
         prop_oneof![
             text_content_strategy().prop_map(ContentBlock::Text),
             thinking_content_strategy().prop_map(ContentBlock::Thinking),
@@ -2065,9 +2071,10 @@ mod tests {
             media_content_strategy().prop_map(ContentBlock::Media),
             tool_call_strategy().prop_map(ContentBlock::ToolCall),
         ]
+        .boxed()
     }
 
-    fn media_content_strategy() -> impl Strategy<Value = MediaContent> {
+    fn media_content_strategy() -> BoxedStrategy<MediaContent> {
         (
             interesting_text_strategy(),
             prop_oneof![
@@ -2082,6 +2089,7 @@ mod tests {
                 mime_type: sanitize_image_mime_type(&mime_type),
                 name: name.as_deref().and_then(sanitize_media_name),
             })
+            .boxed()
     }
 
     fn content_block_json_strategy() -> impl Strategy<Value = serde_json::Value> {

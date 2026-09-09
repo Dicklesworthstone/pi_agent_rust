@@ -800,6 +800,14 @@ fn convert_user_message(message: &crate::model::UserMessage) -> Option<BedrockMe
                             },
                         });
                     }
+                    // Converse has a `video` block for Amazon's own models
+                    // only; the Claude models pi routes here take text, so
+                    // degrade to the placeholder (gh #212).
+                    ContentBlock::Media(media) => {
+                        content.push(BedrockContent::Text {
+                            text: media.placeholder(),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -872,6 +880,11 @@ fn convert_tool_result_message(message: &ToolResultMessage) -> BedrockMessage {
                             bytes: img.data.clone(),
                         },
                     },
+                });
+            }
+            ContentBlock::Media(media) => {
+                contents.push(BedrockToolResultContent::Text {
+                    text: media.placeholder(),
                 });
             }
             _ => {}

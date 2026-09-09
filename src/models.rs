@@ -1101,15 +1101,47 @@ fn api_fallback_base_url(api: &str) -> Option<&'static str> {
     }
 }
 
+/// Parse catalog / `models.json` `input` labels. Unknown labels are dropped
+/// with a warning instead of silently (gh #212) so a typo such as `"vidoe"`
+/// is visible in the log.
 fn parse_input_types(input: &[String]) -> Vec<InputType> {
-    input
-        .iter()
-        .filter_map(|value| match value.as_str() {
-            "text" => Some(InputType::Text),
-            "image" => Some(InputType::Image),
-            _ => None,
-        })
-        .collect()
+    let mut parsed = Vec::with_capacity(input.len());
+    for value in input {
+        if let Some(input_type) = InputType::parse(value) {
+            if !parsed.contains(&input_type) {
+                parsed.push(input_type);
+            }
+        } else {
+            tracing::warn!(
+                input = %value,
+                "Ignoring unknown model input type (known: text, image, video, audio)"
+            );
+        }
+    }
+    parsed
+}
+
+/// Gemini-family transports accept inline video and audio on every model
+/// that accepts images (gh #212; https://ai.google.dev/gemini-api/docs/video-understanding,
+/// https://ai.google.dev/gemini-api/docs/audio). The bundled catalog only
+/// spells `["text", "image"]`, so the capability is added here for the
+/// Gemini models routed through the three Gemini converters.
+fn augment_gemini_media_inputs(api: &str, model_id: &str, input: &mut Vec<InputType>) {
+    let gemini_transport = matches!(
+        api,
+        "google-generative-ai" | "google-gemini-cli" | "google-vertex"
+    );
+    if !gemini_transport
+        || !model_id.to_ascii_lowercase().contains("gemini")
+        || !input.contains(&InputType::Image)
+    {
+        return;
+    }
+    for media in [InputType::Video, InputType::Audio] {
+        if !input.contains(&media) {
+            input.push(media);
+        }
+    }
 }
 
 fn legacy_generated_models_cache_path() -> Option<PathBuf> {
@@ -2446,12 +2478,14 @@ fn built_in_models(
 
         let input = {
             let parsed = parse_input_types(&legacy.input);
-            if parsed.is_empty() {
+            let mut input = if parsed.is_empty() {
                 routing_defaults
                     .map_or_else(|| vec![InputType::Text], |defaults| defaults.input.to_vec())
             } else {
                 parsed
-            }
+            };
+            augment_gemini_media_inputs(api_string.as_str(), &legacy.id, &mut input);
+            input
         };
 
         let auth_header = match api_string.as_str() {
@@ -5168,6 +5202,89 @@ mod tests {
             "legacy model display name mismatches: {}",
             mismatches.join("; ")
         );
+    }
+
+    /// gh #212: `input` labels parse case-insensitively, dedupe, and drop
+    /// unknown labels instead of panicking; Gemini-family entries pick up
+    /// video/audio while everything else keeps the catalog's spelling.
+    #[test]
+    fn parse_input_types_accepts_video_and_audio() {
+        let parsed = parse_input_types(&[
+            "text".to_string(),
+            "Image".to_string(),
+            "video".to_string(),
+            "audio".to_string(),
+            "video".to_string(),
+            "hologram".to_string(),
+        ]);
+        assert_eq!(
+            parsed,
+            vec![
+                InputType::Text,
+                InputType::Image,
+                InputType::Video,
+                InputType::Audio
+            ]
+        );
+        assert_eq!(parse_input_types(&["hologram".to_string()]), Vec::new());
+    }
+
+    #[test]
+    fn gemini_transports_gain_video_and_audio_inputs() {
+        let mut gemini = vec![InputType::Text, InputType::Image];
+        augment_gemini_media_inputs("google-generative-ai", "gemini-2.5-pro", &mut gemini);
+        assert_eq!(
+            gemini,
+            vec![
+                InputType::Text,
+                InputType::Image,
+                InputType::Video,
+                InputType::Audio
+            ]
+        );
+        // Idempotent.
+        augment_gemini_media_inputs("google-vertex", "gemini-2.5-pro", &mut gemini);
+        assert_eq!(gemini.len(), 4);
+
+        // Text-only, non-Gemini ids, and non-Gemini transports are untouched.
+        let mut text_only = vec![InputType::Text];
+        augment_gemini_media_inputs("google-gemini-cli", "gemini-2.5-pro", &mut text_only);
+        assert_eq!(text_only, vec![InputType::Text]);
+        let mut claude_on_vertex = vec![InputType::Text, InputType::Image];
+        augment_gemini_media_inputs("google-vertex", "claude-sonnet-4-6", &mut claude_on_vertex);
+        assert_eq!(claude_on_vertex, vec![InputType::Text, InputType::Image]);
+        let mut copilot = vec![InputType::Text, InputType::Image];
+        augment_gemini_media_inputs("openai-completions", "gemini-2.5-pro", &mut copilot);
+        assert_eq!(copilot, vec![InputType::Text, InputType::Image]);
+    }
+
+    #[test]
+    fn built_in_gemini_models_declare_video_and_audio() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
+        for (provider, id) in [
+            ("google", "gemini-2.5-pro"),
+            ("google-gemini-cli", "gemini-2.5-pro"),
+            ("google-vertex", "gemini-2.5-flash"),
+        ] {
+            let entry = models
+                .iter()
+                .find(|m| m.model.provider == provider && m.model.id == id)
+                .unwrap_or_else(|| panic!("{provider}/{id} missing from bundled catalog"));
+            assert!(
+                entry.model.input.contains(&InputType::Video)
+                    && entry.model.input.contains(&InputType::Audio),
+                "{provider}/{id} input = {:?}",
+                entry.model.input
+            );
+        }
+        // The same Gemini id served over OpenAI-compatible gateways stays
+        // image-only: those transports have no media part.
+        let copilot = models
+            .iter()
+            .find(|m| m.model.provider == "github-copilot" && m.model.id == "gemini-2.5-pro")
+            .expect("github-copilot/gemini-2.5-pro present");
+        assert!(!copilot.model.input.contains(&InputType::Video));
     }
 
     #[test]

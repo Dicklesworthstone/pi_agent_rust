@@ -902,6 +902,7 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
                             image_url: AzureImageUrl { url },
                         });
                     }
+                    ContentBlock::Media(media) => text_parts.push(media.placeholder()),
                     _ => {}
                 }
             }
@@ -957,6 +958,9 @@ fn convert_user_content(content: &UserContent) -> AzureContent {
                             image_url: AzureImageUrl { url },
                         })
                     }
+                    ContentBlock::Media(media) => Some(AzureContentPart::Text {
+                        text: media.placeholder(),
+                    }),
                     _ => None,
                 })
                 .collect();

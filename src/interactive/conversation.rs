@@ -50,6 +50,9 @@ pub(super) fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
                     &crate::terminal_images::placeholder(&image.mime_type, None, None),
                 );
             }
+            // Media blocks are never rendered inline; the sanitized
+            // placeholder is the whole terminal surface (gh #212).
+            ContentBlock::Media(media) => push_line(&mut output, &media.placeholder()),
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
             }
@@ -109,6 +112,7 @@ pub(super) fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: 
                     hidden_images = hidden_images.saturating_add(1);
                 }
             }
+            ContentBlock::Media(media) => push_line(&mut output, &media.placeholder()),
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
             }

@@ -249,6 +249,8 @@ Accessor defaults:
 - `media.tts_voice` (string): Voice identifier (e.g. `"alloy"`, `"rachel"`).
 - `media.image_gen_provider` (string): Default `"gemini"`. Supported: `"gemini"`, `"dall-e-3"`.
 - `media.output_dir` (string): Destination folder for generated media artifacts.
+- `media.enable_read_media` / `media.enableReadMedia` (bool): Default `false`. When `true`, activates `read_media`, which attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Only Gemini-family models consume it natively; other providers see `[media omitted: <name>, <mime>, <size>]`.
+- `media.max_bytes` / `media.maxBytes` (integer): Default `5242880` (5 MiB). Hard cap on one `read_media` file in bytes; larger files are rejected with an error naming the cap. The payload is base64-inlined into the session file and re-sent every turn until compaction, so keep this small.
 
 ### Computer (desktop automation)
 

@@ -1800,6 +1800,8 @@ fn merge_media(
             enable_inspect_image: other.enable_inspect_image.or(base.enable_inspect_image),
             enable_generate_image: other.enable_generate_image.or(base.enable_generate_image),
             enable_tts: other.enable_tts.or(base.enable_tts),
+            enable_read_media: other.enable_read_media.or(base.enable_read_media),
+            max_bytes: other.max_bytes.or(base.max_bytes),
             vision_model: other.vision_model.or(base.vision_model),
             vision_provider: other.vision_provider.or(base.vision_provider),
             image_gen_provider: other.image_gen_provider.or(base.image_gen_provider),

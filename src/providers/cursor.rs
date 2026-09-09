@@ -343,12 +343,15 @@ fn render_user_content(content: &UserContent) -> String {
         UserContent::Blocks(blocks) => {
             let mut out = String::new();
             for block in blocks {
-                if let ContentBlock::Text(text) = block {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&text.text);
+                let line = match block {
+                    ContentBlock::Text(text) => text.text.clone(),
+                    ContentBlock::Media(media) => media.placeholder(),
+                    _ => continue,
+                };
+                if !out.is_empty() {
+                    out.push('\n');
                 }
+                out.push_str(&line);
             }
             out
         }

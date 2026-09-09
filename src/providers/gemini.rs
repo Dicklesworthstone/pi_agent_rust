@@ -1074,9 +1074,11 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                     }
                     ContentBlock::Thinking(_)
                     | ContentBlock::Image(_)
+                    | ContentBlock::Media(_)
                     | ContentBlock::RedactedThinking(_) => {
                         // Anthropic-shaped thinking blocks (including redacted
-                        // markers) and image blocks have no Gemini equivalent.
+                        // markers) and image/media blocks have no Gemini
+                        // equivalent on the model side.
                     }
                 }
             }
@@ -1092,17 +1094,19 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
         }
         Message::ToolResult(result) => {
             // Gemini expects function responses as user role with functionResponse part
-            let content_text = result
+            let inline_parts = tool_result_inline_parts(result);
+            let mut content_text = result
                 .content
                 .iter()
-                .map(|b| match b {
-                    ContentBlock::Text(t) => t.text.clone(),
-                    ContentBlock::Image(img) => format!("[Image ({}) omitted]", img.mime_type),
-                    _ => String::new(),
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
                 })
-                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
+            if content_text.is_empty() && !inline_parts.is_empty() {
+                content_text = "(see attached media)".to_string();
+            }
 
             let response_value = if result.is_error {
                 serde_json::json!({ "error": content_text })
@@ -1110,7 +1114,7 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                 serde_json::json!({ "result": content_text })
             };
 
-            vec![GeminiContent {
+            let mut contents = vec![GeminiContent {
                 role: Some("user".into()),
                 parts: vec![GeminiPart::FunctionResponse {
                     function_response: GeminiFunctionResponse {
@@ -1118,7 +1122,18 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                         response: response_value,
                     },
                 }],
-            }]
+            }];
+            if !inline_parts.is_empty() {
+                let mut parts = vec![GeminiPart::Text {
+                    text: "Tool result media:".to_string(),
+                }];
+                parts.extend(inline_parts);
+                contents.push(GeminiContent {
+                    role: Some("user".into()),
+                    parts,
+                });
+            }
+            contents
         }
     }
 }
@@ -1138,10 +1153,46 @@ pub(crate) fn convert_user_content_to_parts(content: &UserContent) -> Vec<Gemini
                         data: img.data.clone(),
                     },
                 }),
+                // Video/audio go out as the same `inline_data` blob shape the
+                // Gemini API documents for all inline media (gh #212).
+                ContentBlock::Media(media) => Some(GeminiPart::InlineData {
+                    inline_data: GeminiBlob {
+                        mime_type: media.mime_type.clone(),
+                        data: media.data.clone(),
+                    },
+                }),
                 _ => None,
             })
             .collect(),
     }
+}
+
+/// Inline blobs (images, video, audio) carried by a tool result.
+///
+/// Gemini's `functionResponse.response` is a JSON object, so binary tool
+/// output cannot ride inside it on every model generation. Mirroring the
+/// Node reference's cross-model fallback, the blobs are attached as a
+/// separate trailing `user` turn so the model still receives them.
+fn tool_result_inline_parts(result: &crate::model::ToolResultMessage) -> Vec<GeminiPart> {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(img) => Some(GeminiPart::InlineData {
+                inline_data: GeminiBlob {
+                    mime_type: img.mime_type.clone(),
+                    data: img.data.clone(),
+                },
+            }),
+            ContentBlock::Media(media) => Some(GeminiPart::InlineData {
+                inline_data: GeminiBlob {
+                    mime_type: media.mime_type.clone(),
+                    data: media.data.clone(),
+                },
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn convert_tool_to_gemini(tool: &ToolDef) -> GeminiFunctionDeclaration {
@@ -1939,6 +1990,113 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    /// gh #212: video/audio blocks serialize as the same `inline_data` blob
+    /// shape as images, with the MIME type passed through verbatim.
+    #[test]
+    fn test_convert_user_blocks_with_media_to_gemini_inline_data() {
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("what happens in this clip?")),
+            ContentBlock::Media(crate::model::MediaContent {
+                data: "AAAA".to_string(),
+                mime_type: "video/mp4".to_string(),
+                name: Some("clip.mp4".to_string()),
+            }),
+            ContentBlock::Media(crate::model::MediaContent {
+                data: "BBBB".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: None,
+            }),
+        ]);
+
+        let parts = convert_user_content_to_parts(&content);
+        assert_eq!(parts.len(), 3);
+        let wire = serde_json::to_value(&parts).expect("serialize parts");
+        assert_eq!(
+            wire,
+            serde_json::json!([
+                { "text": "what happens in this clip?" },
+                { "inline_data": { "mimeType": "video/mp4", "data": "AAAA" } },
+                { "inline_data": { "mimeType": "audio/wav", "data": "BBBB" } },
+            ])
+        );
+    }
+
+    /// gh #212: a tool result carrying media (the `read_media` shape) keeps
+    /// its text inside `functionResponse` and attaches the blobs on a
+    /// trailing user turn, so the model actually receives them.
+    #[test]
+    fn test_convert_tool_result_with_media_attaches_inline_turn() {
+        let message = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("Read media file clip.mp4")),
+                ContentBlock::Media(crate::model::MediaContent {
+                    data: "AAAA".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                }),
+            ],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+
+        let converted = convert_message_to_gemini(&message);
+        assert_eq!(converted.len(), 2, "functionResponse turn + media turn");
+        match &converted[0].parts[0] {
+            GeminiPart::FunctionResponse { function_response } => {
+                assert_eq!(function_response.name, "read_media");
+                assert_eq!(
+                    function_response.response["result"],
+                    "Read media file clip.mp4"
+                );
+            }
+            _ => panic!("expected functionResponse part"),
+        }
+        assert_eq!(converted[1].role, Some("user".to_string()));
+        let wire = serde_json::to_value(&converted[1].parts).expect("serialize parts");
+        assert_eq!(
+            wire,
+            serde_json::json!([
+                { "text": "Tool result media:" },
+                { "inline_data": { "mimeType": "video/mp4", "data": "AAAA" } },
+            ])
+        );
+
+        // A media-only result gets a stand-in text so the JSON response is
+        // never empty; a text-only result stays a single turn.
+        let media_only = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![ContentBlock::Media(crate::model::MediaContent {
+                data: "AAAA".to_string(),
+                mime_type: "audio/mpeg".to_string(),
+                name: None,
+            })],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let converted = convert_message_to_gemini(&media_only);
+        assert_eq!(converted.len(), 2);
+        match &converted[0].parts[0] {
+            GeminiPart::FunctionResponse { function_response } => {
+                assert_eq!(function_response.response["result"], "(see attached media)");
+            }
+            _ => panic!("expected functionResponse part"),
+        }
+        let text_only = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_text".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("plain"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        assert_eq!(convert_message_to_gemini(&text_only).len(), 1);
     }
 
     #[test]

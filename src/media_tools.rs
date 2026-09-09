@@ -19,6 +19,12 @@ use uuid::Uuid;
 
 pub const MAX_IMAGE_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
 pub const MAX_TTS_TEXT_CHARS: usize = 4096;
+/// Default hard cap on one inline video/audio block produced by `read_media`.
+///
+/// 5 MiB of decoded bytes (gh #212), configurable via `media.maxBytes`. The
+/// payload is base64-inlined into the session file and re-sent every turn
+/// until compaction, so this is deliberately conservative.
+pub const DEFAULT_MEDIA_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 // Minimal valid 1x1 PNG bytes for fixture / VCR fallback
 const MIN_VALID_PNG: &[u8] = &[
@@ -59,6 +65,14 @@ pub struct MediaSettings {
     pub enable_generate_image: Option<bool>,
     #[serde(alias = "enableTts")]
     pub enable_tts: Option<bool>,
+    /// Enables the `read_media` tool (inline video/audio for Gemini-family
+    /// models, gh #212).
+    #[serde(alias = "enableReadMedia")]
+    pub enable_read_media: Option<bool>,
+    /// Hard cap in decoded bytes for one `read_media` block. Defaults to
+    /// [`DEFAULT_MEDIA_MAX_BYTES`]; files above it are rejected outright.
+    #[serde(alias = "maxBytes")]
+    pub max_bytes: Option<u64>,
     #[serde(alias = "visionModel")]
     pub vision_model: Option<String>,
     #[serde(alias = "visionProvider")]
@@ -286,6 +300,205 @@ impl Tool for InspectImageTool {
                 "size_bytes": metadata.len(),
                 "provider": self.default_provider,
                 "model": self.default_model,
+            })),
+            is_error: false,
+        })
+    }
+}
+
+// ============================================================================
+// 1b. read_media Tool (gh #212)
+// ============================================================================
+
+/// Map a `read_media` file extension to its MIME type.
+///
+/// The list is the intersection of common containers and what the Gemini API
+/// documents for inline `inline_data` parts (video: mp4/webm/mov; audio:
+/// mp3/wav/m4a/ogg/flac). The MIME spellings follow the Gemini docs verbatim
+/// (`video/mov`, `audio/m4a`) rather than the IANA registrations, since that
+/// transport is the only native consumer.
+pub fn media_mime_type_for_extension(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mov" => Some("video/mov"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "m4a" => Some("audio/m4a"),
+        "ogg" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        _ => None,
+    }
+}
+
+/// Extensions `read_media` accepts, in the order the tool schema advertises them.
+pub const READ_MEDIA_EXTENSIONS: &[&str] =
+    &["mp4", "webm", "mov", "mp3", "wav", "m4a", "ogg", "flac"];
+
+/// `read_media`: load a local video/audio file as an inline
+/// [`ContentBlock::Media`] so Gemini/Vertex models can consume it. Every
+/// other provider receives the block's text placeholder instead.
+pub struct ReadMediaTool {
+    cwd: PathBuf,
+    max_bytes: u64,
+}
+
+impl ReadMediaTool {
+    pub fn new(cwd: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            max_bytes: DEFAULT_MEDIA_MAX_BYTES,
+        }
+    }
+
+    /// Apply the configured cap (`media.maxBytes`); `None` keeps the default.
+    #[must_use]
+    pub const fn with_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
+        if let Some(max_bytes) = max_bytes {
+            self.max_bytes = max_bytes;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    fn resolve_path(&self, rel_or_abs: &str) -> PathBuf {
+        let p = Path::new(rel_or_abs);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.cwd.join(p)
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for ReadMediaTool {
+    fn name(&self) -> &str {
+        "read_media"
+    }
+
+    fn label(&self) -> &str {
+        "Read Media"
+    }
+
+    fn description(&self) -> &str {
+        "Attach a local video or audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) to the \
+         conversation as inline media. Only Gemini-family models can watch/listen to it; other \
+         providers see a text placeholder. Files above the configured size cap are rejected."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to a local video (mp4, webm, mov) or audio (mp3, wav, m4a, ogg, flac) file"
+                }
+            }
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::read()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        args: Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let path_str = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::tool("read_media", "missing required path parameter"))?;
+
+        let target_path = self.resolve_path(path_str);
+        if !target_path.is_file() {
+            return Err(Error::tool(
+                "read_media",
+                format!("media file not found: {}", target_path.display()),
+            ));
+        }
+
+        let ext = target_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let Some(mime_type) = media_mime_type_for_extension(&ext) else {
+            return Err(Error::tool(
+                "read_media",
+                format!(
+                    "unsupported media extension: .{ext} (supported: {})",
+                    READ_MEDIA_EXTENSIONS.join(", ")
+                ),
+            ));
+        };
+
+        let metadata = fs::metadata(&target_path)
+            .map_err(|e| Error::tool("read_media", format!("cannot stat media file: {e}")))?;
+        let size = metadata.len();
+        if size > self.max_bytes {
+            return Err(Error::tool(
+                "read_media",
+                format!(
+                    "media file is {} ({size} bytes), above the {} cap ({} bytes); raise media.maxBytes or trim the file",
+                    crate::model::format_media_size(size),
+                    crate::model::format_media_size(self.max_bytes),
+                    self.max_bytes
+                ),
+            ));
+        }
+        if size == 0 {
+            return Err(Error::tool("read_media", "media file is empty"));
+        }
+
+        let bytes = fs::read(&target_path)
+            .map_err(|e| Error::tool("read_media", format!("cannot read media file: {e}")))?;
+        // Re-check after the read: the stat above is advisory only.
+        if bytes.len() as u64 > self.max_bytes {
+            return Err(Error::tool(
+                "read_media",
+                format!(
+                    "media file grew past the {} cap while being read",
+                    crate::model::format_media_size(self.max_bytes)
+                ),
+            ));
+        }
+        let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+        let name = target_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(crate::model::sanitize_media_name);
+
+        let note = format!(
+            "Read media file {} [{mime_type}, {}]",
+            name.as_deref().unwrap_or(path_str),
+            crate::model::format_media_size(size)
+        );
+
+        Ok(ToolOutput {
+            content: vec![
+                ContentBlock::Text(TextContent::new(note)),
+                ContentBlock::Media(crate::model::MediaContent {
+                    data,
+                    mime_type: mime_type.to_string(),
+                    name,
+                }),
+            ],
+            details: Some(json!({
+                "path": target_path.display().to_string(),
+                "mime_type": mime_type,
+                "size_bytes": size,
+                "max_bytes": self.max_bytes,
             })),
             is_error: false,
         })
