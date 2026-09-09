@@ -691,6 +691,53 @@ JSON
 printf '%s\n' "$artifact_record" >"$TEST_ARTIFACT_INDEX_PATH"
 "#;
     write_executable(&bin_dir.join("cargo"), cargo_stub);
+
+    // Deterministic git, so this test does not depend on whether the tree it
+    // runs in happens to be a repository. It previously shelled out to the
+    // real git against the project root, which works on a developer checkout
+    // and fails on an rch worker: clean-overlay sync delivers the committed
+    // files without a .git directory, so `git ls-files` exits 128 and the run
+    // died with "fatal: not a git repository". The same test therefore passed
+    // on one worker and failed on another from identical source, which is the
+    // non-hermeticity bd-b3yao is named for.
+    //
+    // The runner uses exactly three git verbs (rev-parse HEAD, status
+    // --porcelain, ls-files -c -o --exclude-standard -z), all covered here.
+    // `ls-files` reports Cargo.toml, a file guaranteed to exist at the project
+    // root, so the source digest the summary binds is a real sha256 over real
+    // bytes and is stable across the runner's before/after comparisons —
+    // rather than a fabricated constant.
+    let git_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  rev-parse)
+    if [[ "${2:-}" == "HEAD" ]]; then
+      printf '%s\n' '0123456789abcdef0123456789abcdef01234567'
+      exit 0
+    fi
+    exit 64
+    ;;
+  status)
+    exit 0
+    ;;
+  -C)
+    if [[ "${3:-}" == "ls-files" ]]; then
+      printf 'Cargo.toml\0'
+      exit 0
+    fi
+    exit 64
+    ;;
+  ls-files)
+    printf 'Cargo.toml\0'
+    exit 0
+    ;;
+  *)
+    echo "unexpected fake git invocation: $*" >&2
+    exit 64
+    ;;
+esac
+"#;
+    write_executable(&bin_dir.join("git"), git_stub);
 }
 
 #[cfg(unix)]
