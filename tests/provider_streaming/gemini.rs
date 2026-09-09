@@ -81,9 +81,7 @@ async fn run_scenario(scenario: Scenario) {
 
     if mode == VcrMode::Playback && !cassette_path.exists() {
         let message = format!("Missing cassette {}", cassette_path.display());
-        if vcr_strict() {
-            panic!("{message}");
-        }
+        assert!(!vcr_strict(), "{message}");
         harness.log().warn("vcr", message);
         return;
     }
