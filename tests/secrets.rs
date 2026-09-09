@@ -1,3 +1,10 @@
+// Product and vendor names appear throughout these docs (Alibaba BaiLian,
+// OpenAI and friends) and `doc_markdown` reads their capitalisation as
+// un-backticked code items. Backticking a brand renders it as code, which is
+// worse than the warning. Same allow that 30 other files in tests/ already
+// carry.
+#![allow(clippy::doc_markdown)]
+
 //! Integration tests for the secrets obfuscation vault (bd-cv653.7.9).
 //!
 //! Acceptance coverage:
