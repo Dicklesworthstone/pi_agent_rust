@@ -62,6 +62,12 @@ storage.sqlite3
 # Agent probe/scratch files and temp directories
 .codex_space_probe
 .space_probe_bytes
+# Per-agent ambient-context hook state (`ee capture`, writes .ee/hook-state/).
+# Left untracked it shows up in every session's `git status` and, worse, trips
+# the strict release contract's "clean tree, tracked AND untracked" check, so
+# `dsr build --dry-run` cannot reach per-target planning from a working
+# checkout.
+.ee/
 .rch-tmp/
 .tmp-*/
 .tmp-*
