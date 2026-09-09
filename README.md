@@ -42,7 +42,7 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 35 built-in tools (19 in the default `--tools` list; 14 always in the model's schema, the rest reachable through the `xdev` dispatcher or enabled in settings).
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 36 built-in tools (19 in the default `--tools` list; 14 always in the model's schema, the rest reachable through the `xdev` dispatcher or enabled in settings).
 
 ### Current product direction
 
@@ -392,7 +392,7 @@ pi "Write a quicksort implementation"
 
 Watch the response appear incrementally, with thinking blocks shown inline.
 
-### 35 Built-in Tools
+### 36 Built-in Tools
 
 Tools are tiered so the model's live schema stays small while everything
 remains reachable. The tier table lives in `src/xdev.rs`; the default
@@ -2912,7 +2912,7 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 | **Startup** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
 | **Memory** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
 | **Providers** | 11 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
-| **Tools** | 35 built-in (19 in the default `--tools` list) | Many | File-focused | IDE-integrated |
+| **Tools** | 36 built-in (19 in the default `--tools` list) | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |
 
