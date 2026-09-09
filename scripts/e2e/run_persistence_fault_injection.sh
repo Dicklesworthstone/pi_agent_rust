@@ -119,11 +119,27 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-listed = subprocess.run(
+# Degrade to a sentinel when there is no git inventory to read, matching what
+# SOURCE_COMMIT and SOURCE_DIRTY above already do with `|| echo unknown`. This
+# digest was the one source-identity signal in the script that raised instead,
+# so a tree without a .git directory killed the whole run with
+#   fatal: not a git repository ... git ls-files ... exit status 128
+# rch syncs committed files to a worker without .git in clean-overlay mode, so
+# whether this passed depended on which sync mode rch happened to choose —
+# the test failed on one worker and passed on another from identical source
+# (bd-b3yao.3). The before/after comparison this feeds stays meaningful:
+# both ends read "unavailable" and agree, and a tree that gains or loses its
+# repository mid-run still differs and trips the fence.
+completed = subprocess.run(
     ["git", "-C", str(root), "ls-files", "-c", "-o", "--exclude-standard", "-z"],
-    check=True,
+    check=False,
     stdout=subprocess.PIPE,
-).stdout
+    stderr=subprocess.DEVNULL,
+)
+if completed.returncode != 0:
+    print("unavailable")
+    raise SystemExit(0)
+listed = completed.stdout
 digest = hashlib.sha256()
 for raw_relative in sorted(filter(None, listed.split(b"\0"))):
     relative = os.fsdecode(raw_relative)
