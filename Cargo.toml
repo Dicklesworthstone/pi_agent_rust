@@ -568,6 +568,13 @@ module_name_repetitions = "allow"
 # pedantic/nursery groups underneath us. Between them they were 294 of the 296
 # errors blocking `cargo clippy -- -D warnings`, i.e. the entire quality gate.
 # Decided deliberately rather than reverted (bd-39x9z).
+#
+# One deviation from bd-39x9z's acceptance, recorded rather than glossed: that
+# bead asked for per-module suppression rather than crate-wide if this route was
+# taken. The owner chose the allow directly, and per-module would mean an inner
+# attribute in each of the ~78 affected files, which scatters the reasoning
+# across the tree instead of stating it once where the lint policy lives. One
+# documented place is easier to revisit than 78 undocumented ones.
 
 # 288 hits, essentially all in test assertions. The lint wants
 #   assert_eq!(plan_tool_effect_batches(&effect_plan(&cases)), [] as [agent::ToolEffectBatch; 0])

@@ -1,16 +1,27 @@
 # Pinned to a specific nightly so builds and lint results are reproducible.
 # The locked dependency graph requires Rust 1.95 or newer; the repository's
-# validated release toolchain is nightly-2026-07-05. An unpinned `nightly`
-# channel let clippy drift across toolchains: newer nightlies strengthen the
-# pedantic/nursery lint groups and can expose new warnings without a source
-# change. CI runs `cargo clippy --all-targets -- -D warnings`, so bump this pin
-# deliberately and re-run the complete release gates rather than floating.
+# validated release toolchain is nightly-2026-08-31, the channel set below. An
+# unpinned `nightly` channel let clippy drift across toolchains: newer nightlies
+# strengthen the pedantic/nursery lint groups and can expose new warnings
+# without a source change. CI runs `cargo clippy --all-targets -- -D warnings`,
+# so bump this pin deliberately and re-run the complete release gates rather
+# than floating.
 #
-# Deliberate bump 2026-07-09: nightly-2026-02-19 -> nightly-2026-07-05.
+# Bump 2026-09-04: nightly-2026-07-05 -> nightly-2026-08-31 (e403485b3).
+# This one was NOT deliberate for this repository. It was fleet-wide
+# housekeeping — "unify dated and floating pins so extra rustup nightlies can be
+# uninstalled on shared hosts" — it touched no source, and it did exactly what
+# the paragraph above warns about: the strengthened lint groups produced 300
+# clippy errors across 78 files and took the quality gate down. The pin was kept
+# rather than reverted, and the debt was paid instead: 296 of the 300 were fixed
+# or decided at the Cargo.toml lint level, and `cargo clippy --locked
+# --all-targets -- -D warnings` now reports zero errors on this channel (run
+# 20260909T184726-41326, source 7b6a53cc0). That run is what makes
+# nightly-2026-08-31 "validated" rather than merely current. See bd-39x9z.
+#
+# Earlier bump 2026-07-09: nightly-2026-02-19 -> nightly-2026-07-05.
 # asupersync requires `sysinfo = "0.39"`; the locked sysinfo 0.39.6 declares
 # Rust 1.95 and uses language/library support unavailable on the old pin.
-# nightly-2026-07-05 is the validated landing spot for the current dependency
-# graph and lint policy.
 # (Sibling projects may use different pins because they do not consume this
 # repository's locked asupersync/sysinfo graph.)
 [toolchain]
