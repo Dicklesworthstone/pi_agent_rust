@@ -12382,9 +12382,7 @@ fn orchestrate_weighted_attribution_computes_with_two_pass_cells_and_one_dropped
         "save_ms carries 70 of the 200 weighted stage-milliseconds across both cells"
     );
     assert_eq!(
-        ranking
-            .first()
-            .and_then(|row| row["stage"].as_str()),
+        ranking.first().and_then(|row| row["stage"].as_str()),
         Some("save_ms"),
         "the ranking is sorted by weighted contribution, heaviest first"
     );
@@ -12416,7 +12414,7 @@ fn orchestrate_weighted_attribution_computes_with_two_pass_cells_and_one_dropped
 
     // Negative control from the same fixture: with no passing cell the function
     // falls to `missing`, which is what the stub toolchain actually hits.
-    let mut no_pass = request.clone();
+    let mut no_pass = request;
     for cell in no_pass["cells"].as_array_mut().expect("cells array") {
         cell["status"] = json!("fail");
     }

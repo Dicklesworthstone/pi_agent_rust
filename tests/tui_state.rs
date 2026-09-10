@@ -3466,7 +3466,7 @@ fn tui_state_slash_export_writes_html_and_reports_path() {
 /// `tui_state_slash_share_is_cancellable_and_cleans_temp_file` on "expected
 /// fake gh to record temp path" and
 /// `tui_state_slash_share_reports_parse_error_and_cleans_temp_file` on
-/// "expected AgentError for gist parse failure". Neither is a logic failure:
+/// "expected `AgentError` for gist parse failure". Neither is a logic failure:
 /// the lane runs hundreds of test binaries at once and a fork plus a write does
 /// not reliably finish inside half a second on a loaded worker.
 ///

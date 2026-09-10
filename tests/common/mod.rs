@@ -111,8 +111,8 @@ pub fn hermetic_interactive_config(mut config: pi::config::Config) -> pi::config
 /// than release.
 ///
 /// 16 MiB matches what this project already reserves for its other long-frame
-/// threads: `SQLITE_THREAD_STACK_BYTES` in src/session_sqlite.rs and
-/// `DRIVER_STACK_BYTES` in src/interactive_ftui.rs. The reservation is virtual
+/// threads: `SQLITE_THREAD_STACK_BYTES` in `src/session_sqlite.rs` and
+/// `DRIVER_STACK_BYTES` in `src/interactive_ftui.rs`. The reservation is virtual
 /// and committed lazily, so the cost to every other suite sharing this runtime
 /// is nil.
 ///

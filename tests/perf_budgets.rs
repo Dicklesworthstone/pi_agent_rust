@@ -8074,8 +8074,8 @@ fn artifact_age_hours_accepts_fresh_embedded_timestamp_with_old_mtime() {
     );
 }
 
-/// The PiJS regression gate must refuse records shaped like the checked-in
-/// synthetic artifact (bd-tool-call-throughput-canonical-o3ubk).
+/// The `PiJS` regression gate must refuse records shaped like the checked-in
+/// synthetic artifact (`bd-tool-call-throughput-canonical-o3ubk`).
 ///
 /// Why this exists, since a test that asserts a rejection is easy to write for
 /// the wrong reason. `tests/perf/reports/pijs_workload_perf.jsonl` holds 20,000
@@ -8109,7 +8109,10 @@ fn pijs_gate_refuses_synthetic_stub_records() {
             "binary_profile": "synthetic_stub",
         })
     };
-    let events = vec![stub("read", 1.083, 236_451.022), stub("bash", 0.125, 4_991.0)];
+    let events = vec![
+        stub("read", 1.083, 236_451.022),
+        stub("bash", 0.125, 4_991.0),
+    ];
 
     let error = validate_pijs_gate_pair(&events, max_artifact_age_hours())
         .expect_err("synthetic stub records must not satisfy the PiJS regression gate");
@@ -8128,10 +8131,10 @@ fn pijs_gate_refuses_synthetic_stub_records() {
 /// The companion to the case above, and the one that matters more: someone
 /// looking at that failure could reasonably conclude the producer just forgot a
 /// flag. It did not. The gate cross-checks the 1-call and 10-call lanes on
-/// binary_path, binary_sha256, build_fingerprint_contract, config_hash,
-/// compiled_profile_family, compiled_opt_level, compiled_debug,
-/// allocator_requested and allocator_effective, and derives its metrics from
-/// total_calls / elapsed_us / per_call_us rather than trusting a reported
+/// `binary_path`, `binary_sha256`, `build_fingerprint_contract`, `config_hash`,
+/// `compiled_profile_family`, `compiled_opt_level`, `compiled_debug`,
+/// `allocator_requested` and `allocator_effective`, and derives its metrics from
+/// `total_calls` / `elapsed_us` / `per_call_us` rather than trusting a reported
 /// latency. The synthetic records carry none of that, so adding the flag moves
 /// the failure rather than fixing it.
 #[test]
