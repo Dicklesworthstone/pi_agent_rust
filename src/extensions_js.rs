@@ -9935,6 +9935,48 @@ export class DefaultResourceLoader {
   async reload() { return; }
 }
 
+// Upstream exports DefaultPackageManager from this module, and extensions
+// import it. In this host the package manager lives in Rust and is not
+// reachable from inside QuickJS, so this is a shim like SettingsManager and
+// DefaultResourceLoader above. Without it the import is a static link error —
+// "Could not find export 'DefaultPackageManager'" — which kills the whole
+// extension at load even when it never calls the class (gh #223).
+//
+// The read-shaped methods are inert and return the upstream shapes. The three
+// mutating ones throw instead of resolving: an install() that silently
+// succeeds without installing anything is a worse answer than a named error,
+// because the caller cannot tell the difference and will act on a package that
+// is not there.
+export class DefaultPackageManager {
+  constructor(options = {}) {
+    this.cwd = String(options.cwd ?? "");
+    this.agentDir = String(options.agentDir ?? "");
+    this.settingsManager = options.settingsManager ?? null;
+    this.progressCallback = undefined;
+  }
+  setProgressCallback(callback) {
+    this.progressCallback = typeof callback === "function" ? callback : undefined;
+  }
+  getInstalledPath(_source, _scope) { return undefined; }
+  async resolve(_onMissing) {
+    return { extensions: [], skills: [], prompts: [], themes: [] };
+  }
+  async resolveExtensionSources(_sources, _options) {
+    return { extensions: [], skills: [], prompts: [], themes: [] };
+  }
+  async install(source, _options) { throw this._unsupported("install", source); }
+  async remove(source, _options) { throw this._unsupported("remove", source); }
+  async update(source) { throw this._unsupported("update", source); }
+  _unsupported(action, source) {
+    const target = source ? ` '${String(source)}'` : "";
+    return new Error(
+      `DefaultPackageManager.${action}()${target} is not available to extensions in this host: ` +
+      "package installation is owned by the pi binary. Use `pi install` from the shell, " +
+      "or declare the package in settings.json."
+    );
+  }
+}
+
 export function highlightCode(code, _lang, _theme) {
   return String(code ?? "");
 }
@@ -10039,6 +10081,7 @@ export default {
   SessionManager,
   SettingsManager,
   DefaultResourceLoader,
+  DefaultPackageManager,
   highlightCode,
   getLanguageFromPath,
   isBashToolResult,
@@ -25304,8 +25347,8 @@ mod tests {
     /// same commit. On drift the test prints the complete regenerated table,
     /// so re-pinning is one copy-paste instead of one test run per receipt.
     ///
-    /// Re-pinned 2026-09-09: only `<bridge>` moved, 202_987 -> 205_065
-    /// (+2_078 bytes, sha `fdfa107d…` -> `992b7def…`). `e0ce03b0d`
+    /// Re-pinned 2026-09-09 (bridge): only `<bridge>` moved, 202_987 ->
+    /// 205_065 (+2_078 bytes, sha `fdfa107d…` -> `992b7def…`). `e0ce03b0d`
     /// ("fix(extensions): chain `before_provider_request` handlers in load
     /// order", gh #219) added a 35-line chaining branch to the bridge source
     /// and changed nothing else: `git show e0ce03b0d -- src/extensions_js.rs`
@@ -25313,6 +25356,12 @@ mod tests {
     /// delta. Every virtual-module receipt is unchanged. The pin before this
     /// one rotted the same way, so this drift is bridge edits landing without
     /// the receipt update, not bundle corruption.
+    ///
+    /// Re-pinned 2026-09-09 (pi-coding-agent): only
+    /// `@mariozechner/pi-coding-agent` moved, 25_208 -> 27_280 (+2_072 bytes,
+    /// sha `f74b473e…` -> `61463384…`), from adding the `DefaultPackageManager`
+    /// shim export that gh #223 hits. Re-pinned in the same commit as the edit,
+    /// which is what this table exists to force.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
@@ -25341,8 +25390,8 @@ mod tests {
         ),
         (
             "@mariozechner/pi-coding-agent",
-            25_208,
-            "f74b473ecf0df9a826c21be3863c10a28f65b439b08c7dc49da43e2be7c6c4b5",
+            27_280,
+            "61463384323e22fac7f3a736c03346cbc177c70177f131190688c8a65773ce65",
         ),
         (
             "@mariozechner/pi-tui",
