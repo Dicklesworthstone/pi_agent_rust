@@ -1388,8 +1388,16 @@ mod tests {
             .find(|line| line.contains("日本語テキスト"))
             .expect("the untruncated data row");
         assert_eq!(
-            wide_rule.split('┼').next().expect("wide rule prefix").width(),
-            wide_data.split('│').next().expect("wide data prefix").width(),
+            wide_rule
+                .split('┼')
+                .next()
+                .expect("wide rule prefix")
+                .width(),
+            wide_data
+                .split('│')
+                .next()
+                .expect("wide data prefix")
+                .width(),
             "an untruncated wide-character cell must line up with the header rule"
         );
     }
