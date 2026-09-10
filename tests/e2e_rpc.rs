@@ -875,8 +875,27 @@ const CRASH_INTERRUPT_RECOVERY_READY_ENV: &str = "PI_CRASH_INTERRUPT_RECOVERY_RE
 const CRASH_INTERRUPT_RECOVERY_SUMMARY_ENV: &str = "PI_CRASH_INTERRUPT_RECOVERY_SUMMARY_PATH";
 #[cfg(unix)]
 const CRASH_INTERRUPT_RECOVERY_SESSION_ENV: &str = "PI_CRASH_INTERRUPT_RECOVERY_SESSION_PATH";
+/// How long the crash/interrupt recovery cases wait on the real `pi` binary.
+///
+/// These are the only cases here that spawn the shipped binary, drive a bash
+/// tool call through it, and then wait on the filesystem for a persisted
+/// session. 45 seconds was enough in isolation and not enough in the lane:
+/// `rpc_binary_sigint_exits_orderly_and_preserves_session` failed the first
+/// complete test run with "timed out waiting for pi --rpc to persist the SIGINT
+/// fixture", and passes on its own (173 of 173, run 20260910T032641-68164).
+/// Hundreds of test binaries run concurrently there, and process spawn plus a
+/// tool call plus a session write does not fit a 45 second budget under that
+/// load.
+///
+/// Raising it costs nothing when things are healthy: every wait loop breaks the
+/// moment its condition holds, so the budget is only ever spent on the way to a
+/// failure.
+///
+/// Stated plainly, because it would be easy to over-claim: this removes a
+/// margin, it does not fix a demonstrated defect. If the case fails again with
+/// this budget, the cause is real and is not load.
 #[cfg(unix)]
-const CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
+const CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
