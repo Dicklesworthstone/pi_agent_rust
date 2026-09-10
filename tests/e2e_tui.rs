@@ -53,8 +53,21 @@ fn base_interactive_args() -> Vec<&'static str> {
     ]
 }
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Patience budgets for this tmux-driven lane.
+///
+/// Every wait here polls a real tmux pane until the expected text appears, so
+/// it is bounded by how fast the machine can start a process, render a frame,
+/// and let tmux report it. The previous values were comfortable on an idle
+/// worker and not in a full lane: an equivalent case in tests/e2e_ftui.rs
+/// failed on a run that took roughly ten times as long as the runs that passed,
+/// on the same commit. A ten second budget on a worker running an order of
+/// magnitude slow is about one second of effective time.
+///
+/// Raising them costs nothing when things are healthy, because every wait
+/// returns as soon as its pane matches; the budget is only ever spent on the
+/// way to a failure. See tests/e2e_ftui.rs for the measurements.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const VCR_TEST_NAME: &str = "e2e_tui_tool_read";
 const VCR_BASIC_CHAT_TEST_NAME: &str = "e2e_tui_basic_chat";
 const VCR_RICH_MARKDOWN_TEST_NAME: &str = "e2e_tui_rich_markdown";

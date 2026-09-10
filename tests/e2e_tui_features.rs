@@ -22,11 +22,26 @@ use std::time::Duration;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-const SHARE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Patience budgets for this tmux-driven lane.
+///
+/// Every wait here polls a real tmux pane until the expected text appears, so
+/// it is bounded by how fast the machine can start a process, render a frame,
+/// and let tmux report it. The previous values were comfortable on an idle
+/// worker and not in a full lane: an equivalent case in tests/e2e_ftui.rs
+/// failed on a run that took roughly ten times as long as the runs that passed,
+/// on the same commit. A ten second budget on a worker running an order of
+/// magnitude slow is about one second of effective time.
+///
+/// Raising them costs nothing when things are healthy, because every wait
+/// returns as soon as its pane matches; the budget is only ever spent on the
+/// way to a failure. See tests/e2e_ftui.rs for the measurements.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// `/share` shells out to `gh`, so it carries the same budget as any other
+/// command rather than the tighter one it had.
+const SHARE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Overall budget for resending `/share` while the session reports busy.
-const SHARE_RETRY_BUDGET: Duration = Duration::from_secs(30);
+const SHARE_RETRY_BUDGET: Duration = Duration::from_secs(120);
 
 /// Standard CLI args for interactive mode with minimal features (no API calls).
 fn minimal_interactive_args() -> Vec<&'static str> {
