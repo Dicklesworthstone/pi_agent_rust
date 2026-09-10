@@ -266,6 +266,7 @@ files = [
     "extension_trust_promotion",
     "extensions_url_shim",
     "http_client",
+    "http_proxy",
     "interactive_extension_ui",
     "js_runtime_ordering",
     "lab_runtime_extensions",

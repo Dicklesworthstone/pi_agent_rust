@@ -166,6 +166,10 @@
           "justification": "HTTP client request/response behavior and transport-level diagnostics coverage."
         },
         {
+          "path": "tests/http_proxy.rs",
+          "justification": "Proxy wiring for the HTTP client (gh #210): the client dials the configured proxy, uses absolute-form for http:// targets, and forwards the response, proved against a loopback listener with no external network."
+        },
+        {
           "path": "tests/main_cli_selection.rs",
           "justification": "CLI command/model selection behavior and argument-routing correctness."
         },
