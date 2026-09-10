@@ -3457,6 +3457,26 @@ fn tui_state_slash_export_writes_html_and_reports_path() {
     assert_after_contains(&harness, &step, "Exported HTML:");
 }
 
+/// Patience budgets for the `/share` tests, which are the only ones here that
+/// wait on a real forked subprocess (a fake `gh` shell script) and on the
+/// filesystem underneath it.
+///
+/// These were 1 second and 500 milliseconds, and two of the eight cases failed
+/// in the first full test lane on that account —
+/// `tui_state_slash_share_is_cancellable_and_cleans_temp_file` on "expected
+/// fake gh to record temp path" and
+/// `tui_state_slash_share_reports_parse_error_and_cleans_temp_file` on
+/// "expected AgentError for gist parse failure". Neither is a logic failure:
+/// the lane runs hundreds of test binaries at once and a fork plus a write does
+/// not reliably finish inside half a second on a loaded worker.
+///
+/// Raising them costs nothing on a healthy machine. `wait_for_pi_msgs` returns
+/// as soon as its predicate holds, and the file loops exit as soon as the file
+/// appears or disappears, so the budget is only ever spent on the way to a
+/// failure.
+const SHARE_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+const SHARE_FILE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[test]
 fn tui_state_slash_share_reports_error_when_gh_missing() {
     let harness = TestHarness::new("tui_state_slash_share_reports_error_when_gh_missing");
@@ -3517,7 +3537,7 @@ fn tui_state_slash_share_reports_error_when_gh_not_authenticated() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Sharing session...");
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, SHARE_EVENT_TIMEOUT, |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::AgentError(_)))
     });
     let error = events
@@ -3560,7 +3580,7 @@ fn tui_state_slash_share_reports_parse_error_and_cleans_temp_file() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Sharing session...");
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, SHARE_EVENT_TIMEOUT, |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::AgentError(_)))
     });
     let error = events
@@ -3577,7 +3597,7 @@ fn tui_state_slash_share_reports_parse_error_and_cleans_temp_file() {
     let recorded = fs::read_to_string(&record_path).expect("read record path");
     let shared_path = std::path::Path::new(recorded.trim());
     let start = Instant::now();
-    while shared_path.exists() && start.elapsed() < Duration::from_millis(500) {
+    while shared_path.exists() && start.elapsed() < SHARE_FILE_TIMEOUT {
         thread::sleep(Duration::from_millis(5));
     }
     assert!(
@@ -3651,7 +3671,7 @@ fn tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file() {
     let recorded = fs::read_to_string(&record_path).expect("read record path");
     let shared_path = std::path::Path::new(recorded.trim());
     let start = Instant::now();
-    while shared_path.exists() && start.elapsed() < Duration::from_millis(500) {
+    while shared_path.exists() && start.elapsed() < SHARE_FILE_TIMEOUT {
         thread::sleep(Duration::from_millis(5));
     }
     assert!(
@@ -3692,7 +3712,7 @@ fn tui_state_slash_share_is_cancellable_and_cleans_temp_file() {
     assert_after_contains(&harness, &step, "Sharing session...");
 
     let start = Instant::now();
-    while !record_path.exists() && start.elapsed() < Duration::from_millis(500) {
+    while !record_path.exists() && start.elapsed() < SHARE_FILE_TIMEOUT {
         thread::sleep(Duration::from_millis(5));
     }
     assert!(record_path.exists(), "expected fake gh to record temp path");
@@ -3700,7 +3720,7 @@ fn tui_state_slash_share_is_cancellable_and_cleans_temp_file() {
     let step = press_esc(&harness, &mut app);
     assert_after_contains(&harness, &step, "Aborting request...");
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, SHARE_EVENT_TIMEOUT, |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::System(message) if message.contains("Share cancelled")))
     });
@@ -3714,7 +3734,7 @@ fn tui_state_slash_share_is_cancellable_and_cleans_temp_file() {
     let recorded = fs::read_to_string(&record_path).expect("read record path");
     let shared_path = std::path::Path::new(recorded.trim());
     let start = Instant::now();
-    while shared_path.exists() && start.elapsed() < Duration::from_millis(500) {
+    while shared_path.exists() && start.elapsed() < SHARE_FILE_TIMEOUT {
         thread::sleep(Duration::from_millis(5));
     }
     assert!(
