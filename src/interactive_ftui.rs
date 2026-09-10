@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use ftui::core::geometry::Rect;
 use ftui::render::sanitize::sanitize;
 use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
-use ftui::text::Text;
+use ftui::text::{Text, WrapMode, display_width};
 use ftui::widgets::Widget;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::spinner::{DOTS, SpinnerState};
@@ -742,6 +742,153 @@ fn apply_compact_spacing(
     out
 }
 
+/// Cell width of a rendered line's leading whitespace.
+///
+/// Walks spans rather than materializing the plain text: the markdown
+/// renderer emits list and code-block indentation as its own span, so the
+/// answer is usually the first span's width.
+fn leading_indent_cells(line: &ftui::text::Line<'_>) -> usize {
+    let mut cells = 0;
+    for span in line.spans() {
+        let content = span.as_str();
+        let trimmed = content.trim_start();
+        if trimmed.is_empty() {
+            // Empty or whitespace-only span: all of it is indent.
+            cells += display_width(content);
+            continue;
+        }
+        cells += display_width(&content[..content.len() - trimmed.len()]);
+        break;
+    }
+    cells
+}
+
+/// Split the first `indent_cells` cells off `line`, returning the indent
+/// spans and the remainder. Styles and OSC-8 links survive the split because
+/// [`ftui::text::Span::split_at_cell`] carries them onto both halves.
+fn split_leading_indent(
+    line: &ftui::text::Line<'static>,
+    indent_cells: usize,
+) -> (Vec<ftui::text::Span<'static>>, ftui::text::Line<'static>) {
+    let mut indent: Vec<ftui::text::Span<'static>> = Vec::new();
+    let mut rest: Vec<ftui::text::Span<'static>> = Vec::new();
+    let mut consumed = 0_usize;
+    for span in line.spans() {
+        if consumed >= indent_cells {
+            rest.push(span.clone());
+            continue;
+        }
+        let span_width = span.width();
+        if consumed + span_width <= indent_cells {
+            consumed += span_width;
+            indent.push(span.clone());
+            continue;
+        }
+        let (left, right) = span.split_at_cell(indent_cells - consumed);
+        consumed = indent_cells;
+        if !left.is_empty() {
+            indent.push(left);
+        }
+        if !right.is_empty() {
+            rest.push(right);
+        }
+    }
+    (indent, ftui::text::Line::from_spans(rest))
+}
+
+/// The hanging indent for a wrapped line: how many cells its continuations
+/// move in by, and the spans that fill them.
+///
+/// A list bullet or task checkbox is emitted as its own span carrying the
+/// nesting indent plus the marker, and is identified by the theme style
+/// stamped on it (the same technique [`compact_line_is_boundary`] uses).
+/// Continuations of a list item align under its text with blanks — repeating
+/// the glyph would read as a new item. Everything else hangs on its literal
+/// leading whitespace, and those spans are cloned so a fenced code block
+/// keeps its background tint all the way to the margin.
+fn hanging_indent(
+    line: &ftui::text::Line<'static>,
+    theme: &ftui_extras::markdown::MarkdownTheme,
+) -> (usize, Vec<ftui::text::Span<'static>>) {
+    let marker_styles = [theme.list_bullet, theme.task_done, theme.task_todo];
+    if let Some(first) = line.spans().first()
+        && !first.is_empty()
+        && first
+            .style
+            .is_some_and(|style| marker_styles.contains(&style))
+    {
+        let cells = first.width();
+        return (cells, vec![ftui::text::Span::raw(" ".repeat(cells))]);
+    }
+    let cells = leading_indent_cells(line);
+    if cells == 0 {
+        return (0, Vec::new());
+    }
+    (cells, split_leading_indent(line, cells).0)
+}
+
+/// Wrap one rendered conversation line to `width` cells (issue #227).
+///
+/// [`WrapMode::WordChar`] breaks at word boundaries and falls back to
+/// grapheme boundaries for a token longer than the row, so an unbroken URL
+/// hard-breaks instead of overflowing; splits are measured in display cells,
+/// so CJK and emoji never straddle the edge. ftui's word wrap left-trims
+/// wrapped rows, so the hanging indent is re-applied here — otherwise list
+/// items and fenced code slide back to the margin on every continuation.
+fn wrap_body_line(
+    line: &ftui::text::Line<'static>,
+    width: usize,
+    theme: &ftui_extras::markdown::MarkdownTheme,
+) -> Vec<ftui::text::Line<'static>> {
+    if width == 0 || line.width() <= width {
+        return vec![line.clone()];
+    }
+    let (indent_cells, continuation) = hanging_indent(line, theme);
+    // A hanging indent is only worth it while it leaves most of the row for
+    // text; deep indents (and whitespace-only lines, whose indent is the
+    // whole line) wrap flush instead of squeezing text into a sliver.
+    if indent_cells == 0 || indent_cells.saturating_mul(2) >= width {
+        return line.wrap(width, WrapMode::WordChar);
+    }
+    let (own_prefix, rest) = split_leading_indent(line, indent_cells);
+    rest.wrap(width - indent_cells, WrapMode::WordChar)
+        .into_iter()
+        .enumerate()
+        .map(|(row, piece)| {
+            // Row 0 keeps the line's real prefix (the bullet, the tinted
+            // code indent); the rest get the continuation fill.
+            let prefix = if row == 0 { &own_prefix } else { &continuation };
+            let mut out = ftui::text::Line::from_spans(prefix.iter().cloned());
+            for span in piece {
+                out.push_span(span);
+            }
+            out
+        })
+        .collect()
+}
+
+/// Wrap a block of rendered lines to `width` in place (issue #227).
+///
+/// The whole conversation body is one [`Paragraph`], and ftui's paragraph
+/// defaults to `WrapMode::None` — long lines are *clipped* at the right edge,
+/// silently losing everything past it. Wrapping here rather than through
+/// `Paragraph::wrap` keeps one source of truth for the visual line count,
+/// which the tail-follow scroll math in `render_frame` depends on.
+fn wrap_body_block(
+    lines: &mut Vec<ftui::text::Line<'static>>,
+    width: usize,
+    theme: &ftui_extras::markdown::MarkdownTheme,
+) {
+    if width == 0 || lines.iter().all(|line| line.width() <= width) {
+        return;
+    }
+    let mut out: Vec<ftui::text::Line<'static>> = Vec::with_capacity(lines.len() + 8);
+    for line in lines.iter() {
+        out.extend(wrap_body_line(line, width, theme));
+    }
+    *lines = out;
+}
+
 /// Live state of a tool-execution card (bd-cv653.9.2): a pending card
 /// flips to its terminal state IN PLACE when the tool ends, mirroring
 /// omp's state-tinted tool boxes. Bordered widget chrome lands with the
@@ -1052,9 +1199,14 @@ pub struct PiFtuiModel {
     /// matches, so a frame re-renders only changed entries plus the
     /// in-flight streaming tail instead of the whole transcript. Interior
     /// mutability because `view()` builds frames through `&self`. Cleared
-    /// whenever the styling inputs change (theme picker) — the markdown
-    /// renderer itself is width-independent, so resizes need no flush.
+    /// whenever the styling inputs change (theme picker) and whenever the
+    /// body width changes: cached lines are wrapped (issue #227) and tables
+    /// fitted (gh #195) for one width only.
     render_cache: std::cell::RefCell<Vec<Option<CachedBlock>>>,
+    /// Body width the blocks in `render_cache` were rendered for. A frame at
+    /// a different width drops the cache before reusing anything; see
+    /// [`PiFtuiModel::conversation_text`].
+    render_cache_width: std::cell::Cell<u16>,
     /// `(rendered, reused)` block counts from the most recent
     /// `conversation_text()` pass — the observable that keeps the cache
     /// honest in tests (O(changed) per frame, not O(transcript)).
@@ -1192,6 +1344,7 @@ impl PiFtuiModel {
             watchdog: LoopWatchdog::new(),
             transcript_revision: 0,
             render_cache: std::cell::RefCell::new(Vec::new()),
+            render_cache_width: std::cell::Cell::new(0),
             render_stats: std::cell::Cell::new((0, 0)),
             busy: None,
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
@@ -2521,9 +2674,11 @@ impl PiFtuiModel {
                 _ => {}
             },
             Event::Resize { width, height } => {
-                // Rendered markdown depends on the width only through the
-                // table budget; drop cached blocks when it changes so tables
-                // re-fit (gh #195). Height-only resizes keep the cache.
+                // Cached blocks are wrapped (issue #227) and their tables
+                // fitted (gh #195) for one width; drop them when it changes.
+                // Height-only resizes keep the cache. `conversation_text`
+                // repeats this check against the authoritative frame width,
+                // so a missed resize event cannot leave stale wrapping.
                 if *width != self.term.0 {
                     self.render_cache.borrow_mut().clear();
                 }
@@ -2729,26 +2884,43 @@ impl PiFtuiModel {
         if usable < 20 { 20 } else { usable }
     }
 
-    /// Build the styled conversation. Assistant content renders as markdown
-    /// (auto-detected; plain text stays plain); other roles get their prefix
-    /// on the first line, matching indent on continuations, and role style.
+    /// Build the styled conversation, wrapped to `width` cells. Assistant
+    /// content renders as markdown (auto-detected; plain text stays plain);
+    /// other roles get their prefix on the first line, matching indent on
+    /// continuations, and role style.
     ///
-    /// Note: markdown rendering can change line counts vs the raw text, so
-    /// `conversation_line_count()` is an approximation for scroll clamping in
-    /// `update()`; the view recomputes offsets against the rendered total.
-    fn conversation_text(&self) -> Text<'static> {
+    /// `width` is the conversation body's own width, taken from the frame
+    /// rather than from `self.term`: the frame is authoritative (the first
+    /// frame renders before any `Event::Resize` arrives, and the test
+    /// simulator renders at an arbitrary size without one).
+    ///
+    /// Note: markdown rendering and wrapping both change line counts vs the
+    /// raw text, so `conversation_line_count()` is an approximation for
+    /// scroll clamping in `update()`; the view recomputes offsets against the
+    /// rendered total.
+    fn conversation_text(&self, width: u16) -> Text<'static> {
         // Assistant output always renders as markdown, matching the glamour
         // treatment in the bubbletea stack (auto-detection would leave short
-        // or mostly-plain replies unstyled). Tables are fitted to the
-        // terminal width (gh #195: at natural width a wide table overflowed
-        // the frame and its cells were clipped mid-column); the resize handler
-        // drops the render cache when the width changes so cached table
-        // blocks re-fit.
+        // or mostly-plain replies unstyled). Tables are fitted to the body
+        // width (gh #195: at natural width a wide table overflowed the frame
+        // and its cells were clipped mid-column).
         let theme = ftui_extras::markdown::MarkdownTheme::default();
         let md = ftui_extras::markdown::MarkdownRenderer::new(theme.clone())
-            .table_max_width(Self::table_width_for(self.term.0));
+            .table_max_width(Self::table_width_for(width));
         let palette = self.palette;
         let compact = self.markdown_spacing == crate::config::MarkdownSpacing::Compact;
+        let wrap_width = usize::from(width);
+        // Cached blocks hold lines already wrapped to (and tables already
+        // fitted to) one width, so a width change invalidates all of them
+        // (issue #227, gh #195). The resize handler clears the cache on the
+        // same condition; this check is what makes the guarantee hold
+        // against the frame rather than against `self.term`, covering the
+        // first frame — which renders before any `Event::Resize` arrives —
+        // and any later frame whose width the model was not told about.
+        if self.render_cache_width.get() != width {
+            self.render_cache.borrow_mut().clear();
+            self.render_cache_width.set(width);
+        }
         // Per-entry render cache (issue #201): reuse each block's styled
         // lines while its revision matches, so a frame costs O(changed
         // entries + streaming tail) markdown renders, not O(transcript).
@@ -2765,8 +2937,9 @@ impl PiFtuiModel {
                 // leave no stale cache slot behind.
                 cache[idx] = None;
                 rendered_blocks += 1;
+                let mut block_lines: Vec<ftui::text::Line<'static>> = Vec::new();
                 push_card_block(
-                    &mut lines,
+                    &mut block_lines,
                     CardState::Pending,
                     &entry.text,
                     entry.detail.as_ref(),
@@ -2775,6 +2948,8 @@ impl PiFtuiModel {
                     &palette,
                     self.spinner.current_frame,
                 );
+                wrap_body_block(&mut block_lines, wrap_width, &theme);
+                lines.extend(block_lines);
                 continue;
             }
             if let Some(block) = cache[idx].as_ref()
@@ -2803,6 +2978,10 @@ impl PiFtuiModel {
                     block_lines = apply_compact_spacing(&block_lines, &theme);
                 }
             }
+            // Wrap last, and cache the wrapped result: compact spacing reads
+            // blank-line runs, which wrapping must not manufacture, and the
+            // cached line count has to be the visual one the scroll math uses.
+            wrap_body_block(&mut block_lines, wrap_width, &theme);
             lines.extend(block_lines.iter().cloned());
             cache[idx] = Some(CachedBlock {
                 revision: entry.revision,
@@ -2815,11 +2994,13 @@ impl PiFtuiModel {
             // renderer is tolerant of unterminated markdown. The in-flight
             // tail is deliberately uncached — it changes every delta.
             let rendered = md.render_streaming(&self.streaming);
-            if compact {
-                lines.extend(apply_compact_spacing(rendered.lines(), &theme));
+            let mut tail = if compact {
+                apply_compact_spacing(rendered.lines(), &theme)
             } else {
-                lines.extend(rendered.lines().iter().cloned());
-            }
+                rendered.lines().to_vec()
+            };
+            wrap_body_block(&mut tail, wrap_width, &theme);
+            lines.extend(tail);
         }
         Text::from_lines(lines)
     }
@@ -2873,9 +3054,6 @@ impl PiFtuiModel {
         self.watchdog.snapshot()
     }
 
-    /// The real render pass. Split out of [`Model::view`] so the watchdog can
-    /// time it without an extra guard type.
-    #[allow(clippy::too_many_lines)]
     /// Suggestion rows plus a keyboard hint (issue #208). The highlighted
     /// row is kept inside the window via the shared `scroll_offset`, so a
     /// short terminal that clamps the region below `max_visible` still
@@ -2966,6 +3144,9 @@ impl PiFtuiModel {
         .render(regions.footer, frame);
     }
 
+    /// The real render pass. Split out of [`Model::view`] so the watchdog can
+    /// time it without an extra guard type.
+    #[allow(clippy::too_many_lines)]
     fn render_frame(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let regions = layout_regions(
@@ -2993,7 +3174,7 @@ impl PiFtuiModel {
         // Conversation body with tail-follow scroll. `scroll_from_tail == 0`
         // sticks to the bottom; scrolling up pins an offset measured from the
         // tail so streaming appends don't yank the view.
-        let body_text = self.conversation_text();
+        let body_text = self.conversation_text(regions.body.width);
         let total_lines = body_text.lines().len();
         let visible = usize::from(regions.body.height).max(1);
         // Record the authoritative total for update()'s scroll clamping
@@ -3003,10 +3184,14 @@ impl PiFtuiModel {
             .scroll_from_tail
             .min(total_lines.saturating_sub(visible));
         let offset = total_lines.saturating_sub(visible + from_tail);
-        let offset_u16 = u16::try_from(offset).unwrap_or(u16::MAX);
-        Paragraph::new(body_text)
-            .scroll((offset_u16, 0))
-            .render(regions.body, frame);
+        // Hand the widget just the rows that fit rather than the whole
+        // transcript plus a scroll offset: `Paragraph::scroll` takes a u16,
+        // and past 65535 rows it saturates and draws from the wrong place
+        // instead of the tail — which wrapping (issue #227) makes a long
+        // session reach several times sooner. Slicing also means the widget
+        // measures a screenful instead of the entire history each frame.
+        let window = Text::from_lines(body_text.lines().iter().skip(offset).take(visible).cloned());
+        Paragraph::new(window).render(regions.body, frame);
 
         // Pinned error banner (bd-cv653.9.2): sits between the conversation
         // and the status line until the next sent input dismisses it.
@@ -4675,6 +4860,11 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         (tx, PiFtuiModel::new(rx))
     }
+
+    /// Body width for tests that call `conversation_text` directly. Cached
+    /// blocks are width-specific (issue #227), so repeated calls in one test
+    /// must agree on a width or every frame reads as cold.
+    const TEST_BODY_WIDTH: u16 = 80;
 
     #[test]
     fn replacement_session_template_preserves_launch_capabilities() {
@@ -7379,26 +7569,26 @@ mod tests {
             finish_turn(&mut sim, &format!("message **{i}** body"));
         }
         assert_eq!(sim.model().transcript.len(), 4);
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(
             sim.model().render_stats.get(),
             (4, 0),
             "cold frame renders every block"
         );
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(
             sim.model().render_stats.get(),
             (0, 4),
             "warm frame must reuse every unchanged block"
         );
         finish_turn(&mut sim, "one more");
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(
             sim.model().render_stats.get(),
             (1, 4),
             "only the new entry may render"
         );
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(sim.model().render_stats.get(), (0, 5));
     }
 
@@ -7413,8 +7603,8 @@ mod tests {
             name: "bash".into(),
             tool_id: "t1".into(),
         }));
-        let _ = sim.model().conversation_text();
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(
             sim.model().render_stats.get(),
             (1, 1),
@@ -7431,13 +7621,13 @@ mod tests {
             stop_reason: StopReason::Stop,
             error_message: None,
         }));
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         let (rendered, _) = sim.model().render_stats.get();
         assert!(
             rendered >= 1,
             "the settled card must re-render once after mutation"
         );
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         let (rendered, reused) = sim.model().render_stats.get();
         assert_eq!(rendered, 0, "settled card caches like any other block");
         assert_eq!(reused, sim.model().transcript.len());
@@ -7450,7 +7640,7 @@ mod tests {
         sim.init();
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
         sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("streaming tail".into())));
-        let text = sim.model().conversation_text();
+        let text = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert!(
             text.lines()
                 .iter()
@@ -7470,13 +7660,13 @@ mod tests {
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         finish_turn(&mut sim, "themed message");
-        let _ = sim.model().conversation_text();
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(sim.model().render_stats.get(), (0, 1));
         type_str(&mut sim, "/theme");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty())); // apply "dark"
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         let (rendered, reused) = sim.model().render_stats.get();
         assert_eq!(reused, 0, "theme change must drop every cached block");
         assert_eq!(rendered, sim.model().transcript.len());
@@ -7498,16 +7688,18 @@ mod tests {
             height: 24,
         });
         finish_turn(&mut sim, source);
-        let widest = |model: &PiFtuiModel| {
+        // The body width is the render argument, matching `render_frame`;
+        // the resize events drive the cache-invalidation half of the test.
+        let widest = |model: &PiFtuiModel, width: u16| {
             model
-                .conversation_text()
+                .conversation_text(width)
                 .lines()
                 .iter()
                 .map(|line| line.to_plain_text().chars().count())
                 .max()
                 .unwrap_or(0)
         };
-        let narrow = widest(sim.model());
+        let narrow = widest(sim.model(), 48);
         assert!(
             narrow <= 48,
             "table must be fitted to a 48-column terminal, widest rendered line is {narrow}"
@@ -7518,23 +7710,23 @@ mod tests {
             width: 120,
             height: 24,
         });
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(120);
         let (rendered, reused) = sim.model().render_stats.get();
         assert_eq!(reused, 0, "width change must drop every cached block");
         assert_eq!(rendered, sim.model().transcript.len());
-        let wide = widest(sim.model());
+        let wide = widest(sim.model(), 120);
         assert!(
             wide > narrow,
             "a wider terminal must let the table use more width (narrow={narrow}, wide={wide})"
         );
 
         // A height-only resize keeps the cache warm.
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(120);
         sim.inject_event(Event::Resize {
             width: 120,
             height: 40,
         });
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(120);
         let (_, reused) = sim.model().render_stats.get();
         assert!(
             reused > 0,
@@ -7554,7 +7746,7 @@ mod tests {
             sim.init();
             finish_turn(&mut sim, source);
             sim.model()
-                .conversation_text()
+                .conversation_text(TEST_BODY_WIDTH)
                 .lines()
                 .iter()
                 .map(ftui::text::Line::to_plain_text)
@@ -7710,6 +7902,276 @@ mod tests {
             output: None,
         }));
         assert!(sim.model().busy.is_none(), "ToolEnd settles the busy op");
+    }
+
+    // ── Issue #227: the conversation body must wrap, not clip ───────────
+
+    /// Widths spanning a narrow pane, the usual defaults, and the very wide
+    /// terminal in the report (3840 px at ~16 px/cell is ~240 columns).
+    const WRAP_WIDTHS: [u16; 5] = [40, 80, 120, 200, 240];
+
+    /// Sentinel at the end of a paragraph far longer than any width under
+    /// test: it can only reach the screen if the line wrapped.
+    const WRAP_TAIL: &str = "ENDMARK";
+
+    fn wrap_probe_paragraph() -> String {
+        format!(
+            "The sky appears blue because of a phenomenon called Rayleigh scattering, \
+             in which the shorter wavelengths of visible light are scattered far more \
+             strongly by the molecules of the atmosphere than the longer red \
+             wavelengths are, which is also the reason sunsets turn red once the light \
+             has to travel a much greater distance through the air {WRAP_TAIL}"
+        )
+    }
+
+    fn plain_lines(text: &Text<'static>) -> Vec<String> {
+        text.lines()
+            .iter()
+            .map(ftui::text::Line::to_plain_text)
+            .collect()
+    }
+
+    /// Issue #227: long answer lines were clipped at the right edge of the
+    /// conversation body instead of wrapping, so everything past the frame
+    /// width was silently lost. Tail-follow keeps the end of the answer on
+    /// screen, so the sentinel must be visible at every width.
+    #[test]
+    fn long_answer_lines_wrap_at_every_terminal_width() {
+        for width in WRAP_WIDTHS {
+            let (_tx, mut model) = new_model();
+            model.push_entry(EntryRole::Assistant, wrap_probe_paragraph());
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            let height = 40_u16;
+            let rendered = buffer_text(sim.capture_frame(width, height), width, height);
+            assert!(
+                rendered.contains(WRAP_TAIL),
+                "width {width}: answer clipped instead of wrapped:\n{rendered}"
+            );
+        }
+    }
+
+    /// Every rendered body line must fit the body width, and the answer's
+    /// words must survive in order — wrapping may move a word to the next
+    /// row but may never drop or reorder one.
+    #[test]
+    fn wrapped_body_lines_fit_the_width_and_keep_every_word() {
+        let source = wrap_probe_paragraph();
+        let expected: Vec<&str> = source.split_whitespace().collect();
+        for width in WRAP_WIDTHS {
+            let (_tx, mut model) = new_model();
+            model.push_entry(EntryRole::Assistant, source.clone());
+            let text = model.conversation_text(width);
+            for line in text.lines() {
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width {width}: line overflows by {} cells: {:?}",
+                    line.width() - usize::from(width),
+                    line.to_plain_text()
+                );
+            }
+            let words: Vec<String> = plain_lines(&text)
+                .join(" ")
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(
+                words, expected,
+                "width {width}: wrapping altered the answer text"
+            );
+        }
+    }
+
+    /// An unbroken token longer than the row (a URL, a hash) must hard-break
+    /// rather than overflow, and no character may be dropped.
+    #[test]
+    fn unbreakable_tokens_hard_break_instead_of_overflowing() {
+        let url = format!(
+            "https://example.com/{}/end",
+            "segment-with-no-spaces-at-all".repeat(6)
+        );
+        for width in [20_u16, 40, 80] {
+            let (_tx, mut model) = new_model();
+            model.push_entry(EntryRole::Assistant, url.clone());
+            let text = model.conversation_text(width);
+            for line in text.lines() {
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width {width}: unbroken token overflowed: {:?}",
+                    line.to_plain_text()
+                );
+            }
+            let joined: String = plain_lines(&text)
+                .iter()
+                .flat_map(|line| line.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let want: String = url.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                joined.contains(&want),
+                "width {width}: hard break lost characters: {joined:?}"
+            );
+        }
+    }
+
+    /// Double-width characters are measured in cells, so a CJK answer must
+    /// still fit. Widths stay above the degenerate case where one glyph is
+    /// wider than the whole row.
+    #[test]
+    fn wide_characters_wrap_by_display_cells() {
+        let cjk = "天空之所以是蓝色的是因为瑞利散射现象".repeat(8);
+        for width in [10_u16, 40, 80, 240] {
+            let (_tx, mut model) = new_model();
+            model.push_entry(EntryRole::Assistant, cjk.clone());
+            let text = model.conversation_text(width);
+            for line in text.lines() {
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width {width}: wide-char line overflowed: {:?}",
+                    line.to_plain_text()
+                );
+            }
+        }
+    }
+
+    /// A wrapped list item must hang under its own text rather than sliding
+    /// back to the margin, and the bullet must not be repeated on every row.
+    #[test]
+    fn wrapped_list_items_hang_under_their_marker() {
+        let source = format!(
+            "- {} {WRAP_TAIL}",
+            "a list item whose body runs well past the frame ".repeat(3)
+        );
+        let (_tx, mut model) = new_model();
+        model.push_entry(EntryRole::Assistant, source);
+        let lines = plain_lines(&model.conversation_text(40));
+        let start = lines
+            .iter()
+            .position(|line| line.contains("a list item"))
+            .expect("list item rendered");
+        let tail = lines
+            .iter()
+            .position(|line| line.contains(WRAP_TAIL))
+            .expect("list item tail rendered");
+        assert!(tail > start, "the list item must have wrapped: {lines:?}");
+        // Cells, not bytes: the bullet glyph is multi-byte but one cell wide.
+        let text_at = lines[start]
+            .find("a list item")
+            .expect("marker precedes the text");
+        let marker_cells = display_width(&lines[start][..text_at]);
+        assert!(
+            marker_cells > 0,
+            "markdown emits a bullet marker: {lines:?}"
+        );
+        for line in &lines[start + 1..=tail] {
+            assert!(
+                line.starts_with(&" ".repeat(marker_cells)),
+                "continuation lost the hanging indent: {line:?} in {lines:?}"
+            );
+            assert!(
+                !line.trim_start().starts_with('•'),
+                "the bullet must not repeat on continuations: {line:?}"
+            );
+        }
+    }
+
+    /// A fenced code block's indent is real whitespace and carries the block
+    /// tint; wrapped rows keep it so the block stays a column.
+    #[test]
+    fn wrapped_code_block_rows_keep_their_indent() {
+        let long = format!("let value = \"{}\"; // {WRAP_TAIL}", "x".repeat(30));
+        let source = format!("```rust\n{long}\n```");
+        let (_tx, mut model) = new_model();
+        model.push_entry(EntryRole::Assistant, source);
+        let lines = plain_lines(&model.conversation_text(40));
+        let start = lines
+            .iter()
+            .position(|line| line.contains("let value"))
+            .expect("code line rendered");
+        let tail = lines
+            .iter()
+            .position(|line| line.contains(WRAP_TAIL))
+            .expect("code tail rendered");
+        assert!(tail > start, "the code line must have wrapped: {lines:?}");
+        let indent = lines[start].len() - lines[start].trim_start().len();
+        assert!(indent > 0, "code blocks are indented: {lines:?}");
+        for line in &lines[start + 1..=tail] {
+            assert!(
+                line.starts_with(&" ".repeat(indent)),
+                "code continuation lost its column: {line:?} in {lines:?}"
+            );
+        }
+    }
+
+    /// The render cache stores wrapped lines, so it is width-specific: a
+    /// frame at a new width must re-render every block rather than reuse
+    /// rows wrapped for the old one.
+    #[test]
+    fn render_cache_is_dropped_when_the_body_width_changes() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for i in 0..4 {
+            finish_turn(&mut sim, &format!("message **{i}** body"));
+        }
+        let _ = sim.model().conversation_text(80);
+        assert_eq!(sim.model().render_stats.get(), (4, 0), "cold frame");
+        let _ = sim.model().conversation_text(80);
+        assert_eq!(sim.model().render_stats.get(), (0, 4), "warm frame reuses");
+        let _ = sim.model().conversation_text(120);
+        assert_eq!(
+            sim.model().render_stats.get(),
+            (4, 0),
+            "a width change must invalidate wrapped blocks"
+        );
+        let _ = sim.model().conversation_text(120);
+        assert_eq!(sim.model().render_stats.get(), (0, 4), "then stay warm");
+    }
+
+    /// The body is sliced to the visible window, so a transcript far longer
+    /// than the frame still shows its tail. This is the same arithmetic that
+    /// used to run through a `u16` scroll offset, which saturates past 65535
+    /// rows; the slice has no such ceiling.
+    #[test]
+    fn deep_transcript_still_renders_its_tail() {
+        let (_tx, mut model) = new_model();
+        for i in 0..2000 {
+            model.push_entry(EntryRole::System, format!("line-{i}"));
+        }
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let (width, height) = (40_u16, 12_u16);
+        let rendered = buffer_text(sim.capture_frame(width, height), width, height);
+        assert!(
+            rendered.contains("line-1999"),
+            "tail-follow lost the newest line:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("line-0 "),
+            "the top of the transcript must be scrolled off:\n{rendered}"
+        );
+    }
+
+    /// The scroll math counts wrapped rows: tail-follow must land on the end
+    /// of a long answer, not on the row the unwrapped count pointed at.
+    #[test]
+    fn scroll_total_counts_wrapped_rows() {
+        let (_tx, mut model) = new_model();
+        model.push_entry(EntryRole::Assistant, wrap_probe_paragraph());
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let narrow = sim.model().conversation_text(40).lines().len();
+        let wide = sim.model().conversation_text(240).lines().len();
+        assert!(
+            narrow > wide,
+            "a narrower body must produce more rows: narrow={narrow}, wide={wide}"
+        );
+        let _ = sim.capture_frame(40, 20);
+        assert_eq!(
+            sim.model().rendered_total_lines.get(),
+            narrow,
+            "the frame must record the wrapped total"
+        );
     }
 }
 
