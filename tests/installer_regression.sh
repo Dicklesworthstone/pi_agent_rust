@@ -18,8 +18,17 @@ WORK_ROOT="${INSTALLER_REGRESSION_TMPDIR%/}/pi-installer-regression-$(date -u +%
 
 PASS_COUNT=0
 FAIL_COUNT=0
+SKIP_COUNT=0
 
 mkdir -p "${WORK_ROOT}"
+# Resolve to the physical path. macOS symlinks /var to /private/var, so TMPDIR
+# hands back /var/folders/... while install.sh reports and installs under the
+# resolved /private/var/folders/.... Any test that compares an expected path
+# against installer output then fails on darwin and passes on linux — e.g.
+# test_installer_creates_rpi_alias_when_available asserts
+# "Alias:     installed (rpi -> ${install_bin})". Canonicalising once here
+# fixes every derived path at the source rather than per assertion.
+WORK_ROOT="$(cd "${WORK_ROOT}" && pwd -P)"
 
 usage() {
   cat <<'USAGE'
@@ -628,10 +637,27 @@ run_test() {
   if [ "$status" -eq 0 ]; then
     PASS_COUNT=$((PASS_COUNT + 1))
     echo "[PASS] ${name}"
+  elif [ "$status" -eq 77 ]; then
+    # 77 is the autotools convention for "skipped". Used for cases that can
+    # only be meaningful on one platform, so they report honestly instead of
+    # failing on the others or being silently deleted.
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    echo "[SKIP] ${name}"
   else
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo "[FAIL] ${name}"
   fi
+}
+
+# Report a case as skipped rather than passed or failed. Callers use it as
+# `require_linux || return $?` so the reason is stated once, at the top of the
+# case, next to the condition that makes it platform-specific.
+require_linux() {
+  if [ "$(uname -s)" = "Linux" ]; then
+    return 0
+  fi
+  echo "skipping: requires Linux (running on $(uname -s))" >&2
+  return 77
 }
 
 test_help_lists_installer_flags() {
@@ -1022,6 +1048,10 @@ test_rosetta_prefers_arm64_artifact_naming() {
 
 test_wsl_detection_warning_is_emitted() {
   local dir artifact artifact_url checksum
+  # install.sh only probes for WSL inside `if [ "$OS" = "linux" ]`, so
+  # PI_INSTALLER_TEST_FORCE_WSL is inert on darwin and the warning can never be
+  # emitted there. Forcing this case to "pass" off Linux would assert nothing.
+  require_linux || return $?
   dir="$(case_dir "wsl-detection-warning")"
   write_existing_pi_stub "$dir"
 
@@ -2953,6 +2983,7 @@ main() {
   echo "work dir: ${WORK_ROOT}"
   echo "passed:   ${PASS_COUNT}"
   echo "failed:   ${FAIL_COUNT}"
+  echo "skipped:  ${SKIP_COUNT}"
 
   if [ "${FAIL_COUNT}" -gt 0 ]; then
     exit 1
