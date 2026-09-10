@@ -728,14 +728,20 @@ fn release_publication_never_builds_with_the_registry_token() {
 
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
     let manual_xtrace_disable = manual_lane
         .find("set -euo pipefail\nset +x\numask 077")
         .expect("manual lane must disable shell tracing before reading the registry token");
@@ -932,14 +938,20 @@ fn manual_release_token_handoff_is_not_argv_and_propagates_publish_failure() {
     const FAKE_TOKEN: &str = "fake release token +=:_[]/7391";
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
     let helper_start = manual_lane
         .find("   publish_exact_crate_with_scoped_token() {")
         .expect("manual release must define the scoped-token helper");
@@ -1128,14 +1140,20 @@ fn manual_release_reconciliation_binds_durable_identity_and_live_asset_bytes() {
 fn manual_release_lane_is_actions_independent_and_preserves_ambiguous_crates_state() {
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
 
     for forbidden in [
         "/actions/",
@@ -1409,14 +1427,20 @@ fn manual_release_lane_is_actions_independent_and_preserves_ambiguous_crates_sta
 fn manual_release_controller_preamble_rejects_dispatch_shadowing() {
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
     let preamble = manual_lane
         .split_once("```bash\n")
         .map(|(_, suffix)| suffix)
@@ -1475,14 +1499,20 @@ fn manual_release_controller_preamble_rejects_dispatch_shadowing() {
 fn manual_release_retries_use_fresh_attempts_and_exact_success_receipts() {
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
 
     for rooted_path in [
         "MANUAL_RELEASE_STATE_DIR=\"$MANUAL_RELEASE_ROOT/state\"",
@@ -2707,6 +2737,16 @@ fn failure_count_within_release_threshold() {
     );
 }
 
+// docs/releasing.md headings that bound the retired manual release procedure.
+// Five tests split the runbook on these to assert the lane's secret hygiene, and
+// they are named here rather than inlined five times because that is exactly how
+// they broke: bb6d151c1 renamed the opening heading from "## Manual DSR lane (no
+// GitHub Actions)" to the text below, `split_once` started returning None, and
+// all five failed with "must have stable section boundaries" while the content
+// they guard was untouched. One constant means the next rename breaks in one
+// place.
+const MANUAL_RELEASE_LANE_HEADING: &str = "## Historical manual no-Actions procedure (retired)";
+const MANUAL_RELEASE_LANE_END_HEADING: &str = "## Pre-release flow (rc)";
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
 const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
     "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6";
