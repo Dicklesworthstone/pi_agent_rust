@@ -3,13 +3,13 @@
   "generated": "2026-02-05",
   "description": "Static scan of extension corpus entry points (bd-2u2s)",
   "summary": {
-    "total_files": 1349,
-    "entry_points": 391,
-    "sub_modules": 841,
-    "non_extensions": 111,
+    "total_files": 1369,
+    "entry_points": 392,
+    "sub_modules": 851,
+    "non_extensions": 120,
     "unknown": 6,
     "by_confidence": {
-      "high": 1245,
+      "high": 1265,
       "low": 14,
       "medium": 90
     },
@@ -40,9 +40,9 @@
         "sub_modules": 6
       },
       "third-party-github": {
-        "total_files": 509,
-        "entry_points": 100,
-        "sub_modules": 356
+        "total_files": 529,
+        "entry_points": 101,
+        "sub_modules": 366
       }
     }
   },
@@ -10791,6 +10791,151 @@
         "event_hook",
         "ui_api"
       ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/index.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/compact-client.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/config.test.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/config.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/debug.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/details-store.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/extension-runtime.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_type",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/native-fallback.test.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/native-fallback.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/payload-rewrite.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/request-context-cache.test.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/request-context-cache.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/runtime.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/serializer.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/supported-environment.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/types.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/unit.test.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/src/validation.test.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/test/pi-smoke.test.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/test/runtime.test.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
     },
     {
       "path": "third-party/lsj5031-pi-notification-extension/notification.ts",
