@@ -21,8 +21,25 @@ use std::fs::OpenOptions;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// Patience budgets for the tmux-driven FTUI lane.
+///
+/// These drive a real `pi` inside a real tmux pane and poll the pane's contents
+/// until the expected text appears, so every wait here is bounded by how fast
+/// the machine can start a process, render a frame, and let tmux report it.
+///
+/// They were 30 and 15 seconds. That is comfortable on an idle worker and not
+/// comfortable in a full lane: `e2e_ftui_wheel_scroll_inside_tmux` failed once
+/// during the ftui 0.7 bump with "wheel-up did not scroll the conversation",
+/// and the run that failed took 117.73 seconds for this binary against roughly
+/// 12 to 14 seconds for two runs that passed — the same suite, the same commit,
+/// a busier machine. Read literally, a 15 second budget on a worker running an
+/// order of magnitude slow is about a second and a half of effective time.
+///
+/// Raising them costs nothing when things are healthy, because
+/// `wait_for_pane_contains` returns as soon as the pane matches and the budget
+/// is only ever spent on the way to a failure.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Serialize against every other tmux-based E2E lane (same lock file as
 /// tests/e2e_tui.rs — cross-process via fs4, in-process via a static mutex).
