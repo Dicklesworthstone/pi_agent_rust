@@ -2220,9 +2220,31 @@ mod tests {
         assert!(paths.is_empty());
     }
 
+    /// Walking a directory that is not there yields exactly one error entry.
+    ///
+    /// This used to point at the literal path `/nonexistent/path`, which is a
+    /// bet that no other process on the machine ever creates it. That bet lost:
+    /// the full test lane failed here on rch worker vmi1227854, where
+    /// `/nonexistent/path` is a real, empty directory dated 2026-09-04 —
+    /// something on that host took a `/nonexistent` HOME or similar literally
+    /// and made it. `walk_sessions` then found a perfectly good empty directory,
+    /// returned no entries, and the test failed for a reason that had nothing to
+    /// do with this code.
+    ///
+    /// Deriving the path from a temp directory we own removes the bet: the
+    /// parent exists because the harness made it, and the child does not
+    /// because nothing creates it.
     #[test]
     fn walk_sessions_nonexistent_dir() {
-        let paths = walk_sessions(Path::new("/nonexistent/path"));
+        let harness = TestHarness::new("walk_sessions_nonexistent_dir");
+        let missing = harness.temp_path("sessions").join("definitely-not-created");
+        assert!(
+            !missing.exists(),
+            "the fixture must name a path that does not exist: {}",
+            missing.display()
+        );
+
+        let paths = walk_sessions(&missing);
         assert_eq!(paths.len(), 1);
         assert!(paths[0].is_err());
     }
