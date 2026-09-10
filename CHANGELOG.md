@@ -182,6 +182,22 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Fixed
 
+- **`ftui` clipped long answer lines instead of wrapping them** (gh
+  [#227](https://github.com/Dicklesworthstone/pi_agent_rust/issues/227)):
+  the conversation body is one `Paragraph`, and ftui's paragraph defaults to
+  `WrapMode::None`, which stops drawing each line at the right edge of the
+  region. Any answer line longer than the terminal was truncated mid-word
+  with no indication, and the markdown renderer could not compensate because
+  it takes no text width. The body is now wrapped in `conversation_text`
+  (word wrap with a grapheme fallback, so unbroken URLs hard-break and
+  wide characters are measured in cells), with a hanging indent that keeps
+  wrapped list items and fenced code in their column. Two width bugs fell
+  out of it: the table budget and the render cache read `self.term`, which
+  the first frame has not yet received a resize for, and the tail-follow
+  scroll went through a `u16` offset that saturates past 65535 rows — both
+  now use the frame's own body width, and the body is sliced to the visible
+  window. The bubbletea stack was never affected; it wraps explicitly.
+
 - **`read` returned empty content for every file on Windows** (gh
   [#182](https://github.com/Dicklesworthstone/pi_agent_rust/issues/182)):
   `ReadTool` opens a file once and clones the handle to fingerprint it for
