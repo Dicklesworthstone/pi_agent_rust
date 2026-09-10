@@ -12035,11 +12035,10 @@ fn orchestrate_phase1_matrix_rejects_synthetic_seed_rows_as_release_evidence() {
 /// valid cell remains", and asserting `computed` here would be asserting
 /// something the fixture never had.
 ///
-/// What that leaves untested, and it is a real gap rather than an oversight:
-/// nothing here proves that a REAL matrix with two passing cells and one
-/// dropped stage still yields `computed`. That case needs a fixture with
-/// complete primary data, or a validator-level unit case exercising the
-/// attribution directly. Tracked on bd-b3yao.4.
+/// The computed path is covered separately, because the stub cannot reach it:
+/// `orchestrate_weighted_attribution_computes_with_two_pass_cells_and_one_dropped_stage`
+/// drives the real attribution function on a matrix that does have two passing
+/// cells, and asserts `computed` there.
 #[cfg(unix)]
 #[test]
 fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
@@ -12182,6 +12181,256 @@ fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
     );
 
     let _ = fs::remove_dir_all(temp_root);
+}
+
+/// Lift a top-level `def NAME(...)` block out of `scripts/perf/orchestrate.sh`.
+///
+/// The Phase 1 weighted attribution is Python embedded in a heredoc inside the
+/// orchestration script, so a Rust test cannot call it without either running
+/// the whole script or copying the logic. Copying would be the worst of the
+/// three: the copy would keep passing after the original drifted. Extracting
+/// the real source text and running that keeps the test bound to what ships.
+///
+/// A signature can span several lines and close with `) -> dict:` at column
+/// zero, so the scan walks until the parentheses balance before looking for the
+/// end of the body, which is the next non-blank line at column zero.
+#[cfg(unix)]
+fn extract_python_function(script: &str, name: &str) -> String {
+    let header = format!("def {name}(");
+    let lines: Vec<&str> = script.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with(&header))
+        .unwrap_or_else(|| {
+            panic!("scripts/perf/orchestrate.sh must define `{header}...` at column zero")
+        });
+
+    let mut depth: i64 = 0;
+    let mut signature_end = start;
+    for (offset, line) in lines[start..].iter().enumerate() {
+        depth += i64::try_from(line.matches('(').count()).expect("paren count fits i64");
+        depth -= i64::try_from(line.matches(')').count()).expect("paren count fits i64");
+        if depth == 0 {
+            signature_end = start + offset;
+            break;
+        }
+    }
+
+    let end = lines[signature_end + 1..]
+        .iter()
+        .position(|line| !line.is_empty() && !line.starts_with(char::is_whitespace))
+        .map_or(lines.len(), |offset| signature_end + 1 + offset);
+    lines[start..end].join("\n")
+}
+
+/// Run an extracted-Python driver against a JSON request on stdin and parse the
+/// JSON it prints.
+#[cfg(unix)]
+fn run_extracted_python(driver: &str, request: &Value) -> Value {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(driver)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn python3 to drive the extracted attribution function");
+    child
+        .stdin
+        .as_mut()
+        .expect("python3 stdin")
+        .write_all(request.to_string().as_bytes())
+        .expect("write attribution request");
+    let output = child.wait_with_output().expect("await python3");
+    assert!(
+        output.status.success(),
+        "extracted attribution driver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse attribution result")
+}
+
+/// A real matrix with two passing cells, one of which lost a stage sample,
+/// still yields `status == "computed"` (bd-b3yao.4, second acceptance item).
+///
+/// This is the companion to
+/// `orchestrate_phase1_matrix_treats_missing_index_as_incomplete`, which
+/// documents why the stub toolchain cannot express this case: no stub cell has
+/// complete `primary_e2e` data, so dropping `index_ms` leaves zero passing
+/// cells and `missing` is the honest answer there. The consequence was that
+/// nothing exercised the computed path at all. This closes that gap by driving
+/// `compute_weighted_bottleneck_attribution` on a matrix that does have two
+/// passing cells.
+///
+/// Both directions come from the same fixture so the boundary between them is
+/// explicit: two passing cells give `computed`, and flipping their status away
+/// from `pass` gives `missing` with `no_pass_cells_with_stage_totals`.
+#[cfg(unix)]
+#[test]
+fn orchestrate_weighted_attribution_computes_with_two_pass_cells_and_one_dropped_stage() {
+    let script_path = project_root().join("scripts/perf/orchestrate.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
+
+    let driver = format!(
+        "import json, re, sys\n\n\
+         {parse_float}\n\n\
+         {parse_int}\n\n\
+         {compute}\n\n\
+         request = json.load(sys.stdin)\n\
+         print(json.dumps(compute_weighted_bottleneck_attribution(\n    \
+         request[\"cells\"],\n    request[\"stage_keys\"],\n    request[\"scales\"],\n    \
+         request[\"partitions\"],\n)))\n",
+        parse_float = extract_python_function(&script, "parse_float"),
+        parse_int = extract_python_function(&script, "parse_int"),
+        compute = extract_python_function(&script, "compute_weighted_bottleneck_attribution"),
+    );
+
+    // Two cells at the same scale, both passing, on the two required
+    // partitions. The `long_session` cell is missing `index_ms` — the same drop
+    // that `PI_FAKE_DROP_INDEX_STAGE_SAMPLE` performs — and its
+    // `total_stage_ms` is the sum of the stages it still has, which is how
+    // orchestrate.sh derives that field upstream.
+    let request = json!({
+        "cells": [
+            {
+                "scenario_id": "short_session/session_64",
+                "workload_partition": "short_session",
+                "session_messages": 64,
+                "status": "pass",
+                "stage_attribution": {
+                    "open_ms": 10.0,
+                    "append_ms": 20.0,
+                    "save_ms": 30.0,
+                    "index_ms": 40.0,
+                    "total_stage_ms": 100.0,
+                },
+            },
+            {
+                "scenario_id": "long_session/session_64",
+                "workload_partition": "long_session",
+                "session_messages": 64,
+                "status": "pass",
+                "stage_attribution": {
+                    "open_ms": 30.0,
+                    "append_ms": 30.0,
+                    "save_ms": 40.0,
+                    "index_ms": null,
+                    "total_stage_ms": 100.0,
+                },
+                "missing_reasons": ["missing_stage_metrics:index_ms"],
+            },
+        ],
+        "stage_keys": ["open_ms", "append_ms", "save_ms", "index_ms"],
+        "scales": [64],
+        "partitions": ["short_session", "long_session"],
+    });
+
+    let computed = run_extracted_python(&driver, &request);
+
+    assert_eq!(
+        computed["status"].as_str(),
+        Some("computed"),
+        "two passing cells with positive stage totals must compute an attribution even when one lost a stage: {computed}"
+    );
+    assert_eq!(
+        computed["schema"].as_str(),
+        Some("pi.perf.phase1_weighted_bottleneck_attribution.v1")
+    );
+    assert_eq!(
+        computed["lineage"]["valid_cell_count"].as_u64(),
+        Some(2),
+        "the cell that lost index_ms is still valid: it passed and its remaining stages sum above zero"
+    );
+    assert!(
+        computed["reason"].is_null(),
+        "a computed attribution carries no missing-reason"
+    );
+
+    let ranking = computed["global_ranking"]
+        .as_array()
+        .expect("global_ranking array");
+    let index_row = ranking
+        .iter()
+        .find(|row| row["stage"].as_str() == Some("index_ms"))
+        .expect("index_ms must still be ranked");
+    assert_eq!(
+        index_row["sample_size"].as_u64(),
+        Some(1),
+        "index_ms was observed in exactly one of the two cells"
+    );
+    assert_eq!(
+        index_row["weighted_stage_ms"].as_f64(),
+        Some(40.0 * 64.0),
+        "the surviving index_ms sample is weighted by that cell's session_messages"
+    );
+    let save_row = ranking
+        .iter()
+        .find(|row| row["stage"].as_str() == Some("save_ms"))
+        .expect("save_ms must be ranked");
+    assert_eq!(
+        save_row["sample_size"].as_u64(),
+        Some(2),
+        "save_ms was observed in both cells"
+    );
+    assert_eq!(
+        save_row["weighted_contribution_pct"].as_f64(),
+        Some(35.0),
+        "save_ms carries 70 of the 200 weighted stage-milliseconds across both cells"
+    );
+    assert_eq!(
+        ranking
+            .first()
+            .and_then(|row| row["stage"].as_str()),
+        Some("save_ms"),
+        "the ranking is sorted by weighted contribution, heaviest first"
+    );
+
+    let partitions = computed["per_scale"][0]["partitions"]
+        .as_array()
+        .expect("per_scale partitions");
+    assert_eq!(partitions.len(), 2);
+    for partition in partitions {
+        assert_eq!(
+            partition["present"].as_bool(),
+            Some(true),
+            "both required partitions have a passing cell at this scale: {partition}"
+        );
+    }
+    let long_session = partitions
+        .iter()
+        .find(|row| row["workload_partition"].as_str() == Some("long_session"))
+        .expect("long_session partition row");
+    assert!(
+        long_session["stage_pct"]["index_ms"].is_null(),
+        "the dropped stage has no share in the cell that lost it"
+    );
+    assert_eq!(
+        long_session["stage_pct"]["save_ms"].as_f64(),
+        Some(40.0),
+        "the stages that survived are still a percentage of that cell's own total"
+    );
+
+    // Negative control from the same fixture: with no passing cell the function
+    // falls to `missing`, which is what the stub toolchain actually hits.
+    let mut no_pass = request.clone();
+    for cell in no_pass["cells"].as_array_mut().expect("cells array") {
+        cell["status"] = json!("fail");
+    }
+    let missing = run_extracted_python(&driver, &no_pass);
+    assert_eq!(
+        missing["status"].as_str(),
+        Some("missing"),
+        "without a passing cell the attribution must be missing: {missing}"
+    );
+    assert_eq!(
+        missing["reason"].as_str(),
+        Some("no_pass_cells_with_stage_totals")
+    );
+    assert_eq!(missing["lineage"]["valid_cell_count"].as_u64(), Some(0));
 }
 
 #[cfg(unix)]
