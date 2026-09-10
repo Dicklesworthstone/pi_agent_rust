@@ -61,7 +61,30 @@ case_dir() {
   local name="$1"
   local dir="${WORK_ROOT}/${name}"
   mkdir -p "$dir/home" "$dir/state" "$dir/data" "$dir/config" "$dir/dest" "$dir/fixtures" "$dir/fakebin"
+  provide_host_xz "$dir"
   printf '%s\n' "$dir"
+}
+
+# Make an `xz` visible inside the case sandbox when the host has one.
+#
+# Cases run with PATH restricted to "<case>/fakebin:/usr/bin:/bin", and
+# install.sh checks `command -v xz` before extracting a .tar.xz. Linux ships xz
+# in /usr/bin so the restricted PATH finds it; macOS does not, and Homebrew's
+# copy in /opt/homebrew/bin is outside that PATH. Eight cases build .tar.xz
+# fixtures, so without this the suite tests a different code path on each
+# platform. Linking the host binary keeps the sandbox restricted while giving
+# the installer the tool it legitimately requires. If the host has no xz at all
+# the link is simply absent and the affected cases fail with install.sh's own
+# "xz is not available" message, which is the honest outcome.
+provide_host_xz() {
+  local dir="$1" host_xz
+  if [ -x /usr/bin/xz ] || [ -x /bin/xz ]; then
+    return 0
+  fi
+  host_xz="$(command -v xz 2>/dev/null || true)"
+  if [ -n "$host_xz" ]; then
+    ln -sf "$host_xz" "${dir}/fakebin/xz"
+  fi
 }
 
 write_existing_pi_stub() {

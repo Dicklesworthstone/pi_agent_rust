@@ -161,6 +161,29 @@ run_with_spinner() {
   fi
 }
 
+# BSD mktemp, which is what macOS ships, ignores TMPDIR unless it is handed an
+# explicit template (or -t); GNU mktemp honours TMPDIR on its own. With a bare
+# `mktemp -d` the installer scratch therefore always landed in the system temp
+# directory on macOS, so a caller-supplied TMPDIR — and PI_INSTALLER_RETAIN_TEMP
+# with it — was silently ignored there while working on Linux. Always pass a
+# template rooted at TMPDIR so both platforms agree.
+installer_tmp_root() {
+  local root="${TMPDIR:-/tmp}"
+  root="${root%/}"
+  if [ -z "$root" ]; then
+    root="/tmp"
+  fi
+  printf '%s' "$root"
+}
+
+installer_mktemp_file() {
+  mktemp "$(installer_tmp_root)/pi-install.XXXXXXXX"
+}
+
+installer_mktemp_dir() {
+  mktemp -d "$(installer_tmp_root)/pi-install.XXXXXXXX"
+}
+
 version_timeout_cmd() {
   if command -v timeout >/dev/null 2>&1; then
     printf '%s\n' "timeout"
@@ -193,13 +216,13 @@ run_command_with_timeout_capture() {
   fi
 
   local out_file=""
-  out_file="$(mktemp 2>/dev/null || true)"
+  out_file="$(installer_mktemp_file 2>/dev/null || true)"
   if [ -z "$out_file" ]; then
     return 125
   fi
 
   local timed_out_file=""
-  timed_out_file="$(mktemp 2>/dev/null || true)"
+  timed_out_file="$(installer_mktemp_file 2>/dev/null || true)"
   if [ -z "$timed_out_file" ]; then
     rm -f "$out_file" 2>/dev/null || true
     return 125
@@ -262,13 +285,13 @@ run_bounded_stderr_capture() {
   : > "$err_file"
 
   local out_file=""
-  out_file="$(mktemp 2>/dev/null || true)"
+  out_file="$(installer_mktemp_file 2>/dev/null || true)"
   if [ -z "$out_file" ]; then
     return 125
   fi
 
   local timed_out_file=""
-  timed_out_file="$(mktemp 2>/dev/null || true)"
+  timed_out_file="$(installer_mktemp_file 2>/dev/null || true)"
   if [ -z "$timed_out_file" ]; then
     rm -f "$out_file" 2>/dev/null || true
     return 125
@@ -3496,7 +3519,7 @@ install_agent_skills() {
         fi
         prev_ref="$ref"
         local downloaded_dir=""
-        downloaded_dir="$(mktemp -d 2>/dev/null || true)"
+        downloaded_dir="$(installer_mktemp_dir 2>/dev/null || true)"
         if [ -z "$downloaded_dir" ] || [ ! -d "$downloaded_dir" ]; then
           break
         fi
@@ -3512,7 +3535,7 @@ install_agent_skills() {
 
     if [ -z "$source_path" ]; then
       local inline_skill_dir=""
-      inline_skill_dir="$(mktemp -d 2>/dev/null || true)"
+      inline_skill_dir="$(installer_mktemp_dir 2>/dev/null || true)"
       if [ -z "$inline_skill_dir" ] || [ ! -d "$inline_skill_dir" ]; then
         AGENT_SKILL_STATUS="failed (temp dir error)"
         warn "Failed to prepare inline agent skill directory"
@@ -3775,7 +3798,7 @@ main() {
   fi
 
   acquire_lock
-  TMP=$(mktemp -d)
+  TMP=$(installer_mktemp_dir)
 
   local source_bin=""
   if [ "$FROM_SOURCE" -eq 1 ]; then
