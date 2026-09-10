@@ -8073,3 +8073,91 @@ fn artifact_age_hours_accepts_fresh_embedded_timestamp_with_old_mtime() {
         "expected fresh artifact to pass contract evaluation"
     );
 }
+
+/// The PiJS regression gate must refuse records shaped like the checked-in
+/// synthetic artifact (bd-tool-call-throughput-canonical-o3ubk).
+///
+/// Why this exists, since a test that asserts a rejection is easy to write for
+/// the wrong reason. `tests/perf/reports/pijs_workload_perf.jsonl` holds 20,000
+/// records that all carry `"binary_profile": "synthetic_stub"` and
+/// `"source_dirty": true`, and the two tool-call budgets report
+/// `missing_measurement_data` because the harness never looks in that
+/// directory. The tempting fix is to point the harness at the file or to relax
+/// the eligibility filter, and either would turn a fail-closed gate green on
+/// the strength of a stub: those records would claim a mean tool-call latency of
+/// 0.203 us against a 200 us budget and 697,643 calls/sec against a 5,000
+/// minimum.
+///
+/// So the gate's refusal is the behaviour under test, not the bug. These two
+/// cases pin it at the exact failure messages, so relaxing the filter to make
+/// the budgets pass breaks them loudly.
+#[test]
+fn pijs_gate_refuses_synthetic_stub_records() {
+    // Exactly the field set of the checked-in artifact: ten keys, no
+    // eligibility flag, no lane size, no build provenance.
+    let stub = |tool_name: &str, latency_us: f64, throughput: f64| {
+        json!({
+            "embedded_timestamp": "2026-08-28T09:17:30.813786+00:00",
+            "source_commit": "e178a73d4145c25f09c845e65a8385a3684d7920",
+            "source_dirty": true,
+            "run_id": "pijs-20260828T091730Z",
+            "correlation_id": "pijs-20260828T091730Z",
+            "iteration": 0,
+            "tool_name": tool_name,
+            "latency_us": latency_us,
+            "throughput_calls_per_sec": throughput,
+            "binary_profile": "synthetic_stub",
+        })
+    };
+    let events = vec![stub("read", 1.083, 236_451.022), stub("bash", 0.125, 4_991.0)];
+
+    let error = validate_pijs_gate_pair(&events, max_artifact_age_hours())
+        .expect_err("synthetic stub records must not satisfy the PiJS regression gate");
+    assert!(
+        error.contains("requires exactly two eligible records"),
+        "rejection must name the eligibility requirement, got: {error}"
+    );
+    assert!(
+        error.contains("observed 0"),
+        "no stub record carries eligible_for_regression_gate, so none is admitted; got: {error}"
+    );
+}
+
+/// Marking stub records eligible is still not enough (bd-tool-call-throughput-canonical-o3ubk).
+///
+/// The companion to the case above, and the one that matters more: someone
+/// looking at that failure could reasonably conclude the producer just forgot a
+/// flag. It did not. The gate cross-checks the 1-call and 10-call lanes on
+/// binary_path, binary_sha256, build_fingerprint_contract, config_hash,
+/// compiled_profile_family, compiled_opt_level, compiled_debug,
+/// allocator_requested and allocator_effective, and derives its metrics from
+/// total_calls / elapsed_us / per_call_us rather than trusting a reported
+/// latency. The synthetic records carry none of that, so adding the flag moves
+/// the failure rather than fixing it.
+#[test]
+fn pijs_gate_refuses_stub_records_even_when_marked_eligible() {
+    let stub = |tool_calls: u64| {
+        json!({
+            "embedded_timestamp": "2026-08-28T09:17:30.813786+00:00",
+            "source_commit": "e178a73d4145c25f09c845e65a8385a3684d7920",
+            "source_dirty": true,
+            "run_id": "pijs-20260828T091730Z",
+            "correlation_id": "pijs-20260828T091730Z",
+            "iteration": 0,
+            "tool_name": "read",
+            "latency_us": 1.083,
+            "throughput_calls_per_sec": 236_451.022,
+            "binary_profile": "synthetic_stub",
+            "eligible_for_regression_gate": true,
+            "tool_calls_per_iteration": tool_calls,
+        })
+    };
+    let events = vec![stub(1), stub(10)];
+
+    let error = validate_pijs_gate_pair(&events, max_artifact_age_hours())
+        .expect_err("an eligibility flag must not admit records with no build provenance");
+    assert!(
+        !error.contains("observed 0"),
+        "the flag should get these records as far as per-record validation; got: {error}"
+    );
+}
