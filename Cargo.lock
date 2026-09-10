@@ -2635,10 +2635,11 @@ dependencies = [
 
 [[package]]
 name = "ftui"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3291fa66fe476dd0cd19c3d54689ab9e834b56ffc7ac9c8d5081a796bc3f364e"
+checksum = "ae0ca9943323b42c8a7392ac3370632639e9d673acc767776571da597192bd26"
 dependencies = [
+ "ftui-a11y",
  "ftui-core",
  "ftui-layout",
  "ftui-render",
@@ -2650,9 +2651,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-a11y"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5953c62962a9c2db4015d827e84577d4343883f39fee9aacbaa095a1cea8d5e"
+checksum = "6bbe410badb72667a24b7eed7849330405c51b45c60eb9ac244a04b899da9cdf"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -2660,9 +2661,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "067165cc0a293978457fa75aabe8ff1d5bb15bcd46f12b2f72c2c3da03a7e8d8"
+checksum = "5c6bc3324b762ec301814aed4029fd682b983901917e8173a5f6af32a51ffcba"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2670,9 +2671,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7a9484364b0e5e3992517c17404b630a7bd403475dfecc5b4da0bc36d4e1d87"
+checksum = "87fc55a9f0b062eb7e00f3b1b7b0cbbdfa22016fde90ebd23535ac6e86e92558"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2690,9 +2691,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-extras"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6751fd7fe88d1743e024a4014688746506ea9b9c85727d19166081eeed1b7e6"
+checksum = "3dd6699670e2b9707e2c29c1407e51c6cf7b77d0ef16880179742d9721eddfab"
 dependencies = [
  "ftui-render",
  "ftui-style",
@@ -2705,15 +2706,15 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7874722a0ce160fc3bcf6e07bd2dc88969fd4affd5bb96f9402607a8e3ec8404"
+checksum = "77be7485365ce0a870b21bb2e52f687dbe38f1f3523430101b892d8425bd4ac6"
 
 [[package]]
 name = "ftui-layout"
-version = "0.5.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e133cdfeea98af75e7f6f386d2f7e2f0e36e81132d4d0bbd0f826ac5a49fb838"
+checksum = "e7fe06a4d5e9806e0c7142d64b1d737f561d138bc63ef33b2f729930f805cbf0"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2724,13 +2725,14 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f89c71ce0d4d84758aa18183e890e833882436dab571c717b9e0a909b99b6fd"
+checksum = "458cb5599f6bf6871bc27016da4aabba2f8aaa4d57f3eeb42008a0bd8b3c497b"
 dependencies = [
  "ahash",
  "bitflags 2.13.1",
  "bumpalo",
+ "ftui-a11y",
  "ftui-core",
  "memchr",
  "smallvec",
@@ -2740,11 +2742,12 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca69e9ca3059fc54a536f11eb40caa9ef78123c0318f800e9aac673d48839ae8"
+checksum = "1afa014b5a30e34a7c7cb69aa9b45ab6b97745410462deee8c96918419fd3811"
 dependencies = [
  "arc-swap",
+ "ftui-a11y",
  "ftui-backend",
  "ftui-core",
  "ftui-i18n",
@@ -2760,9 +2763,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90daee8258f778332e7b54be899fa06f2bdb2c1e498156b20a01202772371f00"
+checksum = "d482787e47dad74133369144a77563e9ca1598f943c171cb5d9255d090f37556"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2772,9 +2775,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ece5d8ed10603bf7814d43867a7a4ae7ddbe15569c7d5c3e6f11b9fd97db678e"
+checksum = "6fa3626e73c76e14e9dd70482e0bffbfbec30efec6d8e3eaf03f401ebf9a0277"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2791,9 +2794,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "394213c80bd5ee3fbac49547ec178389e13afb36c74fee41cb79ba008bd98904"
+checksum = "178db13fa4d3dced1cef8bf0e0c2bbe88b375f561001112426250b551e4ddc1a"
 dependencies = [
  "ahash",
  "bitflags 2.13.1",
