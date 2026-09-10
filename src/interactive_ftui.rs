@@ -4547,6 +4547,11 @@ async fn create_driver_session(
     let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
     session_options.extension_ui_handler =
         Some(Arc::clone(&ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
+    // The driver runtime is what extension observation events are dispatched
+    // onto. Without it the SDK builds a coalescer that can never fire and
+    // extensions on this stack see lifecycle events and nothing else
+    // (bd-82331).
+    session_options.runtime_handle = Some(runtime_handle.clone());
     spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, runtime_handle);
     match crate::sdk::create_agent_session(session_options).await {
         Ok(handle) => Some((handle, ext_handler)),

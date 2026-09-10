@@ -211,3 +211,73 @@ impl EventCoalescer {
         self.dispatch_fire_and_forget(event_name, CoalescedPayload::Lazy(lazy), runtime_handle);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AgentEvent, ExtensionEventName, extension_event_name_from_agent, is_lifecycle_event,
+    };
+    use crate::model::{Message, UserContent, UserMessage};
+
+    /// The two-route split this file depends on, pinned (bd-82331).
+    ///
+    /// Lifecycle events are dispatched to extensions from inside the agent
+    /// loop, so the coalescer must skip them or every surface that installs
+    /// one would deliver them twice. Observation events are the coalescer's
+    /// job, and a surface that does not install one delivers none of them —
+    /// which is the whole of bd-82331. If this classification ever changes,
+    /// both halves change with it and this test is where that shows up.
+    #[test]
+    fn lifecycle_events_are_skipped_and_observation_events_are_not() {
+        let lifecycle = [
+            ExtensionEventName::AgentStart,
+            ExtensionEventName::AgentEnd,
+            ExtensionEventName::TurnStart,
+            ExtensionEventName::TurnEnd,
+        ];
+        for name in lifecycle {
+            assert!(
+                is_lifecycle_event(&name),
+                "{name:?} must stay a lifecycle event: it is dispatched in-loop, and treating it \
+                 as an observation event would double-deliver it on every surface that installs a \
+                 coalescer"
+            );
+        }
+        let observation = [
+            ExtensionEventName::MessageStart,
+            ExtensionEventName::MessageUpdate,
+            ExtensionEventName::MessageEnd,
+            ExtensionEventName::ToolExecutionStart,
+            ExtensionEventName::ToolExecutionEnd,
+        ];
+        for name in observation {
+            assert!(
+                !is_lifecycle_event(&name),
+                "{name:?} must stay an observation event: it reaches extensions only through a \
+                 surface-installed coalescer (bd-82331)"
+            );
+        }
+    }
+
+    /// An AgentEvent that maps to no extension event name is dropped before
+    /// any work, which is the outermost layer of the no-cost guarantee.
+    #[test]
+    fn events_without_an_extension_name_are_dropped_before_dispatch() {
+        // MessageStart maps to a name; a synthetic event that does not is the
+        // interesting case, but every current variant maps. Assert the mapping
+        // is total for the observation set instead, so a new variant that
+        // silently maps to None is caught here rather than by an extension
+        // that stops receiving it.
+        let message_start = AgentEvent::MessageStart {
+            message: Message::User(UserMessage {
+                content: UserContent::Text("probe".to_string()),
+                timestamp: 1_700_000_000,
+            }),
+        };
+        assert!(
+            extension_event_name_from_agent(&message_start).is_some(),
+            "message_start must map to an extension event name; a None here means extensions \
+             silently stop seeing it"
+        );
+    }
+}

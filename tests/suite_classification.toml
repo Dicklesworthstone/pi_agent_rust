@@ -16,6 +16,7 @@ files = [
     "agent_tools_coverage",
     "algorithms",
     "ast_tools",
+    "extension_event_routing",
     "lsp",
     "mcp",
     "debug",

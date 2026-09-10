@@ -12075,6 +12075,20 @@ impl AgentSession {
         self
     }
 
+    /// The runtime this session dispatches background work on, when one was
+    /// installed by [`Self::with_runtime_handle`].
+    ///
+    /// Exposed for surfaces that need to route agent events to extensions:
+    /// `EventCoalescer::dispatch_agent_event_lazy` spawns onto a runtime, and
+    /// a surface holding only an `AgentSession` had no way to reach one. See
+    /// bd-82331, where the default interactive stack silently delivered no
+    /// observation events to extensions because its event path could not build
+    /// a coalescer.
+    #[must_use]
+    pub const fn runtime_handle(&self) -> Option<&RuntimeHandle> {
+        self.runtime_handle.as_ref()
+    }
+
     #[must_use]
     pub fn with_model_registry(mut self, registry: ModelRegistry) -> Self {
         self.set_model_registry(registry);

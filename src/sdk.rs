@@ -337,6 +337,17 @@ pub struct SessionOptions {
     /// the single connect-and-mount pass. This avoids cross-wiring tools from
     /// a different, already-dropped session (bd-vjfol).
     pub mcp: Option<McpSessionOptions>,
+    /// Runtime this session dispatches background work on.
+    ///
+    /// Required for extension observation events to reach extensions at all:
+    /// `EventCoalescer` spawns its batched dispatch onto a runtime, so without
+    /// a handle the SDK path can build a coalescer that never fires. That was
+    /// bd-82331 — the default interactive stack delivered lifecycle events and
+    /// nothing else, silently, because no surface on this path supplied one.
+    ///
+    /// A caller that omits it gets a debug line saying observation events will
+    /// not be routed, rather than the previous silence.
+    pub runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
 
     /// Optional factory for the session's [`ToolRegistry`].
     ///
@@ -459,6 +470,7 @@ impl Default for SessionOptions {
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             mcp: None,
+            runtime_handle: None,
             on_event: None,
             on_tool_start: None,
             on_tool_end: None,
@@ -1998,6 +2010,32 @@ impl AgentSessionHandle {
         per_prompt: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
         let listeners = self.listeners.clone();
+        // Extension observation events (bd-82331). Lifecycle events reach
+        // extensions from inside the agent loop, but message_* and
+        // tool_execution_* only arrive if the surface routes them through a
+        // coalescer. Print, RPC and the classic stack each install one; this
+        // path did not, so every extension running under the default
+        // interactive stack — which is the SDK path since v0.4.0 — silently
+        // observed nothing.
+        //
+        // Installing it here rather than in `interactive_ftui` is deliberate:
+        // this is the single fan-out point every SDK event travels through, so
+        // a future SDK-based surface inherits the routing instead of having to
+        // remember it.
+        let coalescer = self
+            .extension_manager()
+            .map(|manager| crate::extensions::EventCoalescer::new(manager.clone()));
+        let event_runtime = self.session.runtime_handle().cloned();
+        if coalescer.is_some() && event_runtime.is_none() {
+            // Nothing to spawn onto: the routing cannot work and would fail
+            // silently, which is the exact shape of the bug this fixes. Say so
+            // once rather than pretend the events were delivered.
+            tracing::debug!(
+                target: "pi::sdk",
+                "extensions are loaded but this session has no runtime handle; \
+                 message and tool-execution events will not reach them"
+            );
+        }
         move |event: AgentEvent| {
             // Typed tool hooks — fire before generic listeners.
             match &event {
@@ -2031,6 +2069,15 @@ impl AgentSessionHandle {
 
             // Session-level generic subscribers.
             listeners.notify(&event);
+
+            // Extension observation events, batched with lazy serialization.
+            // The coalescer skips lifecycle events (already dispatched
+            // in-loop) and returns before serializing when no extension has a
+            // hook for this event kind, so a session whose extensions
+            // subscribe to nothing pays nothing here (bd-82331).
+            if let (Some(coal), Some(runtime)) = (coalescer.as_ref(), event_runtime.as_ref()) {
+                coal.dispatch_agent_event_lazy(&event, runtime);
+            }
 
             // Per-prompt callback.
             per_prompt(event);
@@ -2419,6 +2466,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         !cli.no_session,
         compaction_settings,
     );
+    if let Some(handle) = options.runtime_handle.clone() {
+        agent_session = agent_session.with_runtime_handle(handle);
+    }
     agent_session.set_api_key_override(options.api_key.clone());
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
