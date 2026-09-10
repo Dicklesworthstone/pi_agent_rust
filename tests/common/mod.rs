@@ -100,6 +100,27 @@ pub fn hermetic_interactive_config(mut config: pi::config::Config) -> pi::config
     config
 }
 
+/// Stack size for the shared test runtime's worker thread.
+///
+/// asupersync's builder defaults to 2 MiB per worker, which the SDK suites
+/// exceed: `sdk_unit` and `sdk_integration` both aborted with "thread
+/// 'asupersync-worker-0' has overflowed its stack" and exited on SIGABRT,
+/// reporting no pass/fail tally at all. The test bodies run on the worker
+/// thread rather than the main test thread, so they never see the 8 MiB the
+/// process stack would give them, and debug builds put much larger frames on it
+/// than release.
+///
+/// 16 MiB matches what this project already reserves for its other long-frame
+/// threads: `SQLITE_THREAD_STACK_BYTES` in src/session_sqlite.rs and
+/// `DRIVER_STACK_BYTES` in src/interactive_ftui.rs. The reservation is virtual
+/// and committed lazily, so the cost to every other suite sharing this runtime
+/// is nil.
+///
+/// Note that `ASUPERSYNC_THREAD_STACK_SIZE` does NOT reach this: the env
+/// overrides are applied on a different construction path, and setting it
+/// against this builder changes nothing. It has to be set here.
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 /// Runs an async future to completion on an asupersync runtime.
 ///
 /// Note: We spawn the future onto the runtime so it runs with a proper task context.
@@ -119,6 +140,7 @@ where
             .enable_parking(false)
             .worker_threads(1)
             .blocking_threads(1, 8)
+            .thread_stack_size(WORKER_STACK_BYTES)
             .build()
             .expect("build asupersync runtime")
     });
