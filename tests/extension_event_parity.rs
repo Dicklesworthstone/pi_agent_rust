@@ -405,12 +405,43 @@ fn common_args(extension_path: &Path) -> Vec<String> {
     ]
 }
 
+/// Write the settings every surface runs under.
+///
+/// Two features that default to ON make their own provider calls around a turn,
+/// and both had to be turned off for this measurement to mean anything:
+/// automatic session titling, which summarises the first exchange into a
+/// session name, and the advisor, which reviews each turn with a second model.
+/// The symptom was the scripted turn completing and printing its text, then the
+/// run dying on a request the cassette had no interaction left for.
+///
+/// Padding the cassette instead would have hidden it and then produced a worse
+/// failure: those extra calls emit `message_*` events of their own, on whichever
+/// surfaces run them, and this test would have reported a parity failure that
+/// was really a difference in post-turn housekeeping. Turning them off keeps the
+/// measurement about the turn.
+fn write_hermetic_settings(path: &Path) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create settings dir");
+    }
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "advisor": { "enabled": false },
+            "titling": { "autoTitle": false },
+        }))
+        .expect("serialize settings"),
+    )
+    .expect("write hermetic settings");
+}
+
 /// Environment every surface shares: isolation, VCR playback, and a log filter
 /// narrow enough that the surface's own output cannot drown the records.
 fn apply_common_env(command: &mut Command, agent_dir: &Path, cassette_dir: &Path) {
+    let settings_path = agent_dir.join("settings.json");
+    write_hermetic_settings(&settings_path);
     command
         .env("PI_CODING_AGENT_DIR", agent_dir)
-        .env("PI_CONFIG_PATH", agent_dir.join("settings.json"))
+        .env("PI_CONFIG_PATH", &settings_path)
         .env("PI_SESSIONS_DIR", agent_dir.join("sessions"))
         .env("PI_PACKAGE_DIR", agent_dir.join("packages"))
         .env("PI_TEST_MODE", "1")
@@ -418,6 +449,11 @@ fn apply_common_env(command: &mut Command, agent_dir: &Path, cassette_dir: &Path
         .env(pi::vcr::VCR_ENV_MODE, "playback")
         .env(pi::vcr::VCR_ENV_DIR, cassette_dir)
         .env("PI_VCR_TEST_NAME", VCR_TEST_NAME)
+        // Dumps every request body VCR was asked to match, next to the
+        // interactions it compared them against. Without it an unmatched
+        // request is a sha256 and nothing else, which costs a full build cycle
+        // to identify.
+        .env("VCR_DEBUG_BODY_FILE", agent_dir.join("vcr-bodies.txt"))
         .env("RUST_LOG", "pi::extensions=info");
 }
 
@@ -456,7 +492,10 @@ fn run_print_surface(
         });
     assert!(
         output.status.success(),
-        "{name} must complete the scripted turn.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "{name} must complete the scripted turn.\nstdout:\n{stdout}\nstderr:\n{stderr}\n\
+         VCR request bodies:\n{}",
+        std::fs::read_to_string(agent_dir.join("vcr-bodies.txt"))
+            .unwrap_or_else(|err| format!("(no VCR body dump: {err})"))
     );
 
     let names = parse_dispatched_events(&stderr);
@@ -578,6 +617,12 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
     let cassette_dir = session.harness.temp_path("vcr");
     write_parity_cassette(&cassette_dir, SAMPLE_FILE);
 
+    // TuiSession points PI_CONFIG_PATH at a .toml; give it the same hermetic
+    // JSON settings the other surfaces run under so the advisor stays off here
+    // too and all five drive the identical turn.
+    let settings_path = session.harness.temp_path("pi-settings.json");
+    write_hermetic_settings(&settings_path);
+    session.set_env("PI_CONFIG_PATH", &settings_path.display().to_string());
     session.set_env(pi::vcr::VCR_ENV_MODE, "playback");
     session.set_env(pi::vcr::VCR_ENV_DIR, &cassette_dir.display().to_string());
     session.set_env("PI_VCR_TEST_NAME", VCR_TEST_NAME);
