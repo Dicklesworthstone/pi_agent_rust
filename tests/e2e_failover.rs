@@ -333,6 +333,24 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_success() {
         1,
         "exactly one failover_end per failover_start: {kinds:?}"
     );
+    // bd-oqo03: `attempt` is the successful-swap ordinal within the turn, and
+    // `chainIndex` is where the entry sits in the chain. They are reported
+    // separately because they answer different questions — budget versus
+    // provenance — and `attempt` used to carry the index, which stopped
+    // meaning anything once the walk began skipping entries. Here the single
+    // chain entry sits at index 0 and is the turn's first swap, so the two
+    // values differ and a regression that puts the cursor back in `attempt`
+    // shows up as 0 where 1 is expected.
+    let start_event = &events[start]; // ubs:ignore index proven by position() above
+    assert_eq!(
+        start_event["attempt"], 1,
+        "the first successful swap of the turn is attempt 1, not the chain cursor: {start_event}"
+    );
+    assert_eq!(
+        start_event["chainIndex"], 0,
+        "the only fallback entry sits at chain index 0: {start_event}"
+    );
+
     let end_event = &events[end]; // ubs:ignore index proven by position() above
     assert_eq!(end_event["success"], serde_json::Value::Bool(true));
     assert_eq!(end_event["restoredPrimary"], serde_json::Value::Bool(false));

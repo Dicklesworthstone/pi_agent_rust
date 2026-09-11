@@ -5581,6 +5581,7 @@ async fn run_prompt_with_retry(
                     final_error.as_deref(),
                     require_incomplete_tail,
                     (retry_count > 0).then_some(retry_count),
+                    failovers_this_turn,
                     &cx,
                 )
                 .await
@@ -6050,6 +6051,7 @@ async fn try_failover_to_next_chain_entry(
     error_text: Option<&str>,
     require_incomplete_tail: bool,
     retry_attempt_to_end: Option<u32>,
+    swaps_so_far: u32,
     cx: &AgentCx,
 ) -> Result<bool> {
     let Some(error_text) = error_text else {
@@ -6165,6 +6167,12 @@ async fn try_failover_to_next_chain_entry(
                 .cloned()
                 .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
         })();
+        // Where this candidate sits in the chain, captured before the cursor
+        // advances to the resume position. `position` after this line is where
+        // the NEXT turn starts looking, which is one past the entry being
+        // considered — reporting that as the chain index is off by one
+        // (bd-oqo03).
+        let entry_index = position;
         position += 1;
         let Some(entry) = candidate else {
             continue;
@@ -6293,7 +6301,10 @@ async fn try_failover_to_next_chain_entry(
             to_provider: to_provider.clone(),
             to_model: to_model.clone(),
             class: format!("{class:?}").to_ascii_lowercase(),
-            attempt: position as u32,
+            // Budget position, not chain position: this swap is the
+            // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
+            attempt: swaps_so_far.saturating_add(1),
+            chain_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
         });
         drop(inner);
         drop(state);
@@ -8330,6 +8341,7 @@ mod retry_tests {
                     Some("server error"),
                     false,
                     None,
+                    0,
                     &cx,
                 )
                 .await
@@ -8447,6 +8459,7 @@ mod retry_tests {
                 Some("server error"),
                 true,
                 None,
+                0,
                 &cx,
             )
             .await
@@ -8531,6 +8544,7 @@ mod retry_tests {
                     Some("server error"),
                     true,
                     Some(2),
+                    0,
                     &cx,
                 )
                 .await
@@ -8817,6 +8831,7 @@ mod retry_tests {
                     Some("server error"),
                     true,
                     None,
+                    0,
                     &cx,
                 )
                 .await
@@ -8883,6 +8898,7 @@ mod retry_tests {
                     Some("server error"),
                     true,
                     None,
+                    1,
                     &cx,
                 )
                 .await

@@ -9078,6 +9078,7 @@ async fn try_print_failover(
     is_json: bool,
     require_incomplete_tail: bool,
     retry_attempt_to_end: Option<u32>,
+    swaps_so_far: u32,
 ) -> Result<Option<(String, String)>> {
     let Some(ctx) = failover_ctx else {
         return Ok(None);
@@ -9138,6 +9139,12 @@ async fn try_print_failover(
                 .cloned()
                 .or_else(|| pi::models::ad_hoc_model_entry(provider, model_id))
         })();
+        // Where this candidate sits in the chain, captured before the cursor
+        // advances to the resume position. `cursor` after this line is where
+        // the NEXT turn starts looking, which is one past the entry being
+        // considered — reporting that as the chain index is off by one
+        // (bd-oqo03).
+        let entry_index = cursor;
         cursor += 1;
         let Some(entry) = candidate else { continue };
         let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
@@ -9259,7 +9266,11 @@ async fn try_print_failover(
                 to_provider: to_provider.clone(),
                 to_model: to_model.clone(),
                 class: format!("{class:?}").to_ascii_lowercase(),
-                attempt: u32::try_from(cursor).unwrap_or(u32::MAX),
+                // Budget position, not chain position: this swap is the
+                // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn`
+                // (bd-oqo03).
+                attempt: swaps_so_far.saturating_add(1),
+                chain_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
             });
         }
 
@@ -9422,6 +9433,7 @@ where
                             is_json,
                             true,
                             (retry_count > 0).then_some(retry_count),
+                            failovers_this_turn,
                         )
                         .await
                     } else {
@@ -9560,6 +9572,7 @@ where
                             is_json,
                             false,
                             (retry_count > 0).then_some(retry_count),
+                            failovers_this_turn,
                         )
                         .await
                     } else {
@@ -12056,6 +12069,7 @@ mod tests {
                 false,
                 true,
                 None,
+                0,
             )
             .await
             .expect_err("known assistant failure requires a restorable tail");
@@ -12096,6 +12110,7 @@ mod tests {
                     false,
                     true,
                     None,
+                    0,
                 )
                 .await
                 .expect("durable print failover")
@@ -12295,6 +12310,7 @@ mod tests {
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("walk past the current entry");
@@ -12327,6 +12343,7 @@ mod tests {
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("walk past keyless and duplicate entries");
@@ -12344,6 +12361,7 @@ mod tests {
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("second walk");
@@ -12492,6 +12510,7 @@ mod tests {
                 false,
                 true,
                 None,
+                0,
             )
             .await
             .expect_err("unwritable candidate must block failover");
