@@ -174,9 +174,14 @@ struct SurfaceRun {
     /// explicitly so a skipped surface can never read as a passing one.
     outcome: Option<SurfaceEvents>,
     skip_reason: Option<String>,
-    /// Raw log lines, kept for the artifact so a failure is diagnosable
+    /// Raw dispatch records, kept for the artifact so a failure is diagnosable
     /// without re-running.
     raw: Vec<String>,
+    /// The tail of everything the surface logged. A surface that routed no
+    /// observation events cannot explain itself through `raw`, which is empty
+    /// by definition in exactly that case — this is what says whether the
+    /// extension loaded at all.
+    log_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,15 +236,45 @@ impl SurfaceEvents {
     }
 }
 
+/// Strip ANSI SGR sequences from log output.
+///
+/// `tracing_subscriber`'s fmt layer colourises field names, so a record reaches
+/// this test as `\x1b[3mevent_name\x1b[0m\x1b[2m=\x1b[0mmessage_start` — the
+/// literal `event_name=` never appears, and a parser looking for it silently
+/// finds nothing on every surface. That is exactly the failure this test is
+/// built to report, arriving from the instrument rather than the subject, which
+/// is the worst way for it to be wrong. Strip first, then parse.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // CSI: ESC [ ... final byte in @-~. Anything else: drop the ESC and
+        // the single byte after it, which covers the short escapes.
+        if chars.next() == Some('[') {
+            for next in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Pull `ext.event.start` records out of pi's log output.
 ///
-/// The fmt layer is installed with `with_target(false)`, so a record looks like
+/// The fmt layer is installed with `with_target(false)`, so a record reads
 /// `2026-..Z  INFO Extension event dispatch start event="ext.event.start"
-/// event_name=message_start timeout_ms=30000`. Accept the value quoted or not:
-/// whether a field is quoted depends on how it was recorded, which is not a
-/// thing this test should be pinned to.
+/// event_name=message_start timeout_ms=30000` once the colour is stripped.
+/// Accept the value quoted or not: whether a field is quoted depends on how it
+/// was recorded, which is not a thing this test should be pinned to.
 fn parse_dispatched_events(log: &str) -> Vec<String> {
     log.lines()
+        .map(strip_ansi)
         .filter(|line| line.contains("ext.event.start"))
         .filter_map(|line| {
             let rest = line.split("event_name=").nth(1)?;
@@ -250,6 +285,16 @@ fn parse_dispatched_events(log: &str) -> Vec<String> {
                 .trim_end_matches(',');
             (!value.is_empty()).then(|| value.to_string())
         })
+        .collect()
+}
+
+/// The last `LOG_TAIL_LINES` lines of a surface's log output.
+fn log_tail(log: &str) -> Vec<String> {
+    const LOG_TAIL_LINES: usize = 60;
+    let lines: Vec<&str> = log.lines().collect();
+    lines[lines.len().saturating_sub(LOG_TAIL_LINES)..]
+        .iter()
+        .map(|line| strip_ansi(line))
         .collect()
 }
 
@@ -454,7 +499,7 @@ fn apply_common_env(command: &mut Command, agent_dir: &Path, cassette_dir: &Path
         // request is a sha256 and nothing else, which costs a full build cycle
         // to identify.
         .env("VCR_DEBUG_BODY_FILE", agent_dir.join("vcr-bodies.txt"))
-        .env("RUST_LOG", "pi::extensions=info");
+        .env("RUST_LOG", "pi=info");
 }
 
 /// Drive `pi -p`, optionally in JSON output mode, and collect what it logged.
@@ -469,14 +514,19 @@ fn run_print_surface(
     extension_path: &Path,
     json_output: bool,
 ) -> SurfaceRun {
-    let mut command = Command::new(pi_binary());
-    command
-        .arg("-p")
-        .arg(PROMPT)
-        .args(common_args(extension_path));
+    // Flags first, prompt last. `Cli::args` is `trailing_var_arg`, so every
+    // token after the first positional is captured verbatim as another message
+    // — putting the prompt first made pi run the turn, then try to run
+    // "--provider" as a second prompt, with none of the flags applied. The
+    // symptom was a third provider request the cassette had no interaction for,
+    // and a default model and thinking budget in a body that was supposed to be
+    // pinned by --model and --thinking.
+    let mut command = Command::new(pi_binary()); // ubs:ignore false positive: Cargo provides the compiled test binary path.
+    command.arg("-p").args(common_args(extension_path));
     if json_output {
         command.args(["--output-format", "json"]);
     }
+    command.arg(PROMPT);
     apply_common_env(&mut command, agent_dir, cassette_dir);
     command.current_dir(workdir);
 
@@ -506,9 +556,10 @@ fn run_print_surface(
         skip_reason: None,
         raw: stderr
             .lines()
+            .map(strip_ansi)
             .filter(|line| line.contains("ext.event.start"))
-            .map(str::to_string)
             .collect(),
+        log_tail: log_tail(&stderr),
     }
 }
 
@@ -522,7 +573,7 @@ fn run_rpc_surface(
 ) -> SurfaceRun {
     use std::io::{BufRead as _, BufReader, Write as _};
 
-    let mut command = Command::new(pi_binary());
+    let mut command = Command::new(pi_binary()); // ubs:ignore false positive: Cargo provides the compiled test binary path.
     command.arg("--rpc").args(common_args(extension_path));
     apply_common_env(&mut command, agent_dir, cassette_dir);
     command
@@ -590,9 +641,10 @@ fn run_rpc_surface(
         skip_reason: None,
         raw: stderr
             .lines()
+            .map(strip_ansi)
             .filter(|line| line.contains("ext.event.start"))
-            .map(str::to_string)
             .collect(),
+        log_tail: log_tail(&stderr),
     }
 }
 
@@ -628,7 +680,7 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
     session.set_env("PI_VCR_TEST_NAME", VCR_TEST_NAME);
     // TuiSession sets RUST_LOG=info by default, which would bury the records
     // under everything else pi logs at info during startup.
-    session.set_env("RUST_LOG", "pi::extensions=info");
+    session.set_env("RUST_LOG", "pi=info");
 
     let mut args: Vec<String> = Vec::new();
     if classic {
@@ -652,12 +704,11 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
         .join("agent")
         .join("logs")
         .join("tui.log");
-    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|err| {
-        panic!(
-            "{name} must write its tracing output to {}: {err}",
-            log_path.display()
-        )
-    });
+    let missing_log = format!(
+        "{name} must write its tracing output to {}",
+        log_path.display()
+    );
+    let log = std::fs::read_to_string(&log_path).expect(&missing_log);
     let names = parse_dispatched_events(&log);
     Some(SurfaceRun {
         name: name.to_string(),
@@ -666,9 +717,10 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
         skip_reason: None,
         raw: log
             .lines()
+            .map(strip_ansi)
             .filter(|line| line.contains("ext.event.start"))
-            .map(str::to_string)
             .collect(),
+        log_tail: log_tail(&log),
     })
 }
 
@@ -730,6 +782,7 @@ fn write_parity_artifact(
                     "behaviour_kinds": events.behaviour,
                     "counts_per_kind": counts,
                     "raw_dispatch_records": run.raw,
+                    "log_tail": run.log_tail,
                 })
             },
         );
@@ -812,8 +865,14 @@ fn evaluate_parity(runs: &[SurfaceRun]) -> ParityOutcome {
         let events = run.outcome.as_ref().expect("driven surface has events");
         if events.kinds.is_empty() {
             outcome.silent.push(format!(
-                "  {} ({}) delivered no observation events at all",
-                run.name, run.owner
+                "  {} ({}) delivered no observation events at all\n    last lines it logged:\n{}",
+                run.name,
+                run.owner,
+                run.log_tail
+                    .iter()
+                    .map(|line| format!("      {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
     }
@@ -881,6 +940,7 @@ fn extension_observation_events_are_identical_on_every_surface() {
                                 .to_string(),
                         ),
                         raw: Vec::new(),
+                        log_tail: Vec::new(),
                     }
                 }),
             );
@@ -1000,6 +1060,7 @@ fn healthy_surface(name: &str) -> SurfaceRun {
         ])),
         skip_reason: None,
         raw: Vec::new(),
+        log_tail: Vec::new(),
     }
 }
 
@@ -1104,6 +1165,7 @@ fn a_surface_that_could_not_be_driven_is_recorded_as_skipped() {
         outcome: None,
         skip_reason: Some("tmux is not available on this host".to_string()),
         raw: Vec::new(),
+        log_tail: Vec::new(),
     };
     let outcome = evaluate_parity(&[healthy_surface("main"), skipped]);
     assert!(outcome.is_clean(), "a skip is not a failure");
@@ -1120,12 +1182,15 @@ fn a_surface_that_could_not_be_driven_is_recorded_as_skipped() {
 /// The log parser reads what the host actually writes, including a TUI log.
 #[test]
 fn dispatch_records_are_parsed_from_pi_log_output() {
+    // The third line carries the ANSI field colouring pi actually emits.
     let log = concat!(
         "2026-09-11T04:00:00.000000Z  INFO Extension event dispatch start ",
         "event=\"ext.event.start\" event_name=message_start timeout_ms=30000\n",
         "2026-09-11T04:00:00.001000Z  INFO something else entirely\n",
-        "2026-09-11T04:00:00.002000Z  INFO Extension event dispatch start ",
-        "event=\"ext.event.start\" event_name=\"tool_execution_start\" timeout_ms=30000\n",
+        "\u{1b}[2m2026-09-11T04:00:00.002000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m ",
+        "Extension event dispatch start \u{1b}[3mevent\u{1b}[0m\u{1b}[2m=\u{1b}[0m",
+        "\"ext.event.start\" \u{1b}[3mevent_name\u{1b}[0m\u{1b}[2m=\u{1b}[0m",
+        "tool_execution_start \u{1b}[3mtimeout_ms\u{1b}[0m\u{1b}[2m=\u{1b}[0m30000\n",
     );
     assert_eq!(
         parse_dispatched_events(log),
