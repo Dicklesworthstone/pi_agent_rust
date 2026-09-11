@@ -120,13 +120,37 @@ fn load_json_value(root: &Path, relative_path: &str) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("invalid JSON in {}: {e}", path.display())) // ubs:ignore test harness assertion, not production runtime.
 }
 
-fn git_tracked_test_stems(root: &Path) -> Option<BTreeSet<String>> {
-    let output = Command::new("git")
+/// Ask Git which of `candidates` are ignored, by rule rather than by index.
+///
+/// `git check-ignore` consults `.gitignore` and friends; it does not read
+/// `.git/index`, which is what makes it usable in the environments described
+/// on [`on_disk_test_stems`]. Exit status 0 means "some paths were ignored",
+/// 1 means "none were", and anything else (no Git, not a checkout) means we
+/// could not answer — the caller falls back to the literal `.gitignore` scan.
+///
+/// `--no-index` trades one thing away deliberately: plain `check-ignore`
+/// exempts a path that is in the index, so a file force-added despite matching
+/// an ignore rule would count as present, while here it reads as ignored. That
+/// case is a Git anti-pattern, does not occur in this repo (`check-ignore`
+/// currently matches none of the test files), and buying it back means reading
+/// the index again — which is the whole problem.
+fn git_ignored_test_stems(root: &Path, candidates: &BTreeSet<String>) -> Option<BTreeSet<String>> {
+    if candidates.is_empty() {
+        return Some(BTreeSet::new());
+    }
+
+    let mut command = Command::new("git");
+    command
         .current_dir(root)
-        .args(["ls-files", "--", "tests/*.rs"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .args(["check-ignore", "--no-index", "--"]);
+    for stem in candidates {
+        command.arg(format!("tests/{stem}.rs"));
+    }
+
+    let output = command.output().ok()?;
+    // 0: at least one path is ignored. 1: none are, and stdout is empty.
+    // 128 and friends: not a checkout, or Git is unusable here.
+    if !matches!(output.status.code(), Some(0 | 1)) {
         return None;
     }
 
@@ -135,7 +159,7 @@ fn git_tracked_test_stems(root: &Path) -> Option<BTreeSet<String>> {
         stdout
             .lines()
             .filter_map(|line| {
-                let stem = line.strip_prefix("tests/")?.strip_suffix(".rs")?;
+                let stem = line.trim().strip_prefix("tests/")?.strip_suffix(".rs")?;
                 (!stem.contains('/')).then(|| stem.to_string())
             })
             .collect(),
@@ -168,27 +192,44 @@ fn literal_gitignored_test_stems(root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Discover tracked `tests/*.rs` stems, falling back to disk without Git metadata.
+/// The top-level `tests/*.rs` files that exist, minus the ones Git is
+/// configured to ignore.
+///
+/// This deliberately does **not** use `git ls-files`, which it used to. The
+/// index is not a reliable statement about what is on disk in the environments
+/// this suite runs in: `rch` ships a compiled-in transfer exclusion for
+/// `.git/index` (see `rch config show`, `exclude_patterns`), so a remote worker
+/// receives the working tree — new test files included, which Cargo then
+/// happily compiles and runs — on top of whatever index its checkout already
+/// had. Every newly added test file therefore looked *absent* to this gate on
+/// every worker, one release-blocking failure per file added, with the file
+/// sitting right there next to the binary that had just executed it.
+///
+/// The index was only ever a proxy for the real rule, which is what this
+/// implements directly: a file counts if Cargo would build it as a test target
+/// and Git is not ignoring it. Gitignored developer repro files stay excluded,
+/// which is the behaviour the index lookup was reaching for, and the answer is
+/// now the same on a laptop and on a worker.
 fn on_disk_test_stems(root: &Path) -> BTreeSet<String> {
-    if let Some(stems) = git_tracked_test_stems(root) {
-        return stems;
-    }
-
     let tests_dir = root.join("tests");
-    let ignored = literal_gitignored_test_stems(root);
-    let mut stems = BTreeSet::new();
+    let mut present = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(&tests_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
+            // `mod.rs` is a shared module, never its own test target.
             if path.extension().is_some_and(|e| e == "rs")
                 && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                && !ignored.contains(stem)
+                && stem != "mod"
             {
-                stems.insert(stem.to_string());
+                present.insert(stem.to_string());
             }
         }
     }
-    stems
+
+    let ignored = git_ignored_test_stems(root, &present)
+        .unwrap_or_else(|| literal_gitignored_test_stems(root));
+    present.retain(|stem| !ignored.contains(stem));
+    present
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -380,25 +380,72 @@ fn quarantine_waiver_counts(root: &Path) -> (usize, usize) {
     (quarantine, waiver)
 }
 
-/// Count top-level tracked Rust test files, matching traceability governance.
+/// Count the top-level Rust test files, matching traceability governance.
+///
+/// This counts what is on disk and not gitignored, deliberately rather than
+/// `git ls-files`. `rch` carries a compiled-in transfer exclusion for
+/// `.git/index` (`rch config show`, `exclude_patterns`), so a remote worker
+/// receives the working tree over whatever index its checkout already had:
+/// `ls-files` there omits every newly added test file, including the ones
+/// Cargo compiled and ran moments earlier, and this count came up one short per
+/// added file. `git check-ignore` reads the ignore rules rather than the index,
+/// so the answer is the same on a laptop and on a worker. See the matching
+/// rationale on `on_disk_test_stems` in `tests/traceability_staleness.rs`.
+///
+/// `metadata_free_fallback` still covers a tree with no `tests/` directory at
+/// all, which is not a situation this dossier can say anything useful about.
 fn tracked_test_file_count(root: &Path, metadata_free_fallback: usize) -> usize {
-    let Ok(output) = Command::new("git")
-        .current_dir(root)
-        .args(["ls-files", "--", "tests/*.rs"])
-        .output()
-    else {
+    let Ok(entries) = std::fs::read_dir(root.join("tests")) else {
         return metadata_free_fallback;
     };
-    if !output.status.success() {
-        return metadata_free_fallback;
+
+    let mut present: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `mod.rs` is a shared module, never its own test target.
+        if path.extension().is_some_and(|e| e == "rs")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && stem != "mod"
+        {
+            present.push(stem.to_string());
+        }
+    }
+
+    // `saturating_sub` because a count that came back larger than the input
+    // would mean git answered something we do not understand, and a panic in a
+    // dossier generator is a worse way to learn that than a zero.
+    present
+        .len()
+        .saturating_sub(gitignored_test_file_count(root, &present))
+}
+
+/// How many of `stems` git's ignore rules exclude. Zero when git cannot answer.
+fn gitignored_test_file_count(root: &Path, stems: &[String]) -> usize {
+    if stems.is_empty() {
+        return 0;
+    }
+
+    let mut command = Command::new("git");
+    command
+        .current_dir(root)
+        .args(["check-ignore", "--no-index", "--"]);
+    for stem in stems {
+        command.arg(format!("tests/{stem}.rs"));
+    }
+
+    let Ok(output) = command.output() else {
+        return 0;
+    };
+    // 0: at least one ignored. 1: none ignored. Anything else: git could not
+    // answer, so claim nothing is ignored rather than undercount the suite.
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return 0;
     }
 
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|path| {
-            path.strip_prefix("tests/")
-                .is_some_and(|relative| relative != "mod.rs" && !relative.contains('/'))
-        })
+        .filter_map(|path| path.trim().strip_prefix("tests/")?.strip_suffix(".rs"))
+        .filter(|stem| !stem.contains('/'))
         .count()
 }
 

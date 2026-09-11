@@ -169,38 +169,61 @@ def extract_test_stem(path: str) -> str | None:
     return None
 
 
-def _git_tracked_test_stems(tests_dir: Path) -> set[str] | None:
-    """Return stems of git-tracked `tests/*.rs` files, or None if unavailable.
+def _git_ignored_test_stems(stems: set[str]) -> set[str] | None:
+    """Return which of `stems` git ignores, or None if git cannot answer.
 
-    Filtering by git-tracked-only avoids false positives from local-only repro
+    Filtering out ignored files avoids false positives from local-only repro
     files that developers keep around but are listed in `.gitignore` (e.g.,
-    `tests/edit_repro.rs`). CI checkouts only see tracked files, so reconciling
-    the matrix/classification against the same set keeps developer and CI runs
-    in agreement.
+    `tests/edit_repro.rs`), so developer and CI runs agree on the inventory.
+
+    This asks `git check-ignore`, which evaluates the ignore *rules*, rather
+    than `git ls-files`, which reads `.git/index`. The distinction is not
+    academic here: `rch` carries a compiled-in transfer exclusion for
+    `.git/index` (`rch config show`, `exclude_patterns`), so a remote worker
+    gets the working tree laid over whatever index its checkout already had.
+    `git ls-files` there reports a stale inventory that omits every newly added
+    test file — files Cargo has just compiled and run — and this gate failed on
+    each one. `check-ignore --no-index` answers from the rules alone and so
+    gives the same result on a laptop and on a worker.
+
+    `--no-index` trades one thing away deliberately: plain `check-ignore`
+    exempts a path that is in the index, so a file force-added despite matching
+    an ignore rule would count as present, while here it reads as ignored. That
+    case is a git anti-pattern, does not occur in this repo, and buying it back
+    means reading the index again — which is the whole problem.
+
+    Exit 0 means at least one path is ignored, 1 means none are; anything else
+    means git could not answer and the caller should fall back.
     """
+
+    if not stems:
+        return set()
 
     try:
         result = subprocess.run(
-            ["git", "ls-files", "--", "tests/*.rs"],
+            ["git", "check-ignore", "--no-index", "--"]
+            + [f"tests/{stem}.rs" for stem in sorted(stems)],
             cwd=str(REPO_ROOT),
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except OSError:
+        # No git on PATH, or it could not be executed at all.
+        return None
+    if result.returncode not in (0, 1):
         return None
 
-    stems: set[str] = set()
+    ignored: set[str] = set()
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line.startswith("tests/") or not line.endswith(".rs"):
             continue
-        # Only top-level `tests/*.rs` (matches the existing glob behaviour).
         rel = line[len("tests/") : -len(".rs")]
         if "/" in rel:
             continue
-        stems.add(rel)
-    return stems
+        ignored.add(rel)
+    return ignored
 
 
 def _gitignored_top_level_test_stems(tests_dir: Path) -> set[str]:
@@ -286,20 +309,19 @@ def check_stale_mappings(
 
     matrix_test_stems = extract_matrix_test_stems(matrix)
 
-    # On-disk test files. Only count git-tracked files so that local-only
-    # developer repro files (gitignored) don't trigger spurious classification
-    # mismatches between developer machines and CI checkouts.
+    # On-disk test files: every top-level `tests/*.rs` Cargo would build as a
+    # test target, minus the ones git ignores, so local-only developer repro
+    # files don't trigger spurious classification mismatches between developer
+    # machines, CI checkouts and rch workers. See `_git_ignored_test_stems` for
+    # why this asks the ignore rules rather than the index.
     tests_dir = REPO_ROOT / "tests"
-    on_disk_stems: set[str] = set()
-    tracked_stems = _git_tracked_test_stems(tests_dir)
-    if tracked_stems is None:
-        # Not a git checkout (or git unavailable): fall back to filesystem scan.
+    # `mod.rs` is a shared module, never its own test target.
+    present_stems = {f.stem for f in sorted(tests_dir.glob("*.rs")) if f.stem != "mod"}
+    ignored_stems = _git_ignored_test_stems(present_stems)
+    if ignored_stems is None:
+        # Git cannot answer (no git, not a checkout): evaluate the rules here.
         ignored_stems = _gitignored_top_level_test_stems(tests_dir)
-        for f in sorted(tests_dir.glob("*.rs")):
-            if f.stem not in ignored_stems:
-                on_disk_stems.add(f.stem)
-    else:
-        on_disk_stems = tracked_stems
+    on_disk_stems = present_stems - ignored_stems
 
     stats["on_disk"] = len(on_disk_stems)
     stats["classified"] = len(classified_stems)
