@@ -1197,9 +1197,14 @@ fn ensure_must_pass_worktree_matches_commit(
     }
 
     let records = must_pass_tree_records(root, commit, source_paths)?;
+    // Index first, then worktree. Both answer "does this differ from the
+    // commit", and when content is staged AND on disk both are true — so the
+    // order decides which one the operator is told about. Staged drift is the
+    // more specific diagnosis and the more surprising state to be in, so it
+    // wins; unstaged drift falls through to the worktree comparison.
+    ensure_index_matches_commit_when_readable(root, commit, source_paths, &records)?;
     ensure_committed_paths_match_worktree(root, &records)?;
     ensure_no_uncommitted_files_under(root, source_paths, &records)?;
-    ensure_index_matches_commit_when_readable(root, commit, source_paths, &records)?;
 
     Ok(())
 }
@@ -1464,11 +1469,10 @@ fn collect_worktree_files(
     out: &mut Vec<String>,
 ) -> Result<(), String> {
     let absolute = root.join(relative);
-    let metadata = match std::fs::symlink_metadata(&absolute) {
-        Ok(metadata) => metadata,
-        // A must-pass path that is not on disk is reported by the
-        // commit-side comparison, which names the specific missing files.
-        Err(_) => return Ok(()),
+    let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
+        // A must-pass path that is not on disk is reported by the commit-side
+        // comparison, which names the specific missing files.
+        return Ok(());
     };
     if !metadata.is_dir() {
         out.push(relative.to_string());

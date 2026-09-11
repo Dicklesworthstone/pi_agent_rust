@@ -82,6 +82,21 @@ const ORDERED_OBSERVATION: &[&str] = &[
 /// Dispatched in-loop by the agent, so every surface gets them for free. Their
 /// presence is the control: a surface missing these has a different problem.
 const LIFECYCLE: &[&str] = &["agent_start", "agent_end", "turn_start", "turn_end"];
+/// Hooks that can CHANGE what the agent does, also dispatched in-loop.
+///
+/// Included because bd-82331 rests on the claim that these were never affected
+/// — an extension that modifies behaviour works everywhere, one that observes
+/// did not — and a claim load-bearing enough to scope a bug around is worth a
+/// test. If one of these ever moves to the per-surface route, this is where it
+/// shows up, rather than in a bug report about one stack behaving differently.
+const BEHAVIOUR: &[&str] = &[
+    "input",
+    "before_agent_start",
+    "context",
+    "before_provider_request",
+    "tool_call",
+    "tool_result",
+];
 
 /// A fixture extension that subscribes to everything and does nothing.
 ///
@@ -93,6 +108,7 @@ const LIFECYCLE: &[&str] = &["agent_start", "agent_end", "turn_start", "turn_end
 fn fixture_extension_source() -> String {
     let mut names: Vec<&str> = Vec::new();
     names.extend_from_slice(LIFECYCLE);
+    names.extend_from_slice(BEHAVIOUR);
     names.extend_from_slice(ORDERED_OBSERVATION);
     names.extend_from_slice(COALESCABLE);
     let list = names
@@ -173,6 +189,8 @@ struct SurfaceEvents {
     kinds: BTreeSet<String>,
     /// Lifecycle kinds seen at least once.
     lifecycle: BTreeSet<String>,
+    /// Behaviour-hook kinds seen at least once.
+    behaviour: BTreeSet<String>,
 }
 
 impl SurfaceEvents {
@@ -194,11 +212,17 @@ impl SurfaceEvents {
             .filter(|name| LIFECYCLE.contains(&name.as_str()))
             .cloned()
             .collect();
+        let behaviour = names
+            .iter()
+            .filter(|name| BEHAVIOUR.contains(&name.as_str()))
+            .cloned()
+            .collect();
         Self {
             all: names,
             ordered_observation,
             kinds,
             lifecycle,
+            behaviour,
         }
     }
 
@@ -235,26 +259,23 @@ fn pi_binary() -> PathBuf {
 
 /// Write the two-interaction cassette every surface replays.
 ///
-/// The recorded request bodies constrain only `model` and `stream`. VCR matches
-/// recorded bodies as templates — recorded keys must match, incoming may carry
-/// extra ones — and playback walks interactions with a monotonic cursor, so two
-/// loosely-matched interactions are handed out in order. That is deliberate:
-/// pinning the full body would pin the system prompt and the tool schema list,
-/// and this test would then fail whenever an unrelated prompt line changed,
-/// which is exactly the kind of failure that gets a test deleted rather than
-/// fixed. What must be deterministic here is the shape of the TURN, and the
-/// responses below fix that completely.
+/// The recorded requests constrain method and URL only. VCR treats an absent
+/// recorded body as "do not constrain the body", and playback walks
+/// interactions with a monotonic cursor, so the two are handed out in order:
+/// the tool call first, the final text second.
+///
+/// That is deliberate. Pinning the body pins the system prompt and the tool
+/// schema list, and this test would then fail whenever an unrelated prompt line
+/// changed — the kind of failure that gets a test deleted rather than fixed. A
+/// first version constrained `model` and `stream` and still failed to match,
+/// which is the argument: what this test needs to be deterministic is the shape
+/// of the TURN, and the responses below fix that completely. Request-shape
+/// fidelity is the provider suites' job, and they do it properly.
 #[allow(clippy::too_many_lines)]
 fn write_parity_cassette(dir: &Path, read_path: &str) -> PathBuf {
     std::fs::create_dir_all(dir).expect("create cassette dir");
     let cassette_path = dir.join(format!("{VCR_TEST_NAME}.json"));
 
-    let loose_request = || {
-        json!({
-            "model": VCR_MODEL,
-            "stream": true,
-        })
-    };
     let sse = |event: &str, data: &Value| -> String {
         let payload = serde_json::to_string(data).expect("serialize sse payload");
         format!("event: {event}\ndata: {payload}\n\n")
@@ -336,7 +357,6 @@ fn write_parity_cassette(dir: &Path, read_path: &str) -> PathBuf {
                     "method": "POST",
                     "url": "https://api.anthropic.com/v1/messages",
                     "headers": [],
-                    "body": loose_request(),
                 },
                 "response": tool_call_response,
             },
@@ -345,7 +365,6 @@ fn write_parity_cassette(dir: &Path, read_path: &str) -> PathBuf {
                     "method": "POST",
                     "url": "https://api.anthropic.com/v1/messages",
                     "headers": [],
-                    "body": loose_request(),
                 },
                 "response": text_response,
             },
@@ -649,6 +668,7 @@ fn write_parity_artifact(
                     .iter()
                     .chain(COALESCABLE)
                     .chain(LIFECYCLE)
+                    .chain(BEHAVIOUR)
                 {
                     counts.insert((*name).to_string(), json!(events.count_of(name)));
                 }
@@ -662,6 +682,7 @@ fn write_parity_artifact(
                     "ordered_observation_sequence": events.ordered_observation,
                     "observation_kinds": events.kinds,
                     "lifecycle_kinds": events.lifecycle,
+                    "behaviour_kinds": events.behaviour,
                     "counts_per_kind": counts,
                     "raw_dispatch_records": run.raw,
                 })
@@ -874,7 +895,8 @@ fn extension_observation_events_are_identical_on_every_surface() {
     // The in-loop route must be surface-independent. If this fails while the
     // observation comparison passes, the two halves have drifted apart and the
     // split this whole design rests on is no longer true.
-    for run in runs.iter().filter(|run| run.outcome.is_some()) {
+    let driven_runs: Vec<&SurfaceRun> = runs.iter().filter(|run| run.outcome.is_some()).collect();
+    for run in &driven_runs {
         let events = run.outcome.as_ref().expect("driven surface has events");
         for name in LIFECYCLE {
             assert!(
@@ -886,6 +908,27 @@ fn extension_observation_events_are_identical_on_every_surface() {
             );
         }
     }
+
+    // Behaviour hooks are the other in-loop half. bd-82331 scoped itself around
+    // these being unaffected; this is what makes that a checked claim rather
+    // than a remembered one.
+    let behaviour_baseline = driven_runs[0];
+    let baseline_behaviour = &behaviour_baseline
+        .outcome
+        .as_ref()
+        .expect("driven surface has events")
+        .behaviour;
+    for run in driven_runs.iter().skip(1) {
+        let events = run.outcome.as_ref().expect("driven surface has events");
+        assert_eq!(
+            &events.behaviour, baseline_behaviour,
+            "{} ({}) received a different set of in-loop behaviour hooks than {} ({}). These are \
+             dispatched from inside the agent loop and must not vary by surface; a difference \
+             here means one of them has moved onto the per-surface route, which is how the \
+             observation half broke in the first place.",
+            run.name, run.owner, behaviour_baseline.name, behaviour_baseline.owner
+        );
+    }
 }
 
 /// Build a surface that delivered a full, healthy turn.
@@ -894,13 +937,19 @@ fn healthy_surface(name: &str) -> SurfaceRun {
         name: name.to_string(),
         owner: format!("src/{name}.rs"),
         outcome: Some(SurfaceEvents::from_names(vec![
+            "input".to_string(),
+            "before_agent_start".to_string(),
             "agent_start".to_string(),
             "turn_start".to_string(),
+            "context".to_string(),
+            "before_provider_request".to_string(),
             "message_start".to_string(),
             "message_update".to_string(),
             "message_end".to_string(),
+            "tool_call".to_string(),
             "tool_execution_start".to_string(),
             "tool_execution_end".to_string(),
+            "tool_result".to_string(),
             "turn_end".to_string(),
             "agent_end".to_string(),
         ])),
