@@ -2759,6 +2759,89 @@ mod tests {
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
     }
 
+    /// A fixture extension that observes and does nothing else.
+    fn observing_extension(dir: &Path) -> PathBuf {
+        let path = dir.join("observe.mjs");
+        std::fs::write(
+            &path,
+            "export default function (pi) {\n  pi.on(\"message_update\", async () => {});\n}\n",
+        )
+        .expect("write fixture extension");
+        path
+    }
+
+    /// An embedder that loads extensions and supplies no runtime gets one
+    /// built for the session (bd-8rvry).
+    ///
+    /// Without it the session works and its extensions observe nothing: the
+    /// coalescer `make_combined_callback` installs has nothing to spawn onto,
+    /// so `message_*` and `tool_execution_*` are never delivered, with no error
+    /// anywhere. That is bd-82331's failure moved from the in-tree surfaces,
+    /// which all supply a runtime now, to everyone outside this repo.
+    #[test]
+    fn extensions_without_a_supplied_runtime_get_one_built_for_them() {
+        let tmp = tempdir().expect("tempdir");
+        let mut options = hermetic_session_options(tmp.path());
+        options.extension_paths = vec![observing_extension(tmp.path())];
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+
+        assert!(
+            handle.session.extensions.is_some(),
+            "the fixture extension must load, or this test is asserting nothing"
+        );
+        assert!(
+            handle.event_runtime.is_some(),
+            "a session that loads extensions and was given no runtime must build one and own it"
+        );
+        assert!(
+            handle.session.runtime_handle().is_some(),
+            "the built runtime must be installed on the session, not merely held: the coalescer \
+             reads it from there"
+        );
+    }
+
+    /// A supplied runtime is used as-is; no second one appears (bd-8rvry).
+    #[test]
+    fn a_supplied_runtime_is_not_replaced_by_a_built_one() {
+        let tmp = tempdir().expect("tempdir");
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime for handle");
+        let mut options = hermetic_session_options(tmp.path());
+        options.extension_paths = vec![observing_extension(tmp.path())];
+        options.runtime_handle = Some(runtime.handle());
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+
+        assert!(
+            handle.event_runtime.is_none(),
+            "an embedder that supplied a runtime must not have a second one started behind its \
+             back: four worker threads appearing unasked is worse than the problem it solves"
+        );
+        assert!(
+            handle.session.runtime_handle().is_some(),
+            "the supplied handle must still be installed"
+        );
+    }
+
+    /// No extensions, no runtime, nothing allocated (bd-8rvry).
+    #[test]
+    fn a_session_without_extensions_builds_no_runtime() {
+        let tmp = tempdir().expect("tempdir");
+        let handle = run_async(create_agent_session(hermetic_session_options(tmp.path())))
+            .expect("create session");
+
+        assert!(
+            handle.session.extensions.is_none(),
+            "the hermetic options must not load extensions, or this test asserts nothing"
+        );
+        assert!(
+            handle.event_runtime.is_none(),
+            "a session with nothing to observe must not start worker threads for observation"
+        );
+    }
+
     #[test]
     fn create_agent_session_with_explicit_test_provider_succeeds() {
         let tmp = tempdir().expect("tempdir");
