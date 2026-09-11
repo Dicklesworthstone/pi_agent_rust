@@ -37,12 +37,13 @@ impl EventCoalescer {
         data: CoalescedPayload,
         runtime_handle: &asupersync::runtime::RuntimeHandle,
     ) {
-        let event_name_str = event.to_string();
-
-        // Fast path: skip entirely if no hooks registered.
-        if !self.manager.has_hook_for(&event_name_str) {
+        // Fast path: skip entirely if no hooks registered. Asked through
+        // `as_str`, before the owned name exists, so an event nothing
+        // subscribes to costs no allocation at all (bd-82331).
+        if !self.manager.has_hook_for(event.as_str()) {
             return;
         }
+        let event_name_str = event.to_string();
 
         if !is_coalescable_event(&event) {
             // Non-coalescable: buffer for batch dispatch.
@@ -201,8 +202,7 @@ impl EventCoalescer {
         if is_lifecycle_event(&event_name) {
             return;
         }
-        let event_name_str = event_name.to_string();
-        if !self.manager.has_hook_for(&event_name_str) {
+        if !self.manager.has_hook_for(event_name.as_str()) {
             return;
         }
         // Hook exists — defer serialization to the async task.

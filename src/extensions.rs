@@ -10121,7 +10121,24 @@ pub enum ExtensionEventName {
 
 impl std::fmt::Display for ExtensionEventName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ExtensionEventName {
+    /// The wire name, without allocating.
+    ///
+    /// The hot path needs this: every agent event asks `has_hook_for` whether
+    /// anything is listening before doing any work, and going through
+    /// [`std::fmt::Display`] to ask meant a `String` per event — on a streaming
+    /// turn, one allocation per token, paid by sessions whose extensions
+    /// subscribe to nothing. That is the opposite of the "subscribing to
+    /// nothing costs nothing" guarantee bd-82331 relies on when it builds a
+    /// coalescer unconditionally, so the check takes this instead and the
+    /// allocation happens only once something is actually listening.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
             Self::Startup => "startup",
             Self::Input => "input",
             Self::BeforeAgentStart => "before_agent_start",
@@ -10152,8 +10169,7 @@ impl std::fmt::Display for ExtensionEventName {
             Self::SessionBeforeTree => "session_before_tree",
             Self::SessionTree => "session_tree",
             Self::SessionShutdown => "session_shutdown",
-        };
-        write!(f, "{name}")
+        }
     }
 }
 

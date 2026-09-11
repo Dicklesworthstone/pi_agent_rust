@@ -4865,6 +4865,23 @@ impl ExtensionManager {
         let ctx_payload = self.get_or_build_ctx_payload().await;
 
         if let Some(runtime) = runtime {
+            // Same record `dispatch_event_value` emits, for the same reason:
+            // this is the host's own statement that an event reached
+            // extensions, and it is the only way an operator can answer "did my
+            // extension get this?". Logging it on one route and not the other
+            // made that answer depend on an internal detail — whether the event
+            // happened to be coalescable — which is invisible from outside
+            // (bd-82331). Emitted inside this branch because without a runtime
+            // nothing is dispatched and the line would be a lie.
+            for (event_name, _) in &filtered_events {
+                tracing::info!(
+                    event = "ext.event.start",
+                    event_name = %event_name,
+                    timeout_ms,
+                    batched = true,
+                    "Extension event dispatch start"
+                );
+            }
             let results = runtime
                 .dispatch_event_batch(filtered_events, ctx_payload, timeout_ms)
                 .await;

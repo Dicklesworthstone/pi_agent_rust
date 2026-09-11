@@ -345,10 +345,16 @@ pub struct SessionOptions {
     /// bd-82331 — the default interactive stack delivered lifecycle events and
     /// nothing else, silently, because no surface on this path supplied one.
     ///
-    /// A caller that omits it while extensions are loaded gets a debug line on
-    /// `pi::sdk` saying observation events will not be routed, rather than the
-    /// previous silence. Omitting it with no extensions loaded costs nothing
-    /// and is the normal case for an embedder that does not use them.
+    /// Omitting it while extensions are loaded makes
+    /// [`create_agent_session`] build a runtime for the session and say so at
+    /// debug on `pi::sdk`, so observation events still arrive (bd-8rvry). That
+    /// runtime lives on the returned handle and is shut down with it. Supply
+    /// one whenever the host already has a runtime: sharing it is cheaper than
+    /// the four worker threads the fallback starts, and it keeps extension
+    /// dispatch on the same executor as the rest of the host's work.
+    ///
+    /// Omitting it with no extensions loaded costs nothing and is the normal
+    /// case for an embedder that does not use them.
     pub runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
 
     /// Optional factory for the session's [`ToolRegistry`].
@@ -542,6 +548,14 @@ pub struct AgentSessionHandle {
     workspace: Option<crate::workspace::WorkspaceHandle>,
     /// MCP manager owned by this exact SDK session, when enabled.
     mcp_manager: Option<Arc<crate::mcp::McpManager>>,
+    /// Runtime this session built for itself because extensions were loaded and
+    /// the embedder supplied no [`SessionOptions::runtime_handle`] (bd-8rvry).
+    ///
+    /// Held only to keep it alive: the session uses it through the handle
+    /// installed on [`AgentSession`]. `None` is the common case — either the
+    /// embedder supplied a runtime, or no extension is loaded to observe with.
+    /// Dropping this handle shuts it down with everything else it owns.
+    event_runtime: Option<asupersync::runtime::Runtime>,
 }
 
 /// Snapshot of the current agent session state.
@@ -1397,6 +1411,12 @@ impl AgentSessionHandle {
     ///
     /// This is useful for tests and advanced embedding scenarios where
     /// the full `create_agent_session()` flow is not needed.
+    ///
+    /// No fallback event runtime is provisioned here, unlike
+    /// [`create_agent_session`]: the caller built the `AgentSession` itself and
+    /// owns the decision of what it dispatches on. If it carries extensions
+    /// that should observe, install a runtime on it with
+    /// `AgentSession::with_runtime_handle` first (bd-8rvry).
     pub const fn from_session_with_listeners(
         session: AgentSession,
         listeners: EventListeners,
@@ -1407,6 +1427,7 @@ impl AgentSessionHandle {
             ask_tool: None,
             workspace: None,
             mcp_manager: None,
+            event_runtime: None,
         }
     }
 
@@ -2558,6 +2579,47 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             .await?;
     }
 
+    // Extensions observe through a coalescer that spawns onto a runtime
+    // (bd-82331). Every surface in this repo now supplies one, but an embedder
+    // that loads extensions and omits `runtime_handle` would still get the four
+    // lifecycle events and nothing else, with no error — the exact failure
+    // bd-82331 existed to remove. Build one rather than leave the trap set for
+    // everyone outside this tree, and say so at debug: four worker threads
+    // appearing because you loaded an extension should not be a surprise
+    // (bd-8rvry).
+    //
+    // Gated on extensions actually being loaded, so a session that will never
+    // dispatch an observation event allocates nothing.
+    let event_runtime = if options.runtime_handle.is_none() && agent_session.extensions.is_some() {
+        match asupersync::runtime::RuntimeBuilder::new().build() {
+            Ok(runtime) => {
+                agent_session = agent_session.with_runtime_handle(runtime.handle());
+                tracing::debug!(
+                    target: "pi::sdk",
+                    "extensions are loaded and no runtime handle was supplied; built one so \
+                     message and tool-execution events reach them"
+                );
+                Some(runtime)
+            }
+            Err(err) => {
+                // Deliberately not fatal. Everything except extension
+                // observation still works, and refusing to create the session
+                // would be a worse trade than the degradation it replaces —
+                // but it is a warning, not a debug line, because the events
+                // really are being dropped.
+                tracing::warn!(
+                    target: "pi::sdk",
+                    error = %err,
+                    "extensions are loaded but no runtime could be built for them; message and \
+                     tool-execution events will not reach extensions on this session"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mcp_manager = if let Some(mcp) = &options.mcp {
         let global_dir = mcp.global_dir.clone().unwrap_or_else(Config::global_dir);
         let manager = Arc::new(crate::mcp::bootstrap_with_project_trust(
@@ -2611,6 +2673,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         ask_tool: ask_tool_handle,
         workspace: options.workspace.clone(),
         mcp_manager,
+        event_runtime,
     })
 }
 
