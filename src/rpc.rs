@@ -8376,6 +8376,158 @@ mod retry_tests {
         });
     }
 
+    /// bd-oqo03: a cap of one must not permanently block chain entry two.
+    ///
+    /// `retry.maxFailoversPerTurn` counts successful swaps WITHIN one logical
+    /// turn; `failover_chain_position` is durable process state that survives
+    /// turns. Comparing the two — which is what the original code did — means a
+    /// cap of one lets the first turn reach entry one and then refuses every
+    /// later turn forever, because the cursor is already at the cap. Two walks,
+    /// each the first swap of its own turn, must land on successive entries.
+    ///
+    /// The emitted events are the other half of bd-oqo03 and this is where the
+    /// two numbers visibly part company: both swaps are `attempt: 1` (each is
+    /// its turn's first) while `chainIndex` goes 0 then 1. Before the split
+    /// there was one field carrying the advanced cursor, and a consumer could
+    /// not tell a second turn's first swap from a first turn's second swap.
+    #[test]
+    fn rpc_failover_cap_of_one_still_reaches_the_next_entry_on_a_later_turn() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(Arc::new(AlwaysErrorProvider), tools, AgentConfig::default());
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                session_temp.path().join("sessions"),
+            ))));
+            let agent_session = AgentSession::new(
+                agent,
+                inner_session,
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let entry = |id: &str| crate::models::ModelEntry {
+                model: Model {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    api: "openai-completions".to_string(),
+                    provider: "openai".to_string(),
+                    base_url: "http://127.0.0.1:1/v1".to_string(),
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: HashMap::new(),
+                },
+                api_key: Some("fallback-key".to_string()),
+                headers: HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                fallback_chains: Some(HashMap::from([(
+                    "default".to_string(),
+                    vec![
+                        "openai/first-fallback".to_string(),
+                        "openai/second-fallback".to_string(),
+                    ],
+                )])),
+                // The cap under test. One successful swap per turn.
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: vec![entry("first-fallback"), entry("second-fallback")],
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
+                runtime_handle,
+                ask_tool: None,
+            };
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+            let cx = AgentCx::for_request();
+
+            // Turn one: its first (and, under the cap, only) swap.
+            assert!(
+                try_failover_to_next_chain_entry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    out_tx.clone(),
+                    &options,
+                    Some("server error"),
+                    false,
+                    None,
+                    0,
+                    &cx,
+                )
+                .await
+                .expect("turn one swap"),
+                "turn one must reach the first chain entry"
+            );
+
+            // Turn two: a fresh turn, so its own count starts at zero again.
+            assert!(
+                try_failover_to_next_chain_entry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    out_tx,
+                    &options,
+                    Some("server error"),
+                    false,
+                    None,
+                    0,
+                    &cx,
+                )
+                .await
+                .expect("turn two swap"),
+                "a cap of one must not block the next entry on a later turn: the durable cursor \
+                 is not the per-turn budget"
+            );
+
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            assert_eq!(guard.agent.provider().model_id(), "second-fallback");
+            drop(guard);
+
+            let starts: Vec<Value> = out_rx
+                .try_iter()
+                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                .filter(|value| value.get("type").and_then(Value::as_str) == Some("failover_start"))
+                .collect();
+            assert_eq!(starts.len(), 2, "one swap announced per turn: {starts:?}");
+            assert_eq!(starts[0]["toModel"], "first-fallback");
+            assert_eq!(starts[1]["toModel"], "second-fallback");
+            assert_eq!(
+                (&starts[0]["attempt"], &starts[1]["attempt"]),
+                (&Value::from(1), &Value::from(1)),
+                "each turn's first swap is attempt 1: {starts:?}"
+            );
+            assert_eq!(
+                (&starts[0]["chainIndex"], &starts[1]["chainIndex"]),
+                (&Value::from(0), &Value::from(1)),
+                "the durable cursor advances across turns: {starts:?}"
+            );
+        });
+    }
+
     #[test]
     fn rpc_failover_requires_tail_then_commits_restored_candidate() {
         let runtime = asupersync::runtime::RuntimeBuilder::new()
