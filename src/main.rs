@@ -8773,7 +8773,15 @@ async fn run_print_mode(
         // previous prompt's turn is finished and its `FailoverEnd
         // { restoredPrimary: false }` already closed, so this can open and
         // close its own `restoredPrimary: true` without interleaving.
-        maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
+        //
+        // The result is deliberately unused here. Every refusal leaves the
+        // fallback installed and the next prompt simply runs on it, which is
+        // the correct outcome and not something this loop can improve on; the
+        // `FailoverEnd` event is the report when a restoration does happen.
+        // `print_failover_walk_skips_current_keyless_and_duplicate_entries`
+        // covers the refusals, which is where the return value earns its keep.
+        let _restored =
+            maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
         reset_print_text_stream_state(&text_stream_state);
         let response = run_print_prompt_with_retry(
             session,
@@ -12664,6 +12672,117 @@ mod tests {
             assert_eq!(
                 failover_state.chain_position, 4,
                 "the walk is bounded by the chain length"
+            );
+
+            // bd-gm481.1: the restoration REFUSALS, which the e2e pair cannot
+            // reach — it can only observe the two outcomes, restored and not.
+            // Each of these leaves the fallback installed, which is the safe
+            // direction: a session on a working fallback beats one wrongly
+            // moved off it.
+            let (mut clean, _keep) = build_session();
+            let config = config_with_chain(&["anthropic/fallback-model"]);
+
+            // Nothing installed: there is nothing to come back from.
+            let mut empty = PrintFailoverState::new(&config);
+            assert!(
+                !maybe_restore_print_primary(&mut clean, &mut empty, failover_ctx, false).await,
+                "a session that never failed over must not be touched"
+            );
+            assert_eq!(clean.agent.provider().model_id(), "primary-model");
+
+            // Cooldown still holding: the primary just told us it was unwell.
+            let (mut swapped, _keep) = build_session();
+            let mut holding = PrintFailoverState::new(&config);
+            holding.cooldown = Some(pi::failover::CooldownTracker::new(600));
+            assert!(
+                try_print_failover(
+                    &mut swapped,
+                    &config,
+                    failover_ctx,
+                    &mut holding,
+                    Some("server error"),
+                    false,
+                    false,
+                    None,
+                    0,
+                )
+                .await
+                .expect("swap for the cooldown case")
+                .is_some()
+            );
+            assert!(
+                !maybe_restore_print_primary(&mut swapped, &mut holding, failover_ctx, false).await,
+                "the cooldown must hold the primary back"
+            );
+            assert_eq!(swapped.agent.provider().model_id(), "fallback-model");
+            assert!(
+                holding.active.is_some(),
+                "a refused restoration keeps the recorded fallback"
+            );
+
+            // The live model is no longer the fallback we recorded: something
+            // else moved it, and undoing that is not ours to do.
+            let (mut moved, _keep) = build_session();
+            let mut elapsed = PrintFailoverState::new(&config);
+            elapsed.cooldown = Some(pi::failover::CooldownTracker::new(0));
+            assert!(
+                try_print_failover(
+                    &mut moved,
+                    &config,
+                    failover_ctx,
+                    &mut elapsed,
+                    Some("server error"),
+                    false,
+                    false,
+                    None,
+                    0,
+                )
+                .await
+                .expect("swap for the drift case")
+                .is_some()
+            );
+            elapsed.active = Some(("anthropic".to_string(), "some-other-model".to_string()));
+            assert!(
+                !maybe_restore_print_primary(&mut moved, &mut elapsed, failover_ctx, false).await,
+                "a runtime that does not match the recorded fallback must not be swapped"
+            );
+            assert_eq!(moved.agent.provider().model_id(), "fallback-model");
+
+            // And the control: cooldown elapsed, everything consistent.
+            let (mut restorable, _keep) = build_session();
+            let mut ready = PrintFailoverState::new(&config);
+            ready.cooldown = Some(pi::failover::CooldownTracker::new(0));
+            assert!(
+                try_print_failover(
+                    &mut restorable,
+                    &config,
+                    failover_ctx,
+                    &mut ready,
+                    Some("server error"),
+                    false,
+                    false,
+                    None,
+                    0,
+                )
+                .await
+                .expect("swap for the restore case")
+                .is_some()
+            );
+            assert_eq!(restorable.agent.provider().model_id(), "fallback-model");
+            assert!(
+                maybe_restore_print_primary(&mut restorable, &mut ready, failover_ctx, false).await,
+                "an elapsed cooldown with consistent state restores"
+            );
+            assert_eq!(restorable.agent.provider().model_id(), "primary-model");
+            assert_eq!(
+                restorable.agent.stream_options().api_key.as_deref(),
+                Some("primary-key"),
+                "restoring installs the primary's credential, not the fallback's"
+            );
+            assert!(ready.primary.is_none() && ready.active.is_none());
+            assert_eq!(
+                ready.chain_position, 0,
+                "back on the primary, the chain starts over"
             );
         });
     }
