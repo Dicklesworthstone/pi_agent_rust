@@ -345,8 +345,10 @@ pub struct SessionOptions {
     /// bd-82331 — the default interactive stack delivered lifecycle events and
     /// nothing else, silently, because no surface on this path supplied one.
     ///
-    /// A caller that omits it gets a debug line saying observation events will
-    /// not be routed, rather than the previous silence.
+    /// A caller that omits it while extensions are loaded gets a debug line on
+    /// `pi::sdk` saying observation events will not be routed, rather than the
+    /// previous silence. Omitting it with no extensions loaded costs nothing
+    /// and is the normal case for an embedder that does not use them.
     pub runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
 
     /// Optional factory for the session's [`ToolRegistry`].
@@ -2022,14 +2024,27 @@ impl AgentSessionHandle {
         // this is the single fan-out point every SDK event travels through, so
         // a future SDK-based surface inherits the routing instead of having to
         // remember it.
+        //
+        // Construction is deliberately unconditional when extensions exist.
+        // Gating it on `has_any_event_hooks()` here would save four `Arc`
+        // allocations per prompt and would be wrong: that answer is computed
+        // once, at the start of the turn, while an extension may register a
+        // handler part-way through it. The correct fast path is the per-event
+        // `has_hook_for` check inside `dispatch_agent_event_lazy`, which
+        // re-reads the manager's lock-free snapshot on every event and returns
+        // before serializing when nothing is listening. That is where the
+        // "subscribes to nothing costs nothing" guarantee actually lives.
         let coalescer = self
             .extension_manager()
             .map(|manager| crate::extensions::EventCoalescer::new(manager.clone()));
         let event_runtime = self.session.runtime_handle().cloned();
         if coalescer.is_some() && event_runtime.is_none() {
             // Nothing to spawn onto: the routing cannot work and would fail
-            // silently, which is the exact shape of the bug this fixes. Say so
-            // once rather than pretend the events were delivered.
+            // silently, which is the exact shape of the bug this fixes. Emitted
+            // per prompt rather than once, deliberately — a single line at
+            // startup is easy to scroll past, and the condition is static, so
+            // repeating it costs nothing and makes it findable from any point
+            // in a session transcript.
             tracing::debug!(
                 target: "pi::sdk",
                 "extensions are loaded but this session has no runtime handle; \

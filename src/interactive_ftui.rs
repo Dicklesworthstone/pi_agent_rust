@@ -3812,7 +3812,34 @@ fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::Ses
     // The replacement session must receive the live handler created by this
     // driver's reply channel, never retain an earlier handler instance.
     template.extension_ui_handler = None;
+    // Likewise the runtime handle: the template is built on the UI thread
+    // before the driver thread's runtime exists, so it cannot carry one.
+    // `replacement_options` installs the live one at each construction site.
+    template.runtime_handle = None;
     template
+}
+
+/// Everything a `/new` or `/resume` replacement session must be given that the
+/// launch template cannot carry.
+///
+/// Both replacement paths clone the same template and then had to repeat the
+/// same wirings independently, which is how `runtime_handle` came to be missing
+/// from both. The symptom is invisible: the session works, and extensions
+/// simply stop receiving `message_*` and `tool_execution_*` after the first
+/// `/new` or `/resume`, because the SDK coalescer built for the replacement has
+/// nothing to dispatch onto (bd-82331). One function, so there is one place to
+/// forget and a test that watches it.
+fn replacement_options(
+    template: &crate::sdk::SessionOptions,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> crate::sdk::SessionOptions {
+    let mut options = template.clone();
+    options.extension_ui_handler =
+        Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
+    options.runtime_handle = Some(runtime_handle.clone());
+    options.no_session = false;
+    options
 }
 
 /// Match the bubbletea stack's interactive extension-command budget.
@@ -4058,15 +4085,13 @@ async fn new_session_command(
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) -> std::result::Result<(), String> {
     let (provider, model_id) = handle.model();
-    let mut options = template.clone();
+    let mut options = replacement_options(template, ext_handler, runtime_handle);
+    // `thinking` is deliberately left as the template carries it: that is the
+    // launch selection, and a `None` there lets session creation re-resolve the
+    // configured default rather than force-resetting to off (issue #197).
     options.provider = Some(provider.clone());
     options.model = Some(model_id.clone());
     options.session_path = None;
-    options.extension_ui_handler =
-        Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
-    // `template.thinking` carries the launch selection; `None` lets session
-    // creation re-resolve the configured default (issue #197).
-    options.no_session = false;
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
             let prepared = match handle.preflight_replacement().await {
@@ -4385,11 +4410,8 @@ async fn resume_session_command(
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) -> std::result::Result<(), String> {
-    let mut options = template.clone();
+    let mut options = replacement_options(template, ext_handler, runtime_handle);
     options.session_path = Some(std::path::PathBuf::from(path));
-    options.extension_ui_handler =
-        Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
-    options.no_session = false;
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
             let prepared = match handle.preflight_replacement().await {
@@ -4905,6 +4927,50 @@ mod tests {
         assert_eq!(
             mcp.global_dir,
             Some(std::path::PathBuf::from("isolated-global"))
+        );
+        assert!(
+            template.runtime_handle.is_none(),
+            "the template is built before the driver runtime exists, so it must not pretend to \
+             carry a handle; `replacement_options` installs the live one (bd-82331)"
+        );
+    }
+
+    /// A `/new` or `/resume` replacement keeps extensions observing (bd-82331).
+    ///
+    /// The launch path installs a runtime handle on the session it builds, but
+    /// both replacement paths clone the launch *template*, which cannot carry
+    /// one. Without this the session still works and extensions simply stop
+    /// receiving `message_*` and `tool_execution_*` the moment the user runs
+    /// `/new` or `/resume` — no error, no warning, on the default stack.
+    #[test]
+    fn replacement_options_install_the_driver_runtime_and_ui_handler() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime for handle");
+        let runtime_handle = runtime.handle();
+        let (agent_tx, _agent_rx) = mpsc::channel::<PiMsg>();
+        let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx));
+        let template = resume_template_from(&crate::sdk::SessionOptions {
+            no_session: true,
+            ..crate::sdk::SessionOptions::default()
+        });
+
+        let options = replacement_options(&template, &ext_handler, &runtime_handle);
+
+        assert!(
+            options.runtime_handle.is_some(),
+            "a replacement session must be handed the driver runtime, or the SDK coalescer it \
+             builds has nothing to dispatch onto and extension observation events are silently \
+             dropped for the rest of the session (bd-82331)"
+        );
+        assert!(
+            options.extension_ui_handler.is_some(),
+            "a replacement session must be handed this driver's live UI handler, never an \
+             earlier instance"
+        );
+        assert!(
+            !options.no_session,
+            "a replacement session is always persisted, whatever the launch flags said"
         );
     }
 

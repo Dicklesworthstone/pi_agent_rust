@@ -12075,8 +12075,13 @@ impl AgentSession {
         self
     }
 
-    /// The runtime this session dispatches background work on, when one was
-    /// installed by [`Self::with_runtime_handle`].
+    /// The runtime this session dispatches background work on, if it has one.
+    ///
+    /// Set either explicitly by [`Self::with_runtime_handle`] or lazily by
+    /// `compaction_runtime_handle` when background compaction first needs a
+    /// runtime and none was supplied. So a `Some` here does not imply a caller
+    /// provided it, and a `None` means nothing has needed one yet — not that
+    /// none will ever exist.
     ///
     /// Exposed for surfaces that need to route agent events to extensions:
     /// `EventCoalescer::dispatch_agent_event_lazy` spawns onto a runtime, and

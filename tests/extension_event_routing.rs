@@ -4,16 +4,17 @@
 //!
 //! ## Why a source-inventory test rather than a behavioural one
 //!
-//! AgentEvents reach extensions by two routes. The four lifecycle events
+//! `AgentEvent`s reach extensions by two routes. The four lifecycle events
 //! (`agent_start`, `agent_end`, `turn_start`, `turn_end`) are dispatched from
-//! inside the agent loop, so every surface gets them for free. Everything else
-//! — `message_start`, `message_update`, `message_end`, `tool_execution_start`,
-//! `tool_execution_end` — reaches extensions only if the surface routes its own
-//! event stream through `EventCoalescer::dispatch_agent_event_lazy`.
+//! inside the agent loop, so every surface gets them for free. The six
+//! observation events — `message_start`, `message_update`, `message_end`,
+//! `tool_execution_start`, `tool_execution_update`, `tool_execution_end` —
+//! reach extensions only if the surface routes its own event stream through
+//! `EventCoalescer::dispatch_agent_event_lazy`.
 //!
 //! That is a per-surface obligation with no compiler support, and two of five
 //! surfaces did not meet it: the SDK path, and therefore the default
-//! FrankenTUI interactive stack, delivered lifecycle events and nothing else.
+//! `FrankenTUI` interactive stack, delivered lifecycle events and nothing else.
 //! There was no error and no warning, because the events were never routed
 //! rather than dropped in transit. An extension that observes looked installed
 //! and did nothing, on the stack most users run.
@@ -43,6 +44,13 @@ struct Surface {
 }
 
 /// The complete set of surfaces that build an agent-event callback.
+///
+/// Four rows for the five surfaces named above: the ftui stack has no callback
+/// of its own, it drives the SDK handle, so `src/sdk.rs` is where its
+/// obligation is discharged and a separate row would assert the same file
+/// twice. The ftui half is covered by
+/// `the_sdk_session_can_be_given_a_runtime_to_dispatch_events_on`, which pins
+/// the other thing ftui owes: handing the SDK a runtime to dispatch onto.
 ///
 /// Adding a surface means adding a row. A row with `routes: false` must carry a
 /// reason that survives review.
@@ -85,6 +93,32 @@ fn read(path: &Path) -> String {
 /// The routing call every surface owes its extensions.
 const ROUTING_CALL: &str = "dispatch_agent_event_lazy";
 
+/// Does this source make the call on a line that is not a line comment?
+///
+/// A plain `contains` would pass on a commented-out call, which is exactly how
+/// a surface would most plausibly lose its routing: somebody comments it out to
+/// debug something and it never comes back. This does not understand block
+/// comments or strings, and it does not need to — it needs to notice the one
+/// mistake that actually happens.
+fn has_live_call(source: &str, call: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with("//") && trimmed.contains(call)
+    })
+}
+
+/// Is `needle` present in `haystack`, ignoring every whitespace character?
+///
+/// Used for declarations whose exact text matters but whose line breaks do
+/// not. rustfmt decides the wrapping; squeezing whitespace out of both sides
+/// means it can rewrap freely without the assertion going stale, and without
+/// weakening it into a substring match that a half-right declaration would
+/// also satisfy.
+fn contains_ignoring_whitespace(haystack: &str, needle: &str) -> bool {
+    let squeeze = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    squeeze(haystack).contains(&squeeze(needle))
+}
+
 #[test]
 fn every_agent_driving_surface_routes_observation_events_to_extensions() {
     let root = project_root();
@@ -93,7 +127,7 @@ fn every_agent_driving_surface_routes_observation_events_to_extensions() {
     for surface in SURFACES {
         let path = root.join(surface.file);
         let source = read(&path);
-        let routes = source.contains(ROUTING_CALL);
+        let routes = has_live_call(&source, ROUTING_CALL);
 
         if routes != surface.routes {
             missing.push(format!(
@@ -138,6 +172,8 @@ fn the_surface_inventory_lists_every_file_that_builds_a_coalescer() {
         "src/extensions/event_coalescer_impl.rs",
         "src/extensions/extension_manager_impl.rs",
     ];
+    // Paths here are forward-slash normalised by `collect_coalescer_builders`,
+    // so this rule holds on Windows too.
     let is_test_module = |path: &str| path.contains("/tests/") || path.ends_with("_tests.rs");
     let listed: Vec<&str> = SURFACES.iter().map(|s| s.file).collect();
 
@@ -166,10 +202,16 @@ fn collect_coalescer_builders(dir: &Path, root: &Path, out: &mut Vec<String>) {
             collect_coalescer_builders(&path, root, out);
         } else if path.extension().is_some_and(|e| e == "rs") {
             let source = read(&path);
-            if source.contains("EventCoalescer::new") {
-                if let Ok(rel) = path.strip_prefix(root) {
-                    out.push(rel.display().to_string());
-                }
+            if source.contains("EventCoalescer::new")
+                && let Ok(rel) = path.strip_prefix(root)
+            {
+                // Normalise to forward slashes. `Path::display` yields
+                // backslashes on Windows, which would make every comparison
+                // below — against the SURFACES table, the ignore list, and the
+                // test-module rule — silently fail to match, turning this whole
+                // test into a no-op on the platform the project ships a binary
+                // for.
+                out.push(rel.display().to_string().replace('\\', "/"));
             }
         }
     }
@@ -187,21 +229,29 @@ fn collect_coalescer_builders(dir: &Path, root: &Path, out: &mut Vec<String>) {
 fn the_sdk_session_can_be_given_a_runtime_to_dispatch_events_on() {
     let root = project_root();
     let sdk = read(&root.join("src/sdk.rs"));
+    // Asserted whitespace-insensitively rather than against a formatted line:
+    // rustfmt is free to wrap any of these, and a test that breaks on reflow
+    // gets deleted rather than fixed. Squeezing the whitespace out of both
+    // sides keeps the assertion exact — the field, its visibility and its type
+    // — without pinning the line breaks.
     assert!(
-        sdk.contains("pub runtime_handle: Option<asupersync::runtime::RuntimeHandle>"),
+        contains_ignoring_whitespace(
+            &sdk,
+            "pub runtime_handle: Option<asupersync::runtime::RuntimeHandle>"
+        ),
         "SessionOptions must carry a runtime handle: without one the coalescer installed on this \
          path has nothing to dispatch onto and extension observation events are silently dropped \
          (bd-82331)"
     );
     assert!(
-        sdk.contains("agent_session.with_runtime_handle(handle)"),
+        has_live_call(&sdk, "with_runtime_handle("),
         "create_agent_session must install the supplied runtime handle on the session it builds; \
          carrying the option without applying it is the same bug one layer down (bd-82331)"
     );
 
     let ftui = read(&root.join("src/interactive_ftui.rs"));
     assert!(
-        ftui.contains("session_options.runtime_handle = Some(runtime_handle.clone())"),
+        has_live_call(&ftui, "session_options.runtime_handle"),
         "the ftui driver must hand its own runtime to the SDK session, or the default interactive \
          stack routes nothing (bd-82331)"
     );

@@ -217,7 +217,11 @@ mod tests {
     use super::{
         AgentEvent, ExtensionEventName, extension_event_name_from_agent, is_lifecycle_event,
     };
-    use crate::model::{Message, UserContent, UserMessage};
+    use crate::model::{
+        AssistantMessage, AssistantMessageEvent, Message, UserContent, UserMessage,
+    };
+    use crate::tools::ToolOutput;
+    use std::sync::Arc;
 
     /// The two-route split this file depends on, pinned (bd-82331).
     ///
@@ -248,6 +252,7 @@ mod tests {
             ExtensionEventName::MessageUpdate,
             ExtensionEventName::MessageEnd,
             ExtensionEventName::ToolExecutionStart,
+            ExtensionEventName::ToolExecutionUpdate,
             ExtensionEventName::ToolExecutionEnd,
         ];
         for name in observation {
@@ -259,25 +264,87 @@ mod tests {
         }
     }
 
-    /// An AgentEvent that maps to no extension event name is dropped before
-    /// any work, which is the outermost layer of the no-cost guarantee.
+    /// Every observation event an agent can emit maps to the extension event
+    /// name extensions subscribe to (bd-82331).
+    ///
+    /// `dispatch_agent_event_lazy` returns early when
+    /// `extension_event_name_from_agent` yields `None`, which is correct for
+    /// the events extensions have no concept of (`auto_retry_*`,
+    /// `failover_*`, `provider_error`, …). The match in that function is
+    /// exhaustive, so a *new* `AgentEvent` variant cannot be forgotten — the
+    /// compiler demands an arm. What the compiler cannot catch is an existing
+    /// observation variant being folded into the trailing `=> None` group, or
+    /// wired to the wrong name: both compile, both are silent, and both stop
+    /// extensions receiving an event they are registered for with no error
+    /// anywhere. So assert the exact name, for all six, rather than merely
+    /// `is_some()`.
     #[test]
-    fn events_without_an_extension_name_are_dropped_before_dispatch() {
-        // MessageStart maps to a name; a synthetic event that does not is the
-        // interesting case, but every current variant maps. Assert the mapping
-        // is total for the observation set instead, so a new variant that
-        // silently maps to None is caught here rather than by an extension
-        // that stops receiving it.
-        let message_start = AgentEvent::MessageStart {
-            message: Message::User(UserMessage {
+    fn every_observation_event_maps_to_an_extension_event_name() {
+        let message = || {
+            Message::User(UserMessage {
                 content: UserContent::Text("probe".to_string()),
                 timestamp: 1_700_000_000,
-            }),
+            })
         };
-        assert!(
-            extension_event_name_from_agent(&message_start).is_some(),
-            "message_start must map to an extension event name; a None here means extensions \
-             silently stop seeing it"
-        );
+        let tool_output = || ToolOutput {
+            content: Vec::new(),
+            details: None,
+            is_error: false,
+        };
+        let events = [
+            (
+                AgentEvent::MessageStart { message: message() },
+                ExtensionEventName::MessageStart,
+            ),
+            (
+                AgentEvent::MessageUpdate {
+                    message: message(),
+                    assistant_message_event: AssistantMessageEvent::Start {
+                        partial: Arc::new(AssistantMessage::default()),
+                    },
+                },
+                ExtensionEventName::MessageUpdate,
+            ),
+            (
+                AgentEvent::MessageEnd { message: message() },
+                ExtensionEventName::MessageEnd,
+            ),
+            (
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "probe".to_string(),
+                    args: serde_json::Value::Null,
+                },
+                ExtensionEventName::ToolExecutionStart,
+            ),
+            (
+                AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "probe".to_string(),
+                    args: serde_json::Value::Null,
+                    partial_result: tool_output(),
+                },
+                ExtensionEventName::ToolExecutionUpdate,
+            ),
+            (
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "probe".to_string(),
+                    result: tool_output(),
+                    is_error: false,
+                },
+                ExtensionEventName::ToolExecutionEnd,
+            ),
+        ];
+        for (event, expected) in events {
+            let actual = extension_event_name_from_agent(&event);
+            assert_eq!(
+                actual,
+                Some(expected),
+                "this observation event must map to {expected:?}; a None means extensions \
+                 silently stop seeing it and a different name means it is delivered to the \
+                 wrong subscribers — neither reports the loss (bd-82331)"
+            );
+        }
     }
 }
