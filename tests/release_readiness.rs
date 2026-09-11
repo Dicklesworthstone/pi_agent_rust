@@ -1168,35 +1168,6 @@ fn ensure_must_pass_worktree_matches_commit(
         ));
     }
 
-    let mut untracked_command = std::process::Command::new("git");
-    untracked_command
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "--others", "-z", "--"])
-        .args(source_paths);
-    let untracked_output = untracked_command
-        .output()
-        .map_err(|err| format!("failed to list untracked must-pass source inputs: {err}"))?;
-    if !untracked_output.status.success() {
-        return Err(format!(
-            "git ls-files failed while checking untracked must-pass inputs: {}",
-            String::from_utf8_lossy(&untracked_output.stderr).trim()
-        ));
-    }
-    let untracked = String::from_utf8(untracked_output.stdout)
-        .map_err(|err| format!("git ls-files returned non-UTF-8 untracked paths: {err}"))?;
-    let untracked = untracked
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .take(5)
-        .collect::<Vec<_>>();
-    if !untracked.is_empty() {
-        return Err(format!(
-            "must-pass source inputs contain untracked files: {}",
-            untracked.join(", ")
-        ));
-    }
-
     let flag_output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -1225,35 +1196,302 @@ fn ensure_must_pass_worktree_matches_commit(
         ));
     }
 
-    for (label, diff_args) in [
-        ("worktree", vec!["diff", "--quiet", "--no-ext-diff", "--"]),
-        (
-            "index",
-            vec!["diff", "--cached", "--quiet", "--no-ext-diff", commit, "--"],
-        ),
-    ] {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(diff_args)
-            .args(source_paths)
-            .status()
-            .map_err(|err| format!("failed to inspect must-pass source dirt: {err}"))?;
-        match status.code() {
-            Some(0) => {}
-            Some(1) => {
-                return Err(format!(
-                    "must-pass source inputs differ in the {label}; commit them before generating release evidence"
-                ));
-            }
-            code => {
-                return Err(format!(
-                    "git diff failed while inspecting must-pass source inputs (status {code:?})"
-                ));
-            }
+    let records = must_pass_tree_records(root, commit, source_paths)?;
+    ensure_committed_paths_match_worktree(root, &records)?;
+    ensure_no_uncommitted_files_under(root, source_paths, &records)?;
+    ensure_index_matches_commit_when_readable(root, commit, source_paths, &records)?;
+
+    Ok(())
+}
+
+/// Number of paths handed to one `git hash-object` invocation.
+///
+/// One process for the whole must-pass set would be fine today (245 files), but
+/// the set grows, and a command line that grows with it eventually meets
+/// `ARG_MAX`. Chunking costs one extra process per 200 files and removes the
+/// cliff entirely.
+const WORKTREE_HASH_CHUNK: usize = 200;
+
+/// Confirm every file the commit records is byte-identical in the worktree.
+///
+/// Index-free, and deliberately so. This used to be `git diff --quiet` against
+/// the worktree and `git diff --cached --quiet` against the commit, both of
+/// which route through `.git/index`. `rch` carries a compiled-in transfer
+/// exclusion for `.git/index` (`rch config show`, `exclude_patterns`), so a
+/// remote worker runs these gates against the working tree laid over whatever
+/// index its checkout already had: `git diff` there compares real files to
+/// stale index entries and reports drift that does not exist, or misses drift
+/// that does. `git hash-object` reads the file and applies the same
+/// attribute-driven conversion `git add` would, so comparing its output to the
+/// blob id in the commit is an exact content comparison that never consults the
+/// index at all (bd-zy2ma).
+fn ensure_committed_paths_match_worktree(
+    root: &Path,
+    records: &[(String, String, String)],
+) -> Result<(), String> {
+    let mut missing = Vec::new();
+    let mut present: Vec<(&str, &str, &str)> = Vec::new();
+    for (path, mode, blob) in records {
+        if root.join(path).is_file() {
+            present.push((path.as_str(), mode.as_str(), blob.as_str()));
+        } else {
+            missing.push(path.clone());
         }
     }
+    if !missing.is_empty() {
+        missing.sort();
+        missing.truncate(5);
+        return Err(format!(
+            "must-pass source inputs are in the commit but absent from the worktree: {}",
+            missing.join(", ")
+        ));
+    }
 
+    let paths: Vec<&str> = present.iter().map(|(path, _, _)| *path).collect();
+    let observed = worktree_blob_ids(root, &paths)?;
+
+    let file_mode_is_tracked = git_tracks_file_mode(root);
+    let mut differing = Vec::new();
+    for ((path, mode, blob), actual) in present.iter().zip(observed.iter()) {
+        if actual.as_str() != *blob {
+            differing.push(format!("{path} (content)"));
+        } else if file_mode_is_tracked && !worktree_mode_matches(root, path, mode) {
+            differing.push(format!("{path} (mode)"));
+        }
+    }
+    if !differing.is_empty() {
+        differing.sort();
+        differing.truncate(5);
+        return Err(format!(
+            "must-pass source inputs differ in the worktree from the commit they are being bound to; commit them before generating release evidence: {}",
+            differing.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+/// Compare the index to the commit, but only where the index can be believed.
+///
+/// The worktree is what the evidence binds to, and the checks above settle it
+/// without the index. This one is kept because it caught a real thing the
+/// others do not: content staged and then reverted on disk, which leaves the
+/// worktree honest and the repository in a state the author probably did not
+/// mean. It cannot be asked on an rch worker, whose index is missing whatever
+/// the last transfer added (`rch config show`, `exclude_patterns` drops
+/// `.git/index`), and asking anyway would fail the gate on a lie. So it is
+/// asked only when the index still knows every path the commit records, and
+/// skipped explicitly otherwise — a check that reports "I could not tell" by
+/// staying silent is worth more than one that reports a confident wrong answer
+/// (bd-zy2ma).
+fn ensure_index_matches_commit_when_readable(
+    root: &Path,
+    commit: &str,
+    source_paths: &[&str],
+    records: &[(String, String, String)],
+) -> Result<(), String> {
+    if !index_knows_every_path(root, source_paths, records) {
+        return Ok(());
+    }
+
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--cached", "--quiet", "--no-ext-diff", commit, "--"])
+        .args(source_paths)
+        .status()
+        .map_err(|err| format!("failed to inspect must-pass source dirt: {err}"))?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(1) => Err(
+            "must-pass source inputs differ in the index; commit them before generating release evidence"
+                .to_string(),
+        ),
+        code => Err(format!(
+            "git diff failed while inspecting must-pass source inputs (status {code:?})"
+        )),
+    }
+}
+
+/// Does the index still list every path the commit records?
+///
+/// A `false` means the index is not a usable answer for these paths — either
+/// absent, or behind the tree it is supposed to describe. Never an error: not
+/// being able to consult the index is a property of the environment, not a
+/// finding about the source.
+fn index_knows_every_path(
+    root: &Path,
+    source_paths: &[&str],
+    records: &[(String, String, String)],
+) -> bool {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--"])
+        .args(source_paths)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    let indexed: BTreeSet<&str> = stdout.split('\0').filter(|path| !path.is_empty()).collect();
+    records
+        .iter()
+        .all(|(path, _, _)| indexed.contains(path.as_str()))
+}
+
+/// Blob ids for the worktree content of `paths`, in the order given.
+fn worktree_blob_ids(root: &Path, paths: &[&str]) -> Result<Vec<String>, String> {
+    let mut ids = Vec::with_capacity(paths.len());
+    for chunk in paths.chunks(WORKTREE_HASH_CHUNK) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["hash-object", "--"])
+            .args(chunk)
+            .output()
+            .map_err(|err| format!("failed to hash must-pass worktree content: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git hash-object failed for must-pass source inputs: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("git hash-object returned non-UTF-8 ids: {err}"))?;
+        let before = ids.len();
+        ids.extend(stdout.split_ascii_whitespace().map(str::to_string));
+        let produced = ids.len() - before;
+        if produced != chunk.len() {
+            return Err(format!(
+                "git hash-object returned {produced} ids for {} must-pass paths",
+                chunk.len()
+            ));
+        }
+    }
+    Ok(ids)
+}
+
+/// Does Git track the executable bit in this checkout?
+///
+/// Unset means Git's own default, which is true on unix and false on Windows.
+/// Asking rather than assuming keeps the mode comparison from failing every
+/// file on a checkout that has deliberately turned `core.fileMode` off.
+fn git_tracks_file_mode(root: &Path) -> bool {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "core.fileMode"])
+        .output()
+    else {
+        return cfg!(unix);
+    };
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "true" => true,
+        "false" => false,
+        _ => cfg!(unix),
+    }
+}
+
+#[cfg(unix)]
+fn worktree_mode_matches(root: &Path, path: &str, mode: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(metadata) = std::fs::metadata(root.join(path)) else {
+        return false;
+    };
+    let executable = metadata.permissions().mode() & 0o111 != 0;
+    (mode == "100755") == executable
+}
+
+#[cfg(not(unix))]
+fn worktree_mode_matches(_root: &Path, _path: &str, _mode: &str) -> bool {
+    // Git does not track the executable bit here; `git_tracks_file_mode`
+    // already gates the caller, so this is only reached if it was overridden.
+    true
+}
+
+/// Confirm nothing sits under a must-pass path that the commit does not record.
+///
+/// Replaces `git ls-files --others`, which answers from `.git/index` and so
+/// calls every committed-but-not-in-this-index file untracked on an rch worker
+/// — failing the gate on exactly the files a change just added (bd-zy2ma).
+/// Walking the directory and subtracting the commit's own tree answers the same
+/// question from the two sources that are actually present and current.
+///
+/// Ignored files are rejected here too, matching what bare `--others` did: this
+/// gate wants a must-pass path to contain nothing but what it is binding to.
+fn ensure_no_uncommitted_files_under(
+    root: &Path,
+    source_paths: &[&str],
+    records: &[(String, String, String)],
+) -> Result<(), String> {
+    let committed: BTreeSet<&str> = records.iter().map(|(path, _, _)| path.as_str()).collect();
+    let mut on_disk = Vec::new();
+    for source in source_paths {
+        collect_worktree_files(root, source, &mut on_disk)?;
+    }
+
+    let mut extra: Vec<String> = on_disk
+        .into_iter()
+        .filter(|path| !committed.contains(path.as_str()))
+        .collect();
+    if extra.is_empty() {
+        return Ok(());
+    }
+
+    extra.sort();
+    extra.truncate(5);
+    Err(format!(
+        "must-pass source inputs contain untracked files that are not in the commit: {}",
+        extra.join(", ")
+    ))
+}
+
+/// Every regular file under `relative`, as repo-relative forward-slash paths.
+///
+/// Symlinks are reported as files rather than followed: `must_pass_tree_records`
+/// accepts only blob modes 100644 and 100755, so a symlink under a must-pass
+/// path is something the caller must be told about, and following one risks a
+/// cycle.
+fn collect_worktree_files(
+    root: &Path,
+    relative: &str,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let absolute = root.join(relative);
+    let metadata = match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        // A must-pass path that is not on disk is reported by the
+        // commit-side comparison, which names the specific missing files.
+        Err(_) => return Ok(()),
+    };
+    if !metadata.is_dir() {
+        out.push(relative.to_string());
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(&absolute)
+        .map_err(|err| format!("failed to read must-pass directory {relative}: {err}"))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| format!("failed to read must-pass entry under {relative}: {err}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(format!(
+                "must-pass source inputs contain a non-UTF-8 name under {relative}"
+            ));
+        };
+        // Never descend into a nested repository's metadata.
+        if name == ".git" {
+            continue;
+        }
+        collect_worktree_files(root, &format!("{relative}/{name}"), out)?;
+    }
     Ok(())
 }
 

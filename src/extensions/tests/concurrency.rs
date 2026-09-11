@@ -2497,3 +2497,198 @@ mod hostcall_protocol_equivalence {
         assert_eq!(artifacts.args_shape_hash, again.args_shape_hash);
     }
 }
+
+// ========================================================================
+// Coalescer cost and batching contract (bd-82331)
+// ========================================================================
+
+/// An extension that subscribes to nothing costs nothing.
+///
+/// This is the guarantee bd-82331 rests on when it makes coalescer
+/// construction unconditional on every surface: the per-event `has_hook_for`
+/// check must return before any work happens. "Costs nothing" is checked by the
+/// only thing that can be observed from outside — the lazy payload is never
+/// resolved, so nothing is serialized — plus the coalescer never taking an
+/// in-flight marker or buffering, which is what a spawn would require.
+///
+/// Written as a burst rather than one event because the cost that matters is
+/// per-event: a streaming turn emits `message_update` continuously, and the
+/// question is whether each one is free, not whether the first one is.
+#[test]
+fn event_coalescer_without_a_subscriber_resolves_nothing_and_never_spawns() {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+    let handle = runtime.handle();
+    // Registered, but hooked to a DIFFERENT event: the realistic shape of "an
+    // extension is loaded and does not observe this", which an empty manager
+    // would not exercise.
+    let manager = coalescer_test_manager_with_hooks(&[ExtensionEventName::SessionStart]);
+    let coalescer = EventCoalescer::new(manager);
+    let resolved = Arc::new(Mutex::new(Vec::new()));
+
+    for sequence in 1..=64 {
+        coalescer.dispatch_fire_and_forget(
+            ExtensionEventName::MessageUpdate,
+            coalescer_recording_payload(sequence, &resolved),
+            &handle,
+        );
+        coalescer.dispatch_fire_and_forget(
+            ExtensionEventName::MessageStart,
+            coalescer_recording_payload(sequence, &resolved),
+            &handle,
+        );
+    }
+
+    assert!(
+        resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "no payload may be serialized for an event nothing subscribes to; a non-empty list here \
+         means every streaming token is paying for a listener that does not exist"
+    );
+    assert!(
+        coalescer
+            .batch_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "an unsubscribed event must not be buffered for a batch drain"
+    );
+    assert_coalescer_idle(&coalescer);
+}
+
+/// A burst of updates dispatches the first and the latest, and nothing else.
+///
+/// The batching contract bd-82331 must not change: coalescing exists so a
+/// streaming turn does not cross the JS bridge once per token. This pins both
+/// halves of it — the count (two, not sixty-four) and the identity (the first,
+/// because it starts immediately, and the last, because it supersedes every
+/// payload queued behind it).
+#[test]
+fn event_coalescer_burst_resolves_only_the_first_and_the_latest_payload() {
+    const BURST: usize = 64;
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+    let handle = runtime.handle();
+    let manager = coalescer_test_manager_with_hooks(&[ExtensionEventName::MessageUpdate]);
+    let coalescer = EventCoalescer::new(manager);
+    let resolved = Arc::new(Mutex::new(Vec::new()));
+
+    for sequence in 1..=BURST {
+        coalescer.dispatch_fire_and_forget(
+            ExtensionEventName::MessageUpdate,
+            coalescer_recording_payload(sequence, &resolved),
+            &handle,
+        );
+    }
+
+    runtime.block_on(async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if coalescer
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return;
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
+        }
+        panic!("coalesced dispatch did not become idle");
+    });
+
+    let resolved = resolved
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        resolved,
+        vec![1, BURST],
+        "a burst of {BURST} updates must cross the bridge twice — the first and the latest — and \
+         the {} superseded payloads in between must never be serialized",
+        BURST - 2
+    );
+    assert_coalescer_idle(&coalescer);
+}
+
+/// COST (bd-82331): routing costs nothing per token when nobody subscribes.
+///
+/// bd-82331 made every surface build a coalescer and hand it every agent event,
+/// including one `message_update` per streamed token. That is only acceptable
+/// if an event nothing subscribes to is genuinely free, so this measures it
+/// rather than asserting it in a comment.
+///
+/// The assertion is a ratio against the subscribed path measured in the same
+/// process, not an absolute time: an absolute budget is a promise about the
+/// machine, and on a loaded build worker that promise gets broken for reasons
+/// that have nothing to do with this code. The ratio cancels the machine out.
+/// The regression it is built to catch — the fast path starting to serialize,
+/// allocate per event, or spawn — moves the two measurements together toward
+/// 1.0, and there is a wide margin before a healthy run gets near the bound.
+#[test]
+fn event_coalescer_unsubscribed_dispatch_is_far_cheaper_than_subscribed() {
+    const EVENTS: usize = 20_000;
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+    let handle = runtime.handle();
+
+    // Subscribed: every event buffers a payload and schedules a drain.
+    let subscribed = EventCoalescer::new(coalescer_test_manager_with_hooks(&[
+        ExtensionEventName::MessageStart,
+    ]));
+    let resolved = Arc::new(Mutex::new(Vec::new()));
+    let subscribed_start = std::time::Instant::now();
+    for sequence in 1..=EVENTS {
+        subscribed.dispatch_fire_and_forget(
+            ExtensionEventName::MessageStart,
+            coalescer_recording_payload(sequence, &resolved),
+            &handle,
+        );
+    }
+    let subscribed_elapsed = subscribed_start.elapsed();
+
+    // Unsubscribed: an extension is loaded, hooked to something else.
+    let unsubscribed = EventCoalescer::new(coalescer_test_manager_with_hooks(&[
+        ExtensionEventName::SessionStart,
+    ]));
+    let untouched = Arc::new(Mutex::new(Vec::new()));
+    let unsubscribed_start = std::time::Instant::now();
+    for sequence in 1..=EVENTS {
+        unsubscribed.dispatch_fire_and_forget(
+            ExtensionEventName::MessageStart,
+            coalescer_recording_payload(sequence, &untouched),
+            &handle,
+        );
+    }
+    let unsubscribed_elapsed = unsubscribed_start.elapsed();
+
+    assert!(
+        untouched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "the unsubscribed path must not resolve a single payload"
+    );
+
+    let subscribed_ns = subscribed_elapsed.as_nanos().max(1);
+    let unsubscribed_ns = unsubscribed_elapsed.as_nanos().max(1);
+    eprintln!(
+        "coalescer dispatch cost over {EVENTS} events: unsubscribed {}ns/event, \
+         subscribed {}ns/event",
+        unsubscribed_ns / EVENTS as u128,
+        subscribed_ns / EVENTS as u128
+    );
+    assert!(
+        unsubscribed_ns * 4 < subscribed_ns,
+        "an event nothing subscribes to must stay far cheaper than one that is delivered, or the \
+         per-token cost bd-82331 added to every surface is real: unsubscribed {unsubscribed_ns}ns \
+         vs subscribed {subscribed_ns}ns over {EVENTS} events"
+    );
+}

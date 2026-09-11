@@ -282,6 +282,10 @@
           "justification": "Extension entry scanning and discovery behavior verification."
         },
         {
+          "path": "tests/extension_event_parity.rs",
+          "justification": "Behavioural parity: one fixture extension driven through every agent-driving surface on one scripted turn, with the delivered observation-event streams compared and a per-surface JSONL artifact. Catches a surface whose routing call is present but whose session cannot use it (bd-82331)."
+        },
+        {
           "path": "tests/extension_event_routing.rs",
           "justification": "Every agent-driving surface routes observation events to extensions, and the inventory of surfaces is complete. Guards the per-surface obligation that has no compiler support (bd-82331)."
         },
