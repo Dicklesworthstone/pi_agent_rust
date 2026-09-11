@@ -11,6 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
+// The single definition lives in src/; see its doc for why three copies
+// of this number was itself a defect (bd-649i1).
+use pi::semantic_workspace_graph::PERF_CANONICAL_BUDGET_INVENTORY_SHA256;
 
 const REPORT_SCHEMA: &str = "pi.release_readiness.v1";
 const CONFORMANCE_SUMMARY_SCHEMA: &str = "pi.ext.conformance_summary.v2";
@@ -36,8 +39,6 @@ const OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/opport
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
 const PERF_BUDGET_SUMMARY_PATH: &str = "tests/perf/reports/budget_summary.json";
 const PERF_CANONICAL_BUDGET_COUNT: usize = 19;
-const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
-    "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6";
 const PERF_MAX_EVIDENCE_AGE_HOURS: i64 = 168;
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
