@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result};
+#[cfg(windows)]
+use crate::file_identity::FileIdentity;
 
 /// Trust record format version.
 const TRUST_SCHEMA_VERSION: u32 = 2;
@@ -118,7 +120,7 @@ pub(crate) type TrustWriteGuard = crate::file_lock::DirLock;
 #[derive(Debug)]
 struct WindowsTrustDirectoryGuard {
     path: PathBuf,
-    identity: (u32, u64),
+    identity: FileIdentity,
     handle: std::fs::File,
 }
 
@@ -463,21 +465,6 @@ fn reject_windows_reparse_components(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn windows_file_identity(metadata: &std::fs::Metadata) -> std::io::Result<(u32, u64)> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    metadata
-        .volume_serial_number()
-        .zip(metadata.file_index())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Windows did not expose a stable MCP trust file identity",
-            )
-        })
-}
-
-#[cfg(windows)]
 fn validate_windows_trust_directory_guard(
     guard: &WindowsTrustDirectoryGuard,
 ) -> std::io::Result<()> {
@@ -487,8 +474,8 @@ fn validate_windows_trust_directory_guard(
         || !path_metadata.is_dir()
         || windows_metadata_is_reparse(&handle_metadata)
         || windows_metadata_is_reparse(&path_metadata)
-        || windows_file_identity(&handle_metadata)? != guard.identity
-        || windows_file_identity(&path_metadata)? != guard.identity
+        || FileIdentity::of_open_file(&guard.handle)? != guard.identity
+        || FileIdentity::of_path_nofollow(&guard.path)? != guard.identity
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -576,7 +563,7 @@ fn open_or_create_windows_trust_parent(
                 ),
             ));
         }
-        let identity = windows_file_identity(&initial_metadata)?;
+        let identity = FileIdentity::of_path_nofollow(&current)?;
         // Omitting FILE_SHARE_DELETE pins this component against rename or
         // replacement for the lifetime of the guard.
         let handle = std::fs::OpenOptions::new()
@@ -587,7 +574,7 @@ fn open_or_create_windows_trust_parent(
         let opened_metadata = handle.metadata()?;
         if !opened_metadata.is_dir()
             || windows_metadata_is_reparse(&opened_metadata)
-            || windows_file_identity(&opened_metadata)? != identity
+            || FileIdentity::of_open_file(&handle)? != identity
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -756,7 +743,7 @@ impl TrustStore {
                 ),
             ));
         }
-        let expected_identity = windows_file_identity(&path_metadata).map_err(|err| {
+        let expected_identity = FileIdentity::of_path_nofollow(path).map_err(|err| {
             Error::tool(
                 "mcp",
                 format!("[MCP_TRUST_IO] cannot identify {}: {err}", path.display()),
@@ -781,7 +768,7 @@ impl TrustStore {
         if !opened_metadata.is_file()
             || windows_metadata_is_reparse(&opened_metadata)
             || opened_metadata.len() > MAX_TRUST_FILE_BYTES
-            || windows_file_identity(&opened_metadata).map_err(|err| {
+            || FileIdentity::of_open_file(&file).map_err(|err| {
                 Error::tool(
                     "mcp",
                     format!("[MCP_TRUST_IO] cannot identify {}: {err}", path.display()),
@@ -827,7 +814,7 @@ impl TrustStore {
             )
         })?;
         if windows_metadata_is_reparse(&current_metadata)
-            || windows_file_identity(&current_metadata).map_err(|err| {
+            || FileIdentity::of_path_nofollow(path).map_err(|err| {
                 Error::tool(
                     "mcp",
                     format!("[MCP_TRUST_IO] cannot re-identify trust file: {err}"),

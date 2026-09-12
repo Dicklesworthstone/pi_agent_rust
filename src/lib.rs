@@ -182,6 +182,8 @@ pub mod extensions;
 pub mod extensions_js;
 pub mod failover;
 #[doc(hidden)]
+pub mod file_identity;
+#[doc(hidden)]
 pub mod file_lock;
 #[doc(hidden)]
 pub mod flake_classifier;

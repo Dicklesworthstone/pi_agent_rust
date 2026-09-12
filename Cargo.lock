@@ -5452,7 +5452,7 @@ dependencies = [
 
 [[package]]
 name = "pi_agent_rust"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -5541,6 +5541,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "win32job",
+ "winapi-util",
  "xxhash-rust",
 ]
 

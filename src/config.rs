@@ -4,6 +4,9 @@ use crate::agent::QueueMode;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+// Only `sync_settings_parent_dir` opens a directory to fsync it, and only Unix
+// allows that; the `cfg(not(unix))` arm is a no-op.
+#[cfg(unix)]
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

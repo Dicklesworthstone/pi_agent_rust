@@ -398,10 +398,32 @@ every commit against the active **exclusive** file reservations. It exists
 because an unattended sweeper committed another agent's unverified in-flight
 work five times in one day (last: `5d3eb35a`).
 
-- **Identify yourself:** the guard reads `AGENT_NAME` (falling back to the
-  registered pane identity). Commit and push as
-  `AGENT_NAME=<your registered agent name> git commit …`; an unidentified
-  commit is refused while any exclusive reservation is active.
+- **Identify yourself, on push as well as commit:** the guard reads
+  `AGENT_NAME` (falling back to the registered pane identity) and is installed
+  on both hooks. Use
+  `AGENT_NAME=<your registered agent name> git commit …` **and**
+  `AGENT_NAME=<your registered agent name> git push …`; an unidentified commit
+  or push is refused when it touches files under an active exclusive
+  reservation — including your own, because without `AGENT_NAME` the guard
+  cannot tell the lease is yours. The push refusal surfaces as a bare
+  `50-agent-mail.py exited with status 2`, which reads like a tool failure
+  rather than a refusal — it is the guard.
+- **Reserve EXCLUSIVELY, or the guard ignores you.** The MCP examples above
+  pass `exclusive=true`; the CLI does not default to it.
+  `am file_reservations reserve <project> <agent> <paths>` creates a SHARED
+  lease unless you pass `--exclusive`, and `50-agent-mail.py` skips every
+  reservation whose `exclusive` is not exactly true. A shared reservation
+  announces intent and blocks nothing. Verified by running the hook both ways
+  against a live reservation: exclusive refuses and names the holder, shared
+  exits 0 silently (bd-0x31m).
+- **Give the lease longer than a gate run.** The 3600s default is shorter than
+  the work it protects: `clippy --all-targets` alone ran 4–22 minutes across
+  this session depending on cache warmth, a three-check cycle 25–45, and a
+  change usually needs two or three cycles before it is committable.
+  A lease taken when you start routinely expires before you commit. Use
+  `--ttl 14400` for a session that will run dsr, or renew while you wait. On
+  2026-09-11 a lease on three files expired at 02:47:01Z and the sweeper
+  committed those exact three files at 02:47:18Z.
 - **Never commit into someone else's reservation.** If the guard names a
   holder, coordinate in the bead thread or wait for the lease to expire; do
   not bypass it to land your slice.

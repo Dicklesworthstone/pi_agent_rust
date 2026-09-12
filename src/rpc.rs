@@ -9166,6 +9166,15 @@ mod retry_tests {
                 failover_start.get("type").and_then(Value::as_str),
                 Some("failover_start")
             );
+            // bd-oqo03: the first hop is swap 1 and sits at chain index 0.
+            assert_eq!(
+                failover_start.get("attempt").and_then(Value::as_u64),
+                Some(1)
+            );
+            assert_eq!(
+                failover_start.get("chainIndex").and_then(Value::as_u64),
+                Some(0)
+            );
             let second_failover_start: Value =
                 serde_json::from_str(&out_rx.try_recv().expect("second failover_start event"))
                     .expect("second failover_start JSON");
@@ -9173,9 +9182,22 @@ mod retry_tests {
                 second_failover_start.get("type").and_then(Value::as_str),
                 Some("failover_start")
             );
+            // The second hop of the SAME turn is swap 2 at chain index 1. Both
+            // numbers advance here, which is why this pair is the one place
+            // that would not notice if they were collapsed back into one field
+            // — the multihop case is where they happen to agree. The two-turn
+            // test is the one that separates them (attempt 1, 1 with
+            // chainIndex 0, 1); this one pins that they both increment within
+            // a turn (bd-oqo03).
             assert_eq!(
                 second_failover_start.get("attempt").and_then(Value::as_u64),
                 Some(2)
+            );
+            assert_eq!(
+                second_failover_start
+                    .get("chainIndex")
+                    .and_then(Value::as_u64),
+                Some(1)
             );
             let failover_end: Value =
                 serde_json::from_str(&out_rx.try_recv().expect("failover_end event"))

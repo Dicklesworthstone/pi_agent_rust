@@ -1,6 +1,6 @@
 [package]
 name = "pi_agent_rust"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native AI coding agent CLI - Rust port of Pi Agent"
@@ -451,6 +451,11 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 # crate unsafe-free while encapsulating the Win32 FFI.
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"
+# `GetFileInformationByHandle` without `unsafe`: std's own accessors for the
+# volume serial number and file index are behind the unstable
+# `windows_by_handle` feature, which this crate cannot use because it also has
+# to build on stable. See `src/file_identity.rs`.
+winapi-util = "0.1.11"
 
 [features]
 default = ["sqlite-sessions", "tui", "bpe-tokens", "ftui"]

@@ -408,6 +408,38 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_success() {
         1,
         "exactly one failover_end per failover_start: {kinds:?}"
     );
+    // bd-2vmu6: the retry lifecycle closes BEFORE the failover one opens, and
+    // exactly once. This is the bead's core claim — an exhausted retry budget
+    // transitioning into failover used to emit `auto_retry_start` and then
+    // reset `retry_count` to 0 on the way into the swap, so the matching
+    // `auto_retry_end` never fired and clients saw an open lifecycle inherited
+    // by whatever the fallback did next. The fix closes it from the failover
+    // path itself (`retry_attempt_to_end`), so removing that plumbing shows up
+    // here as a missing end rather than as a subtly wrong event stream.
+    let retry_starts = kinds.iter().filter(|k| *k == "auto_retry_start").count();
+    let retry_ends = kinds.iter().filter(|k| *k == "auto_retry_end").count();
+    assert_eq!(
+        (retry_starts, retry_ends),
+        (1, 1),
+        "one retry lifecycle, opened and closed exactly once: {kinds:?}\n{stdout}\n{stderr}"
+    );
+    let retry_end = kinds
+        .iter()
+        .position(|k| k == "auto_retry_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("auto_retry_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    assert!(
+        retry_end < start,
+        "the retry lifecycle closes before the failover one opens, so the two cannot be confused \
+         for one another: {kinds:?}"
+    );
+    let retry_end_event = &events[retry_end]; // ubs:ignore index proven by position() above
+    assert_eq!(
+        retry_end_event["success"],
+        serde_json::Value::Bool(false),
+        "the retries really did fail — that is why the failover happened: {retry_end_event}"
+    );
+
     // bd-oqo03: `attempt` is the successful-swap ordinal within the turn, and
     // `chainIndex` is where the entry sits in the chain. They are reported
     // separately because they answer different questions — budget versus
