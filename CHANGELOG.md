@@ -23,6 +23,23 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Fixed
 
+- **Windows builds again.** The crate had stopped compiling for
+  `x86_64-pc-windows-msvc` somewhere after v0.3.0 — ten hard errors, so
+  `cargo install pi_agent_rust` failed outright on Windows and no release
+  binary could be produced. Nothing caught it because this repository runs no
+  CI and the quality gate builds only the host target. Three independent
+  causes: the crash reporter's fatal-signal watcher referenced
+  `signal_hook::iterator` and `SIGBUS`, neither of which exists off Unix, and
+  is now Unix-only (Windows abnormal exits that Rust can see arrive as panics,
+  which the panic hook already captures); and the Windows file-identity checks
+  in `jobs` and `mcp::trust` read `volume_serial_number`/`file_index` off
+  `std::os::windows::fs::MetadataExt`, which are still behind the unstable
+  `windows_by_handle` feature and so unavailable to a crate that must also
+  build on stable. Both now go through a new `file_identity::FileIdentity`
+  that reads the same two values from an open handle via `winapi-util`, so the
+  identity comparisons keep their exact TOCTOU semantics on both platforms
+  rather than being weakened to make the build pass.
+
 - **Extensions receive `message_*` and `tool_execution_*` on the default
   interactive stack again** (bd-82331). `AgentEvent`s reach extensions by two
   routes: four lifecycle events are dispatched from inside the agent loop, and
@@ -67,6 +84,12 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   was emitted for coalescable events only, so whether an event appeared in the
   log depended on an internal detail invisible from outside. Batched events
   now log identically, with `batched=true`.
+
+## Carried forward from the unpublished v0.4.0 cycle
+
+Everything below landed after v0.3.0 and has never appeared in a published
+release. It is listed separately from the entries above only so each group
+reads as one Added/Changed/Fixed set; all of it ships in v0.5.0.
 
 ### Added
 

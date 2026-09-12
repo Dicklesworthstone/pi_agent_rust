@@ -9,7 +9,10 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, File, Permissions};
+use std::fs::{self, File};
+// Only the Unix arm sets a mode on the staged binary.
+#[cfg(unix)]
+use std::fs::Permissions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -936,15 +936,19 @@ fn source_fingerprint_matches(jsonl_path: &Path, expected: &V2SourceFingerprint)
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    let metadata = file.metadata()?;
+    // Unix can settle this from `(dev, ino, len)` alone; every other platform
+    // falls through to re-hashing the file.
     #[cfg(unix)]
-    if expected.byte_length == metadata.len()
-        && expected
-            .file_identity
-            .as_ref()
-            .is_some_and(|identity| identity == &v2_source_file_identity(&metadata))
     {
-        return Ok(true);
+        let metadata = file.metadata()?;
+        if expected.byte_length == metadata.len()
+            && expected
+                .file_identity
+                .as_ref()
+                .is_some_and(|identity| identity == &v2_source_file_identity(&metadata))
+        {
+            return Ok(true);
+        }
     }
 
     let actual = fingerprint_open_session_source(file)?;
@@ -1049,6 +1053,10 @@ fn read_v2_source_state(v2_root: &Path) -> Result<Option<V2SourceStateValue>> {
 
 fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()> {
     let path = v2_source_state_path(v2_root);
+    // Only the Unix arm below re-checks the opened descriptor against this;
+    // the validation and the writability probe inside still have to run
+    // everywhere, so the binding stays and only its use is platform-specific.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let initial_metadata =
         if session_path_entry_exists(&path).map_err(|err| Error::Io(Box::new(err)))? {
             let metadata = std::fs::symlink_metadata(&path)?;

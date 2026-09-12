@@ -5541,6 +5541,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "win32job",
+ "winapi-util",
  "xxhash-rust",
 ]
 

@@ -32,6 +32,7 @@ use futures::FutureExt;
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::file_identity::FileIdentity;
 use crate::model::{Message, UserContent, UserMessage};
 
 /// Future returned by the live session-identity resolver shared by the jobs
@@ -927,29 +928,7 @@ impl ArtifactRetentionPolicy {
 struct ArtifactCleanupCandidate {
     path: PathBuf,
     modified: std::time::SystemTime,
-    identity: std::fs::Metadata,
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    left.volume_serial_number().is_some()
-        && left.file_index().is_some()
-        && left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
-    false
+    identity: FileIdentity,
 }
 
 fn is_managed_job_artifact_name(name: &OsStr) -> bool {
@@ -980,6 +959,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
         if !metadata.file_type().is_file() {
             continue;
         }
+        let scanned_identity = FileIdentity::of_path_nofollow(&path)?;
         let artifact = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -995,6 +975,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             Err(fs4::TryLockError::Error(err)) => return Err(err),
         }
         let opened = artifact.metadata()?;
+        let opened_identity = FileIdentity::of_open_file(&artifact)?;
         let current = match std::fs::symlink_metadata(&path) {
             Ok(current) => current,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1003,9 +984,17 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             }
             Err(err) => return Err(err),
         };
+        let current_identity = match FileIdentity::of_path_nofollow(&path) {
+            Ok(identity) => identity,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs4::FileExt::unlock(&artifact)?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         if !current.file_type().is_file()
-            || !same_file_identity(&opened, &current)
-            || !same_file_identity(&metadata, &current)
+            || opened_identity != current_identity
+            || scanned_identity != current_identity
         {
             fs4::FileExt::unlock(&artifact)?;
             continue;
@@ -1015,7 +1004,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
         candidates.push(ArtifactCleanupCandidate {
             path,
             modified,
-            identity: opened,
+            identity: opened_identity,
         });
     }
     candidates.sort_by(|left, right| {
@@ -1027,13 +1016,18 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
 }
 
 fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Result<Option<u64>> {
-    let before = match std::fs::symlink_metadata(&candidate.path) {
-        Ok(metadata) if metadata.file_type().is_file() => metadata,
+    match std::fs::symlink_metadata(&candidate.path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Ok(None),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
+    }
+    let before_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
     };
-    if !same_file_identity(&candidate.identity, &before) {
+    if candidate.identity != before_identity {
         return Ok(None);
     }
     let artifact = match std::fs::OpenOptions::new()
@@ -1051,6 +1045,7 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         Err(fs4::TryLockError::Error(err)) => return Err(err),
     }
     let opened = artifact.metadata()?;
+    let opened_identity = FileIdentity::of_open_file(&artifact)?;
     let current = match std::fs::symlink_metadata(&candidate.path) {
         Ok(current) => current,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1059,9 +1054,17 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         }
         Err(err) => return Err(err),
     };
+    let current_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs4::FileExt::unlock(&artifact)?;
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
     if !current.file_type().is_file()
-        || !same_file_identity(&before, &current)
-        || !same_file_identity(&opened, &current)
+        || before_identity != current_identity
+        || opened_identity != current_identity
     {
         fs4::FileExt::unlock(&artifact)?;
         return Ok(None);
@@ -1087,15 +1090,17 @@ fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
         if metadata.file_type().is_file() {
             bytes = bytes.saturating_add(metadata.len());
             if path.extension().is_some_and(|extension| extension == "log") {
+                let scanned_identity = FileIdentity::of_path_nofollow(&path)?;
                 let artifact = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(&path)?;
-                let opened = artifact.metadata()?;
+                let opened_identity = FileIdentity::of_open_file(&artifact)?;
                 let current = std::fs::symlink_metadata(&path)?;
+                let current_identity = FileIdentity::of_path_nofollow(&path)?;
                 if !current.file_type().is_file()
-                    || !same_file_identity(&metadata, &current)
-                    || !same_file_identity(&opened, &current)
+                    || scanned_identity != current_identity
+                    || opened_identity != current_identity
                 {
                     return Err(std::io::Error::other(format!(
                         "artifact identity changed while inspecting {}",
@@ -1247,7 +1252,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to acquire jobs artifact budget lock: {err}"),
         )
     })?;
-    let locked = lock.metadata().map_err(|err| {
+    let locked_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to re-inspect jobs artifact budget lock: {err}"),
@@ -1259,7 +1264,13 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to re-verify jobs artifact budget lock: {err}"),
         )
     })?;
-    if !current.file_type().is_file() || !same_file_identity(&locked, &current) {
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    if !current.file_type().is_file() || locked_identity != current_identity {
         return Err(Error::tool(
             "bash",
             "Failed to acquire jobs artifact budget lock: path identity changed while locking"
@@ -1282,6 +1293,18 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             "Failed to open jobs artifact budget lock: path is not a regular file".to_string(),
         ));
     }
+    // `None` when the lock file did not exist yet: this open is then expected
+    // to create it, and there is no prior identity to hold it to.
+    let before_identity = match FileIdentity::of_path_nofollow(&lock_path) {
+        Ok(identity) => Some(identity),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(Error::tool(
+                "bash",
+                format!("Failed to identify jobs artifact budget lock: {err}"),
+            ));
+        }
+    };
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1294,7 +1317,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
                 format!("Failed to open jobs artifact budget lock: {err}"),
             )
         })?;
-    let opened = lock.metadata().map_err(|err| {
+    let opened_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to inspect jobs artifact budget lock: {err}"),
@@ -1306,11 +1329,15 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to verify jobs artifact budget lock: {err}"),
         )
     })?;
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to verify jobs artifact budget lock: {err}"),
+        )
+    })?;
     if !current.file_type().is_file()
-        || !same_file_identity(&opened, &current)
-        || before
-            .as_ref()
-            .is_some_and(|before| !same_file_identity(before, &current))
+        || opened_identity != current_identity
+        || before_identity.is_some_and(|before| before != current_identity)
     {
         return Err(Error::tool(
             "bash",
@@ -1323,7 +1350,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to acquire jobs artifact budget lock: {err}"),
         )
     })?;
-    let locked = lock.metadata().map_err(|err| {
+    let locked_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to re-inspect jobs artifact budget lock: {err}"),
@@ -1335,7 +1362,13 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to re-verify jobs artifact budget lock: {err}"),
         )
     })?;
-    if !current.file_type().is_file() || !same_file_identity(&locked, &current) {
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    if !current.file_type().is_file() || locked_identity != current_identity {
         return Err(Error::tool(
             "bash",
             "Failed to acquire jobs artifact budget lock: path identity changed while locking"

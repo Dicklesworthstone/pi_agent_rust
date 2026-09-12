@@ -273,9 +273,19 @@ fn payload_of(info: &std::panic::PanicHookInfo<'_>) -> String {
     )
 }
 
+/// No fatal-signal watcher off Unix.
+///
+/// `signal_hook::iterator` is a Unix-only module and `SIGBUS` is not among the
+/// signals the C runtime defines on Windows, so there is nothing here to watch.
+/// Windows abnormal terminations that Rust can observe at all arrive as panics,
+/// which the hook installed above already captures.
+#[cfg(not(unix))]
+fn spawn_signal_watcher(_agent_dir: PathBuf, _session_path: Option<String>) {}
+
 /// Best-effort fatal-signal watcher: writes a minimal bundle naming the
 /// signal with redacted ring context. See module docs for the coverage
 /// caveat under `forbid(unsafe_code)`.
+#[cfg(unix)]
 fn spawn_signal_watcher(agent_dir: PathBuf, session_path: Option<String>) {
     // SIGSEGV/SIGILL/SIGFPE are forbidden by signal-hook's safe registry
     // (registration panics, not errors) — the module docs already scope
