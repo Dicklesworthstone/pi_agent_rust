@@ -14,6 +14,59 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+## [v0.5.1] — 2026-09-12 — Release
+
+Windows-only. Nothing on Linux or macOS behaves differently; the binaries for
+those platforms are rebuilt from this commit and are otherwise unchanged.
+
+v0.5.0 got `pi_agent_rust` compiling for `x86_64-pc-windows-msvc` again after
+it had been broken since some point after v0.3.0, but it only ever built the
+lib and bin targets there. Running what the Unix gate runs — `cargo check
+--all-targets` and `cargo clippy --all-targets -- -D warnings` — found the
+target still broken past that point, across nine rounds as each fix let
+compilation reach further. Windows now passes exactly the gate Unix does.
+
+### Fixed
+
+- **The `--list-models` cache fingerprint could accept a swapped file on
+  Windows.** `same_file_identity` returned `true` unconditionally off Unix, so
+  both of the fingerprint's TOCTOU identity checks — open handle against
+  pre-open path, and again against the path after the read — were no-ops
+  there. Only size and mtime still had to agree, which a same-size edit inside
+  one filesystem timestamp tick satisfies. It now uses the
+  `file_identity::FileIdentity` introduced in v0.5.0, giving Windows the same
+  volume-serial-plus-file-index comparison Unix gets from `(dev, ino)`.
+
+- **Fingerprinted files were opened through reparse points on Windows.** The
+  Unix arm opens with `O_NOFOLLOW`; the Windows arm used a plain
+  `File::open`, so a junction or symlink at the path was traversed and the
+  fingerprint described whatever it pointed at. It now passes
+  `FILE_FLAG_OPEN_REPARSE_POINT`.
+
+- **`tests/e2e_cli.rs` did not compile on Windows**: `Arc` was imported under
+  `cfg(unix)` but used from an ungated helper, and `running_as_root` was
+  defined only for Unix while one caller was ungated.
+
+### Changed
+
+- Windows-only lint hygiene, none of it user-visible: roughly twenty
+  `cfg(not(unix))` no-op stubs that must keep their Unix arm's fallible
+  signature now carry the matching `allow`s, and imports, constants and one
+  struct field reachable only from Unix-gated tests are gated to match.
+  Several genuinely reducible spots were rewritten rather than suppressed —
+  `is_executable`, `is_already_exists`, `is_executable_file`, the `\\?\`
+  prefix stripper's nested `if`s and format arguments, `path_for_line_output`'s
+  needless `return`, and `win_job`'s redundant `pub(crate)`.
+
+### Known
+
+- `e2e_cli_startup_surfaces_configured_resource_failures` still carries a
+  `running_as_root` skip guard copied from the auth-permission tests, though
+  it has no auth fixture and no permission premise. The guard makes the test
+  skip on root gate workers, where it would otherwise fail. Making it compile
+  on Windows did not touch that; removing the guard belongs with fixing what
+  it hides.
+
 ## [v0.5.0] — 2026-09-11 — Release
 
 > Cut from `main` with `v0.4.0` left as Tag-only: that tag (2026-09-01,
