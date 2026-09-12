@@ -1449,7 +1449,25 @@ pub enum AgentEvent {
         to_model: String,
         /// Failure class that triggered the failover (quota/overload/transient).
         class: String,
+        /// Which successful swap this is within the logical turn, 1-based.
+        ///
+        /// This is the number `retry.maxFailoversPerTurn` is counted against,
+        /// so a consumer can say "swap 2 of at most 3" without tracking state.
+        /// It used to carry the chain index instead, which stopped meaning
+        /// anything once the walk began skipping the current model, duplicates
+        /// and unusable entries (bd-oqo03.1) — the number then jumped by more
+        /// than one per swap, or not at all, with nothing to say why. The index
+        /// is still reported, as `chain_index`.
         attempt: u32,
+        /// Position in the fallback chain of the entry being swapped to,
+        /// 0-based.
+        ///
+        /// Durable across turns, unlike `attempt`: the walk resumes from where
+        /// the previous turn left it. Reported separately because the two
+        /// answer different questions — `attempt` is budget, this is
+        /// provenance — and conflating them is what bd-oqo03 was opened for.
+        #[serde(rename = "chainIndex")]
+        chain_index: u32,
     },
     /// Cross-model failover end (bd-cv653.3.2): the turn completed on a
     /// failover entry, or the primary was restored after cooldown.

@@ -18,6 +18,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+// The single definition lives in src/; see its doc for why three copies
+// of this number was itself a defect (bd-649i1).
+use pi::semantic_workspace_graph::PERF_CANONICAL_BUDGET_INVENTORY_SHA256;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2748,8 +2751,6 @@ fn failure_count_within_release_threshold() {
 const MANUAL_RELEASE_LANE_HEADING: &str = "## Historical manual no-Actions procedure (retired)";
 const MANUAL_RELEASE_LANE_END_HEADING: &str = "## Pre-release flow (rc)";
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
-const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
-    "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6";
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
     "generated_at",

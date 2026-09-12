@@ -82,6 +82,21 @@ const ORDERED_OBSERVATION: &[&str] = &[
 /// Dispatched in-loop by the agent, so every surface gets them for free. Their
 /// presence is the control: a surface missing these has a different problem.
 const LIFECYCLE: &[&str] = &["agent_start", "agent_end", "turn_start", "turn_end"];
+/// Hooks that can CHANGE what the agent does, also dispatched in-loop.
+///
+/// Included because bd-82331 rests on the claim that these were never affected
+/// — an extension that modifies behaviour works everywhere, one that observes
+/// did not — and a claim load-bearing enough to scope a bug around is worth a
+/// test. If one of these ever moves to the per-surface route, this is where it
+/// shows up, rather than in a bug report about one stack behaving differently.
+const BEHAVIOUR: &[&str] = &[
+    "input",
+    "before_agent_start",
+    "context",
+    "before_provider_request",
+    "tool_call",
+    "tool_result",
+];
 
 /// A fixture extension that subscribes to everything and does nothing.
 ///
@@ -93,6 +108,7 @@ const LIFECYCLE: &[&str] = &["agent_start", "agent_end", "turn_start", "turn_end
 fn fixture_extension_source() -> String {
     let mut names: Vec<&str> = Vec::new();
     names.extend_from_slice(LIFECYCLE);
+    names.extend_from_slice(BEHAVIOUR);
     names.extend_from_slice(ORDERED_OBSERVATION);
     names.extend_from_slice(COALESCABLE);
     let list = names
@@ -158,9 +174,14 @@ struct SurfaceRun {
     /// explicitly so a skipped surface can never read as a passing one.
     outcome: Option<SurfaceEvents>,
     skip_reason: Option<String>,
-    /// Raw log lines, kept for the artifact so a failure is diagnosable
+    /// Raw dispatch records, kept for the artifact so a failure is diagnosable
     /// without re-running.
     raw: Vec<String>,
+    /// The tail of everything the surface logged. A surface that routed no
+    /// observation events cannot explain itself through `raw`, which is empty
+    /// by definition in exactly that case — this is what says whether the
+    /// extension loaded at all.
+    log_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +194,8 @@ struct SurfaceEvents {
     kinds: BTreeSet<String>,
     /// Lifecycle kinds seen at least once.
     lifecycle: BTreeSet<String>,
+    /// Behaviour-hook kinds seen at least once.
+    behaviour: BTreeSet<String>,
 }
 
 impl SurfaceEvents {
@@ -194,11 +217,17 @@ impl SurfaceEvents {
             .filter(|name| LIFECYCLE.contains(&name.as_str()))
             .cloned()
             .collect();
+        let behaviour = names
+            .iter()
+            .filter(|name| BEHAVIOUR.contains(&name.as_str()))
+            .cloned()
+            .collect();
         Self {
             all: names,
             ordered_observation,
             kinds,
             lifecycle,
+            behaviour,
         }
     }
 
@@ -207,15 +236,45 @@ impl SurfaceEvents {
     }
 }
 
+/// Strip ANSI SGR sequences from log output.
+///
+/// `tracing_subscriber`'s fmt layer colourises field names, so a record reaches
+/// this test as `\x1b[3mevent_name\x1b[0m\x1b[2m=\x1b[0mmessage_start` — the
+/// literal `event_name=` never appears, and a parser looking for it silently
+/// finds nothing on every surface. That is exactly the failure this test is
+/// built to report, arriving from the instrument rather than the subject, which
+/// is the worst way for it to be wrong. Strip first, then parse.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // CSI: ESC [ ... final byte in @-~. Anything else: drop the ESC and
+        // the single byte after it, which covers the short escapes.
+        if chars.next() == Some('[') {
+            for next in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Pull `ext.event.start` records out of pi's log output.
 ///
-/// The fmt layer is installed with `with_target(false)`, so a record looks like
+/// The fmt layer is installed with `with_target(false)`, so a record reads
 /// `2026-..Z  INFO Extension event dispatch start event="ext.event.start"
-/// event_name=message_start timeout_ms=30000`. Accept the value quoted or not:
-/// whether a field is quoted depends on how it was recorded, which is not a
-/// thing this test should be pinned to.
+/// event_name=message_start timeout_ms=30000` once the colour is stripped.
+/// Accept the value quoted or not: whether a field is quoted depends on how it
+/// was recorded, which is not a thing this test should be pinned to.
 fn parse_dispatched_events(log: &str) -> Vec<String> {
     log.lines()
+        .map(strip_ansi)
         .filter(|line| line.contains("ext.event.start"))
         .filter_map(|line| {
             let rest = line.split("event_name=").nth(1)?;
@@ -229,32 +288,39 @@ fn parse_dispatched_events(log: &str) -> Vec<String> {
         .collect()
 }
 
+/// The last `LOG_TAIL_LINES` lines of a surface's log output.
+fn log_tail(log: &str) -> Vec<String> {
+    const LOG_TAIL_LINES: usize = 60;
+    let lines: Vec<&str> = log.lines().collect();
+    lines[lines.len().saturating_sub(LOG_TAIL_LINES)..]
+        .iter()
+        .map(|line| strip_ansi(line))
+        .collect()
+}
+
 fn pi_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_pi"))
 }
 
 /// Write the two-interaction cassette every surface replays.
 ///
-/// The recorded request bodies constrain only `model` and `stream`. VCR matches
-/// recorded bodies as templates — recorded keys must match, incoming may carry
-/// extra ones — and playback walks interactions with a monotonic cursor, so two
-/// loosely-matched interactions are handed out in order. That is deliberate:
-/// pinning the full body would pin the system prompt and the tool schema list,
-/// and this test would then fail whenever an unrelated prompt line changed,
-/// which is exactly the kind of failure that gets a test deleted rather than
-/// fixed. What must be deterministic here is the shape of the TURN, and the
-/// responses below fix that completely.
+/// The recorded requests constrain method and URL only. VCR treats an absent
+/// recorded body as "do not constrain the body", and playback walks
+/// interactions with a monotonic cursor, so the two are handed out in order:
+/// the tool call first, the final text second.
+///
+/// That is deliberate. Pinning the body pins the system prompt and the tool
+/// schema list, and this test would then fail whenever an unrelated prompt line
+/// changed — the kind of failure that gets a test deleted rather than fixed. A
+/// first version constrained `model` and `stream` and still failed to match,
+/// which is the argument: what this test needs to be deterministic is the shape
+/// of the TURN, and the responses below fix that completely. Request-shape
+/// fidelity is the provider suites' job, and they do it properly.
 #[allow(clippy::too_many_lines)]
 fn write_parity_cassette(dir: &Path, read_path: &str) -> PathBuf {
     std::fs::create_dir_all(dir).expect("create cassette dir");
     let cassette_path = dir.join(format!("{VCR_TEST_NAME}.json"));
 
-    let loose_request = || {
-        json!({
-            "model": VCR_MODEL,
-            "stream": true,
-        })
-    };
     let sse = |event: &str, data: &Value| -> String {
         let payload = serde_json::to_string(data).expect("serialize sse payload");
         format!("event: {event}\ndata: {payload}\n\n")
@@ -336,7 +402,6 @@ fn write_parity_cassette(dir: &Path, read_path: &str) -> PathBuf {
                     "method": "POST",
                     "url": "https://api.anthropic.com/v1/messages",
                     "headers": [],
-                    "body": loose_request(),
                 },
                 "response": tool_call_response,
             },
@@ -345,7 +410,6 @@ fn write_parity_cassette(dir: &Path, read_path: &str) -> PathBuf {
                     "method": "POST",
                     "url": "https://api.anthropic.com/v1/messages",
                     "headers": [],
-                    "body": loose_request(),
                 },
                 "response": text_response,
             },
@@ -386,12 +450,43 @@ fn common_args(extension_path: &Path) -> Vec<String> {
     ]
 }
 
+/// Write the settings every surface runs under.
+///
+/// Two features that default to ON make their own provider calls around a turn,
+/// and both had to be turned off for this measurement to mean anything:
+/// automatic session titling, which summarises the first exchange into a
+/// session name, and the advisor, which reviews each turn with a second model.
+/// The symptom was the scripted turn completing and printing its text, then the
+/// run dying on a request the cassette had no interaction left for.
+///
+/// Padding the cassette instead would have hidden it and then produced a worse
+/// failure: those extra calls emit `message_*` events of their own, on whichever
+/// surfaces run them, and this test would have reported a parity failure that
+/// was really a difference in post-turn housekeeping. Turning them off keeps the
+/// measurement about the turn.
+fn write_hermetic_settings(path: &Path) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create settings dir");
+    }
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "advisor": { "enabled": false },
+            "titling": { "autoTitle": false },
+        }))
+        .expect("serialize settings"),
+    )
+    .expect("write hermetic settings");
+}
+
 /// Environment every surface shares: isolation, VCR playback, and a log filter
 /// narrow enough that the surface's own output cannot drown the records.
 fn apply_common_env(command: &mut Command, agent_dir: &Path, cassette_dir: &Path) {
+    let settings_path = agent_dir.join("settings.json");
+    write_hermetic_settings(&settings_path);
     command
         .env("PI_CODING_AGENT_DIR", agent_dir)
-        .env("PI_CONFIG_PATH", agent_dir.join("settings.json"))
+        .env("PI_CONFIG_PATH", &settings_path)
         .env("PI_SESSIONS_DIR", agent_dir.join("sessions"))
         .env("PI_PACKAGE_DIR", agent_dir.join("packages"))
         .env("PI_TEST_MODE", "1")
@@ -399,7 +494,12 @@ fn apply_common_env(command: &mut Command, agent_dir: &Path, cassette_dir: &Path
         .env(pi::vcr::VCR_ENV_MODE, "playback")
         .env(pi::vcr::VCR_ENV_DIR, cassette_dir)
         .env("PI_VCR_TEST_NAME", VCR_TEST_NAME)
-        .env("RUST_LOG", "pi::extensions=info");
+        // Dumps every request body VCR was asked to match, next to the
+        // interactions it compared them against. Without it an unmatched
+        // request is a sha256 and nothing else, which costs a full build cycle
+        // to identify.
+        .env("VCR_DEBUG_BODY_FILE", agent_dir.join("vcr-bodies.txt"))
+        .env("RUST_LOG", "pi=info");
 }
 
 /// Drive `pi -p`, optionally in JSON output mode, and collect what it logged.
@@ -414,14 +514,19 @@ fn run_print_surface(
     extension_path: &Path,
     json_output: bool,
 ) -> SurfaceRun {
-    let mut command = Command::new(pi_binary());
-    command
-        .arg("-p")
-        .arg(PROMPT)
-        .args(common_args(extension_path));
+    // Flags first, prompt last. `Cli::args` is `trailing_var_arg`, so every
+    // token after the first positional is captured verbatim as another message
+    // — putting the prompt first made pi run the turn, then try to run
+    // "--provider" as a second prompt, with none of the flags applied. The
+    // symptom was a third provider request the cassette had no interaction for,
+    // and a default model and thinking budget in a body that was supposed to be
+    // pinned by --model and --thinking.
+    let mut command = Command::new(pi_binary()); // ubs:ignore false positive: Cargo provides the compiled test binary path.
+    command.arg("-p").args(common_args(extension_path));
     if json_output {
         command.args(["--output-format", "json"]);
     }
+    command.arg(PROMPT);
     apply_common_env(&mut command, agent_dir, cassette_dir);
     command.current_dir(workdir);
 
@@ -437,7 +542,10 @@ fn run_print_surface(
         });
     assert!(
         output.status.success(),
-        "{name} must complete the scripted turn.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "{name} must complete the scripted turn.\nstdout:\n{stdout}\nstderr:\n{stderr}\n\
+         VCR request bodies:\n{}",
+        std::fs::read_to_string(agent_dir.join("vcr-bodies.txt"))
+            .unwrap_or_else(|err| format!("(no VCR body dump: {err})"))
     );
 
     let names = parse_dispatched_events(&stderr);
@@ -448,9 +556,10 @@ fn run_print_surface(
         skip_reason: None,
         raw: stderr
             .lines()
+            .map(strip_ansi)
             .filter(|line| line.contains("ext.event.start"))
-            .map(str::to_string)
             .collect(),
+        log_tail: log_tail(&stderr),
     }
 }
 
@@ -464,7 +573,7 @@ fn run_rpc_surface(
 ) -> SurfaceRun {
     use std::io::{BufRead as _, BufReader, Write as _};
 
-    let mut command = Command::new(pi_binary());
+    let mut command = Command::new(pi_binary()); // ubs:ignore false positive: Cargo provides the compiled test binary path.
     command.arg("--rpc").args(common_args(extension_path));
     apply_common_env(&mut command, agent_dir, cassette_dir);
     command
@@ -532,9 +641,10 @@ fn run_rpc_surface(
         skip_reason: None,
         raw: stderr
             .lines()
+            .map(strip_ansi)
             .filter(|line| line.contains("ext.event.start"))
-            .map(str::to_string)
             .collect(),
+        log_tail: log_tail(&stderr),
     }
 }
 
@@ -559,12 +669,18 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
     let cassette_dir = session.harness.temp_path("vcr");
     write_parity_cassette(&cassette_dir, SAMPLE_FILE);
 
+    // TuiSession points PI_CONFIG_PATH at a .toml; give it the same hermetic
+    // JSON settings the other surfaces run under so the advisor stays off here
+    // too and all five drive the identical turn.
+    let settings_path = session.harness.temp_path("pi-settings.json");
+    write_hermetic_settings(&settings_path);
+    session.set_env("PI_CONFIG_PATH", &settings_path.display().to_string());
     session.set_env(pi::vcr::VCR_ENV_MODE, "playback");
     session.set_env(pi::vcr::VCR_ENV_DIR, &cassette_dir.display().to_string());
     session.set_env("PI_VCR_TEST_NAME", VCR_TEST_NAME);
     // TuiSession sets RUST_LOG=info by default, which would bury the records
     // under everything else pi logs at info during startup.
-    session.set_env("RUST_LOG", "pi::extensions=info");
+    session.set_env("RUST_LOG", "pi=info");
 
     let mut args: Vec<String> = Vec::new();
     if classic {
@@ -588,12 +704,11 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
         .join("agent")
         .join("logs")
         .join("tui.log");
-    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|err| {
-        panic!(
-            "{name} must write its tracing output to {}: {err}",
-            log_path.display()
-        )
-    });
+    let missing_log = format!(
+        "{name} must write its tracing output to {}",
+        log_path.display()
+    );
+    let log = std::fs::read_to_string(&log_path).expect(&missing_log);
     let names = parse_dispatched_events(&log);
     Some(SurfaceRun {
         name: name.to_string(),
@@ -602,9 +717,10 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
         skip_reason: None,
         raw: log
             .lines()
+            .map(strip_ansi)
             .filter(|line| line.contains("ext.event.start"))
-            .map(str::to_string)
             .collect(),
+        log_tail: log_tail(&log),
     })
 }
 
@@ -649,6 +765,7 @@ fn write_parity_artifact(
                     .iter()
                     .chain(COALESCABLE)
                     .chain(LIFECYCLE)
+                    .chain(BEHAVIOUR)
                 {
                     counts.insert((*name).to_string(), json!(events.count_of(name)));
                 }
@@ -662,8 +779,10 @@ fn write_parity_artifact(
                     "ordered_observation_sequence": events.ordered_observation,
                     "observation_kinds": events.kinds,
                     "lifecycle_kinds": events.lifecycle,
+                    "behaviour_kinds": events.behaviour,
                     "counts_per_kind": counts,
                     "raw_dispatch_records": run.raw,
+                    "log_tail": run.log_tail,
                 })
             },
         );
@@ -746,8 +865,14 @@ fn evaluate_parity(runs: &[SurfaceRun]) -> ParityOutcome {
         let events = run.outcome.as_ref().expect("driven surface has events");
         if events.kinds.is_empty() {
             outcome.silent.push(format!(
-                "  {} ({}) delivered no observation events at all",
-                run.name, run.owner
+                "  {} ({}) delivered no observation events at all\n    last lines it logged:\n{}",
+                run.name,
+                run.owner,
+                run.log_tail
+                    .iter()
+                    .map(|line| format!("      {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
     }
@@ -815,6 +940,7 @@ fn extension_observation_events_are_identical_on_every_surface() {
                                 .to_string(),
                         ),
                         raw: Vec::new(),
+                        log_tail: Vec::new(),
                     }
                 }),
             );
@@ -874,7 +1000,8 @@ fn extension_observation_events_are_identical_on_every_surface() {
     // The in-loop route must be surface-independent. If this fails while the
     // observation comparison passes, the two halves have drifted apart and the
     // split this whole design rests on is no longer true.
-    for run in runs.iter().filter(|run| run.outcome.is_some()) {
+    let driven_runs: Vec<&SurfaceRun> = runs.iter().filter(|run| run.outcome.is_some()).collect();
+    for run in &driven_runs {
         let events = run.outcome.as_ref().expect("driven surface has events");
         for name in LIFECYCLE {
             assert!(
@@ -886,6 +1013,27 @@ fn extension_observation_events_are_identical_on_every_surface() {
             );
         }
     }
+
+    // Behaviour hooks are the other in-loop half. bd-82331 scoped itself around
+    // these being unaffected; this is what makes that a checked claim rather
+    // than a remembered one.
+    let behaviour_baseline = driven_runs[0];
+    let baseline_behaviour = &behaviour_baseline
+        .outcome
+        .as_ref()
+        .expect("driven surface has events")
+        .behaviour;
+    for run in driven_runs.iter().skip(1) {
+        let events = run.outcome.as_ref().expect("driven surface has events");
+        assert_eq!(
+            &events.behaviour, baseline_behaviour,
+            "{} ({}) received a different set of in-loop behaviour hooks than {} ({}). These are \
+             dispatched from inside the agent loop and must not vary by surface; a difference \
+             here means one of them has moved onto the per-surface route, which is how the \
+             observation half broke in the first place.",
+            run.name, run.owner, behaviour_baseline.name, behaviour_baseline.owner
+        );
+    }
 }
 
 /// Build a surface that delivered a full, healthy turn.
@@ -894,18 +1042,25 @@ fn healthy_surface(name: &str) -> SurfaceRun {
         name: name.to_string(),
         owner: format!("src/{name}.rs"),
         outcome: Some(SurfaceEvents::from_names(vec![
+            "input".to_string(),
+            "before_agent_start".to_string(),
             "agent_start".to_string(),
             "turn_start".to_string(),
+            "context".to_string(),
+            "before_provider_request".to_string(),
             "message_start".to_string(),
             "message_update".to_string(),
             "message_end".to_string(),
+            "tool_call".to_string(),
             "tool_execution_start".to_string(),
             "tool_execution_end".to_string(),
+            "tool_result".to_string(),
             "turn_end".to_string(),
             "agent_end".to_string(),
         ])),
         skip_reason: None,
         raw: Vec::new(),
+        log_tail: Vec::new(),
     }
 }
 
@@ -1010,6 +1165,7 @@ fn a_surface_that_could_not_be_driven_is_recorded_as_skipped() {
         outcome: None,
         skip_reason: Some("tmux is not available on this host".to_string()),
         raw: Vec::new(),
+        log_tail: Vec::new(),
     };
     let outcome = evaluate_parity(&[healthy_surface("main"), skipped]);
     assert!(outcome.is_clean(), "a skip is not a failure");
@@ -1026,12 +1182,15 @@ fn a_surface_that_could_not_be_driven_is_recorded_as_skipped() {
 /// The log parser reads what the host actually writes, including a TUI log.
 #[test]
 fn dispatch_records_are_parsed_from_pi_log_output() {
+    // The third line carries the ANSI field colouring pi actually emits.
     let log = concat!(
         "2026-09-11T04:00:00.000000Z  INFO Extension event dispatch start ",
         "event=\"ext.event.start\" event_name=message_start timeout_ms=30000\n",
         "2026-09-11T04:00:00.001000Z  INFO something else entirely\n",
-        "2026-09-11T04:00:00.002000Z  INFO Extension event dispatch start ",
-        "event=\"ext.event.start\" event_name=\"tool_execution_start\" timeout_ms=30000\n",
+        "\u{1b}[2m2026-09-11T04:00:00.002000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m ",
+        "Extension event dispatch start \u{1b}[3mevent\u{1b}[0m\u{1b}[2m=\u{1b}[0m",
+        "\"ext.event.start\" \u{1b}[3mevent_name\u{1b}[0m\u{1b}[2m=\u{1b}[0m",
+        "tool_execution_start \u{1b}[3mtimeout_ms\u{1b}[0m\u{1b}[2m=\u{1b}[0m30000\n",
     );
     assert_eq!(
         parse_dispatched_events(log),

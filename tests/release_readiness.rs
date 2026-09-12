@@ -11,6 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
+// The single definition lives in src/; see its doc for why three copies
+// of this number was itself a defect (bd-649i1).
+use pi::semantic_workspace_graph::PERF_CANONICAL_BUDGET_INVENTORY_SHA256;
 
 const REPORT_SCHEMA: &str = "pi.release_readiness.v1";
 const CONFORMANCE_SUMMARY_SCHEMA: &str = "pi.ext.conformance_summary.v2";
@@ -36,8 +39,6 @@ const OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/opport
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
 const PERF_BUDGET_SUMMARY_PATH: &str = "tests/perf/reports/budget_summary.json";
 const PERF_CANONICAL_BUDGET_COUNT: usize = 19;
-const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
-    "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6";
 const PERF_MAX_EVIDENCE_AGE_HOURS: i64 = 168;
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
@@ -1197,9 +1198,14 @@ fn ensure_must_pass_worktree_matches_commit(
     }
 
     let records = must_pass_tree_records(root, commit, source_paths)?;
+    // Index first, then worktree. Both answer "does this differ from the
+    // commit", and when content is staged AND on disk both are true — so the
+    // order decides which one the operator is told about. Staged drift is the
+    // more specific diagnosis and the more surprising state to be in, so it
+    // wins; unstaged drift falls through to the worktree comparison.
+    ensure_index_matches_commit_when_readable(root, commit, source_paths, &records)?;
     ensure_committed_paths_match_worktree(root, &records)?;
     ensure_no_uncommitted_files_under(root, source_paths, &records)?;
-    ensure_index_matches_commit_when_readable(root, commit, source_paths, &records)?;
 
     Ok(())
 }
@@ -1464,11 +1470,10 @@ fn collect_worktree_files(
     out: &mut Vec<String>,
 ) -> Result<(), String> {
     let absolute = root.join(relative);
-    let metadata = match std::fs::symlink_metadata(&absolute) {
-        Ok(metadata) => metadata,
-        // A must-pass path that is not on disk is reported by the
-        // commit-side comparison, which names the specific missing files.
-        Err(_) => return Ok(()),
+    let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
+        // A must-pass path that is not on disk is reported by the commit-side
+        // comparison, which names the specific missing files.
+        return Ok(());
     };
     if !metadata.is_dir() {
         out.push(relative.to_string());
