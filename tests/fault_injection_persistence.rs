@@ -18,7 +18,10 @@
 
 use asupersync::runtime::RuntimeBuilder;
 use pi::model::UserContent;
-use pi::session::{AutosaveDurabilityMode, AutosaveFlushTrigger, Session, SessionMessage};
+use pi::session::{AutosaveDurabilityMode, Session, SessionMessage};
+// Only the Unix-gated autosave-queue fault case drives a flush trigger.
+#[cfg(unix)]
+use pi::session::AutosaveFlushTrigger;
 use pi::session_store_v2::SessionStoreV2;
 use serde_json::json;
 use std::future::Future;

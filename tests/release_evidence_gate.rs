@@ -6040,6 +6040,9 @@ fn run_release_gate_python(
         .expect("wait for embedded release-gate Python")
 }
 
+// Every caller is Unix-gated, and so is this: it looks for a bare `git` with no
+// `PATHEXT` handling, which would never resolve on Windows.
+#[cfg(unix)]
 fn git_executable_on_path() -> PathBuf {
     let path = std::env::var_os("PATH").expect("PATH must be set for release-gate tests");
     std::env::split_paths(&path)

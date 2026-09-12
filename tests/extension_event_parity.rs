@@ -67,7 +67,9 @@ const SAMPLE_FILE: &str = "parity-sample.txt";
 const SAMPLE_CONTENT: &str = "parity sample content\n";
 /// Tool call id used by the cassette.
 const TOOL_CALL_ID: &str = "toolu_parity_0001";
-/// Text the second scripted response streams back.
+/// Text the second scripted response streams back. Only the tmux-driven
+/// surfaces wait on it, and those are Unix-gated.
+#[cfg(unix)]
 const FINAL_TEXT: &str = "Parity done.";
 
 /// Observation events that are coalesced, so their counts are not comparable.
@@ -724,7 +726,10 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
     })
 }
 
+// The TUI surfaces are driven through a real tmux session, which this harness
+// only knows how to do on Unix; `None` records the surface as skipped.
 #[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn)]
 fn run_tmux_surface(_name: &str, _owner: &str, _classic: bool) -> Option<SurfaceRun> {
     None
 }

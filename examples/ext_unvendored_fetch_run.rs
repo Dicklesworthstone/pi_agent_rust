@@ -35,7 +35,11 @@ struct Cli {
     command: CommandMode,
 }
 
+// A clap subcommand enum, parsed exactly once at startup and never stored in a
+// collection, so the variant size spread costs nothing. Boxing a variant is not
+// an option here: `Subcommand` derives onto the `Args` type directly.
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum CommandMode {
     /// Fetch and probe a corpus of candidates.
     RunAll(RunAllArgs),

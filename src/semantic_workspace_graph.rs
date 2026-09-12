@@ -6545,13 +6545,19 @@ fn redact_error_message(message: &str) -> String {
 
 #[cfg(test)]
 mod git_record_parser_tests {
-    use super::{
-        canonical_nul_records, parse_canonical_git_record, repository_git_command,
-        repository_git_context, trusted_git_executable,
-    };
+    use super::{canonical_nul_records, parse_canonical_git_record};
+    // Only `repository_git_commands_ignore_hostile_global_configuration` needs
+    // these, and it is Unix-gated (it builds a hostile `HOME`/`XDG_CONFIG_HOME`
+    // and inspects the resulting argv), so the imports follow its gate.
+    #[cfg(unix)]
+    use super::{repository_git_command, repository_git_context, trusted_git_executable};
+    #[cfg(unix)]
     use std::collections::BTreeMap;
+    #[cfg(unix)]
     use std::ffi::OsString;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::process::Command;
 
     #[test]

@@ -29,6 +29,8 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+// Only the Unix-gated case shells out to bash.
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

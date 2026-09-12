@@ -41,6 +41,7 @@ use pi::extensions::{
     resolve_extension_load_spec,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
+use pi::file_identity::FileIdentity;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
 use pi::models::{
     ExtensionProviderBinding, ModelEntry, ModelRegistry, default_models_path,
@@ -7286,20 +7287,24 @@ fn open_fingerprint_file(path: &Path) -> io::Result<fs::File> {
     Ok(fs::File::from(descriptor))
 }
 
-#[cfg(not(unix))]
+/// Windows counterpart to the Unix `O_NOFOLLOW` open above: a final reparse
+/// point must not be traversed, or the fingerprint would describe a file other
+/// than the one at `path`.
+#[cfg(windows)]
+fn open_fingerprint_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn open_fingerprint_file(path: &Path) -> io::Result<fs::File> {
     fs::File::open(path)
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    true
 }
 
 fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) -> bool {
@@ -7321,6 +7326,10 @@ fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) -> bool {
                 hasher.update(duration.as_secs().to_le_bytes());
                 hasher.update(duration.subsec_nanos().to_le_bytes());
             }
+            let Ok(before_identity) = FileIdentity::of_path_nofollow(path) else {
+                hasher.update([3]);
+                return false;
+            };
             let Ok(file) = open_fingerprint_file(path) else {
                 hasher.update([3]);
                 return false;
@@ -7342,16 +7351,24 @@ fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) -> bool {
                 hasher.update([6]);
                 return false;
             };
+            let Ok(opened_identity) = FileIdentity::of_open_file(limited.get_ref()) else {
+                hasher.update([6]);
+                return false;
+            };
             let Ok(after) = fs::symlink_metadata(path) else {
                 hasher.update([6]);
                 return false;
             };
+            let Ok(after_identity) = FileIdentity::of_path_nofollow(path) else {
+                hasher.update([6]);
+                return false;
+            };
             if !opened_after.file_type().is_file()
-                || !same_file_identity(&meta, &opened_after)
+                || before_identity != opened_identity
                 || opened_after.len() != meta.len()
                 || opened_after.modified().ok() != modified
                 || !after.file_type().is_file()
-                || !same_file_identity(&opened_after, &after)
+                || opened_identity != after_identity
                 || after.len() != meta.len()
                 || after.modified().ok() != modified
             {

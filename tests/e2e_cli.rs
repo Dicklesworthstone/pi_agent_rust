@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_CLI_TIMEOUT_SECS: u64 = 120;
 const VCR_CLAUDE_SONNET_MAX_TOKENS: u32 = 64_000;
+// A `#!/bin/sh` stub written to disk and marked executable, so its only writer
+// is Unix-gated.
+#[cfg(unix)]
 const FAKE_NPM_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 
@@ -418,6 +421,7 @@ fn running_as_root() -> bool {
 /// skips above are guarding against. Answering `false` lets those tests run
 /// rather than silently skipping everywhere that is not Unix.
 #[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn)]
 fn running_as_root() -> bool {
     false
 }

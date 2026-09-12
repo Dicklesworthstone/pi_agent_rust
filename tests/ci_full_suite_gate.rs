@@ -1726,7 +1726,11 @@ fn worktree_mode_matches(root: &Path, path: &str, mode: &str) -> bool {
     (mode == "100755") == executable
 }
 
+// Windows has no POSIX mode bits and git's `core.fileMode` is off there, so the
+// recorded 100644/100755 cannot be checked against the worktree; accepting is
+// the only answer that does not fail the gate for a platform difference.
 #[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn)]
 fn worktree_mode_matches(_root: &Path, _path: &str, _mode: &str) -> bool {
     true
 }

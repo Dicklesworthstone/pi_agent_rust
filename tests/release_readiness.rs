@@ -1415,6 +1415,7 @@ fn worktree_mode_matches(root: &Path, path: &str, mode: &str) -> bool {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn)]
 fn worktree_mode_matches(_root: &Path, _path: &str, _mode: &str) -> bool {
     // Git does not track the executable bit here; `git_tracks_file_mode`
     // already gates the caller, so this is only reached if it was overridden.
@@ -5207,6 +5208,9 @@ fn materialize_performance_fixture_summary_from_head(root: &Path) {
 
 struct PerformanceSourceRepositoryFixture {
     root: tempfile::TempDir,
+    /// Read only by the Unix-gated product-follow-up case, which asserts the
+    /// claim still names the commit the fixture was bound to.
+    #[cfg_attr(not(unix), allow(dead_code))]
     source_commit: String,
     summary: V,
 }
