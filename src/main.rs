@@ -8732,6 +8732,11 @@ async fn run_print_mode(
     let max_retries = config.retry_max_retries();
     let is_json = mode.eq("json");
     let mut sent_prompts = 0usize;
+    // Lives across every prompt in this process (bd-gm481.1): what the chain
+    // started from, what is installed now, when the cooldown began, and where
+    // the walk left off. Previously all of this was per-prompt, so a sequence
+    // that failed over never came back and restarted the chain each time.
+    let mut failover_state = PrintFailoverState::new(config);
 
     if let Some(initial) = initial {
         let content = pi::app::build_initial_content(&initial);
@@ -8750,6 +8755,7 @@ async fn run_print_mode(
                 keyword_scan_source: Some(initial.keyword_scan_source),
             },
             failover_ctx,
+            &mut failover_state,
         )
         .await?;
         sent_prompts = sent_prompts.saturating_add(1);
@@ -8763,6 +8769,11 @@ async fn run_print_mode(
     }
 
     for (message, keyword_scan_source) in messages {
+        // Cooldown restoration (bd-gm481.1) is a between-prompt lifecycle: the
+        // previous prompt's turn is finished and its `FailoverEnd
+        // { restoredPrimary: false }` already closed, so this can open and
+        // close its own `restoredPrimary: true` without interleaving.
+        maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
         reset_print_text_stream_state(&text_stream_state);
         let response = run_print_prompt_with_retry(
             session,
@@ -8778,6 +8789,7 @@ async fn run_print_mode(
                 keyword_scan_source: Some(keyword_scan_source),
             },
             failover_ctx,
+            &mut failover_state,
         )
         .await?;
         sent_prompts = sent_prompts.saturating_add(1);
@@ -8966,6 +8978,87 @@ fn print_mode_json_record(event: &AgentEvent) -> serde_json::Result<String> {
     event.to_json_stream_line()
 }
 
+/// The provider/model print mode was on before the first failover of the
+/// current chain (bd-gm481.1).
+///
+/// Recorded explicitly because neither the Session header nor the newest
+/// `ModelChange` can answer the question after a committed failover: both
+/// advance to the fallback. The thinking level is the one the user actually
+/// asked for, not the level the fallback clamped it to, so restoring gives
+/// back what they configured rather than what the detour allowed.
+#[derive(Debug, Clone)]
+struct PrintFailoverPrimary {
+    provider: String,
+    model_id: String,
+    requested_thinking_level: ThinkingLevel,
+}
+
+/// Cross-prompt failover state for print mode (bd-gm481.1).
+///
+/// RPC keeps the equivalent on `RpcSharedState`. Print had nowhere to put it,
+/// and three things were wrong at once as a result. A `--message` sequence that
+/// failed over stayed pinned to the fallback for every later prompt with no
+/// path back. The chain cursor was a per-prompt local, so prompt two restarted
+/// its walk at entry zero and could reinstall the fallback it was already on.
+/// And nothing recorded what the primary had been, so even an attempt to
+/// restore had no identity to return to.
+///
+/// Per-process, like RPC's: a reopened session starts empty and stays on
+/// whatever the Session header says. Recovering the primary across a restart
+/// would need it durably recorded, which neither surface does today.
+#[derive(Debug, Default)]
+struct PrintFailoverState {
+    /// `None` when no fallback chain is configured, matching RPC — with no
+    /// chain there is nothing to fail over to and nothing to restore from.
+    cooldown: Option<pi::failover::CooldownTracker>,
+    primary: Option<PrintFailoverPrimary>,
+    /// The fallback currently installed, if any.
+    active: Option<(String, String)>,
+    /// Where the walk left off, carried across prompts so a later prompt
+    /// resumes the chain instead of restarting it.
+    chain_position: usize,
+}
+
+impl PrintFailoverState {
+    fn new(config: &Config) -> Self {
+        Self {
+            cooldown: config
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.fallback_chains.as_ref())
+                .map(|_| pi::failover::CooldownTracker::new(config.failover_cooldown_secs())),
+            primary: None,
+            active: None,
+            chain_position: 0,
+        }
+    }
+
+    /// Record a committed swap away from `primary` onto `active`.
+    ///
+    /// The primary is recorded only on the FIRST swap of a chain: a second hop
+    /// moves away from a fallback, and the identity to return to is still the
+    /// model the chain started from.
+    fn record_swap(&mut self, primary: PrintFailoverPrimary, active: (String, String)) {
+        if self.primary.is_none() {
+            self.primary = Some(primary);
+        }
+        self.active = Some(active);
+        if let Some(tracker) = self.cooldown.as_mut() {
+            tracker.record_primary_failure(std::time::Instant::now());
+        }
+    }
+
+    /// The primary is back; the chain starts over from the top next time.
+    fn clear(&mut self) {
+        self.primary = None;
+        self.active = None;
+        self.chain_position = 0;
+        if let Some(tracker) = self.cooldown.as_mut() {
+            tracker.reset();
+        }
+    }
+}
+
 /// Failover lifecycle (bd-2vmu6.1): a turn that swapped to a fallback chain
 /// entry closes its `FailoverStart` before the turn's terminal output,
 /// whether the fallback succeeded, failed, or was aborted. Restoring the
@@ -9063,6 +9156,173 @@ fn emit_print_restore_failure(is_json: bool, retry_count: u32, error: &anyhow::E
     }
 }
 
+/// Print-mode primary restoration after cooldown (bd-gm481.1).
+///
+/// Called before each prompt. If a fallback is installed and its cooldown has
+/// elapsed, swap back to the recorded primary and close that lifecycle with
+/// `FailoverEnd { restoredPrimary: true }`. Before this existed, print mode had
+/// no way back: a `--message` sequence that failed over ran every later prompt
+/// on the temporary fallback.
+///
+/// The invariants are RPC's, for RPC's reason — the recorded fallback must
+/// still be what is actually installed, in both the live agent and the Session
+/// path. If either has moved, something other than this failover changed the
+/// model and undoing it is not ours to do. Unlike RPC, a broken invariant here
+/// does not quarantine the session: print has no admission gate to block, and
+/// the honest response is to leave the fallback in place and say so.
+///
+/// Returns `true` when the primary was restored.
+///
+/// Long on purpose, like `try_print_failover` beside it: this is one linear
+/// transition — gate, resolve, validate, build a candidate, persist, install —
+/// and every early return is a refusal that leaves the fallback in place.
+/// Splitting it would hide which refusals are reachable from which state.
+#[allow(clippy::too_many_lines)]
+async fn maybe_restore_print_primary(
+    session: &mut AgentSession,
+    state: &mut PrintFailoverState,
+    failover_ctx: Option<FailoverResolution<'_>>,
+    is_json: bool,
+) -> bool {
+    let Some(ctx) = failover_ctx else {
+        return false;
+    };
+    let Some((active_provider, active_model)) = state.active.clone() else {
+        return false;
+    };
+    let Some(primary) = state.primary.clone() else {
+        return false;
+    };
+    if !state
+        .cooldown
+        .as_ref()
+        .is_some_and(|tracker| tracker.should_use_primary(std::time::Instant::now()))
+    {
+        return false;
+    }
+
+    let runtime_provider = session.agent.provider();
+    if !pi::provider_metadata::provider_ids_match(runtime_provider.name(), &active_provider)
+        || !runtime_provider
+            .model_id()
+            .eq_ignore_ascii_case(&active_model)
+    {
+        return false;
+    }
+
+    let Some(entry) = ctx
+        .available_models
+        .iter()
+        .find(|m| {
+            pi::provider_metadata::provider_ids_match(&m.model.provider, &primary.provider)
+                && m.model.id.eq_ignore_ascii_case(&primary.model_id)
+        })
+        .cloned()
+        .or_else(|| pi::models::ad_hoc_model_entry(&primary.provider, &primary.model_id))
+    else {
+        return false;
+    };
+    let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
+    if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
+        // Restoring into an auth error would be strictly worse than staying on
+        // a working fallback.
+        return false;
+    }
+    let Ok(provider_impl) = providers::create_provider(
+        &entry,
+        session.extensions.as_ref().map(ExtensionRegion::manager),
+    ) else {
+        return false;
+    };
+
+    let session_store = Arc::clone(&session.session);
+    let cx = pi::agent_cx::AgentCx::for_request();
+    let Ok(mut inner) = OwnedMutexGuard::lock(session_store, &cx).await else {
+        return false;
+    };
+    let session_matches_active = inner.effective_model_for_current_path().is_some_and(
+        |(session_provider, session_model)| {
+            pi::provider_metadata::provider_ids_match(&session_provider, &active_provider)
+                && session_model.eq_ignore_ascii_case(&active_model)
+        },
+    );
+    if !session_matches_active {
+        return false;
+    }
+
+    // Build the whole transition on a private candidate; the live transcript
+    // and provider stay untouched if persistence fails.
+    let to_provider = entry.model.provider.clone();
+    let to_model = entry.model.id.clone();
+    let target_thinking = entry.clamp_thinking_level(primary.requested_thinking_level);
+    let target_thinking_text = target_thinking.to_string();
+    let mut candidate = inner.clone();
+    let thinking_changed = candidate
+        .effective_thinking_level_for_current_path()
+        .as_deref()
+        != Some(target_thinking_text.as_str());
+    candidate.set_model_header(
+        Some(to_provider.clone()),
+        Some(to_model.clone()),
+        Some(target_thinking_text.clone()),
+    );
+    candidate.append_model_change_with_role(
+        to_provider.clone(),
+        to_model.clone(),
+        Some("primary_restore".to_string()),
+    );
+    if thinking_changed {
+        candidate.append_thinking_level_change(target_thinking_text);
+    }
+    if session.save_enabled()
+        && let Err(_first) = candidate.save().await
+        && let Err(_retry) = candidate.save().await
+    {
+        // Leave the fallback installed. A half-written restoration is worse
+        // than a working session on the wrong model.
+        return false;
+    }
+
+    // No fallible operation remains after installing the candidate.
+    *inner = candidate;
+    session.agent.set_provider(provider_impl);
+    session
+        .agent
+        .set_keyword_max_thinking_level(entry.clamp_thinking_level(ThinkingLevel::Max));
+    session
+        .agent
+        .set_tool_call_dialect(entry.tool_call_dialect());
+    session
+        .agent
+        .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
+    {
+        let stream_options = session.agent.stream_options_mut();
+        stream_options.api_key.clone_from(&key);
+        stream_options.headers.clone_from(&entry.headers);
+        stream_options.max_tokens = Some(entry.model.max_tokens);
+        stream_options.thinking_level = Some(target_thinking);
+    }
+    session.set_compaction_context_window(context_window_tokens_for_entry(&entry));
+    session.refresh_extension_completion_host_state();
+    if let Some(region) = &session.extensions {
+        region
+            .manager()
+            .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
+    }
+    drop(inner);
+    state.clear();
+
+    if is_json {
+        emit_json_event(&AgentEvent::FailoverEnd {
+            success: true,
+            provider: to_provider,
+            model: to_model,
+            restored_primary: true,
+        });
+    }
+    true
+}
+
 /// Print-mode failover swap (bd-cv653.3.2): classify the terminal error; if
 /// eligible, resolve the next chain entry, swap the agent's provider, emit
 /// `FailoverStart` (json mode), and record the session audit + `ModelChange`.
@@ -9073,11 +9333,12 @@ async fn try_print_failover(
     session: &mut AgentSession,
     config: &Config,
     failover_ctx: Option<FailoverResolution<'_>>,
-    position: &mut usize,
+    failover_state: &mut PrintFailoverState,
     error_text: Option<&str>,
     is_json: bool,
     require_incomplete_tail: bool,
     retry_attempt_to_end: Option<u32>,
+    swaps_so_far: u32,
 ) -> Result<Option<(String, String)>> {
     let Some(ctx) = failover_ctx else {
         return Ok(None);
@@ -9101,11 +9362,19 @@ async fn try_print_failover(
         current_provider.name().to_string(),
         current_provider.model_id().to_string(),
     );
+    // Captured before any swap installs the fallback's own clamped level, so a
+    // later restoration gives back what the user asked for rather than what the
+    // detour allowed (bd-gm481.1).
+    let requested_thinking_level = session
+        .agent
+        .stream_options()
+        .thinking_level
+        .unwrap_or_default();
     let Some(chain) = pi::failover::chain_for(chains, "default", &from_provider, &from_model)
     else {
         return Ok(None);
     };
-    let mut cursor = *position;
+    let mut cursor = failover_state.chain_position;
 
     // The walk is bounded by the chain, not by `max_failovers_per_turn`: the
     // caller counts successful swaps against that cap (bd-oqo03.1). Bounding
@@ -9138,6 +9407,12 @@ async fn try_print_failover(
                 .cloned()
                 .or_else(|| pi::models::ad_hoc_model_entry(provider, model_id))
         })();
+        // Where this candidate sits in the chain, captured before the cursor
+        // advances to the resume position. `cursor` after this line is where
+        // the NEXT turn starts looking, which is one past the entry being
+        // considered — reporting that as the chain index is off by one
+        // (bd-oqo03).
+        let entry_index = cursor;
         cursor += 1;
         let Some(entry) = candidate else { continue };
         let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
@@ -9242,7 +9517,19 @@ async fn try_print_failover(
                 .manager()
                 .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
         }
-        *position = cursor;
+        failover_state.chain_position = cursor;
+        // Cross-prompt record (bd-gm481.1): what to return to, and when the
+        // cooldown on doing so started. The primary is only captured on the
+        // first swap of a chain — a second hop moves away from a fallback, and
+        // the identity to restore is still the model the chain started from.
+        failover_state.record_swap(
+            PrintFailoverPrimary {
+                provider: from_provider.clone(),
+                model_id: from_model.clone(),
+                requested_thinking_level,
+            },
+            (to_provider.clone(), to_model.clone()),
+        );
         drop(inner);
 
         if is_json {
@@ -9259,13 +9546,17 @@ async fn try_print_failover(
                 to_provider: to_provider.clone(),
                 to_model: to_model.clone(),
                 class: format!("{class:?}").to_ascii_lowercase(),
-                attempt: u32::try_from(cursor).unwrap_or(u32::MAX),
+                // Budget position, not chain position: this swap is the
+                // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn`
+                // (bd-oqo03).
+                attempt: swaps_so_far.saturating_add(1),
+                chain_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
             });
         }
 
         return Ok(Some((to_provider, to_model)));
     }
-    *position = cursor;
+    failover_state.chain_position = cursor;
     Ok(None)
 }
 
@@ -9283,6 +9574,7 @@ async fn run_print_prompt_with_retry<H, EH>(
     text_stream_state: &Arc<StdMutex<PrintTextStreamState>>,
     input: PromptInput,
     failover_ctx: Option<FailoverResolution<'_>>,
+    failover_state: &mut PrintFailoverState,
 ) -> Result<AssistantMessage>
 where
     H: Fn() -> EH + Sync,
@@ -9328,7 +9620,6 @@ where
     }
 
     let mut retry_count: u32 = 0;
-    let mut failover_position: usize = 0;
     // Set once a fallback chain entry has been installed for this turn; every
     // exit below then closes the failover lifecycle before returning.
     let mut failed_over = false;
@@ -9417,11 +9708,12 @@ where
                             session,
                             config,
                             failover_ctx,
-                            &mut failover_position,
+                            failover_state,
                             msg.error_message.as_deref(),
                             is_json,
                             true,
                             (retry_count > 0).then_some(retry_count),
+                            failovers_this_turn,
                         )
                         .await
                     } else {
@@ -9555,11 +9847,12 @@ where
                             session,
                             config,
                             failover_ctx,
-                            &mut failover_position,
+                            failover_state,
                             Some(err_str.as_str()),
                             is_json,
                             false,
                             (retry_count > 0).then_some(retry_count),
+                            failovers_this_turn,
                         )
                         .await
                     } else {
@@ -11705,6 +11998,7 @@ mod tests {
                     keyword_scan_source: None,
                 },
                 None,
+                &mut PrintFailoverState::default(),
             )
             .await
             .expect_err("typed persistence failure must remain terminal");
@@ -11852,6 +12146,7 @@ mod tests {
                     keyword_scan_source: None,
                 },
                 None,
+                &mut PrintFailoverState::default(),
             )
             .await
             .expect("Ok(Error) persistence marker returns the original assistant");
@@ -12046,16 +12341,17 @@ mod tests {
                 auth: &auth,
                 cli_api_key: None,
             });
-            let mut position = 0;
+            let mut failover_state = PrintFailoverState::new(&config);
             let no_tail = try_print_failover(
                 &mut agent_session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 true,
                 None,
+                0,
             )
             .await
             .expect_err("known assistant failure requires a restorable tail");
@@ -12085,17 +12381,18 @@ mod tests {
                     .agent
                     .replace_messages(inner.to_messages_for_current_path());
             }
-            position = 0;
+            failover_state.chain_position = 0;
             assert!(
                 try_print_failover(
                     &mut agent_session,
                     &config,
                     failover_ctx,
-                    &mut position,
+                    &mut failover_state,
                     Some("server error"),
                     false,
                     true,
                     None,
+                    0,
                 )
                 .await
                 .expect("durable print failover")
@@ -12285,16 +12582,17 @@ mod tests {
             // swapped to itself, and the valid fallback is installed.
             let (mut session, _keep) = build_session();
             let config = config_with_chain(&["openai/primary-model", "anthropic/fallback-model"]);
-            let mut position = 0;
+            let mut failover_state = PrintFailoverState::new(&config);
             let swapped = try_print_failover(
                 &mut session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("walk past the current entry");
@@ -12303,7 +12601,20 @@ mod tests {
                 Some(("anthropic".to_string(), "fallback-model".to_string())),
                 "the current model must not consume the walk"
             );
-            assert_eq!(position, 2);
+            assert_eq!(failover_state.chain_position, 2);
+            // bd-gm481.1: the swap records what to come back to.
+            assert_eq!(
+                failover_state
+                    .primary
+                    .as_ref()
+                    .map(|p| (p.provider.as_str(), p.model_id.as_str())),
+                Some(("openai", "primary-model")),
+                "the model the chain started from is the one to restore"
+            );
+            assert_eq!(
+                failover_state.active,
+                Some(("anthropic".to_string(), "fallback-model".to_string()))
+            );
             assert_eq!(session.agent.provider().name(), "anthropic");
             assert_eq!(session.agent.provider().model_id(), "fallback-model");
 
@@ -12317,16 +12628,17 @@ mod tests {
                 "anthropic/fallback-model",
                 "anthropic/fallback-model",
             ]);
-            let mut position = 0;
+            let mut failover_state = PrintFailoverState::new(&config);
             let swapped = try_print_failover(
                 &mut session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("walk past keyless and duplicate entries");
@@ -12334,21 +12646,25 @@ mod tests {
                 swapped,
                 Some(("anthropic".to_string(), "fallback-model".to_string()))
             );
-            assert_eq!(position, 3);
+            assert_eq!(failover_state.chain_position, 3);
             let again = try_print_failover(
                 &mut session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("second walk");
             assert_eq!(again, None, "the trailing duplicate is not a new swap");
-            assert_eq!(position, 4, "the walk is bounded by the chain length");
+            assert_eq!(
+                failover_state.chain_position, 4,
+                "the walk is bounded by the chain length"
+            );
         });
     }
 
@@ -12482,16 +12798,17 @@ mod tests {
                 cli_api_key: None,
             });
             let original_dialect = agent_session.agent.tool_call_dialect();
-            let mut position = 0;
+            let mut failover_state = PrintFailoverState::new(&config);
             let failover_error = try_print_failover(
                 &mut agent_session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 true,
                 None,
+                0,
             )
             .await
             .expect_err("unwritable candidate must block failover");

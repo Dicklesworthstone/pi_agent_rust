@@ -65,12 +65,27 @@ struct PiEnv {
 
 impl PiEnv {
     fn new(harness: &TestHarness) -> Self {
+        Self::with_cooldown_secs(harness, None)
+    }
+
+    /// Same environment with an explicit `failoverCooldownSecs`.
+    ///
+    /// The default is 300s, which is fine for the single-prompt lifecycle tests
+    /// and useless for the restoration ones (bd-gm481.1): 0 makes the primary
+    /// eligible again immediately, and a large value pins the session to the
+    /// fallback for the rest of the run. Those are the two behaviours to test.
+    fn with_cooldown_secs(harness: &TestHarness, cooldown_secs: Option<u64>) -> Self {
         let root = harness.temp_path("pi-env");
         std::fs::create_dir_all(root.join("agent")).expect("mkdir agent");
         std::fs::create_dir_all(root.join("home")).expect("mkdir home");
+        let cooldown = cooldown_secs
+            .map(|secs| format!(r#", "failoverCooldownSecs": {secs}"#))
+            .unwrap_or_default();
         std::fs::write(
             root.join("settings.json"),
-            r#"{"retry": {"enabled": true, "maxRetries": 1, "fallbackChains": {"default": ["e2ebackup/backup-model"]}}, "checkForUpdates": false}"#,
+            format!(
+                r#"{{"retry": {{"enabled": true, "maxRetries": 1, "fallbackChains": {{"default": ["e2ebackup/backup-model"]}}{cooldown}}}, "checkForUpdates": false}}"#
+            ),
         )
         .expect("write settings.json");
         Self { root }
@@ -268,6 +283,66 @@ fn run_print_json_failover(
     (events, stdout, stderr)
 }
 
+/// Run `pi --print --mode json` with TWO prompts against the mock server.
+///
+/// Two prompts is the whole point for bd-gm481.1: restoration is a
+/// between-prompt lifecycle, so a single-prompt run can never observe it.
+fn run_print_json_two_prompts(
+    harness: &TestHarness,
+    server: &common::harness::MockHttpServer,
+    cooldown_secs: u64,
+    label: &str,
+) -> (Vec<serde_json::Value>, String, String) {
+    let env = PiEnv::with_cooldown_secs(harness, Some(cooldown_secs));
+    env.write_models(&server.base_url());
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let mut command = env.command(&binary);
+    // Flags first: `Cli::args` is `trailing_var_arg`, so everything after the
+    // first positional is captured as another message. Both positionals below
+    // are messages, which is what makes this a two-prompt run.
+    command.args([
+        "--print",
+        "--mode",
+        "json",
+        "--no-session",
+        "--provider",
+        "e2eprimary",
+        "--model",
+        "primary-model",
+        "ping",
+        "pong",
+    ]);
+    harness.log().info("action", label);
+    let child = command.spawn().expect("spawn pi");
+    let (stdout, stderr) = run_and_collect(child, 120);
+    let events = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    harness.log().info_ctx("verify", "process finished", |ctx| {
+        ctx.push(("event_count".to_string(), events.len().to_string()));
+        ctx.push((
+            "stderr_tail".to_string(),
+            stderr.chars().take(400).collect(),
+        ));
+    });
+    (events, stdout, stderr)
+}
+
+/// The `failover_end` records that report a primary restoration.
+fn restoration_events(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    events
+        .iter()
+        .filter(|event| {
+            event.get("type").and_then(serde_json::Value::as_str) == Some("failover_end")
+                && event
+                    .get("restoredPrimary")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })
+        .collect()
+}
+
 fn event_kinds(events: &[serde_json::Value]) -> Vec<String> {
     events
         .iter()
@@ -333,6 +408,24 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_success() {
         1,
         "exactly one failover_end per failover_start: {kinds:?}"
     );
+    // bd-oqo03: `attempt` is the successful-swap ordinal within the turn, and
+    // `chainIndex` is where the entry sits in the chain. They are reported
+    // separately because they answer different questions — budget versus
+    // provenance — and `attempt` used to carry the index, which stopped
+    // meaning anything once the walk began skipping entries. Here the single
+    // chain entry sits at index 0 and is the turn's first swap, so the two
+    // values differ and a regression that puts the cursor back in `attempt`
+    // shows up as 0 where 1 is expected.
+    let start_event = &events[start]; // ubs:ignore index proven by position() above
+    assert_eq!(
+        start_event["attempt"], 1,
+        "the first successful swap of the turn is attempt 1, not the chain cursor: {start_event}"
+    );
+    assert_eq!(
+        start_event["chainIndex"], 0,
+        "the only fallback entry sits at chain index 0: {start_event}"
+    );
+
     let end_event = &events[end]; // ubs:ignore index proven by position() above
     assert_eq!(end_event["success"], serde_json::Value::Bool(true));
     assert_eq!(end_event["restoredPrimary"], serde_json::Value::Bool(false));
@@ -425,6 +518,124 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_failure() {
     let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
     assert!(errors.is_empty(), "JSONL violations: {errors:?}");
     harness.record_artifact("e2e_failover_json_failure.jsonl", &path);
+}
+
+/// bd-gm481.1: with the cooldown elapsed, the primary comes back between
+/// prompts and the next prompt is attempted on it again.
+///
+/// Print mode had no cooldown tracker and no restoration path at all, so a
+/// `--message` sequence that failed over ran every later prompt on the
+/// temporary fallback with no way home. The shape below is the proof: the
+/// primary refuses every request, so if restoration happens the SECOND prompt
+/// must fail over again, and if it does not there is only ever one swap.
+#[test]
+fn e2e_failover_restores_primary_between_prompts_once_cooldown_elapsed() {
+    let harness =
+        TestHarness::new("e2e_failover_restores_primary_between_prompts_once_cooldown_elapsed");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/backup/v1/chat/completions",
+        sse_response(text_sse_body("backup ok")),
+    );
+
+    let (events, stdout, stderr) = run_print_json_two_prompts(
+        &harness,
+        &server,
+        0,
+        "two prompts, cooldown 0: the primary is eligible again immediately",
+    );
+    let kinds = event_kinds(&events);
+
+    let restorations = restoration_events(&events);
+    assert_eq!(
+        restorations.len(),
+        1,
+        "exactly one restoration between the two prompts: {kinds:?}\n{stdout}\n{stderr}"
+    );
+    let restoration = restorations[0];
+    assert_eq!(
+        restoration["success"],
+        serde_json::Value::Bool(true),
+        "a restoration that happened is a success: {restoration}"
+    );
+    assert_eq!(
+        restoration["provider"], "e2eprimary",
+        "the restoration names the model the chain started from, not the fallback: {restoration}"
+    );
+    assert_eq!(restoration["model"], "primary-model");
+
+    // The primary refuses everything, so a restored session fails over again.
+    // Two swaps is what proves the first one was actually undone.
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "failover_start").count(),
+        2,
+        "each prompt starts on the primary and fails over: {kinds:?}\n{stdout}\n{stderr}"
+    );
+
+    let path = harness.temp_path("e2e_failover_restore.jsonl");
+    harness.write_jsonl_logs(&path).expect("write logs");
+    let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
+    assert!(errors.is_empty(), "JSONL violations: {errors:?}");
+    harness.record_artifact("e2e_failover_restore.jsonl", &path);
+}
+
+/// bd-gm481.1, the other half: before the cooldown elapses the session stays on
+/// the fallback, and says nothing about restoring.
+///
+/// Without this the test above would pass on an implementation that restored
+/// unconditionally, which would defeat the point of a cooldown — the primary
+/// just told us it was rate limited.
+#[test]
+fn e2e_failover_stays_on_fallback_while_the_cooldown_holds() {
+    let harness = TestHarness::new("e2e_failover_stays_on_fallback_while_the_cooldown_holds");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/backup/v1/chat/completions",
+        sse_response(text_sse_body("backup ok")),
+    );
+
+    let (events, stdout, stderr) = run_print_json_two_prompts(
+        &harness,
+        &server,
+        600,
+        "two prompts, cooldown 600: the primary stays quiesced",
+    );
+    let kinds = event_kinds(&events);
+
+    assert!(
+        restoration_events(&events).is_empty(),
+        "nothing may be restored while the cooldown holds: {kinds:?}\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "failover_start").count(),
+        1,
+        "only the first prompt fails over; the second runs on the fallback it is still pinned to: \
+         {kinds:?}\n{stdout}\n{stderr}"
+    );
+
+    let path = harness.temp_path("e2e_failover_pinned.jsonl");
+    harness.write_jsonl_logs(&path).expect("write logs");
+    let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
+    assert!(errors.is_empty(), "JSONL violations: {errors:?}");
+    harness.record_artifact("e2e_failover_pinned.jsonl", &path);
 }
 
 #[test]
