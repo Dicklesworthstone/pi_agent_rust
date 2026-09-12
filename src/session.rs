@@ -243,7 +243,12 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(parent)?.sync_all()
 }
 
+// Every `cfg(not(unix))` arm in this file mirrors a Unix arm that really can
+// fail, so the fallible signature has to stay even though this one cannot —
+// hence `unnecessary_wraps` and `missing_const_for_fn` are expected here and
+// on each stub below.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -447,6 +452,7 @@ pub(crate) fn ensure_session_directory_readable(path: &Path) -> std::io::Result<
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_directory_readable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -464,6 +470,7 @@ pub(crate) fn ensure_session_file_writable(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_file_writable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -481,6 +488,7 @@ pub(crate) fn ensure_session_file_read_write(path: &Path) -> std::io::Result<()>
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_file_read_write(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -508,6 +516,7 @@ pub(crate) fn ensure_session_parent_writable(path: &Path) -> std::io::Result<()>
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_parent_writable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -537,6 +546,7 @@ fn ensure_session_parent_durable_writable(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn ensure_session_parent_durable_writable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -585,6 +595,7 @@ pub(crate) fn ensure_session_directory_creation_access(path: &Path) -> std::io::
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_directory_creation_access(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -675,6 +686,7 @@ fn ensure_v2_sidecar_tree_access(root: &Path, writable: bool) -> std::io::Result
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn ensure_v2_sidecar_tree_access(_root: &Path, _writable: bool) -> std::io::Result<()> {
     Ok(())
 }

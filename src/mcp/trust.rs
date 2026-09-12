@@ -109,7 +109,9 @@ pub(crate) struct TrustWriteGuard {
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct TrustWriteGuard {
-    _directories: Vec<WindowsTrustDirectoryGuard>,
+    /// Read back by `save` to re-verify each pinned parent before and after
+    /// the commit, so this is a live field and not an RAII-only hold.
+    directories: Vec<WindowsTrustDirectoryGuard>,
     _lock: crate::file_lock::DirLock,
 }
 
@@ -689,7 +691,11 @@ impl TrustStore {
         }
     }
 
+    // One linear TOCTOU sequence — pin the parents, identify the path, open it,
+    // re-identify the handle, read, re-verify — where every early return is a
+    // refusal. Splitting it would hide which refusal is reachable from where.
     #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
     fn read_content(path: &Path) -> Result<Option<String>> {
         use std::os::windows::fs::OpenOptionsExt as _;
 
@@ -1186,7 +1192,7 @@ impl TrustStore {
         self.schema_version = fresh.schema_version;
         self.servers = fresh.servers;
         Ok(TrustWriteGuard {
-            _directories: directories,
+            directories,
             _lock: lock,
         })
     }
@@ -1312,7 +1318,7 @@ impl TrustStore {
 
     #[cfg(windows)]
     fn save(&self, guard: &TrustWriteGuard) -> Result<()> {
-        validate_windows_trust_directory_guards(&guard._directories).map_err(|err| {
+        validate_windows_trust_directory_guards(&guard.directories).map_err(|err| {
             Error::tool(
                 "mcp",
                 format!("[MCP_TRUST_IO] trust parent changed before saving: {err}"),
@@ -1341,7 +1347,7 @@ impl TrustStore {
         temp.as_file()
             .sync_all()
             .map_err(|err| Error::tool("mcp", format!("[MCP_TRUST_IO] sync: {err}")))?;
-        validate_windows_trust_directory_guards(&guard._directories).map_err(|err| {
+        validate_windows_trust_directory_guards(&guard.directories).map_err(|err| {
             Error::tool(
                 "mcp",
                 format!("[MCP_TRUST_IO] trust parent changed before persistence: {err}"),
@@ -1349,7 +1355,7 @@ impl TrustStore {
         })?;
         temp.persist(&self.path)
             .map_err(|err| Error::tool("mcp", format!("[MCP_TRUST_IO] persist: {}", err.error)))?;
-        if validate_windows_trust_directory_guards(&guard._directories).is_err() {
+        if validate_windows_trust_directory_guards(&guard.directories).is_err() {
             tracing::warn!(
                 event = "pi.mcp.trust_parent_revalidation_failed_after_commit",
                 "MCP trust transition committed but its Windows parent handles could not be revalidated"

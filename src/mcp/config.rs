@@ -277,9 +277,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|meta| meta.is_file())
-        .unwrap_or(false)
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 /// Pure resolver for one raw command against explicit PATH contents.

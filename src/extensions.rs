@@ -1737,19 +1737,19 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     {
         let s = path.to_string_lossy();
         if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            if let Some(unc) = stripped.strip_prefix("UNC") {
-                if unc.starts_with('\\') {
-                    return PathBuf::from(format!(r"\{}", unc));
-                }
+            if let Some(unc) = stripped.strip_prefix("UNC")
+                && unc.starts_with('\\')
+            {
+                return PathBuf::from(format!(r"\{unc}"));
             }
             return PathBuf::from(stripped);
         }
         // fd normalises separators to `/`, producing `//?/` instead of `\\?\`.
         if let Some(stripped) = s.strip_prefix("//?/") {
-            if let Some(unc) = stripped.strip_prefix("UNC") {
-                if unc.starts_with('/') {
-                    return PathBuf::from(format!("/{}", unc));
-                }
+            if let Some(unc) = stripped.strip_prefix("UNC")
+                && unc.starts_with('/')
+            {
+                return PathBuf::from(format!("/{unc}"));
             }
             return PathBuf::from(stripped);
         }

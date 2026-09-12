@@ -696,7 +696,9 @@ fn check_dir(cat: CheckCategory, label: &str, dir: &Path, fix: bool, findings: &
 // ── Check: Auth ─────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-#[cfg_attr(not(unix), allow(unused_variables))]
+// `auth_path` is consumed by the load below and then re-read by the Unix-only
+// permission check, so the clone is redundant only where that check is absent.
+#[cfg_attr(not(unix), allow(unused_variables, clippy::redundant_clone))]
 fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
     let cat = CheckCategory::Auth;
     let auth_path = Config::auth_path();
@@ -1108,19 +1110,19 @@ fn resolve_executable_in_dir(dir: &Path, tool: &str) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        path.is_file()
+            && std::fs::metadata(path)
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
     }
 
+    // Windows carries no executable bit; being a regular file is all that can
+    // be checked here, and PATHEXT decides the rest at spawn time.
     #[cfg(not(unix))]
     {
-        true
+        path.is_file()
     }
 }
 

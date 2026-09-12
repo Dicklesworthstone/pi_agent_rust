@@ -915,7 +915,9 @@ fn validate_extension_scan_permissions_after_lexical(
     Ok(())
 }
 
+// Mirrors the Unix arm's fallible signature, which really can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn validate_extension_scan_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }

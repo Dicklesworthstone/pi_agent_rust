@@ -435,16 +435,13 @@ impl DirLock {
 /// component is itself a regular file some platforms surface `ENOTDIR`. Treat
 /// both as "already occupied" so the stale/heal path runs.
 fn is_already_exists(e: &io::Error) -> bool {
-    if e.kind() == io::ErrorKind::AlreadyExists {
-        return true;
-    }
     #[cfg(unix)]
     {
-        e.raw_os_error() == Some(ENOTDIR)
+        e.kind() == io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(ENOTDIR)
     }
     #[cfg(not(unix))]
     {
-        false
+        e.kind() == io::ErrorKind::AlreadyExists
     }
 }
 

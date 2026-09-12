@@ -175,7 +175,11 @@ pub(super) fn is_file_ref_boundary(text: &str, at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    // Only `file_url_to_path_valid` names a `PathBuf`, and its `file:///tmp/…`
+    // fixture is Unix-shaped, so it is gated and this import with it.
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     use super::*;
 

@@ -2720,10 +2720,8 @@ fn permission_octal(metadata: &std::fs::Metadata) -> String {
     format!("{:03o}", metadata.permissions().mode() & 0o777)
 }
 
-#[cfg(not(unix))]
-fn permission_octal(_metadata: &std::fs::Metadata) -> String {
-    "n/a".to_string()
-}
+// No `cfg(not(unix))` arm: the single caller is itself Unix-gated and reports
+// `permissions_octal: None` elsewhere, so a fallback here would be dead code.
 
 fn collect_allowlisted_env() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();

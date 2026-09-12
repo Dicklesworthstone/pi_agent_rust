@@ -63,6 +63,13 @@ pub(crate) struct EffectiveModeAccessContext {
 }
 
 impl EffectiveModeAccessContext {
+    // Both methods below carry a Unix mode check that really can fail and
+    // really does read `self`; off Unix the arms collapse to `Ok(())`, so the
+    // signature-shaped lints are expected rather than actionable.
+    #[cfg_attr(
+        not(unix),
+        allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+    )]
     pub(crate) fn current() -> std::io::Result<Self> {
         #[cfg(unix)]
         {
@@ -77,6 +84,14 @@ impl EffectiveModeAccessContext {
         }
     }
 
+    #[cfg_attr(
+        not(unix),
+        allow(
+            clippy::unnecessary_wraps,
+            clippy::missing_const_for_fn,
+            clippy::unused_self
+        )
+    )]
     pub(crate) fn ensure(
         &self,
         metadata: &std::fs::Metadata,

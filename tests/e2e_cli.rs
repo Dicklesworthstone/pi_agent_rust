@@ -28,7 +28,6 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-#[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -413,6 +412,14 @@ fn canon(p: &Path) -> PathBuf {
 #[cfg(unix)]
 fn running_as_root() -> bool {
     rustix::process::geteuid().is_root()
+}
+
+/// There is no euid off Unix, so nothing here can claim the DAC bypass the
+/// skips above are guarding against. Answering `false` lets those tests run
+/// rather than silently skipping everywhere that is not Unix.
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
 }
 
 #[cfg(unix)]

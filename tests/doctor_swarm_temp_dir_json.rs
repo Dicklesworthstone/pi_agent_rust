@@ -16,6 +16,9 @@ use std::process::{Command, Stdio};
 const SWARM_TEMP_DIR_SCHEMA: &str = "pi.doctor.swarm_temp_dir.v1";
 const SWARM_RESOURCE_PREFLIGHT_SCHEMA: &str = "pi.doctor.swarm_resource_preflight.v1";
 const SWARM_LANE_PLACEMENT_SCHEMA: &str = "pi.doctor.swarm_lane_placement.v1";
+// Read only by the Unix-gated degraded-mailbox case, which chmods a mailbox
+// directory to provoke the finding.
+#[cfg(unix)]
 const SWARM_MAIL_DEGRADED_SCHEMA: &str = "pi.doctor.agent_mail_degraded_mode.v1";
 const SWARM_CONTEXT_INTELLIGENCE_SCHEMA: &str = "pi.doctor.context_intelligence_posture.v1";
 const SWARM_VALIDATION_BROKER_SCHEMA: &str = "pi.doctor.validation_broker_posture.v1";

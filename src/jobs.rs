@@ -1766,7 +1766,9 @@ fn prepare_job_stream(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
     Ok(())
 }
 
+// Mirrors the Unix arm's fallible signature, which really can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn prepare_job_stream<R>(_reader: &R) -> std::io::Result<()> {
     Ok(())
 }

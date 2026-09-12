@@ -468,6 +468,12 @@ fn check_deprecated_extension_dirs(base_dir: &Path, label: &str) -> Vec<String> 
     warnings
 }
 
+// The Unix arm really can fail, so the fallible signature has to stay even
+// though the `cfg(not(unix))` arm below cannot.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
 fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

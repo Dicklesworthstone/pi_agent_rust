@@ -4953,7 +4953,9 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// Mirrors the Unix arm's fallible signature, which really can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }

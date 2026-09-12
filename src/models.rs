@@ -4324,13 +4324,14 @@ fn ensure_model_catalog_persistence_access_for_platform(
     path: &Path,
     target_metadata: Option<&fs::Metadata>,
 ) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
     if target_metadata.is_none() {
         return Ok(());
     }
 
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)

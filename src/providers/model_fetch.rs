@@ -1814,7 +1814,11 @@ fn ensure_windows_catalog_target_unchanged(
     Ok(())
 }
 
+// The Windows arm has to open, re-identify and re-verify the target around the
+// replacement rather than leaning on an atomic rename over a pinned directory
+// fd, so it is materially longer than the Unix arm.
 #[cfg(windows)]
+#[allow(clippy::too_many_lines)]
 fn persist_provider_model_catalog_rows_platform<F, G>(
     request: CatalogPersistenceRequest<'_>,
     before_replace: F,

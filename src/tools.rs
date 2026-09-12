@@ -873,10 +873,12 @@ fn escape_bytes_for_line_output(bytes: &[u8]) -> String {
 }
 
 fn path_for_line_output(path: &Path) -> String {
+    // Each arm is the function tail on its own platform; only one is ever
+    // compiled, so none of them needs an explicit `return`.
     #[cfg(windows)]
     {
         let rendered = path.to_string_lossy().replace('\\', "/");
-        return escape_bytes_for_line_output(rendered.as_bytes());
+        escape_bytes_for_line_output(rendered.as_bytes())
     }
 
     #[cfg(unix)]
@@ -2952,7 +2954,9 @@ impl ScopedScanRoot {
         Ok(Stdio::from(self.handle.try_clone()?))
     }
 
+    // Mirrors the Unix arm, which clones a real handle off `self` and can fail.
     #[cfg(windows)]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn child_stdin(&self) -> std::io::Result<Stdio> {
         Ok(Stdio::null())
     }
@@ -4325,7 +4329,9 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     )
 }
 
+// Mirrors the Unix arm's fallible signature, which really can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -13429,7 +13435,8 @@ mod win_job {
     /// Returns whether the child is now covered by a registered Job. Most
     /// callers can retain the walk-based fallback on failure; subprocess
     /// surfaces that cannot safely tolerate inherited handles can fail closed.
-    pub(crate) fn attach(child: &Child) -> bool {
+    // `win_job` is a private module, so `pub` here is already crate-limited.
+    pub fn attach(child: &Child) -> bool {
         let Ok(mut map) = REGISTRY.lock() else {
             return false;
         };
@@ -13452,7 +13459,7 @@ mod win_job {
     /// Kill the tree rooted at `pid` via its job, returning whether one
     /// existed. Dropping the stored `Job` closes the handle, and
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does the actual termination.
-    pub(crate) fn terminate(pid: u32) -> bool {
+    pub fn terminate(pid: u32) -> bool {
         REGISTRY
             .lock()
             .ok()
@@ -13782,7 +13789,9 @@ fn command_with_default_sigpipe_for_cwd(
     Ok(command)
 }
 
+// Mirrors the Unix arm, which resolves the program against `cwd` and can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn command_with_default_sigpipe_for_cwd(
     program: &OsStr,
     _cwd: Option<&Path>,
@@ -13854,6 +13863,12 @@ fn resolve_executable_for_shell_trampoline(
 }
 
 /// Detach a child process from pi's controlling terminal.
+// The Unix arm mutates `command`; off Unix there is no controlling terminal to
+// detach from, so the parameter is untouched and the body is a no-op.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::needless_pass_by_ref_mut, clippy::missing_const_for_fn)
+)]
 pub(crate) fn isolate_command_process_group(command: &mut Command) {
     #[cfg(unix)]
     {

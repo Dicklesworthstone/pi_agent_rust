@@ -22,12 +22,17 @@ use pi::perf_build::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+// Every consumer of these lives in a `cfg(unix)` case (the bench harness shells
+// out to bash/python3 and hashes artifacts only on the Unix perf hosts).
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Schema Definitions ──────────────────────────────────────────────────────
