@@ -16,8 +16,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Current Drift Check
 
-- Current `src/` inventory: 202 files.
-- Source-file rows below: 202.
+- Current `src/` inventory: 226 files.
+- Source-file rows below: 226.
 - Source files omitted from this document: 0.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -124,6 +124,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extensions/wasm_host.rs` | Wasm extension host | Extension runtime suites; in-source tests. |
 | `src/extensions_js.rs` | QuickJS bridge | Unit; `tests/event_loop_conformance.rs`, `tests/js_runtime_ordering.rs`, `tests/node_*_shim.rs`, `tests/e2e_ts_extension_loading.rs`. |
 | `src/failover.rs` | Provider failover | `tests/e2e_failover.rs`. |
+| `src/file_identity.rs` | Platform file identity for TOCTOU checks (`(dev, ino)` on Unix, volume serial + file index via `winapi-util` on Windows) | Unit (5 tests); exercised through the identity guards in `src/jobs.rs` and `src/mcp/trust.rs`. |
 | `src/file_lock.rs` | Cross-process directory locking | Unit; session-index lock integration coverage in `tests/session_index_tests.rs` and RPC concurrency coverage in `tests/e2e_rpc.rs`. |
 | `src/flake_classifier.rs` | Flake classifier | Unit; patterns are mirrored by `scripts/ci_conformance_retry.sh`. |
 | `src/gallery.rs` | Visual component gallery harness (OMP-ADOPT / bd-cv653.9.10) | Unit (1 test); `tests/gallery.rs`, `tests/chrome_tui_integration.rs`. |
