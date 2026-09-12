@@ -14,6 +14,60 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+## [v0.5.0] — 2026-09-11 — Release
+
+> Cut from `main` with `v0.4.0` left as Tag-only: that tag (2026-09-01,
+> `5bd3e353`) never got a GitHub Release and sits 192 commits behind this one,
+> so publishing it now would ship none of the work below. Everything since
+> v0.3.0 is in this release.
+
+### Fixed
+
+- **Extensions receive `message_*` and `tool_execution_*` on the default
+  interactive stack again** (bd-82331). `AgentEvent`s reach extensions by two
+  routes: four lifecycle events are dispatched from inside the agent loop, and
+  the six observation events reach them only if the surface routes its own
+  event stream through an `EventCoalescer`. Print, RPC and `--classic` each
+  did; the SDK path did not, and since v0.4.0 the default interactive stack
+  IS the SDK path. An extension that observed streaming output or tool
+  execution loaded, ran its lifecycle hooks, looked installed, and silently
+  did nothing — with no error, because the events were never routed rather
+  than dropped. Extensions that *modify* behaviour (`tool_call`,
+  `tool_result`, `context`, …) were never affected.
+
+- **`/new` and `/resume` no longer silently stop extension observation**
+  (bd-82331). Both build a replacement session from the launch template, which
+  cannot carry a runtime handle, so the fix above worked until the first
+  `/new` — after which observation stopped again for the rest of the session.
+
+- **Print mode returns to the primary model after a failover cooldown**
+  (bd-gm481.1). A `--message` sequence that failed over ran every later prompt
+  on the temporary fallback with no way back: nothing recorded what the
+  primary had been, the chain cursor reset each prompt so the walk could
+  reinstall the fallback it was already on, and no cooldown was ever started.
+  RPC has had this since v0.2.0; print now matches it.
+
+- **`maxFailoversPerTurn` counts successful swaps, not scan attempts**
+  (bd-oqo03, bd-oqo03.1). Malformed, uncredentialed, unconstructible, current
+  and duplicate chain entries consumed the per-turn budget and could hide a
+  later valid fallback; a prior turn's cursor sitting at the cap could block
+  every failover in a new turn.
+
+### Changed
+
+- **`failover_start.attempt` is now the successful-swap ordinal, and the chain
+  position moved to a new `chainIndex` field** (bd-oqo03). `attempt` used to
+  carry the chain cursor *after* it advanced, so the entry at chain index 0
+  reported `attempt: 1` and looked like a correct ordinal by coincidence.
+  Consumers reading `attempt` to mean "which swap is this" were right by
+  accident and are now right on purpose; consumers reading it as a chain
+  position should move to `chainIndex`.
+
+- **Extension events are logged on both dispatch routes.** `ext.event.start`
+  was emitted for coalescable events only, so whether an event appeared in the
+  log depended on an internal detail invisible from outside. Batched events
+  now log identically, with `batched=true`.
+
 ### Added
 
 - **Machine-readable fatal-error record in `--mode json` / `--mode rpc`**
