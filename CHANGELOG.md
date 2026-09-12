@@ -43,6 +43,17 @@ compilation reach further. Windows now passes exactly the gate Unix does.
   fingerprint described whatever it pointed at. It now passes
   `FILE_FLAG_OPEN_REPARSE_POINT`.
 
+- **A `HOMEPATH` without a leading separator produced a drive-relative home
+  directory on Windows.** With `HOMEDRIVE=C:` and `HOMEPATH=Users\me`, the
+  fallback joined them with `PathBuf::push`, which deliberately suppresses the
+  separator after a bare drive prefix — leaving `C:Users\me`, a path resolved
+  against the current directory on C: rather than its root. pi would then read
+  and write `auth.json`, settings and sessions somewhere under the working
+  directory. All three copies of the join (`auth`'s general and AWS lookups,
+  and the Anthropic provider's) now write the separator explicitly. Running
+  the unit suite on Windows for the first time is what surfaced this: on Unix
+  the same `push` inserts `/`, so the test covering it had always passed.
+
 - **`tests/e2e_cli.rs` did not compile on Windows**: `Arc` was imported under
   `cfg(unix)` but used from an ungated helper, and `running_as_root` was
   defined only for Unix while one caller was ungated.
@@ -59,6 +70,14 @@ compilation reach further. Windows now passes exactly the gate Unix does.
   needless `return`, and `win_job`'s redundant `pub(crate)`.
 
 ### Known
+
+- The Windows unit suite (`cargo test --lib`) ran for the first time in this
+  release: **8205 of 8261 pass**. The 56 failures are POSIX-shaped test
+  harnesses rather than product defects — cases that spawn `sh`, assert Unix
+  lock and signal semantics (`SIGTSTP`, `SIGTERM` reaping, stale-lock healing),
+  or expect Unix path encodings. They are tracked rather than fixed here; the
+  one failure that did turn out to be a product defect is the `HOMEPATH` fix
+  above. Integration tests (`tests/`) have still never been run on Windows.
 
 - `e2e_cli_startup_surfaces_configured_resource_failures` still carries a
   `running_as_root` skip guard copied from the auth-permission tests, though

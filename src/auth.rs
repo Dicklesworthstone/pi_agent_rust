@@ -3041,9 +3041,17 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(PathBuf::from(format!("{drive}{path}")))
             } else {
-                let mut combined = PathBuf::from(drive);
-                combined.push(path);
-                Some(combined)
+                // The separator has to be written out. `PathBuf::push`
+                // deliberately suppresses it after a bare drive prefix, so
+                // `"C:"` + `"Users\\me"` would stay the drive-RELATIVE
+                // `C:Users\me` — resolved against the current directory on
+                // that drive, not its root. On Unix the same push inserts
+                // `/`, which is why this only ever misbehaved on the platform
+                // the branch exists for.
+                Some(PathBuf::from(format!(
+                    "{drive}{}{path}",
+                    std::path::MAIN_SEPARATOR
+                )))
             }
         })
 }
@@ -4946,9 +4954,17 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(PathBuf::from(format!("{drive}{path}")))
             } else {
-                let mut combined = PathBuf::from(drive);
-                combined.push(path);
-                Some(combined)
+                // The separator has to be written out. `PathBuf::push`
+                // deliberately suppresses it after a bare drive prefix, so
+                // `"C:"` + `"Users\\me"` would stay the drive-RELATIVE
+                // `C:Users\me` — resolved against the current directory on
+                // that drive, not its root. On Unix the same push inserts
+                // `/`, which is why this only ever misbehaved on the platform
+                // the branch exists for.
+                Some(PathBuf::from(format!(
+                    "{drive}{}{path}",
+                    std::path::MAIN_SEPARATOR
+                )))
             }
         })
 }
@@ -10138,6 +10154,26 @@ mod tests {
             _ => None,
         });
         assert_eq!(home, Some(PathBuf::from("C:/Users\\tester")));
+    }
+
+    /// `aws_home_dir_from_env` carries its own copy of the HOMEDRIVE/HOMEPATH
+    /// join, so it needs its own proof that a separator-less `HOMEPATH` still
+    /// produces a rooted path rather than a drive-relative one.
+    #[test]
+    fn test_aws_home_dir_homedrive_homepath_without_root_separator() {
+        let mut env = |key: &str| match key {
+            "HOMEDRIVE" => Some("C:".to_string()),
+            "HOMEPATH" => Some("Users\\tester".to_string()),
+            _ => None,
+        };
+        let home = aws_home_dir_from_env(&mut env).expect("HOMEDRIVE/HOMEPATH home");
+
+        assert_eq!(home, PathBuf::from("C:/Users\\tester"));
+        #[cfg(windows)]
+        assert!(
+            home.has_root(),
+            "a drive-relative home would resolve against the current directory on C:, not its root"
+        );
     }
 
     #[test]

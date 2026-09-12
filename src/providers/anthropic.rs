@@ -217,9 +217,13 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(std::path::PathBuf::from(format!("{drive}{path}")))
             } else {
-                let mut combined = std::path::PathBuf::from(drive);
-                combined.push(path);
-                Some(combined)
+                // Write the separator out: `PathBuf::push` suppresses it after
+                // a bare drive prefix, leaving the drive-RELATIVE `C:Users\me`
+                // instead of a rooted home. See `auth::home_dir_with_env_lookup`.
+                Some(std::path::PathBuf::from(format!(
+                    "{drive}{}{path}",
+                    std::path::MAIN_SEPARATOR
+                )))
             }
         })
 }
@@ -1667,6 +1671,23 @@ mod tests {
         });
 
         assert_eq!(home, Some(PathBuf::from("D:\\Users\\Grace")));
+    }
+
+    /// A `HOMEPATH` with no leading separator must still root against the
+    /// drive; joining it with `PathBuf::push` would leave the drive-relative
+    /// `D:Users\Grace`, which resolves against the current directory on D:.
+    #[test]
+    fn home_dir_lookup_roots_homepath_without_leading_separator() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("D:".to_string()),
+            "HOMEPATH" => Some("Users\\Grace".to_string()),
+            _ => None,
+        })
+        .expect("HOMEDRIVE/HOMEPATH home");
+
+        assert_eq!(home, PathBuf::from("D:/Users\\Grace"));
+        #[cfg(windows)]
+        assert!(home.has_root(), "home must be rooted on the drive");
     }
 
     /// gh #212: the Messages API has text/image/document blocks only, so a
