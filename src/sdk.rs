@@ -1407,6 +1407,20 @@ impl SessionResourceShutdown {
 }
 
 impl AgentSessionHandle {
+    /// Register async fetchers the agent polls for queued messages — steering
+    /// (drained between tool calls) and follow-up (drained at turn end). Lets a
+    /// frontend feed input typed *during* a turn without reaching into the
+    /// private session; the agent pulls from the fetchers itself.
+    pub fn register_message_fetchers(
+        &mut self,
+        steering: Option<crate::agent::MessageFetcher>,
+        follow_up: Option<crate::agent::MessageFetcher>,
+    ) {
+        self.session
+            .agent
+            .register_message_fetchers(steering, follow_up);
+    }
+
     /// Create a handle from a pre-built `AgentSession` with custom listeners.
     ///
     /// This is useful for tests and advanced embedding scenarios where

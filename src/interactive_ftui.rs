@@ -386,7 +386,7 @@ fn drain_agent_events(
 /// the model freezes spinner ticks while suspending so pending frames stay
 /// byte-identical and the diff engine emits nothing.
 #[cfg(unix)]
-fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
+fn perform_terminal_suspend(alt_screen: bool, disable_mouse: bool) -> std::io::Result<(u16, u16)> {
     use std::io::{Write, stdout};
 
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
@@ -398,7 +398,9 @@ fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
     {
         let mut out = stdout();
         out.write_all(b"\x1b[?2004l")?; // bracketed paste off
-        out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // SGR mouse off
+        if !disable_mouse {
+            out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // SGR mouse off
+        }
         if alt_screen {
             out.write_all(b"\x1b[?1049l")?; // leave alternate screen
         }
@@ -416,7 +418,9 @@ fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
             out.write_all(b"\x1b[?1049h")?; // re-enter alternate screen
         }
         out.write_all(b"\x1b[?2004h")?; // bracketed paste on
-        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
+        if !disable_mouse {
+            out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
+        }
         out.write_all(b"\x1b[?25l")?; // hide cursor
         out.flush()?;
     }
@@ -427,8 +431,11 @@ fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
 /// stop until continued, then hand back a message that clears the suspend
 /// state and triggers a full repaint.
 #[cfg(unix)]
-fn suspend_task(alt_screen: bool) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
-    move || match perform_terminal_suspend(alt_screen) {
+fn suspend_task(
+    alt_screen: bool,
+    disable_mouse: bool,
+) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
+    move || match perform_terminal_suspend(alt_screen, disable_mouse) {
         Ok((width, height)) => PiFtuiMsg::Term(Event::Resize { width, height }),
         Err(err) => PiFtuiMsg::Agent(PiMsg::AgentError(format!("suspend/resume: {err}"))),
     }
@@ -1177,6 +1184,16 @@ pub struct PiFtuiModel {
     /// Whether the program owns the alternate screen (fullscreen launch).
     /// The suspend path mirrors only the features actually enabled.
     alt_screen: bool,
+    /// When true, mouse capture was never enabled (user disabled it to keep
+    /// native text selection). The suspend/resume path must not re-enable it.
+    disable_mouse: bool,
+    /// Input typed while a turn streams, drained by the agent's fetchers
+    /// (see [`QueuedInputStore`]). `None` when the launch path did not wire
+    /// queueing, in which case busy-time submits fall through to a prompt.
+    queued_input: Option<Arc<Mutex<QueuedInputStore>>>,
+    /// Large pasted blocks, collapsed in the editor to `[Pasted #N ~L lines]`
+    /// chips (index N-1 here) and expanded back to the full text on submit.
+    pasted_blocks: Vec<String>,
     /// Set while a ctrl+z suspension is in flight: freezes spinner ticks so
     /// the pre-stop frames stay byte-identical (the diff engine then emits
     /// nothing into the restored cooked terminal). Cleared by
@@ -1340,6 +1357,9 @@ impl PiFtuiModel {
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
 
             alt_screen: false,
+            disable_mouse: false,
+            queued_input: None,
+            pasted_blocks: Vec::new(),
             suspending: false,
             watchdog: LoopWatchdog::new(),
             transcript_revision: 0,
@@ -1444,6 +1464,22 @@ impl PiFtuiModel {
     #[must_use]
     pub const fn with_alt_screen(mut self, alt_screen: bool) -> Self {
         self.alt_screen = alt_screen;
+        self
+    }
+
+    /// Record whether mouse capture is disabled, so the suspend/resume path
+    /// does not re-enable it after ctrl+z → `fg`.
+    #[must_use]
+    pub const fn with_disable_mouse(mut self, disable_mouse: bool) -> Self {
+        self.disable_mouse = disable_mouse;
+        self
+    }
+
+    /// Wire the store that input typed during a turn is queued into. The
+    /// launch path registers matching fetchers on the driver's session.
+    #[must_use]
+    pub fn with_queued_input(mut self, store: Arc<Mutex<QueuedInputStore>>) -> Self {
+        self.queued_input = Some(store);
         self
     }
 
@@ -2069,7 +2105,73 @@ impl PiFtuiModel {
 
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
+    /// Paste-collapse threshold, mirroring opencode's paste summary
+    /// (`lineCount >= 3 || length > 150`).
+    const PASTE_COLLAPSE_MIN_LINES: usize = 3;
+    const PASTE_COLLAPSE_MIN_CHARS: usize = 150;
+
+    /// Handle a terminal paste. Small pastes go into the editor verbatim. A
+    /// large block is stored and replaced by an inline chip —
+    /// `[Pasted #N ~L lines]` — so the draft around it stays visible and
+    /// editable (`hello [Pasted #1 ~42 lines] how are you`), the convention
+    /// opencode and Claude Code use. The chip expands back to the full text
+    /// when the message is sent (see `expand_pastes`).
+    fn insert_paste(&mut self, raw: &str) {
+        let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let content = normalized.trim();
+        if content.is_empty() {
+            return;
+        }
+        let lines = content.lines().count();
+        if lines >= Self::PASTE_COLLAPSE_MIN_LINES
+            || content.len() > Self::PASTE_COLLAPSE_MIN_CHARS
+        {
+            self.pasted_blocks.push(content.to_string());
+            let n = self.pasted_blocks.len();
+            self.input.insert_text(&format!("[Pasted #{n} ~{lines} lines]"));
+        } else {
+            self.input.insert_text(content);
+        }
+    }
+
+    /// Replace every `[Pasted #N ~L lines]` chip in `text` with stored block
+    /// N. Chips that reference no stored block (typed by hand, or whose
+    /// block was already consumed) are left as-is.
+    fn expand_pastes(&self, text: &str) -> String {
+        const OPEN: &str = "[Pasted #";
+        if self.pasted_blocks.is_empty() {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find(OPEN) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + OPEN.len()..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            match (digits.parse::<usize>(), after.find(']')) {
+                (Ok(n), Some(end)) if n >= 1 && n <= self.pasted_blocks.len() => {
+                    out.push_str(&self.pasted_blocks[n - 1]);
+                    rest = &after[end + 1..];
+                }
+                _ => {
+                    out.push_str(OPEN);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Enter: submit, or — while a turn is streaming — queue as a steering
+    /// message (mirrors the classic frontend, where Enter steers when busy).
     fn submit_input(&mut self) {
+        self.submit_input_kind(QueuedInputKind::Steer);
+    }
+
+    /// Submit the editor contents; `busy_kind` says how to queue them if a
+    /// turn is currently streaming. Slash and `!` commands never queue.
+    fn submit_input_kind(&mut self, busy_kind: QueuedInputKind) {
         let text = self.input.text();
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -2080,11 +2182,35 @@ impl PiFtuiModel {
         self.error_banner = None;
         // User input is the one text source the user typed themself, but it
         // still goes through sanitize: paste can smuggle control sequences.
-        let clean = sanitize(trimmed).into_owned();
+        // `display` keeps any paste chips (what the transcript shows);
+        // `clean` has them expanded to the full pasted text (what is sent).
+        let display = sanitize(trimmed).into_owned();
+        let expanded = self.expand_pastes(trimmed);
+        let clean = sanitize(&expanded).into_owned();
+        self.pasted_blocks.clear();
         self.input.set_text("");
         self.autocomplete.close();
         self.scroll_from_tail = 0;
-        self.push_entry(EntryRole::User, clean.clone());
+
+        // Queue while a turn streams (opencode-style): the message shows in
+        // the transcript immediately, tagged, and the input is clear for the
+        // next one. The agent drains it via the registered fetchers.
+        if matches!(self.state, AgentUiState::Working)
+            && !clean.starts_with('/')
+            && !clean.starts_with('!')
+            && let Some(store) = &self.queued_input
+        {
+            if let Ok(mut store) = store.lock() {
+                store.push(busy_kind, &clean);
+            }
+            self.push_entry(
+                EntryRole::User,
+                format!("[queued · {}] {display}", busy_kind.label()),
+            );
+            return;
+        }
+
+        self.push_entry(EntryRole::User, display);
 
         // Bash routing comes before slash commands, matching submit_message:
         // `!cmd` shows output and submits it to the agent, `!!cmd` shows only.
@@ -2575,6 +2701,9 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::PageDown))
                     .or_else(|| pick(AppAction::Submit))
                     .or_else(|| pick(AppAction::NewLine))
+                    // Alt+Enter is bound to FollowUp (not NewLine) in the
+                    // shared catalog, as in the classic frontend.
+                    .or_else(|| pick(AppAction::FollowUp))
                     .or_else(|| pick(AppAction::Interrupt))
                     .or_else(|| pick(AppAction::CursorLineEnd))
                     .or_else(|| {
@@ -2599,12 +2728,11 @@ impl PiFtuiModel {
                         #[cfg(unix)]
                         {
                             #[cfg(test)]
-                            let task = self
-                                .suspend_task_override
-                                .take()
-                                .unwrap_or_else(|| Box::new(suspend_task(self.alt_screen)));
+                            let task = self.suspend_task_override.take().unwrap_or_else(|| {
+                                Box::new(suspend_task(self.alt_screen, self.disable_mouse))
+                            });
                             #[cfg(not(test))]
-                            let task = suspend_task(self.alt_screen);
+                            let task = suspend_task(self.alt_screen, self.disable_mouse);
                             return Cmd::task(task);
                         }
                         #[cfg(not(unix))]
@@ -2653,6 +2781,22 @@ impl PiFtuiModel {
                         self.maybe_trigger_autocomplete();
                         return Cmd::none();
                     }
+                    Some(AppAction::FollowUp) if self.input_active() => {
+                        // Alt+Enter: while a turn streams, queue the editor
+                        // contents as a follow-up (runs once this turn ends),
+                        // mirroring the classic frontend. When idle, keep the
+                        // behaviour the editor gave this key before: a newline.
+                        if matches!(self.state, AgentUiState::Working)
+                            && self.queued_input.is_some()
+                            && !self.input.text().trim().is_empty()
+                        {
+                            self.submit_input_kind(QueuedInputKind::FollowUp);
+                            return Cmd::none();
+                        }
+                        self.input.insert_newline();
+                        self.maybe_trigger_autocomplete();
+                        return Cmd::none();
+                    }
                     Some(AppAction::CursorLineEnd) if self.input.is_empty() => {
                         // End with an empty editor resumes tail-follow; with
                         // content it falls through to the editor's line-end.
@@ -2689,9 +2833,16 @@ impl PiFtuiModel {
                 // Re-clamp: a taller window may make the old offset overshoot.
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
             }
+            Event::Paste(paste) if self.input_active() => {
+                // A large paste collapses to an inline chip (see
+                // `insert_paste`) instead of flooding the editor and burying
+                // the draft around it.
+                self.insert_paste(&paste.text);
+                self.maybe_trigger_autocomplete();
+            }
             _ => {
                 if self.input_active() && self.input.handle_event(event) {
-                    // Paste and other editor-relevant events flow through.
+                    // Other editor-relevant events flow through.
                     self.maybe_trigger_autocomplete();
                 }
             }
@@ -2703,7 +2854,15 @@ impl PiFtuiModel {
     /// `editor_input_is_available()` in the bubbletea stack) or while an
     /// ask card / extension UI prompt is collecting its reply mid-turn.
     fn input_active(&self) -> bool {
-        self.state == AgentUiState::Ready || self.active_ask.is_some() || self.active_ext.is_some()
+        self.state == AgentUiState::Ready
+            || self.active_ask.is_some()
+            || self.active_ext.is_some()
+            // Queued input (opencode-style): keep the editor live while a
+            // turn streams so the next message can be typed and queued
+            // (Enter = steer, Alt+Enter = follow-up) instead of being lost.
+            // Only when the launch path wired a queue store; otherwise the
+            // editor stays inert while working, as before.
+            || (self.state == AgentUiState::Working && self.queued_input.is_some())
     }
 
     /// Fail closed every modal owned by the completed/replaced turn. Replies
@@ -4631,6 +4790,12 @@ pub fn run(
     available_sessions: Vec<(String, String)>,
     markdown_spacing: crate::config::MarkdownSpacing,
     autocomplete: AutocompleteLaunch,
+    // When true, do not enable SGR mouse capture. The ftui frontend otherwise
+    // grabs the mouse unconditionally, which blocks native terminal
+    // text selection (a problem over SSH). Honors `disableMouseCapture`,
+    // `--no-mouse-capture`, and `PI_NO_MOUSE_CAPTURE` the same way the classic
+    // frontend does.
+    disable_mouse: bool,
 ) -> std::io::Result<()> {
     const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
     // Issue #208: the driver re-sends the catalog with extension commands
@@ -4647,6 +4812,12 @@ pub fn run(
     // driver's in-flight prompt turn instead of waiting it out.
     let turn_abort: TurnAbortSlot = Arc::new(Mutex::new(None));
     let driver_turn_abort = Arc::clone(&turn_abort);
+    // Queued input (opencode-style): the UI pushes messages typed while a
+    // turn streams; the driver registers fetchers on the session so the
+    // agent drains them itself (steering between tool calls, follow-ups at
+    // turn end).
+    let queued_input: Arc<Mutex<QueuedInputStore>> = Arc::new(Mutex::new(QueuedInputStore::default()));
+    let driver_queued_input = Arc::clone(&queued_input);
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -4671,6 +4842,13 @@ pub fn run(
                     &runtime_handle,
                 )
                 .await?;
+                // Let the agent pull input queued from the UI mid-turn; this
+                // loop is blocked in run_prompt_turn for the whole turn, so a
+                // UiCommand could not deliver it in time.
+                handle.register_message_fetchers(
+                    Some(QueuedInputStore::steering_fetcher(&driver_queued_input)),
+                    Some(QueuedInputStore::follow_up_fetcher(&driver_queued_input)),
+                );
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
                 send_conversation_reset(
@@ -4844,6 +5022,8 @@ pub fn run(
         .with_available_models(available_models)
         .with_available_sessions(available_sessions)
         .with_alt_screen(!inline)
+        .with_disable_mouse(disable_mouse)
+        .with_queued_input(queued_input)
         .with_markdown_spacing(markdown_spacing)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
@@ -4858,13 +5038,103 @@ pub fn run(
     // Divert tracing output away from the terminal while the TUI owns it
     // (bd-trkef); restored on drop.
     let log_guard = crate::tui::TuiLogRedirectGuard::begin();
-    let result = app.with_mouse().run();
+    // Only grab the mouse when the user has not disabled capture. With capture
+    // on, the terminal routes mouse events to the app and native drag-to-select
+    // stops working; leaving it off restores selection/copy (e.g. over SSH).
+    let result = if disable_mouse {
+        app.run()
+    } else {
+        app.with_mouse().run()
+    };
     drop(log_guard);
 
     // The UI (and with it the submit sender) is gone; the driver's next poll
     // sees Disconnected and unwinds. Await the teardown result so final save
     // or resource-shutdown failures cannot be reported as a successful exit.
     finish_ftui_run(result, driver.join())
+}
+
+/// How input typed while a turn is streaming should be delivered
+/// (opencode-style queueing; mirrors the classic frontend's keys).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedInputKind {
+    /// Enter while busy: inject before the model's next step (between tool
+    /// calls), so it can change course mid-turn.
+    Steer,
+    /// Alt+Enter while busy: run as the next turn once this one finishes.
+    FollowUp,
+}
+
+impl QueuedInputKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::FollowUp => "follow-up",
+        }
+    }
+}
+
+/// Input queued from the UI while a turn streams. The UI thread pushes; the
+/// agent drains it through the fetchers registered on the driver's session
+/// (`steering_fetcher` / `follow_up_fetcher`), which is the only path that
+/// works mid-turn — the driver's command loop is blocked in `run_prompt_turn`
+/// for the whole turn, so a `UiCommand` would not be read until it ended.
+#[derive(Default)]
+pub struct QueuedInputStore {
+    steering: VecDeque<crate::agent::QueuedAgentMessage>,
+    follow_up: VecDeque<crate::agent::QueuedAgentMessage>,
+}
+
+impl std::fmt::Debug for QueuedInputStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedInputStore")
+            .field("steering", &self.steering.len())
+            .field("follow_up", &self.follow_up.len())
+            .finish()
+    }
+}
+
+impl QueuedInputStore {
+    /// Queue user-authored text. The provider sees it as a plain user message
+    /// (no wrapper), and the raw text is also the magic-keyword scan source —
+    /// the same shape the classic frontend's `queue_input` produces.
+    pub fn push(&mut self, kind: QueuedInputKind, text: &str) {
+        let message = crate::model::Message::User(crate::model::UserMessage {
+            content: crate::model::UserContent::Text(text.to_string()),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        });
+        let queued = crate::agent::QueuedAgentMessage::authored(message, text);
+        match kind {
+            QueuedInputKind::Steer => self.steering.push_back(queued),
+            QueuedInputKind::FollowUp => self.follow_up.push_back(queued),
+        }
+    }
+
+    /// Fetcher the agent polls between tool calls.
+    pub fn steering_fetcher(store: &Arc<Mutex<Self>>) -> crate::agent::MessageFetcher {
+        let store = Arc::clone(store);
+        Arc::new(move || -> futures::future::BoxFuture<'static, Vec<crate::agent::QueuedAgentMessage>> {
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                store
+                    .lock()
+                    .map_or_else(|_| Vec::new(), |mut s| s.steering.drain(..).collect())
+            })
+        })
+    }
+
+    /// Fetcher the agent polls at the end of a turn.
+    pub fn follow_up_fetcher(store: &Arc<Mutex<Self>>) -> crate::agent::MessageFetcher {
+        let store = Arc::clone(store);
+        Arc::new(move || -> futures::future::BoxFuture<'static, Vec<crate::agent::QueuedAgentMessage>> {
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                store
+                    .lock()
+                    .map_or_else(|_| Vec::new(), |mut s| s.follow_up.drain(..).collect())
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -5221,6 +5491,87 @@ mod tests {
         sim.inject_event(key(KeyCode::Char('b'), Modifiers::empty()));
         assert_eq!(sim.model().input.text(), "a\nb");
         assert_eq!(sim.model().input_rows(), 2);
+    }
+
+    #[test]
+    fn enter_while_working_queues_steer_and_alt_enter_queues_follow_up() {
+        let (_tx, model) = new_model();
+        let store = Arc::new(Mutex::new(QueuedInputStore::default()));
+        let mut model = model.with_queued_input(Arc::clone(&store));
+        model.state = AgentUiState::Working;
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // Enter while a turn streams: queued as steering, editor cleared,
+        // shown in the transcript with a tag instead of being submitted.
+        for ch in "steer me".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().input.is_empty(), "editor not cleared after queueing");
+        {
+            let transcript = &sim.model().transcript;
+            assert_eq!(transcript.len(), 1);
+            assert_eq!(transcript[0].role, EntryRole::User);
+            assert_eq!(transcript[0].text, "[queued · steer] steer me");
+        }
+
+        // Alt+Enter while a turn streams: queued as a follow-up (when idle
+        // it inserts a newline, covered by alt_enter_inserts_newline...).
+        for ch in "later".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
+        assert!(sim.model().input.is_empty(), "editor not cleared after follow-up");
+        assert_eq!(
+            sim.model().transcript[1].text,
+            "[queued · follow-up] later"
+        );
+
+        let store = store.lock().expect("store lock");
+        assert_eq!(store.steering.len(), 1, "one steering message queued");
+        assert_eq!(store.follow_up.len(), 1, "one follow-up message queued");
+    }
+
+    #[test]
+    fn large_paste_collapses_to_chip_and_expands_on_submit() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "hello ".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        let block = "line one\nline two\nline three\nline four";
+        sim.inject_event(Event::Paste(ftui::core::event::PasteEvent::new(block, true)));
+        // The editor shows a chip, not the block, so the draft stays readable.
+        assert_eq!(sim.model().input.text(), "hello [Pasted #1 ~4 lines]");
+        for ch in " how are you".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        // What is sent has the chip expanded to the full pasted text …
+        let UiCommand::Prompt(submitted) = submit_rx.try_recv().expect("submitted") else {
+            panic!("expected a prompt");
+        };
+        assert_eq!(submitted, format!("hello {block} how are you"));
+        // … while the transcript keeps the compact chip form.
+        assert_eq!(
+            sim.model().transcript[0].text,
+            "hello [Pasted #1 ~4 lines] how are you"
+        );
+        assert!(sim.model().pasted_blocks.is_empty(), "blocks cleared after submit");
+    }
+
+    #[test]
+    fn small_paste_inserts_verbatim() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Paste(ftui::core::event::PasteEvent::new("just a word", true)));
+        assert_eq!(sim.model().input.text(), "just a word");
     }
 
     #[test]
