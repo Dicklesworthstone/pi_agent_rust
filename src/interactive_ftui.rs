@@ -386,7 +386,7 @@ fn drain_agent_events(
 /// the model freezes spinner ticks while suspending so pending frames stay
 /// byte-identical and the diff engine emits nothing.
 #[cfg(unix)]
-fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
+fn perform_terminal_suspend(alt_screen: bool, disable_mouse: bool) -> std::io::Result<(u16, u16)> {
     use std::io::{Write, stdout};
 
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
@@ -398,7 +398,9 @@ fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
     {
         let mut out = stdout();
         out.write_all(b"\x1b[?2004l")?; // bracketed paste off
-        out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // SGR mouse off
+        if !disable_mouse {
+            out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // SGR mouse off
+        }
         if alt_screen {
             out.write_all(b"\x1b[?1049l")?; // leave alternate screen
         }
@@ -416,7 +418,9 @@ fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
             out.write_all(b"\x1b[?1049h")?; // re-enter alternate screen
         }
         out.write_all(b"\x1b[?2004h")?; // bracketed paste on
-        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
+        if !disable_mouse {
+            out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
+        }
         out.write_all(b"\x1b[?25l")?; // hide cursor
         out.flush()?;
     }
@@ -427,8 +431,11 @@ fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
 /// stop until continued, then hand back a message that clears the suspend
 /// state and triggers a full repaint.
 #[cfg(unix)]
-fn suspend_task(alt_screen: bool) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
-    move || match perform_terminal_suspend(alt_screen) {
+fn suspend_task(
+    alt_screen: bool,
+    disable_mouse: bool,
+) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
+    move || match perform_terminal_suspend(alt_screen, disable_mouse) {
         Ok((width, height)) => PiFtuiMsg::Term(Event::Resize { width, height }),
         Err(err) => PiFtuiMsg::Agent(PiMsg::AgentError(format!("suspend/resume: {err}"))),
     }
@@ -1177,6 +1184,9 @@ pub struct PiFtuiModel {
     /// Whether the program owns the alternate screen (fullscreen launch).
     /// The suspend path mirrors only the features actually enabled.
     alt_screen: bool,
+    /// When true, mouse capture was never enabled (user disabled it to keep
+    /// native text selection). The suspend/resume path must not re-enable it.
+    disable_mouse: bool,
     /// Set while a ctrl+z suspension is in flight: freezes spinner ticks so
     /// the pre-stop frames stay byte-identical (the diff engine then emits
     /// nothing into the restored cooked terminal). Cleared by
@@ -1340,6 +1350,7 @@ impl PiFtuiModel {
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
 
             alt_screen: false,
+            disable_mouse: false,
             suspending: false,
             watchdog: LoopWatchdog::new(),
             transcript_revision: 0,
@@ -1444,6 +1455,14 @@ impl PiFtuiModel {
     #[must_use]
     pub const fn with_alt_screen(mut self, alt_screen: bool) -> Self {
         self.alt_screen = alt_screen;
+        self
+    }
+
+    /// Record whether mouse capture is disabled, so the suspend/resume path
+    /// does not re-enable it after ctrl+z → `fg`.
+    #[must_use]
+    pub const fn with_disable_mouse(mut self, disable_mouse: bool) -> Self {
+        self.disable_mouse = disable_mouse;
         self
     }
 
@@ -2599,12 +2618,11 @@ impl PiFtuiModel {
                         #[cfg(unix)]
                         {
                             #[cfg(test)]
-                            let task = self
-                                .suspend_task_override
-                                .take()
-                                .unwrap_or_else(|| Box::new(suspend_task(self.alt_screen)));
+                            let task = self.suspend_task_override.take().unwrap_or_else(|| {
+                                Box::new(suspend_task(self.alt_screen, self.disable_mouse))
+                            });
                             #[cfg(not(test))]
-                            let task = suspend_task(self.alt_screen);
+                            let task = suspend_task(self.alt_screen, self.disable_mouse);
                             return Cmd::task(task);
                         }
                         #[cfg(not(unix))]
@@ -4631,6 +4649,12 @@ pub fn run(
     available_sessions: Vec<(String, String)>,
     markdown_spacing: crate::config::MarkdownSpacing,
     autocomplete: AutocompleteLaunch,
+    // When true, do not enable SGR mouse capture. The ftui frontend otherwise
+    // grabs the mouse unconditionally, which blocks native terminal
+    // text selection (a problem over SSH). Honors `disableMouseCapture`,
+    // `--no-mouse-capture`, and `PI_NO_MOUSE_CAPTURE` the same way the classic
+    // frontend does.
+    disable_mouse: bool,
 ) -> std::io::Result<()> {
     const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
     // Issue #208: the driver re-sends the catalog with extension commands
@@ -4844,6 +4868,7 @@ pub fn run(
         .with_available_models(available_models)
         .with_available_sessions(available_sessions)
         .with_alt_screen(!inline)
+        .with_disable_mouse(disable_mouse)
         .with_markdown_spacing(markdown_spacing)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
@@ -4858,7 +4883,14 @@ pub fn run(
     // Divert tracing output away from the terminal while the TUI owns it
     // (bd-trkef); restored on drop.
     let log_guard = crate::tui::TuiLogRedirectGuard::begin();
-    let result = app.with_mouse().run();
+    // Only grab the mouse when the user has not disabled capture. With capture
+    // on, the terminal routes mouse events to the app and native drag-to-select
+    // stops working; leaving it off restores selection/copy (e.g. over SSH).
+    let result = if disable_mouse {
+        app.run()
+    } else {
+        app.with_mouse().run()
+    };
     drop(log_guard);
 
     // The UI (and with it the submit sender) is gone; the driver's next poll

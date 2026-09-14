@@ -1659,6 +1659,11 @@ pub struct Agent {
     /// Session-scoped secrets vault (bd-cv653.7.9): placeholder map lives in
     /// memory and dies with the session — never persisted raw.
     secrets_vault: crate::secrets::SecretVault,
+
+    /// Active model's context window in tokens, kept in sync by the session
+    /// wrapper (`AgentSession::maybe_compact`). Used by the tool-output
+    /// overflow guard ([`Self::fit_tool_result_to_context`]); `0` disables it.
+    context_window_tokens: u32,
 }
 
 /// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
@@ -1748,6 +1753,7 @@ impl Agent {
             magic_keyword_scan_override: None,
             keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
+            context_window_tokens: 0,
         }
     }
 
@@ -2140,6 +2146,125 @@ impl Agent {
 
     pub const fn stream_options_mut(&mut self) -> &mut StreamOptions {
         &mut self.config.stream_options
+    }
+
+    /// Set the active model's context window (tokens) for the tool-output
+    /// overflow guard. `0` disables the guard. Kept in sync by the session
+    /// wrapper alongside the compaction window.
+    pub const fn set_context_window_tokens(&mut self, tokens: u32) {
+        self.context_window_tokens = tokens;
+    }
+
+    /// Chars/3 estimate of everything the next request will carry from this
+    /// agent: the conversation so far plus the system prompt + tool schemas.
+    fn context_used_tokens(&self) -> u64 {
+        const CHARS_PER_TOKEN: u64 = 3;
+        let tools = self
+            .cached_tool_defs
+            .as_ref()
+            .map_or(&[][..], |(_, defs)| defs.as_slice());
+        let overhead =
+            compaction::estimate_context_overhead_tokens(self.config.system_prompt.as_deref(), tools);
+        let used_chars = serde_json::to_string(&self.messages).map_or(0, |s| s.len() as u64);
+        (used_chars / CHARS_PER_TOKEN).saturating_add(overhead)
+    }
+
+    /// Room to keep free for the model: twice `max_tokens`, because a reply is
+    /// appended to the conversation and the request *after* it must still fit
+    /// alongside another full reply.
+    fn context_reply_reserve_tokens(&self) -> u64 {
+        u64::from(self.config.stream_options.max_tokens.unwrap_or(4096)).saturating_mul(2)
+    }
+
+    /// True when the next provider request can no longer fit a full reply in
+    /// the context window. The turn loop checks this before executing more
+    /// tools so the turn winds down instead of sending a request the
+    /// provider is certain to reject with "context length exceeded".
+    fn context_is_full(&self) -> bool {
+        const MARGIN_TOKENS: u64 = 512;
+        let window = u64::from(self.context_window_tokens);
+        if window == 0 {
+            return false;
+        }
+        self.context_used_tokens()
+            .saturating_add(self.context_reply_reserve_tokens())
+            .saturating_add(MARGIN_TOKENS)
+            > window
+    }
+
+    /// Overflow guard for tool output (the idea behind opencode's
+    /// `truncateToolOutput`): before a tool result is appended and sent back
+    /// to the provider, make sure the request that will carry it still fits
+    /// the model's context window with the configured `max_tokens` intact. If
+    /// it would not, truncate the result's text blocks to the remaining budget
+    /// and append a visible marker so the model knows output was cut.
+    ///
+    /// This is the only defence against growth *inside* a turn: the
+    /// compaction trigger runs at turn boundaries and cannot see a tool batch
+    /// that adds thousands of tokens mid-turn (a single `read` may return
+    /// 2,000 lines / 1 MB). `max_tokens` is never reduced, so replies are
+    /// never starved; the budget is taken out of the tool output instead.
+    fn fit_tool_result_to_context(&self, mut content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+        const CHARS_PER_TOKEN: u64 = 3;
+        const MARGIN_TOKENS: u64 = 512;
+        // Always leave at least a stub so the model can tell the call ran.
+        const MIN_KEEP_TOKENS: u64 = 256;
+
+        let window = u64::from(self.context_window_tokens);
+        if window == 0 {
+            return content;
+        }
+        let used = self.context_used_tokens();
+        let budget = window
+            .saturating_sub(self.context_reply_reserve_tokens())
+            .saturating_sub(MARGIN_TOKENS)
+            .saturating_sub(used)
+            .max(MIN_KEEP_TOKENS);
+
+        let result_tokens: u64 = content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => text.text.len() as u64 / CHARS_PER_TOKEN,
+                _ => 0,
+            })
+            .sum();
+        if result_tokens <= budget {
+            return content;
+        }
+
+        // Keep the head of the output, truncating text blocks in order until
+        // the budget is spent. Cut on a char boundary so UTF-8 stays valid.
+        let mut remaining_chars = usize::try_from(budget * CHARS_PER_TOKEN).unwrap_or(usize::MAX);
+        let mut omitted: usize = 0;
+        for block in &mut content {
+            if let ContentBlock::Text(text) = block {
+                if text.text.len() <= remaining_chars {
+                    remaining_chars -= text.text.len();
+                    continue;
+                }
+                let mut cut = remaining_chars.min(text.text.len());
+                while cut > 0 && !text.text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                omitted += text.text.len() - cut;
+                text.text.truncate(cut);
+                remaining_chars = 0;
+            }
+        }
+        if omitted > 0 {
+            content.push(ContentBlock::Text(TextContent::new(format!(
+                "\n[tool output truncated to fit the context window: {omitted} chars omitted]"
+            ))));
+            tracing::warn!(
+                omitted_chars = omitted,
+                budget_tokens = budget,
+                result_tokens,
+                used_tokens = used,
+                context_window = window,
+                "truncated tool output to fit the context window"
+            );
+        }
+        content
     }
 
     pub fn system_prompt(&self) -> Option<&str> {
@@ -2714,6 +2839,10 @@ impl Agent {
         let mut iterations = 0usize;
         let mut pause_turn_continuations = 0usize;
         let mut warned_at_handoff_threshold = false;
+        // One-shot "context window nearly full" handoff (see the check after
+        // `iterations += 1`): warn once, hard-stop if the model keeps calling
+        // tools anyway.
+        let mut context_full_warned = false;
         let mut turn_index: usize = 0;
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
         let mut last_assistant: Option<Arc<AssistantMessage>> = None;
@@ -3116,11 +3245,54 @@ impl Agent {
                             "tool-iteration budget at >=80%; injected handoff steering message"
                         );
                     }
-                    if iterations > self.config.max_tool_iterations {
-                        let error_message = format!(
-                            "Maximum tool iterations ({}) exceeded",
-                            self.config.max_tool_iterations
+                    // Context-window handoff (the counterpart of the
+                    // iteration handoff above). `fit_tool_result_to_context`
+                    // bounds tool output, but it cannot bound the model's own
+                    // messages, and a model told its output was truncated tends
+                    // to keep calling tools until the next request is one the
+                    // provider must reject. So: the first time the next request
+                    // could not fit a full reply, queue a one-shot steering
+                    // message telling the model to answer now (the guard has
+                    // reserved room for exactly that reply). If it calls tools
+                    // again anyway, take the same hard stop as the iteration
+                    // cap instead of sending a doomed request. Pre-turn
+                    // compaction then runs before the user's next message.
+                    let context_full_now = self.context_is_full();
+                    let context_hard_stop = context_full_warned && context_full_now;
+                    if !context_full_warned && context_full_now {
+                        context_full_warned = true;
+                        let used = self.context_used_tokens();
+                        let window = u64::from(self.context_window_tokens);
+                        let warning = Message::User(UserMessage {
+                            content: UserContent::Text(format!(
+                                "[system] The context window is nearly full (~{used} of {window} tokens). \
+                                 Do not call any more tools. Answer the user now with what you already have; \
+                                 further tool calls will end this turn."
+                            )),
+                            timestamp: Utc::now().timestamp_millis(),
+                        });
+                        self.message_queue
+                            .push_steering(QueuedAgentMessage::generated(warning));
+                        tracing::warn!(
+                            used_tokens = used,
+                            context_window = window,
+                            "context window nearly full; injected handoff steering message"
                         );
+                    }
+                    if iterations > self.config.max_tool_iterations || context_hard_stop {
+                        let error_message = if context_hard_stop {
+                            format!(
+                                "Context window nearly full (~{} of {} tokens); stopped before a request \
+                                 the provider would reject. Compaction runs at the next turn.",
+                                self.context_used_tokens(),
+                                self.context_window_tokens
+                            )
+                        } else {
+                            format!(
+                                "Maximum tool iterations ({}) exceeded",
+                                self.config.max_tool_iterations
+                            )
+                        };
                         let mut stop_message = (*assistant_arc).clone();
                         stop_message.stop_reason = StopReason::Error;
                         stop_message.error_message = Some(error_message.clone());
@@ -4541,10 +4713,11 @@ impl Agent {
                     is_error: true,
                 });
 
+                let fitted_content = self.fit_tool_result_to_context(output.content);
                 let tool_result = Arc::new(ToolResultMessage {
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
-                    content: output.content,
+                    content: fitted_content,
                     details: output.details,
                     is_error: true,
                     timestamp: Utc::now().timestamp_millis(),
@@ -4588,10 +4761,11 @@ impl Agent {
             },
         });
 
+        let fitted_content = self.fit_tool_result_to_context(output.content);
         let tool_result = Arc::new(ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            content: output.content,
+            content: fitted_content,
             details: output.details,
             is_error,
             timestamp: Utc::now().timestamp_millis(),
@@ -12218,6 +12392,21 @@ impl AgentSession {
         &self.compaction_settings
     }
 
+    /// Tokens the system prompt + tool schemas add to every request but that
+    /// session entries never account for. Fed into the compaction trigger on
+    /// the heuristic path (first turn / right after a compaction) so it does
+    /// not under-count by the overhead and fire too late. Read-only: uses the
+    /// agent's cached tool definitions (populated by the first request, which
+    /// is before any compaction could matter).
+    fn compaction_overhead_tokens(&self) -> u64 {
+        let tools = self
+            .agent
+            .cached_tool_defs
+            .as_ref()
+            .map_or(&[][..], |(_, defs)| defs.as_slice());
+        compaction::estimate_context_overhead_tokens(self.agent.system_prompt(), tools)
+    }
+
     pub(crate) fn provider_admission_gate(&self) -> ProviderAdmissionGate {
         self.provider_admission.clone()
     }
@@ -12770,6 +12959,16 @@ impl AgentSession {
             return Ok(());
         }
 
+        // Warm the tool-definition cache so `compaction_overhead_tokens` sees
+        // the tool schemas even before this session's first request. Resuming
+        // right after a compaction is exactly the case that matters: there is
+        // no measured usage yet, so the trigger relies on the heuristic path.
+        let _ = self.agent.build_context();
+        // Keep the tool-output overflow guard's window in sync with the
+        // compaction window (see `Agent::fit_tool_result_to_context`).
+        self.agent
+            .set_context_window_tokens(self.compaction_settings.context_window_tokens);
+
         // Phase 1: apply completed background result.
         if let Some((origin, outcome)) = self.compaction_worker.try_recv_bound().await {
             // Preserve legacy lifecycle semantics: isCompacting remains true
@@ -12889,7 +13088,11 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            let prep = compaction::prepare_compaction_with_overhead(
+                &entries,
+                self.compaction_settings.clone(),
+                self.compaction_overhead_tokens(),
+            );
             let origin = CompactionOrigin {
                 session_id: session.header.id.clone(),
                 provider_id: origin_provider_id,
@@ -13104,7 +13307,11 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            compaction::prepare_compaction_with_overhead(
+                &entries,
+                self.compaction_settings.clone(),
+                self.compaction_overhead_tokens(),
+            )
         };
 
         let Some(prep) = preparation else {
@@ -13331,6 +13538,10 @@ impl AgentSession {
             return Ok(());
         }
 
+        // See `maybe_compact`: warm the tool-definition cache before the
+        // heuristic-path overhead estimate.
+        let _ = self.agent.build_context();
+
         let (entries, preparation) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
@@ -13344,7 +13555,11 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            let prep = compaction::prepare_compaction_with_overhead(
+                &entries,
+                self.compaction_settings.clone(),
+                self.compaction_overhead_tokens(),
+            );
             (entries, prep)
         };
 

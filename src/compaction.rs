@@ -12,7 +12,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ThinkingLevel, ToolCall,
     Usage, UserContent, UserMessage,
 };
-use crate::provider::{Context, Provider, StreamOptions};
+use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::{SessionEntry, SessionMessage, session_message_to_model};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -1066,6 +1066,36 @@ struct ContextUsageEstimate {
 }
 
 fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate {
+    estimate_context_tokens_with_overhead(messages, 0)
+}
+
+/// Estimate the tokens every request carries that no session entry accounts
+/// for: the system prompt plus the tool schemas (name, description and JSON
+/// parameters). Server-reported `usage` already includes these, so this is
+/// only added on the heuristic (no measured usage) path — first turn and
+/// right after a compaction — where the entry-only estimate otherwise
+/// under-counts by several thousand tokens and lets the compaction trigger
+/// fire too late, overflowing the provider's context window.
+pub fn estimate_context_overhead_tokens(system_prompt: Option<&str>, tools: &[ToolDef]) -> u64 {
+    let mut chars: u64 = system_prompt.map_or(0, |s| s.len() as u64);
+    for tool in tools {
+        chars = chars
+            .saturating_add(tool.name.len() as u64)
+            .saturating_add(tool.description.len() as u64);
+        if let Ok(serialized) = serde_json::to_string(&tool.parameters) {
+            chars = chars.saturating_add(serialized.len() as u64);
+        }
+    }
+    chars / CHARS_PER_TOKEN_ESTIMATE as u64
+}
+
+/// Like [`estimate_context_tokens`], but adds `fixed_overhead_tokens` on the
+/// heuristic paths (see [`estimate_context_overhead_tokens`]). The measured
+/// path is left alone: the provider's `usage` already counted the overhead.
+fn estimate_context_tokens_with_overhead(
+    messages: &[SessionMessage],
+    fixed_overhead_tokens: u64,
+) -> ContextUsageEstimate {
     let mut last_usage: Option<(&Usage, usize)> = None;
     for (idx, msg) in messages.iter().enumerate().rev() {
         if let Some(usage) = get_assistant_usage(msg) {
@@ -1080,7 +1110,7 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
             .map(estimate_tokens)
             .fold(0u64, u64::saturating_add);
         return ContextUsageEstimate {
-            tokens: total,
+            tokens: total.saturating_add(fixed_overhead_tokens),
             last_usage_index: None,
         };
     };
@@ -1094,7 +1124,7 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
             .map(estimate_tokens)
             .fold(0u64, u64::saturating_add);
         return ContextUsageEstimate {
-            tokens: total,
+            tokens: total.saturating_add(fixed_overhead_tokens),
             last_usage_index: None,
         };
     }
@@ -1899,10 +1929,23 @@ fn build_fallback_summary(preparation: &CompactionPreparation) -> String {
 // Public API
 // =============================================================================
 
-#[allow(clippy::too_many_lines)]
 pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_with_overhead(path_entries, settings, 0)
+}
+
+/// [`prepare_compaction`] with the per-request system-prompt + tool-schema
+/// overhead folded into the trigger estimate on the heuristic path, so the
+/// decision to compact is as accurate on the first turn and right after a
+/// compaction (no measured usage yet) as it is in steady state. Callers with
+/// an agent in hand should pass [`estimate_context_overhead_tokens`].
+#[allow(clippy::too_many_lines)]
+pub fn prepare_compaction_with_overhead(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+    fixed_overhead_tokens: u64,
 ) -> Option<CompactionPreparation> {
     let settings = settings.with_mode_applied();
     if path_entries.is_empty() {
@@ -1938,7 +1981,8 @@ pub fn prepare_compaction(
     // If the segment includes a previous compaction summary, this counts the *summary* tokens,
     // not the original uncompressed history tokens. This effectively tracks the "compressed size"
     // of the history prior to the new cut point.
-    let tokens_before = estimate_context_tokens(&usage_messages).tokens;
+    let tokens_before =
+        estimate_context_tokens_with_overhead(&usage_messages, fixed_overhead_tokens).tokens;
 
     if !should_compact(tokens_before, settings.context_window_tokens, &settings) {
         return None;
