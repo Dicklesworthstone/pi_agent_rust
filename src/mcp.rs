@@ -8,6 +8,7 @@
 //! all three provenances.
 
 pub mod config;
+mod content;
 pub mod manager;
 pub mod transport;
 pub mod trust;
@@ -20,7 +21,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use crate::model::{ContentBlock, TextContent};
+#[cfg(test)]
+use crate::model::ContentBlock;
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 
 /// Build an MCP manager while enforcing the established workspace-trust
@@ -161,51 +163,10 @@ impl Tool for McpTool {
     }
 }
 
-/// Shape an MCP `tools/call` result into a ToolOutput: text content blocks
-/// join into the text payload; structured content lands in details;
-/// `isError` propagates.
+/// Preserve native media and ordered mixed content, expose embedded documents
+/// and structured results, and keep client metadata out of prompt text.
 fn mcp_result_to_output(result: &Value) -> ToolOutput {
-    let is_error = result
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut texts = Vec::new();
-    let mut non_text = Vec::new();
-    if let Some(content) = result.get("content").and_then(Value::as_array) {
-        for block in content {
-            let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
-            if kind == "text" {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    texts.push(text.to_string());
-                }
-            } else {
-                non_text.push(block.clone());
-            }
-        }
-    }
-    let structured = result.get("structuredContent").cloned();
-    let text = if texts.is_empty() {
-        // No text blocks: fall back to a JSON rendering so the model sees
-        // the result instead of an empty payload.
-        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "<unserializable>".to_string())
-    } else {
-        texts.join("\n")
-    };
-    let mut details = serde_json::json!({
-        "mcp": true,
-        "nonTextBlocks": non_text.len(),
-    });
-    if let Some(structured) = structured {
-        details["structuredContent"] = structured;
-    }
-    if !non_text.is_empty() {
-        details["nonText"] = Value::Array(non_text);
-    }
-    ToolOutput {
-        content: vec![ContentBlock::Text(TextContent::new(text))],
-        details: Some(details),
-        is_error,
-    }
+    content::tool_output(result)
 }
 
 /// Mount every cached server tool as a first-class tool wrapper.
@@ -364,18 +325,18 @@ mod tests {
     }
 
     #[test]
-    fn result_shaping_error_and_nontext_fallback() {
+    fn result_shaping_error_and_invalid_media() {
         let out = mcp_result_to_output(&serde_json::json!({
             "content": [{"type": "image", "data": "..."}],
             "isError": true
         }));
         assert!(out.is_error);
-        // No text blocks → JSON fallback rendering.
+        // A malformed media result is explicit, never a raw base64 dump.
         let text = out.content.first().and_then(|b| match b {
             ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         });
-        assert!(text.is_some_and(|t| t.contains("image")));
+        assert!(text.is_some_and(|t| t.contains("MCP_CONTENT_INVALID")));
         assert_eq!(out.details.as_ref().unwrap()["nonTextBlocks"], 1);
     }
 }
