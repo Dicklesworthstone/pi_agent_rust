@@ -1118,9 +1118,15 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
       bench_name="${CRITERION_BENCHES[$bench]}"
       bench_build_args=(bench --bench "$bench_name" --no-run --profile "$CARGO_PROFILE")
       if [[ "$bench" == "criterion_pijs" ]]; then
+        # Exactly CANONICAL_PIJS_PERF_FEATURES (src/perf_build.rs:44). The gate
+        # compares compiled_features by EXACT slice equality
+        # (matches_canonical_pijs_perf_features), so one extra feature makes
+        # every record it emits inadmissible. `tui` used to be in this list and
+        # is not in the constant; see the header comment on the second copy of
+        # these flags below.
         bench_build_args+=(
           --no-default-features
-          --features clipboard,image,image-resize,sqlite-sessions,tui,wasm-host
+          --features clipboard,image,image-resize,sqlite-sessions,wasm-host
         )
       fi
       if "${PHASE2_RUNNER_ARGS[@]}" "${bench_build_args[@]}" 2>>"$OUTPUT_DIR/logs/build_benches.log"; then
@@ -2742,9 +2748,21 @@ run_criterion_bench() {
     criterion_runner_args=("${PERF_BENCH_RUNNER_ARGS[@]}")
   fi
   if [[ "$suite_name" == "criterion_pijs" ]]; then
+    # These features must equal CANONICAL_PIJS_PERF_FEATURES
+    # (src/perf_build.rs:44) exactly: clipboard, image, image-resize,
+    # sqlite-sessions, wasm-host. `matches_canonical_pijs_perf_features`
+    # compares the compiled set by slice equality, so ONE extra feature sets
+    # eligible_for_regression_gate=false and confidence="medium", and
+    # validate_pijs_gate_classification then rejects the record --
+    # which is what `tui` was doing here since 950827f74 (2026-08-25), twenty
+    # days after the constant was introduced without it. The measurement
+    # boundary is `production_extension_manager`; a terminal UI is not part of
+    # it. Verified empirically: this exact set yields
+    # eligible_for_regression_gate=true, confidence="high", and both
+    # tool_call budgets PASS.
     criterion_cargo_args+=(
       --no-default-features
-      --features clipboard,image,image-resize,sqlite-sessions,tui,wasm-host
+      --features clipboard,image,image-resize,sqlite-sessions,wasm-host
       --
       --regression-gate-pair
     )
