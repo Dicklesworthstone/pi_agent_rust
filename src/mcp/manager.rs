@@ -15,6 +15,8 @@ use super::transport::{DEFAULT_MCP_TIMEOUT, MCP_PROTOCOL_VERSION, McpTransport};
 use super::trust::{TrustDecision, TrustStore, TrustWriteGuard};
 use crate::error::{Error, Result};
 
+mod catalog;
+
 #[cfg(test)]
 type TestTransportFactory = dyn Fn() -> Box<dyn McpTransport> + Send + Sync;
 #[cfg(test)]
@@ -681,28 +683,10 @@ impl McpManager {
                 "connection changed before tools/list dispatch",
             ));
         }
-        let result = match transport
-            .request("tools/list", serde_json::json!({}), DEFAULT_MCP_TIMEOUT)
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                Self::fail_transport_generation(entry, &transport, &err);
-                return Err(err);
-            }
-        };
+        // A server's catalog may span several opaque cursor pages. Retain
+        // the connection lane and publish only the complete validated set.
+        let tools = self.collect_tool_catalog(entry, &transport).await?;
         self.check_running()?;
-        if let Err(err) = self.check_trust(entry) {
-            Self::close_revoked_transport(entry, &transport).await;
-            return Err(err);
-        }
-        let tools = match parse_tool_list(&result) {
-            Ok(tools) => tools,
-            Err(err) => {
-                Self::fail_transport_generation(entry, &transport, &err);
-                return Err(err);
-            }
-        };
         // Narrow the final cross-process revocation window immediately before
         // publishing schemas, then bind publication to this exact connection.
         if let Err(err) = self.check_trust(entry) {
