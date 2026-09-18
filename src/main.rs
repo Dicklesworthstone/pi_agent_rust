@@ -1827,7 +1827,12 @@ async fn run(
         }
     });
     let is_print_mode = mode.eq("text") || mode.eq("json");
-    if is_print_mode {
+    if is_print_mode
+        && cli.session.is_none()
+        && cli.session_dir.is_none()
+        && !cli.r#continue
+        && !cli.resume
+    {
         cli.no_session = true;
     }
     if mode.eq("text") && initial.is_none() && messages.is_empty() {
@@ -8873,7 +8878,22 @@ async fn run_print_mode(
     // started from, what is installed now, when the cooldown began, and where
     // the walk left off. Previously all of this was per-prompt, so a sequence
     // that failed over never came back and restarted the chain each time.
-    let mut failover_state = PrintFailoverState::new(config);
+    let mut failover_state = {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let inner = session.session.lock(cx.cx()).await.ok();
+        inner.as_deref().map_or_else(
+            || PrintFailoverState::new(config),
+            |s| {
+                PrintFailoverState::reconstruct_from_session(
+                    s,
+                    config.failover_cooldown_secs(),
+                    chrono::Utc::now(),
+                )
+            },
+        )
+    };
+
+    let _ = maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
 
     if let Some(initial) = initial {
         let content = pi::app::build_initial_content(&initial);
@@ -9346,6 +9366,9 @@ async fn try_print_failover(
         // sticky across models.
         thinking_level_to_clamp: primary.requested_thinking_level,
         require_incomplete_tail,
+        primary: Some(&primary),
+        cooldown_secs: Some(config.failover_cooldown_secs()),
+        lifecycle_id: failover_state.lifecycle_id(),
     };
     let outcome = session.try_failover(&cx, &attempt).await?;
     let Some(committed) = outcome.committed else {
@@ -9362,6 +9385,9 @@ async fn try_print_failover(
         // RPC and the SDK have always behaved this way; print was the outlier.
         return Ok(None);
     };
+    if failover_state.lifecycle_id().is_none() {
+        failover_state.set_lifecycle_id(Some(uuid::Uuid::new_v4().to_string()));
+    }
     // Only a committed swap advances the cursor, so a later prompt resumes past
     // the entry it actually installed.
     failover_state.set_chain_position(outcome.next_position);

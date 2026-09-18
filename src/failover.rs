@@ -220,6 +220,33 @@ impl CooldownTracker {
         self.failed_at = None;
     }
 
+    /// Create a cooldown tracker restored from a restart-safe deadline (bd-gm481.2).
+    /// If `now < deadline`, the remaining cooldown is tracked. If `now >= deadline`,
+    /// the cooldown has elapsed.
+    #[must_use]
+    pub fn from_deadline(
+        cooldown_secs: u64,
+        deadline: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let mut tracker = Self::new(cooldown_secs);
+        if now < deadline {
+            let remaining_millis = (deadline - now).num_milliseconds().max(0) as u64;
+            let total_millis = cooldown_secs.saturating_mul(1000);
+            let elapsed_millis = total_millis.saturating_sub(remaining_millis);
+            let failed_at = Instant::now()
+                .checked_sub(Duration::from_millis(elapsed_millis))
+                .unwrap_or_else(Instant::now);
+            tracker.record_primary_failure(failed_at);
+        } else {
+            let past = Instant::now()
+                .checked_sub(Duration::from_secs(cooldown_secs.saturating_add(1)))
+                .unwrap_or_else(Instant::now);
+            tracker.record_primary_failure(past);
+        }
+        tracker
+    }
+
     /// Deterministic test view of the failure timestamp.
     #[cfg(test)]
     pub(crate) fn failed_at(&self) -> Option<Instant> {
@@ -398,16 +425,15 @@ pub struct FailoverPrimary {
 /// the interactive stacks, where a configured chain is currently inert — adopt
 /// failover without becoming a third copy (bd-u2qv4).
 ///
-/// Per-process by design, matching both existing surfaces: a reopened session
-/// starts empty and stays on whatever the Session header says. Recovering the
-/// primary across a restart would need it durably recorded, which neither
-/// surface does today.
+/// Durable restart-safe failover provenance is recorded on Session `ModelChange`
+/// entries and restored upon session open (bd-gm481.2).
 #[derive(Debug, Default)]
 pub struct FailoverState {
     cooldown: Option<CooldownTracker>,
     primary: Option<FailoverPrimary>,
     active: Option<(String, String)>,
     chain_position: usize,
+    lifecycle_id: Option<String>,
 }
 
 impl FailoverState {
@@ -425,6 +451,7 @@ impl FailoverState {
             primary: None,
             active: None,
             chain_position: 0,
+            lifecycle_id: None,
         }
     }
 
@@ -437,6 +464,7 @@ impl FailoverState {
             primary: None,
             active: None,
             chain_position: 0,
+            lifecycle_id: None,
         }
     }
 
@@ -447,6 +475,68 @@ impl FailoverState {
         Self {
             cooldown: Some(CooldownTracker::new(cooldown_secs)),
             ..Self::default()
+        }
+    }
+
+    /// Reconstruct cross-turn failover bookkeeping from a persisted session
+    /// record (bd-gm481.2). If the session's active branch path ends on an
+    /// unrestored failover swap, its primary, active fallback, chain position,
+    /// and restart-safe cooldown deadline are restored.
+    #[must_use]
+    pub fn reconstruct_from_session(
+        session: &crate::session::Session,
+        configured_cooldown_secs: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let Some(provenance) = session.active_failover_provenance_for_current_path() else {
+            return Self::with_cooldown_secs(configured_cooldown_secs);
+        };
+        Self::reconstruct_from_provenance(provenance, configured_cooldown_secs, now)
+    }
+
+    /// Reconstruct cross-turn failover bookkeeping from explicit provenance
+    /// (bd-gm481.2).
+    #[must_use]
+    pub fn reconstruct_from_provenance(
+        provenance: &crate::session::ModelChangeFailover,
+        configured_cooldown_secs: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let primary = FailoverPrimary {
+            provider: provenance.primary_provider.clone(),
+            model_id: provenance.primary_model_id.clone(),
+            requested_thinking_level: provenance
+                .primary_thinking_level
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+        };
+        let active = (
+            provenance.fallback_provider.clone(),
+            provenance.fallback_model_id.clone(),
+        );
+        let chain_position = provenance.chain_position.unwrap_or(0);
+        let cooldown_secs = provenance.cooldown_secs.unwrap_or(configured_cooldown_secs);
+        let cooldown = provenance
+            .cooldown_deadline
+            .as_deref()
+            .and_then(|dl| chrono::DateTime::parse_from_rfc3339(dl).ok())
+            .map_or_else(
+                || CooldownTracker::new(cooldown_secs),
+                |deadline| {
+                    CooldownTracker::from_deadline(
+                        cooldown_secs,
+                        deadline.with_timezone(&chrono::Utc),
+                        now,
+                    )
+                },
+            );
+        Self {
+            cooldown: Some(cooldown),
+            primary: Some(primary),
+            active: Some(active),
+            chain_position,
+            lifecycle_id: provenance.lifecycle_id.clone(),
         }
     }
 
@@ -472,6 +562,43 @@ impl FailoverState {
     /// Record where a walk finished, whether or not it swapped.
     pub const fn set_chain_position(&mut self, position: usize) {
         self.chain_position = position;
+    }
+
+    /// Active failover lifecycle ID, if any.
+    #[must_use]
+    pub fn lifecycle_id(&self) -> Option<&str> {
+        self.lifecycle_id.as_deref()
+    }
+
+    /// Set or update the active failover lifecycle ID.
+    pub fn set_lifecycle_id(&mut self, id: Option<String>) {
+        self.lifecycle_id = id;
+    }
+
+    /// Cooldown tracker, if configured.
+    #[must_use]
+    pub const fn cooldown(&self) -> Option<&CooldownTracker> {
+        self.cooldown.as_ref()
+    }
+
+    /// Deconstruct into constituent state components.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<CooldownTracker>,
+        Option<FailoverPrimary>,
+        Option<(String, String)>,
+        usize,
+        Option<String>,
+    ) {
+        (
+            self.cooldown,
+            self.primary,
+            self.active,
+            self.chain_position,
+            self.lifecycle_id,
+        )
     }
 
     /// The identity a fresh swap should record as its primary: the one already
@@ -517,6 +644,7 @@ impl FailoverState {
         self.primary = None;
         self.active = None;
         self.chain_position = 0;
+        self.lifecycle_id = None;
         if let Some(tracker) = self.cooldown.as_mut() {
             tracker.reset();
         }
@@ -1218,6 +1346,162 @@ mod tests {
             !state.should_restore_primary(now + Duration::from_secs(100_000)),
             "with no chain there is nothing to fail over to and nothing to restore from"
         );
+    }
+
+    #[test]
+    fn failover_state_reconstructs_from_session_with_cooldown_active() {
+        use crate::session::{ModelChangeFailover, Session};
+        let mut session = Session::in_memory();
+        let now = chrono::Utc::now();
+        // Cooldown deadline is 40 seconds in the future
+        let deadline = (now + chrono::Duration::seconds(40))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let provenance = ModelChangeFailover {
+            primary_provider: "anthropic".to_string(),
+            primary_model_id: "claude-3-7-sonnet".to_string(),
+            primary_thinking_level: Some("high".to_string()),
+            fallback_provider: "openai".to_string(),
+            fallback_model_id: "gpt-4o".to_string(),
+            chain_position: Some(2),
+            cooldown_deadline: Some(deadline),
+            cooldown_secs: Some(60),
+            lifecycle_id: Some("lifecycle-active-123".to_string()),
+        };
+
+        session.append_model_change_with_role_and_failover(
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            Some("failover".to_string()),
+            Some(provenance),
+        );
+
+        let state = FailoverState::reconstruct_from_session(&session, 60, now);
+        assert_eq!(
+            state.primary(),
+            Some(&primary("anthropic", "claude-3-7-sonnet"))
+        );
+        assert_eq!(
+            state.active(),
+            Some(&("openai".to_string(), "gpt-4o".to_string()))
+        );
+        assert_eq!(state.chain_position(), 2);
+        assert_eq!(state.lifecycle_id(), Some("lifecycle-active-123"));
+
+        // Cooldown has 40s left: right now it should NOT restore
+        let inst_now = Instant::now();
+        assert!(!state.should_restore_primary(inst_now));
+        // After 41s, it SHOULD restore
+        assert!(state.should_restore_primary(inst_now + Duration::from_secs(41)));
+    }
+
+    #[test]
+    fn failover_state_reconstructs_from_session_with_cooldown_elapsed() {
+        use crate::session::{ModelChangeFailover, Session};
+        let mut session = Session::in_memory();
+        let now = chrono::Utc::now();
+        // Cooldown deadline is in the past (10 seconds ago)
+        let deadline = (now - chrono::Duration::seconds(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let provenance = ModelChangeFailover {
+            primary_provider: "anthropic".to_string(),
+            primary_model_id: "claude-3-7-sonnet".to_string(),
+            primary_thinking_level: Some("high".to_string()),
+            fallback_provider: "openai".to_string(),
+            fallback_model_id: "gpt-4o".to_string(),
+            chain_position: Some(1),
+            cooldown_deadline: Some(deadline),
+            cooldown_secs: Some(300),
+            lifecycle_id: Some("lifecycle-elapsed-456".to_string()),
+        };
+
+        session.append_model_change_with_role_and_failover(
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            Some("failover".to_string()),
+            Some(provenance),
+        );
+
+        let state = FailoverState::reconstruct_from_session(&session, 300, now);
+        assert_eq!(
+            state.primary(),
+            Some(&primary("anthropic", "claude-3-7-sonnet"))
+        );
+        assert_eq!(
+            state.active(),
+            Some(&("openai".to_string(), "gpt-4o".to_string()))
+        );
+        assert_eq!(state.lifecycle_id(), Some("lifecycle-elapsed-456"));
+        // Cooldown already elapsed: should restore immediately!
+        assert!(state.should_restore_primary(Instant::now()));
+    }
+
+    #[test]
+    fn failover_state_reconstruct_returns_clean_state_when_restored_or_explicitly_changed() {
+        use crate::session::{ModelChangeFailover, Session};
+        let mut session = Session::in_memory();
+        let now = chrono::Utc::now();
+
+        // 1. Unrestored failover
+        let provenance = ModelChangeFailover {
+            primary_provider: "anthropic".to_string(),
+            primary_model_id: "claude-3-7-sonnet".to_string(),
+            primary_thinking_level: None,
+            fallback_provider: "openai".to_string(),
+            fallback_model_id: "gpt-4o".to_string(),
+            chain_position: Some(1),
+            cooldown_deadline: None,
+            cooldown_secs: Some(0),
+            lifecycle_id: None,
+        };
+        session.append_model_change_with_role_and_failover(
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            Some("failover".to_string()),
+            Some(provenance),
+        );
+
+        // 2. Primary restored
+        session.append_model_change_with_role(
+            "anthropic".to_string(),
+            "claude-3-7-sonnet".to_string(),
+            Some("primary_restore".to_string()),
+        );
+
+        let state = FailoverState::reconstruct_from_session(&session, 300, now);
+        assert_eq!(
+            state.primary(),
+            None,
+            "restored session must not reconstruct failover primary"
+        );
+        assert_eq!(state.active(), None);
+
+        // 3. Re-failover then explicit user model change
+        session.append_model_change_with_role_and_failover(
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            Some("failover".to_string()),
+            Some(ModelChangeFailover {
+                primary_provider: "anthropic".to_string(),
+                primary_model_id: "claude-3-7-sonnet".to_string(),
+                primary_thinking_level: None,
+                fallback_provider: "openai".to_string(),
+                fallback_model_id: "gpt-4o".to_string(),
+                chain_position: Some(1),
+                cooldown_deadline: None,
+                cooldown_secs: Some(0),
+                lifecycle_id: None,
+            }),
+        );
+        // Explicit change (role None)
+        session.append_model_change("cohere".to_string(), "command-r".to_string());
+
+        let state2 = FailoverState::reconstruct_from_session(&session, 300, now);
+        assert_eq!(
+            state2.primary(),
+            None,
+            "explicit model change must supersede failover primary"
+        );
+        assert_eq!(state2.active(), None);
     }
 
     // -- shared chain walk (bd-u2qv4) --------------------------------------

@@ -145,6 +145,7 @@ fn model_change_entry(
         provider: provider.to_string(),
         model_id: model_id.to_string(),
         role: None,
+        failover: None,
     })
 }
 

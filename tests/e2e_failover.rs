@@ -1640,3 +1640,185 @@ fn e2e_path_scope_pins_repo_model_set() {
     assert!(errors.is_empty(), "JSONL violations: {errors:?}");
     harness.record_artifact("e2e_path_scope.jsonl", &path);
 }
+
+/// bd-gm481.2: Restart durability for print mode.
+/// A session that fails over in process 1 (with cooldown 0), when reopened
+/// in a brand new process via `--session-dir` + `--continue`, restores the primary
+/// on startup before running the prompt.
+#[test]
+fn e2e_failover_reopen_restores_primary_once_cooldown_elapsed() {
+    let harness = TestHarness::new("e2e_failover_reopen_restores_primary_once_cooldown_elapsed");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/backup/v1/chat/completions",
+        sse_response(text_sse_body("backup ok")),
+    );
+
+    let env = PiEnv::with_cooldown_secs(&harness, Some(0));
+    env.write_models(&server.base_url());
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let session_dir = env.root.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("create session_dir");
+
+    // Process 1: Runs initial prompt "ping". Primary fails with 429, fails over to backup.
+    let mut command1 = env.command(&binary);
+    command1.args([
+        "--print",
+        "--mode",
+        "json",
+        "--session-dir",
+        session_dir.to_str().unwrap(),
+        "--provider",
+        "e2eprimary",
+        "--model",
+        "primary-model",
+        "ping",
+    ]);
+    let child1 = command1.spawn().expect("spawn pi 1");
+    let (stdout1, stderr1) = run_and_collect(child1, 120);
+    let events1 = stdout1
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let kinds1 = event_kinds(&events1);
+    assert_eq!(
+        kinds1.iter().filter(|k| *k == "failover_start").count(),
+        1,
+        "process 1 must fail over once: {kinds1:?}\n{stdout1}\n{stderr1}"
+    );
+
+    // Process 2: Reopens the session via `--continue`. With cooldown 0 (elapsed),
+    // it restores the primary, emits FailoverEnd{restoredPrimary: true}, and then runs "pong".
+    // Since primary returns 429, "pong" fails over again!
+    let mut command2 = env.command(&binary);
+    command2.args([
+        "--print",
+        "--mode",
+        "json",
+        "--session-dir",
+        session_dir.to_str().unwrap(),
+        "--continue",
+        "pong",
+    ]);
+    let child2 = command2.spawn().expect("spawn pi 2");
+    let (stdout2, stderr2) = run_and_collect(child2, 120);
+    let events2 = stdout2
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let kinds2 = event_kinds(&events2);
+
+    let restorations = restoration_events(&events2);
+    assert_eq!(
+        restorations.len(),
+        1,
+        "process 2 must restore primary on reopen: {kinds2:?}\n{stdout2}\n{stderr2}"
+    );
+    let restoration = restorations[0];
+    assert_eq!(restoration["provider"], "e2eprimary");
+    assert_eq!(restoration["model"], "primary-model");
+    assert_eq!(
+        kinds2.iter().filter(|k| *k == "failover_start").count(),
+        1,
+        "process 2 started on restored primary which 429s, so it fails over again: {kinds2:?}\n{stdout2}\n{stderr2}"
+    );
+}
+
+/// bd-gm481.2: Restart durability with active cooldown holding.
+/// A session that fails over in process 1 with cooldown 600s, when reopened
+/// in a brand new process via `--session-dir` + `--continue`, sees the cooldown
+/// is still active, stays on the fallback, and does NOT restore the primary.
+#[test]
+fn e2e_failover_reopen_stays_on_fallback_while_cooldown_holds() {
+    let harness = TestHarness::new("e2e_failover_reopen_stays_on_fallback_while_cooldown_holds");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+    server.add_route(
+        "POST",
+        "/backup/v1/chat/completions",
+        sse_response(text_sse_body("backup ok")),
+    );
+
+    let env = PiEnv::with_cooldown_secs(&harness, Some(600));
+    env.write_models(&server.base_url());
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let session_dir = env.root.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("create session_dir");
+
+    // Process 1: Runs "ping", fails over to backup, records 600s cooldown deadline in session.
+    let mut command1 = env.command(&binary);
+    command1.args([
+        "--print",
+        "--mode",
+        "json",
+        "--session-dir",
+        session_dir.to_str().unwrap(),
+        "--provider",
+        "e2eprimary",
+        "--model",
+        "primary-model",
+        "ping",
+    ]);
+    let child1 = command1.spawn().expect("spawn pi 1");
+    let (stdout1, stderr1) = run_and_collect(child1, 120);
+    let events1 = stdout1
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let kinds1 = event_kinds(&events1);
+    assert_eq!(
+        kinds1.iter().filter(|k| *k == "failover_start").count(),
+        1,
+        "process 1 must fail over once: {kinds1:?}\n{stdout1}\n{stderr1}"
+    );
+
+    // Process 2: Reopens the session via `--continue`. Cooldown is 600s, so it is still active.
+    // It must NOT restore primary, staying on backup. "pong" succeeds directly on backup.
+    let mut command2 = env.command(&binary);
+    command2.args([
+        "--print",
+        "--mode",
+        "json",
+        "--session-dir",
+        session_dir.to_str().unwrap(),
+        "--continue",
+        "pong",
+    ]);
+    let child2 = command2.spawn().expect("spawn pi 2");
+    let (stdout2, stderr2) = run_and_collect(child2, 120);
+    let events2 = stdout2
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let kinds2 = event_kinds(&events2);
+
+    assert!(
+        restoration_events(&events2).is_empty(),
+        "nothing may be restored while cooldown holds across restart: {kinds2:?}\n{stdout2}\n{stderr2}"
+    );
+    assert_eq!(
+        kinds2.iter().filter(|k| *k == "failover_start").count(),
+        0,
+        "process 2 stays on fallback, no new failover needed: {kinds2:?}\n{stdout2}\n{stderr2}"
+    );
+    assert!(
+        stdout2.contains("backup ok"),
+        "process 2 must successfully complete turn on fallback: {stdout2}\n{stderr2}"
+    );
+}

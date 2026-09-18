@@ -4792,6 +4792,26 @@ impl Session {
         None
     }
 
+    /// Inspect the latest model change on the current active branch path to determine
+    /// if an unrestored failover cycle is in flight (bd-gm481.2).
+    ///
+    /// Returns `Some(&ModelChangeFailover)` only if the latest model change on the path
+    /// has `role == Some("failover")` and carries durable failover provenance. If the
+    /// latest model change is `primary_restore` or a user-initiated change (`None`),
+    /// this returns `None`.
+    #[must_use]
+    pub fn active_failover_provenance_for_current_path(&self) -> Option<&ModelChangeFailover> {
+        for entry in self.entries_for_current_path().iter().rev() {
+            if let SessionEntry::ModelChange(change) = entry {
+                if change.role.as_deref() == Some("failover") {
+                    return change.failover.as_ref();
+                }
+                return None;
+            }
+        }
+        None
+    }
+
     pub fn effective_model_for_current_path(&self) -> Option<(String, String)> {
         // If there's an explicit model change on the current path, use it
         if let Some(model) = self.latest_model_change_for_current_path() {
@@ -5018,6 +5038,18 @@ impl Session {
         model_id: String,
         role: Option<String>,
     ) -> String {
+        self.append_model_change_with_role_and_failover(provider, model_id, role, None)
+    }
+
+    /// Append a model change tagged with the role it applies to and optional
+    /// durable failover provenance (bd-gm481.2).
+    pub fn append_model_change_with_role_and_failover(
+        &mut self,
+        provider: String,
+        model_id: String,
+        role: Option<String>,
+        failover: Option<ModelChangeFailover>,
+    ) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
         let entry = SessionEntry::ModelChange(ModelChangeEntry {
@@ -5025,6 +5057,7 @@ impl Session {
             provider,
             model_id,
             role,
+            failover,
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
@@ -6600,6 +6633,35 @@ impl From<Message> for SessionMessage {
     }
 }
 
+/// Durable failover provenance recorded on a `failover` role ModelChange entry (bd-gm481.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChangeFailover {
+    /// The primary provider before the failover chain started.
+    pub primary_provider: String,
+    /// The primary model id before the failover chain started.
+    pub primary_model_id: String,
+    /// Requested thinking level of the primary model before any clamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_thinking_level: Option<String>,
+    /// The fallback provider installed by this swap.
+    pub fallback_provider: String,
+    /// The fallback model id installed by this swap.
+    pub fallback_model_id: String,
+    /// Chain position for resuming future walks in this cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_position: Option<usize>,
+    /// Restart-safe cooldown deadline timestamp (RFC3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_deadline: Option<String>,
+    /// Configured cooldown duration in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
+    /// Unique lifecycle ID identifying this failover cycle across hops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_id: Option<String>,
+}
+
 /// Model change entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -6613,6 +6675,9 @@ pub struct ModelChangeEntry {
     /// or require the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Durable failover provenance (bd-gm481.2). Present only when `role == Some("failover")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<ModelChangeFailover>,
 }
 
 /// Thinking level change entry.
@@ -11935,6 +12000,102 @@ mod tests {
         } else {
             test_fail!("Expected ModelChange after round-trip");
         }
+    }
+
+    /// bd-gm481.2: durable failover provenance must serialize, deserialize, and be queryable
+    /// along the active branch path.
+    #[test]
+    fn test_model_change_failover_provenance_round_trip_and_path_lookup() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Initial message"));
+
+        // 1. Appending a standard model change has no failover provenance and does not serialize "failover".
+        let mc1_id =
+            session.append_model_change("anthropic".to_string(), "claude-3-7-sonnet".to_string());
+        let mc1 = session.get_entry(&mc1_id).unwrap().clone();
+        let json1 = serde_json::to_string(&mc1).unwrap();
+        assert!(
+            !json1.contains("\"failover\""),
+            "standard model change must not have failover key: {json1}"
+        );
+        assert!(
+            session
+                .active_failover_provenance_for_current_path()
+                .is_none()
+        );
+
+        // 2. Appending a failover model change with durable provenance.
+        let failover_meta = ModelChangeFailover {
+            primary_provider: "anthropic".to_string(),
+            primary_model_id: "claude-3-7-sonnet".to_string(),
+            primary_thinking_level: Some("high".to_string()),
+            fallback_provider: "openai".to_string(),
+            fallback_model_id: "gpt-4o".to_string(),
+            chain_position: Some(1),
+            cooldown_deadline: Some("2026-09-18T20:00:00.000Z".to_string()),
+            cooldown_secs: Some(300),
+            lifecycle_id: Some("lifecycle-test-123".to_string()),
+        };
+
+        let mc2_id = session.append_model_change_with_role_and_failover(
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            Some("failover".to_string()),
+            Some(failover_meta.clone()),
+        );
+
+        let mc2 = session.get_entry(&mc2_id).unwrap().clone();
+        let json2 = serde_json::to_string(&mc2).unwrap();
+        assert!(
+            json2.contains("\"role\":\"failover\""),
+            "failover role must serialize: {json2}"
+        );
+        assert!(
+            json2.contains("\"primaryProvider\":\"anthropic\""),
+            "primaryProvider must serialize: {json2}"
+        );
+        assert!(
+            json2.contains("\"primaryModelId\":\"claude-3-7-sonnet\""),
+            "primaryModelId must serialize: {json2}"
+        );
+        assert!(
+            json2.contains("\"lifecycleId\":\"lifecycle-test-123\""),
+            "lifecycleId must serialize: {json2}"
+        );
+
+        // Deserializing matches original provenance exactly.
+        let parsed: SessionEntry = serde_json::from_str(&json2).unwrap();
+        if let SessionEntry::ModelChange(mc) = parsed {
+            assert_eq!(mc.failover, Some(failover_meta.clone()));
+        } else {
+            test_fail!("Expected ModelChange");
+        }
+
+        // Active failover query returns the provenance.
+        assert_eq!(
+            session.active_failover_provenance_for_current_path(),
+            Some(&failover_meta)
+        );
+
+        // 3. Appending intermediate message still returns the active failover provenance.
+        session.append_message(make_test_message("Intervening assistant response"));
+        assert_eq!(
+            session.active_failover_provenance_for_current_path(),
+            Some(&failover_meta)
+        );
+
+        // 4. Appending a primary_restore model change ends the failover.
+        session.append_model_change_with_role(
+            "anthropic".to_string(),
+            "claude-3-7-sonnet".to_string(),
+            Some("primary_restore".to_string()),
+        );
+        assert!(
+            session
+                .active_failover_provenance_for_current_path()
+                .is_none(),
+            "primary_restore must clear active failover provenance"
+        );
     }
 
     #[test]

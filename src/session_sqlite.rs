@@ -854,6 +854,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 model_id: "claude-sonnet-4-5".to_string(),
                 role: None,
+                failover: None,
             }),
             message_entry(),
         ];
@@ -925,6 +926,7 @@ mod tests {
                 provider: "openai".to_string(),
                 model_id: "gpt-4".to_string(),
                 role: None,
+                failover: None,
             }),
             session_info_entry(Some("Named".to_string())),
             SessionEntry::Label(LabelEntry {

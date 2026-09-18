@@ -1606,6 +1606,12 @@ pub struct FailoverSwapAttempt<'a> {
     pub thinking_level_to_clamp: crate::model::ThinkingLevel,
     /// Whether a completed error response must have left a revertible tail.
     pub require_incomplete_tail: bool,
+    /// The primary identity before failover started (bd-gm481.2).
+    pub primary: Option<&'a crate::failover::FailoverPrimary>,
+    /// Cooldown duration in seconds (bd-gm481.2).
+    pub cooldown_secs: Option<u64>,
+    /// Unique lifecycle ID across hops in this failover cycle (bd-gm481.2).
+    pub lifecycle_id: Option<&'a str>,
 }
 
 /// A swap that committed, with what the caller needs for its own events and
@@ -1672,6 +1678,12 @@ pub struct FailoverSwapRequest<'a> {
     pub thinking_level_to_clamp: crate::model::ThinkingLevel,
     /// Whether a completed error response must have left a revertible tail.
     pub require_incomplete_tail: bool,
+    /// The primary identity before failover started (bd-gm481.2).
+    pub primary: Option<&'a crate::failover::FailoverPrimary>,
+    /// Cooldown duration in seconds (bd-gm481.2).
+    pub cooldown_secs: Option<u64>,
+    /// Unique lifecycle ID across hops in this failover cycle (bd-gm481.2).
+    pub lifecycle_id: Option<&'a str>,
 }
 
 /// One restoration of the captured primary after a failover cooldown, as
@@ -13293,6 +13305,9 @@ impl AgentSession {
                 chain_position: next_position,
                 thinking_level_to_clamp: attempt.thinking_level_to_clamp,
                 require_incomplete_tail: attempt.require_incomplete_tail,
+                primary: attempt.primary,
+                cooldown_secs: attempt.cooldown_secs,
+                lifecycle_id: attempt.lifecycle_id,
             };
             self.commit_failover_swap(cx, &request, admission).await?;
             return Ok(FailoverSwapOutcome {
@@ -13353,10 +13368,47 @@ impl AgentSession {
                 "attempt": request.chain_position,
             })),
         );
-        candidate.append_model_change_with_role(
+
+        let primary_provider = request
+            .primary
+            .map(|p| p.provider.clone())
+            .unwrap_or_else(|| request.from_provider.to_string());
+        let primary_model_id = request
+            .primary
+            .map(|p| p.model_id.clone())
+            .unwrap_or_else(|| request.from_model.to_string());
+        let primary_thinking_level = request
+            .primary
+            .map(|p| p.requested_thinking_level.to_string())
+            .or_else(|| Some(request.thinking_level_to_clamp.to_string()));
+        let cooldown_secs = request.cooldown_secs.unwrap_or(0);
+        let now = chrono::Utc::now();
+        let deadline = now + chrono::Duration::seconds(cooldown_secs as i64);
+        let cooldown_deadline = Some(deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let lifecycle_id = request.lifecycle_id.map(String::from).or_else(|| {
+            inner
+                .active_failover_provenance_for_current_path()
+                .and_then(|p| p.lifecycle_id.clone())
+                .or_else(|| Some(uuid::Uuid::new_v4().to_string()))
+        });
+
+        let failover_meta = crate::session::ModelChangeFailover {
+            primary_provider,
+            primary_model_id,
+            primary_thinking_level,
+            fallback_provider: to_provider.clone(),
+            fallback_model_id: to_model.clone(),
+            chain_position: Some(request.chain_position),
+            cooldown_deadline,
+            cooldown_secs: Some(cooldown_secs),
+            lifecycle_id,
+        };
+
+        candidate.append_model_change_with_role_and_failover(
             to_provider,
             to_model,
             Some("failover".to_string()),
+            Some(failover_meta),
         );
         if thinking_changed {
             candidate.append_thinking_level_change(target_thinking_text);

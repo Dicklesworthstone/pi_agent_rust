@@ -3904,6 +3904,7 @@ mod tests {
             provider: "test".to_string(),
             model_id: "model-1".to_string(),
             role: None,
+            failover: None,
         });
         assert!(!entry_is_message_like(&entry));
     }
@@ -4004,6 +4005,7 @@ mod tests {
             provider: "test".to_string(),
             model_id: "model".to_string(),
             role: None,
+            failover: None,
         });
         assert!(message_from_entry(&entry).is_none());
     }
@@ -4272,6 +4274,7 @@ mod tests {
             provider: "test".to_string(),
             model_id: "model".to_string(),
             role: None,
+            failover: None,
         })];
         assert!(prepare_compaction(&entries, ResolvedCompactionSettings::default()).is_none());
     }

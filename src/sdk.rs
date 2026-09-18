@@ -2151,6 +2151,9 @@ impl AgentSessionHandle {
             // (bd-jk057).
             thinking_level_to_clamp: primary.requested_thinking_level,
             require_incomplete_tail,
+            primary: Some(&primary),
+            cooldown_secs: Some(options.cooldown_secs),
+            lifecycle_id: self.failover_state.lifecycle_id(),
         };
         let outcome = self.session.try_failover(&cx, &attempt).await?;
         let Some(committed) = outcome.committed else {
@@ -2161,6 +2164,10 @@ impl AgentSessionHandle {
             // (bd-gr6fk).
             return Ok(false);
         };
+        if self.failover_state.lifecycle_id().is_none() {
+            self.failover_state
+                .set_lifecycle_id(Some(uuid::Uuid::new_v4().to_string()));
+        }
         self.failover_state
             .set_chain_position(outcome.next_position);
         self.failover_state.record_swap(
@@ -3395,6 +3402,23 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     listeners.on_tool_start = options.on_tool_start;
     listeners.on_tool_end = options.on_tool_end;
     listeners.on_stream_event = options.on_stream_event;
+    let failover_state = match options.failover.as_ref() {
+        None => crate::failover::FailoverState::new_empty(),
+        Some(failover) => {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = agent_session.session.lock(cx.cx()).await.ok();
+            inner.as_deref().map_or_else(
+                || crate::failover::FailoverState::with_cooldown_secs(failover.cooldown_secs),
+                |s| {
+                    crate::failover::FailoverState::reconstruct_from_session(
+                        s,
+                        failover.cooldown_secs,
+                        chrono::Utc::now(),
+                    )
+                },
+            )
+        }
+    };
     Ok(AgentSessionHandle {
         session: agent_session,
         listeners,
@@ -3402,12 +3426,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         workspace: options.workspace.clone(),
         mcp_manager,
         retry: options.retry,
-        failover_state: options
-            .failover
-            .as_ref()
-            .map_or_else(crate::failover::FailoverState::new_empty, |failover| {
-                crate::failover::FailoverState::with_cooldown_secs(failover.cooldown_secs)
-            }),
+        failover_state,
         failover: options.failover.map(Arc::new),
         event_runtime,
     })

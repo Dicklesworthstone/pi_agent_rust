@@ -813,6 +813,8 @@ struct RpcSharedState {
     active_failover_model: Option<(String, String)>,
     /// Position of the last used entry in the active chain (per-chain walk).
     failover_chain_position: Option<usize>,
+    /// Unique lifecycle ID across hops in this failover cycle (bd-gm481.2).
+    failover_lifecycle_id: Option<String>,
     /// Shared with AgentSession and extension hostcalls: every RPC admission
     /// and transition observes the same permanent quarantine authority.
     provider_admission: ProviderAdmissionGate,
@@ -978,6 +980,7 @@ impl RpcSharedState {
             failover_primary: None,
             active_failover_model: None,
             failover_chain_position: None,
+            failover_lifecycle_id: None,
             provider_admission,
         }
     }
@@ -1147,8 +1150,33 @@ impl RpcSharedState {
         self.failover_primary = None;
         self.active_failover_model = None;
         self.failover_chain_position = None;
+        self.failover_lifecycle_id = None;
         if let Some(tracker) = self.failover_cooldown.as_mut() {
             tracker.reset();
+        }
+    }
+
+    fn reconstruct_failover_from_session(
+        &mut self,
+        session: &crate::session::Session,
+        configured_cooldown_secs: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        if let Some(provenance) = session.active_failover_provenance_for_current_path() {
+            let reconstructed = crate::failover::FailoverState::reconstruct_from_provenance(
+                provenance,
+                configured_cooldown_secs,
+                now,
+            );
+            let (cooldown, primary, active, chain_position, lifecycle_id) =
+                reconstructed.into_parts();
+            self.failover_primary = primary;
+            self.active_failover_model = active;
+            self.failover_chain_position = Some(chain_position);
+            self.failover_lifecycle_id = lifecycle_id;
+            if cooldown.is_some() {
+                self.failover_cooldown = cooldown;
+            }
         }
     }
 }
@@ -1628,14 +1656,36 @@ pub async fn run(
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
             .await
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        let initial_plan_mode = {
+        let (initial_plan_mode, failover_provenance) = {
             let inner = guard
                 .session
                 .lock(&cx)
                 .await
                 .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-            replayed_plan_mode(&inner)
+            (
+                replayed_plan_mode(&inner),
+                inner.active_failover_provenance_for_current_path().cloned(),
+            )
         };
+        if let Some(provenance) = failover_provenance {
+            let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                .await
+                .map_err(|err| Error::session(format!("shared state lock failed: {err}")))?;
+            let reconstructed = crate::failover::FailoverState::reconstruct_from_provenance(
+                &provenance,
+                options.config.failover_cooldown_secs(),
+                chrono::Utc::now(),
+            );
+            let (cooldown, primary, active, chain_position, lifecycle_id) =
+                reconstructed.into_parts();
+            state.failover_primary = primary;
+            state.active_failover_model = active;
+            state.failover_chain_position = Some(chain_position);
+            state.failover_lifecycle_id = lifecycle_id;
+            if cooldown.is_some() {
+                state.failover_cooldown = cooldown;
+            }
+        }
         guard.agent.reset_session_scoped_state(initial_plan_mode);
         guard.set_queue_modes(
             options.config.steering_queue_mode(),
@@ -6076,6 +6126,9 @@ async fn try_failover_to_next_chain_entry(
         // FailoverSwapRequest::thinking_level_to_clamp.
         thinking_level_to_clamp: primary_model.requested_thinking_level,
         require_incomplete_tail,
+        primary: Some(&primary_model),
+        cooldown_secs: Some(options.config.failover_cooldown_secs()),
+        lifecycle_id: state.failover_lifecycle_id.as_deref(),
     };
     let admission = state.provider_admission.clone();
     let outcome = guard
@@ -6095,6 +6148,9 @@ async fn try_failover_to_next_chain_entry(
         // half, which nothing did while it was merely a convention.
         return Ok(false);
     };
+    if state.failover_lifecycle_id.is_none() {
+        state.failover_lifecycle_id = Some(uuid::Uuid::new_v4().to_string());
+    }
     state.failover_chain_position = Some(outcome.next_position);
 
     state.failover_primary = Some(primary_model.clone());
@@ -9063,6 +9119,587 @@ mod retry_tests {
                 Some(true)
             );
             assert!(out_rx.try_recv().is_err(), "unexpected lifecycle event");
+        });
+    }
+
+    #[test]
+    fn rpc_reopen_restores_primary_after_cooldown_elapses() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let model_entry = |provider: &str,
+                               model_id: &str,
+                               api: &str,
+                               base_url: &str,
+                               key: &str,
+                               header_name: &str| {
+                crate::models::ModelEntry {
+                    model: Model {
+                        id: model_id.to_string(),
+                        name: model_id.to_string(),
+                        api: api.to_string(),
+                        provider: provider.to_string(),
+                        base_url: base_url.to_string(),
+                        reasoning: false,
+                        input: vec![InputType::Text],
+                        cost: ModelCost {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        context_window: 8_192,
+                        max_tokens: 1_024,
+                        headers: HashMap::new(),
+                    },
+                    api_key: Some(key.to_string()),
+                    headers: HashMap::from([(header_name.to_string(), "true".to_string())]),
+                    auth_header: true,
+                    compat: None,
+                    oauth_config: None,
+                }
+            };
+            let mut primary = model_entry(
+                "openai",
+                "primary-model",
+                "openai-completions",
+                "https://api.openai.com/v1",
+                "primary-key",
+                "x-primary",
+            );
+            primary.model.reasoning = true;
+            primary.model.input = vec![InputType::Text, InputType::Image];
+            primary.model.context_window = 16_384;
+            primary.model.max_tokens = 1_536;
+
+            let mut fallback = model_entry(
+                "anthropic",
+                "fallback-model",
+                "anthropic",
+                "https://api.anthropic.com",
+                "fallback-key",
+                "x-fallback",
+            );
+            fallback.model.context_window = 4_096;
+            fallback.model.max_tokens = 2_048;
+            fallback.compat = Some(crate::models::CompatConfig {
+                tool_call_dialect: Some(crate::dialects::Dialect::Xmlish),
+                ..Default::default()
+            });
+
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let persisted_path;
+
+            // --- PROCESS 1: Active failover commits to session and process exits ---
+            {
+                let provider =
+                    providers::create_provider(&primary, None).expect("primary provider");
+                let tools = ToolRegistry::new(&[], Path::new("."), None);
+                let mut agent = Agent::new(provider, tools, AgentConfig::default());
+                agent.stream_options_mut().api_key = Some("primary-key".to_string());
+                agent
+                    .stream_options_mut()
+                    .headers
+                    .clone_from(&primary.headers);
+                agent.stream_options_mut().max_tokens = Some(primary.model.max_tokens);
+                agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+                agent.set_model_accepts_images(true);
+
+                let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                    session_temp.path().join("sessions"),
+                ))));
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&inner_session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
+                {
+                    let seed_cx = AgentCx::for_request();
+                    let mut inner = inner_session
+                        .lock(seed_cx.cx())
+                        .await
+                        .expect("seed Session");
+                    inner.append_message(SessionMessage::User {
+                        content: UserContent::Text("hello".to_string()),
+                        timestamp: Some(0),
+                    });
+                    inner.append_message(SessionMessage::Assistant {
+                        message: AssistantMessage {
+                            content: Vec::new(),
+                            api: "openai-completions".to_string(),
+                            provider: "openai".to_string(),
+                            model: "primary-model".to_string(),
+                            usage: Usage::default(),
+                            stop_reason: StopReason::Error,
+                            stop_details: None,
+                            error_message: Some("server error".to_string()),
+                            timestamp: 0,
+                        },
+                    });
+                    agent_session
+                        .agent
+                        .replace_messages(inner.to_messages_for_current_path());
+                }
+                let session = Arc::new(Mutex::new(agent_session));
+
+                let mut config = Config::default();
+                config.retry = Some(crate::config::RetrySettings {
+                    fallback_chains: Some(HashMap::from([(
+                        "openai/primary-model".to_string(),
+                        vec!["anthropic/fallback-model".to_string()],
+                    )])),
+                    failover_cooldown_secs: Some(0),
+                    max_failovers_per_turn: Some(1),
+                    ..Default::default()
+                });
+                let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+                let auth_temp = tempfile::tempdir().expect("auth tempdir");
+                let options = RpcOptions {
+                    config,
+                    resources: ResourceLoader::empty(false),
+                    available_models: vec![primary.clone(), fallback.clone()],
+                    scoped_models: Vec::new(),
+                    cli_api_key: None,
+                    auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
+                    runtime_handle: runtime_handle.clone(),
+                    ask_tool: None,
+                };
+                let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(8);
+                let cx = AgentCx::for_request();
+
+                assert!(
+                    try_failover_to_next_chain_entry(
+                        Arc::clone(&session),
+                        Arc::clone(&shared_state),
+                        out_tx,
+                        &options,
+                        Some("server error"),
+                        true,
+                        None,
+                        0,
+                        &cx,
+                    )
+                    .await
+                    .expect("failover commit")
+                );
+
+                let guard = session.lock(&cx).await.expect("fallback AgentSession lock");
+                let inner = guard.session.lock(cx.cx()).await.expect("Session lock");
+                persisted_path = inner.path.clone().expect("session path");
+                // Verify durable failover provenance was saved
+                let provenance = inner
+                    .active_failover_provenance_for_current_path()
+                    .expect("active failover provenance must be recorded");
+                assert_eq!(provenance.primary_provider, "openai");
+                assert_eq!(provenance.primary_model_id, "primary-model");
+                assert_eq!(provenance.fallback_provider, "anthropic");
+                assert_eq!(provenance.fallback_model_id, "fallback-model");
+                assert_eq!(provenance.cooldown_secs, Some(0));
+            }
+
+            // --- PROCESS 2 (RESTART): Reopen session from disk, reconstruct failover state, restore ---
+            {
+                let mut config = Config::default();
+                config.retry = Some(crate::config::RetrySettings {
+                    fallback_chains: Some(HashMap::from([(
+                        "openai/primary-model".to_string(),
+                        vec!["anthropic/fallback-model".to_string()],
+                    )])),
+                    failover_cooldown_secs: Some(0),
+                    max_failovers_per_turn: Some(1),
+                    ..Default::default()
+                });
+                let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+                let auth_temp = tempfile::tempdir().expect("auth tempdir 2");
+                let options = RpcOptions {
+                    config: config.clone(),
+                    resources: ResourceLoader::empty(false),
+                    available_models: vec![primary.clone(), fallback.clone()],
+                    scoped_models: Vec::new(),
+                    cli_api_key: None,
+                    auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
+                    runtime_handle: runtime_handle.clone(),
+                    ask_tool: None,
+                };
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(8);
+                let cx = AgentCx::for_request();
+
+                // Reopen the persisted session from disk
+                let reopened = Session::open(persisted_path.to_str().unwrap())
+                    .await
+                    .expect("reopen session from disk");
+                let inner_session = Arc::new(Mutex::new(reopened));
+
+                // Reconstruct failover state on startup, matching `rpc::run`
+                {
+                    let inner = inner_session.lock(cx.cx()).await.expect("inner lock");
+                    let mut state = shared_state.lock(&cx).await.expect("shared_state lock");
+                    state.reconstruct_failover_from_session(
+                        &inner,
+                        options.config.failover_cooldown_secs(),
+                        chrono::Utc::now(),
+                    );
+                }
+
+                // Verify reconstructed shared state
+                {
+                    let state = shared_state.lock(&cx).await.expect("shared state lock");
+                    assert_eq!(
+                        state
+                            .failover_primary
+                            .as_ref()
+                            .map(|p| (p.provider.as_str(), p.model_id.as_str())),
+                        Some(("openai", "primary-model"))
+                    );
+                    assert_eq!(
+                        state
+                            .active_failover_model
+                            .as_ref()
+                            .map(|(p, m)| (p.as_str(), m.as_str())),
+                        Some(("anthropic", "fallback-model"))
+                    );
+                    assert_eq!(state.failover_chain_position, Some(1));
+                    assert!(state.failover_lifecycle_id.is_some());
+                }
+
+                // Create agent session starting on the fallback (from session header)
+                let fallback_provider =
+                    providers::create_provider(&fallback, None).expect("fallback provider");
+                let tools = ToolRegistry::new(&[], Path::new("."), None);
+                let mut agent = Agent::new(fallback_provider, tools, AgentConfig::default());
+                agent.stream_options_mut().api_key = Some("fallback-key".to_string());
+                agent
+                    .stream_options_mut()
+                    .headers
+                    .clone_from(&fallback.headers);
+                agent.stream_options_mut().max_tokens = Some(fallback.model.max_tokens);
+                agent.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
+                agent.set_model_accepts_images(false);
+
+                let agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&inner_session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings {
+                        context_window_tokens: 4_096,
+                        ..Default::default()
+                    },
+                );
+                let session = Arc::new(Mutex::new(agent_session));
+
+                // Now invoke maybe_restore_primary on the reopened session
+                maybe_restore_primary(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    out_tx,
+                    &options,
+                    &cx,
+                )
+                .await
+                .expect("primary restore commit after restart");
+
+                // Assert primary was fully restored across all runtime attributes
+                let guard = session.lock(&cx).await.expect("AgentSession lock");
+                assert_eq!(guard.agent.provider().name(), "openai");
+                assert_eq!(guard.agent.provider().model_id(), "primary-model");
+                assert_eq!(
+                    guard.agent.stream_options().thinking_level,
+                    Some(ThinkingLevel::High)
+                );
+                assert_eq!(guard.agent.stream_options().max_tokens, Some(1_536));
+                assert!(guard.agent.model_accepts_images());
+                assert_eq!(guard.compaction_settings().context_window_tokens, 16_384);
+                assert_eq!(
+                    guard.agent.stream_options().api_key.as_deref(),
+                    Some("primary-key")
+                );
+                assert_eq!(
+                    guard
+                        .agent
+                        .stream_options()
+                        .headers
+                        .get("x-primary")
+                        .map(String::as_str),
+                    Some("true")
+                );
+
+                let state = shared_state.lock(&cx).await.expect("shared state lock");
+                assert!(state.failover_primary.is_none());
+                assert!(state.active_failover_model.is_none());
+                assert!(state.failover_chain_position.is_none());
+                drop(state);
+
+                let failover_end: Value =
+                    serde_json::from_str(&out_rx.try_recv().expect("failover_end event"))
+                        .expect("failover_end JSON");
+                assert_eq!(
+                    failover_end.get("type").and_then(Value::as_str),
+                    Some("failover_end")
+                );
+                assert_eq!(
+                    failover_end.get("restoredPrimary").and_then(Value::as_bool),
+                    Some(true)
+                );
+                assert_eq!(
+                    failover_end.get("provider").and_then(Value::as_str),
+                    Some("openai")
+                );
+                assert_eq!(
+                    failover_end.get("model").and_then(Value::as_str),
+                    Some("primary-model")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_reopen_holds_fallback_while_cooldown_active() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let model_entry = |provider: &str,
+                               model_id: &str,
+                               api: &str,
+                               base_url: &str,
+                               key: &str,
+                               header_name: &str| {
+                crate::models::ModelEntry {
+                    model: Model {
+                        id: model_id.to_string(),
+                        name: model_id.to_string(),
+                        api: api.to_string(),
+                        provider: provider.to_string(),
+                        base_url: base_url.to_string(),
+                        reasoning: false,
+                        input: vec![InputType::Text],
+                        cost: ModelCost {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        context_window: 8_192,
+                        max_tokens: 1_024,
+                        headers: HashMap::new(),
+                    },
+                    api_key: Some(key.to_string()),
+                    headers: HashMap::from([(header_name.to_string(), "true".to_string())]),
+                    auth_header: true,
+                    compat: None,
+                    oauth_config: None,
+                }
+            };
+            let mut primary = model_entry(
+                "openai",
+                "primary-model",
+                "openai-completions",
+                "https://api.openai.com/v1",
+                "primary-key",
+                "x-primary",
+            );
+            primary.model.reasoning = true;
+            primary.model.max_tokens = 1_536;
+
+            let fallback = model_entry(
+                "anthropic",
+                "fallback-model",
+                "anthropic",
+                "https://api.anthropic.com",
+                "fallback-key",
+                "x-fallback",
+            );
+
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let persisted_path;
+
+            // --- PROCESS 1: Failover with 300s cooldown ---
+            {
+                let provider =
+                    providers::create_provider(&primary, None).expect("primary provider");
+                let tools = ToolRegistry::new(&[], Path::new("."), None);
+                let agent = Agent::new(provider, tools, AgentConfig::default());
+                let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                    session_temp.path().join("sessions"),
+                ))));
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&inner_session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
+                {
+                    let seed_cx = AgentCx::for_request();
+                    let mut inner = inner_session
+                        .lock(seed_cx.cx())
+                        .await
+                        .expect("seed Session");
+                    inner.append_message(SessionMessage::User {
+                        content: UserContent::Text("hello".to_string()),
+                        timestamp: Some(0),
+                    });
+                    inner.append_message(SessionMessage::Assistant {
+                        message: AssistantMessage {
+                            content: Vec::new(),
+                            api: "openai-completions".to_string(),
+                            provider: "openai".to_string(),
+                            model: "primary-model".to_string(),
+                            usage: Usage::default(),
+                            stop_reason: StopReason::Error,
+                            stop_details: None,
+                            error_message: Some("server error".to_string()),
+                            timestamp: 0,
+                        },
+                    });
+                    agent_session
+                        .agent
+                        .replace_messages(inner.to_messages_for_current_path());
+                }
+                let session = Arc::new(Mutex::new(agent_session));
+
+                let mut config = Config::default();
+                config.retry = Some(crate::config::RetrySettings {
+                    fallback_chains: Some(HashMap::from([(
+                        "openai/primary-model".to_string(),
+                        vec!["anthropic/fallback-model".to_string()],
+                    )])),
+                    failover_cooldown_secs: Some(300),
+                    max_failovers_per_turn: Some(1),
+                    ..Default::default()
+                });
+                let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+                let auth_temp = tempfile::tempdir().expect("auth tempdir");
+                let options = RpcOptions {
+                    config,
+                    resources: ResourceLoader::empty(false),
+                    available_models: vec![primary.clone(), fallback.clone()],
+                    scoped_models: Vec::new(),
+                    cli_api_key: None,
+                    auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
+                    runtime_handle: runtime_handle.clone(),
+                    ask_tool: None,
+                };
+                let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(8);
+                let cx = AgentCx::for_request();
+
+                assert!(
+                    try_failover_to_next_chain_entry(
+                        Arc::clone(&session),
+                        Arc::clone(&shared_state),
+                        out_tx,
+                        &options,
+                        Some("server error"),
+                        true,
+                        None,
+                        0,
+                        &cx,
+                    )
+                    .await
+                    .expect("failover commit")
+                );
+
+                let guard = session.lock(&cx).await.expect("fallback AgentSession lock");
+                let inner = guard.session.lock(cx.cx()).await.expect("Session lock");
+                persisted_path = inner.path.clone().expect("session path");
+            }
+
+            // --- PROCESS 2 (RESTART): Reopen while 300s cooldown is active ---
+            {
+                let mut config = Config::default();
+                config.retry = Some(crate::config::RetrySettings {
+                    fallback_chains: Some(HashMap::from([(
+                        "openai/primary-model".to_string(),
+                        vec!["anthropic/fallback-model".to_string()],
+                    )])),
+                    failover_cooldown_secs: Some(300),
+                    max_failovers_per_turn: Some(1),
+                    ..Default::default()
+                });
+                let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+                let auth_temp = tempfile::tempdir().expect("auth tempdir 2");
+                let options = RpcOptions {
+                    config: config.clone(),
+                    resources: ResourceLoader::empty(false),
+                    available_models: vec![primary.clone(), fallback.clone()],
+                    scoped_models: Vec::new(),
+                    cli_api_key: None,
+                    auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
+                    runtime_handle: runtime_handle.clone(),
+                    ask_tool: None,
+                };
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(8);
+                let cx = AgentCx::for_request();
+
+                let reopened = Session::open(persisted_path.to_str().unwrap())
+                    .await
+                    .expect("reopen session from disk");
+                let inner_session = Arc::new(Mutex::new(reopened));
+
+                // Reconstruct failover state at current time
+                {
+                    let inner = inner_session.lock(cx.cx()).await.expect("inner lock");
+                    let mut state = shared_state.lock(&cx).await.expect("shared_state lock");
+                    state.reconstruct_failover_from_session(
+                        &inner,
+                        options.config.failover_cooldown_secs(),
+                        chrono::Utc::now(),
+                    );
+                }
+
+                // Create agent session with fallback
+                let fallback_provider =
+                    providers::create_provider(&fallback, None).expect("fallback provider");
+                let tools = ToolRegistry::new(&[], Path::new("."), None);
+                let agent = Agent::new(fallback_provider, tools, AgentConfig::default());
+                let agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&inner_session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
+                let session = Arc::new(Mutex::new(agent_session));
+
+                // Attempt restoration while cooldown is still holding
+                maybe_restore_primary(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    out_tx,
+                    &options,
+                    &cx,
+                )
+                .await
+                .expect("maybe_restore_primary must succeed without error");
+
+                // Verify that primary was NOT restored; agent remains on fallback
+                let guard = session.lock(&cx).await.expect("AgentSession lock");
+                assert_eq!(guard.agent.provider().name(), "anthropic");
+                assert_eq!(guard.agent.provider().model_id(), "fallback-model");
+
+                // Shared state still retains the failover primary
+                let state = shared_state.lock(&cx).await.expect("shared state lock");
+                assert!(state.failover_primary.is_some());
+                assert_eq!(
+                    state
+                        .active_failover_model
+                        .as_ref()
+                        .map(|(p, m)| (p.as_str(), m.as_str())),
+                    Some(("anthropic", "fallback-model"))
+                );
+
+                // No restoration event was emitted
+                assert!(
+                    out_rx.try_recv().is_err(),
+                    "no restoration event while cooldown holds"
+                );
+            }
         });
     }
 
