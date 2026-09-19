@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone)]
-pub(crate) struct OutputTarget {
+pub struct OutputTarget {
     root: PathBuf,
     relative: PathBuf,
     absolute: PathBuf,
@@ -17,7 +17,7 @@ pub(crate) struct OutputTarget {
 
 impl OutputTarget {
     #[must_use]
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.absolute
     }
 }
@@ -26,12 +26,12 @@ fn error(tool: &str, message: impl Into<String>) -> Error {
     Error::tool(tool, message)
 }
 
-pub(crate) fn resolve_new(cwd: &Path, requested: &str, tool: &str) -> Result<OutputTarget> {
+pub fn resolve_new(cwd: &Path, requested: &str, tool: &str) -> Result<OutputTarget> {
     if requested.is_empty()
         || requested.len() > 4096
         || requested.contains('\0')
         || requested.contains('\\')
-        || requested.chars().any(|ch| ch.is_control())
+        || requested.chars().any(char::is_control)
     {
         return Err(error(
             tool,
@@ -58,7 +58,6 @@ pub(crate) fn resolve_new(cwd: &Path, requested: &str, tool: &str) -> Result<Out
         .components()
         .filter_map(|component| match component {
             Component::Normal(part) => Some(part),
-            Component::CurDir => None,
             _ => None,
         })
         .collect();
@@ -115,7 +114,24 @@ pub(crate) fn resolve_new(cwd: &Path, requested: &str, tool: &str) -> Result<Out
 }
 
 #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
-pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
+struct Stage<'a> {
+    directory: &'a rustix::fd::OwnedFd,
+    name: String,
+}
+
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+impl Drop for Stage<'_> {
+    fn drop(&mut self) {
+        let _ = rustix::fs::unlinkat(
+            self.directory,
+            self.name.as_str(),
+            rustix::fs::AtFlags::empty(),
+        );
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     use std::io::Write as _;
 
@@ -188,15 +204,6 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
         Mode::RUSR | Mode::WUSR,
     )
     .map_err(|_| error(tool, "cannot create private artifact staging file"))?;
-    struct Stage<'a> {
-        directory: &'a std::os::fd::OwnedFd,
-        name: String,
-    }
-    impl Drop for Stage<'_> {
-        fn drop(&mut self) {
-            let _ = rustix::fs::unlinkat(self.directory, self.name.as_str(), AtFlags::empty());
-        }
-    }
     let _stage = Stage {
         directory: &directory,
         name: stage_name.clone(),
@@ -222,7 +229,7 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
 }
 
 #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
-pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
+pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
     use std::io::Write as _;
     if bytes.is_empty() {
         return Err(error(tool, "refusing to publish an empty artifact"));

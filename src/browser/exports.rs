@@ -252,6 +252,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn export_paths_cannot_escape_or_cross_symlinked_ancestors() {
         let dir = tempfile::tempdir().unwrap();
         for path in [

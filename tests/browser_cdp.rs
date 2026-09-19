@@ -526,7 +526,7 @@ fn frame_reply(url: &str) -> (&'static str, Value) {
     )
 }
 
-fn file_control_script(action: &str, files: Value) -> Script {
+fn file_control_script(action: &str, files: &Value) -> Script {
     vec![
         frame_reply("https://example.com/"),
         (
@@ -564,7 +564,7 @@ fn upload_prefix() -> Script {
     ]);
     script.extend(file_control_script(
         "file_input",
-        json!([{ "name":"previous.txt", "size":3 }]),
+        &json!([{ "name":"previous.txt", "size":3 }]),
     ));
     script.push(frame_reply("https://example.com/"));
     script
@@ -586,7 +586,7 @@ fn native_upload_selects_private_bytes_and_retains_them_until_tool_drop() {
     ));
     script.extend(file_control_script(
         "file_input",
-        json!([{ "name":"upload.txt", "size":11 }]),
+        &json!([{ "name":"upload.txt", "size":11 }]),
     ));
     script.push(frame_reply("https://example.com/"));
     let (endpoint, handle) = peer(script);
@@ -624,7 +624,7 @@ fn native_upload_selects_private_bytes_and_retains_them_until_tool_drop() {
 fn empty_upload_uses_native_clear_instead_of_noop_empty_cdp_file_list() {
     let mut script = upload_prefix();
     // No DOM.setFileInputFiles call is accepted here: Chromium 144 ignores [].
-    script.extend(file_control_script("clear_files", json!([])));
+    script.extend(file_control_script("clear_files", &json!([])));
     script.push(frame_reply("https://example.com/"));
     let (endpoint, handle) = peer(script);
     let dir = tempfile::tempdir().unwrap();
