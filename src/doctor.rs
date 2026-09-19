@@ -527,7 +527,12 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
                 return;
             };
 
-            let unknown: Vec<&String> = map.keys().filter(|k| !is_known_config_key(k)).collect();
+            // `$`-prefixed names are the editor-metadata convention (`$schema`
+            // above all), not settings, and pi ignores them on purpose.
+            let unknown: Vec<&String> = map
+                .keys()
+                .filter(|k| !k.starts_with('$') && !is_known_config_key(k))
+                .collect();
             if unknown.is_empty() {
                 findings.push(Finding::pass(cat, label.to_string()));
             } else {
@@ -555,78 +560,21 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
     }
 }
 
-/// Known top-level config keys (from `Config` struct fields + their camelCase aliases).
+/// Known top-level config keys.
+///
+/// This used to be a hand-written list of names, and it had drifted badly: it
+/// held 67 of the 108 spellings `Config` accepts, so `pi doctor` reported 41
+/// perfectly valid settings as "unknown keys" — `approval`, `http`, `lsp`,
+/// `tools`, `memory`, `plan`, `secrets`, `trustAllWorkspaces`,
+/// `requestTimeoutSecs`, `modelRoles`, `disabledProviders` among them. Telling
+/// someone to fix a setting that is already correct is worse than saying
+/// nothing, and a list like that drifts every time a field is added, in
+/// exactly this direction.
+///
+/// So the question is put to serde instead, which cannot drift; see
+/// [`crate::config::recognises_setting_key`].
 fn is_known_config_key(key: &str) -> bool {
-    matches!(
-        key,
-        "theme"
-            | "hideThinkingBlock"
-            | "hide_thinking_block"
-            | "showHardwareCursor"
-            | "show_hardware_cursor"
-            | "defaultProvider"
-            | "default_provider"
-            | "defaultModel"
-            | "default_model"
-            | "defaultThinkingLevel"
-            | "default_thinking_level"
-            | "enabledModels"
-            | "enabled_models"
-            | "steeringMode"
-            | "steering_mode"
-            | "followUpMode"
-            | "follow_up_mode"
-            | "quietStartup"
-            | "quiet_startup"
-            | "collapseChangelog"
-            | "collapse_changelog"
-            | "lastChangelogVersion"
-            | "last_changelog_version"
-            | "doubleEscapeAction"
-            | "double_escape_action"
-            | "editorPaddingX"
-            | "editor_padding_x"
-            | "autocompleteMaxVisible"
-            | "autocomplete_max_visible"
-            | "sessionPickerInput"
-            | "session_picker_input"
-            | "sessionStore"
-            | "sessionBackend"
-            | "session_store"
-            | "compaction"
-            | "branchSummary"
-            | "branch_summary"
-            | "retry"
-            | "shellPath"
-            | "shell_path"
-            | "shellCommandPrefix"
-            | "shell_command_prefix"
-            | "ghPath"
-            | "gh_path"
-            | "images"
-            | "terminal"
-            | "thinkingBudgets"
-            | "thinking_budgets"
-            | "packages"
-            | "extensions"
-            | "skills"
-            | "prompts"
-            | "themes"
-            | "enableSkillCommands"
-            | "enable_skill_commands"
-            | "extensionPolicy"
-            | "extension_policy"
-            | "repairPolicy"
-            | "repair_policy"
-            | "extensionRisk"
-            | "extension_risk"
-            | "checkForUpdates"
-            | "check_for_updates"
-            | "sessionDurability"
-            | "session_durability"
-            | "markdown"
-            | "queueMode"
-    )
+    crate::config::recognises_setting_key(key)
 }
 
 // ── Check: Dirs ─────────────────────────────────────────────────────
@@ -11113,6 +11061,65 @@ mod tests {
         assert!(is_known_config_key("defaultModel"));
         assert!(is_known_config_key("extensionPolicy"));
         assert!(!is_known_config_key("nonexistent_key_xyz"));
+    }
+
+    #[test]
+    fn every_key_config_accepts_is_known_to_doctor() {
+        // The list this replaced held 67 of 108 spellings, so doctor called 41
+        // valid settings typos. Generating the expected set from a serialized
+        // `Config` rather than typing it out is the point: a written list is
+        // what drifted, and it drifted silently in the direction of accusing
+        // correct configuration.
+        let serialized = serde_json::to_value(Config::default()).expect("serialize config");
+        let canonical = serialized.as_object().expect("config is an object");
+        assert!(
+            canonical.len() >= 60,
+            "expected the full field set, got {} keys",
+            canonical.len()
+        );
+
+        let unknown: Vec<&String> = canonical
+            .keys()
+            .filter(|key| !is_known_config_key(key))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "doctor would report these valid settings as unknown: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn settings_doctor_once_missed_these_whole_subsystems() {
+        // A sample of the 41, named so the regression reads as what it was
+        // rather than as a count. Aliases are included because doctor sees
+        // whichever spelling the user wrote.
+        for key in [
+            "approval",
+            "askPolicy",
+            "ask_policy",
+            "bash",
+            "browser",
+            "computer",
+            "disabledProviders",
+            "http",
+            "keywords",
+            "lsp",
+            "media",
+            "memory",
+            "modelRoles",
+            "plan",
+            "requestTimeoutSecs",
+            "secrets",
+            "titling",
+            "tools",
+            "trustAllWorkspaces",
+            "turn_recovery",
+        ] {
+            assert!(
+                is_known_config_key(key),
+                "doctor still calls the valid setting {key:?} unknown"
+            );
+        }
     }
 
     #[test]

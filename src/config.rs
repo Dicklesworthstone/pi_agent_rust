@@ -1680,6 +1680,22 @@ fn unrecognised_setting_keys(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// Does this build recognise `key` as a top-level settings key, by any spelling?
+///
+/// The same question as [`unrecognised_setting_keys`] asked about one name with
+/// no value to hand, which is the shape `pi doctor` needs. Any non-null probe
+/// value answers it: a recognised key either accepts the probe (and then
+/// differs from the default, since every `Config` field is an `Option`) or
+/// rejects it with a type error, which is itself proof that serde knows the
+/// name. An unrecognised key is dropped in silence whatever the value, and the
+/// result is indistinguishable from `Config::default()`.
+pub(crate) fn recognises_setting_key(key: &str) -> bool {
+    let Ok(default) = serde_json::to_value(Config::default()) else {
+        return true;
+    };
+    moves_config(key, &serde_json::Value::Bool(true), &default)
+}
+
 /// Does deserializing just this one key change anything about a default config?
 fn moves_config(key: &str, value: &serde_json::Value, default: &serde_json::Value) -> bool {
     let mut probe = serde_json::Map::new();
