@@ -63,8 +63,11 @@ impl ReportCache {
     }
 
     fn previous(&self, uri: &str, revision: Revision) -> Option<Report> {
+        // Without a server-visible version, closing/reopening identical text
+        // cannot distinguish incarnations by (version, hash). Request a full
+        // report instead of reusing a possibly retired server result ID.
         self.reports.get(uri)
-            .filter(|report| report.revision == revision && report.result_id.is_some())
+            .filter(|report| revision.version != 0 && report.revision == revision && report.result_id.is_some())
             .cloned()
     }
 
@@ -166,6 +169,53 @@ impl LspClient {
         Self::lock(&self.capabilities).raw.get("diagnosticProvider").is_some_and(Value::is_object)
     }
 
+    /// Obtain a diagnostic report for the currently synchronized document.
+    ///
+    /// Unlike the boolean waiting API, this method preserves pull failures and
+    /// distinguishes an explicit empty report from the absence of a report.
+    /// A zero wait inspects the cache without sending a pull request. Returned
+    /// data is checked against the local synchronized revision; unversioned
+    /// server pushes still cannot provide a server-side freshness proof.
+    ///
+    /// # Errors
+    /// Returns `LSP_DIAGNOSTICS_PENDING` when no report arrived, and propagates
+    /// protocol, cancellation, transport and resynchronization failures.
+    pub async fn document_diagnostics(&self, uri: &str, wait: Duration) -> Result<Vec<Value>> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        owner.checkpoint().map_err(|_| Error::from(super::LspCallError::Cancelled))?;
+        let uri = file_uri::normalize_uri(uri)
+            .ok_or_else(|| protocol_error("invalid document URI"))?;
+        let (revision, source) = {
+            let docs = Self::lock(&self.open_docs);
+            let doc = docs.get(&uri)
+                .ok_or_else(|| protocol_error("synchronize the document before reading diagnostics"))?;
+            (Revision::from(doc), Arc::clone(&doc.text))
+        };
+        let received = if self.has_pull_diagnostics() && !wait.is_zero() {
+            self.refresh_document_diagnostics(&uri, wait).await?;
+            true
+        } else {
+            self.wait_for_diagnostics(&uri, wait).await
+        };
+        owner.checkpoint().map_err(|_| Error::from(super::LspCallError::Cancelled))?;
+        if !self.is_alive() {
+            return Err(Error::tool("lsp", "[LSP_TRANSPORT_CLOSED] diagnostic connection closed"));
+        }
+        if !received {
+            return Err(Error::tool("lsp", "[LSP_DIAGNOSTICS_PENDING] no diagnostic report arrived; this is not a clean result"));
+        }
+        // Holding the document lock through the snapshot read prevents a
+        // resync from clearing the cache between freshness check and clone.
+        let docs = Self::lock(&self.open_docs);
+        if !docs.get(&uri).is_some_and(|doc| {
+            Revision::from(doc) == revision && Arc::ptr_eq(&doc.text, &source)
+        }) {
+            return Err(protocol_error("document changed or closed while waiting for diagnostics"));
+        }
+        Self::lock(&self.diagnostics).get(&uri).cloned()
+            .ok_or_else(|| protocol_error("diagnostic report was invalidated before delivery"))
+    }
+
     /// Refresh diagnostics using the server's negotiated pull protocol.
     ///
     /// The document must already be synchronized. Full reports replace prior
@@ -191,14 +241,18 @@ impl LspClient {
                 Some(_) => return Err(protocol_error("diagnostic provider identifier must be a bounded string")),
             }
         };
-        let (revision, ticket, previous) = {
+        let (revision, source, ticket, previous) = {
             let docs = Self::lock(&self.open_docs);
-            let revision = docs.get(&uri).map(Revision::from)
+            let doc = docs.get(&uri)
                 .ok_or_else(|| protocol_error("synchronize the document before pulling diagnostics"))?;
+            let revision = Revision::from(doc);
+            // Retain the source allocation only for the in-flight request.
+            // Pointer identity also detects close/reopen when version == 0.
+            let source = Arc::clone(&doc.text);
             let mut cache = Self::lock(&self.pull_reports);
             let ticket = cache.start(&uri, &docs)?;
             let previous = cache.previous(&uri, revision);
-            (revision, ticket, previous)
+            (revision, source, ticket, previous)
         };
         let mut params = json!({"textDocument":{"uri":uri}});
         if let Some(identifier) = identifier { params["identifier"] = json!(identifier); }
@@ -212,7 +266,9 @@ impl LspClient {
         // Same lock order as push acceptance and document synchronization.
         // A result cannot pass freshness checks, wait for a resync, then win.
         let docs = Self::lock(&self.open_docs);
-        if docs.get(&uri).map(Revision::from) != Some(revision) {
+        if !docs.get(&uri).is_some_and(|doc| {
+            Revision::from(doc) == revision && Arc::ptr_eq(&doc.text, &source)
+        }) {
             return Err(protocol_error("document changed or closed during diagnostic request"));
         }
         let mut cache = Self::lock(&self.pull_reports);

@@ -240,3 +240,93 @@ fn unadvertised_related_documents_are_not_imported_as_requested_results() {
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot[&uri][0]["message"], "requested");
 }
+
+#[test]
+fn checked_cache_read_distinguishes_missing_and_explicit_empty_reports() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else { return };
+    let (_, uri) = source(&peer, temp.path(), "source");
+    let error = peer.runtime.block_on(peer.client.document_diagnostics(&uri, Duration::ZERO)).unwrap_err();
+    assert!(error.to_string().contains("LSP_DIAGNOSTICS_PENDING"));
+    peer.client.accept_diagnostics(&json!({"uri":uri,"diagnostics":[]}));
+    assert!(peer.runtime.block_on(peer.client.document_diagnostics(&uri, Duration::ZERO)).unwrap().is_empty());
+    peer.client.kill();
+    let error = peer.runtime.block_on(peer.client.document_diagnostics(&uri, Duration::ZERO)).unwrap_err();
+    assert!(error.to_string().contains("LSP_TRANSPORT_CLOSED"));
+}
+
+#[test]
+fn checked_pull_preserves_original_failure_even_with_a_previous_cached_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = peer(temp.path()) else { return };
+    let (_, uri) = source(&peer, temp.path(), "source");
+    peer.configure(json!({"textDocument/diagnostic":[
+        {"result":{"kind":"full","resultId":"prior","items":[diagnostic("prior")]}},
+        {"error":{"code":-32603,"message":"refresh failed"}}
+    ]}));
+    let items = peer.runtime.block_on(peer.client.document_diagnostics(&uri, Duration::from_secs(5))).unwrap();
+    assert_eq!(items[0]["message"], "prior");
+    let error = peer.runtime.block_on(peer.client.document_diagnostics(&uri, Duration::from_secs(5))).unwrap_err();
+    assert!(error.to_string().contains("refresh failed"));
+    assert_eq!(peer.client.diagnostics_snapshot()[&uri][0]["message"], "prior");
+}
+
+#[test]
+fn checked_diagnostics_rejects_changed_document_while_waiting_for_a_push() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else { return };
+    let (path, uri) = source(&peer, temp.path(), "before");
+    peer.runtime.block_on(async {
+        let mut pending = Box::pin(peer.client.document_diagnostics(&uri, Duration::from_secs(5)));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        std::fs::write(&path, "after").unwrap();
+        peer.client.ensure_synced(&path, "rust").unwrap();
+        peer.client.accept_diagnostics(&json!({"uri":uri,"diagnostics":[diagnostic("new revision")]}));
+        let error = pending.await.unwrap_err();
+        assert!(error.to_string().contains("changed or closed"));
+    });
+}
+
+#[test]
+fn checked_cache_read_cannot_return_success_after_owner_cancellation() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = peer(temp.path()) else { return };
+    let (_, uri) = source(&peer, temp.path(), "source");
+    peer.client.accept_diagnostics(&json!({"uri":uri,"diagnostics":[]}));
+    let owner = peer.runtime.request_cx_with_budget(asupersync::Budget::new());
+    owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel diagnostic query"));
+    let _guard = owner.set_current_restricted();
+    let error = futures::executor::block_on(peer.client.document_diagnostics(&uri, Duration::ZERO)).unwrap_err();
+    assert!(error.to_string().contains("LSP_CANCELLED"));
+}
+
+#[test]
+fn unversioned_baselines_cannot_reuse_result_ids_or_accept_close_reopen_races() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({
+        "textDocumentSync":0,
+        "diagnosticProvider":{"interFileDependencies":false,"workspaceDiagnostics":false}
+    })) else { return };
+    let (path, uri) = source(&peer, temp.path(), "same contents");
+    peer.configure(json!({"textDocument/diagnostic":[
+        {"result":{"kind":"full","resultId":"first","items":[]}},
+        {"result":{"kind":"full","resultId":"second","items":[]}},
+        {"hold":true}
+    ]}));
+    refresh(&peer, &uri).unwrap();
+    refresh(&peer, &uri).unwrap();
+    for frame in peer.frames().iter().filter(|frame| frame["method"] == "textDocument/diagnostic") {
+        assert!(frame["params"].get("previousResultId").is_none());
+    }
+    peer.runtime.block_on(async {
+        let mut pending = Box::pin(peer.client.refresh_document_diagnostics(&uri, Duration::from_secs(5)));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        peer.client.invalidate(&uri);
+        peer.client.ensure_synced(&path, "rust").unwrap();
+        peer.client.call_no_wait_notify("test/release", json!({"result":{
+            "kind":"full","items":[diagnostic("retired incarnation")]
+        }})).unwrap();
+        assert!(pending.await.unwrap_err().to_string().contains("changed or closed"));
+    });
+    assert!(!peer.client.diagnostics_snapshot().contains_key(&uri));
+}

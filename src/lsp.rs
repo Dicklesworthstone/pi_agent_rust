@@ -5,6 +5,8 @@
 //! server-initiated edits require an explicitly selected command window.
 
 mod actions;
+#[cfg(test)]
+mod diagnostics_tests;
 pub mod client;
 pub mod edits;
 pub mod jsonrpc;
@@ -231,8 +233,11 @@ impl LspTool {
                     }
                 }
             }
-            let payload =
-                json!({"action":"diagnostics","glob":file,"files":matched.len(),"entries":matched});
+            let payload = json!({
+                "action":"diagnostics","glob":file,"files":matched.len(),"entries":matched,
+                "cachedOnly":true,"complete":false,
+                "note":"Cached reports only; files absent from this view have not been checked by this request."
+            });
             return Ok(text_output(payload.to_string(), payload));
         }
         let path = resolve_tool_path(file, &self.cwd);
@@ -243,9 +248,7 @@ impl LspTool {
             .map_or(client::DEFAULT_DIAGNOSTICS_WAIT, |secs| {
                 Duration::from_secs(secs).min(Duration::from_secs(60))
             });
-        entry.client.wait_for_diagnostics(&uri, wait).await;
-        let snapshot = entry.client.diagnostics_snapshot();
-        let diags = snapshot.get(&uri).cloned().unwrap_or_default();
+        let diags = entry.client.document_diagnostics(&uri, wait).await?;
         let payload = json!({"action":"diagnostics","file":display_path(&path,&self.cwd),"server":entry.spec_name,"count":diags.len(),"diagnostics":diags});
         Ok(text_output(payload.to_string(), payload))
     }
@@ -670,7 +673,7 @@ impl Tool for LspTool {
             "type":"object","required":["action"],
             "properties": {
                 "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","rename","rename_file","code_actions","type_definition","implementation","status","reload","capabilities","request"]},
-                "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics also accepts a glob"},
+                "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics also accepts a glob over cached reports (not a workspace scan)"},
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
                 "query":{"type":"string","description":"Workspace-symbol query, or fresh code-action title/index selection"},
