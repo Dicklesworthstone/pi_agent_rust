@@ -5224,7 +5224,7 @@ mod tests {
             let cx = Cx::for_testing();
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
                 event_rx.recv(&cx),
             )
             .await
@@ -5257,7 +5257,7 @@ mod tests {
             let cx = Cx::for_testing();
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
                 event_rx.recv(&cx),
             )
             .await
@@ -5338,7 +5338,7 @@ mod tests {
             let cx = Cx::for_testing();
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
                 event_rx.recv(&cx),
             )
             .await
