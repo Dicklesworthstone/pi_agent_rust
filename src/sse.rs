@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 const MAX_EVENT_DATA_BYTES: usize = 100 * 1024 * 1024;
+const MAX_CHUNKS_PER_POLL: usize = 64;
 
 /// A parsed SSE event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,7 +427,6 @@ pub struct SseStream<S> {
     parser: SseParser,
     pending_events: VecDeque<SseEvent>,
     pending_error: Option<std::io::Error>,
-    pending_error_is_terminal: bool,
     terminated: bool,
     utf8_buffer: Vec<u8>,
 }
@@ -439,7 +439,6 @@ impl<S> SseStream<S> {
             parser: SseParser::new(),
             pending_events: VecDeque::new(),
             pending_error: None,
-            pending_error_is_terminal: false,
             terminated: false,
             utf8_buffer: Vec::new(),
         }
@@ -499,33 +498,23 @@ where
     }
 
     fn process_chunk_with_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
-        self.utf8_buffer.extend_from_slice(bytes);
-        match std::str::from_utf8(&self.utf8_buffer) {
-            Ok(s) => {
-                if !s.is_empty() {
+        let mut remaining = bytes;
+        // Complete only the carried code point. The tail never needs more
+        // than four bytes, even when the next HTTP chunk is very large.
+        loop {
+            match std::str::from_utf8(&self.utf8_buffer) {
+                Ok(s) => {
                     Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
-                }
-                self.utf8_buffer.clear();
-                Ok(())
-            }
-            Err(err) => {
-                let valid_len = err.valid_up_to();
-                if valid_len > 0 {
-                    let s = std::str::from_utf8(&self.utf8_buffer[..valid_len])
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
-                }
-
-                if err.error_len().is_some() {
                     self.utf8_buffer.clear();
-                    Err(Self::invalid_utf8_error())
-                } else {
-                    // Retain only the incomplete code point, never the parsed
-                    // prefix. This path has the same failure boundary as above.
-                    let remaining = self.utf8_buffer.len() - valid_len;
-                    self.utf8_buffer.copy_within(valid_len.., 0);
-                    self.utf8_buffer.truncate(remaining);
-                    Ok(())
+                    return self.process_chunk_without_utf8_tail(remaining);
+                }
+                Err(err) if err.error_len().is_some() => return Err(Self::invalid_utf8_error()),
+                Err(_) => {
+                    let Some((&next, rest)) = remaining.split_first() else {
+                        return Ok(());
+                    };
+                    self.utf8_buffer.push(next);
+                    remaining = rest;
                 }
             }
         }
@@ -539,19 +528,30 @@ where
         }
     }
 
+    fn finish_with_error(
+        &mut self,
+        error: std::io::Error,
+    ) -> Poll<Option<Result<SseEvent, std::io::Error>>> {
+        // Complete events before the failure retain wire order; everything
+        // else is discarded. No caller can resume this transport or flush a
+        // partial frame after observing its error.
+        self.parser = SseParser::new();
+        self.utf8_buffer = Vec::new();
+        self.terminated = true;
+        if let Some(event) = self.pending_events.pop_front() {
+            self.pending_error = Some(error);
+            Poll::Ready(Some(Ok(event)))
+        } else {
+            Poll::Ready(Some(Err(error)))
+        }
+    }
+
     fn poll_stream_end(&mut self) -> Poll<Option<Result<SseEvent, std::io::Error>>> {
         if !self.utf8_buffer.is_empty() {
-            // EOF with an incomplete UTF-8 tail is a terminal stream error.
-            // Clear parser state so repeated polls don't emit the same error forever.
-            self.utf8_buffer.clear();
-            self.pending_events.clear();
-            self.pending_error = None;
-            self.parser = SseParser::new();
-            self.terminated = true;
-            return Poll::Ready(Some(Err(std::io::Error::new(
+            return self.finish_with_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Stream ended with incomplete UTF-8 sequence",
-            ))));
+            ));
         }
 
         if let Some(event) = self.parser.flush() {
@@ -571,33 +571,19 @@ where
             return Poll::Ready(Some(Ok(event)));
         }
         if let Some(err) = self.pending_error.take() {
-            if self.pending_error_is_terminal {
-                self.pending_error_is_terminal = false;
-                self.pending_events.clear();
-                self.utf8_buffer.clear();
-                self.parser = SseParser::new();
-                self.terminated = true;
-            }
             return Poll::Ready(Some(Err(err)));
         }
         if self.terminated {
             return Poll::Ready(None);
         }
 
-        loop {
+        // An always-ready source of comments or empty chunks must yield so
+        // the executor can poll cancellation, deadlines, and other agents.
+        for _ in 0..MAX_CHUNKS_PER_POLL {
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Err(err) = self.process_chunk(&bytes) {
-                        if let Some(event) = self.pending_events.pop_front() {
-                            self.pending_error = Some(err);
-                            self.pending_error_is_terminal = true;
-                            return Poll::Ready(Some(Ok(event)));
-                        }
-                        self.pending_events.clear();
-                        self.utf8_buffer.clear();
-                        self.parser = SseParser::new();
-                        self.terminated = true;
-                        return Poll::Ready(Some(Err(err)));
+                        return self.finish_with_error(err);
                     }
 
                     if let Some(event) = self.pending_events.pop_front() {
@@ -605,7 +591,7 @@ where
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(e)));
+                    return self.finish_with_error(e);
                 }
                 Poll::Ready(None) => {
                     return self.poll_stream_end();
@@ -615,6 +601,8 @@ where
                 }
             }
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -626,6 +614,15 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_event(cx)
+    }
+}
+
+impl<S> futures::stream::FusedStream for SseStream<S>
+where
+    S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    fn is_terminated(&self) -> bool {
+        self.terminated && self.pending_events.is_empty() && self.pending_error.is_none()
     }
 }
 
@@ -1855,6 +1852,152 @@ data: {"type":"message_stop"}
             let (whole_events, whole_errors) = parse_stream_single_chunk(&bytes);
             prop_assert_eq!(events, whole_events);
             prop_assert_eq!(whole_errors, vec![ErrorKind::InvalidData]);
+        }
+    }
+
+    #[test]
+    fn corrupted_tool_payloads_never_become_valid_json_at_any_chunk_boundary() {
+        let prefix = b"data: first\n\ndata: second\n\n";
+        let payload = b"data: {\"tool\":\"write\",\"path\":\"safe-file\"}";
+        for invalid_at in 0..=payload.len() {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(&payload[..invalid_at]);
+            bytes.push(0xff);
+            bytes.extend_from_slice(&payload[invalid_at..]);
+            bytes.extend_from_slice(b"\n\ndata: after\n\n");
+            for split in 0..=bytes.len() {
+                let (events, errors) = parse_stream_chunks(vec![
+                    bytes[..split].to_vec(),
+                    bytes[split..].to_vec(),
+                ]);
+                let data: Vec<_> = events.iter().map(|event| event.data.as_str()).collect();
+                assert_eq!(data, ["first", "second"], "invalid={invalid_at}, split={split}");
+                assert_eq!(errors, [ErrorKind::InvalidData]);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_continuations_are_terminal_across_all_splits() {
+        for invalid in [
+            vec![0xe2, b'x'],
+            vec![0xe2, 0x98, b'x'],
+            vec![0xc0, 0xaf],
+            vec![0xed, 0xa0, 0x80],
+            vec![0xf4, 0x90, 0x80, 0x80],
+        ] {
+            let mut bytes = b"data: before\n\ndata: ".to_vec();
+            bytes.extend(invalid);
+            bytes.extend_from_slice(b"\n\ndata: after\n\n");
+            for split in 0..=bytes.len() {
+                let (events, errors) = parse_stream_chunks(vec![
+                    bytes[..split].to_vec(),
+                    bytes[split..].to_vec(),
+                ]);
+                assert_eq!(events.len(), 1, "split={split}");
+                assert_eq!(events[0].data, "before");
+                assert_eq!(errors, [ErrorKind::InvalidData]);
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_tail_completion_does_not_copy_the_entire_next_chunk() {
+        let mut stream = SseStream::new(stream::empty());
+        stream.process_chunk(b"data: \xf0").expect("partial UTF-8");
+        let mut rest = b"\x9f\x98\x80".to_vec();
+        rest.extend(std::iter::repeat_n(b'x', 256 * 1024));
+        rest.extend_from_slice(b"\n\n");
+        stream.process_chunk(&rest).expect("complete UTF-8");
+        assert!(stream.utf8_buffer.is_empty());
+        assert!(stream.utf8_buffer.capacity() <= 8);
+        let event = stream.pending_events.pop_front().expect("event");
+        assert!(event.data.starts_with('😀'));
+        assert_eq!(event.data.len(), 4 + 256 * 1024);
+    }
+
+    #[test]
+    fn transport_error_never_flushes_or_resumes_a_partial_event() {
+        for partial in [b"data: partial".as_slice(), b"data: partial\n", b"data: \xe2"] {
+            let chunks = vec![
+                Ok(b"data: before\n\n".to_vec()),
+                Ok(partial.to_vec()),
+                Err(std::io::Error::new(ErrorKind::ConnectionReset, "reset")),
+                Ok(b"data: after\n\n".to_vec()),
+            ];
+            let mut stream = SseStream::new(stream::iter(chunks));
+            futures::executor::block_on(async {
+                assert_eq!(
+                    stream.next().await.expect("before").expect("ok").data,
+                    "before"
+                );
+                let error = stream.next().await.expect("failure").expect_err("reset");
+                assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+                assert_eq!(error.to_string(), "reset");
+                assert!(stream.next().await.is_none());
+                assert!(stream.next().await.is_none());
+            });
+            assert!(!stream.parser.has_pending());
+            assert!(stream.utf8_buffer.is_empty());
+        }
+    }
+
+    #[test]
+    fn fused_state_accounts_for_prefix_events_and_deferred_error() {
+        use futures::stream::FusedStream;
+
+        let mut stream = SseStream::new(stream::iter(vec![Ok(
+            b"data: first\n\ndata: second\n\n\xffdata: forbidden\n\n".to_vec(),
+        )]));
+        futures::executor::block_on(async {
+            assert!(!stream.is_terminated());
+            assert_eq!(stream.next().await.expect("first").expect("ok").data, "first");
+            assert!(!stream.is_terminated());
+            assert_eq!(
+                stream.next().await.expect("second").expect("ok").data,
+                "second"
+            );
+            assert!(!stream.is_terminated());
+            assert!(stream.next().await.expect("error").is_err());
+            assert!(stream.is_terminated());
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn ready_keepalives_yield_and_wake_without_losing_the_next_event() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        #[derive(Default)]
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for keepalive in [b"".as_slice(), b": keepalive\n\n"] {
+            let chunks = std::iter::repeat_with(|| Ok(keepalive.to_vec()))
+                .take(128)
+                .chain(std::iter::once(Ok(b"data: complete\n\n".to_vec())));
+            let mut stream = SseStream::new(stream::iter(chunks));
+            let count = Arc::new(WakeCount::default());
+            let waker = Waker::from(Arc::clone(&count));
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut stream).poll_next_event(&mut cx).is_pending());
+            assert_eq!(count.0.load(Ordering::SeqCst), 1);
+            assert!(Pin::new(&mut stream).poll_next_event(&mut cx).is_pending());
+            assert_eq!(count.0.load(Ordering::SeqCst), 2);
+            let Poll::Ready(Some(Ok(event))) = Pin::new(&mut stream).poll_next_event(&mut cx) else {
+                panic!("event must survive cooperative yields");
+            };
+            assert_eq!(event.data, "complete");
+            assert!(matches!(
+                Pin::new(&mut stream).poll_next_event(&mut cx),
+                Poll::Ready(None)
+            ));
         }
     }
 }
