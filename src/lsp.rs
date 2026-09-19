@@ -374,9 +374,21 @@ impl LspTool {
     }
 
     fn code_action_range(input: &LspInput, path: &Path) -> Result<Value> {
+        if input.range.is_some() && (input.symbol.is_some() || input.line.is_some()) {
+            return Err(tool_err(
+                "LSP_USAGE",
+                "code_actions range cannot be combined with symbol or line",
+            ));
+        }
         if let Some(symbol) = input.symbol.as_deref() {
             let position = Self::resolve_position(path, input.line, symbol)?;
             return Ok(json!({"start":position,"end":position}));
+        }
+        if input.line.is_some() {
+            return Err(tool_err(
+                "LSP_USAGE",
+                "code_actions line requires symbol; use range to select text",
+            ));
         }
         let content = std::fs::read_to_string(path).map_err(|err| {
             tool_err(
@@ -384,6 +396,18 @@ impl LspTool {
                 format!("cannot read {}: {err}", path.display()),
             )
         })?;
+        if let Some(range) = input.range {
+            if range.end < range.start
+                || text::position_to_offset_exact(&content, range.start).is_none()
+                || text::position_to_offset_exact(&content, range.end).is_none()
+            {
+                return Err(tool_err(
+                    "LSP_USAGE",
+                    "code_actions range must be ordered and use exact zero-based UTF-16 boundaries in the document",
+                ));
+            }
+            return Ok(json!(range));
+        }
         let end = offset_to_position(&content, content.len()).ok_or_else(|| {
             tool_err(
                 "LSP_USAGE",
@@ -549,6 +573,7 @@ struct LspInput {
     payload: Option<Value>,
     limit: Option<usize>,
     range: Option<text::Range>,
+    only: Option<Vec<String>>,
     format_options: Option<Value>,
     hierarchy_id: Option<String>,
 }
@@ -563,7 +588,7 @@ impl Tool for LspTool {
         "lsp"
     }
     fn description(&self) -> &str {
-        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities and request. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. Code actions return stable actionId values; apply with apply:true plus actionId or a title/index query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. Formatting range positions are zero-based UTF-16."
+        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities and request. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -574,15 +599,16 @@ impl Tool for LspTool {
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
                 "query":{"type":"string","description":"Workspace-symbol query, or fresh code-action title/index selection"},
-                "actionId":{"type":"string","description":"Opaque ID from a prior code_actions listing; requires apply:true and no query"},
+                "actionId":{"type":"string","description":"Opaque ID from a prior code_actions listing; requires apply:true. Already identifies the selection; cannot be combined with query, range, only, symbol or line"},
                 "hierarchyId":{"type":"string","description":"Opaque hierarchy item from a previous result; use instead of file/line/symbol to traverse one more level. Call and type handles are not interchangeable. Handles expire with their source or server."},
                 "newName":{"type":"string","description":"New symbol name for rename"},
                 "newFile":{"type":"string","description":"Destination path for rename_file"},
                 "apply":{"type":"boolean","description":"Apply the selected code action, or write formatting changes instead of previewing"},
-                "range":{"type":"object","description":"Optional format selection with zero-based lines and UTF-16 character offsets; omit to format the whole document. The server may expand to a syntactic construct.","required":["start","end"],"properties":{
+                "range":{"type":"object","description":"Optional code_actions or format selection, with exact zero-based lines and UTF-16 character offsets. For code_actions, cannot be combined with symbol or line. Omit all selectors for the whole document. Refactors may also edit outside the selection.","required":["start","end"],"properties":{
                     "start":{"type":"object","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                     "end":{"type":"object","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}}
                 }},
+                "only":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1,"maxLength":128},"description":"code_actions kinds, matching the named kind and its dot-separated descendants, e.g. [refactor.extract] or [source.organizeImports]. Nonmatching or unclassified server results are excluded before indexing and selection. Omit for all kinds."},
                 "formatOptions":{"type":"object","maxProperties":64,"description":"Formatting options; defaults to tabSize 4 and insertSpaces true. Additional server options must be boolean, 32-bit integer or bounded string values.","properties":{
                     "tabSize":{"type":"integer","minimum":1,"maximum":32,"default":4},
                     "insertSpaces":{"type":"boolean","default":true},
@@ -612,6 +638,9 @@ impl Tool for LspTool {
             .map_err(|err| tool_err("LSP_USAGE", format!("invalid input: {err}")))?;
         if input.line == Some(0) {
             return Err(tool_err("LSP_USAGE", "line must be 1-indexed"));
+        }
+        if input.only.is_some() && input.action != "code_actions" {
+            return Err(tool_err("LSP_USAGE", "only is supported by code_actions"));
         }
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         let _operation =

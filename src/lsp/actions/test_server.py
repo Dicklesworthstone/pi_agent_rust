@@ -7,7 +7,9 @@ from urllib.parse import unquote, urlparse
 MODE = sys.argv[1]
 SOURCE = None
 VERSIONS = []
+DOCUMENT_VERSIONS = {}
 SEQUENCE = 0
+EXTRACTED = "prefix\nextracted()\nsuffix\nfn extracted() { left + right }\n"
 
 
 def read():
@@ -65,6 +67,36 @@ def server_edit(uri):
         raise ValueError("unexpected request while awaiting server edit acknowledgement")
 
 
+def selection_actions(params):
+    uri = params["textDocument"]["uri"]
+    sibling = Path("sibling.lspfixture").resolve().as_uri()
+    data = {"uri": uri, "range": params["range"],
+            "version": DOCUMENT_VERSIONS[uri],
+            "siblingVersion": DOCUMENT_VERSIONS.get(sibling)}
+    # Deliberately ignore context.only: the client must filter before indexing
+    # or selection, not accidentally execute this unrelated first result.
+    return [{"title": "Unrelated fix", "kind": "quickfix", "command": "test.wrong"},
+            {"title": "Unclassified command", "command": "test.wrong"},
+            {"title": "Neighboring kind", "kind": "refactor.extractMore", "command": "test.wrong"},
+            {"title": "Extract selected expression", "kind": "refactor.extract.function", "data": data}]
+
+
+def resolve_selection(params):
+    data = params["data"]
+    version = data["version"] + (1 if MODE == "selection-stale" else 0)
+    changes = [{"textDocument": {"uri": data["uri"], "version": version}, "edits": [
+        {"range": data["range"], "newText": "extracted()"},
+        {"range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 0}},
+         "newText": "fn extracted() { left + right }\n"}]}]
+    if MODE in ("selection-sibling", "selection-unknown"):
+        sibling = Path("sibling.lspfixture").resolve().as_uri()
+        changes.append({"textDocument": {"uri": sibling,
+                        "version": data["siblingVersion"] if MODE == "selection-sibling" else 999},
+                        "edits": edit(sibling)["changes"][sibling]})
+    return dict(params, edit={"documentChanges": changes},
+                command={"title": "Finish extraction", "command": "test.extracted"})
+
+
 def main():
     global SOURCE
     while True:
@@ -83,13 +115,23 @@ def main():
                   "executeCommandProvider": {"commands": ["test.finish"]}}})
         elif method in ("textDocument/didOpen", "textDocument/didChange"):
             VERSIONS.append(params["textDocument"]["version"])
+            DOCUMENT_VERSIONS[params["textDocument"]["uri"]] = params["textDocument"]["version"]
         elif method == "textDocument/codeAction":
             SOURCE = params["textDocument"]["uri"]
+            if MODE.startswith("selection"):
+                if MODE == "selection-probe":
+                    probe = server_edit(Path("sibling.lspfixture").resolve().as_uri())
+                    Path("selection-probe.json").write_text(json.dumps(probe), encoding="utf-8")
+                reply(request, selection_actions(params))
+                continue
             action = {"title": "Finish refactoring", "kind": "refactor", "data": {"uri": SOURCE}}
             if MODE == "disabled":
                 action["disabled"] = {"reason": "not applicable"}
             reply(request, [action])
         elif method == "codeAction/resolve":
+            if MODE.startswith("selection"):
+                reply(request, resolve_selection(params))
+                continue
             resolved = dict(params, edit=edit(params["data"]["uri"]),
                             command={"title": "Finish", "command": "test.finish", "arguments": ["literal"]})
             if MODE == "changed":
@@ -98,6 +140,12 @@ def main():
                 resolved["command"]["arguments"] = {"not": "an array"}
             reply(request, resolved)
         elif method == "workspace/executeCommand":
+            if params["command"] == "test.extracted":
+                assert Path(unquote(urlparse(SOURCE).path)).read_text() == EXTRACTED, "command preceded extraction"
+                Path("command-started").write_text("extracted", encoding="ascii")
+                reply(request, None)
+                continue
+            assert params["command"] == "test.finish", "unrelated action was selected"
             assert Path(unquote(urlparse(SOURCE).path)).read_text() == "fixed\n", "command preceded edit"
             Path("command-started").write_text("started", encoding="ascii")
             if MODE == "stall":

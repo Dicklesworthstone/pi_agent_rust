@@ -15,14 +15,14 @@ use crate::lsp::edits::WorkspaceEditPlan;
 mod formatting;
 mod versions;
 
-struct RefactorSnapshot {
+pub(super) struct RefactorSnapshot {
     source: PathBuf,
     source_hash: u64,
     documents: HashMap<PathBuf, DocumentSnapshot>,
 }
 
 impl RefactorSnapshot {
-    fn capture(entry: &ServerEntry, source: &Path, hash: u64) -> Result<Self> {
+    pub(super) fn capture(entry: &ServerEntry, source: &Path, hash: u64) -> Result<Self> {
         inside_root(source, entry.client.root())?;
         verify_source(source, hash)?;
         let documents = entry.client.document_snapshots();
@@ -40,6 +40,13 @@ impl RefactorSnapshot {
             source_hash: hash,
             documents,
         })
+    }
+
+    /// Check the original source before resolving a cached action or running a
+    /// command. Keep the listing-time snapshot; refreshing it would bless drift.
+    pub(super) fn verify_request_source(&self, entry: &ServerEntry) -> Result<()> {
+        let empty = parse_workspace_edit(&Value::Null)?;
+        self.validate(entry, &Value::Null, &empty).map(|_| ())
     }
 
     fn validate(
@@ -212,7 +219,7 @@ fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Re
 }
 
 impl LspTool {
-    fn apply_refactor(
+    pub(super) fn apply_refactor(
         &self,
         entry: &ServerEntry,
         raw: &Value,

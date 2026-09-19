@@ -34,7 +34,7 @@ struct CachedAction {
     id: String,
     entry: Weak<ServerEntry>,
     path: PathBuf,
-    hash: u64,
+    snapshot: Arc<refactor::RefactorSnapshot>,
     action: Value,
     bytes: usize,
 }
@@ -169,7 +169,7 @@ impl ActionState {
         &self,
         entry: &Arc<ServerEntry>,
         path: &Path,
-        hash: u64,
+        snapshot: Arc<refactor::RefactorSnapshot>,
         action: Value,
     ) -> Result<String> {
         let bytes = serde_json::to_vec(&action)?.len();
@@ -193,7 +193,7 @@ impl ActionState {
             id: id.clone(),
             entry: Arc::downgrade(entry),
             path: path.to_path_buf(),
-            hash,
+            snapshot,
             action,
             bytes,
         });
@@ -414,16 +414,59 @@ fn validate_resolution(original: &Value, resolved: Value) -> Result<Value> {
     Ok(resolved)
 }
 
+fn validate_action_request(input: &LspInput) -> Result<()> {
+    if input.action_id.is_some()
+        && (!input.apply.unwrap_or(false)
+            || input.query.is_some()
+            || input.range.is_some()
+            || input.only.is_some()
+            || input.symbol.is_some()
+            || input.line.is_some())
+    {
+        return Err(tool_err(
+            "LSP_USAGE",
+            "actionId requires apply:true and cannot be combined with query, range, only, symbol or line",
+        ));
+    }
+    if input.action_id.is_none()
+        && input.apply.unwrap_or(false)
+        && input.query.as_deref().is_none_or(|query| query.trim().is_empty())
+    {
+        return Err(tool_err("LSP_USAGE", "apply:true requires actionId or a nonempty query"));
+    }
+    if let Some(only) = &input.only
+        && (only.is_empty()
+            || only.len() > 16
+            || only.iter().any(|kind| {
+                kind.is_empty()
+                    || kind.len() > 128
+                    || kind.chars().any(|character| character.is_control() || character.is_whitespace())
+                    || kind.split('.').any(str::is_empty)
+            }))
+    {
+        return Err(tool_err(
+            "LSP_USAGE",
+            "only requires 1..16 nonempty action kinds, at most 128 bytes each, with nonempty dot-separated segments and no whitespace or controls",
+        ));
+    }
+    Ok(())
+}
+
+fn matches_action_kind(action: &Value, only: &[String]) -> bool {
+    action.get("kind").and_then(Value::as_str).is_some_and(|kind| {
+        only.iter().any(|requested| {
+            kind == requested.as_str()
+                || kind.strip_prefix(requested.as_str()).is_some_and(|suffix| suffix.starts_with('.'))
+        })
+    })
+}
+
 impl LspTool {
     #[allow(clippy::too_many_lines)]
     pub(super) async fn run_code_actions(&self, input: &LspInput) -> Result<ToolOutput> {
-        let (path, entry, hash, selected) = if let Some(id) = input.action_id.as_deref() {
-            if !input.apply.unwrap_or(false) || input.query.is_some() {
-                return Err(tool_err(
-                    "LSP_USAGE",
-                    "actionId requires apply:true and cannot be combined with query",
-                ));
-            }
+        // Validate before consuming a handle or starting a language server.
+        validate_action_request(input)?;
+        let (entry, snapshot, selected) = if let Some(id) = input.action_id.as_deref() {
             let cached = self.actions.take(id)?;
             let entry = cached
                 .entry
@@ -440,7 +483,7 @@ impl LspTool {
             {
                 return Err(tool_err("LSP_USAGE", "actionId belongs to another file"));
             }
-            (cached.path, entry, cached.hash, cached.action)
+            (entry, cached.snapshot, cached.action)
         } else {
             let file = input.file.as_deref().ok_or_else(|| {
                 tool_err(
@@ -450,28 +493,32 @@ impl LspTool {
             })?;
             let path = resolve_tool_path(file, &self.cwd).canonicalize()?;
             let hash = file_hash(&path)?;
-            let (uri, entry) = self.synced(&path).await?;
-            verify_source(&path, hash)?;
             let range = Self::code_action_range(input, &path)?;
+            let (uri, entry) = self.synced(&path).await?;
+            let snapshot = Arc::new(refactor::RefactorSnapshot::capture(&entry, &path, hash)?);
             let diagnostics = entry
                 .client
                 .diagnostics_snapshot()
                 .get(&uri)
                 .cloned()
                 .unwrap_or_default();
+            let mut context = json!({"diagnostics":diagnostics,"triggerKind":1});
+            if let Some(only) = &input.only {
+                context["only"] = json!(only);
+            }
             let result = entry
                 .client
                 .call(
                     "textDocument/codeAction",
                     json!({
                         "textDocument":{"uri":uri},"range":range,
-                        "context":{"diagnostics":diagnostics}
+                        "context":context
                     }),
                     self.request_timeout(input),
                 )
                 .await?;
-            verify_source(&path, hash)?;
-            let actions = if result.is_null() {
+            snapshot.verify_request_source(&entry)?;
+            let mut actions = if result.is_null() {
                 Vec::new()
             } else {
                 result.as_array().cloned().ok_or_else(|| {
@@ -488,6 +535,12 @@ impl LspTool {
                     "code action response exceeds 128 actions or 2 MiB",
                 ));
             }
+            // Treat the requested kind as a selection boundary even when a
+            // server ignores context.only. Indices refer to this filtered list.
+            let received = actions.len();
+            if let Some(only) = &input.only {
+                actions.retain(|action| matches_action_kind(action, only));
+            }
             if !input.apply.unwrap_or(false) {
                 let mut summaries = Vec::new();
                 // Old handles are intentionally replaced by the new listing.
@@ -499,7 +552,7 @@ impl LspTool {
                         .ok_or_else(|| {
                             tool_err("LSP_ACTION_MALFORMED", "code action has no title")
                         })?;
-                    let id = self.actions.remember(&entry, &path, hash, action.clone())?;
+                    let id = self.actions.remember(&entry, &path, Arc::clone(&snapshot), action.clone())?;
                     let preview: String = title.chars().take(1000).collect();
                     summaries.push(json!({
                         "index":index+1,"actionId":id,"title":preview,"titleTruncated":preview.len()!=title.len(),"kind":action.get("kind"),
@@ -510,7 +563,11 @@ impl LspTool {
                         "hasCommand":action.get("command").is_some_and(|value| !value.is_null())
                     }));
                 }
-                let payload = json!({"action":"code_actions","file":display_path(&path,&self.cwd),"count":summaries.len(),"actions":summaries});
+                let payload = json!({
+                    "action":"code_actions","file":display_path(&path,&self.cwd),
+                    "range":range,"only":input.only,"filteredOut":received-actions.len(),
+                    "count":summaries.len(),"actions":summaries
+                });
                 return Ok(text_output(payload.to_string(), payload));
             }
             let query = input
@@ -524,10 +581,10 @@ impl LspTool {
                     )
                 })?;
             let selected = select_code_action(&actions, query)?;
-            (path, entry, hash, selected)
+            (entry, snapshot, selected)
         };
         enabled(&selected)?;
-        verify_source(&path, hash)?;
+        snapshot.verify_request_source(&entry)?;
         let selected = if selected["command"].is_string() {
             // Legacy Command literals are not CodeAction objects.
             selected
@@ -560,16 +617,15 @@ impl LspTool {
                 "resolved code action contains neither an edit nor a command",
             ));
         }
-        verify_source(&path, hash)?;
-        AgentCx::for_current_or_request()
+        snapshot.verify_request_source(&entry)?;
+        let owner = AgentCx::for_current_or_request();
+        owner
             .checkpoint()
             .map_err(|_| tool_err("LSP_CANCELLED", "code action cancelled before applying"))?;
         lock(&self.actions.cache).clear();
         let mut report = Report::default();
         if let Some(edit) = edit {
-            let hashes = HashMap::from([(path.clone(), hash)]);
-            report.record(apply_scoped(&entry, edit, Some(&hashes))?);
-            entry.client.invalidate_all();
+            report.record(self.apply_refactor(&entry, edit, &snapshot, &owner)?);
         }
         let mut failure = None;
         if let Some(params) = &command {
@@ -670,4 +726,5 @@ mod tests {
     }
 
     include!("actions/protocol_tests.rs");
+    include!("actions/selection_tests.rs");
 }
