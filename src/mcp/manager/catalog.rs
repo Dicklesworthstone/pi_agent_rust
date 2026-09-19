@@ -5,7 +5,9 @@
 //! whole traversal; a server cannot multiply it by returning more pages.
 
 use std::collections::HashSet;
+use std::future::{Future, poll_fn};
 use std::io::Write;
+use std::task::Poll;
 
 use serde_json::json;
 
@@ -188,13 +190,110 @@ fn check_catalog_generation(
     Ok(())
 }
 
+fn check_request_owner(owner: &crate::agent_cx::AgentCx) -> Result<()> {
+    if !owner.capabilities().io || !owner.capabilities().time {
+        return Err(tool_err(
+            "MCP_CAPABILITY_DENIED",
+            "MCP requests require the owner's I/O and timer capabilities",
+        ));
+    }
+    owner.checkpoint().map_err(|_| request_cancelled())
+}
+
+fn request_cancelled() -> crate::error::Error {
+    tool_err(
+        "MCP_CANCELLED",
+        "MCP request cancelled; delivery may already have occurred and was not retried",
+    )
+}
+
+fn request_timed_out() -> crate::error::Error {
+    tool_err("MCP_TIMEOUT", "MCP request exceeded its manager deadline")
+}
+
+async fn wait_for_owner_cancellation(owner: crate::agent_cx::AgentCx) {
+    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+    // Keeping the sender alive means only owner cancellation can finish this
+    // receive. Its registration is retired with the request, not a new task.
+    let _ = receiver.recv(owner.cx()).await;
+    drop(sender);
+}
+
+/// Enforce the manager's lifetime even when a transport never wakes, ignores
+/// its timeout, or is polled later by a task with different ambient authority.
+/// Cancellation and expiry win over a response arriving in the same poll.
+async fn request_with_owner(
+    owner: &crate::agent_cx::AgentCx,
+    transport: &Arc<dyn McpTransport>,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    check_request_owner(owner)?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(request_timed_out)?;
+    if timeout.is_zero() {
+        return Err(request_timed_out());
+    }
+    let now = owner
+        .cx()
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+    let mut timer = Box::pin(asupersync::time::sleep(now, timeout));
+    let mut cancellation = Box::pin(wait_for_owner_cancellation(owner.clone()));
+    let mut request = transport.request(method, params, timeout);
+    let result = poll_fn(|task| {
+        let _guard = owner.cx().clone().set_current_restricted();
+        if let Err(error) = check_request_owner(owner) {
+            return Poll::Ready(Err(error));
+        }
+        if cancellation.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(request_cancelled()));
+        }
+        if Instant::now() >= deadline || timer.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(request_timed_out()));
+        }
+        let result = request.as_mut().poll(task);
+        if result.is_ready() {
+            if let Err(error) = check_request_owner(owner) {
+                return Poll::Ready(Err(error));
+            }
+            if Instant::now() >= deadline {
+                return Poll::Ready(Err(request_timed_out()));
+            }
+        }
+        result
+    })
+    .await;
+    let _guard = owner.cx().clone().set_current_restricted();
+    drop(request);
+    drop(cancellation);
+    drop(timer);
+    result
+}
+
 impl McpManager {
     pub(super) async fn collect_tool_catalog(
         &self,
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
     ) -> Result<Vec<McpToolMeta>> {
-        let deadline = Instant::now() + DEFAULT_MCP_TIMEOUT;
+        self.collect_tool_catalog_with_timeout(entry, transport, DEFAULT_MCP_TIMEOUT)
+            .await
+    }
+
+    async fn collect_tool_catalog_with_timeout(
+        &self,
+        entry: &Arc<ServerEntry>,
+        transport: &Arc<dyn McpTransport>,
+        timeout: Duration,
+    ) -> Result<Vec<McpToolMeta>> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        check_request_owner(&owner)?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(request_timed_out)?;
         let mut catalog = Catalog::new();
         let mut params = json!({});
         loop {
@@ -216,7 +315,8 @@ impl McpManager {
                 transport: Arc::clone(transport),
                 armed: true,
             };
-            let result = transport.request("tools/list", params, remaining).await;
+            let result =
+                request_with_owner(&owner, transport, "tools/list", params, remaining).await;
             // A returned error is handled by the existing failure taxonomy;
             // only abandonment of the pending future belongs to the guard.
             request_guard.armed = false;
@@ -258,6 +358,10 @@ impl McpManager {
                 }
             };
             if let Err(error) = remaining_budget(deadline, Instant::now()) {
+                Self::fail_transport_generation(entry, transport, &error);
+                return Err(error);
+            }
+            if let Err(error) = check_request_owner(&owner) {
                 Self::fail_transport_generation(entry, transport, &error);
                 return Err(error);
             }
@@ -311,7 +415,12 @@ mod tests {
             }
             let pause = *McpManager::lock(&self.pause_at) == Some(index);
             if pause {
-                futures::future::pending::<()>().await;
+                let budget = asupersync::Cx::current().map(|cx| cx.budget());
+                poll_fn(|_| {
+                    assert_eq!(asupersync::Cx::current().map(|cx| cx.budget()), budget);
+                    Poll::<()>::Pending
+                })
+                .await;
             }
             Ok(page)
         }
@@ -807,5 +916,204 @@ mod tests {
         assert!(McpManager::lock(&entry.transport).is_none());
         assert!(manager.mounted_tool_metas().is_empty());
         assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+    }
+
+    struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn owner_cancellation_wakes_idle_discovery_without_transport_cooperation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![json!({"tools":[tool("never-returned")]})],
+            None,
+        );
+        *McpManager::lock(&transport.pause_at) = Some(1);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let budget = asupersync::Budget::new().with_poll_quota(1000);
+        let owner = crate::agent_cx::AgentCx::from_cx(runtime.request_cx_with_budget(budget));
+        runtime.block_on(async {
+            let parent = asupersync::Cx::current().expect("runtime caller");
+            let counter = Arc::new(WakeCounter(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(Arc::clone(&counter));
+            let mut task = std::task::Context::from_waker(&waker);
+            let mut discovery = Box::pin(manager.list_and_cache_tools(&entry));
+            {
+                let _guard = owner.cx().clone().set_current_restricted();
+                assert!(discovery.as_mut().poll(&mut task).is_pending());
+            }
+            // Re-poll under another caller: the transport fixture asserts
+            // every poll still runs with its initially captured owner budget.
+            assert!(discovery.as_mut().poll(&mut task).is_pending());
+            assert_eq!(asupersync::Cx::current().unwrap().budget(), parent.budget());
+            let wakes_before = counter.0.load(Ordering::SeqCst);
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel discovery"));
+            assert!(counter.0.load(Ordering::SeqCst) > wakes_before);
+            let Poll::Ready(Err(error)) = discovery.as_mut().poll(&mut task) else {
+                panic!("cancellation must finish without a network response");
+            };
+            assert!(error.to_string().contains("MCP_CANCELLED"));
+            assert!(transport.closed.load(Ordering::Acquire));
+            assert!(McpManager::lock(&entry.transport).is_none());
+            assert!(McpManager::lock(&entry.tools_cache).is_none());
+            assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+            assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+            assert!(!parent.is_cancel_requested());
+            assert_eq!(asupersync::Cx::current().unwrap().budget(), parent.budget());
+            assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+        });
+    }
+
+    #[test]
+    fn manager_deadline_terminates_a_transport_that_ignores_its_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![json!({"tools":[tool("never-returned")]})],
+            None,
+        );
+        *McpManager::lock(&transport.pause_at) = Some(1);
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(manager.collect_tool_catalog_with_timeout(
+                &entry,
+                &erased,
+                Duration::from_millis(10),
+            ))
+            .expect_err("manager enforces deadline");
+        assert!(error.to_string().contains("MCP_TIMEOUT"));
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert!(manager.mounted_tool_metas().is_empty());
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+    }
+
+    #[test]
+    fn cancellation_racing_a_page_response_cannot_publish_or_fetch_another_page() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        let owner_for_hook = owner.clone();
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                json!({"tools":[tool("first")],"nextCursor":"more"}),
+                json!({"tools":[tool("must-not-fetch")]}),
+            ],
+            Some(Arc::new(move |_| {
+                owner_for_hook.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel as response arrives"),
+                );
+            })),
+        );
+        runtime.block_on(async {
+            let mut discovery = Box::pin(manager.list_and_cache_tools(&entry));
+            let result = {
+                let _guard = owner.cx().clone().set_current_restricted();
+                futures::poll!(discovery.as_mut())
+            };
+            let Poll::Ready(Err(error)) = result else {
+                panic!("cancellation must beat the simultaneous response");
+            };
+            assert!(error.to_string().contains("MCP_CANCELLED"));
+        });
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert!(manager.mounted_tool_metas().is_empty());
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+    }
+
+    #[test]
+    fn pre_cancelled_or_restricted_owner_cannot_dispatch_a_page() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_manager, _entry, transport) = fixture(&temp, vec![], None);
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cancelled = crate::agent_cx::AgentCx::for_request();
+        cancelled.cancel_with(asupersync::types::CancelKind::User, Some("before dispatch"));
+        let restricted = {
+            let _guard = asupersync::Cx::for_request()
+                .restrict::<asupersync::cx::cap::None>()
+                .set_current_restricted();
+            crate::agent_cx::AgentCx::for_current_or_request()
+        };
+        for (owner, code) in [
+            (cancelled, "MCP_CANCELLED"),
+            (restricted, "MCP_CAPABILITY_DENIED"),
+        ] {
+            let error = runtime
+                .block_on(request_with_owner(
+                    &owner,
+                    &erased,
+                    "tools/list",
+                    json!({}),
+                    DEFAULT_MCP_TIMEOUT,
+                ))
+                .expect_err("owner denies dispatch");
+            assert!(error.to_string().contains(code), "{error}");
+        }
+        assert!(McpManager::lock(&transport.requests).is_empty());
+    }
+
+    #[test]
+    fn expired_request_budget_prevents_dispatch_and_late_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_manager, _entry, transport) = fixture(
+            &temp,
+            vec![json!({"tools":[]})],
+            Some(Arc::new(|_| std::thread::sleep(Duration::from_millis(100)))),
+        );
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        let error = runtime
+            .block_on(request_with_owner(
+                &owner,
+                &erased,
+                "tools/list",
+                json!({}),
+                Duration::ZERO,
+            ))
+            .expect_err("zero budget");
+        assert!(error.to_string().contains("MCP_TIMEOUT"));
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        let error = runtime
+            .block_on(request_with_owner(
+                &owner,
+                &erased,
+                "tools/list",
+                json!({}),
+                Duration::from_millis(50),
+            ))
+            .expect_err("late success is not success");
+        assert!(error.to_string().contains("MCP_TIMEOUT"));
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
     }
 }
