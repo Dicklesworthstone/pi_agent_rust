@@ -210,3 +210,5 @@ fn recreated_document_version_is_rejected_before_transaction_changes_bytes() {
     assert!(validate(&raw, &requested, &requested).is_err());
     assert_eq!(std::fs::read_to_string(source).unwrap(), "old\n");
 }
+
+mod protocol;
