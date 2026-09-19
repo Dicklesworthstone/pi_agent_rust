@@ -9,6 +9,7 @@ pub mod client;
 #[cfg(test)]
 mod diagnostics_tests;
 pub mod edits;
+mod hierarchy;
 pub mod jsonrpc;
 pub mod registry;
 pub mod text;
@@ -89,6 +90,7 @@ pub struct LspTool {
     cwd: PathBuf,
     registry: LspRegistry,
     actions: Arc<actions::ActionState>,
+    hierarchies: hierarchy::HierarchyCache,
     operations: Arc<asupersync::sync::Mutex<()>>,
 }
 
@@ -99,6 +101,7 @@ impl LspTool {
             cwd: cwd.to_path_buf(),
             registry: LspRegistry::new(cwd, config),
             actions: Arc::new(actions::ActionState::default()),
+            hierarchies: hierarchy::HierarchyCache::default(),
             operations: Arc::new(asupersync::sync::Mutex::new(())),
         }
     }
@@ -135,11 +138,20 @@ impl LspTool {
                 format!("cannot read {}: {err}", path.display()),
             )
         })?;
+        Self::resolve_position_in(path, &content, line, symbol)
+    }
+
+    fn resolve_position_in(
+        path: &Path,
+        content: &str,
+        line: Option<u32>,
+        symbol: &str,
+    ) -> Result<Position> {
         let (needle, nth) = parse_symbol_selector(symbol);
         if needle.is_empty() {
             return Err(tool_err("LSP_NO_SYMBOL", "symbol must not be empty"));
         }
-        let occurrences = find_occurrences(&content, &needle, line.map(|l| l.saturating_sub(1)));
+        let occurrences = find_occurrences(content, &needle, line.map(|l| l.saturating_sub(1)));
         if occurrences.is_empty() {
             let scope = line.map_or_else(|| "file".to_string(), |l| format!("line {l}"));
             return Err(tool_err(
@@ -178,7 +190,7 @@ impl LspTool {
                 ));
             }
         };
-        offset_to_position(&content, selected.0).ok_or_else(|| {
+        offset_to_position(content, selected.0).ok_or_else(|| {
             tool_err(
                 "LSP_NO_SYMBOL",
                 format!("occurrence of {needle:?} does not map to an LSP position"),
@@ -407,6 +419,7 @@ impl LspTool {
             .as_deref()
             .map(|f| resolve_tool_path(f, &self.cwd));
         let killed = self.registry.kill_matching(path.as_deref()).await;
+        self.hierarchies.clear();
         let payload =
             json!({"action":"reload","killed":killed,"note":"servers respawn lazily on next use"});
         Ok(text_output(payload.to_string(), payload))
@@ -537,6 +550,7 @@ struct LspInput {
     limit: Option<usize>,
     range: Option<text::Range>,
     format_options: Option<Value>,
+    hierarchy_id: Option<String>,
 }
 
 #[async_trait]
@@ -549,18 +563,19 @@ impl Tool for LspTool {
         "lsp"
     }
     fn description(&self) -> &str {
-        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities and request. Code actions return stable actionId values; apply with apply:true plus actionId or a title/index query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. Formatting range positions are zero-based UTF-16."
+        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities and request. Call hierarchy queries start at file + symbol, then follow returned hierarchyId handles. Code actions return stable actionId values; apply with apply:true plus actionId or a title/index query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. Formatting range positions are zero-based UTF-16."
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request"]},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request"]},
                 "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics also accepts a glob over cached reports (not a workspace scan)"},
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
                 "query":{"type":"string","description":"Workspace-symbol query, or fresh code-action title/index selection"},
                 "actionId":{"type":"string","description":"Opaque ID from a prior code_actions listing; requires apply:true and no query"},
+                "hierarchyId":{"type":"string","description":"Opaque call-hierarchy item from a previous result; use instead of file/line/symbol to traverse one more level. Handles expire with their source or server."},
                 "newName":{"type":"string","description":"New symbol name for rename"},
                 "newFile":{"type":"string","description":"Destination path for rename_file"},
                 "apply":{"type":"boolean","description":"Apply the selected code action, or write formatting changes instead of previewing"},
@@ -578,7 +593,7 @@ impl Tool for LspTool {
                 "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default)"},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
                 "payload":{"description":"Raw JSON params for request"},
-                "limit":{"type":"integer","description":"Max returned locations, capped at 1000"}
+                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128"}
             }
         })
     }
@@ -646,6 +661,7 @@ impl Tool for LspTool {
                 .await
             }
             "symbols" => self.run_symbols(&input).await,
+            "incoming_calls" | "outgoing_calls" => self.run_hierarchy(&input).await,
             "rename" => self.run_rename(&input).await,
             "rename_file" => self.run_rename_file(&input).await,
             "code_actions" => self.run_code_actions(&input).await,
@@ -655,7 +671,7 @@ impl Tool for LspTool {
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request"
             ))),
         }
     }

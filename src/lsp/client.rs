@@ -180,6 +180,7 @@ impl LspClient {
                     "hover":{"contentFormat":["markdown","plaintext"]},
                     "definition":{"linkSupport":false},"typeDefinition":{"linkSupport":false},
                     "implementation":{"linkSupport":false},"references":{},
+                    "callHierarchy":{"dynamicRegistration":false},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
                     "rename":{"prepareSupport":false,"honorsChangeAnnotations":false},
                     "codeAction":{
@@ -297,6 +298,16 @@ impl LspClient {
                 })
             })
             .collect()
+    }
+
+    /// Immutable identity of the current local document incarnation. Keeping
+    /// this Arc lets a read workflow detect close/reopen even without a wire
+    /// version. Callers retaining it must bound their own source working set.
+    pub(in crate::lsp) fn synchronized_text(&self, uri: &str) -> Option<std::sync::Arc<str>> {
+        let uri = file_uri::normalize_uri(uri)?;
+        Self::lock(&self.open_docs)
+            .get(&uri)
+            .map(|document| std::sync::Arc::clone(&document.text))
     }
 
     pub fn poll_notifications(&self) {
