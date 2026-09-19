@@ -60,57 +60,37 @@ pub fn utf16_col_to_byte(line: &str, utf16_col: u32) -> usize {
     line.len()
 }
 
-/// Split `content` into lines without the line terminators.
-///
-/// Handles `\n`, `\r\n`, and a trailing line without terminator. The result
-/// always has at least one element (empty content yields one empty line).
-fn lines_of(content: &str) -> Vec<&str> {
-    let mut lines = Vec::new();
+/// Byte spans excluding line terminators. LSP treats CR, LF and CRLF as
+/// line endings; a trailing terminator introduces a final empty line.
+/// All position consumers share this iterator, including symbol selection.
+fn line_ranges(content: &str) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
     let mut start = 0usize;
-    let bytes = content.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\n' {
-            let mut end = i;
-            if end > start && bytes[end - 1] == b'\r' {
-                end -= 1;
-            }
-            lines.push(&content[start..end]);
-            start = i + 1;
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        if finished {
+            return None;
         }
-        i += 1;
-    }
-    lines.push(&content[start..]);
-    lines
-}
-
-/// Byte offset of the start of `line` (zero-based) in `content`.
-///
-/// Returns `None` when the line index is out of range.
-#[must_use]
-fn line_start_offset(content: &str, line: u32) -> Option<usize> {
-    if line == 0 {
-        return Some(0);
-    }
-    let mut seen = 0u32;
-    for (idx, byte) in content.bytes().enumerate() {
-        if byte == b'\n' {
-            seen += 1;
-            if seen == line {
-                return Some(idx + 1);
+        if let Some(relative) = content[start..].find(['\r', '\n']) {
+            let end = start + relative;
+            let span = start..end;
+            start = end + 1;
+            if content.as_bytes()[end] == b'\r'
+                && content.as_bytes().get(start) == Some(&b'\n')
+            {
+                start += 1;
             }
+            Some(span)
+        } else {
+            finished = true;
+            Some(start..content.len())
         }
-    }
-    None
+    })
 }
 
 /// Total number of lines in `content` (at least 1).
 #[must_use]
 pub fn line_count(content: &str) -> u32 {
-    let newlines = content.bytes().filter(|b| *b == b'\n').count();
-    u32::try_from(newlines)
-        .unwrap_or(u32::MAX)
-        .saturating_add(1)
+    u32::try_from(line_ranges(content).count()).unwrap_or(u32::MAX)
 }
 
 /// Map an LSP position to a UTF-8 byte offset in `content`.
@@ -120,39 +100,38 @@ pub fn line_count(content: &str) -> u32 {
 /// lines with trailing terminators).
 #[must_use]
 pub fn position_to_offset(content: &str, position: Position) -> Option<usize> {
-    let line_start = line_start_offset(content, position.line)?;
-    let line_end = content[line_start..]
-        .find('\n')
-        .map_or(content.len(), |rel| line_start + rel);
-    let mut line = &content[line_start..line_end];
-    if line.ends_with('\r') {
-        line = &line[..line.len() - 1];
-    }
+    let span = line_ranges(content).nth(usize::try_from(position.line).ok()?)?;
+    let col = utf16_col_to_byte(&content[span.clone()], position.character);
+    Some(span.start + col)
+}
+
+/// Map a caller-supplied position without rounding or clamping. Useful for
+/// validating an explicitly selected range before sending it to a server.
+#[must_use]
+pub fn position_to_offset_exact(content: &str, position: Position) -> Option<usize> {
+    let span = line_ranges(content).nth(usize::try_from(position.line).ok()?)?;
+    let line = &content[span.clone()];
     let col = utf16_col_to_byte(line, position.character);
-    Some(line_start + col)
+    (byte_col_to_utf16(line, col)? == position.character).then_some(span.start + col)
 }
 
 /// Map a UTF-8 byte offset in `content` to an LSP position.
 ///
-/// Returns `None` when `offset` is out of range or not on a char boundary.
+/// Returns `None` for out-of-range offsets, non-character boundaries, and
+/// the interior of a CRLF delimiter (which has no distinct LSP position).
 #[must_use]
 pub fn offset_to_position(content: &str, offset: usize) -> Option<Position> {
     if offset > content.len() || !content.is_char_boundary(offset) {
         return None;
     }
-    let newline_count = content[..offset].bytes().filter(|b| *b == b'\n').count();
-    let line = u32::try_from(newline_count).unwrap_or(u32::MAX);
-    let line_start = line_start_offset(content, line)?;
-    let line_text_end = content[line_start..]
-        .find('\n')
-        .map_or(content.len(), |rel| line_start + rel);
-    let mut line_text = &content[line_start..line_text_end];
-    if line_text.ends_with('\r') {
-        line_text = &line_text[..line_text.len() - 1];
+    let (line, span) = line_ranges(content)
+        .enumerate()
+        .find(|(_, span)| offset <= span.end)?;
+    if offset < span.start {
+        return None;
     }
-    let byte_col = offset.saturating_sub(line_start);
-    let character = byte_col_to_utf16(line_text, byte_col)?;
-    Some(Position { line, character })
+    let character = byte_col_to_utf16(&content[span.clone()], offset - span.start)?;
+    Some(Position { line: u32::try_from(line).ok()?, character })
 }
 
 /// One text replacement: splice `new_text` over `range`.
@@ -164,68 +143,71 @@ pub struct TextEdit {
 
 /// Apply LSP text edits to `content`, returning the new content.
 ///
-/// Edits are applied atomically as a batch: they are sorted by descending
-/// start offset and spliced back-to-front so earlier offsets stay valid.
-/// Overlapping edits (after offset mapping) are rejected with an error
-/// naming the overlapping positions, and nothing is applied.
+/// Every edit addresses the original document. Same-position inserts retain
+/// their order in the server's array; they may precede one replacement at
+/// that position, but cannot follow it. Validate first, then construct the
+/// result in one pass rather than shifting the whole suffix for each edit.
 ///
 /// # Errors
 ///
-/// Returns a human-readable error when any position is out of range or two
-/// edits overlap.
+/// Rejects invalid lines, split surrogate pairs, inverted/overlapping ranges
+/// and allocation failures. Past-end columns retain LSP's end-of-line clamp.
 pub fn apply_text_edits(content: &str, edits: &[TextEdit]) -> Result<String, String> {
     if edits.is_empty() {
         return Ok(content.to_string());
     }
-    // Map positions to byte offsets first so all validation happens before
-    // any splice.
+    // Build the line index once: formatting can return thousands of edits.
+    let lines: Vec<_> = line_ranges(content).collect();
+    let edit_offset = |position: Position| -> Option<usize> {
+        let span = lines.get(usize::try_from(position.line).ok()?)?;
+        let line = &content[span.clone()];
+        let col = utf16_col_to_byte(line, position.character);
+        // Navigation may round, but an edit must not delete half a scalar
+        // by silently rounding a UTF-16 surrogate-interior boundary.
+        (byte_col_to_utf16(line, col)? <= position.character).then_some(span.start + col)
+    };
     let mut mapped: Vec<(usize, usize, &str)> = Vec::with_capacity(edits.len());
     for edit in edits {
-        let start = position_to_offset(content, edit.range.start).ok_or_else(|| {
+        if edit.range.end < edit.range.start {
+            return Err(format!("edit range is inverted: {:?}", edit.range));
+        }
+        let start = edit_offset(edit.range.start).ok_or_else(|| {
             format!(
-                "edit start position {}:{} is out of range",
+                "edit start position {}:{} is out of range or splits a surrogate pair",
                 edit.range.start.line, edit.range.start.character
             )
         })?;
-        let end = position_to_offset(content, edit.range.end).ok_or_else(|| {
+        let end = edit_offset(edit.range.end).ok_or_else(|| {
             format!(
-                "edit end position {}:{} is out of range",
+                "edit end position {}:{} is out of range or splits a surrogate pair",
                 edit.range.end.line, edit.range.end.character
             )
         })?;
-        if end < start {
-            return Err(format!(
-                "edit range is inverted ({}:{} > {}:{})",
-                edit.range.start.line,
-                edit.range.start.character,
-                edit.range.end.line,
-                edit.range.end.character
-            ));
-        }
         mapped.push((start, end, edit.new_text.as_str()));
     }
-    // Sort descending by start offset for back-to-front splicing; ties on
-    // start sort descending by end so identical inserts stay deterministic.
-    mapped.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    // Overlap check on the sorted sequence: walking from the end of the
-    // document backwards, each edit must end at or before the previous
-    // (later) edit's start.
-    for window in mapped.windows(2) {
-        let earlier_end = window[0].1;
-        let later_start = window[1].0;
-        // window[0] is the LATER edit in document order (sorted desc).
-        if window[1].1 > window[0].0 && !(window[1].0 == window[1].1 && window[0].0 == window[0].1)
-        {
-            return Err(format!(
-                "edits overlap: byte ranges [{later_start}, {earlier_end}) and [{}, {})",
-                window[0].0, window[0].1
-            ));
+    // Stable sort is intentional: equal-start edits keep wire order.
+    mapped.sort_by_key(|&(start, _, _)| start);
+    let mut cursor = 0;
+    let mut output_len = content.len();
+    for &(start, end, new_text) in &mapped {
+        if start < cursor {
+            return Err(format!("edits overlap: byte range [{start}, {end}) starts before {cursor}"));
         }
+        output_len = output_len.checked_sub(end - start)
+            .and_then(|size| size.checked_add(new_text.len()))
+            .ok_or_else(|| "edited document length overflow".to_string())?;
+        cursor = end;
     }
-    let mut out = content.to_string();
+    let mut out = String::new();
+    out.try_reserve_exact(output_len)
+        .map_err(|error| format!("cannot allocate edited document: {error}"))?;
+    cursor = 0;
     for (start, end, new_text) in mapped {
-        out.replace_range(start..end, new_text);
+        out.push_str(&content[cursor..start]);
+        out.push_str(new_text);
+        cursor = end;
     }
+    out.push_str(&content[cursor..]);
     Ok(out)
 }
 
@@ -252,12 +234,9 @@ pub fn find_occurrences(hay: &str, needle: &str, only_line: Option<u32>) -> Vec<
     }
     let (region_start, region) = match only_line {
         None => (0, hay),
-        Some(line) => match line_start_offset(hay, line) {
+        Some(line) => match usize::try_from(line).ok().and_then(|line| line_ranges(hay).nth(line)) {
             None => return out,
-            Some(start) => {
-                let end = hay[start..].find('\n').map_or(hay.len(), |rel| start + rel);
-                (start, &hay[start..end])
-            }
+            Some(span) => (span.start, &hay[span]),
         },
     };
     let mut search_from = 0usize;
@@ -272,6 +251,103 @@ pub fn find_occurrences(hay: &str, needle: &str, only_line: Option<u32>) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn replacement(line: u32, start: u32, end: u32, text: &str) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position { line, character: start },
+                end: Position { line, character: end },
+            },
+            new_text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn inserts_before_same_start_replacement_keep_server_order() {
+        let edits = [
+            replacement(0, 1, 1, "X"),
+            replacement(0, 1, 1, "Y"),
+            replacement(0, 1, 3, "Z"),
+        ];
+        assert_eq!(apply_text_edits("abcd", &edits).unwrap(), "aXYZd");
+    }
+
+    #[test]
+    fn insertion_after_same_start_replacement_is_rejected() {
+        let edits = [replacement(0, 1, 3, "Z"), replacement(0, 1, 1, "X")];
+        assert!(apply_text_edits("abcd", &edits).unwrap_err().contains("overlap"));
+    }
+
+    #[test]
+    fn unsorted_locations_preserve_equal_location_insertion_order() {
+        let edits = [
+            replacement(0, 5, 5, "!"),
+            replacement(0, 1, 1, "X"),
+            replacement(0, 5, 5, "?"),
+            replacement(0, 1, 2, "Y"),
+        ];
+        assert_eq!(apply_text_edits("abcdef", &edits).unwrap(), "aXYcde!?f");
+    }
+
+    #[test]
+    fn mixed_line_endings_and_unicode_have_exact_roundtrips() {
+        for content in ["", "\r", "\n", "\r\n", "é\r🦀\r\nx\n", "a\r\rb"] {
+            for offset in 0..=content.len() {
+                let crlf_interior = offset > 0
+                    && content.as_bytes().get(offset - 1) == Some(&b'\r')
+                    && content.as_bytes().get(offset) == Some(&b'\n');
+                let position = offset_to_position(content, offset);
+                if content.is_char_boundary(offset) && !crlf_interior {
+                    let position = position.expect("representable boundary");
+                    assert_eq!(position_to_offset_exact(content, position), Some(offset));
+                    assert_eq!(position_to_offset(content, position), Some(offset));
+                } else {
+                    assert!(position.is_none(), "{content:?} at {offset}");
+                }
+            }
+        }
+        assert_eq!(line_count("é\r🦀\r\nx\n"), 4);
+        assert_eq!(offset_to_position("é\r🦀", 3), Some(Position { line: 1, character: 0 }));
+    }
+
+    #[test]
+    fn explicit_positions_reject_clamping_and_surrogate_interiors() {
+        let content = "a🦀b\r\n";
+        assert_eq!(position_to_offset_exact(content, Position { line: 0, character: 3 }), Some(5));
+        assert_eq!(position_to_offset_exact(content, Position { line: 0, character: 2 }), None);
+        assert_eq!(position_to_offset_exact(content, Position { line: 0, character: 99 }), None);
+        assert_eq!(position_to_offset(content, Position { line: 0, character: 99 }), Some(6));
+    }
+
+    #[test]
+    fn edits_cannot_split_surrogates_but_retain_protocol_end_clamping() {
+        for edit in [replacement(0, 2, 2, "X"), replacement(0, 1, 2, "X")] {
+            assert!(apply_text_edits("a🦀b", &[edit]).unwrap_err().contains("surrogate"));
+        }
+        assert_eq!(apply_text_edits("a🦀b", &[replacement(0, 3, 99, "Z")]).unwrap(), "a🦀Z");
+    }
+
+    #[test]
+    fn inverted_ranges_are_rejected_even_when_both_columns_clamp_to_eol() {
+        assert!(apply_text_edits("abc", &[replacement(0, 99, 98, "X")])
+            .unwrap_err().contains("inverted"));
+    }
+
+    #[test]
+    fn edits_and_symbol_queries_agree_on_cr_lines() {
+        let content = "first\ré old\r\nlast";
+        assert_eq!(find_occurrences(content, "old", Some(1)), vec![(9, 3)]);
+        assert!(find_occurrences(content, "last", Some(1)).is_empty());
+        assert!(find_occurrences(content, "\r", Some(1)).is_empty());
+        assert_eq!(apply_text_edits(content, &[replacement(1, 2, 5, "new")]).unwrap(), "first\ré new\r\nlast");
+    }
+
+    #[test]
+    fn large_reversed_batch_uses_original_positions() {
+        let content = "old\r\n".repeat(4096);
+        let edits: Vec<_> = (0..4096).rev().map(|line| replacement(line, 0, 3, "formatted")).collect();
+        assert_eq!(apply_text_edits(&content, &edits).unwrap(), "formatted\r\n".repeat(4096));
+    }
 
     #[test]
     fn utf16_roundtrip_ascii() {
@@ -426,9 +502,8 @@ mod tests {
             },
         ];
         let out = apply_text_edits(content, &edits).expect("apply");
-        // Both insert at the same point; later-sorted edit lands first, so
-        // both orders produce one of the two stable interleavings.
-        assert!(out == "aXYb\n" || out == "aYXb\n");
+        // LSP defines the array order, not either arbitrary interleaving.
+        assert_eq!(out, "aXYb\n");
     }
 
     #[test]
