@@ -1235,12 +1235,18 @@ where
             ) {
                 self.record_error("OpenAI reported a terminal stream failure".to_string());
             }
-            let has_content = delta.content.as_deref().is_some_and(|text| !text.is_empty())
+            let has_content = delta
+                .content
+                .as_deref()
+                .is_some_and(|text| !text.is_empty())
                 || delta
                     .reasoning_content
                     .as_deref()
                     .is_some_and(|text| !text.is_empty())
-                || delta.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+                || delta
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty());
             if has_content {
                 self.record_error("OpenAI sent content after a terminal finish reason".to_string());
             }

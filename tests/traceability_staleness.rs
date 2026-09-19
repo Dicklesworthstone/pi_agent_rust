@@ -17,7 +17,11 @@ const HIGH_VALUE_ARTIFACT_INVENTORY: &str =
     "docs/evidence/high-value-suite-artifact-inventory.json";
 const UBS_EXTENSION_RUNTIME_NOISE_BASELINE: &str =
     "docs/evidence/ubs-extension-runtime-noise-baseline.json";
-const PROVIDER_SUPPORT_MODULES: &[&str] = &["model_fetch"];
+const PROVIDER_SUPPORT_MODULES: &[&str] = &[
+    "model_fetch",
+    "azure_terminal_safety_tests",
+    "openai_terminal_safety_tests",
+];
 const REQUIRED_ARTIFACT_INVENTORY_AREAS: &[&str] = &[
     "provider_streaming",
     "sessions",

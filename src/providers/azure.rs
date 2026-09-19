@@ -633,7 +633,9 @@ where
                     choice.finish_reason.as_deref(),
                     Some("content_filter" | "error")
                 ) {
-                    self.record_error("Azure OpenAI reported a terminal stream failure".to_string());
+                    self.record_error(
+                        "Azure OpenAI reported a terminal stream failure".to_string(),
+                    );
                 }
                 let has_content = choice
                     .delta

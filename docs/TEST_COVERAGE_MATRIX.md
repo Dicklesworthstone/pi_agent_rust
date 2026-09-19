@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 290 current source files.
+- `rg --files src -g '*.rs' | sort` -> 292 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\\[cfg\\(test\\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 290.
+- Source-file rows below: 292.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -243,6 +243,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/anthropic.rs` | Anthropic provider | Unit; `tests/provider_streaming/anthropic.rs`, `tests/e2e_provider_streaming.rs`. |
 | `src/providers/anthropic/transport.rs` | Anthropic Messages transport shared with Vertex (SSE lifecycle validation) | Unit (in-module, 15 tests). |
 | `src/providers/azure.rs` | Azure provider | Unit; `tests/provider_streaming/azure.rs`, provider error/path suites. |
+| `src/providers/azure_terminal_safety_tests.rs` | Azure streamed tool-call finalization and terminal error preservation | Unit (in-module, terminal safety tests). |
 | `src/providers/bedrock.rs` | Bedrock provider | Unit; provider native/contract suites; public-provider HTTP tests cover native thinking/cache controls, hook fallback, exact rewritten-body SigV4 signing, and JSON cache accounting (added, not executed on the editing host). |
 | `src/providers/bedrock/request_options.rs` | Model-aware Bedrock thinking budgets/adaptive effort and native prompt-cache checkpoints | Unit (12 in-module request-shape tests); public-provider HTTP coverage in `src/providers/bedrock.rs`. These tests were added but not executed on the editing host because DSR is unavailable. |
 | `src/providers/bedrock/streaming.rs` | Incremental AWS binary event-stream validation and ConverseStream message lifecycle | Unit; `tests/provider_bedrock_streaming.rs` exercises public-provider incremental delivery, signed/redacted reasoning replay, malformed frames, and terminal handling. No fresh DSR execution is claimed by this inventory update. |
@@ -259,6 +260,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/mod.rs` | Provider factory | Unit; `tests/provider_factory.rs`, `tests/provider_native_verify.rs`; branch export baseline marks this family partly branch-SIGSEGV fallback. |
 | `src/providers/model_fetch.rs` | Live provider-model discovery and cache | Unit tests in this module; static-registry integration through `tests/model_registry.rs`. |
 | `src/providers/openai.rs` | OpenAI chat provider | Unit; `tests/provider_streaming/openai.rs`, provider error/path suites. |
+| `src/providers/openai_terminal_safety_tests.rs` | OpenAI streamed tool argument validation and stream failure preservation | Unit (in-module, terminal safety tests). |
 | `src/providers/openai_responses.rs` | OpenAI Responses provider | Unit; `tests/provider_streaming/openai_responses.rs`, provider error/path suites. |
 | `src/providers/vertex.rs` | Vertex provider | Unit; provider native/contract suites. |
 | `src/providers/vertex/tests_transport.rs` | Vertex Anthropic transport tests over real loopback HTTP/SSE | Test module; one case is timing-flaky under parallel execution, see bd-eg6ng. |

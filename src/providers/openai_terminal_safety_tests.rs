@@ -4,8 +4,7 @@ use super::{
 };
 use serde_json::{Value, json};
 
-type TestState =
-    StreamState<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>;
+type TestState = StreamState<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>;
 
 fn state() -> TestState {
     StreamState::new(
