@@ -1609,8 +1609,13 @@ async fn run(
     // this function (provider/model flags, resources, workspace trust, approval
     // state, enabled tools) is threaded through `SessionOptions`, and the SDK
     // session cannot reach extension-provided providers or models anyway.
+    // `cli.ftui` is redundant with `!cli.classic` while the two are declared
+    // `conflicts_with` each other, and it is named here on purpose: it was the
+    // one Cli field nothing in the crate read, so `--ftui` was a documented
+    // flag that did nothing and three e2e suites passed it believing it chose
+    // the stack. Reading it keeps that honest if the conflict is ever relaxed.
     #[cfg(feature = "ftui")]
-    let ftui_requested = is_interactive && !cli.classic;
+    let ftui_requested = is_interactive && (cli.ftui || !cli.classic);
     #[cfg(not(feature = "ftui"))]
     let ftui_requested = false;
 
