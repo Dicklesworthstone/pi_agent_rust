@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::pin::Pin;
 
 const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
+const MAX_READY_EVENTS_PER_YIELD: usize = 64;
 
 pub(super) type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
@@ -471,18 +472,40 @@ pub(super) fn response_stream(
     wire_stream(response.bytes_stream(), model, api, provider)
 }
 
+/// Metadata and heartbeat frames do not yield a public event. Even if the
+/// transport is continuously ready, periodically return control to the executor
+/// so abort/select futures and other sessions can be polled. No timer or task
+/// is detached from the consumer's stream lifetime.
+async fn yield_stream_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|task| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            task.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
 fn wire_stream<S>(source: S, model: String, api: String, provider: String) -> EventStream
 where
     S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin + Send + 'static,
 {
     let state = StreamState::new(SseStream::new(source), model, api, provider);
-    Box::pin(stream::unfold(
-        (state, StreamLifecycle::default()),
-        |(mut state, mut lifecycle)| async move {
-            if state.done {
-                return None;
-            }
+    let output = stream::unfold(
+        Some((state, StreamLifecycle::default())),
+        |active| async move {
+            let (mut state, mut lifecycle) = active?;
+            let mut ready_events = 0;
             loop {
+                if ready_events == MAX_READY_EVENTS_PER_YIELD {
+                    yield_stream_turn().await;
+                    ready_events = 0;
+                }
+                ready_events += 1;
                 match state.event_source.next().await {
                     Some(Ok(msg)) => {
                         state.transient_error_count = 0;
@@ -494,29 +517,29 @@ where
                                 if let Err(error) =
                                     lifecycle.accept(&mut event, &msg.data, &mut state.partial)
                                 {
-                                    state.done = true;
-                                    return Some((Err(error), (state, lifecycle)));
+                                    return Some((Err(error), None));
                                 }
                                 let event = authorize_terminal(event);
-                                if matches!(
+                                state.done = matches!(
                                     &event,
                                     StreamEvent::Done { .. } | StreamEvent::Error { .. }
-                                ) {
-                                    state.done = true;
-                                }
-                                return Some((Ok(event), (state, lifecycle)));
+                                );
+                                // then_some drops the entire state on a terminal
+                                // event BEFORE returning it. Retaining the outer
+                                // stream must not retain a socket, owner waiter,
+                                // buffered tail or partial tool accumulators.
+                                let active = (!state.done).then_some((state, lifecycle));
+                                return Some((Ok(event), active));
                             }
                             Ok(None) => {
                                 if let Err(error) =
                                     lifecycle.accept_silent(&msg.data, &mut state.partial)
                                 {
-                                    state.done = true;
-                                    return Some((Err(error), (state, lifecycle)));
+                                    return Some((Err(error), None));
                                 }
                             }
                             Err(error) => {
-                                state.done = true;
-                                return Some((Err(error), (state, lifecycle)));
+                                return Some((Err(error), None));
                             }
                         }
                     }
@@ -538,22 +561,21 @@ where
                                 continue;
                             }
                         }
-                        state.done = true;
-                        return Some((Err(Error::sse(&error)), (state, lifecycle)));
+                        return Some((Err(Error::sse(&error)), None));
                     }
                     None => {
-                        state.done = true;
                         return Some((
                             Err(Error::api(
                                 "Anthropic stream ended before message_stop (unexpected EOF)",
                             )),
-                            (state, lifecycle),
+                            None,
                         ));
                     }
                 }
             }
         },
-    ))
+    );
+    Box::pin(output.fuse())
 }
 
 #[cfg(test)]
@@ -561,6 +583,11 @@ mod tests {
     use super::*;
     use crate::model::StopReason;
     use asupersync::runtime::RuntimeBuilder;
+    use futures::FutureExt as _;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context as TaskContext, Poll, Wake, Waker};
 
     #[test]
     fn vertex_wire_format_keeps_messages_tools_thinking_and_cache() {
@@ -1553,5 +1580,238 @@ mod tests {
                 }
             }
         }
+    }
+
+    struct ObservedSource {
+        chunks: VecDeque<std::io::Result<Vec<u8>>>,
+        pending_at_end: bool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for ObservedSource {
+        type Item = std::io::Result<Vec<u8>>;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if let Some(chunk) = this.chunks.pop_front() {
+                Poll::Ready(Some(chunk))
+            } else if this.pending_at_end {
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    impl Drop for ObservedSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn observed_wire(
+        chunks: impl IntoIterator<Item = std::io::Result<Vec<u8>>>,
+        pending_at_end: bool,
+    ) -> (EventStream, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source = ObservedSource {
+            chunks: chunks.into_iter().collect(),
+            pending_at_end,
+            dropped: Arc::clone(&dropped),
+        };
+        (
+            wire_stream(source, "claude-test".into(), "anthropic-messages".into(), "anthropic".into()),
+            dropped,
+        )
+    }
+
+    fn wire_bytes(events: impl IntoIterator<Item = Value>) -> Vec<u8> {
+        events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>().into_bytes()
+    }
+
+    fn assert_retired(output: &mut EventStream, dropped: &AtomicBool) {
+        // This assertion MUST precede another poll: a consumer may retain the
+        // terminal stream indefinitely without ever asking it for EOF.
+        assert!(dropped.load(Ordering::SeqCst), "source retained after terminal event");
+        for _ in 0..3 {
+            assert!(output.next().now_or_never().expect("fused stream must be ready").is_none());
+        }
+    }
+
+    #[test]
+    fn successful_terminal_releases_source_without_an_extra_poll() {
+        let bytes = wire_bytes([start(), final_delta("end_turn"), json!({"type": "message_stop"})]);
+        let (mut output, dropped) = observed_wire([Ok(bytes)], true);
+        assert!(matches!(output.next().now_or_never().unwrap(), Some(Ok(StreamEvent::Start { .. }))));
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(matches!(output.next().now_or_never().unwrap(), Some(Ok(StreamEvent::Done { .. }))));
+        assert_retired(&mut output, &dropped);
+    }
+
+    #[test]
+    fn rejected_tool_terminal_releases_source_before_error_is_observed() {
+        let bytes = wire_bytes([
+            start(), tool_start(0, "call-a", &json!({})), stop(0),
+            final_delta("refusal"), json!({"type": "message_stop"}),
+            // A queued tail cannot keep the source alive or reauthorize calls.
+            final_delta("tool_use"), json!({"type": "message_stop"}),
+        ]);
+        let (mut output, dropped) = observed_wire([Ok(bytes)], true);
+        for _ in 0..3 {
+            let event = output.next().now_or_never().unwrap().unwrap().unwrap();
+            assert!(!matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. }));
+        }
+        let event = output.next().now_or_never().unwrap().unwrap().unwrap();
+        let StreamEvent::Error { reason, error } = event else {
+            panic!("expected withheld call");
+        };
+        assert_eq!(reason, StopReason::Error);
+        assert_eq!(error.usage.total_tokens, 67);
+        assert_retired(&mut output, &dropped);
+    }
+
+    #[test]
+    fn protocol_failures_release_source_before_yielding_the_error() {
+        for bytes in [
+            b"data: {invalid json}\n\n".to_vec(),
+            wire_bytes([start(), stop(9)]),
+            wire_bytes([start(), start()]),
+            wire_bytes([start(), final_delta("refusal"), final_delta("tool_use")]),
+            wire_bytes([
+                start(), tool_start(0, "call-a", &json!({})),
+                json!({"type": "content_block_delta", "index": 0, "delta": {
+                    "type": "input_json_delta", "partial_json": null
+                }}),
+            ]),
+        ] {
+            let (mut output, dropped) = observed_wire([Ok(bytes)], true);
+            let mut terminal_seen = false;
+            for _ in 0..8 {
+                let event = output.next().now_or_never().expect("error must not wait for EOF").unwrap();
+                if event.is_err() {
+                    terminal_seen = true;
+                    break;
+                }
+            }
+            assert!(terminal_seen);
+            assert_retired(&mut output, &dropped);
+        }
+    }
+
+    #[test]
+    fn provider_error_releases_source_before_yielding_the_error() {
+        let bytes = wire_bytes([
+            json!({"type": "error", "error": {"message": "overloaded"}}),
+            start(),
+        ]);
+        let (mut output, dropped) = observed_wire([Ok(bytes)], true);
+        assert!(matches!(output.next().now_or_never().unwrap(), Some(Ok(StreamEvent::Error { .. }))));
+        assert_retired(&mut output, &dropped);
+    }
+
+    #[test]
+    fn transport_errors_and_premature_eof_release_source_and_fuse() {
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let (mut output, dropped) = observed_wire([Err(std::io::Error::new(kind, "fixture"))], true);
+            assert!(output.next().now_or_never().unwrap().unwrap().is_err());
+            assert_retired(&mut output, &dropped);
+        }
+        for started in [false, true] {
+            let chunks = if started { vec![Ok(wire_bytes([start()]))] } else { Vec::new() };
+            let (mut output, dropped) = observed_wire(chunks, false);
+            if started {
+                assert!(matches!(output.next().now_or_never().unwrap(), Some(Ok(StreamEvent::Start { .. }))));
+            }
+            assert!(output.next().now_or_never().unwrap().unwrap().is_err());
+            assert_retired(&mut output, &dropped);
+        }
+    }
+
+    #[test]
+    fn dropping_a_pending_stream_releases_its_source() {
+        let (mut output, dropped) = observed_wire([], true);
+        assert!(output.next().now_or_never().is_none());
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(output);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn silent_burst(kind: &str) -> Vec<u8> {
+        let mut bytes = wire_bytes([start()]);
+        for _ in 0..MAX_READY_EVENTS_PER_YIELD * 2 {
+            let frame = match kind {
+                "header" => b"event: ping\ndata: {}\n\n".to_vec(),
+                "body" => wire_bytes([json!({"type": "ping"})]),
+                "metadata" => wire_bytes([json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 1}})]),
+                _ => panic!("unexpected fixture kind"),
+            };
+            bytes.extend(frame);
+        }
+        bytes.extend(wire_bytes([final_delta("end_turn"), json!({"type": "message_stop"})]));
+        bytes
+    }
+
+    #[test]
+    fn heartbeat_and_metadata_bursts_yield_and_wake_the_consumer() {
+        for kind in ["header", "body", "metadata"] {
+            let (mut output, dropped) = observed_wire([Ok(silent_burst(kind))], true);
+            let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+            let waker = Waker::from(Arc::clone(&flag));
+            let mut task = TaskContext::from_waker(&waker);
+            assert!(matches!(output.as_mut().poll_next(&mut task), Poll::Ready(Some(Ok(StreamEvent::Start { .. })))));
+            assert!(output.as_mut().poll_next(&mut task).is_pending(), "{kind} must yield before completing the burst");
+            assert!(flag.0.load(Ordering::SeqCst), "{kind} must schedule another poll");
+            assert!(!dropped.load(Ordering::SeqCst));
+            // A finite burst must still finish, with no timer or network EOF.
+            let mut done = false;
+            for _ in 0..4 {
+                if let Poll::Ready(Some(Ok(StreamEvent::Done { message, .. }))) = output.as_mut().poll_next(&mut task) {
+                    assert_eq!(message.usage.total_tokens, 67);
+                    done = true;
+                    break;
+                }
+            }
+            assert!(done, "{kind} did not resume after yielding");
+            assert_retired(&mut output, &dropped);
+        }
+    }
+
+    #[test]
+    fn abort_can_win_while_ready_metadata_would_otherwise_monopolize_polling() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let (mut output, dropped) = observed_wire([Ok(silent_burst("metadata"))], true);
+        runtime.block_on(async {
+            assert!(matches!(output.next().await, Some(Ok(StreamEvent::Start { .. }))));
+            let (abort, signal) = crate::agent::AbortHandle::new();
+            // Poll the response first. Without cooperative yielding it returns
+            // Done before the abort branch ever gets a chance to run.
+            let next = Box::pin(output.next());
+            let cancel = Box::pin(async move {
+                abort.abort();
+                signal.wait().await;
+            });
+            match futures::future::select(next, cancel).await {
+                futures::future::Either::Right(((), pending)) => drop(pending),
+                futures::future::Either::Left(_) => panic!("metadata burst starved cancellation"),
+            }
+        });
+        drop(output);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
