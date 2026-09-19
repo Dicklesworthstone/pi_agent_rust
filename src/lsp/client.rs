@@ -14,6 +14,9 @@ use crate::error::{Error, Result};
 
 mod document_sync;
 mod file_uri;
+mod request;
+#[cfg(test)]
+mod test_server;
 pub use file_uri::{path_to_uri, try_path_to_uri, uri_to_path};
 
 const WAIT_TICK: Duration = Duration::from_millis(10);
@@ -335,104 +338,6 @@ impl LspClient {
                 .map_or_else(asupersync::time::wall_now, |timer| timer.now());
             if Duration::from_nanos(now.duration_since(start)) >= wait {
                 return Self::lock(&self.diagnostics).contains_key(&uri);
-            }
-            asupersync::time::sleep(now, WAIT_TICK).await;
-        }
-    }
-
-    pub async fn call(
-        &self,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> std::result::Result<Value, LspCallError> {
-        let cx = AgentCx::for_current_or_request();
-        let start = cx
-            .cx()
-            .timer_driver()
-            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        let mut attempt = self.call_once(method, params.clone(), timeout).await;
-        loop {
-            // Never retry commands: a server error does not prove that its
-            // command or workspace/applyEdit side effects were rolled back.
-            let retryable = is_warmup_empty_retryable(method)
-                && matches!(
-                    &attempt, Err(LspCallError::Transport(TransportError::Server(err)))
-                        if (err.code == -32602 && err.message.contains("No references found")) || err.code == -32801
-                );
-            let empty_during_warmup = matches!(&attempt, Ok(value) if is_empty_result(value))
-                && is_warmup_empty_retryable(method)
-                && self.connected_at.elapsed() < WARMUP_EMPTY_RESULT_WINDOW;
-            if !retryable && !empty_during_warmup {
-                return attempt;
-            }
-            let now = cx
-                .cx()
-                .timer_driver()
-                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-            let remaining = timeout.saturating_sub(Duration::from_nanos(now.duration_since(start)));
-            if remaining < WARMUP_RETRY_CADENCE * 2 {
-                return attempt;
-            }
-            asupersync::time::sleep(now, WARMUP_RETRY_CADENCE).await;
-            if cx.checkpoint().is_err() {
-                return Err(LspCallError::Cancelled);
-            }
-            attempt = self
-                .call_once(
-                    method,
-                    params.clone(),
-                    remaining.saturating_sub(WARMUP_RETRY_CADENCE),
-                )
-                .await;
-        }
-    }
-
-    async fn call_once(
-        &self,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> std::result::Result<Value, LspCallError> {
-        let cx = AgentCx::for_current_or_request();
-        let _lane = asupersync::sync::OwnedMutexGuard::lock(
-            std::sync::Arc::clone(&self.request_lane),
-            cx.cx(),
-        )
-        .await
-        .map_err(|_| LspCallError::Cancelled)?;
-        let (id, rx) = self
-            .rpc
-            .request(method, params)
-            .map_err(LspCallError::Transport)?;
-        let start = cx
-            .cx()
-            .timer_driver()
-            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        loop {
-            match rx.try_recv() {
-                Ok(Ok(value)) => return Ok(value),
-                Ok(Err(err)) => return Err(LspCallError::Transport(err)),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(LspCallError::Transport(TransportError::Closed(
-                        "completion channel dropped".to_string(),
-                    )));
-                }
-            }
-            let now = cx
-                .cx()
-                .timer_driver()
-                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-            if Duration::from_nanos(now.duration_since(start)) >= timeout {
-                self.rpc.cancel_request(id);
-                return Err(LspCallError::Timeout {
-                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                });
-            }
-            if cx.checkpoint().is_err() {
-                self.rpc.cancel_request(id);
-                return Err(LspCallError::Cancelled);
             }
             asupersync::time::sleep(now, WAIT_TICK).await;
         }
