@@ -17,6 +17,7 @@ fn scan(root: &Path, pattern: &str, limit: usize) -> Discovery {
         &root.canonicalize().unwrap(),
         &matcher(pattern).unwrap(),
         limit,
+        None,
         &AgentCx::for_current_or_request(),
         Instant::now(),
         Duration::from_secs(10),
@@ -91,7 +92,7 @@ fn oversized_and_non_utf8_documents_fail_bounded_read_admission() {
 #[test]
 fn discovery_does_not_obtain_io_authority_from_an_unprivileged_owner() {
     let temp = tempfile::tempdir().unwrap();
-    let error = discover(temp.path(), &matcher("**/*.scan").unwrap(), 1,
+    let error = discover(temp.path(), &matcher("**/*.scan").unwrap(), 1, None,
         &AgentCx::for_testing(), Instant::now(), Duration::from_secs(1)).err().unwrap();
     assert!(error.to_string().contains("LSP_IO_PERMISSION"));
 }
@@ -112,7 +113,7 @@ fn depth_and_time_limits_remain_explicit_not_successful_empty_scans() {
     std::fs::create_dir_all(&path).unwrap();
     write(&path, "unvisited.scan", "broken");
     assert_eq!(scan(temp.path(), "**/*.scan", MAX_FILES).stop, Some("depth_limit"));
-    let found = discover(temp.path(), &matcher("**/*.scan").unwrap(), MAX_FILES,
+    let found = discover(temp.path(), &matcher("**/*.scan").unwrap(), MAX_FILES, None,
         &AgentCx::for_current_or_request(), Instant::now(), Duration::ZERO).unwrap();
     assert_eq!(found.stop, Some("timeout"));
     assert!(found.files.is_empty());
@@ -299,4 +300,96 @@ fn invalid_inputs_fail_before_server_initialization() {
         assert!(run(&tool, input).unwrap_err().to_string().contains("LSP_USAGE"));
     }
     assert!(tool.registry.status().is_empty());
+}
+
+#[test]
+fn continuation_pages_visit_each_name_once_without_claiming_a_project_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "pull") else { return; };
+    for file in ["c.scan", "a.scan", "b.scan"] { write(temp.path(), file, "clean\n"); }
+    let mut input = json!({"action":"workspace_diagnostics","file":"*.scan","limit":1,"timeout":5});
+    let mut visited = Vec::new();
+    for index in 0..3 {
+        let report = run(&tool, input.clone()).unwrap().details.unwrap();
+        assert_eq!(report["pageComplete"], true);
+        assert_eq!(report["complete"], false);
+        assert_eq!(report["matchedFiles"], 3);
+        assert_eq!(report["remainingMatchedFiles"], 3 - index);
+        visited.push(report["entries"][0]["file"].as_str().unwrap().to_string());
+        if index < 2 {
+            assert_eq!(report["hasMore"], true);
+            input["after"] = report["nextAfter"].clone();
+        } else {
+            assert_eq!(report["hasMore"], false);
+            assert!(report["nextAfter"].is_null());
+        }
+    }
+    assert_eq!(visited, vec!["a.scan", "b.scan", "c.scan"]);
+    assert_eq!(events(temp.path()).iter().filter(|event| event["method"] == "textDocument/didOpen").count(), 3);
+}
+
+#[test]
+fn incomplete_discovery_never_emits_a_cursor_that_can_skip_unseen_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "pull") else { return; };
+    write(temp.path(), "z.scan", "clean\n");
+    let mut path = temp.path().to_path_buf();
+    for _ in 0..MAX_DEPTH { path.push("d"); }
+    std::fs::create_dir_all(&path).unwrap();
+    write(&path, "a.scan", "broken\n");
+    let report = run(&tool, request()).unwrap().details.unwrap();
+    assert_eq!(report["complete"], false);
+    assert_eq!(report["discoveryComplete"], false);
+    assert!(report["nextAfter"].is_null());
+    assert!(report["hasMore"].is_null());
+}
+
+#[test]
+fn malformed_or_misplaced_cursors_fail_before_any_server_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "pull") else { return; };
+    for after in ["", "../x.scan", "/x.scan", "dir//x.scan", "./x.scan"] {
+        let mut input = request();
+        input["after"] = json!(after);
+        assert!(run(&tool, input).unwrap_err().to_string().contains("LSP_USAGE"));
+    }
+    for action in ["hover", "status", "diagnostics"] {
+        let error = run(&tool, json!({"action":action,"file":"exact.scan","after":"a.scan"})).unwrap_err();
+        assert!(error.to_string().contains("LSP_USAGE"));
+    }
+    assert!(tool.registry.status().is_empty());
+}
+
+#[test]
+fn nested_workspace_roots_start_their_own_servers_without_manual_management() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "pull") else { return; };
+    write(temp.path(), "a.scan", "broken\n");
+    write(temp.path(), "project/.scan-root", "");
+    write(temp.path(), "project/b.scan", "clean\n");
+    let report = run(&tool, request()).unwrap().details.unwrap();
+    assert_eq!(report["complete"], true);
+    assert_eq!(report["checkedFiles"], 2);
+    assert_eq!(tool.registry.status().len(), 2);
+    for root in [temp.path().to_path_buf(), temp.path().join("project")] {
+        assert_eq!(events(&root).iter().filter(|event| event["method"] == "initialize").count(), 1);
+    }
+}
+
+#[test]
+fn active_scanning_does_not_authorize_server_initiated_refactors() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "unsolicited") else { return; };
+    write(temp.path(), "a.scan", "broken\n");
+    let output = run(&tool, request()).unwrap();
+    assert!(!output.is_error);
+    assert_eq!(output.details.unwrap()["complete"], true);
+    // Barrier: the peer has consumed the callback reply before this response.
+    run(&tool, json!({"action":"request","file":"a.scan","method":"test/flush"})).unwrap();
+    let reply: Value = serde_json::from_str(
+        &std::fs::read_to_string(temp.path().join("edit-response.json")).unwrap(),
+    ).unwrap();
+    assert_eq!(reply["applied"], false);
+    assert!(reply["failureReason"].as_str().unwrap().contains("no selected code action"));
+    assert_eq!(std::fs::read_to_string(temp.path().join("a.scan")).unwrap(), "broken\n");
 }

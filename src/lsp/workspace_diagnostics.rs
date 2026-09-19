@@ -21,7 +21,8 @@ const MAX_DEPTH: usize = 64;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
-const RESULT_RESERVE: usize = 8192;
+// Includes two escaped, bounded cursor paths, the glob and fixed metadata.
+const RESULT_RESERVE: usize = 64 * 1024;
 
 fn checkpoint(owner: &AgentCx) -> Result<()> {
     owner.checkpoint().map_err(|_| tool_err("LSP_CANCELLED", "workspace diagnostics cancelled"))?;
@@ -54,6 +55,7 @@ fn matcher(pattern: &str) -> Result<globset::GlobMatcher> {
 struct Discovery {
     files: BTreeSet<String>,
     matched: usize,
+    eligible: usize,
     visited: usize,
     errors: usize,
     stop: Option<&'static str>,
@@ -63,6 +65,7 @@ fn discover(
     root: &Path,
     glob: &globset::GlobMatcher,
     limit: usize,
+    after: Option<&str>,
     owner: &AgentCx,
     started: Instant,
     timeout: Duration,
@@ -119,11 +122,13 @@ fn discover(
         }
         let relative = relative.replace(std::path::MAIN_SEPARATOR, "/");
         found.matched += 1;
+        if after.is_some_and(|after| relative.as_str() <= after) { continue; }
+        found.eligible += 1;
         found.files.insert(relative);
         // Keep a bounded, deterministic first page even with unordered walks.
         if found.files.len() > limit { found.files.pop_last(); }
     }
-    if found.matched > limit { found.stop.get_or_insert("file_limit"); }
+    if found.eligible > limit { found.stop.get_or_insert("file_limit"); }
     Ok(found)
 }
 
@@ -198,6 +203,15 @@ impl LspTool {
 
     pub(super) async fn run_workspace_diagnostics(&self, input: &LspInput, pattern: &str) -> Result<ToolOutput> {
         let glob = matcher(pattern)?;
+        if let Some(after) = input.after.as_deref() {
+            if after.is_empty() || after.len() > MAX_PATH_BYTES || after.contains('\0')
+                || Path::new(after).is_absolute()
+                || Path::new(after).components().any(|part| !matches!(part, Component::Normal(_)))
+                || after.split('/').any(|part| matches!(part, "" | "." | ".."))
+            {
+                return Err(tool_err("LSP_USAGE", "after must be a bounded workspace-relative cursor path"));
+            }
+        }
         if input.limit == Some(0) {
             return Err(tool_err("LSP_USAGE", "diagnostic file limit must be positive"));
         }
@@ -207,7 +221,7 @@ impl LspTool {
         let owner = AgentCx::for_current_or_request();
         checkpoint(&owner)?;
         let root = self.cwd.canonicalize()?;
-        let found = discover(&root, &glob, limit, &owner, started, timeout)?;
+        let found = discover(&root, &glob, limit, input.after.as_deref(), &owner, started, timeout)?;
         let mut stop = found.stop;
         let mut entries = Vec::new();
         let mut guards = Vec::new();
@@ -271,19 +285,32 @@ impl LspTool {
             checkpoint(&owner)?;
             if !disk_hash(&root, relative).is_ok_and(|actual| actual == expected) {
                 entries[index] = json!({"file":relative,"status":"error",
-                    "error":"[LSP_DIAGNOSTIC_STALE] Source changed before the workspace report completed"});
+                    "error":"LSP_DIAGNOSTIC_STALE"});
             }
         }
         let checked = entries.iter().filter(|row| row["status"] == "checked").count();
         let errors = entries.iter().filter(|row| row["status"] == "error").count();
-        let complete = stop.is_none() && found.errors == 0 && !output_truncated
-            && checked == found.matched;
+        // A cursor is sound only after complete discovery: otherwise unvisited
+        // paths may sort before the last emitted name and be skipped forever.
+        let discovery_complete = found.errors == 0
+            && matches!(found.stop, None | Some("file_limit"));
+        let has_more = discovery_complete.then_some(found.eligible > entries.len());
+        let next_after = if has_more == Some(true) {
+            entries.last().and_then(|entry| entry["file"].as_str())
+        } else { None };
+        let page_complete = discovery_complete && !output_truncated
+            && matches!(stop, None | Some("file_limit"))
+            && entries.len() == found.files.len() && checked == entries.len();
+        let complete = input.after.is_none() && page_complete && has_more == Some(false);
         let payload = json!({"action":"workspace_diagnostics","glob":pattern,"cachedOnly":false,
             "complete":complete,"stopReason":stop,"outputTruncated":output_truncated,
+            "after":input.after,"nextAfter":next_after,"hasMore":has_more,
+            "pageComplete":page_complete,"discoveryComplete":discovery_complete,
             "files":entries.len(),"checkedFiles":checked,"failedFiles":errors,
             "matchedFiles":found.matched,"visitedEntries":found.visited,"discoveryErrors":found.errors,
+            "remainingMatchedFiles":found.eligible,
             "entries":entries,"fileLimit":limit,
-            "note":"Document reports for nonignored regular files under cwd, not an atomic project snapshot. Unversioned server pushes cannot prove server-side freshness. Missing or failed reports are not clean files."});
+            "note":"Document reports for nonignored regular files under cwd, not an atomic project snapshot. Continuation pages never claim whole-workspace completeness; files added before a cursor need a fresh scan. Unversioned server pushes cannot prove server-side freshness. Missing or failed reports are not clean files."});
         // A final size guard includes metadata and replacements, not only rows.
         if size_within(&payload, MAX_PAYLOAD_BYTES).is_none() {
             return Err(tool_err("LSP_DIAGNOSTIC_LIMIT", "workspace diagnostic output exceeds its byte limit"));

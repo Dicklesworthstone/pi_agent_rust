@@ -573,6 +573,7 @@ struct LspInput {
     method: Option<String>,
     payload: Option<Value>,
     limit: Option<usize>,
+    after: Option<String>,
     range: Option<text::Range>,
     only: Option<Vec<String>>,
     format_options: Option<Value>,
@@ -620,7 +621,8 @@ impl Tool for LspTool {
                 "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default). workspace_diagnostics instead budgets the whole scan (default 30 seconds, capped at 120); synchronous filesystem operations are not preemptible."},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
                 "payload":{"description":"Raw JSON params for request"},
-                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. workspace_diagnostics checks at most this many files (default 100, capped at 256)."}
+                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. workspace_diagnostics checks at most this many files (default 100, capped at 256)."},
+                "after":{"type":"string","maxLength":4096,"description":"workspace_diagnostics only: resume strictly after the workspace-relative path returned as nextAfter. Use the same glob. This is a stateless path cursor, not a snapshot; complete is false for continuation pages. Inspect pageComplete, hasMore and all per-file failures."}
             }
         })
     }
@@ -642,6 +644,9 @@ impl Tool for LspTool {
         }
         if input.only.is_some() && input.action != "code_actions" {
             return Err(tool_err("LSP_USAGE", "only is supported by code_actions"));
+        }
+        if input.after.is_some() && input.action != "workspace_diagnostics" {
+            return Err(tool_err("LSP_USAGE", "after requires workspace_diagnostics"));
         }
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         let _operation =

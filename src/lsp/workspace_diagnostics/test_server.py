@@ -45,6 +45,10 @@ while True:
     params = message.get("params") or {}
     with (root / "requests.jsonl").open("a", encoding="utf-8") as log:
         log.write(json.dumps({"method": method, "params": params}) + "\n")
+    if method is None:
+        if message.get("id") == "unsolicited-edit":
+            (root / "edit-response.json").write_text(json.dumps(message["result"]), encoding="utf-8")
+        continue
     if method == "exit":
         sys.exit(0)
     if method == "initialized":
@@ -75,6 +79,13 @@ while True:
         result = {"capabilities": capabilities}
     elif method == "textDocument/diagnostic":
         uri = params["textDocument"]["uri"]
+        if mode == "unsolicited" and uri.endswith("/a.scan"):
+            send({"jsonrpc": "2.0", "id": "unsolicited-edit", "method": "workspace/applyEdit",
+                  "params": {"edit": {"changes": {uri: [{
+                      "range": {"start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 6}},
+                      "newText": "changed",
+                  }]}}}})
         if mode == "hang":
             continue
         if mode == "error" and uri.endswith("/a.scan"):
