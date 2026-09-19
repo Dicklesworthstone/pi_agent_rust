@@ -139,6 +139,55 @@ fn remaining_budget(deadline: Instant, now: Instant) -> Result<Duration> {
     }
 }
 
+/// Own the exact generation while a page is in flight. Dropping discovery
+/// (including the outer startup timeout) must retire a request whose result
+/// will never be consumed, without touching a concurrently installed server.
+struct CatalogRequestGuard {
+    entry: Arc<ServerEntry>,
+    transport: Arc<dyn McpTransport>,
+    armed: bool,
+}
+
+impl Drop for CatalogRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            McpManager::fail_transport_generation(
+                &self.entry,
+                &self.transport,
+                &tool_err(
+                    "MCP_CANCELLED",
+                    "tools/list was cancelled before its response was consumed",
+                ),
+            );
+        }
+    }
+}
+
+fn check_catalog_generation(
+    entry: &Arc<ServerEntry>,
+    transport: &Arc<dyn McpTransport>,
+) -> Result<()> {
+    let is_current = McpManager::lock(&entry.transport)
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, transport));
+    if !is_current {
+        transport.abort();
+        return Err(tool_err(
+            "MCP_TRANSPORT_SUPERSEDED",
+            "connection changed during tools/list traversal",
+        ));
+    }
+    if !transport.is_alive() {
+        let error = tool_err(
+            "MCP_TRANSPORT_CLOSED",
+            "connection closed before tools/list completed",
+        );
+        McpManager::fail_transport_generation(entry, transport, &error);
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl McpManager {
     pub(super) async fn collect_tool_catalog(
         &self,
@@ -154,16 +203,7 @@ impl McpManager {
                 Self::close_revoked_transport(entry, transport).await;
                 return Err(error);
             }
-            let is_current = Self::lock(&entry.transport)
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, transport));
-            if !is_current {
-                transport.abort();
-                return Err(tool_err(
-                    "MCP_TRANSPORT_SUPERSEDED",
-                    "connection changed before tools/list page dispatch",
-                ));
-            }
+            check_catalog_generation(entry, transport)?;
             let remaining = match remaining_budget(deadline, Instant::now()) {
                 Ok(remaining) => remaining,
                 Err(error) => {
@@ -171,7 +211,16 @@ impl McpManager {
                     return Err(error);
                 }
             };
-            let result = match transport.request("tools/list", params, remaining).await {
+            let mut request_guard = CatalogRequestGuard {
+                entry: Arc::clone(entry),
+                transport: Arc::clone(transport),
+                armed: true,
+            };
+            let result = transport.request("tools/list", params, remaining).await;
+            // A returned error is handled by the existing failure taxonomy;
+            // only abandonment of the pending future belongs to the guard.
+            request_guard.armed = false;
+            let result = match result {
                 Ok(result) => result,
                 // Tools are optional in MCP. A resource-only server may
                 // explicitly reject the initial tools/list method. Do not
@@ -194,6 +243,7 @@ impl McpManager {
                 Self::close_revoked_transport(entry, transport).await;
                 return Err(error);
             }
+            check_catalog_generation(entry, transport)?;
             // A transport that returns after its allotted deadline cannot
             // publish a late success or buy a fresh timeout for another page.
             if let Err(error) = remaining_budget(deadline, Instant::now()) {
@@ -237,6 +287,7 @@ mod tests {
         requests: Mutex<Vec<(Value, Duration)>>,
         closed: AtomicBool,
         after_page: Mutex<Option<Arc<PageHook>>>,
+        pause_at: Mutex<Option<usize>>,
     }
 
     #[async_trait]
@@ -257,6 +308,10 @@ mod tests {
             let hook = McpManager::lock(&self.after_page).clone();
             if let Some(hook) = hook {
                 hook(index);
+            }
+            let pause = *McpManager::lock(&self.pause_at) == Some(index);
+            if pause {
+                futures::future::pending::<()>().await;
             }
             Ok(page)
         }
@@ -324,6 +379,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             after_page: Mutex::new(hook),
+            pause_at: Mutex::new(None),
         });
         let erased: Arc<dyn McpTransport> = transport.clone();
         *McpManager::lock(&entry.transport) = Some(erased);
@@ -599,6 +655,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             after_page: Mutex::new(None),
+            pause_at: Mutex::new(None),
         });
         let weak_entry = Arc::downgrade(&entry);
         let replacement_for_hook: Arc<dyn McpTransport> = replacement.clone();
@@ -638,5 +695,117 @@ mod tests {
         assert_eq!(mounted[0].1.len(), 1);
         assert_eq!(mounted[0].1[0].name, "replacement");
         assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+    }
+
+    #[test]
+    fn dropped_discovery_retires_first_or_later_pending_page_and_releases_lane() {
+        for pause_at in [1, 2] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, transport) = fixture(
+                &temp,
+                vec![
+                    json!({"tools":[tool("first")],"nextCursor":"more"}),
+                    json!({"tools":[tool("last")]}),
+                ],
+                None,
+            );
+            *McpManager::lock(&transport.pause_at) = Some(pause_at);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let mut discovery = Box::pin(manager.list_and_cache_tools(&entry));
+                assert!(futures::poll!(discovery.as_mut()).is_pending());
+                assert_eq!(McpManager::lock(&transport.requests).len(), pause_at);
+                assert!(!transport.closed.load(Ordering::Acquire));
+                drop(discovery);
+                assert!(transport.closed.load(Ordering::Acquire));
+                assert!(McpManager::lock(&entry.transport).is_none());
+                assert!(McpManager::lock(&entry.tools_cache).is_none());
+                assert!(manager.mounted_tool_metas().is_empty());
+                assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+                assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn dropping_unpolled_discovery_does_not_retire_a_healthy_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![], None);
+        drop(Box::pin(manager.list_and_cache_tools(&entry)));
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(McpManager::lock(&entry.transport).is_some());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+    }
+
+    #[test]
+    fn cancellation_of_an_old_catalog_preserves_replacement_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, old) = fixture(
+            &temp,
+            vec![json!({"tools":[tool("obsolete")]})],
+            None,
+        );
+        *McpManager::lock(&old.pause_at) = Some(1);
+        let replacement = Arc::new(PagedTransport {
+            pages: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            after_page: Mutex::new(None),
+            pause_at: Mutex::new(None),
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut discovery = Box::pin(manager.list_and_cache_tools(&entry));
+            assert!(futures::poll!(discovery.as_mut()).is_pending());
+            assert_eq!(McpManager::lock(&old.requests).len(), 1);
+            let erased: Arc<dyn McpTransport> = replacement.clone();
+            *McpManager::lock(&entry.transport) = Some(erased);
+            *McpManager::lock(&entry.tools_cache) = Some((
+                Instant::now(),
+                vec![McpToolMeta {
+                    name: "replacement".to_string(),
+                    description: String::new(),
+                    input_schema: json!({}),
+                }],
+            ));
+            *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
+            drop(discovery);
+            assert!(old.closed.load(Ordering::Acquire));
+            assert!(!replacement.closed.load(Ordering::Acquire));
+            let mounted = manager.mounted_tool_metas();
+            assert_eq!(mounted.len(), 1);
+            assert_eq!(mounted[0].1[0].name, "replacement");
+            assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+            assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+        });
+    }
+
+    #[test]
+    fn a_final_page_from_a_dead_transport_is_not_publishable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![json!({"tools":[tool("must-not-mount")]})],
+            None,
+        );
+        let weak = Arc::downgrade(&transport);
+        *McpManager::lock(&transport.after_page) = Some(Arc::new(move |_| {
+            weak.upgrade().expect("transport alive").abort();
+        }));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(manager.list_and_cache_tools(&entry))
+            .expect_err("dead generation");
+        assert!(error.to_string().contains("MCP_TRANSPORT_CLOSED"));
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert!(manager.mounted_tool_metas().is_empty());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
     }
 }
