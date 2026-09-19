@@ -1630,6 +1630,79 @@ fn e2e_cli_fetch_models_rejects_unsafe_static_fallback_ids() {
 }
 
 #[test]
+/// bd-print-json-panics-on-closed-stdout: `pi --print --mode json | head` must
+/// end quietly, not panic and file a crash report against the user.
+///
+/// `println!` panics when the write fails, and Rust disables SIGPIPE at
+/// startup, so a reader that closed the pipe used to arrive as EPIPE on every
+/// subsequent write and take the process down with
+/// "failed printing to stdout: Broken pipe". The crash bundle then announced
+/// itself as "previous run crashed" on the NEXT invocation, so the noise
+/// outlived the run that caused it.
+///
+/// The bundle directory is the assertion because it is the part a user sees.
+/// No provider credentials are configured here and none are needed: the
+/// `session` frame is written before any provider is touched, which is already
+/// past the write that used to panic.
+#[test]
+fn e2e_cli_print_json_ends_quietly_when_its_reader_closes_the_pipe() {
+    let harness = CliTestHarness::new("e2e_cli_print_json_ends_quietly_when_its_reader_closes");
+    let mut command = Command::new(&harness.binary_path);
+    command
+        .args(["--print", "--mode", "json", "hello"])
+        .envs(harness.env.clone())
+        .current_dir(harness.harness.temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("spawn pi --print --mode json");
+
+    // Read one line, then drop the pipe — this is `| head -1`.
+    let stdout = child.stdout.take().expect("child stdout pipe");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut first).expect("read the first frame");
+    assert!(
+        first.contains("\"type\":\"session\""),
+        "expected the session frame first, got {first:?}"
+    );
+    drop(reader);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().expect("poll pi").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pi did not exit after its stdout reader went away"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let crashes = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent dir"),
+    )
+    .join("crashes");
+    let bundles: Vec<String> = fs::read_dir(&crashes)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        bundles.is_empty(),
+        "a closed stdout pipe must not produce a crash bundle; found {bundles:?} in {}",
+        crashes.display()
+    );
+}
+
+#[test]
 fn e2e_cli_fetch_models_does_not_wait_for_stdin_eof() {
     let harness = CliTestHarness::new("e2e_cli_fetch_models_does_not_wait_for_stdin_eof");
     let mut command = Command::new(&harness.binary_path);

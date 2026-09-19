@@ -764,6 +764,50 @@ mod tests {
         assert_eq!(cli.session_dir.as_deref(), Some("/tmp/sessions"));
     }
 
+    /// bd-print-session-path-persists-nothing: the exact print-mode argv, since
+    /// `parse_session_path` above proves only the two-token form.
+    ///
+    /// `args` is `trailing_var_arg`, so everything from the first positional on
+    /// is a message — including things that look like flags. This pins that
+    /// `--session` placed BEFORE the message still binds, and that the message
+    /// does not end up in `session`.
+    #[test]
+    fn parse_session_path_in_a_full_print_mode_argv() {
+        let cli = Cli::parse_from([
+            "pi",
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            "/tmp/session.jsonl",
+            "--provider",
+            "e2eprimary",
+            "--model",
+            "primary-model",
+            "hello",
+        ]);
+        assert_eq!(cli.session.as_deref(), Some("/tmp/session.jsonl"));
+        assert!(cli.print);
+        assert_eq!(cli.mode.as_deref(), Some("json"));
+        assert_eq!(cli.message_args(), vec!["hello".to_string()]);
+    }
+
+    /// The same argv without the trailing message, which is the shape that
+    /// showed `--session` having no effect at runtime.
+    #[test]
+    fn parse_session_path_without_a_message() {
+        let cli = Cli::parse_from([
+            "pi",
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            "/tmp/s.jsonl",
+        ]);
+        assert_eq!(cli.session.as_deref(), Some("/tmp/s.jsonl"));
+        assert!(cli.message_args().is_empty());
+    }
+
     #[test]
     fn parse_no_session() {
         let cli = Cli::parse_from(["pi", "--no-session"]);
