@@ -746,11 +746,15 @@ mod tests {
     #[test]
     fn entry_and_blob_changes_follow_the_callers_transaction_rollback() {
         with_database(|conn| {
-            insert_entry_jsons(conn, &[encoded(&fixture("first", 1))], 0)?;
+            insert_entry_jsons(conn, [Ok(encoded(&fixture("first", 1)))].into_iter(), 0)?;
             assert_eq!(count(conn), 1);
             map_sqlite_result(conn.execute_raw("SAVEPOINT pending_append"))?;
-            insert_entry_jsons(conn, &[encoded(&fixture("second", 2)), "{".to_string()], 1)
-                .expect_err("late entry serialization failure");
+            insert_entry_jsons(
+                conn,
+                [Ok(encoded(&fixture("second", 2))), Ok("{".to_string())].into_iter(),
+                1,
+            )
+            .expect_err("late entry serialization failure");
             assert_eq!(count(conn), 2, "new blob was staged inside the savepoint");
             map_sqlite_result(
                 conn.execute_raw("ROLLBACK TO pending_append; RELEASE pending_append"),

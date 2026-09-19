@@ -3,11 +3,11 @@ use crate::session::{SessionEntry, SessionHeader};
 use crate::session_metrics;
 use fsqlite::{FrankenError as SqliteError, Row as SqliteRow, SqliteValue};
 use sha2::{Digest as _, Sha256};
-use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 mod attachments;
+mod entry_io;
 
 /// Suffixes of every auxiliary file the fsqlite engine may create or read
 /// beside a database file. `-journal` covers legacy rollback-journal
@@ -373,13 +373,7 @@ fn ensure_private_sqlite_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct StoredEntry {
-    entry: SessionEntry,
-    canonical_json: String,
-}
-
-fn read_stored_entries(conn: &SqliteConnection) -> Result<Vec<StoredEntry>> {
+fn read_stored_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
     let entry_rows = map_sqlite_result(conn.query_sync(
         "SELECT seq,json FROM pi_session_entries ORDER BY seq ASC",
         &[],
@@ -398,21 +392,13 @@ fn read_stored_entries(conn: &SqliteConnection) -> Result<Vec<StoredEntry>> {
             )));
         }
         let json = row_get_string(&row, 1, "json")?;
-        let entry = attachments::decode_entry(conn, &json)?;
-        let canonical_json = serde_json::to_string(&entry)?;
-        entries.push(StoredEntry {
-            entry,
-            canonical_json,
-        });
+        entries.push(attachments::decode_entry(conn, &json)?);
     }
     Ok(entries)
 }
 
 fn read_all_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
-    Ok(read_stored_entries(conn)?
-        .into_iter()
-        .map(|stored| stored.entry)
-        .collect())
+    read_stored_entries(conn)
 }
 
 fn is_missing_meta_table_error(err: &SqliteError) -> bool {
@@ -451,8 +437,7 @@ fn compute_message_count_and_name(entries: &[SessionEntry]) -> (u64, Option<Stri
 
 struct ReconciledEntries {
     entries: Vec<SessionEntry>,
-    json: Vec<String>,
-    appended_json: Vec<String>,
+    appended_start: usize,
 }
 
 fn validate_unique_incoming_entry_ids(entries: &[SessionEntry], context: &str) -> Result<()> {
@@ -471,55 +456,45 @@ fn validate_unique_incoming_entry_ids(entries: &[SessionEntry], context: &str) -
 }
 
 fn reconcile_entries(
-    stored_entries: Vec<StoredEntry>,
+    stored_entries: Vec<SessionEntry>,
     incoming_entries: &[SessionEntry],
 ) -> Result<ReconciledEntries> {
-    let mut entries = Vec::with_capacity(stored_entries.len() + incoming_entries.len());
-    let mut json = Vec::with_capacity(stored_entries.len() + incoming_entries.len());
-    let mut by_id =
-        std::collections::HashMap::with_capacity(stored_entries.len() + incoming_entries.len());
+    let mut entries = stored_entries;
+    let appended_start = entries.len();
+    let mut by_id = std::collections::HashMap::with_capacity(entries.len());
 
-    for stored in stored_entries {
+    for (index, stored) in entries.iter().enumerate() {
         let id = stored
-            .entry
             .base_id()
             .ok_or_else(|| Error::session("persisted SQLite session entry is missing its ID"))?;
-        if by_id
-            .insert(id.clone(), stored.canonical_json.clone())
-            .is_some()
-        {
+        if by_id.insert(id.clone(), index).is_some() {
             return Err(Error::session(format!(
                 "persisted SQLite session contains duplicate entry ID {id}"
             )));
         }
-        entries.push(stored.entry);
-        json.push(stored.canonical_json);
     }
 
-    let mut appended_json = Vec::new();
     for incoming in incoming_entries {
         let id = incoming
             .base_id()
             .ok_or_else(|| Error::session("SQLite session entry is missing its ID"))?;
-        let encoded = serde_json::to_string(incoming)?;
-        if let Some(persisted) = by_id.get(id) {
-            if persisted != &encoded {
+        if let Some(&index) = by_id.get(id) {
+            // Compare exact canonical bytes for this ID only. Do not keep a
+            // second serialized copy of every hydrated media entry alive.
+            if !entry_io::canonical_matches(&entries[index], incoming)? {
                 return Err(Error::session(format!(
                     "SQLite session entry ID {id} has conflicting persisted content"
                 )));
             }
             continue;
         }
-        by_id.insert(id.clone(), encoded.clone());
+        by_id.insert(id.clone(), entries.len());
         entries.push(incoming.clone());
-        json.push(encoded.clone());
-        appended_json.push(encoded);
     }
 
     Ok(ReconciledEntries {
         entries,
-        json,
-        appended_json,
+        appended_start,
     })
 }
 
@@ -536,42 +511,32 @@ fn validate_sqlite_sequence_range(start_seq: usize, entry_count: usize) -> Resul
 
 fn insert_entry_jsons(
     conn: &SqliteConnection,
-    json: &[String],
+    json: impl ExactSizeIterator<Item = Result<String>>,
     existing_entry_count: usize,
 ) -> Result<()> {
     validate_sqlite_sequence_range(existing_entry_count, json.len())?;
-    if json.is_empty() {
+    if json.len() == 0 {
         return Ok(());
     }
     let mut seq = i64::try_from(existing_entry_count)
         .map_err(|_| Error::session("SQLite existing entry count exceeds i64"))?
         .checked_add(1)
         .ok_or_else(|| Error::session("SQLite session sequence overflow"))?;
-    let mut remaining = json.len();
+    let entry_count = json.len();
     // The caller owns the transaction: blobs and the entries referencing them
     // must commit or roll back together, on full saves and incremental appends.
     let mut encoder = attachments::EntryEncoder::new(conn);
-    for chunk in json.chunks(200) {
-        let mut sql = String::with_capacity(64 + chunk.len() * 16);
-        sql.push_str("INSERT INTO pi_session_entries (seq,json) VALUES ");
-        let mut params = Vec::with_capacity(chunk.len() * 2);
-        for (index, entry_json) in chunk.iter().enumerate() {
-            if index > 0 {
-                sql.push(',');
-            }
-            let _ = write!(sql, "(?{},?{})", index * 2 + 1, index * 2 + 2);
-            params.push(SqliteValue::from(seq));
-            params.push(SqliteValue::from(encoder.encode(entry_json)?));
-            remaining -= 1;
-            if remaining > 0 {
-                seq = seq
-                    .checked_add(1)
-                    .ok_or_else(|| Error::session("SQLite session sequence overflow"))?;
-            }
+    let mut batch = entry_io::InsertBatch::new(conn);
+    for (index, entry_json) in json.enumerate() {
+        let stored = encoder.encode(&entry_json?)?;
+        batch.push(seq, stored)?;
+        if index + 1 < entry_count {
+            seq = seq
+                .checked_add(1)
+                .ok_or_else(|| Error::session("SQLite session sequence overflow"))?;
         }
-        map_sqlite_result(conn.execute_sync(&sql, &params))?;
     }
-    Ok(())
+    batch.finish()
 }
 
 fn write_session_meta(conn: &SqliteConnection, entries: &[SessionEntry]) -> Result<()> {
@@ -808,6 +773,54 @@ mod tests {
             base: dummy_base(),
             name,
         })
+    }
+
+    #[test]
+    fn reconciliation_keeps_concurrent_entries_and_only_appends_new_ids() {
+        let original = message_entry_with_id("original", "one");
+        let concurrent = message_entry_with_id("concurrent", "two");
+        let incoming = message_entry_with_id("incoming", "three");
+        let reconciled = reconcile_entries(
+            vec![original.clone(), concurrent],
+            &[original, incoming],
+        )
+        .expect("merge stale snapshot");
+        assert_eq!(reconciled.appended_start, 2);
+        let ids: Vec<_> = reconciled
+            .entries
+            .iter()
+            .map(|entry| entry.base_id().expect("ID").as_str())
+            .collect();
+        assert_eq!(ids, ["original", "concurrent", "incoming"]);
+    }
+
+    #[test]
+    fn reconciliation_does_not_treat_equal_length_payloads_as_equal() {
+        let original = message_entry_with_id("same", "one");
+        let conflicting = message_entry_with_id("same", "two");
+        let error = reconcile_entries(vec![original], &[conflicting])
+            .err()
+            .expect("conflicting ID");
+        assert!(error.to_string().contains("conflicting persisted content"));
+    }
+
+    #[test]
+    fn reconciliation_checks_persisted_ids_even_without_incoming_entries() {
+        let original = message_entry_with_id("duplicate", "content");
+        let error = reconcile_entries(vec![original.clone(), original], &[])
+            .err()
+            .expect("persisted duplicate ID");
+        assert!(error.to_string().contains("duplicate entry ID"));
+    }
+
+    #[test]
+    fn idempotent_reconciliation_has_an_empty_append_range() {
+        let original = message_entry_with_id("unchanged", "quotes: \"\\\n🙂");
+        let reconciled = reconcile_entries(vec![original.clone()], &[original])
+            .expect("idempotent replay");
+        assert_eq!(reconciled.entries.len(), 1);
+        assert_eq!(reconciled.appended_start, 1);
+        assert!(reconciled.entries[reconciled.appended_start..].is_empty());
     }
 
     #[test]
@@ -2316,16 +2329,13 @@ pub async fn save_session(
             let reconciled = reconcile_entries(read_stored_entries(&conn)?, entries)?;
             crate::session::validate_session_entry_graph(&reconciled.entries)?;
             validate_sqlite_json_for_write("session header", &header_json)?;
-            for entry_json in &reconciled.json {
-                validate_sqlite_json_for_write("session entry", entry_json)?;
-            }
-            validate_sqlite_sequence_range(0, reconciled.json.len())?;
+            validate_sqlite_sequence_range(0, reconciled.entries.len())?;
             let mut total_json_bytes = u64::try_from(header_json.len())
                 .map_err(|_| Error::session("SQLite header JSON length exceeds u64"))?;
-            for entry_json in &reconciled.json {
+            for entry in &reconciled.entries {
                 total_json_bytes = total_json_bytes
                     .checked_add(
-                        u64::try_from(entry_json.len())
+                        u64::try_from(entry_io::serialized_len(entry)?)
                             .map_err(|_| Error::session("SQLite entry JSON length exceeds u64"))?,
                     )
                     .ok_or_else(|| Error::session("SQLite serialized byte count overflow"))?;
@@ -2344,7 +2354,11 @@ pub async fn save_session(
                     SqliteValue::from(header_json),
                 ],
             ))?;
-            insert_entry_jsons(&conn, &reconciled.json, 0)?;
+            insert_entry_jsons(
+                &conn,
+                reconciled.entries.iter().map(entry_io::encode_entry),
+                0,
+            )?;
             write_session_meta(&conn, &reconciled.entries)?;
 
             Ok((header_to_write, reconciled.entries))
@@ -2416,23 +2430,26 @@ pub async fn append_entries(
             }
             let reconciled = reconcile_entries(stored_entries, new_entries)?;
             crate::session::validate_session_entry_graph(&reconciled.entries)?;
-            for entry_json in &reconciled.json {
-                validate_sqlite_json_for_write("session entry", entry_json)?;
-            }
-            validate_sqlite_sequence_range(existing_entry_count, reconciled.appended_json.len())?;
+            let appended = &reconciled.entries[reconciled.appended_start..];
+            validate_sqlite_sequence_range(existing_entry_count, appended.len())?;
             let mut total_json_bytes = 0u64;
-            for entry_json in &reconciled.appended_json {
-                total_json_bytes = total_json_bytes
-                    .checked_add(
-                        u64::try_from(entry_json.len())
-                            .map_err(|_| Error::session("SQLite entry JSON length exceeds u64"))?,
-                    )
-                    .ok_or_else(|| Error::session("SQLite serialized byte count overflow"))?;
+            for (index, entry) in reconciled.entries.iter().enumerate() {
+                let bytes = u64::try_from(entry_io::serialized_len(entry)?)
+                    .map_err(|_| Error::session("SQLite entry JSON length exceeds u64"))?;
+                if index >= reconciled.appended_start {
+                    total_json_bytes = total_json_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| Error::session("SQLite serialized byte count overflow"))?;
+                }
             }
             serialize_timer.finish();
             metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
 
-            insert_entry_jsons(&conn, &reconciled.appended_json, existing_entry_count)?;
+            insert_entry_jsons(
+                &conn,
+                appended.iter().map(entry_io::encode_entry),
+                existing_entry_count,
+            )?;
             write_session_meta(&conn, &reconciled.entries)?;
             #[cfg(feature = "internal-persistence-fault-injection")]
             {
