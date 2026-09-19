@@ -54,7 +54,7 @@ impl State {
         Ok(())
     }
 
-    fn event(&mut self, event: DapEvent) -> Result<()> {
+    fn event(&mut self, event: &DapEvent) -> Result<()> {
         match event.event.as_str() {
             "initialized" => self.initialized = true,
             // Area/thread/frame IDs are advisory hints. Conservatively expire
@@ -87,7 +87,7 @@ pub struct DapSession {
     state: Mutex<State>,
     pub(super) breakpoints: Arc<asupersync::sync::Mutex<Store>>,
     inspection: Arc<asupersync::sync::Mutex<inspection::Handles>>,
-    _launch_artifacts: Option<tempfile::TempDir>,
+    launch_artifacts: Option<tempfile::TempDir>,
 }
 
 impl DapSession {
@@ -118,12 +118,12 @@ impl DapSession {
             }),
             breakpoints: Arc::new(asupersync::sync::Mutex::new(Store::default())),
             inspection: Arc::new(asupersync::sync::Mutex::new(inspection::Handles::default())),
-            _launch_artifacts: None,
+            launch_artifacts: None,
         })
     }
 
     pub(super) fn with_launch_artifacts(mut self, directory: Option<tempfile::TempDir>) -> Self {
-        self._launch_artifacts = directory;
+        self.launch_artifacts = directory;
         self
     }
 
@@ -159,10 +159,16 @@ impl DapSession {
     #[must_use]
     pub fn execution_snapshot(&self) -> Value {
         self.pump_events();
-        let state = Self::lock(&self.state);
-        let mut snapshot = state.execution.snapshot();
-        snapshot["inspectionRevision"] = json!(state.inspection_revision);
-        if let Some(fault) = &state.fault {
+        let (mut snapshot, inspection_revision, fault) = {
+            let state = Self::lock(&self.state);
+            (
+                state.execution.snapshot(),
+                state.inspection_revision,
+                state.fault.clone(),
+            )
+        };
+        snapshot["inspectionRevision"] = json!(inspection_revision);
+        if let Some(fault) = &fault {
             snapshot["fault"] = json!(fault);
         }
         snapshot
@@ -191,7 +197,7 @@ impl DapSession {
         let failed = {
             let mut state = Self::lock(&self.state);
             for event in self.transport.drain_events() {
-                if let Err(error) = state.event(event) {
+                if let Err(error) = state.event(&event) {
                     state.fault = Some(error.to_string());
                     state.execution.exit();
                     break;
@@ -347,19 +353,22 @@ impl DapSession {
                 return None;
             }
             self.pump_events();
-            {
+            let stopped = {
                 let state = Self::lock(&self.state);
                 if state.execution.aggregate() == ExecState::Exited {
                     return None;
                 }
                 if let Some((revision, thread)) = state.stop_wait {
-                    if let Some(stop) = state.execution.stopped_since(revision, thread) {
-                        return Some(stop);
-                    }
+                    state.execution.stopped_since(revision, thread)
                 } else if let ExecState::Stopped { thread_id, reason } = state.execution.aggregate()
                 {
-                    return Some((thread_id, reason));
+                    Some((thread_id, reason))
+                } else {
+                    None
                 }
+            };
+            if let Some(stop) = stopped {
+                return Some(stop);
             }
             let now = owner
                 .cx()
@@ -432,6 +441,7 @@ impl DapSession {
             if own_wait.is_some() {
                 state.stop_wait = own_wait;
             }
+            drop(state);
             (previous, revision, previous_wait, own_wait)
         };
         let result = self
@@ -567,13 +577,13 @@ mod tests {
     fn initialized_and_stopped_in_the_same_batch_are_both_retained() {
         let mut state = state();
         state
-            .event(DapEvent {
+            .event(&DapEvent {
                 event: "initialized".into(),
                 body: json!({}),
             })
             .unwrap();
         state
-            .event(DapEvent {
+            .event(&DapEvent {
                 event: "stopped".into(),
                 body: json!({"threadId":7,"reason":"entry"}),
             })
@@ -584,7 +594,7 @@ mod tests {
             ExecState::Stopped { thread_id: 7, .. }
         ));
         state
-            .event(DapEvent {
+            .event(&DapEvent {
                 event: "continued".into(),
                 body: json!({}),
             })
@@ -597,20 +607,20 @@ mod tests {
     fn terminal_state_is_not_resurrected_and_capabilities_merge() {
         let mut state = state();
         state
-            .event(DapEvent {
+            .event(&DapEvent {
                 event: "capabilities".into(),
                 body: json!({"capabilities":{"supportsLogPoints":true}}),
             })
             .unwrap();
         assert_eq!(state.capabilities["supportsLogPoints"], true);
         state
-            .event(DapEvent {
+            .event(&DapEvent {
                 event: "exited".into(),
                 body: json!({}),
             })
             .unwrap();
         state
-            .event(DapEvent {
+            .event(&DapEvent {
                 event: "stopped".into(),
                 body: json!({"threadId":3}),
             })
@@ -622,14 +632,14 @@ mod tests {
     fn invalidated_refreshes_handles_without_manufacturing_a_new_stop() {
         let mut state = state();
         state
-            .event(DapEvent {
+            .event(&DapEvent {
                 event: "stopped".into(),
                 body: json!({"threadId":7,"reason":"entry"}),
             })
             .unwrap();
         let stop = state.execution.stamp(7);
         state
-            .event(DapEvent {
+            .event(&DapEvent {
                 event: "invalidated".into(),
                 body: json!({"areas":["variables"],"threadId":7}),
             })

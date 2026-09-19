@@ -127,87 +127,93 @@ impl Execution {
         self.threads.clear();
     }
 
+    fn on_stopped(&mut self, body: &Value) -> Result<()> {
+        let all = boolean(body, "allThreadsStopped", false)?;
+        let id = thread_id(body.get("threadId"))?;
+        if !all && id.is_none() {
+            return Err(tool_err(
+                "DAP_PROTOCOL",
+                "single-thread stopped event omitted threadId",
+            ));
+        }
+        let reason = body["reason"]
+            .as_str()
+            .filter(|reason| !reason.is_empty())
+            .ok_or_else(|| tool_err("DAP_PROTOCOL", "stopped event omitted reason"))?;
+        let revision = self.advance()?;
+        let reason: String = reason.chars().take(1024).collect();
+        let mut details = json!({"reason":reason});
+        for key in ["description", "text"] {
+            if let Some(text) = body[key].as_str() {
+                details[key] = json!(text.chars().take(4096).collect::<String>());
+            }
+        }
+        if let Some(ids) = body["hitBreakpointIds"].as_array() {
+            details["hitBreakpointIds"] = json!(
+                ids.iter()
+                    .filter_map(Value::as_i64)
+                    .take(256)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let cell = Cell {
+            status: Status::Stopped(Arc::new(Stop {
+                revision,
+                reason,
+                details,
+            })),
+            revision,
+        };
+        if all {
+            self.baseline = cell.clone();
+            for thread in self.threads.values_mut() {
+                thread.cell = cell.clone();
+            }
+        }
+        if let Some(id) = id {
+            self.insert(id)?.cell = cell;
+            if body["preserveFocusHint"] != true || self.selected.is_none() {
+                self.selected = Some(id);
+            }
+        }
+        self.choose();
+        Ok(())
+    }
+
+    fn on_continued(&mut self, body: &Value) -> Result<()> {
+        let all = boolean(body, "allThreadsContinued", true)?;
+        let id = thread_id(body.get("threadId"))?;
+        if !all && id.is_none() {
+            return Err(tool_err(
+                "DAP_PROTOCOL",
+                "partial continued event omitted threadId",
+            ));
+        }
+        let revision = self.advance()?;
+        let cell = Cell {
+            status: Status::Running,
+            revision,
+        };
+        if all {
+            self.baseline = cell.clone();
+            for thread in self.threads.values_mut() {
+                thread.cell = cell.clone();
+            }
+        }
+        if let Some(id) = id {
+            self.insert(id)?.cell = cell;
+        }
+        self.choose();
+        Ok(())
+    }
+
     pub(super) fn event(&mut self, name: &str, body: &Value) -> Result<()> {
         if self.exited {
             return Ok(());
         }
         match name {
-            "stopped" => {
-                let all = boolean(body, "allThreadsStopped", false)?;
-                let id = thread_id(body.get("threadId"))?;
-                if !all && id.is_none() {
-                    return Err(tool_err(
-                        "DAP_PROTOCOL",
-                        "single-thread stopped event omitted threadId",
-                    ));
-                }
-                let reason = body["reason"]
-                    .as_str()
-                    .filter(|reason| !reason.is_empty())
-                    .ok_or_else(|| tool_err("DAP_PROTOCOL", "stopped event omitted reason"))?;
-                let revision = self.advance()?;
-                let reason: String = reason.chars().take(1024).collect();
-                let mut details = json!({"reason":reason});
-                for key in ["description", "text"] {
-                    if let Some(text) = body[key].as_str() {
-                        details[key] = json!(text.chars().take(4096).collect::<String>());
-                    }
-                }
-                if let Some(ids) = body["hitBreakpointIds"].as_array() {
-                    details["hitBreakpointIds"] = json!(
-                        ids.iter()
-                            .filter_map(Value::as_i64)
-                            .take(256)
-                            .collect::<Vec<_>>()
-                    );
-                }
-                let cell = Cell {
-                    status: Status::Stopped(Arc::new(Stop {
-                        revision,
-                        reason,
-                        details,
-                    })),
-                    revision,
-                };
-                if all {
-                    self.baseline = cell.clone();
-                    for thread in self.threads.values_mut() {
-                        thread.cell = cell.clone();
-                    }
-                }
-                if let Some(id) = id {
-                    self.insert(id)?.cell = cell;
-                    if body["preserveFocusHint"] != true || self.selected.is_none() {
-                        self.selected = Some(id);
-                    }
-                }
-                self.choose();
-            }
-            "continued" => {
-                let all = boolean(body, "allThreadsContinued", true)?;
-                let id = thread_id(body.get("threadId"))?;
-                if !all && id.is_none() {
-                    return Err(tool_err(
-                        "DAP_PROTOCOL",
-                        "partial continued event omitted threadId",
-                    ));
-                }
-                let revision = self.advance()?;
-                let cell = Cell {
-                    status: Status::Running,
-                    revision,
-                };
-                if all {
-                    self.baseline = cell.clone();
-                    for thread in self.threads.values_mut() {
-                        thread.cell = cell.clone();
-                    }
-                }
-                if let Some(id) = id {
-                    self.insert(id)?.cell = cell;
-                }
-                self.choose();
-            }
+            "stopped" => self.on_stopped(body)?,
+            "continued" => self.on_continued(body)?,
             "thread" => {
                 let id = thread_id(body.get("threadId"))?
                     .ok_or_else(|| tool_err("DAP_PROTOCOL", "thread event omitted threadId"))?;
@@ -436,12 +442,11 @@ impl Execution {
 }
 
 fn boolean(body: &Value, key: &str, default: bool) -> Result<bool> {
-    match body.get(key) {
-        None => Ok(default),
-        Some(value) => value
+    body.get(key).map_or(Ok(default), |value| {
+        value
             .as_bool()
-            .ok_or_else(|| tool_err("DAP_PROTOCOL", format!("{key} must be boolean"))),
-    }
+            .ok_or_else(|| tool_err("DAP_PROTOCOL", format!("{key} must be boolean")))
+    })
 }
 
 fn thread_id(value: Option<&Value>) -> Result<Option<u64>> {

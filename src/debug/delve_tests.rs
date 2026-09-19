@@ -183,7 +183,7 @@ fn invalid_go_modes_and_startup_budgets_fail_before_adapter_dispatch() {
         json!({"action":"launch","goMode":"remote"}),
         json!({"action":"attach","goMode":"debug"}),
         json!({"action":"launch","startupTimeoutMs":0}),
-        json!({"action":"launch","startupTimeoutMs":300001}),
+        json!({"action":"launch","startupTimeoutMs":300_001}),
         json!({"action":"threads","startupTimeoutMs":10}),
     ] {
         let input: DebugInput = serde_json::from_value(args).unwrap();

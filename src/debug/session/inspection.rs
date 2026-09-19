@@ -14,7 +14,7 @@ use super::{DapSession, State, tool_err};
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
 
-pub(crate) const MAX_HANDLE: u64 = 9_007_199_254_740_991;
+pub(super) const MAX_HANDLE: u64 = 9_007_199_254_740_991;
 const MAX_HANDLES: usize = 8192;
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
@@ -262,9 +262,6 @@ pub(super) async fn call(
         .map_err(|_| tool_err("DAP_CANCELLED", "debug inspection cancelled while queued"))?;
     session.pump_events();
     let before = {
-        let state = DapSession::lock(&session.state);
-        state.check()?;
-        handles.prune(&state.execution, state.inspection_revision);
         let mut bound = None;
         for (field, kind) in [
             ("frameId", Kind::Frame),
@@ -286,7 +283,10 @@ pub(super) async fn call(
             }
         }
         let selected = arguments.get("threadId").and_then(Value::as_u64);
-        if let Some(at) = bound {
+        let state = DapSession::lock(&session.state);
+        state.check()?;
+        handles.prune(&state.execution, state.inspection_revision);
+        let res = if let Some(at) = bound {
             if selected.is_some_and(|thread| thread != at.thread) {
                 return Err(tool_err(
                     "DAP_USAGE",
@@ -309,7 +309,9 @@ pub(super) async fn call(
                 ));
             }
             suspension(&state, thread)?
-        }
+        };
+        drop(state);
+        res
     };
     // threadId on object/frame actions is Pi's ownership precondition, not a
     // field defined by DAP for scopes, variables, evaluate or assignments.
@@ -329,7 +331,9 @@ pub(super) async fn call(
     let after = {
         let state = DapSession::lock(&session.state);
         handles.prune(&state.execution, state.inspection_revision);
-        suspension(&state, before.thread)?
+        let res = suspension(&state, before.thread)?;
+        drop(state);
+        res
     };
     if before.stop != after.stop || (!mutating && before.inspection != after.inspection) {
         return Err(tool_err(

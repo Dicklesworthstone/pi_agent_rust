@@ -102,23 +102,7 @@ impl DapTransport {
                 "Delve exited after announcing its endpoint",
             ));
         }
-        // Connect on a dedicated bounded OS operation, never on the async
-        // worker. If this wait is dropped, the channel drops any late socket.
-        let (connected_tx, connected_rx) = sync_channel(1);
-        std::thread::Builder::new()
-            .name("pi-delve-connect".into())
-            .spawn(move || {
-                let result = TcpStream::connect_timeout(&endpoint, CONNECT_TIMEOUT)
-                    .map_err(|error| format!("cannot connect to owned Delve endpoint: {error}"));
-                let _ = connected_tx.send(result);
-            })
-            .map_err(|error| {
-                tool_err("DAP_TRANSPORT", format!("cannot connect to Delve: {error}"))
-            })?;
-        let socket = await_completion(connected_rx, STARTUP_TIMEOUT, || {})
-            .await
-            .map_err(startup_error)?
-            .map_err(|message| tool_err("DAP_TRANSPORT", message))?;
+        let socket = connect_endpoint(&endpoint).await?;
         owner
             .checkpoint()
             .map_err(|_| tool_err("DAP_CANCELLED", "Delve startup cancelled"))?;
@@ -136,6 +120,23 @@ impl DapTransport {
             tail,
         }))
     }
+}
+
+async fn connect_endpoint(endpoint: &SocketAddr) -> Result<TcpStream> {
+    let (connected_tx, connected_rx) = sync_channel(1);
+    let target = *endpoint;
+    std::thread::Builder::new()
+        .name("pi-delve-connect".into())
+        .spawn(move || {
+            let result = TcpStream::connect_timeout(&target, CONNECT_TIMEOUT)
+                .map_err(|error| format!("cannot connect to owned Delve endpoint: {error}"));
+            let _ = connected_tx.send(result);
+        })
+        .map_err(|error| tool_err("DAP_TRANSPORT", format!("cannot connect to Delve: {error}")))?;
+    await_completion(connected_rx, STARTUP_TIMEOUT, || {})
+        .await
+        .map_err(startup_error)?
+        .map_err(|message| tool_err("DAP_TRANSPORT", message))
 }
 
 fn startup_error(error: CompletionWaitError) -> crate::error::Error {

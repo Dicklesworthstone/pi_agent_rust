@@ -149,6 +149,7 @@ fn capture(tool: &DebugTool, runtime: &asupersync::runtime::Runtime) -> Vec<Valu
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)]
 fn breakpoint_workflow_preserves_all_families_and_removes_individual_entries() {
     let temp = tempfile::tempdir().unwrap();
     let Some(tool) = fixture(temp.path(), "normal") else {

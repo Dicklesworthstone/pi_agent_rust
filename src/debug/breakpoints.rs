@@ -26,7 +26,7 @@ pub(super) enum Group {
 }
 
 impl Group {
-    fn command(&self) -> &'static str {
+    const fn command(&self) -> &'static str {
         match self {
             Self::Source(_) => "setBreakpoints",
             Self::Function => "setFunctionBreakpoints",
@@ -35,7 +35,7 @@ impl Group {
         }
     }
 
-    fn capability(&self) -> Option<&'static str> {
+    const fn capability(&self) -> Option<&'static str> {
         match self {
             Self::Source(_) => None,
             Self::Function => Some("supportsFunctionBreakpoints"),
@@ -391,7 +391,11 @@ mod tests {
                 json!({"dataId":"opaque-B"}),
             ),
         ] {
-            let (set, _) = proposed(&group, &[first.clone()], Change::Upsert(second.clone()));
+            let (set, _) = proposed(
+                &group,
+                std::slice::from_ref(&first),
+                Change::Upsert(second.clone()),
+            );
             assert_eq!(set.len(), 2);
             let (set, _) = proposed(&group, &set, Change::Remove(Some(first)));
             assert_eq!(set, vec![second]);

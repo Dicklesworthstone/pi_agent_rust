@@ -113,7 +113,7 @@ impl DebugTool {
         let requested = input
             .adapter
             .as_deref()
-            .or(input.go_mode.as_ref().map(|_| "dlv"));
+            .or_else(|| input.go_mode.as_ref().map(|_| "dlv"));
         let adapter = adapters::select_adapter(program.as_deref(), requested, &self.adapters)
             .ok_or_else(|| {
                 tool_err(
@@ -149,16 +149,17 @@ impl DebugTool {
         owner
             .checkpoint()
             .map_err(|_| tool_err("DAP_CANCELLED", "debug launch cancelled"))?;
-        let mut arguments = if let Some(program) = &program {
-            adapters::launch_arguments(
-                &adapter,
-                program,
-                input.args.as_deref().unwrap_or(&[]),
-                &self.cwd,
-            )
-        } else {
-            adapters::attach_arguments(&adapter, input.pid.expect("validated pid"))
-        };
+        let mut arguments = program.as_ref().map_or_else(
+            || adapters::attach_arguments(&adapter, input.pid.expect("validated pid")),
+            |p| {
+                adapters::launch_arguments(
+                    &adapter,
+                    p,
+                    input.args.as_deref().unwrap_or(&[]),
+                    &self.cwd,
+                )
+            },
+        );
         if let Some(stop) = input.stop_on_entry {
             arguments["stopOnEntry"] = json!(stop);
         }
@@ -177,10 +178,10 @@ impl DebugTool {
                     ));
                 }
             } else {
-                if !program.is_dir()
-                    && !program
+                if !(program.is_dir()
+                    || program
                         .extension()
-                        .is_some_and(|extension| extension == "go")
+                        .is_some_and(|extension| extension == "go"))
                 {
                     return Err(tool_err(
                         "DAP_USAGE",
@@ -407,9 +408,12 @@ impl DebugTool {
         Ok(text_output(payload.to_string(), payload))
     }
 
-    async fn run_breakpoints(&self, session: &DapSession, input: &DebugInput) -> Result<Value> {
-        let setting = input.action.starts_with("set_");
-        let (group, key, mut payload) = match input.action.as_str() {
+    fn breakpoint_target(
+        &self,
+        input: &DebugInput,
+        setting: bool,
+    ) -> Result<(Group, Option<Value>, Value)> {
+        match input.action.as_str() {
             "set_breakpoint" | "remove_breakpoint" => {
                 let path = breakpoints::source_path(
                     &self.cwd,
@@ -447,11 +451,11 @@ impl DebugTool {
                         )
                     })
                     .transpose()?;
-                (
+                Ok((
                     Group::Source(path.clone()),
                     key,
                     json!({"file":path,"line":line,"column":input.column}),
-                )
+                ))
             }
             "set_function_breakpoint" | "remove_function_breakpoint" => {
                 let name = if setting {
@@ -459,11 +463,11 @@ impl DebugTool {
                 } else {
                     input.name.as_deref()
                 };
-                (
+                Ok((
                     Group::Function,
                     name.map(|name| json!({"name":name})),
                     json!({"name":name}),
-                )
+                ))
             }
             "set_instruction_breakpoint" | "remove_instruction_breakpoint" => {
                 let reference = if setting {
@@ -471,7 +475,13 @@ impl DebugTool {
                 } else {
                     input.reference.as_deref()
                 };
-                (Group::Instruction, reference.map(|reference|json!({"instructionReference":reference,"offset":input.offset.unwrap_or(0)})), json!({"reference":reference,"offset":input.offset.unwrap_or(0)}))
+                Ok((
+                    Group::Instruction,
+                    reference.map(|reference| {
+                        json!({"instructionReference":reference,"offset":input.offset.unwrap_or(0)})
+                    }),
+                    json!({"reference":reference,"offset":input.offset.unwrap_or(0)}),
+                ))
             }
             "set_data_breakpoint" | "remove_data_breakpoint" => {
                 let data_id = input.data_id.as_deref().or(input.name.as_deref());
@@ -480,10 +490,21 @@ impl DebugTool {
                 } else {
                     data_id
                 };
-                (Group::Data, data_id.map(|id|json!({"dataId":id,"accessType":input.access_type.as_deref().unwrap_or("write")})), json!({"dataId":data_id}))
+                Ok((
+                    Group::Data,
+                    data_id.map(|id| {
+                        json!({"dataId":id,"accessType":input.access_type.as_deref().unwrap_or("write")})
+                    }),
+                    json!({"dataId":data_id}),
+                ))
             }
-            _ => return Err(tool_err("DAP_USAGE", "unknown breakpoint action")),
-        };
+            _ => Err(tool_err("DAP_USAGE", "unknown breakpoint action")),
+        }
+    }
+
+    async fn run_breakpoints(&self, session: &DapSession, input: &DebugInput) -> Result<Value> {
+        let setting = input.action.starts_with("set_");
+        let (group, key, mut payload) = self.breakpoint_target(input, setting)?;
         let change = if setting {
             let mut spec = key.expect("setting requires a key");
             if !matches!(&group, Group::Source(_)) {
@@ -932,7 +953,7 @@ impl Tool for DebugTool {
                 "args":{"type":"array","items":{"type":"string"}},
                 "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
                 "goMode":{"type":"string","enum":["debug","test","exec"]},
-                "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300000,"default":120000,"description":"Launch/attach and configuration budget, including Go compilation; excludes adapter discovery and initialize"},
+                "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300_000,"default":120_000,"description":"Launch/attach and configuration budget, including Go compilation; excludes adapter discovery and initialize"},
                 "pid":{"type":"integer","minimum":1},
                 "file":{"type":"string","description":"Source path for breakpoint set/remove"},
                 "line":{"type":"integer","minimum":1,"description":"1-based line; omit on removal to clear the file's set"},
@@ -954,7 +975,7 @@ impl Tool for DebugTool {
                 "frameId":{"type":"integer","minimum":1,"description":"Opaque frame handle from stack_trace; expires when its thread resumes"},
                 "variablesReference":{"type":"integer","minimum":0,"description":"Opaque object/container handle from scopes/evaluate/variables; zero means no children"},
                 "offset":{"type":"integer"}, "start":{"type":"integer","minimum":0},
-                "limit":{"type":"integer","minimum":1,"maximum":1000000},
+                "limit":{"type":"integer","minimum":1,"maximum":1_000_000},
                 "filter":{"type":"string","enum":["named","indexed"]},
                 "command":{"type":"string"}, "payload":{"type":"object"},
                 "stopOnEntry":{"type":"boolean","default":true},
