@@ -1199,9 +1199,10 @@ pub struct PiFtuiModel {
     pending_quit: bool,
     /// `(display label, session path)` entries for the `/resume` picker.
     available_sessions: Vec<(String, String)>,
-    /// Keybinding catalog (defaults now; user config once the launch path
-    /// wires `KeyBindings::load_from_user_config`). Shared naming with the
-    /// bubbletea stack via `KeyBinding::from_ftui_key`.
+    /// Keybinding catalog, loaded from the user's config by the launch path
+    /// via [`Self::with_keybindings`] and defaulting to the shipped bindings
+    /// otherwise. Shared naming with the bubbletea stack via
+    /// `KeyBinding::from_ftui_key`.
     keybindings: KeyBindings,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
@@ -1529,6 +1530,18 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_sessions(mut self, sessions: Vec<(String, String)>) -> Self {
         self.available_sessions = sessions;
+        self
+    }
+
+    /// Install the keybinding catalog this session resolves keys against.
+    ///
+    /// Without it the model holds `KeyBindings::default()`, which is what the
+    /// launch path used to hand it — so `keybindings.json` was read by nobody
+    /// on this stack and every override in it, editor or application, was
+    /// inert.
+    #[must_use]
+    pub fn with_keybindings(mut self, keybindings: KeyBindings) -> Self {
+        self.keybindings = keybindings;
         self
     }
 
@@ -5177,7 +5190,20 @@ pub fn run(
         ftui::core::capability_override::push_override(over)
     });
 
+    // The catalog every key on this stack resolves against. Loading it here is
+    // what makes `keybindings.json` apply at all: the model defaults to the
+    // shipped bindings, and nothing on this path used to replace them.
+    let keybindings_result = KeyBindings::load_from_user_config();
+    if keybindings_result.has_warnings() {
+        tracing::warn!(
+            target: crate::config::USER_DIAGNOSTIC_TARGET,
+            "Keybindings warnings: {}",
+            keybindings_result.format_warnings()
+        );
+    }
+
     let model = PiFtuiModel::new(agent_rx)
+        .with_keybindings(keybindings_result.bindings)
         .with_submit_channel(submit_tx)
         .with_turn_abort(turn_abort)
         .with_ask_reply_channel(ask_reply_tx)
@@ -5672,6 +5698,42 @@ mod tests {
         // newline.
         sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
         assert_eq!(sim.model().input.text(), "keep\n", "ctrl+u at column 0");
+    }
+
+    #[test]
+    fn a_rebound_key_from_the_users_config_works_on_this_stack() {
+        // The model used to hold `KeyBindings::default()` and the launch path
+        // never replaced it, so keybindings.json was read by nobody here and
+        // every override in it — editor or application — was inert.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "deleteWordBackward": ["ctrl+g"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings));
+        sim.init();
+        for ch in "hello world".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+        assert_eq!(
+            sim.model().input.text(),
+            "hello ",
+            "the rebound key did not reach the editor"
+        );
+    }
+
+    #[test]
+    fn the_default_catalog_still_applies_when_nothing_is_rebound() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(KeyBindings::new()));
+        sim.init();
+        for ch in "hello world".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('w'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "hello ");
     }
 
     #[test]

@@ -14,16 +14,27 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
-/// The tracing target of the settings diagnostics in this module.
+/// The tracing target for diagnostics addressed to the person running pi,
+/// rather than to someone debugging pi.
 ///
-/// The binary's default log filter names this target so that an unrecognised
-/// key or an unparseable queue mode reaches the user without `RUST_LOG` being
-/// set. It is `module_path!()` and not a written-out string because a filter
-/// directive that matches no target is not an error — it simply never fires, so
-/// a rename would take the diagnostics away in silence. That already happened
-/// once here: `pi_agent_rust::config` looks right and matches nothing, because
-/// the library is `[lib] name = "pi"`.
-pub const LOG_TARGET: &str = module_path!();
+/// A message here says the user's own configuration is wrong and pi carried on
+/// without it: a misspelled settings key, an unparseable queue mode, a
+/// `session_store` nobody recognises, a `keybindings.json` naming an action
+/// that does not exist. Nobody sets `RUST_LOG` to find out that their settings
+/// file has a typo in it, so the binary's default filter turns this one target
+/// on at WARN and leaves every module exactly as quiet as it was.
+///
+/// The value is arbitrary; what matters is that the filter and every emitter
+/// share this constant. A filter directive that matches no target is not an
+/// error — it simply never fires — so a written-out string on either side can
+/// take the diagnostics away in silence, which is how the first version of
+/// this went wrong: `pi_agent_rust::config` looks right and matches nothing,
+/// because the library is `[lib] name = "pi"`.
+///
+/// This deliberately does not follow the module path. These messages come from
+/// `config`, `session` and the interactive stacks, and what they have in
+/// common is their audience, not their origin.
+pub const USER_DIAGNOSTIC_TARGET: &str = "pi::settings";
 
 /// Main configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1328,6 +1339,7 @@ impl Config {
         } else {
             // Unknown values fail closed to the safe profile.
             tracing::warn!(
+                target: USER_DIAGNOSTIC_TARGET,
                 requested = %normalized_profile,
                 fallback = "safe",
                 "Unknown extension policy profile; falling back to safe"
@@ -1658,6 +1670,7 @@ fn warn_unrecognised_setting_keys(path: &Path, content: &str) {
     for key in keys {
         if first_report_of(&file, &key) {
             tracing::warn!(
+                target: USER_DIAGNOSTIC_TARGET,
                 setting = key,
                 file = file.as_str(),
                 "Unrecognised setting; it is being ignored"
@@ -1797,6 +1810,7 @@ fn emit_queue_mode_diagnostic(setting: &'static str, mode: Option<&str>) {
     }
 
     tracing::warn!(
+        target: USER_DIAGNOSTIC_TARGET,
         setting,
         value = trimmed,
         "Unknown queue mode; falling back to one-at-a-time"

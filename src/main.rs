@@ -683,12 +683,13 @@ fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
 /// The tracing filter to install when the user has not asked for one.
 ///
 /// `EnvFilter::from_default_env()` with `RUST_LOG` unset enables nothing above
-/// `ERROR`, which meant the settings diagnostics in `pi::config` — an
-/// unrecognised key, an unparseable queue mode — were emitted and then dropped
-/// on the floor for every user who had not set `RUST_LOG`. Those two warnings
-/// are addressed to the person holding the misspelled settings file, not to
-/// someone debugging pi, so the default turns that one target on and leaves the
-/// rest of the crate exactly as quiet as it was.
+/// `ERROR`, which meant every diagnostic telling a user their own config was
+/// wrong — an unrecognised settings key, an unparseable queue mode, a
+/// `session_store` nobody recognises, a `keybindings.json` naming an action
+/// that does not exist — was emitted and then dropped on the floor. Nobody
+/// sets `RUST_LOG` to discover that their settings file has a typo in it, so
+/// the default turns on [`pi::config::USER_DIAGNOSTIC_TARGET`], which those
+/// messages share, and leaves every module exactly as quiet as it was.
 ///
 /// Setting `RUST_LOG` still replaces this wholesale, including to silence it.
 fn default_log_filter() -> EnvFilter {
@@ -703,7 +704,7 @@ fn default_log_filter_for(rust_log: Option<&str>) -> EnvFilter {
     if rust_log.is_some() {
         return filter;
     }
-    match format!("{}=warn", pi::config::LOG_TARGET).parse() {
+    match format!("{}=warn", pi::config::USER_DIAGNOSTIC_TARGET).parse() {
         Ok(directive) => filter.add_directive(directive),
         // A module path and a level always parse. If that ever stops being
         // true, losing the settings warnings beats refusing to start.
@@ -10160,8 +10161,8 @@ mod tests {
         // target `pi_agent_rust::config`, which is not a target that exists,
         // and a directive matching nothing is not an error.
         let seen = logged_under(default_log_filter_for(None), || {
-            tracing::warn!(target: pi::config::LOG_TARGET, "misspelled key");
-            tracing::info!(target: pi::config::LOG_TARGET, "routine chatter");
+            tracing::warn!(target: pi::config::USER_DIAGNOSTIC_TARGET, "misspelled key");
+            tracing::info!(target: pi::config::USER_DIAGNOSTIC_TARGET, "routine chatter");
             tracing::warn!(target: "pi::agent", "somebody else's warning");
             tracing::error!(target: "pi::agent", "somebody else's error");
         });
@@ -10176,7 +10177,7 @@ mod tests {
         );
         assert!(
             !seen.contains("somebody else's warning"),
-            "the default filter reached past pi::config: {seen:?}"
+            "the default filter reached past the user-diagnostic target: {seen:?}"
         );
         assert!(
             seen.contains("somebody else's error"),
@@ -10187,7 +10188,7 @@ mod tests {
     #[test]
     fn rust_log_replaces_the_default_filter_wholesale() {
         let silenced = logged_under(default_log_filter_for(Some("off")), || {
-            tracing::warn!(target: pi::config::LOG_TARGET, "misspelled key");
+            tracing::warn!(target: pi::config::USER_DIAGNOSTIC_TARGET, "misspelled key");
         });
         assert!(
             silenced.is_empty(),

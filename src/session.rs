@@ -2441,13 +2441,17 @@ impl SessionStoreKind {
             #[cfg(not(feature = "sqlite-sessions"))]
             {
                 tracing::warn!(
+                    target: crate::config::USER_DIAGNOSTIC_TARGET,
                     "Config requests session_store=sqlite but binary lacks `sqlite-sessions`; falling back to jsonl"
                 );
                 return Self::Jsonl;
             }
         }
 
-        tracing::warn!("Unknown session_store `{value}`, falling back to jsonl");
+        tracing::warn!(
+            target: crate::config::USER_DIAGNOSTIC_TARGET,
+            "Unknown session_store `{value}`, falling back to jsonl"
+        );
         Self::Jsonl
     }
 
@@ -8945,6 +8949,91 @@ mod tests {
     use std::future::Future;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// Run `emit` under a subscriber that keeps only `target` at WARN, and
+    /// return what it rendered.
+    ///
+    /// The point is the target rather than the text: a diagnostic on the wrong
+    /// target is emitted, formatted, and then dropped for every user who has
+    /// not set `RUST_LOG`, which is exactly the failure being pinned.
+    fn logged_on_target(target: &str, emit: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl Buffer {
+            fn with<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+                f(&mut self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner))
+            }
+        }
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.with(|bytes| bytes.extend_from_slice(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(format!("{target}=warn")))
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(captured.with(|bytes| bytes.clone())).expect("utf-8")
+    }
+
+    #[test]
+    fn an_unknown_session_store_tells_the_user_on_the_target_they_can_see() {
+        let config = Config {
+            session_store: Some("sqlte".to_string()),
+            ..Config::default()
+        };
+
+        let seen = logged_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            assert_eq!(
+                SessionStoreKind::from_config(&config),
+                SessionStoreKind::Jsonl,
+                "an unrecognised store must fall back to jsonl"
+            );
+        });
+
+        assert!(
+            seen.contains("Unknown session_store"),
+            "the fallback was silent on the user-visible target: {seen:?}"
+        );
+        assert!(seen.contains("sqlte"), "the warning should quote the value");
+    }
+
+    #[test]
+    fn a_recognised_session_store_says_nothing() {
+        let config = Config {
+            session_store: Some("jsonl".to_string()),
+            ..Config::default()
+        };
+        let seen = logged_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            assert_eq!(
+                SessionStoreKind::from_config(&config),
+                SessionStoreKind::Jsonl
+            );
+        });
+        assert!(seen.is_empty(), "a correct setting must be quiet: {seen:?}");
+    }
 
     macro_rules! test_fail {
         ($message:literal $(,)?) => {

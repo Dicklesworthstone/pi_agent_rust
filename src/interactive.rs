@@ -3090,6 +3090,7 @@ impl PiApp {
             let keybindings_result = KeyBindings::load_from_user_config();
             if keybindings_result.has_warnings() {
                 tracing::warn!(
+                    target: crate::config::USER_DIAGNOSTIC_TARGET,
                     "Keybindings warnings: {}",
                     keybindings_result.format_warnings()
                 );
