@@ -6,7 +6,7 @@ use crate::tools::Tool as _;
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
-const SERVER: &str = r#"
+const SERVER: &str = r"
 import json, pathlib, sys
 root, mode = pathlib.Path.cwd(), sys.argv[1]
 def read():
@@ -76,7 +76,7 @@ while True:
             reply = read()
             (root / 'callback.json').write_text(json.dumps(reply), encoding='utf-8')
     send({'jsonrpc':'2.0','id':message['id'],'result':result})
-"#;
+";
 
 fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Runtime)> {
     let python = ["python3", "python"].into_iter().find(|program| {

@@ -26,10 +26,7 @@ pub(super) struct ReadSnapshot<'a> {
 impl<'a> ReadSnapshot<'a> {
     pub(super) fn begin(conn: &'a SqliteConnection) -> Result<Self> {
         map_sqlite_result(conn.execute_raw("BEGIN DEFERRED"))?;
-        Ok(Self {
-            conn,
-            active: true,
-        })
+        Ok(Self { conn, active: true })
     }
 
     pub(super) fn finish(mut self) -> Result<()> {
@@ -77,7 +74,9 @@ fn check_text_column(row: &SqliteRow, type_index: usize) -> Result<()> {
     if matches!(row.get(type_index), Some(SqliteValue::Text(kind)) if kind.as_str() == "text") {
         Ok(())
     } else {
-        Err(Error::session("SQLite session column must use TEXT storage"))
+        Err(Error::session(
+            "SQLite session column must use TEXT storage",
+        ))
     }
 }
 
@@ -395,9 +394,7 @@ mod tests {
         })
     }
 
-    fn with_database(
-        f: impl FnOnce(&SqliteConnection, &std::path::Path) -> Result<()> + Send,
-    ) {
+    fn with_database(f: impl FnOnce(&SqliteConnection, &std::path::Path) -> Result<()> + Send) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("paged.sqlite");
         run_on_sqlite_thread(|| {
@@ -546,8 +543,8 @@ mod tests {
         with_database(|conn, _| {
             let secret = b"private-attachment-content".to_vec();
             insert_fixture(conn, 1, SqliteValue::Blob(secret.into()))?;
-            let error = read_entries_with_limits(conn, small_limits())
-                .expect_err("TEXT storage required");
+            let error =
+                read_entries_with_limits(conn, small_limits()).expect_err("TEXT storage required");
             assert!(error.to_string().contains("TEXT storage"));
             assert!(!error.to_string().contains("private-attachment"));
             Ok(())
@@ -690,11 +687,7 @@ mod tests {
                     ..ReadLimits::default()
                 },
             )?;
-            assert_eq!(
-                entries.len(),
-                1,
-                "the later append is not in this snapshot"
-            );
+            assert_eq!(entries.len(), 1, "the later append is not in this snapshot");
             assert_eq!(encode_entry(&entries[0])?, encode_entry(&original)?);
             snapshot.finish()?;
             drop(reader);
@@ -724,8 +717,8 @@ mod tests {
                     SqliteValue::Blob(b"private-header-content".to_vec().into()),
                 ],
             ))?;
-            let error = crate::session_sqlite::read_stored_header(conn)
-                .expect_err("nontext header");
+            let error =
+                crate::session_sqlite::read_stored_header(conn).expect_err("nontext header");
             assert!(error.to_string().contains("TEXT storage"));
             assert!(!error.to_string().contains("private-header"));
             Ok(())
@@ -850,10 +843,9 @@ mod tests {
             }
             assert_eq!(batch.params.len(), 6, "first 200 rows were flushed");
             batch.finish()?;
-            let rows = map_sqlite_result(conn.query_sync(
-                "SELECT seq FROM pi_session_entries ORDER BY seq",
-                &[],
-            ))?;
+            let rows = map_sqlite_result(
+                conn.query_sync("SELECT seq FROM pi_session_entries ORDER BY seq", &[]),
+            )?;
             assert_eq!(rows.len(), INSERT_BATCH_ROWS + 3);
             for (index, row) in rows.iter().enumerate() {
                 let expected = i64::try_from(index + 1).expect("sequence");

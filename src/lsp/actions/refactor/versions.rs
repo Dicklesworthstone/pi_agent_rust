@@ -106,7 +106,7 @@ pub(super) fn validate(
                 };
                 let matches = version
                     .as_u64()
-                    .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+                    .filter(|value| *value > 0 && i32::try_from(*value).is_ok())
                     .zip(origin)
                     .and_then(|(version, origin)| {
                         requested

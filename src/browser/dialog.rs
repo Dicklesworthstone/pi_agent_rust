@@ -53,14 +53,19 @@ impl Expected {
             required(args, "action")?,
             "evaluate" | "click" | "type" | "fill" | "press"
         ) {
-            return Err(invalid("dialog_response is only for evaluate, click, type, fill or press"));
+            return Err(invalid(
+                "dialog_response is only for evaluate, click, type, fill or press",
+            ));
         }
         validate_tab(args)?;
         let fields = value
             .as_object()
             .ok_or_else(|| invalid("dialog_response must be an object"))?;
         if fields.keys().any(|key| {
-            !matches!(key.as_str(), "type" | "message" | "url" | "accept" | "prompt_text")
+            !matches!(
+                key.as_str(),
+                "type" | "message" | "url" | "accept" | "prompt_text"
+            )
         }) {
             return Err(invalid("unknown dialog_response field"));
         }
@@ -73,7 +78,10 @@ impl Expected {
                 .ok_or_else(|| invalid("dialog type, message and url must be bounded strings"))
         };
         let kind = bounded("type")?;
-        if !matches!(kind.as_str(), "alert" | "confirm" | "prompt" | "beforeunload") {
+        if !matches!(
+            kind.as_str(),
+            "alert" | "confirm" | "prompt" | "beforeunload"
+        ) {
             return Err(invalid("unknown JavaScript dialog type"));
         }
         if kind != "prompt" && value.get("prompt_text").is_some() {
@@ -192,10 +200,14 @@ impl State {
 }
 
 fn validate_tab(args: &Value) -> Result<()> {
-    if args.get("tab").and_then(Value::as_str).is_none_or(|tab| {
-        tab.is_empty() || tab.len() > 256 || tab.chars().any(char::is_control)
-    }) {
-        Err(invalid("dialog handling requires an explicit bounded tab name or target ID"))
+    if args
+        .get("tab")
+        .and_then(Value::as_str)
+        .is_none_or(|tab| tab.is_empty() || tab.len() > 256 || tab.chars().any(char::is_control))
+    {
+        Err(invalid(
+            "dialog handling requires an explicit bounded tab name or target ID",
+        ))
     } else {
         Ok(())
     }

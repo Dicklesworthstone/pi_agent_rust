@@ -7378,6 +7378,7 @@ mod extensions_integration_tests {
                 content: "Use strict TypeScript.".to_string(),
                 globs: vec!["*.ts".to_string()],
                 always_apply: false,
+                description: None,
                 source: ".cursor/rules/ts.mdc".to_string(),
                 format: crate::context_files::ForeignRuleFormat::CursorMdc,
             }],

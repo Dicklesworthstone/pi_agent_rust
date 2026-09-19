@@ -2,8 +2,8 @@
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
 use super::{
-    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, interaction, launch, output, policy,
-    required,
+    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, interaction, launch, output,
+    policy, required,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};

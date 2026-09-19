@@ -9,7 +9,7 @@ use crate::tools::Tool as _;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-const SERVER: &str = r#"
+const SERVER: &str = r"
 import json, pathlib, sys
 root = pathlib.Path.cwd()
 mode = sys.argv[1]
@@ -71,7 +71,7 @@ while True:
             (root / 'source.identity').write_text('external\n', encoding='utf-8')
         result = {'documentChanges': steps}
     send({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
-"#;
+";
 
 fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Runtime)> {
     let python = ["python3", "python"].into_iter().find(|program| {

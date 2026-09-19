@@ -24,7 +24,10 @@ pub(super) struct RefactorSnapshot {
 impl RefactorSnapshot {
     pub(super) fn command_edits(&self, owner: AgentCx) -> super::command_edits::CommandEdits {
         super::command_edits::CommandEdits::new(
-            self.source.clone(), self.source_hash, self.documents.clone(), owner,
+            self.source.clone(),
+            self.source_hash,
+            self.documents.clone(),
+            owner,
         )
     }
 

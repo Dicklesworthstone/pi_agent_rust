@@ -946,7 +946,11 @@ mod tests {
     #[test]
     fn reset_clears_both_histories_and_anchor_context() {
         let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "DANGER")], 3);
-        assert!(matcher.feed("xxDAN", StreamChannel::AssistantText).is_none());
+        assert!(
+            matcher
+                .feed("xxDAN", StreamChannel::AssistantText)
+                .is_none()
+        );
         assert!(matcher.feed("xxDAN", StreamChannel::Thinking).is_none());
         matcher.reset();
         for channel in [StreamChannel::AssistantText, StreamChannel::Thinking] {

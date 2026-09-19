@@ -301,6 +301,7 @@ impl HierarchyCache {
                 item,
             });
         }
+        drop(entries);
         Ok(ids)
     }
 }
@@ -471,6 +472,7 @@ impl Budget {
 }
 
 impl LspTool {
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn run_hierarchy(&self, input: &LspInput) -> Result<ToolOutput> {
         let direction = Direction::from_action(&input.action)?;
         let limit = input

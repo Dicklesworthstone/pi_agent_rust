@@ -474,7 +474,7 @@ mod tests {
                 tool_name: "inspect_image".to_string(),
                 content: vec![
                     ContentBlock::Text(TextContent::new("tool attachment")),
-                    image(data.clone()),
+                    image(data),
                 ],
                 details: Some(details.clone()),
                 is_error: false,

@@ -602,11 +602,11 @@ impl MessageState {
                 redacted.data = base64::engine::general_purpose::STANDARD.encode(block.redacted);
             }
             ContentBlock::ToolCall(tool) => {
-                let arguments = if !block.tool_input_seen {
-                    serde_json::json!({})
-                } else {
+                let arguments = if block.tool_input_seen {
                     serde_json::from_str::<Value>(&block.tool_input)
                         .map_err(|_| invalid("malformed tool input JSON"))?
+                } else {
+                    serde_json::json!({})
                 };
                 if !arguments.is_object() {
                     return Err(invalid("tool input must be a complete JSON object"));

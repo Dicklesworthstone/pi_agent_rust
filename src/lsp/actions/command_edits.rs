@@ -9,7 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use super::{AgentCx, ApplyOutcome, FileOp, Result, ServerEntry, Value, inside_root, parse_workspace_edit, refactor, tool_err};
+use super::{
+    AgentCx, ApplyOutcome, FileOp, Result, ServerEntry, Value, inside_root, parse_workspace_edit,
+    refactor, tool_err,
+};
 use crate::lsp::client::{DocumentSnapshot, try_path_to_uri};
 use crate::lsp::edits::{FileEvidence, apply_checked};
 
@@ -32,11 +35,18 @@ impl CommandEdits {
         documents: HashMap<PathBuf, DocumentSnapshot>,
         owner: AgentCx,
     ) -> Self {
-        let mut states: HashMap<_, _> = documents.iter().map(|(path, document)| {
-            (path.clone(), FileEvidence::Text(document.hash))
-        }).collect();
+        let mut states: HashMap<_, _> = documents
+            .iter()
+            .map(|(path, document)| (path.clone(), FileEvidence::Text(document.hash)))
+            .collect();
         states.insert(source.clone(), FileEvidence::Text(source_hash));
-        Self { owner, states, documents, anchors: HashSet::from([source]), deadline: None }
+        Self {
+            owner,
+            states,
+            documents,
+            anchors: HashSet::from([source]),
+            deadline: None,
+        }
     }
 
     pub(super) fn activate(&mut self, entry: &ServerEntry, timeout: Duration) -> Result<()> {
@@ -47,15 +57,29 @@ impl CommandEdits {
     }
 
     fn checkpoint(&self, entry: &ServerEntry) -> Result<()> {
-        self.owner.checkpoint().map_err(|_| tool_err("LSP_CANCELLED", "selected command was cancelled"))?;
+        self.owner
+            .checkpoint()
+            .map_err(|_| tool_err("LSP_CANCELLED", "selected command was cancelled"))?;
         if !self.owner.capabilities().io {
-            return Err(tool_err("LSP_EDIT_PERMISSION", "selected command owner does not permit filesystem I/O"));
+            return Err(tool_err(
+                "LSP_EDIT_PERMISSION",
+                "selected command owner does not permit filesystem I/O",
+            ));
         }
-        if self.deadline.is_some_and(|(started, timeout)| started.elapsed() >= timeout) {
-            return Err(tool_err("LSP_TIMEOUT", "selected command edit window expired"));
+        if self
+            .deadline
+            .is_some_and(|(started, timeout)| started.elapsed() >= timeout)
+        {
+            return Err(tool_err(
+                "LSP_TIMEOUT",
+                "selected command edit window expired",
+            ));
         }
         if !entry.client.is_alive() {
-            return Err(tool_err("LSP_TRANSPORT_CLOSED", "selected command connection closed"));
+            return Err(tool_err(
+                "LSP_TRANSPORT_CLOSED",
+                "selected command connection closed",
+            ));
         }
         Ok(())
     }
@@ -73,16 +97,26 @@ impl CommandEdits {
         let mut touched: HashSet<_> = plan.text_edits.keys().cloned().collect();
         for operation in &plan.file_ops {
             match operation {
-                FileOp::Create { path, .. } | FileOp::Delete { path } => { touched.insert(path.clone()); }
-                FileOp::Rename { old_path, new_path, .. } => {
+                FileOp::Create { path, .. } | FileOp::Delete { path } => {
+                    touched.insert(path.clone());
+                }
+                FileOp::Rename {
+                    old_path, new_path, ..
+                } => {
                     touched.insert(old_path.clone());
                     touched.insert(new_path.clone());
                 }
             }
         }
-        let new_paths = touched.iter().filter(|path| !self.states.contains_key(*path)).count();
+        let new_paths = touched
+            .iter()
+            .filter(|path| !self.states.contains_key(*path))
+            .count();
         if self.states.len().saturating_add(new_paths) > MAX_COMMAND_FILES {
-            return Err(tool_err("LSP_EDIT_LIMIT", "selected command exceeds 1024 observed files"));
+            return Err(tool_err(
+                "LSP_EDIT_LIMIT",
+                "selected command exceeds 1024 observed files",
+            ));
         }
         let root = entry.client.root();
         for path in touched.iter().chain(&self.anchors) {
@@ -93,9 +127,14 @@ impl CommandEdits {
         let mut expected = HashMap::new();
         for path in touched.iter().chain(&self.anchors) {
             if let Some(before) = self.documents.get(path)
-                && current.get(path).is_none_or(|now| now.version != before.version || now.hash != before.hash)
+                && current
+                    .get(path)
+                    .is_none_or(|now| now.version != before.version || now.hash != before.hash)
             {
-                return Err(tool_err("LSP_EDIT_CONFLICT", "document synchronization changed during the selected command"));
+                return Err(tool_err(
+                    "LSP_EDIT_CONFLICT",
+                    "document synchronization changed during the selected command",
+                ));
             }
             if let Some(state) = self.states.get(path) {
                 expected.insert(path.clone(), *state);
@@ -103,7 +142,10 @@ impl CommandEdits {
         }
         // Do every fallible URI conversion before commit. Once the write has
         // succeeded, notification failure must not erase its apply receipt.
-        let invalidations: Vec<_> = touched.iter().map(|path| try_path_to_uri(path)).collect::<Result<_>>()?;
+        let invalidations: Vec<_> = touched
+            .iter()
+            .map(|path| try_path_to_uri(path))
+            .collect::<Result<_>>()?;
         let checked = match apply_checked(&plan, &expected, || {
             permission()?;
             self.checkpoint(entry)

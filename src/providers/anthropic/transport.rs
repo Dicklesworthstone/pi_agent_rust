@@ -226,6 +226,7 @@ impl StreamLifecycle {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn accept(
         &mut self,
         event: &mut StreamEvent,

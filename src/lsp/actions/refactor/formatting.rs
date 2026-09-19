@@ -131,6 +131,7 @@ fn preview(edits: &[Value]) -> Result<(Vec<Value>, bool)> {
 }
 
 impl LspTool {
+    #[allow(clippy::too_many_lines)]
     pub(in crate::lsp) async fn run_format(&self, input: &LspInput) -> Result<ToolOutput> {
         let file = input
             .file

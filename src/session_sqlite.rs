@@ -258,9 +258,10 @@ fn parse_sqlite_json<T: serde::de::DeserializeOwned>(kind: &str, json: &str) -> 
 
 fn read_stored_header(conn: &SqliteConnection) -> Result<Option<SessionHeader>> {
     entry_io::preflight_header(conn)?;
-    let mut rows = map_sqlite_result(
-        conn.query_sync("SELECT id,json FROM pi_session_header ORDER BY id LIMIT 2", &[]),
-    )?;
+    let mut rows = map_sqlite_result(conn.query_sync(
+        "SELECT id,json FROM pi_session_header ORDER BY id LIMIT 2",
+        &[],
+    ))?;
     if rows.len() > 1 {
         return Err(Error::session(
             "SQLite session contains multiple header rows",
@@ -756,11 +757,9 @@ mod tests {
         let original = message_entry_with_id("original", "one");
         let concurrent = message_entry_with_id("concurrent", "two");
         let incoming = message_entry_with_id("incoming", "three");
-        let reconciled = reconcile_entries(
-            vec![original.clone(), concurrent],
-            &[original, incoming],
-        )
-        .expect("merge stale snapshot");
+        let reconciled =
+            reconcile_entries(vec![original.clone(), concurrent], &[original, incoming])
+                .expect("merge stale snapshot");
         assert_eq!(reconciled.appended_start, 2);
         let ids: Vec<_> = reconciled
             .entries
@@ -792,8 +791,8 @@ mod tests {
     #[test]
     fn idempotent_reconciliation_has_an_empty_append_range() {
         let original = message_entry_with_id("unchanged", "quotes: \"\\\n🙂");
-        let reconciled = reconcile_entries(vec![original.clone()], &[original])
-            .expect("idempotent replay");
+        let reconciled =
+            reconcile_entries(vec![original.clone()], &[original]).expect("idempotent replay");
         assert_eq!(reconciled.entries.len(), 1);
         assert_eq!(reconciled.appended_start, 1);
         assert!(reconciled.entries[reconciled.appended_start..].is_empty());

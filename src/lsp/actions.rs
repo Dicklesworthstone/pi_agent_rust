@@ -88,12 +88,17 @@ struct CommandLease {
 
 impl CommandLease {
     fn close_admission(&self) {
-        let _ = self.state.admission.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
+        let _ =
+            self.state
+                .admission
+                .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 
     fn apply_inline(&self, entry: &Arc<ServerEntry>, edit: &Value) -> Result<()> {
         let mut active = lock(&self.state.active);
-        let grant = active.as_mut().filter(|grant| grant.id == self.id)
+        let grant = active
+            .as_mut()
+            .filter(|grant| grant.id == self.id)
             .ok_or_else(|| tool_err("LSP_EDIT_REVOKED", "selected action lease ended"))?;
         let outcome = grant.edits.apply(entry, edit, || Ok(()))?;
         grant.report.record(outcome);
@@ -102,7 +107,9 @@ impl CommandLease {
 
     fn activate(&self, entry: &Arc<ServerEntry>, timeout: std::time::Duration) -> Result<()> {
         let mut active = lock(&self.state.active);
-        let grant = active.as_mut().filter(|grant| grant.id == self.id)
+        let grant = active
+            .as_mut()
+            .filter(|grant| grant.id == self.id)
             .ok_or_else(|| tool_err("LSP_EDIT_REVOKED", "selected action lease ended"))?;
         grant.edits.activate(entry, timeout)?;
         grant.accepting = true;
@@ -152,7 +159,10 @@ impl ActionState {
         }
         // The active lock serializes allocation. A distinct generation is
         // published in `admission` only after inline edits and activation.
-        let id = self.next_grant.load(Ordering::Relaxed).checked_add(1)
+        let id = self
+            .next_grant
+            .load(Ordering::Relaxed)
+            .checked_add(1)
             .ok_or_else(|| tool_err("LSP_EDIT_LIMIT", "selected command generation exhausted"))?;
         self.next_grant.store(id, Ordering::Relaxed);
         *active = Some(Grant {
@@ -180,17 +190,20 @@ impl ActionState {
         // Keep close and apply linearized. A command cannot finish/drop its
         // permission while a callback that already acquired it is committing.
         let mut active = lock(&self.active);
-        let Some(grant) = active
-            .as_mut()
-            .filter(|grant| grant.id == admission && grant.accepting
+        let Some(grant) = active.as_mut().filter(|grant| {
+            grant.id == admission
+                && grant.accepting
                 && self.admission.load(Ordering::Acquire) == admission
-                && Weak::ptr_eq(&grant.entry, &Arc::downgrade(entry)))
-        else {
+                && Weak::ptr_eq(&grant.entry, &Arc::downgrade(entry))
+        }) else {
             return json!({"applied":false,"failureReason":"no selected code action authorizes server edits"});
         };
         grant.report.requests = grant.report.requests.saturating_add(1);
         let outcome = if grant.revoked {
-            Err(tool_err("LSP_EDIT_REVOKED", "an earlier rejection revoked this command's edit permission"))
+            Err(tool_err(
+                "LSP_EDIT_REVOKED",
+                "an earlier rejection revoked this command's edit permission",
+            ))
         } else if grant.report.requests > MAX_APPLY_REQUESTS {
             Err(tool_err(
                 "LSP_EDIT_LIMIT",
@@ -200,13 +213,18 @@ impl ActionState {
             params
                 .get("edit")
                 .ok_or_else(|| tool_err("LSP_EDIT_MALFORMED", "missing workspace edit"))
-                .and_then(|edit| grant.edits.apply(entry, edit, || {
-                    if self.admission.load(Ordering::Acquire) == admission {
-                        Ok(())
-                    } else {
-                        Err(tool_err("LSP_CANCELLED", "selected command ended before committing server edits"))
-                    }
-                }))
+                .and_then(|edit| {
+                    grant.edits.apply(entry, edit, || {
+                        if self.admission.load(Ordering::Acquire) == admission {
+                            Ok(())
+                        } else {
+                            Err(tool_err(
+                                "LSP_CANCELLED",
+                                "selected command ended before committing server edits",
+                            ))
+                        }
+                    })
+                })
         };
         match outcome {
             Ok(outcome) => {
@@ -498,9 +516,15 @@ fn validate_action_request(input: &LspInput) -> Result<()> {
     }
     if input.action_id.is_none()
         && input.apply.unwrap_or(false)
-        && input.query.as_deref().is_none_or(|query| query.trim().is_empty())
+        && input
+            .query
+            .as_deref()
+            .is_none_or(|query| query.trim().is_empty())
     {
-        return Err(tool_err("LSP_USAGE", "apply:true requires actionId or a nonempty query"));
+        return Err(tool_err(
+            "LSP_USAGE",
+            "apply:true requires actionId or a nonempty query",
+        ));
     }
     if let Some(only) = &input.only
         && (only.is_empty()
@@ -508,7 +532,9 @@ fn validate_action_request(input: &LspInput) -> Result<()> {
             || only.iter().any(|kind| {
                 kind.is_empty()
                     || kind.len() > 128
-                    || kind.chars().any(|character| character.is_control() || character.is_whitespace())
+                    || kind
+                        .chars()
+                        .any(|character| character.is_control() || character.is_whitespace())
                     || kind.split('.').any(str::is_empty)
             }))
     {
@@ -521,12 +547,17 @@ fn validate_action_request(input: &LspInput) -> Result<()> {
 }
 
 fn matches_action_kind(action: &Value, only: &[String]) -> bool {
-    action.get("kind").and_then(Value::as_str).is_some_and(|kind| {
-        only.iter().any(|requested| {
-            kind == requested.as_str()
-                || kind.strip_prefix(requested.as_str()).is_some_and(|suffix| suffix.starts_with('.'))
+    action
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| {
+            only.iter().any(|requested| {
+                kind == requested.as_str()
+                    || kind
+                        .strip_prefix(requested.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            })
         })
-    })
 }
 
 impl LspTool {
@@ -620,7 +651,12 @@ impl LspTool {
                         .ok_or_else(|| {
                             tool_err("LSP_ACTION_MALFORMED", "code action has no title")
                         })?;
-                    let id = self.actions.remember(&entry, &path, Arc::clone(&snapshot), action.clone())?;
+                    let id = self.actions.remember(
+                        &entry,
+                        &path,
+                        Arc::clone(&snapshot),
+                        action.clone(),
+                    )?;
                     let preview: String = title.chars().take(1000).collect();
                     summaries.push(json!({
                         "index":index+1,"actionId":id,"title":preview,"titleTruncated":preview.len()!=title.len(),"kind":action.get("kind"),
@@ -705,9 +741,11 @@ impl LspTool {
             match lease.activate(&entry, timeout) {
                 Ok(()) => {
                     command_started = true;
-                    if let Err(error) = entry.client.call(
-                        "workspace/executeCommand", params.clone(), timeout,
-                    ).await {
+                    if let Err(error) = entry
+                        .client
+                        .call("workspace/executeCommand", params.clone(), timeout)
+                        .await
+                    {
                         failure = Some(error.message());
                     }
                 }

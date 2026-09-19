@@ -40,6 +40,7 @@ impl Fixture {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn edit(&self, index: usize, version: Value) -> Value {
         json!({"textDocument":{"uri":self.uris[index],"version":version},"edits":[{
             "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},
@@ -51,6 +52,7 @@ impl Fixture {
         json!({"kind":"rename","oldUri":self.uris[old],"newUri":self.uris[new]})
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn check(&self, changes: Vec<Value>) -> Result<()> {
         validate(
             &json!({"documentChanges":changes}),
@@ -223,7 +225,7 @@ fn invalid_or_unknown_versions_still_fail_closed() {
     for version in [
         json!(0),
         json!(-1),
-        json!(2147483648_u64),
+        json!(2_147_483_648_u64),
         json!(7.5),
         json!("7"),
     ] {

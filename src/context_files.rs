@@ -988,7 +988,10 @@ mod tests {
             ("['*.py', 'scripts/**']", vec!["*.py", "scripts/**"]),
             ("[a,b]*.rs,*.py", vec!["[a,b]*.rs", "*.py"]),
             (r"name\,part.rs,*.py", vec![r"name\,part.rs", "*.py"]),
-            ("src/{a,{b,c}}/*.rs,*.py", vec!["src/{a,{b,c}}/*.rs", "*.py"]),
+            (
+                "src/{a,{b,c}}/*.rs,*.py",
+                vec!["src/{a,{b,c}}/*.rs", "*.py"],
+            ),
             ("日本語/*.{rs,ts},*.py", vec!["日本語/*.{rs,ts}", "*.py"]),
             ("{*.rs,*.ts", vec!["{*.rs,*.ts"]),
             ("[]", vec![]),
@@ -1033,7 +1036,11 @@ mod tests {
     fn scoped_matches_stay_inside_workspace_and_respect_directory_depth() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("workspace");
-        write(&root, ".cursor/rules/ts.mdc", "---\nglobs: src/*.ts\n---\nTS.");
+        write(
+            &root,
+            ".cursor/rules/ts.mdc",
+            "---\nglobs: src/*.ts\n---\nTS.",
+        );
         let rules = discover_foreign_rules(&root);
         let matcher = ScopedRuleMatcher::new(&rules.rules);
         for path in [
@@ -1044,11 +1051,7 @@ mod tests {
         ] {
             assert_eq!(matcher.matching_rules(Path::new(path), &root), vec![0]);
         }
-        for path in [
-            "src/sub/main.ts",
-            "../src/main.ts",
-            "src/../../src/main.ts",
-        ] {
+        for path in ["src/sub/main.ts", "../src/main.ts", "src/../../src/main.ts"] {
             assert!(matcher.matching_rules(Path::new(path), &root).is_empty());
         }
         assert!(
@@ -1067,11 +1070,7 @@ mod tests {
     fn deduplication_keeps_distinct_scopes_and_collapses_reordered_scopes() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
-        for (name, globs) in [
-            ("a", "*.ts,*.tsx"),
-            ("b", "*.rs"),
-            ("c", "*.tsx,*.ts,*.ts"),
-        ] {
+        for (name, globs) in [("a", "*.ts,*.tsx"), ("b", "*.rs"), ("c", "*.tsx,*.ts,*.ts")] {
             write(
                 root,
                 &format!(".cursor/rules/{name}.mdc"),
@@ -1153,9 +1152,16 @@ mod tests {
         for path in ["src/main.ts", "src/ui/view.tsx"] {
             let matches = matcher.matching_rules(Path::new(path), root);
             assert_eq!(matches.len(), 1);
-            assert_eq!(rules.rules[matches[0]].source, ".windsurf/rules/frontend.md");
+            assert_eq!(
+                rules.rules[matches[0]].source,
+                ".windsurf/rules/frontend.md"
+            );
         }
-        assert!(matcher.matching_rules(Path::new("src/main.rs"), root).is_empty());
+        assert!(
+            matcher
+                .matching_rules(Path::new("src/main.rs"), root)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1214,7 +1220,11 @@ mod tests {
             );
         }
         let rules = discover_foreign_rules(root);
-        assert_eq!(rules.rules.len(), 2, "distinct selection hints must survive");
+        assert_eq!(
+            rules.rules.len(),
+            2,
+            "distinct selection hints must survive"
+        );
         let block = rules.system_prompt_block().expect("selection hints");
         assert!(block.contains("Database changes"));
         assert!(block.contains("API changes"));

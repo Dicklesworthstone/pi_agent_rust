@@ -33,6 +33,7 @@ fn is_warmup_empty_retryable(method: &str) -> bool {
             | "textDocument/references"
             | "textDocument/hover"
             | "textDocument/rename"
+            | "workspace/willRenameFiles"
     )
 }
 
@@ -506,5 +507,6 @@ mod tests {
         assert!(!is_warmup_empty_retryable("workspace/executeCommand"));
         assert!(!is_warmup_empty_retryable("codeAction/resolve"));
         assert!(is_warmup_empty_retryable("textDocument/definition"));
+        assert!(is_warmup_empty_retryable("workspace/willRenameFiles"));
     }
 }

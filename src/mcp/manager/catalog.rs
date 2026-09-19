@@ -852,11 +852,7 @@ mod tests {
     #[test]
     fn cancellation_of_an_old_catalog_preserves_replacement_state() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, old) = fixture(
-            &temp,
-            vec![json!({"tools":[tool("obsolete")]})],
-            None,
-        );
+        let (manager, entry, old) = fixture(&temp, vec![json!({"tools":[tool("obsolete")]})], None);
         *McpManager::lock(&old.pause_at) = Some(1);
         let replacement = Arc::new(PagedTransport {
             pages: Mutex::new(VecDeque::new()),
@@ -897,11 +893,8 @@ mod tests {
     #[test]
     fn a_final_page_from_a_dead_transport_is_not_publishable() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(
-            &temp,
-            vec![json!({"tools":[tool("must-not-mount")]})],
-            None,
-        );
+        let (manager, entry, transport) =
+            fixture(&temp, vec![json!({"tools":[tool("must-not-mount")]})], None);
         let weak = Arc::downgrade(&transport);
         *McpManager::lock(&transport.after_page) = Some(Arc::new(move |_| {
             weak.upgrade().expect("transport alive").abort();
@@ -933,11 +926,8 @@ mod tests {
     #[test]
     fn owner_cancellation_wakes_idle_discovery_without_transport_cooperation() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(
-            &temp,
-            vec![json!({"tools":[tool("never-returned")]})],
-            None,
-        );
+        let (manager, entry, transport) =
+            fixture(&temp, vec![json!({"tools":[tool("never-returned")]})], None);
         *McpManager::lock(&transport.pause_at) = Some(1);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -959,7 +949,10 @@ mod tests {
             assert!(discovery.as_mut().poll(&mut task).is_pending());
             assert_eq!(asupersync::Cx::current().unwrap().budget(), parent.budget());
             let wakes_before = counter.0.load(Ordering::SeqCst);
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel discovery"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel discovery"),
+            );
             assert!(counter.0.load(Ordering::SeqCst) > wakes_before);
             let Poll::Ready(Err(error)) = discovery.as_mut().poll(&mut task) else {
                 panic!("cancellation must finish without a network response");
@@ -979,11 +972,8 @@ mod tests {
     #[test]
     fn manager_deadline_terminates_a_transport_that_ignores_its_timeout() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(
-            &temp,
-            vec![json!({"tools":[tool("never-returned")]})],
-            None,
-        );
+        let (manager, entry, transport) =
+            fixture(&temp, vec![json!({"tools":[tool("never-returned")]})], None);
         *McpManager::lock(&transport.pause_at) = Some(1);
         let erased: Arc<dyn McpTransport> = transport.clone();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()

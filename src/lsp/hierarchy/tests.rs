@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-const SERVER: &str = r#"
+const SERVER: &str = r"
 import json, pathlib, sys, time
 root = pathlib.Path.cwd()
 mode = sys.argv[1]
@@ -135,7 +135,7 @@ while True:
     else:
         reply['result'] = None
     send(reply)
-"#;
+";
 
 fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Runtime)> {
     let python = ["python3", "python"].into_iter().find(|program| {
@@ -603,6 +603,7 @@ fn cache_evicts_old_handles_without_evicting_the_just_returned_batch() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn expired_handles_do_not_renew_their_lifetime_on_lookup() {
     let temp = tempfile::tempdir().unwrap();
     let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
@@ -619,7 +620,7 @@ fn expired_handles_do_not_renew_their_lifetime_on_lookup() {
             path: old.path.clone(),
             uri: old.uri.clone(),
             text: Arc::clone(&old.text),
-            created: Instant::now() - HANDLE_TTL,
+            created: Instant::now().checked_sub(HANDLE_TTL).unwrap(),
             family: old.family,
         });
     }

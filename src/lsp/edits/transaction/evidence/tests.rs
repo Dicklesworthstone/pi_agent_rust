@@ -34,9 +34,17 @@ fn receipts_follow_move_edit_delete_and_recreation_without_rereading_postimages(
     let first = apply(&move_edit, &HashMap::from([(old.clone(), text("old\n"))])).unwrap();
     assert_eq!(first.states[&old], FileEvidence::Absent);
     assert_eq!(first.states[&moved], text("new\n"));
-    let second = apply(&json!({"documentChanges":[{"kind":"delete","uri":moved_uri}]}), &first.states).unwrap();
+    let second = apply(
+        &json!({"documentChanges":[{"kind":"delete","uri":moved_uri}]}),
+        &first.states,
+    )
+    .unwrap();
     assert_eq!(second.states[&moved], FileEvidence::Absent);
-    let third = apply(&json!({"documentChanges":[{"kind":"create","uri":moved_uri}]}), &second.states).unwrap();
+    let third = apply(
+        &json!({"documentChanges":[{"kind":"create","uri":moved_uri}]}),
+        &second.states,
+    )
+    .unwrap();
     assert_eq!(third.states[&moved], text(""));
     assert!(!old.exists());
     assert_eq!(std::fs::read(&moved).unwrap(), b"");
@@ -63,7 +71,11 @@ fn guard_only_source_drift_prevents_sibling_writes() {
     let sibling = root.join("sibling.rs");
     std::fs::write(&source, "external\n").unwrap();
     std::fs::write(&sibling, "old\n").unwrap();
-    let error = apply(&edits(&sibling, "new"), &HashMap::from([(source.clone(), text("old\n"))])).unwrap_err();
+    let error = apply(
+        &edits(&sibling, "new"),
+        &HashMap::from([(source.clone(), text("old\n"))]),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("LSP_EDIT_CONFLICT"));
     assert_eq!(std::fs::read_to_string(sibling).unwrap(), "old\n");
     assert_eq!(std::fs::read_to_string(source).unwrap(), "external\n");
@@ -78,10 +90,14 @@ fn guard_only_files_are_rechecked_after_staging_before_commit() {
     std::fs::write(&source, "old\n").unwrap();
     std::fs::write(&sibling, "old\n").unwrap();
     let plan = parse_workspace_edit(&edits(&sibling, "new")).unwrap();
-    let result = apply_checked(&plan, &HashMap::from([(source.clone(), text("old\n"))]), || {
-        std::fs::write(&source, "external\n")?;
-        Ok(())
-    });
+    let result = apply_checked(
+        &plan,
+        &HashMap::from([(source.clone(), text("old\n"))]),
+        || {
+            std::fs::write(&source, "external\n")?;
+            Ok(())
+        },
+    );
     assert!(result.is_err());
     assert_eq!(std::fs::read_to_string(sibling).unwrap(), "old\n");
     assert_eq!(std::fs::read_to_string(source).unwrap(), "external\n");
@@ -93,9 +109,14 @@ fn moved_away_paths_cannot_be_externally_recreated_then_overwritten() {
     let path = temp.path().canonicalize().unwrap().join("a.rs");
     std::fs::write(&path, "old\n").unwrap();
     let uri = try_path_to_uri(&path).unwrap();
-    let deleted = apply(&json!({"documentChanges":[{"kind":"delete","uri":uri}]}), &HashMap::new()).unwrap();
+    let deleted = apply(
+        &json!({"documentChanges":[{"kind":"delete","uri":uri}]}),
+        &HashMap::new(),
+    )
+    .unwrap();
     std::fs::write(&path, "external\n").unwrap();
-    let create = json!({"documentChanges":[{"kind":"create","uri":uri,"options":{"overwrite":true}}]});
+    let create =
+        json!({"documentChanges":[{"kind":"create","uri":uri,"options":{"overwrite":true}}]});
     assert!(apply(&create, &deleted.states).is_err());
     assert_eq!(std::fs::read_to_string(path).unwrap(), "external\n");
 }
@@ -107,7 +128,14 @@ fn missing_is_not_an_empty_or_non_utf8_file() {
     let empty = WorkspaceEditPlan::default();
     for bytes in [b"".as_slice(), b"\xff\x00".as_slice()] {
         std::fs::write(&path, bytes).unwrap();
-        assert!(apply_checked(&empty, &HashMap::from([(path.clone(), FileEvidence::Absent)]), || Ok(())).is_err());
+        assert!(
+            apply_checked(
+                &empty,
+                &HashMap::from([(path.clone(), FileEvidence::Absent)]),
+                || Ok(())
+            )
+            .is_err()
+        );
     }
 }
 
@@ -118,12 +146,17 @@ fn binary_moves_produce_non_lossy_receipts_and_detect_later_drift() {
     let old = root.join("a.bin");
     let new = root.join("b.bin");
     std::fs::write(&old, b"\xff\x00\x01").unwrap();
-    let result = apply(&json!({"documentChanges":[{"kind":"rename",
-        "oldUri":try_path_to_uri(&old).unwrap(),"newUri":try_path_to_uri(&new).unwrap()}]}), &HashMap::new()).unwrap();
+    let result = apply(
+        &json!({"documentChanges":[{"kind":"rename",
+        "oldUri":try_path_to_uri(&old).unwrap(),"newUri":try_path_to_uri(&new).unwrap()}]}),
+        &HashMap::new(),
+    )
+    .unwrap();
     assert!(matches!(result.states[&new], FileEvidence::Binary(_)));
     assert_eq!(result.states[&old], FileEvidence::Absent);
     std::fs::write(&new, b"\xfe\x00\x01").unwrap();
-    let deletion = json!({"documentChanges":[{"kind":"delete","uri":try_path_to_uri(&new).unwrap()}]});
+    let deletion =
+        json!({"documentChanges":[{"kind":"delete","uri":try_path_to_uri(&new).unwrap()}]});
     assert!(apply(&deletion, &result.states).is_err());
     assert_eq!(std::fs::read(new).unwrap(), b"\xfe\x00\x01");
 }
@@ -134,7 +167,9 @@ fn cancellation_after_staging_never_starts_commit() {
     let path = temp.path().canonicalize().unwrap().join("a.rs");
     std::fs::write(&path, "old\n").unwrap();
     let plan = parse_workspace_edit(&edits(&path, "new")).unwrap();
-    let result = apply_checked(&plan, &HashMap::new(), || Err(crate::lsp::edits::plan_error("LSP_CANCELLED", "cancelled")));
+    let result = apply_checked(&plan, &HashMap::new(), || {
+        Err(crate::lsp::edits::plan_error("LSP_CANCELLED", "cancelled"))
+    });
     assert!(result.unwrap_err().to_string().contains("LSP_CANCELLED"));
     assert_eq!(std::fs::read_to_string(path).unwrap(), "old\n");
 }
@@ -143,7 +178,9 @@ fn cancellation_after_staging_never_starts_commit() {
 fn evidence_path_budget_is_enforced_before_any_write() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
-    let expected = (0..1025).map(|index| (root.join(format!("{index}.rs")), FileEvidence::Absent)).collect();
+    let expected = (0..1025)
+        .map(|index| (root.join(format!("{index}.rs")), FileEvidence::Absent))
+        .collect();
     let error = apply_checked(&WorkspaceEditPlan::default(), &expected, || Ok(())).unwrap_err();
     assert!(error.to_string().contains("LSP_EDIT_LIMIT"));
     assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
@@ -155,8 +192,11 @@ fn checked_batches_reuse_the_existing_rollback_commit_path() {
     let path = temp.path().canonicalize().unwrap().join("a.rs");
     std::fs::write(&path, "old\n").unwrap();
     let plan = parse_workspace_edit(&edits(&path, "new")).unwrap();
-    let transaction = prepare_checked(&plan, &HashMap::from([(path.clone(), text("old\n"))])).unwrap();
-    let error = transaction.commit_with(|_, _| Err(std::io::Error::other("injected commit failure"))).unwrap_err();
+    let transaction =
+        prepare_checked(&plan, &HashMap::from([(path.clone(), text("old\n"))])).unwrap();
+    let error = transaction
+        .commit_with(|_, _| Err(std::io::Error::other("injected commit failure")))
+        .unwrap_err();
     assert!(error.to_string().contains("LSP_EDIT_APPLY"));
     assert_eq!(std::fs::read_to_string(path).unwrap(), "old\n");
 }

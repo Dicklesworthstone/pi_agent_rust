@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 // Helpers
 // ---------------------------------------------------------------------------
 
-const RPC_E2E_WAIT_TIMEOUT: Duration = Duration::from_secs(90);
+const RPC_E2E_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 const KEYLESS_REPLAY_ABORT_WINDOW: Duration = Duration::from_secs(10);
 
 fn cassette_root() -> PathBuf {

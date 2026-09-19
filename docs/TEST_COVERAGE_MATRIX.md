@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 319 current source files.
+- `rg --files src -g '*.rs' | sort` -> 327 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 319.
+- Source-file rows below: 327.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -55,6 +55,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/bpe.rs` | Vendored tiktoken BPE core (bd-w8q6u): rank tables loaded from gzip assets for token counting | Unit (2 tests); exercised through `src/token_count.rs` and its tests. |
 | `src/browser.rs` | Opt-in headless Chromium automation tool via CDP attach (bd-cv653.2.4) | `tests/browser.rs`, `tests/cross_surface_parity.rs`. |
 | `src/browser/cdp.rs` | Browser CDP protocol transport | Unit; `tests/e2e_browser.rs`, `tests/browser_cdp.rs`. |
+| `src/browser/dialog.rs` | Browser JavaScript dialog handling and response dispatch | Unit; `src/browser/dialog/tests.rs`, `tests/browser.rs`. |
+| `src/browser/dialog/tests.rs` | Browser JavaScript dialog handling test suite | Test module; dialog handling tests. |
 | `src/browser/download.rs` | Browser download lifecycle and management | Unit; `tests/e2e_browser.rs`. |
 | `src/browser/exports.rs` | Browser module exports and public surface | Waived glue; re-exports for browser submodules. |
 | `src/browser/interaction.rs` | Browser interaction and navigation | Unit; `tests/e2e_browser.rs`. |
@@ -194,6 +196,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lib.rs` | Crate exports | Waived glue: exported module surface is compiled by all targets; no behavior-only row. |
 | `src/lsp.rs` | LSP facade | `tests/lsp.rs`, `tests/e2e_lsp.rs`. |
 | `src/lsp/actions.rs` | LSP code action and refactoring execution | Unit; `tests/lsp.rs`. |
+| `src/lsp/actions/command_edits.rs` | LSP execute command workspace edit collector | `tests/lsp.rs`, `src/lsp/actions/command_tests.rs`. |
+| `src/lsp/actions/command_tests.rs` | LSP execute command test suite | Test module; execute command tests. |
 | `src/lsp/actions/protocol_tests.rs` | LSP code action protocol test cases | Test support module; exercises code actions. |
 | `src/lsp/actions/refactor.rs` | LSP symbol rename and refactor operations | Unit; `src/lsp/actions/refactor/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/actions/refactor/formatting.rs` | LSP document and range formatting | Unit; `src/lsp/actions/refactor/formatting/tests.rs`. |
@@ -202,6 +206,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/actions/refactor/versions.rs` | LSP request-time document version tracking across resource operations | Unit; `src/lsp/actions/refactor/versions/tests.rs`. |
 | `src/lsp/actions/refactor/versions/tests.rs` | LSP document version tracking test suite | Test module; version tracking tests. |
 | `src/lsp/actions/refactor/versions/tests/protocol.rs` | LSP document version tracking protocol test cases | Test support module; exercises version tracking. |
+| `src/lsp/actions/selection_tests.rs` | LSP code action selection test suite | Test module; action selection tests. |
 | `src/lsp/client.rs` | LSP client | `tests/lsp.rs`. |
 | `src/lsp/client/document_sync.rs` | LSP client live document synchronization | Unit; `src/lsp/client/document_sync/tests.rs`. |
 | `src/lsp/client/document_sync/tests.rs` | LSP document synchronization tests | Test module; document sync tests. |
@@ -217,6 +222,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/edits/sequence.rs` | LSP workspace edit sequence parser and validator | Unit; in-module tests. |
 | `src/lsp/edits/sequence/tests.rs` | LSP workspace edit sequence test suite | Test module; sequence tests. |
 | `src/lsp/edits/transaction.rs` | LSP atomic workspace edit transaction engine | Unit; in-module tests. |
+| `src/lsp/edits/transaction/evidence.rs` | LSP edit transaction evidence tracking and verification | Unit; `src/lsp/edits/transaction/evidence/tests.rs`. |
+| `src/lsp/edits/transaction/evidence/tests.rs` | LSP edit transaction evidence test suite | Test module; transaction evidence tests. |
 | `src/lsp/edits/transaction/tests.rs` | LSP workspace edit transaction test suite | Test module; transaction tests. |
 | `src/lsp/hierarchy.rs` | LSP call hierarchy navigation | Unit; `src/lsp/hierarchy/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/hierarchy/tests.rs` | LSP call hierarchy test suite | Test module; hierarchy tests. |
@@ -315,6 +322,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_picker.rs` | Session picker UI | Unit; `tests/session_picker.rs`. |
 | `src/session_sqlite.rs` | SQLite session backend | Unit; `tests/session_sqlite.rs`, `tests/fault_injection_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/session_sqlite/attachments.rs` | SQLite session attachment and media blob storage | Unit; `tests/session_sqlite.rs`. |
+| `src/session_sqlite/entry_io.rs` | SQLite session entry serialization, paging, and batch insertion | Unit; `tests/session_sqlite.rs`. |
 | `src/session_store_v2.rs` | Session store v2 | Unit; `tests/session_store_v2.rs`, `tests/session_store_v2_contract.rs`. |
 | `src/session_test.rs` | Session test helpers | Waived test-support module; compiled by session tests. |
 | `src/skills_managed.rs` | Managed skills | `tests/skills_managed.rs`. |

@@ -227,9 +227,9 @@ impl Tool for BrowserTool {
         if self.is_mock() {
             if matches!(
                 action,
-                "start" | "status" | "stop" | "upload" | "download" | "print_pdf"
-                    | "handle_dialog"
-            ) || args.get("full_page").is_some() || args.get("dialog_response").is_some()
+                "start" | "status" | "stop" | "upload" | "download" | "print_pdf" | "handle_dialog"
+            ) || args.get("full_page").is_some()
+                || args.get("dialog_response").is_some()
             {
                 return Err(Error::tool(
                     "browser",

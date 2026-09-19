@@ -5,7 +5,7 @@ use crate::config::{Config, LspServerSettings, LspSettings};
 use crate::tools::Tool as _;
 use std::process::{Command, Stdio};
 
-const SERVER: &str = r#"
+const SERVER: &str = r"
 import json, pathlib, sys, urllib.parse, urllib.request
 root = pathlib.Path.cwd()
 mode = sys.argv[1]
@@ -99,7 +99,7 @@ while True:
                 {'textDocument': {'uri': sibling, 'version': None}, 'edits': edits()}
             ]}
     send({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
-"#;
+";
 
 fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Runtime)> {
     let python = ["python3", "python"].into_iter().find(|program| {
@@ -547,6 +547,7 @@ fn appending_a_move_preserves_order_versions_and_change_annotations() {
 
 #[test]
 fn static_file_operation_filters_match_scheme_kind_case_and_native_paths() {
+    #[allow(clippy::needless_pass_by_value)]
     fn capabilities(filter: Value) -> Value {
         json!({"workspace":{"fileOperations":{"willRename":{"filters":[filter]}}}})
     }

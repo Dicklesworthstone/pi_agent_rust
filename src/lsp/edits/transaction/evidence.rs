@@ -24,7 +24,9 @@ pub(in crate::lsp) enum FileEvidence {
 
 impl FileEvidence {
     fn from_image(image: Option<&Image>) -> Self {
-        let Some(image) = image else { return Self::Absent };
+        let Some(image) = image else {
+            return Self::Absent;
+        };
         if let Ok(text) = std::str::from_utf8(&image.bytes) {
             Self::Text(content_hash_for_drift(text))
         } else {
@@ -73,9 +75,16 @@ pub(in crate::lsp) fn apply_checked(
     before_commit: impl FnOnce() -> Result<()>,
 ) -> Result<CheckedApply> {
     let transaction = prepare_checked(plan, expected)?;
-    let states = transaction.files.iter().map(|(path, staged)| {
-        (path.clone(), FileEvidence::from_image(staged.after.as_ref()))
-    }).collect();
+    let states = transaction
+        .files
+        .iter()
+        .map(|(path, staged)| {
+            (
+                path.clone(),
+                FileEvidence::from_image(staged.after.as_ref()),
+            )
+        })
+        .collect();
     before_commit()?;
     let outcome = transaction.commit()?;
     Ok(CheckedApply { outcome, states })
