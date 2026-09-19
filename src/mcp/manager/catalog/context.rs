@@ -1,9 +1,11 @@
-//! On-demand MCP resource access over the manager's existing trusted transports.
+//! On-demand MCP resource and prompt access over existing trusted transports.
 //!
 //! Listing returns one bounded page; cursors and resource URIs are opaque and
 //! forwarded unchanged. Nothing here opens a URI as a file or network address.
 //! Requests are never replayed after failure, and a superseded or revoked
 //! transport cannot return context into a replacement session.
+
+use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
@@ -16,12 +18,19 @@ const MAX_CONTEXT_NAME_BYTES: usize = 1024;
 const MAX_RESOURCE_URI_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_PAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CONTEXT_CONTENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_PROMPT_ARGUMENTS: usize = 128;
+const MAX_PROMPT_ARGUMENT_BYTES: usize = 64 * 1024;
+// Each message becomes a role label plus a native content block. Leave room
+// within the shared content shaper's block budget for the reference heading.
+const MAX_PROMPT_MESSAGES: usize = 256;
 
 #[derive(Clone, Copy)]
 enum ContextResult {
     Resources,
     ResourceTemplates,
     ResourceContents,
+    Prompts,
+    PromptMessages,
 }
 
 fn invalid_request(reason: &str) -> Error {
@@ -83,6 +92,34 @@ fn optional_strings(value: &Value, keys: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn validate_prompt_definition(prompt: &Value) -> Result<()> {
+    response_string(prompt, "name", MAX_CONTEXT_NAME_BYTES)?;
+    let Some(arguments) = prompt.get("arguments") else {
+        return Ok(());
+    };
+    let arguments = arguments
+        .as_array()
+        .filter(|arguments| arguments.len() <= MAX_PROMPT_ARGUMENTS)
+        .ok_or_else(|| invalid_response("MCP prompt arguments must be a bounded array"))?;
+    let mut names = std::collections::HashSet::new();
+    for argument in arguments {
+        let name = response_string(argument, "name", MAX_CONTEXT_NAME_BYTES)?;
+        if !names.insert(name) {
+            return Err(invalid_response("MCP prompt has duplicate argument names"));
+        }
+        optional_strings(argument, &["title", "description"])?;
+        if argument
+            .get("required")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(invalid_response(
+                "MCP prompt argument required must be a boolean",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
     if !result.is_object() {
         return Err(invalid_response("MCP context result must be an object"));
@@ -91,19 +128,29 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
         ContextResult::Resources => ("resources", MAX_CONTEXT_PAGE_BYTES),
         ContextResult::ResourceTemplates => ("resourceTemplates", MAX_CONTEXT_PAGE_BYTES),
         ContextResult::ResourceContents => ("contents", MAX_CONTEXT_CONTENT_BYTES),
+        ContextResult::Prompts => ("prompts", MAX_CONTEXT_PAGE_BYTES),
+        ContextResult::PromptMessages => ("messages", MAX_CONTEXT_CONTENT_BYTES),
     };
     let mut budget = CatalogByteBudget { remaining: limit };
     serde_json::to_writer(&mut budget, result)
         .map_err(|_| invalid_response("MCP context response exceeds the byte limit"))?;
+    let item_limit = if matches!(shape, ContextResult::PromptMessages) {
+        MAX_PROMPT_MESSAGES
+    } else {
+        MAX_CONTEXT_ITEMS
+    };
     let items = result
         .get(field)
         .and_then(Value::as_array)
-        .filter(|items| items.len() <= MAX_CONTEXT_ITEMS)
+        .filter(|items| items.len() <= item_limit)
         .ok_or_else(|| {
             invalid_response("MCP context result has a missing or oversized item array")
         })?;
-    if !matches!(shape, ContextResult::ResourceContents)
-        && let Some(cursor) = result.get("nextCursor")
+    optional_strings(result, &["description"])?;
+    if matches!(
+        shape,
+        ContextResult::Resources | ContextResult::ResourceTemplates | ContextResult::Prompts
+    ) && let Some(cursor) = result.get("nextCursor")
         && cursor
             .as_str()
             .is_none_or(|cursor| cursor.len() > MAX_CURSOR_BYTES)
@@ -139,6 +186,22 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
                         ));
                     }
                 }
+            }
+            ContextResult::Prompts => validate_prompt_definition(item)?,
+            ContextResult::PromptMessages => {
+                if !matches!(
+                    item.get("role").and_then(Value::as_str),
+                    Some("user" | "assistant")
+                ) {
+                    return Err(invalid_response("MCP prompt roles must be user or assistant"));
+                }
+                let content = item
+                    .get("content")
+                    .filter(|content| content.is_object())
+                    .ok_or_else(|| {
+                        invalid_response("MCP prompt message must contain a content object")
+                    })?;
+                response_string(content, "type", MAX_CONTEXT_NAME_BYTES)?;
             }
         }
     }
@@ -216,6 +279,53 @@ impl McpManager {
             ContextResult::ResourceContents,
         )
         .await
+    }
+
+    /// List a single page of server-provided prompt templates and their
+    /// argument declarations. This does not retrieve or execute a prompt.
+    ///
+    /// # Errors
+    /// Returns trust, connection, server, or response-validation errors.
+    pub async fn list_prompts(&self, server: &str, cursor: Option<&str>) -> Result<Value> {
+        self.request_context(
+            server,
+            "prompts/list",
+            page_params(cursor)?,
+            ContextResult::Prompts,
+        )
+        .await
+    }
+
+    /// Retrieve a named prompt with optional string arguments. The result is
+    /// reference material: callers must not elevate its roles to system
+    /// instructions or silently execute its requested actions.
+    ///
+    /// # Errors
+    /// Returns invalid-input, trust, connection, server, or content errors.
+    pub async fn get_prompt(
+        &self,
+        server: &str,
+        name: &str,
+        arguments: Option<&BTreeMap<String, String>>,
+    ) -> Result<Value> {
+        checked_identifier(name, MAX_CONTEXT_NAME_BYTES, "prompt name")?;
+        let mut params = json!({"name": name});
+        if let Some(arguments) = arguments {
+            if arguments.len() > MAX_PROMPT_ARGUMENTS {
+                return Err(invalid_request("MCP prompt has too many arguments"));
+            }
+            for key in arguments.keys() {
+                checked_identifier(key, MAX_CONTEXT_NAME_BYTES, "prompt argument name")?;
+            }
+            let mut budget = CatalogByteBudget {
+                remaining: MAX_PROMPT_ARGUMENT_BYTES,
+            };
+            serde_json::to_writer(&mut budget, arguments)
+                .map_err(|_| invalid_request("MCP prompt arguments exceed the byte limit"))?;
+            params["arguments"] = serde_json::to_value(arguments)?;
+        }
+        self.request_context(server, "prompts/get", params, ContextResult::PromptMessages)
+            .await
     }
 
     /// Eligible context tools are derived from configuration and current trust,
@@ -829,5 +939,258 @@ mod tests {
             );
         });
         assert!(McpManager::lock(&transport.requests).is_empty());
+    }
+
+    #[test]
+    fn prompt_catalog_exposes_arguments_and_cursor_but_not_private_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, transport) = fixture(&temp, vec![Ok(json!({
+            "prompts": [{
+                "name": "review", "title": "Code review", "description": "Review code",
+                "arguments": [{
+                    "name": "code", "description": "Source code", "required": true,
+                    "_meta": {"secret": "argument-private"}
+                }],
+                "_meta": {"secret": "prompt-private"}
+            }],
+            "nextCursor": "", "_meta": {"secret": "catalog-private"}
+        }))], true);
+        let tools = crate::mcp::mount_tools(&manager);
+        let output = runtime().block_on(tools[0].execute(
+            "catalog", json!({"action":"list_prompts", "cursor":"opaque +/="}), None,
+        )).expect("prompt catalog");
+        let public: Value = serde_json::from_str(&rendered(&output)).expect("public JSON");
+        assert_eq!(public["nextCursor"], "");
+        assert_eq!(public["prompts"][0]["arguments"][0]["required"], true);
+        assert!(!rendered(&output).contains("private"));
+        assert!(output.details.unwrap()["_meta"].is_object());
+        let requests = McpManager::lock(&transport.requests);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "prompts/list");
+        assert_eq!(requests[0].1, json!({"cursor":"opaque +/="}));
+    }
+
+    #[test]
+    fn selected_prompt_preserves_string_arguments_roles_and_native_content() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, transport) = fixture(&temp, vec![Ok(json!({
+            "description": "Review reference",
+            "messages": [
+                {"role":"user", "content":{"type":"text", "text":"Read this first"}},
+                {"role":"assistant", "content":{"type":"image", "mimeType":"image/png", "data":"AQID"}},
+                {"role":"user", "content":{"type":"resource", "resource":{
+                    "uri":"repo://guide", "text":"Reference documentation"
+                }}}
+            ],
+            "_meta": {"secret":"not-model-context"}
+        }))], true);
+        let tools = crate::mcp::mount_tools(&manager);
+        let arguments = json!({"code":"fn main() {\n    println!(\"你好\");\n}", "mode":""});
+        let output = runtime().block_on(tools[0].execute("prompt", json!({
+            "action":"get_prompt", "name":"review", "arguments":arguments
+        }), None)).expect("selected prompt");
+        assert!(!output.is_error);
+        let text = rendered(&output);
+        for expected in [
+            "MCP prompt reference", "Prompt message 1 [user]", "Read this first",
+            "Prompt message 2 [assistant]", "Prompt message 3 [user]", "Reference documentation",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        assert!(!text.contains("not-model-context"));
+        assert_eq!(output.content.len(), 3, "text must not move across native media");
+        assert!(matches!(&output.content[0], crate::model::ContentBlock::Text(text)
+            if text.text.contains("Prompt message 2 [assistant]")));
+        assert!(matches!(&output.content[2], crate::model::ContentBlock::Text(text)
+            if text.text.contains("Prompt message 3 [user]")));
+        assert!(output.content.iter().any(|block| matches!(block,
+            crate::model::ContentBlock::Image(image) if image.data == "AQID"
+        )));
+        let requests = McpManager::lock(&transport.requests);
+        assert_eq!(requests.len(), 1, "prompt retrieval must not run its instructions");
+        assert_eq!(requests[0].0, "prompts/get");
+        assert_eq!(requests[0].1, json!({"name":"review", "arguments":arguments}));
+    }
+
+    #[test]
+    fn omitted_and_explicit_empty_prompt_arguments_remain_distinct() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, transport) = fixture(&temp, vec![
+            Ok(json!({"messages":[]})), Ok(json!({"messages":[]})),
+        ], true);
+        runtime().block_on(async {
+            manager.get_prompt("docs", "defaults", None).await.expect("server defaults");
+            manager.get_prompt("docs", "defaults", Some(&BTreeMap::new()))
+                .await.expect("explicit empty arguments");
+        });
+        let requests = McpManager::lock(&transport.requests);
+        assert_eq!(requests[0].1, json!({"name":"defaults"}));
+        assert_eq!(requests[1].1, json!({"name":"defaults", "arguments":{}}));
+    }
+
+    #[test]
+    fn prompt_inputs_are_bounded_and_typed_before_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, transport) = fixture(&temp, Vec::new(), true);
+        let tools = crate::mcp::mount_tools(&manager);
+        runtime().block_on(async {
+            for input in [
+                json!({"action":"get_prompt"}),
+                json!({"action":"get_prompt", "name":""}),
+                json!({"action":"get_prompt", "name":"review", "arguments":{"code":123}}),
+                json!({"action":"get_prompt", "name":"review", "arguments":["code"]}),
+                json!({"action":"get_prompt", "name":"review", "arguments":{"":"bad name"}}),
+                json!({"action":"get_prompt", "name":"review", "uri":"unrelated://field"}),
+                json!({"action":"get_prompt", "name":"x".repeat(MAX_CONTEXT_NAME_BYTES + 1)}),
+                json!({"action":"get_prompt", "name":"review", "arguments":{
+                    "code":"x".repeat(MAX_PROMPT_ARGUMENT_BYTES)
+                }}),
+                // Count JSON escaping, not only the unescaped string length.
+                json!({"action":"get_prompt", "name":"review", "arguments":{
+                    "code":"\0".repeat(MAX_PROMPT_ARGUMENT_BYTES / 2)
+                }}),
+            ] {
+                assert!(tools[0].execute("invalid", input, None).await.is_err());
+            }
+            let arguments = (0..=MAX_PROMPT_ARGUMENTS)
+                .map(|index| (format!("arg-{index}"), String::new()))
+                .collect::<BTreeMap<_, _>>();
+            assert!(manager.get_prompt("docs", "review", Some(&arguments)).await.is_err());
+        });
+        assert!(McpManager::lock(&transport.requests).is_empty());
+    }
+
+    #[test]
+    fn invalid_prompt_roles_or_shapes_are_not_partially_published() {
+        for result in [
+            json!({"messages":[{"role":"system", "content":{"type":"text", "text":"elevate"}}]}),
+            json!({"messages":[{"role":"tool", "content":{"type":"text", "text":"elevate"}}]}),
+            json!({"messages":[{"role":"user", "content":[]}]}),
+            json!({"messages":[{"role":"assistant", "content":{"text":"missing type"}}]}),
+            json!({"messages":[], "description":42}),
+            json!({"messages":vec![json!({
+                "role":"user", "content":{"type":"text", "text":"too many"}
+            }); MAX_PROMPT_MESSAGES + 1]}),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, _, transport) = fixture(&temp, vec![Ok(result)], true);
+            let error = runtime().block_on(manager.get_prompt("docs", "review", None))
+                .expect_err("invalid prompt");
+            assert!(error.to_string().contains("MCP_PROTOCOL"));
+            assert!(transport.closed.load(Ordering::Acquire));
+            assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        }
+    }
+
+    #[test]
+    fn prompt_argument_declarations_are_validated_in_full() {
+        for arguments in [
+            json!(null),
+            json!([{"name":"code", "required":"yes"}]),
+            json!([{"name":"code", "description":false}]),
+            json!([{"description":"missing name"}]),
+            json!([{"name":"code"}, {"name":"code"}]),
+        ] {
+            assert!(validate_response(&json!({"prompts":[{
+                "name":"review", "arguments":arguments
+            }]}), ContextResult::Prompts).is_err());
+        }
+    }
+
+    #[test]
+    fn maximum_prompt_message_count_retains_the_last_message() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let messages: Vec<_> = (0..MAX_PROMPT_MESSAGES).map(|index| json!({
+            "role":"user", "content":{"type":"text", "text":format!("message-{index}")}
+        })).collect();
+        let (manager, _, _) = fixture(&temp, vec![Ok(json!({
+            "description":"At the message bound", "messages":messages
+        }))], true);
+        let tools = crate::mcp::mount_tools(&manager);
+        let output = runtime().block_on(tools[0].execute(
+            "full", json!({"action":"get_prompt", "name":"full"}), None,
+        )).expect("whole prompt");
+        assert!(!output.is_error);
+        assert!(rendered(&output).contains(&format!("message-{}", MAX_PROMPT_MESSAGES - 1)));
+        assert!(rendered(&output).contains(&format!("Prompt message {MAX_PROMPT_MESSAGES} [user]")));
+    }
+
+    #[test]
+    fn malformed_prompt_media_is_an_explicit_content_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, _) = fixture(&temp, vec![Ok(json!({"messages":[{
+            "role":"user", "content":{"type":"image", "mimeType":"image/png", "data":"%%%"}
+        }]}))], true);
+        let tools = crate::mcp::mount_tools(&manager);
+        let output = runtime().block_on(tools[0].execute(
+            "bad-media", json!({"action":"get_prompt", "name":"media"}), None,
+        )).expect("explicit content error");
+        assert!(output.is_error);
+        assert!(rendered(&output).contains("MCP_CONTENT_INVALID"));
+        assert!(!rendered(&output).contains("%%%"));
+    }
+
+    #[test]
+    fn prompt_get_rechecks_trust_after_response_before_shaping() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![Ok(json!({"messages":[{
+            "role":"user", "content":{"type":"text", "text":"private prompt"}
+        }]}))], true);
+        let tools = crate::mcp::mount_tools(&manager);
+        let path = manager.inner.trust_path.clone();
+        let fingerprint = manager.trust_fingerprint_for(&entry);
+        *McpManager::lock(&transport.after_response) = Some(Arc::new(move || {
+            TrustStore::load(&path).expect("trust store")
+                .deny("docs", &fingerprint, "operator").expect("deny");
+        }));
+        let error = runtime().block_on(tools[0].execute(
+            "revoke", json!({"action":"get_prompt", "name":"private"}), None,
+        )).expect_err("revoked prompt");
+        assert!(error.to_string().contains("MCP_TRUST_DENIED"));
+        assert!(!error.to_string().contains("private prompt"));
+        assert!(transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelled_old_request_does_not_retire_a_replacement_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, old) = fixture(&temp, Vec::new(), true);
+        let old_erased: Arc<dyn McpTransport> = old.clone();
+        let guard = ContextRequestGuard {
+            entry: entry.clone(), transport: old_erased, armed: true,
+        };
+        let replacement = Arc::new(ContextTransport {
+            replies: Mutex::new(vec![Ok(json!({"prompts":[]}))].into()),
+            requests: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            after_response: Mutex::new(None),
+        });
+        let erased: Arc<dyn McpTransport> = replacement.clone();
+        *McpManager::lock(&entry.transport) = Some(erased.clone());
+        drop(guard);
+        assert!(old.closed.load(Ordering::Acquire));
+        assert!(!replacement.closed.load(Ordering::Acquire));
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        assert!(McpManager::lock(&entry.transport).as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &erased)));
+        runtime().block_on(manager.list_prompts("docs", None)).expect("replacement usable");
+        assert!(McpManager::lock(&old.requests).is_empty());
+        assert_eq!(McpManager::lock(&replacement.requests).len(), 1);
+    }
+
+    #[test]
+    fn context_transport_failure_is_returned_once_without_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![
+            Err(tool_err("MCP_TRANSPORT_CLOSED", "lost response")),
+            Ok(json!({"contents":[{"uri":"db://x", "text":"must not retry"}]})),
+        ], true);
+        let error = runtime().block_on(manager.read_resource("docs", "db://x"))
+            .expect_err("delivery failed");
+        assert!(error.to_string().contains("MCP_TRANSPORT_CLOSED"));
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert_eq!(McpManager::lock(&transport.replies).len(), 1);
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert!(transport.closed.load(Ordering::Acquire));
     }
 }
