@@ -3,7 +3,7 @@
 use super::*;
 use std::process::{Command, Stdio};
 
-const SERVER: &str = r#"
+const SERVER: &str = r"
 import json, sys
 mode = sys.argv[1]
 def send(value):
@@ -42,12 +42,16 @@ while True:
             response['result'] = {'kind':'full','resultId':'fixture','items':items}
     else: response['result'] = None
     send(response)
-"#;
+";
 
 fn tool(root: &Path, mode: &str) -> Option<LspTool> {
     let python = ["python3", "python"].into_iter().find(|program| {
-        Command::new(program).arg("--version").stdout(Stdio::null())
-            .stderr(Stdio::null()).status().is_ok_and(|status| status.success())
+        Command::new(program)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     });
     let Some(python) = python else {
         eprintln!("SKIP model-facing LSP diagnostics test: Python is unavailable");
@@ -59,21 +63,30 @@ fn tool(root: &Path, mode: &str) -> Option<LspTool> {
             "command":python,"args":["-u","-c",SERVER,mode],
             "languages":["plaintext"],"extensions":[".pidiag"],"rootMarkers":[]
         }}
-    }})).expect("server configuration");
+    }}))
+    .expect("server configuration");
     Some(LspTool::new(root, Some(&config)))
 }
 
 fn run(tool: &LspTool, file: &str) -> Result<ToolOutput> {
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    runtime.block_on(tool.execute("diagnostics-test", json!({
-        "action":"diagnostics","file":file,"timeout":1
-    }), None))
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(tool.execute(
+        "diagnostics-test",
+        json!({
+            "action":"diagnostics","file":file,"timeout":1
+        }),
+        None,
+    ))
 }
 
 #[test]
 fn model_facing_diagnostics_retrieves_a_pull_only_report() {
     let temp = tempfile::tempdir().unwrap();
-    let Some(tool) = tool(temp.path(), "pull") else { return };
+    let Some(tool) = tool(temp.path(), "pull") else {
+        return;
+    };
     let output = run(&tool, "source.pidiag").expect("diagnostic report");
     assert!(!output.is_error);
     let details = output.details.unwrap();
@@ -86,8 +99,10 @@ fn model_facing_diagnostics_retrieves_a_pull_only_report() {
 fn model_facing_diagnostics_propagates_pull_errors_instead_of_zero_issues() {
     for mode in ["error", "malformed", "unchanged_without_prior"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some(tool) = tool(temp.path(), mode) else { return };
-        let error = run(&tool, "source.pidiag").err().expect("no clean result on failure");
+        let Some(tool) = tool(temp.path(), mode) else {
+            return;
+        };
+        let error = run(&tool, "source.pidiag").expect_err("no clean result on failure");
         let message = error.to_string();
         if mode == "error" {
             assert!(message.contains("diagnostic engine failed"), "{message}");
@@ -100,16 +115,23 @@ fn model_facing_diagnostics_propagates_pull_errors_instead_of_zero_issues() {
 #[test]
 fn model_facing_diagnostics_requires_an_actual_push_report() {
     let temp = tempfile::tempdir().unwrap();
-    let Some(tool) = tool(temp.path(), "silent") else { return };
-    let error = run(&tool, "source.pidiag").err().expect("missing report is not clean");
-    assert!(error.to_string().contains("LSP_DIAGNOSTICS_PENDING"), "{error}");
+    let Some(tool) = tool(temp.path(), "silent") else {
+        return;
+    };
+    let error = run(&tool, "source.pidiag").expect_err("missing report is not clean");
+    assert!(
+        error.to_string().contains("LSP_DIAGNOSTICS_PENDING"),
+        "{error}"
+    );
 }
 
 #[test]
 fn explicitly_empty_push_and_pull_reports_are_successful_empty_results() {
     for mode in ["push_empty", "pull_empty"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some(tool) = tool(temp.path(), mode) else { return };
+        let Some(tool) = tool(temp.path(), mode) else {
+            return;
+        };
         let output = run(&tool, "source.pidiag").expect("explicit empty report");
         assert!(!output.is_error);
         let details = output.details.unwrap();
@@ -127,6 +149,11 @@ fn glob_view_explicitly_declares_cached_partial_coverage_without_spawning() {
     assert_eq!(details["files"], 0);
     assert_eq!(details["cachedOnly"], true);
     assert_eq!(details["complete"], false);
-    assert!(details["note"].as_str().unwrap().contains("have not been checked"));
+    assert!(
+        details["note"]
+            .as_str()
+            .unwrap()
+            .contains("have not been checked")
+    );
     assert!(tool.registry.status().is_empty());
 }

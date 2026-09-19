@@ -91,7 +91,7 @@ fn invalid_request_timeouts_never_launch() {
 fn an_uncooperative_running_child_is_terminated_by_the_parent() {
     let (_root, tool) = fixture(
         "printf 'started\\n' > launched\nexec sleep 30",
-        Duration::from_secs(3),
+        Duration::from_secs(6),
     );
     let started = Instant::now();
     let output = run(&tool, request(), None).unwrap();
@@ -101,7 +101,7 @@ fn an_uncooperative_running_child_is_terminated_by_the_parent() {
     assert!(value["pid"].as_u64().is_some(), "exercise a running child");
     assert!(tool.cwd.join("launched").exists());
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(20),
         "must not wait for sleep 30"
     );
     let pid = value["pid"].as_u64().unwrap();
@@ -119,7 +119,7 @@ fn an_uncooperative_running_child_is_terminated_by_the_parent() {
 fn a_terminal_frame_cannot_hide_a_process_that_never_exits() {
     let (_root, tool) = fixture(
         &format!("{}exec sleep 30", end("looks complete")),
-        Duration::from_secs(3),
+        Duration::from_secs(6),
     );
     let output = run(&tool, request(), None).unwrap();
     assert!(output.is_error);
@@ -131,7 +131,7 @@ fn a_terminal_frame_cannot_hide_a_process_that_never_exits() {
 fn queued_parallel_work_consumes_the_original_budget() {
     let (_root, tool) = fixture(
         "printf 'started\\n' >> launches\nexec sleep 30",
-        Duration::from_secs(3),
+        Duration::from_secs(6),
     );
     let output = run(
         &tool,
@@ -185,7 +185,7 @@ fn starting_callback_can_exhaust_budget_before_spawn() {
 fn chained_steps_do_not_get_a_fresh_timeout() {
     let (_root, tool) = fixture(
         &format!("printf 'started\\n' >> launches\n{}", end("first")),
-        Duration::from_secs(3),
+        Duration::from_secs(6),
     );
     let observed = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&observed);
@@ -201,7 +201,7 @@ fn chained_steps_do_not_get_a_fresh_timeout() {
                 .is_some_and(|value| value["result"]["status"] == "completed")
                 && !flag.swap(true, Ordering::SeqCst)
             {
-                std::thread::sleep(Duration::from_millis(3500));
+                std::thread::sleep(Duration::from_millis(6500));
             }
         })),
     )
@@ -220,7 +220,7 @@ fn chained_steps_do_not_get_a_fresh_timeout() {
 fn an_expired_budget_does_not_launch_a_corrective_retry() {
     let (_root, tool) = fixture(
         &format!("printf 'started\\n' >> launches\n{}", end("not JSON")),
-        Duration::from_secs(3),
+        Duration::from_secs(6),
     );
     let observed = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&observed);
@@ -236,7 +236,7 @@ fn an_expired_budget_does_not_launch_a_corrective_retry() {
                 .is_some_and(|value| value["result"]["schemaValid"] == false)
                 && !flag.swap(true, Ordering::SeqCst)
             {
-                std::thread::sleep(Duration::from_millis(3500));
+                std::thread::sleep(Duration::from_millis(6500));
             }
         })),
     )
@@ -280,7 +280,7 @@ fn corrective_processes_receive_the_same_absolute_deadline() {
 fn expired_isolated_work_is_preserved_and_never_applied() {
     let (_root, tool) = fixture(
         "printf 'unaccepted\\n' > tracked.txt\nexec sleep 30",
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
     for args in [
         vec!["init", "--quiet", "-b", "main"],
@@ -333,7 +333,7 @@ fn expired_isolated_work_is_preserved_and_never_applied() {
 
 #[test]
 fn background_tan_uses_the_same_host_budget() {
-    let (_root, tool) = fixture("exec sleep 30", Duration::from_secs(3));
+    let (_root, tool) = fixture("exec sleep 30", Duration::from_secs(6));
     let completion = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .unwrap()

@@ -5,9 +5,9 @@
 //! server-initiated edits require an explicitly selected command window.
 
 mod actions;
+pub mod client;
 #[cfg(test)]
 mod diagnostics_tests;
-pub mod client;
 pub mod edits;
 pub mod jsonrpc;
 pub mod registry;

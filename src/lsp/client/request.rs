@@ -13,9 +13,8 @@ use futures::future::{Either, select};
 use serde_json::Value;
 
 use super::{
-    JsonRpcClient, LspCallError, LspClient, TransportError, WAIT_TICK,
-    WARMUP_EMPTY_RESULT_WINDOW, WARMUP_RETRY_CADENCE, is_empty_result,
-    is_warmup_empty_retryable,
+    JsonRpcClient, LspCallError, LspClient, TransportError, WAIT_TICK, WARMUP_EMPTY_RESULT_WINDOW,
+    WARMUP_RETRY_CADENCE, is_empty_result, is_warmup_empty_retryable,
 };
 use crate::agent_cx::AgentCx;
 
@@ -29,11 +28,17 @@ impl RequestBudget {
     pub(super) fn new(timeout: Duration) -> Self {
         let owner = AgentCx::for_current_or_request();
         let start = now(&owner);
-        Self { owner, start, timeout }
+        Self {
+            owner,
+            start,
+            timeout,
+        }
     }
 
     pub(super) fn remaining(&self) -> Result<Duration, LspCallError> {
-        self.owner.checkpoint().map_err(|_| LspCallError::Cancelled)?;
+        self.owner
+            .checkpoint()
+            .map_err(|_| LspCallError::Cancelled)?;
         let elapsed = Duration::from_nanos(now(&self.owner).duration_since(self.start));
         let remaining = self.timeout.saturating_sub(elapsed);
         if remaining.is_zero() {
@@ -57,9 +62,8 @@ impl RequestBudget {
         &self,
         lane: &Arc<Mutex<()>>,
     ) -> Result<OwnedMutexGuard<()>, LspCallError> {
-        let mut acquisition = std::pin::pin!(OwnedMutexGuard::lock(
-            Arc::clone(lane), self.owner.cx(),
-        ));
+        let mut acquisition =
+            std::pin::pin!(OwnedMutexGuard::lock(Arc::clone(lane), self.owner.cx(),));
         loop {
             let remaining = self.remaining()?;
             let time = self.owner.time();
@@ -74,7 +78,10 @@ impl RequestBudget {
 }
 
 fn now(owner: &AgentCx) -> Time {
-    owner.cx().timer_driver().map_or_else(asupersync::time::wall_now, |timer| timer.now())
+    owner
+        .cx()
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now())
 }
 
 /// A posted request remains owned even when its calling future is dropped.
@@ -141,8 +148,15 @@ impl LspClient {
     ) -> Result<Value, LspCallError> {
         let _lane = budget.acquire(&self.request_lane).await?;
         budget.remaining()?;
-        let (id, rx) = self.rpc.request(method, params).map_err(LspCallError::Transport)?;
-        let mut pending = PendingRequest { rpc: &self.rpc, id, completed: false };
+        let (id, rx) = self
+            .rpc
+            .request(method, params)
+            .map_err(LspCallError::Transport)?;
+        let mut pending = PendingRequest {
+            rpc: &self.rpc,
+            id,
+            completed: false,
+        };
         loop {
             // Cancellation and expiry win over an already-buffered late
             // response. No subsequent retry gets a fresh request timeout.
