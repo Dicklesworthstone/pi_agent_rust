@@ -5373,6 +5373,19 @@ pub struct ToolRegistry {
     shared: Option<std::sync::Weak<SharedToolRegistryInner>>,
 }
 
+/// The requested tool names pi will silently ignore.
+///
+/// Order and duplicates follow the request, so the warning reads back what the
+/// user typed.
+#[must_use]
+pub fn unknown_tool_names(requested: &[&str]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|name| !ToolRegistry::KNOWN_TOOL_NAMES.contains(*name))
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
 impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
@@ -5384,6 +5397,53 @@ impl ToolRegistry {
     pub fn mutation_recorder(&self) -> Option<Arc<crate::undo::FileMutationRecorder>> {
         self.mutation_recorder.clone()
     }
+
+    /// Every name `--tools` will honour.
+    ///
+    /// The match in [`Self::with_mutation_recorder`] ends in `_ => {}`, so a
+    /// name it does not know is dropped without a word: `pi --tools
+    /// completely_made_up` starts an agent with no tools at all and says
+    /// nothing, and `--tools read,bsah,edit` quietly hands the model two tools
+    /// instead of three. This list is what [`unknown_tool_names`] measures a
+    /// request against.
+    ///
+    /// Keep it in step with that match. `tool_registry_builds_every_listed_name`
+    /// fails if a name here builds nothing, which is the direction that would
+    /// promise a tool pi cannot deliver; the reverse — an arm nobody listed —
+    /// costs a spurious warning for a tool that still works.
+    pub const KNOWN_TOOL_NAMES: &'static [&'static str] = &[
+        // Built here, one arm each.
+        "ast_edit",
+        "ast_grep",
+        "bash",
+        "browser",
+        "computer",
+        "current_time",
+        "debug",
+        "edit",
+        "eval",
+        "find",
+        "generate_image",
+        "github",
+        "grep",
+        "hashline_edit",
+        "hub",
+        "inspect_image",
+        "jobs",
+        "ls",
+        "lsp",
+        "read",
+        "read_media",
+        "security_scan",
+        "subagent",
+        "tts",
+        "web_search",
+        "write",
+        // Host-coupled: joined after construction by main.rs / sdk.rs.
+        "ask",
+        "todo",
+        "submit_plan",
+    ];
 
     /// Like [`ToolRegistry::new`] but attaches a session undo recorder to the
     /// mutating file tools (bd-cv653.3.13). `workspace` installs the shared
@@ -5549,6 +5609,12 @@ impl ToolRegistry {
                             .with_role_model_spec(role_model_spec),
                     ));
                 }
+                // Nothing to build: either a host-coupled tool the session host
+                // joins after construction (`ask`, `todo`, `submit_plan` — see
+                // main.rs and sdk.rs) or a name pi does not have. The two are
+                // told apart by [`ToolRegistry::KNOWN_TOOL_NAMES`], which is
+                // what warns about the second; they cannot be told apart here,
+                // because both do nothing.
                 _ => {}
             }
         }
@@ -21517,6 +21583,92 @@ mod tests {
         assert!(
             !registry.is_discoverable("current_time"),
             "current_time must be essential-tier (directly callable)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod known_tool_name_tests {
+    use super::*;
+
+    /// Joined after construction by the session host, so the registry builds
+    /// nothing for them and neither does this test.
+    const HOST_COUPLED: &[&str] = &["ask", "todo", "submit_plan"];
+
+    /// What the registry holds for a request naming nothing at all.
+    ///
+    /// Not necessarily zero — some tools join regardless of `--tools` — so
+    /// "this name built something" has to be measured as a difference.
+    fn baseline_tool_count(dir: &std::path::Path) -> usize {
+        ToolRegistry::new(&[], dir, None).tools().len()
+    }
+
+    #[test]
+    fn tool_registry_builds_every_listed_name() {
+        // The direction that matters: a name in KNOWN_TOOL_NAMES that builds
+        // nothing is pi promising a tool it will then drop in silence, which
+        // is the whole defect the list exists to report.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let baseline = baseline_tool_count(dir.path());
+        let mut built_nothing = Vec::new();
+        for name in ToolRegistry::KNOWN_TOOL_NAMES {
+            if HOST_COUPLED.contains(name) {
+                continue;
+            }
+            if ToolRegistry::new(&[name], dir.path(), None).tools().len() <= baseline {
+                built_nothing.push(*name);
+            }
+        }
+        assert!(
+            built_nothing.is_empty(),
+            "listed but built nothing beyond the {baseline}-tool baseline: \
+             {built_nothing:?} — either the arm went away or the name is \
+             misspelled in KNOWN_TOOL_NAMES"
+        );
+    }
+
+    #[test]
+    fn host_coupled_names_are_listed_and_build_nothing_here() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let baseline = baseline_tool_count(dir.path());
+        for name in HOST_COUPLED {
+            assert!(
+                ToolRegistry::KNOWN_TOOL_NAMES.contains(name),
+                "{name} would be reported as a typo"
+            );
+            assert_eq!(
+                ToolRegistry::new(&[name], dir.path(), None).tools().len(),
+                baseline,
+                "{name} now builds in the registry; move it out of HOST_COUPLED"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_tool_name_is_reported_and_a_real_one_is_not() {
+        assert_eq!(
+            unknown_tool_names(&["read", "bsah", "edit"]),
+            vec!["bsah".to_string()]
+        );
+        assert!(unknown_tool_names(&["read", "ask", "todo", "submit_plan"]).is_empty());
+        assert_eq!(
+            unknown_tool_names(&["completely_made_up"]),
+            vec!["completely_made_up".to_string()]
+        );
+        assert!(unknown_tool_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_default_tool_set_is_entirely_honoured() {
+        // `--tools`' own default must not contain a name pi drops.
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        let requested = cli.enabled_tools();
+        assert!(!requested.is_empty(), "the default set should not be empty");
+        assert!(
+            unknown_tool_names(&requested).is_empty(),
+            "pi's own default --tools names something it drops: {:?}",
+            unknown_tool_names(&requested)
         );
     }
 }

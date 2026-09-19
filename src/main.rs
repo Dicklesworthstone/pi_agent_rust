@@ -1661,6 +1661,20 @@ async fn run(
     // undo/workspace policy and see tools mounted after boot (extension
     // wrappers, MCP tools, plan tools).
     let shared_enabled_tools = cli.enabled_tools();
+    // A name the registry does not know is dropped without a word, so
+    // `--tools read,bsah,edit` hands the model two tools and reports three.
+    let unknown_tools = pi::tools::unknown_tool_names(&shared_enabled_tools);
+    if !unknown_tools.is_empty() {
+        for name in &unknown_tools {
+            eprintln!("Warning: --tools: \"{name}\" is not a tool pi provides; it is ignored");
+        }
+        // The constant groups registry-built names ahead of host-coupled ones,
+        // which is the right order to read the code in and the wrong one to
+        // scan for a name.
+        let mut provided = ToolRegistry::KNOWN_TOOL_NAMES.to_vec();
+        provided.sort_unstable();
+        eprintln!("Warning: --tools: pi provides {}", provided.join(", "));
+    }
     let shared_tools = pi::tools::SharedToolRegistry::new(ToolRegistry::with_mutation_recorder(
         &shared_enabled_tools,
         &cwd,
