@@ -169,6 +169,174 @@ fn mcp_result_to_output(result: &Value) -> ToolOutput {
     content::tool_output(result)
 }
 
+/// Resource access for one trusted server. This namespace is disjoint from
+/// server-advertised `mcp__...` tools, even for hostile or ambiguous names.
+pub struct McpContextTool {
+    server: String,
+    mounted: String,
+    description: String,
+    manager: std::sync::Arc<McpManager>,
+}
+
+impl McpContextTool {
+    #[must_use]
+    pub fn new(server: &str, manager: std::sync::Arc<McpManager>) -> Self {
+        use sha2::{Digest as _, Sha256};
+
+        let readable: String = server
+            .chars()
+            .take(24)
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let mut hasher = Sha256::new();
+        hasher.update(b"pi_agent_rust:mcp-context:v1\0");
+        hasher.update(server.as_bytes());
+        let hash = crate::package_manager::hex_encode(&hasher.finalize());
+        Self {
+            server: server.to_string(),
+            mounted: format!("mcp_context_{readable}_{}", &hash[..24]),
+            description: format!(
+                "Browse resource and URI-template catalogs and read resources from MCP server {server:?}. \
+                 Listings return one page: pass nextCursor unchanged to continue. Read resource URIs \
+                 through this tool, not local file or web tools. Unsupported methods return an error."
+            ),
+            manager,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum McpContextAction {
+    ListResources { cursor: Option<String> },
+    ListResourceTemplates { cursor: Option<String> },
+    ReadResource { uri: String },
+}
+
+/// Only public catalog fields enter model context. In particular, `_meta`
+/// remains in details; it must not become an extra instruction channel.
+fn resource_catalog_output(result: Value, templates: bool) -> ToolOutput {
+    let (field, uri_field) = if templates {
+        ("resourceTemplates", "uriTemplate")
+    } else {
+        ("resources", "uri")
+    };
+    let entries: Vec<Value> = result[field]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let mut public = serde_json::Map::new();
+            for key in ["name", "title", uri_field, "description", "mimeType"] {
+                if let Some(value) = entry.get(key) {
+                    public.insert(key.to_string(), value.clone());
+                }
+            }
+            if !templates && let Some(size) = entry.get("size") {
+                public.insert("size".to_string(), size.clone());
+            }
+            Value::Object(public)
+        })
+        .collect();
+    let mut public = serde_json::json!({field: entries});
+    if let Some(cursor) = result.get("nextCursor") {
+        public["nextCursor"] = cursor.clone();
+    }
+    ToolOutput {
+        content: vec![crate::model::ContentBlock::Text(
+            crate::model::TextContent::new(public.to_string()),
+        )],
+        details: Some(result),
+        is_error: false,
+    }
+}
+
+fn resource_read_output(result: Value) -> ToolOutput {
+    let blocks: Vec<Value> = result["contents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|resource| serde_json::json!({"type": "resource", "resource": resource}))
+        .collect();
+    let mut output = content::tool_output(&serde_json::json!({"content": blocks}));
+    let shaping = output.details.take();
+    output.details = Some(serde_json::json!({"result": result, "shaping": shaping}));
+    output
+}
+
+#[async_trait]
+impl Tool for McpContextTool {
+    fn name(&self) -> &str {
+        &self.mounted
+    }
+
+    fn label(&self) -> &str {
+        &self.mounted
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["action"],
+            "additionalProperties": false,
+            "properties": {
+                "action": {"type": "string", "enum": ["list_resources", "list_resource_templates", "read_resource"]},
+                "cursor": {"type": "string", "description": "Opaque nextCursor from this server's previous page, including empty strings"},
+                "uri": {"type": "string", "description": "Exact resource URI to read through this MCP server"}
+            }
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        // External server requests remain barriers, even for read-shaped RPC.
+        ToolEffects::network().union(ToolEffects::process())
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> crate::error::Result<ToolOutput> {
+        let action: McpContextAction = serde_json::from_value(input).map_err(|_| {
+            crate::error::Error::tool(
+                "mcp",
+                "[MCP_REQUEST_INVALID] expected a resource action with its cursor or URI",
+            )
+        })?;
+        match action {
+            McpContextAction::ListResources { cursor } => {
+                let result = self
+                    .manager
+                    .list_resources(&self.server, cursor.as_deref())
+                    .await?;
+                Ok(resource_catalog_output(result, false))
+            }
+            McpContextAction::ListResourceTemplates { cursor } => {
+                let result = self
+                    .manager
+                    .list_resource_templates(&self.server, cursor.as_deref())
+                    .await?;
+                Ok(resource_catalog_output(result, true))
+            }
+            McpContextAction::ReadResource { uri } => {
+                let result = self.manager.read_resource(&self.server, &uri).await?;
+                Ok(resource_read_output(result))
+            }
+        }
+    }
+}
+
 /// Mount every cached server tool as a first-class tool wrapper.
 #[must_use]
 pub fn mount_tools(manager: &std::sync::Arc<McpManager>) -> Vec<Box<dyn Tool>> {
@@ -177,6 +345,9 @@ pub fn mount_tools(manager: &std::sync::Arc<McpManager>) -> Vec<Box<dyn Tool>> {
         for meta in metas {
             out.push(Box::new(McpTool::new(&server, &meta, manager.clone())));
         }
+    }
+    for server in manager.context_server_names(None) {
+        out.push(Box::new(McpContextTool::new(&server, manager.clone())));
     }
     out
 }
@@ -191,17 +362,21 @@ pub fn mount_server_tools(
     manager: &std::sync::Arc<McpManager>,
     server_name: &str,
 ) -> Vec<Box<dyn Tool>> {
-    let Some((server, metas)) = manager
+    let mut out: Vec<Box<dyn Tool>> = manager
         .mounted_tool_metas()
         .into_iter()
         .find(|(server, _)| server == server_name)
-    else {
-        return Vec::new();
-    };
-    metas
         .into_iter()
-        .map(|meta| Box::new(McpTool::new(&server, &meta, manager.clone())) as Box<dyn Tool>)
-        .collect()
+        .flat_map(|(server, metas)| {
+            metas.into_iter().map(move |meta| {
+                Box::new(McpTool::new(&server, &meta, manager.clone())) as Box<dyn Tool>
+            })
+        })
+        .collect();
+    for server in manager.context_server_names(Some(server_name)) {
+        out.push(Box::new(McpContextTool::new(&server, manager.clone())));
+    }
+    out
 }
 
 /// Connect every acknowledged server, then snapshot its cached tools as

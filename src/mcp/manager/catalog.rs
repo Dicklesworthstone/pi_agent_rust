@@ -14,6 +14,8 @@ use super::{
     McpTransport, Result, ServerEntry, Value, parse_tool_list, tool_err,
 };
 
+mod context;
+
 const MAX_CATALOG_PAGES: usize = 128;
 const MAX_CURSOR_BYTES: usize = 4096;
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
@@ -171,6 +173,17 @@ impl McpManager {
             };
             let result = match transport.request("tools/list", params, remaining).await {
                 Ok(result) => result,
+                // Tools are optional in MCP. A resource-only server may
+                // explicitly reject the initial tools/list method. Do not
+                // mistake that for a crashed connection, or accept a failure
+                // on a later page as a successfully completed partial catalog.
+                Err(error)
+                    if catalog.pages == 0
+                        && transport.is_alive()
+                        && context::is_method_not_found(&error) =>
+                {
+                    json!({"tools": []})
+                }
                 Err(error) => {
                     Self::fail_transport_generation(entry, transport, &error);
                     return Err(error);
