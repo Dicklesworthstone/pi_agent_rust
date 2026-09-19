@@ -506,34 +506,34 @@
 
 | Command | TS Pi | Rust Pi | Notes |
 |---------|-------|---------|-------|
-| `prompt` | Y | ? | Initial prompt |
+| `prompt` | Y | Y | Initial prompt |
 | `steer` | Y | Y | Steer with user message |
 | `follow_up` / `queue-follow-up` | Y | Y | Queue follow-up |
 | `abort` | Y | Y | Abort current operation |
-| `new_session` | Y | ? | Start new session |
+| `new_session` | Y | Y | Start new session |
 | `get_state` / `get-state` | Y | Y | Get session state |
 | `set_model` / `set-model` | Y | Y | Set active model |
-| `cycle_model` | Y | ? | Cycle to next model |
-| `get_available_models` | Y | ? | List models |
-| `set_thinking_level` | Y | ? | Set thinking level |
-| `cycle_thinking_level` | Y | ? | Cycle thinking level |
-| `set_steering_mode` | Y | ? | Set steering mode |
-| `set_follow_up_mode` | Y | ? | Set follow-up mode |
+| `cycle_model` | Y | Y | Cycle to next model; covered by the g05 RPC differential fixture |
+| `get_available_models` | Y | Y | List models |
+| `set_thinking_level` | Y | Y | Set thinking level |
+| `cycle_thinking_level` | Y | Y | Cycle thinking level; covered by the g05 RPC differential fixture |
+| `set_steering_mode` | Y | Y | Set steering mode |
+| `set_follow_up_mode` | Y | Y | Set follow-up mode |
 | `compact` | Y | Y | Compact session |
 | `set_auto_compaction` / `set-auto-compaction` | Y | Y | Enable/disable compaction |
 | `set_auto_retry` / `set-auto-retry` | Y | Y | Enable/disable retry |
-| `abort_retry` | Y | ? | Abort retry |
-| `bash` | Y | ? | Execute bash |
-| `abort_bash` | Y | ? | Abort bash |
-| `get_session_stats` | Y | ? | Session statistics |
-| `export_html` | Y | ? | Export to HTML |
-| `switch_session` | Y | ? | Switch session |
-| `fork` | Y | ? | Fork from entry |
-| `get_fork_messages` | Y | ? | Get fork messages |
-| `get_last_assistant_text` | Y | ? | Last assistant text |
-| `set_session_name` | Y | ? | Set name |
-| `get_messages` | Y | ? | Get all messages |
-| `get_commands` | Y | ? | List commands |
+| `abort_retry` | Y | Y | Abort retry |
+| `bash` | Y | Y | Execute bash |
+| `abort_bash` | Y | Y | Abort bash |
+| `get_session_stats` | Y | Y | Session statistics |
+| `export_html` | Y | Y | Export to HTML |
+| `switch_session` | Y | Y | Switch session |
+| `fork` | Y | Y | Fork from entry |
+| `get_fork_messages` | Y | Y | Get fork messages; covered by the g05 RPC differential fixture |
+| `get_last_assistant_text` | Y | Y | Last assistant text |
+| `set_session_name` | Y | Y | Set name |
+| `get_messages` | Y | Y | Get all messages |
+| `get_commands` | Y | Y | List commands |
 | `query-completion` | N | Y | Rust-only: completion query |
 
 ### RPC Events (responses)
