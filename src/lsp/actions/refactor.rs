@@ -22,6 +22,12 @@ pub(super) struct RefactorSnapshot {
 }
 
 impl RefactorSnapshot {
+    pub(super) fn command_edits(&self, owner: AgentCx) -> super::command_edits::CommandEdits {
+        super::command_edits::CommandEdits::new(
+            self.source.clone(), self.source_hash, self.documents.clone(), owner,
+        )
+    }
+
     pub(super) fn capture(entry: &ServerEntry, source: &Path, hash: u64) -> Result<Self> {
         inside_root(source, entry.client.root())?;
         verify_source(source, hash)?;
@@ -87,7 +93,7 @@ impl RefactorSnapshot {
     }
 }
 
-fn validate_versions(
+pub(super) fn validate_versions(
     raw: &Value,
     requested: &HashMap<PathBuf, DocumentSnapshot>,
     current: &HashMap<PathBuf, DocumentSnapshot>,
@@ -95,7 +101,7 @@ fn validate_versions(
     versions::validate(raw, requested, current)
 }
 
-fn check_response_size(raw: &Value) -> Result<()> {
+pub(super) fn check_response_size(raw: &Value) -> Result<()> {
     // Count without allocating another potentially large response copy.
     struct Limit(usize);
     impl std::io::Write for Limit {

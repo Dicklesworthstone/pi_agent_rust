@@ -51,20 +51,97 @@ def edit(uri, text="fixed", end=3):
                               "newText": text}]}}
 
 
-def server_edit(uri):
+def observe(message):
+    method = message.get("method")
+    params = message.get("params", {})
+    if method:
+        with Path("requests.jsonl").open("a", encoding="utf-8") as log:
+            log.write(json.dumps({"method": method, "params": params}) + "\n")
+    if method in ("textDocument/didOpen", "textDocument/didChange"):
+        doc = params["textDocument"]
+        VERSIONS.append(doc["version"])
+        DOCUMENT_VERSIONS[doc["uri"]] = doc["version"]
+    elif method == "textDocument/didClose":
+        DOCUMENT_VERSIONS.pop(params["textDocument"]["uri"], None)
+
+
+def server_workspace_edit(workspace_edit):
     global SEQUENCE
     SEQUENCE += 1
     request_id = "apply-%d" % SEQUENCE
-    send({"id": request_id, "method": "workspace/applyEdit", "params": {"edit": edit(uri)}})
+    send({"id": request_id, "method": "workspace/applyEdit", "params": {"edit": workspace_edit}})
     while True:
         response = read()
         if response is None:
             raise EOFError("client left during server edit")
+        observe(response)
         if response.get("id") == request_id:
             return response["result"]
         if "method" in response and "id" not in response:
             continue
         raise ValueError("unexpected request while awaiting server edit acknowledgement")
+
+
+def server_edit(uri):
+    return server_workspace_edit(edit(uri))
+
+
+def versioned_edit(uri, version, text="one", end=3):
+    return {"documentChanges": [{"textDocument": {"uri": uri, "version": version},
+            "edits": edit(uri, text, end)["changes"][uri]}]}
+
+
+def command_action(uri):
+    sibling = Path("sibling.lspfixture").resolve().as_uri()
+    data = {"uri": uri, "version": DOCUMENT_VERSIONS[uri],
+            "sibling": sibling, "siblingVersion": DOCUMENT_VERSIONS.get(sibling)}
+    command = {"title": "Command refactor", "command": "test.sequence", "arguments": [data]}
+    if MODE.startswith("command-inline"):
+        return {"title": "Command refactor", "kind": "refactor", "edit": edit(uri), "command": command}
+    return command
+
+
+def run_command_sequence(data):
+    uri, sibling = data["uri"], data["sibling"]
+    results = []
+    if MODE == "command-versions":
+        results.append(server_workspace_edit(versioned_edit(uri, data["version"])))
+        assert uri not in DOCUMENT_VERSIONS, "client did not retire the applied wire version"
+        results.append(server_workspace_edit(versioned_edit(uri, None, "two")))
+    elif MODE in ("command-stale", "command-unknown"):
+        target = sibling if MODE == "command-unknown" else uri
+        results.append(server_workspace_edit(versioned_edit(target, data["version"] + 1)))
+        results.append(server_edit(sibling))  # Must remain rejected, not a silent retry.
+    elif MODE == "command-inline-sibling":
+        assert Path("source.lspfixture").read_text() == "fixed\n"
+        results.append(server_workspace_edit(versioned_edit(sibling, data["siblingVersion"])))
+    elif MODE in ("command-source-drift", "command-inline-drift"):
+        Path("source.lspfixture").write_text("external\n", encoding="utf-8")
+        results.append(server_edit(sibling))
+    elif MODE == "command-between-drift":
+        results.append(server_edit(uri))
+        Path("source.lspfixture").write_text("external\n", encoding="utf-8")
+        results.append(server_workspace_edit(edit(uri, "bad", 5)))
+        results.append(server_edit(sibling))
+    elif MODE in ("command-move", "command-recreated"):
+        moved = Path("moved.lspfixture").resolve().as_uri()
+        steps = [{"kind": "rename", "oldUri": uri, "newUri": moved}]
+        if MODE == "command-move":
+            steps += versioned_edit(moved, data["version"])["documentChanges"]
+        results.append(server_workspace_edit({"documentChanges": steps}))
+        if MODE == "command-move":
+            results.append(server_workspace_edit(versioned_edit(moved, None, "two")))
+        else:
+            Path("source.lspfixture").write_text("external\n", encoding="utf-8")
+            results.append(server_workspace_edit({"documentChanges": [
+                {"kind": "create", "uri": uri, "options": {"overwrite": True}}]}))
+    elif MODE == "command-budget":
+        for _ in range(33):
+            results.append(server_workspace_edit({}))
+    else:
+        raise ValueError("unknown command fixture mode")
+    Path("command-results.json").write_text(json.dumps(results), encoding="utf-8")
+    return results
 
 
 def selection_actions(params):
@@ -105,19 +182,19 @@ def main():
             return
         method = request.get("method")
         params = request.get("params", {})
-        if method:
-            with Path("requests.jsonl").open("a", encoding="utf-8") as log:
-                log.write(json.dumps({"method": method, "params": params}) + "\n")
+        observe(request)
         if method == "initialize":
             assert params["capabilities"]["textDocument"]["codeAction"]["dataSupport"]
             reply(request, {"capabilities": {"textDocumentSync": 1,
                   "codeActionProvider": {"resolveProvider": True},
                   "executeCommandProvider": {"commands": ["test.finish"]}}})
         elif method in ("textDocument/didOpen", "textDocument/didChange"):
-            VERSIONS.append(params["textDocument"]["version"])
-            DOCUMENT_VERSIONS[params["textDocument"]["uri"]] = params["textDocument"]["version"]
+            continue
         elif method == "textDocument/codeAction":
             SOURCE = params["textDocument"]["uri"]
+            if MODE.startswith("command-"):
+                reply(request, [command_action(SOURCE)])
+                continue
             if MODE.startswith("selection"):
                 if MODE == "selection-probe":
                     probe = server_edit(Path("sibling.lspfixture").resolve().as_uri())
@@ -140,6 +217,10 @@ def main():
                 resolved["command"]["arguments"] = {"not": "an array"}
             reply(request, resolved)
         elif method == "workspace/executeCommand":
+            if params["command"] == "test.sequence":
+                Path("command-started").write_text("started", encoding="ascii")
+                reply(request, run_command_sequence(params["arguments"][0]))
+                continue
             if params["command"] == "test.extracted":
                 assert Path(unquote(urlparse(SOURCE).path)).read_text() == EXTRACTED, "command preceded extraction"
                 Path("command-started").write_text("extracted", encoding="ascii")

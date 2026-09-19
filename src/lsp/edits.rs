@@ -18,6 +18,8 @@ use super::text::TextEdit;
 mod sequence;
 mod transaction;
 
+pub(in crate::lsp) use transaction::evidence::{FileEvidence, apply_checked};
+
 /// A file operation from `documentChanges`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOp {

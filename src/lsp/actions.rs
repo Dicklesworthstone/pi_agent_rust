@@ -15,9 +15,10 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+mod command_edits;
 mod refactor;
 
 const MAX_ACTIONS: usize = 128;
@@ -45,6 +46,7 @@ struct Report {
     operations: Vec<String>,
     failures: Vec<String>,
     requests: usize,
+    rollback_incomplete: bool,
 }
 
 impl Report {
@@ -58,29 +60,58 @@ impl Report {
     }
 
     const fn changed(&self) -> bool {
-        !self.files.is_empty() || !self.operations.is_empty()
+        !self.files.is_empty() || !self.operations.is_empty() || self.rollback_incomplete
     }
 }
 
 struct Grant {
-    id: String,
+    id: u64,
     entry: Weak<ServerEntry>,
     report: Report,
+    edits: command_edits::CommandEdits,
+    accepting: bool,
+    revoked: bool,
 }
 
 #[derive(Default)]
 pub(super) struct ActionState {
     cache: Mutex<VecDeque<CachedAction>>,
     active: Mutex<Option<Grant>>,
+    next_grant: AtomicU64,
+    admission: AtomicU64,
 }
 
 struct CommandLease {
     state: Arc<ActionState>,
-    id: String,
+    id: u64,
 }
 
 impl CommandLease {
+    fn close_admission(&self) {
+        let _ = self.state.admission.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn apply_inline(&self, entry: &Arc<ServerEntry>, edit: &Value) -> Result<()> {
+        let mut active = lock(&self.state.active);
+        let grant = active.as_mut().filter(|grant| grant.id == self.id)
+            .ok_or_else(|| tool_err("LSP_EDIT_REVOKED", "selected action lease ended"))?;
+        let outcome = grant.edits.apply(entry, edit, || Ok(()))?;
+        grant.report.record(outcome);
+        Ok(())
+    }
+
+    fn activate(&self, entry: &Arc<ServerEntry>, timeout: std::time::Duration) -> Result<()> {
+        let mut active = lock(&self.state.active);
+        let grant = active.as_mut().filter(|grant| grant.id == self.id)
+            .ok_or_else(|| tool_err("LSP_EDIT_REVOKED", "selected action lease ended"))?;
+        grant.edits.activate(entry, timeout)?;
+        grant.accepting = true;
+        self.state.admission.store(self.id, Ordering::Release);
+        Ok(())
+    }
+
     fn finish(self) -> Report {
+        self.close_admission();
         let mut active = lock(&self.state.active);
         let report = if active.as_ref().is_some_and(|grant| grant.id == self.id) {
             active
@@ -96,6 +127,9 @@ impl CommandLease {
 
 impl Drop for CommandLease {
     fn drop(&mut self) {
+        // Close admission before waiting for a callback's staging lock. That
+        // callback rechecks this generation immediately before committing.
+        self.close_admission();
         let mut active = lock(&self.state.active);
         if active.as_ref().is_some_and(|grant| grant.id == self.id) {
             active.take();
@@ -104,7 +138,11 @@ impl Drop for CommandLease {
 }
 
 impl ActionState {
-    fn grant(self: &Arc<Self>, entry: &Arc<ServerEntry>) -> Result<CommandLease> {
+    fn grant(
+        self: &Arc<Self>,
+        entry: &Arc<ServerEntry>,
+        edits: command_edits::CommandEdits,
+    ) -> Result<CommandLease> {
         let mut active = lock(&self.active);
         if active.is_some() {
             return Err(tool_err(
@@ -112,11 +150,18 @@ impl ActionState {
                 "another code action owns the edit window",
             ));
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        // The active lock serializes allocation. A distinct generation is
+        // published in `admission` only after inline edits and activation.
+        let id = self.next_grant.load(Ordering::Relaxed).checked_add(1)
+            .ok_or_else(|| tool_err("LSP_EDIT_LIMIT", "selected command generation exhausted"))?;
+        self.next_grant.store(id, Ordering::Relaxed);
         *active = Some(Grant {
-            id: id.clone(),
+            id,
             entry: Arc::downgrade(entry),
             report: Report::default(),
+            edits,
+            accepting: false,
+            revoked: false,
         });
         drop(active);
         Ok(CommandLease {
@@ -126,17 +171,27 @@ impl ActionState {
     }
 
     fn apply_from_server(&self, entry: &Arc<ServerEntry>, params: &Value) -> Value {
+        // Do not queue a request received before command activation behind an
+        // inline apply and then accidentally authorize it after activation.
+        let admission = self.admission.load(Ordering::Acquire);
+        if admission == 0 {
+            return json!({"applied":false,"failureReason":"no selected code action authorizes server edits"});
+        }
         // Keep close and apply linearized. A command cannot finish/drop its
         // permission while a callback that already acquired it is committing.
         let mut active = lock(&self.active);
         let Some(grant) = active
             .as_mut()
-            .filter(|grant| Weak::ptr_eq(&grant.entry, &Arc::downgrade(entry)))
+            .filter(|grant| grant.id == admission && grant.accepting
+                && self.admission.load(Ordering::Acquire) == admission
+                && Weak::ptr_eq(&grant.entry, &Arc::downgrade(entry)))
         else {
             return json!({"applied":false,"failureReason":"no selected code action authorizes server edits"});
         };
-        grant.report.requests += 1;
-        let outcome = if grant.report.requests > MAX_APPLY_REQUESTS {
+        grant.report.requests = grant.report.requests.saturating_add(1);
+        let outcome = if grant.revoked {
+            Err(tool_err("LSP_EDIT_REVOKED", "an earlier rejection revoked this command's edit permission"))
+        } else if grant.report.requests > MAX_APPLY_REQUESTS {
             Err(tool_err(
                 "LSP_EDIT_LIMIT",
                 "code action exceeded its server-edit request budget",
@@ -145,18 +200,31 @@ impl ActionState {
             params
                 .get("edit")
                 .ok_or_else(|| tool_err("LSP_EDIT_MALFORMED", "missing workspace edit"))
-                .and_then(|edit| apply_scoped(entry, edit, None))
+                .and_then(|edit| grant.edits.apply(entry, edit, || {
+                    if self.admission.load(Ordering::Acquire) == admission {
+                        Ok(())
+                    } else {
+                        Err(tool_err("LSP_CANCELLED", "selected command ended before committing server edits"))
+                    }
+                }))
         };
         match outcome {
             Ok(outcome) => {
                 grant.report.record(outcome);
                 drop(active);
-                entry.client.invalidate_all();
                 lock(&self.cache).clear();
                 json!({"applied":true})
             }
             Err(error) => {
+                // Once rejected, never accept a "corrected" callback under
+                // stale evidence. The caller must explicitly select again.
+                if !grant.revoked {
+                    entry.client.invalidate_all();
+                    lock(&self.cache).clear();
+                }
+                grant.revoked = true;
                 let reason = error.to_string();
+                grant.report.rollback_incomplete |= reason.contains("[LSP_EDIT_ROLLBACK]");
                 if grant.report.failures.len() < MAX_APPLY_REQUESTS {
                     grant.report.failures.push(reason.clone());
                 }
@@ -624,30 +692,30 @@ impl LspTool {
             .map_err(|_| tool_err("LSP_CANCELLED", "code action cancelled before applying"))?;
         lock(&self.actions.cache).clear();
         let mut report = Report::default();
-        if let Some(edit) = edit {
-            report.record(self.apply_refactor(&entry, edit, &snapshot, &owner)?);
-        }
         let mut failure = None;
+        let mut command_started = false;
         if let Some(params) = &command {
-            let lease = self.actions.grant(&entry)?;
-            let result = entry
-                .client
-                .call(
-                    "workspace/executeCommand",
-                    params.clone(),
-                    self.request_timeout(input),
-                )
-                .await;
-            let callbacks = lease.finish();
-            report.files.extend(callbacks.files);
-            report.files.sort();
-            report.files.dedup();
-            report.operations.extend(callbacks.operations);
-            report.failures.extend(callbacks.failures);
-            report.requests = callbacks.requests;
-            if let Err(error) = result {
-                failure = Some(error.message());
+            // Reserve the lineage before inline writes, but do not authorize
+            // server callbacks until those writes and activation checks pass.
+            let lease = self.actions.grant(&entry, snapshot.command_edits(owner))?;
+            if let Some(edit) = edit {
+                lease.apply_inline(&entry, edit)?;
             }
+            let timeout = self.request_timeout(input);
+            match lease.activate(&entry, timeout) {
+                Ok(()) => {
+                    command_started = true;
+                    if let Err(error) = entry.client.call(
+                        "workspace/executeCommand", params.clone(), timeout,
+                    ).await {
+                        failure = Some(error.message());
+                    }
+                }
+                Err(error) => failure = Some(error.to_string()),
+            }
+            report = lease.finish();
+        } else if let Some(edit) = edit {
+            report.record(self.apply_refactor(&entry, edit, &snapshot, &owner)?);
         }
         if failure.is_none() && !report.failures.is_empty() {
             failure = Some("server edit request was rejected during the command".to_string());
@@ -662,9 +730,9 @@ impl LspTool {
         let payload = json!({
             "action":"code_actions","title":selected["title"],"applied":!failed,
             "filesChanged":files,"fileOps":report.operations,
-            "executedCommand":command.as_ref().and_then(|params| params["command"].as_str()),
+            "executedCommand":command.as_ref().filter(|_| command_started).and_then(|params| params["command"].as_str()),
             "serverEditRequests":report.requests,"serverEditFailures":report.failures,
-            "partial":partial,"error":failure,
+            "partial":partial,"rollbackIncomplete":report.rollback_incomplete,"error":failure,
             "note":if failed { "Previously accepted edits or command effects are not rolled back; inspect before retrying." } else { "Edit applied before command; no automatic command retry." }
         });
         let mut output = text_output(payload.to_string(), payload);
@@ -727,4 +795,5 @@ mod tests {
 
     include!("actions/protocol_tests.rs");
     include!("actions/selection_tests.rs");
+    include!("actions/command_tests.rs");
 }

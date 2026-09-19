@@ -20,6 +20,8 @@ const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSACTION_FILES: usize = 1024;
 
+pub(super) mod evidence;
+
 #[derive(Clone, PartialEq, Eq)]
 struct Image {
     bytes: Arc<[u8]>,
