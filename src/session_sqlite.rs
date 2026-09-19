@@ -421,7 +421,7 @@ fn is_missing_meta_table_error(err: &SqliteError) -> bool {
 
 fn query_session_meta_rows(conn: &SqliteConnection) -> Result<Vec<SqliteRow>> {
     match conn.query_sync(
-        "SELECT key,value FROM pi_session_meta WHERE key IN ('message_count','name')",
+        "SELECT key,value FROM pi_session_meta WHERE key IN ('message_count','name','name_json')",
         &[],
     ) {
         Ok(rows) => Ok(rows),
@@ -576,6 +576,11 @@ fn insert_entry_jsons(
 
 fn write_session_meta(conn: &SqliteConnection, entries: &[SessionEntry]) -> Result<()> {
     let (message_count, name) = compute_message_count_and_name(entries);
+    // Keep an explicit cached absence distinct from a missing cache row, and
+    // preserve Some("") separately from None. The old plain-text name row
+    // cannot represent that distinction; it remains available to older readers.
+    let name_json = serde_json::to_string(&name)?;
+    validate_sqlite_json_for_write("session name metadata", &name_json)?;
     map_sqlite_result(conn.execute_sync(
         "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
         &[
@@ -588,6 +593,13 @@ fn write_session_meta(conn: &SqliteConnection, entries: &[SessionEntry]) -> Resu
         &[
             SqliteValue::from("name"),
             SqliteValue::from(name.unwrap_or_default()),
+        ],
+    ))?;
+    map_sqlite_result(conn.execute_sync(
+        "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
+        &[
+            SqliteValue::from("name_json"),
+            SqliteValue::from(name_json),
         ],
     ))?;
     Ok(())
@@ -643,25 +655,38 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
 
         let mut message_count: Option<u64> = None;
         let mut name: Option<String> = None;
+        let mut name_cached = false;
+        let mut legacy_name: Option<String> = None;
         for row in meta_rows {
             let key = row_get_string(&row, 0, "key")?;
             let value = row_get_string(&row, 1, "value")?;
             match key.as_str() {
                 "message_count" => message_count = value.parse::<u64>().ok(),
+                "name_json" => {
+                    name = parse_sqlite_json("session name metadata", &value)?;
+                    name_cached = true;
+                }
                 "name" if !value.is_empty() => {
-                    name = Some(value);
+                    legacy_name = Some(value);
                 }
                 _ => {}
             }
         }
 
-        if message_count.is_none() || name.is_none() {
+        // Old databases without a typed cache can still use a nonempty name
+        // row. An empty old row is ambiguous, so only that legacy case needs
+        // the historical scan. New unnamed sessions take the metadata-only path.
+        if !name_cached && legacy_name.is_some() {
+            name = legacy_name;
+            name_cached = true;
+        }
+        if message_count.is_none() || !name_cached {
             let entries = read_all_entries(&conn)?;
             let (fallback_message_count, fallback_name) = compute_message_count_and_name(&entries);
             if message_count.is_none() {
                 message_count = Some(fallback_message_count);
             }
-            if name.is_none() {
+            if !name_cached {
                 name = fallback_name;
             }
         }
@@ -1145,16 +1170,212 @@ mod tests {
 
         with_write_connection(&path, |conn| {
             map_sqlite_result(conn.execute_sync(
-                "DELETE FROM pi_session_meta WHERE key = ?1",
-                &[SqliteValue::from("name")],
+                "DELETE FROM pi_session_meta WHERE key IN (?1,?2)",
+                &[
+                    SqliteValue::from("name"),
+                    SqliteValue::from("name_json"),
+                ],
             ))
         })
-        .expect("delete name meta row");
+        .expect("remove both cached name representations");
 
         let meta = futures::executor::block_on(async { load_session_meta(&path).await })
             .expect("load sqlite meta");
         assert_eq!(meta.message_count, 2);
         assert_eq!(meta.name.as_deref(), Some("Recovered Name"));
+    }
+
+    #[test]
+    fn typed_name_cache_preserves_absence_empty_and_unicode_names() {
+        for name in [None, Some(String::new()), Some("音声 review".to_string())] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("typed-name.sqlite");
+            let header = SessionHeader {
+                id: "typed-name-cache".to_string(),
+                ..SessionHeader::default()
+            };
+            let entries = vec![message_entry(), session_info_entry(name.clone())];
+            futures::executor::block_on(save_session(&path, &header, &entries, true))
+                .expect("save name cache");
+            with_write_connection(&path, |conn| {
+                let rows = map_sqlite_result(conn.query_sync(
+                    "SELECT value FROM pi_session_meta WHERE key = 'name_json'",
+                    &[],
+                ))?;
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    row_get_string(&rows[0], 0, "value")?,
+                    serde_json::to_string(&name)?
+                );
+                // A metadata lookup is not an integrity audit. Corrupt entry
+                // bytes prove that it does not read/hydrate the conversation.
+                map_sqlite_result(conn.execute_sync(
+                    "UPDATE pi_session_entries SET json = ?1 WHERE seq = 1",
+                    &[SqliteValue::from("{")],
+                ))?;
+                Ok(())
+            })
+            .expect("inspect cache and poison history");
+            let meta = futures::executor::block_on(load_session_meta(&path))
+                .expect("metadata-only read");
+            assert_eq!(meta.name, name);
+            assert_eq!(meta.message_count, 1);
+            futures::executor::block_on(load_session(&path))
+                .expect_err("full load must still detect corrupt history");
+        }
+    }
+
+    #[test]
+    fn unnamed_session_listing_does_not_read_attachment_blobs() {
+        use crate::model::{ContentBlock, ImageContent};
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("media-listing.sqlite");
+        let header = SessionHeader {
+            id: "media-listing".to_string(),
+            ..SessionHeader::default()
+        };
+        let entry = SessionEntry::Message(MessageEntry {
+            base: dummy_base(),
+            message: SessionMessage::User {
+                content: UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
+                    data: base64::engine::general_purpose::STANDARD
+                        .encode(vec![1u8; 65 * 1024]),
+                    mime_type: "image/png".to_string(),
+                })]),
+                timestamp: None,
+            },
+        });
+        futures::executor::block_on(save_session(&path, &header, &[entry], true))
+            .expect("save large attachment");
+        with_write_connection(&path, |conn| {
+            // Keep the same byte count so only payload verification, not a
+            // superficial length check, can catch this corruption.
+            map_sqlite_result(conn.execute_sync(
+                "UPDATE pi_session_blobs SET data = ?1",
+                &[SqliteValue::from(vec![2u8; 65 * 1024])],
+            ))
+        })
+        .expect("poison blob payload");
+        let meta = futures::executor::block_on(load_session_meta(&path))
+            .expect("listing must not hydrate attachments");
+        assert_eq!(meta.message_count, 1);
+        assert!(meta.name.is_none());
+        let error = futures::executor::block_on(load_session(&path))
+            .expect_err("opening the session verifies the attachment");
+        assert!(error.to_string().contains("PI_SESSION_ATTACHMENT_INVALID"));
+    }
+
+    #[test]
+    fn legacy_plain_name_rows_are_never_interpreted_as_json() {
+        for name in ["null", "\"literal quotes\"", "{not JSON}", ""] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("legacy-name.sqlite");
+            let header = SessionHeader {
+                id: "legacy-name".to_string(),
+                ..SessionHeader::default()
+            };
+            let entries = vec![
+                message_entry(),
+                session_info_entry(Some(name.to_string())),
+            ];
+            futures::executor::block_on(save_session(&path, &header, &entries, true))
+                .expect("seed legacy name fixture");
+            with_write_connection(&path, |conn| {
+                map_sqlite_result(conn.execute_raw(
+                    "DELETE FROM pi_session_meta WHERE key = 'name_json'",
+                ))
+            })
+            .expect("leave the legacy plain-text name row");
+            let meta = futures::executor::block_on(load_session_meta(&path))
+                .expect("legacy metadata");
+            assert_eq!(meta.name.as_deref(), Some(name));
+            assert_eq!(meta.message_count, 1);
+        }
+    }
+
+    #[test]
+    fn append_refreshes_the_typed_name_cache_in_the_same_transaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rename-cache.sqlite");
+        let header = SessionHeader {
+            id: "rename-cache".to_string(),
+            ..SessionHeader::default()
+        };
+        futures::executor::block_on(async {
+            save_session(&path, &header, &[message_entry()], true).await?;
+            for (index, name) in ["named", "", "latest"].into_iter().enumerate() {
+                append_entries(
+                    &path,
+                    &header.id,
+                    &[session_info_entry(Some(name.to_string()))],
+                    index + 1,
+                )
+                .await?;
+                let meta = load_session_meta(&path).await?;
+                assert_eq!(meta.name.as_deref(), Some(name));
+                assert_eq!(meta.message_count, 1);
+            }
+            Ok::<_, Error>(())
+        })
+        .expect("renaming through incremental persistence");
+    }
+
+    #[test]
+    fn invalid_count_cache_still_falls_back_without_losing_an_empty_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("count-fallback.sqlite");
+        let header = SessionHeader {
+            id: "count-fallback".to_string(),
+            ..SessionHeader::default()
+        };
+        let entries = vec![message_entry(), session_info_entry(Some(String::new()))];
+        futures::executor::block_on(save_session(&path, &header, &entries, true))
+            .expect("seed count fallback");
+        with_write_connection(&path, |conn| {
+            map_sqlite_result(conn.execute_raw(
+                "UPDATE pi_session_meta SET value = 'not-a-count' WHERE key = 'message_count'",
+            ))
+        })
+        .expect("invalidate count cache");
+        let meta = futures::executor::block_on(load_session_meta(&path))
+            .expect("recompute count from history");
+        assert_eq!(meta.message_count, 1);
+        assert_eq!(meta.name.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn malformed_typed_name_cache_fails_with_redacted_diagnostics() {
+        const SECRET: &str = "PRIVATE_NAME_METADATA_DO_NOT_ECHO";
+        for value in [
+            format!("{{\"secret\":\"{SECRET}\","),
+            format!("{{\"secret\":\"{SECRET}\"}}"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("invalid-name-cache.sqlite");
+            let header = SessionHeader {
+                id: "invalid-name-cache".to_string(),
+                ..SessionHeader::default()
+            };
+            futures::executor::block_on(save_session(&path, &header, &[], true))
+                .expect("seed metadata");
+            with_write_connection(&path, |conn| {
+                map_sqlite_result(conn.execute_sync(
+                    "UPDATE pi_session_meta SET value = ?1 WHERE key = 'name_json'",
+                    &[SqliteValue::from(value.clone())],
+                ))
+            })
+            .expect("poison name metadata");
+            let error = futures::executor::block_on(load_session_meta(&path))
+                .expect_err("invalid typed name is not an unnamed session");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("session name metadata"));
+            assert!(diagnostic.contains("sha256="));
+            assert!(!diagnostic.contains(SECRET));
+            futures::executor::block_on(load_session(&path))
+                .expect("metadata corruption does not alter the actual conversation");
+        }
     }
 
     #[test]
