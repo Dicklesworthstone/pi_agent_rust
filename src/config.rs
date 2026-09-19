@@ -1165,7 +1165,27 @@ impl Config {
     }
 
     /// Whether to check for version updates on startup (default: true).
+    ///
+    /// The check reaches the network, so `PI_SKIP_VERSION_CHECK` can turn it
+    /// off but never on: an environment that wants silence gets silence
+    /// whatever `checkForUpdates` says. That is also pi-mono's order — its
+    /// `checkForNewVersion` returns on the variable before it reads any
+    /// setting — and the variable is the one a migrating user already has in
+    /// their shell profile.
     pub fn should_check_for_updates(&self) -> bool {
+        self.should_check_for_updates_with_lookup(env_lookup)
+    }
+
+    fn should_check_for_updates_with_lookup<F>(&self, get_env: F) -> bool
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        // pi-mono tests the variable for JavaScript truthiness, and
+        // `PI_SKIP_VERSION_CHECK=` is the empty string, which is falsy. An
+        // empty value therefore does not skip the check, here either.
+        if get_env("PI_SKIP_VERSION_CHECK").is_some_and(|value| !value.is_empty()) {
+            return false;
+        }
         self.check_for_updates.unwrap_or(true)
     }
 
@@ -4493,6 +4513,44 @@ mod tests {
         let json = r#"{"check_for_updates": true}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.should_check_for_updates());
+    }
+
+    #[test]
+    fn pi_skip_version_check_silences_the_startup_network_call() {
+        // The lookup is injected rather than set, because these tests share a
+        // process and `std::env::set_var` would reach every other one.
+        let skip = |value: &'static str| {
+            move |name: &str| (name == "PI_SKIP_VERSION_CHECK").then(|| value.to_string())
+        };
+        let unset = |_: &str| None;
+
+        let asked_for_it: Config = serde_json::from_str(r#"{"checkForUpdates": true}"#).unwrap();
+        assert!(
+            asked_for_it.should_check_for_updates_with_lookup(unset),
+            "the setting should still decide when the variable is unset"
+        );
+        assert!(
+            !asked_for_it.should_check_for_updates_with_lookup(skip("1")),
+            "PI_SKIP_VERSION_CHECK must beat checkForUpdates: true"
+        );
+        assert!(
+            !asked_for_it.should_check_for_updates_with_lookup(skip("anything at all")),
+            "pi-mono tests truthiness, not the value"
+        );
+        assert!(
+            asked_for_it.should_check_for_updates_with_lookup(skip("")),
+            "`PI_SKIP_VERSION_CHECK=` is falsy in pi-mono and must not skip here"
+        );
+
+        // The variable only ever turns the check off.
+        let refused: Config = serde_json::from_str(r#"{"checkForUpdates": false}"#).unwrap();
+        assert!(!refused.should_check_for_updates_with_lookup(unset));
+        assert!(!refused.should_check_for_updates_with_lookup(skip("1")));
+
+        assert!(
+            Config::default().should_check_for_updates_with_lookup(unset),
+            "checking for updates is still the default"
+        );
     }
 
     // ── merge function property tests ──────────────────────────────────

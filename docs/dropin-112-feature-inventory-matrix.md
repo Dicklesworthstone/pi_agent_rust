@@ -357,10 +357,10 @@
 | `DEEPSEEK_API_KEY` | Y | Y | |
 | `PERPLEXITY_API_KEY` | Y | Y | |
 | `COHERE_API_KEY` | N | Y | Rust-only provider |
-| `AI_GATEWAY_API_KEY` | Y | ? | Vercel AI Gateway |
-| `ZAI_API_KEY` | Y | ? | ZAI provider |
-| `MINIMAX_API_KEY` | Y | ? | MiniMax provider |
-| `KIMI_API_KEY` | Y | ? | Kimi provider |
+| `AI_GATEWAY_API_KEY` | Y | Y | Vercel AI Gateway; `provider_metadata` auth key |
+| `ZAI_API_KEY` | Y | ? | ZAI provider. Rust resolves `zai` auth from `ZHIPU_API_KEY`; `ZAI_API_KEY` appears only in the JS bridge map (`extensions_js.rs`). Needs a call on whether the alias should be accepted |
+| `MINIMAX_API_KEY` | Y | Y | MiniMax provider; `provider_metadata` auth key |
+| `KIMI_API_KEY` | Y | Y | Kimi provider; `provider_metadata` auth key (alongside `MOONSHOT_API_KEY`) |
 | `MOONSHOT_API_KEY` | N | Y | Rust-only |
 | `DASHSCOPE_API_KEY` | N | Y | Rust-only (Qwen) |
 | `FIREWORKS_API_KEY` | N | Y | Rust-only |
@@ -375,17 +375,17 @@
 | `PI_PACKAGE_DIR` | Y | Y | Package directory |
 | `PI_SESSIONS_DIR` | N | Y | Rust-only |
 | `PI_CONFIG_PATH` | N | Y | Rust-only |
-| `PI_SHARE_VIEWER_URL` | Y | ? | Share viewer base URL |
+| `PI_SHARE_VIEWER_URL` | Y | Y | Share viewer base URL; read in `session.rs` |
 
 ### Development / Testing
 
 | Variable | TS Pi | Rust Pi | Notes |
 |----------|-------|---------|-------|
 | `PI_TEST_MODE` | Y | Y | Deterministic rendering |
-| `PI_TIMING` | Y | ? | Timing output |
-| `PI_SKIP_VERSION_CHECK` | Y | ? | Skip version check |
-| `PI_HARDWARE_CURSOR` | Y | ? | Hardware cursor |
-| `PI_CLEAR_ON_SHRINK` | Y | ? | Clear on shrink |
+| `PI_TIMING` | Y | N | TS gates `core/timings.js` on `PI_TIMING === "1"`. Nothing in Rust reads it; there is no equivalent instrumentation module |
+| `PI_SKIP_VERSION_CHECK` | Y | Y | Skips the startup GitHub-releases check; beats `checkForUpdates`, and an empty value does not skip (matching JS truthiness) |
+| `PI_HARDWARE_CURSOR` | Y | Y | Hardware cursor; read in `interactive.rs` |
+| `PI_CLEAR_ON_SHRINK` | Y | Y | Clear on shrink; read in `config.rs`, settings take precedence |
 | `VCR_MODE` | N | Y | Rust-only VCR testing |
 | `VCR_CASSETTE_DIR` | N | Y | Rust-only VCR testing |
 | `PI_VCR_TEST_NAME` | N | Y | Rust-only VCR testing |
