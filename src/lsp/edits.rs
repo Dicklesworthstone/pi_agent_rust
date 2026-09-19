@@ -1,29 +1,22 @@
-//! WorkspaceEdit parsing and atomic application.
+//! WorkspaceEdit parsing and rollback-safe application.
 //!
 //! A `WorkspaceEdit` arrives either as `changes: {uri: [TextEdit]}` or as
 //! `documentChanges: [...]` mixing `TextDocumentEdit`s with file operations
-//! (`CreateFile`/`RenameFile`/`DeleteFile`). Application is all-or-nothing:
-//! every file's new content is computed in memory first (positions mapped,
-//! overlaps rejected, drift against the request-time hash rejected), then
-//! written via temp-file + rename; a mid-apply failure rolls back
-//! already-written files from their staged originals (bd-cv653.1.1, same
-//! discipline as `ast_edit`).
+//! (`CreateFile`/`RenameFile`/`DeleteFile`). All target images are staged before
+//! writing. Reported commit failures restore original bytes and permissions,
+//! including deleted files and overwritten rename destinations. Incomplete
+//! rollback is explicit and retains recovery files instead of hiding data loss.
+//! This is bounded regular-file support, not a multi-file crash-atomic commit.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::Value;
 
 use super::client::uri_to_path;
-use super::text::{TextEdit, apply_text_edits, content_hash_for_drift};
+use super::text::TextEdit;
 
-/// One planned file write: original content retained for rollback.
-#[derive(Debug)]
-struct PlannedWrite {
-    path: PathBuf,
-    original: String,
-    updated: String,
-}
+mod transaction;
 
 /// A file operation from `documentChanges`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,50 +183,6 @@ fn parse_text_edit_array(raw: &Value) -> Result<Vec<TextEdit>, crate::error::Err
     Ok(out)
 }
 
-/// Validate file operations against the current filesystem before any
-/// write happens (fail-closed, zero side effects).
-fn validate_file_ops(ops: &[FileOp]) -> Result<(), crate::error::Error> {
-    for op in ops {
-        match op {
-            FileOp::Create { path, overwrite } => {
-                if path.exists() && !overwrite {
-                    return Err(plan_error(
-                        "LSP_EDIT_CONFLICT",
-                        format!("create target exists: {}", path.display()),
-                    ));
-                }
-            }
-            FileOp::Rename {
-                old_path,
-                new_path,
-                overwrite,
-            } => {
-                if !old_path.exists() {
-                    return Err(plan_error(
-                        "LSP_EDIT_CONFLICT",
-                        format!("rename source missing: {}", old_path.display()),
-                    ));
-                }
-                if new_path.exists() && !overwrite {
-                    return Err(plan_error(
-                        "LSP_EDIT_CONFLICT",
-                        format!("rename target exists: {}", new_path.display()),
-                    ));
-                }
-            }
-            FileOp::Delete { path } => {
-                if !path.exists() {
-                    return Err(plan_error(
-                        "LSP_EDIT_CONFLICT",
-                        format!("delete target missing: {}", path.display()),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Outcome of an atomic apply.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -244,100 +193,28 @@ pub struct ApplyOutcome {
     pub file_ops_applied: Vec<String>,
 }
 
-/// Apply a parsed WorkspaceEdit atomically.
+/// Apply a parsed WorkspaceEdit with staged validation and rollback.
 ///
-/// Phase 1 (validate + compute): read every target file, apply its text
-/// edits in memory. Any failure (unreadable file, out-of-range position,
-/// overlap, drift when `expected_hashes` are provided) aborts with zero
-/// writes.
-///
-/// Phase 2 (commit): write each file via temp-file + rename in the same
-/// directory, then perform file operations. A mid-commit failure rolls back
-/// already-written files from staged originals and un-applies file ops on a
-/// best-effort basis.
+/// Validation stages bounded regular-file images before changing targets.
+/// Commit rechecks preimages, preserves permissions and retains sibling
+/// backups. On failure it restores originals unless another writer changed
+/// a committed target; that conflict is reported with a recovery-file path.
+/// Directories, symlinks and file/directory shape changes are rejected before
+/// commit. There is no claim of cross-file atomic visibility or crash recovery.
 ///
 /// # Errors
 ///
 /// Returns `[LSP_EDIT_CONFLICT]` for drift/overlap/range failures and
-/// `[LSP_EDIT_APPLY]` for I/O failures during commit (after rollback).
+/// `[LSP_EDIT_APPLY]` for commit failures with completed rollback,
+/// `[LSP_EDIT_ROLLBACK]` for incomplete rollback, and `[LSP_EDIT_LIMIT]` for
+/// admission limits. No filesystem sandbox against hostile concurrent path
+/// replacement is implied; callers must still enforce workspace scope.
 #[allow(clippy::implicit_hasher)] // concrete RandomState keeps `None` call sites inference-free
 pub fn apply_workspace_edit(
     plan: &WorkspaceEditPlan,
     expected_hashes: Option<&HashMap<PathBuf, u64>>,
 ) -> Result<ApplyOutcome, crate::error::Error> {
-    // ── Phase 1: validate + compute ─────────────────────────────────────
-    let mut planned: Vec<PlannedWrite> = Vec::with_capacity(plan.text_edits.len());
-    for (path, edits) in &plan.text_edits {
-        let original = std::fs::read_to_string(path).map_err(|err| {
-            plan_error(
-                "LSP_EDIT_CONFLICT",
-                format!("cannot read {}: {err}", path.display()),
-            )
-        })?;
-        if let Some(expected) = expected_hashes.and_then(|hashes| hashes.get(path)) {
-            let actual = content_hash_for_drift(&original);
-            if actual != *expected {
-                return Err(plan_error(
-                    "LSP_EDIT_CONFLICT",
-                    format!(
-                        "{} changed on disk since the edit was computed; re-run the request",
-                        path.display()
-                    ),
-                ));
-            }
-        }
-        let updated = apply_text_edits(&original, edits)
-            .map_err(|err| plan_error("LSP_EDIT_CONFLICT", format!("{}: {err}", path.display())))?;
-        planned.push(PlannedWrite {
-            path: path.clone(),
-            original,
-            updated,
-        });
-    }
-
-    // Validate file ops before committing anything.
-    validate_file_ops(&plan.file_ops)?;
-
-    // ── Phase 2: commit with rollback ───────────────────────────────────
-    let mut written: Vec<PathBuf> = Vec::new();
-    let mut ops_done: Vec<FileOp> = Vec::new();
-    let commit_result: Result<(), crate::error::Error> = (|| {
-        for write in &planned {
-            write_file_atomic(&write.path, &write.updated).map_err(|err| {
-                plan_error(
-                    "LSP_EDIT_APPLY",
-                    format!("failed writing {}: {err}", write.path.display()),
-                )
-            })?;
-            written.push(write.path.clone());
-        }
-        for op in &plan.file_ops {
-            apply_file_op(op).map_err(|err| {
-                plan_error("LSP_EDIT_APPLY", format!("file operation failed: {err}"))
-            })?;
-            ops_done.push(op.clone());
-        }
-        Ok(())
-    })();
-
-    if let Err(err) = commit_result {
-        // Roll back written files from staged originals.
-        for write in &planned {
-            if written.contains(&write.path) {
-                let _ = write_file_atomic(&write.path, &write.original);
-            }
-        }
-        // Best-effort un-apply file ops in reverse.
-        for op in ops_done.iter().rev() {
-            undo_file_op(op);
-        }
-        return Err(err);
-    }
-
-    Ok(ApplyOutcome {
-        files_changed: planned.iter().map(|w| w.path.clone()).collect(),
-        file_ops_applied: ops_done.iter().map(describe_file_op).collect(),
-    })
+    transaction::apply(plan, expected_hashes)
 }
 
 fn describe_file_op(op: &FileOp) -> String {
@@ -348,70 +225,6 @@ fn describe_file_op(op: &FileOp) -> String {
         } => format!("rename {} -> {}", old_path.display(), new_path.display()),
         FileOp::Delete { path } => format!("delete {}", path.display()),
     }
-}
-
-fn apply_file_op(op: &FileOp) -> std::io::Result<()> {
-    match op {
-        FileOp::Create { path, overwrite } => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            if *overwrite {
-                std::fs::write(path, "")
-            } else {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                    .map(|_| ())
-            }
-        }
-        FileOp::Rename {
-            old_path, new_path, ..
-        } => {
-            if let Some(parent) = new_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(old_path, new_path)
-        }
-        FileOp::Delete { path } => {
-            if path.is_dir() {
-                std::fs::remove_dir_all(path)
-            } else {
-                std::fs::remove_file(path)
-            }
-        }
-    }
-}
-
-fn undo_file_op(op: &FileOp) {
-    match op {
-        FileOp::Create { path, .. } => {
-            let _ = std::fs::remove_file(path);
-        }
-        FileOp::Rename {
-            old_path, new_path, ..
-        } => {
-            let _ = std::fs::rename(new_path, old_path);
-        }
-        FileOp::Delete { .. } => {
-            // Deletion cannot be un-applied without a snapshot; rollback of
-            // text writes still proceeded above. Deletes are staged after
-            // text writes, so a delete-commit failure can only strand ops
-            // that the server itself requested.
-        }
-    }
-}
-
-/// Write file content atomically via temp-file + rename in the same
-/// directory (same-filesystem rename is atomic on POSIX).
-fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut temp, content.as_bytes())?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|err| err.error)?;
-    Ok(())
 }
 
 #[cfg(test)]
