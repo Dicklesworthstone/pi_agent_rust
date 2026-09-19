@@ -4,6 +4,8 @@
 //! cancellation semantics, RPC type serde, and extension-policy interactions
 //! with structured JSONL log output.
 
+#![recursion_limit = "256"]
+
 mod common;
 
 use common::{TestHarness, run_async};

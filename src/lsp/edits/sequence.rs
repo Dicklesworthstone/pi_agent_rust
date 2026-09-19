@@ -268,7 +268,7 @@ pub(super) fn stage(plan: &WorkspaceEditPlan) -> Result<Transaction> {
         for step in sequence {
             match step {
                 Step::Text { path, edits } => {
-                    transaction.edit(path, &plan.text_edits[path][edits.clone()])?
+                    transaction.edit(path, &plan.text_edits[path][edits.clone()])?;
                 }
                 Step::File {
                     index,

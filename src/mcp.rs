@@ -257,7 +257,7 @@ fn resource_catalog_output(result: Value, templates: bool) -> ToolOutput {
     }
 }
 
-fn resource_read_output(result: Value) -> ToolOutput {
+fn resource_read_output(result: &Value) -> ToolOutput {
     let blocks: Vec<Value> = result["contents"]
         .as_array()
         .into_iter()
@@ -331,7 +331,7 @@ impl Tool for McpContextTool {
             }
             McpContextAction::ReadResource { uri } => {
                 let result = self.manager.read_resource(&self.server, &uri).await?;
-                Ok(resource_read_output(result))
+                Ok(resource_read_output(&result))
             }
         }
     }

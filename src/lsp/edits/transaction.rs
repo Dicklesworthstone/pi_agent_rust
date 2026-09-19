@@ -43,7 +43,7 @@ fn conflict(message: impl Into<String>) -> crate::error::Error {
     plan_error("LSP_EDIT_CONFLICT", message)
 }
 
-fn io_context(path: &Path, error: io::Error) -> crate::error::Error {
+fn io_context(path: &Path, error: &io::Error) -> crate::error::Error {
     conflict(format!("{}: {error}", path.display()))
 }
 
@@ -146,7 +146,7 @@ impl Transaction {
     }
 
     fn load(&mut self, path: &Path) -> Result<PathBuf> {
-        let path = target_path(path).map_err(|error| io_context(path, error))?;
+        let path = target_path(path).map_err(|error| io_context(path, &error))?;
         if !self.files.contains_key(&path) {
             if self.files.len() >= MAX_TRANSACTION_FILES {
                 return Err(plan_error(
@@ -165,7 +165,7 @@ impl Transaction {
                     "workspace edit has overlapping file/directory paths",
                 ));
             }
-            let before = read_image(&path).map_err(|error| io_context(&path, error))?;
+            let before = read_image(&path).map_err(|error| io_context(&path, &error))?;
             self.spend(before.as_ref().map_or(0, |image| image.bytes.len()))?;
             self.files.insert(
                 path.clone(),
@@ -289,7 +289,7 @@ impl Transaction {
     pub(super) fn check_hashes(&self, hashes: Option<&HashMap<PathBuf, u64>>) -> Result<()> {
         if let Some(hashes) = hashes {
             for (path, expected) in hashes {
-                let normalized = target_path(path).map_err(|error| io_context(path, error))?;
+                let normalized = target_path(path).map_err(|error| io_context(path, &error))?;
                 let Some(staged) = self.files.get(&normalized) else {
                     continue;
                 };
@@ -321,7 +321,7 @@ impl Transaction {
     ) -> Result<ApplyOutcome> {
         // Validate ALL read preimages, including no-op targets, before commit.
         for (path, staged) in &self.files {
-            verify_image(path, &staged.before).map_err(|error| io_context(path, error))?;
+            verify_image(path, staged.before.as_ref()).map_err(|error| io_context(path, &error))?;
         }
         self.files.retain(|_, staged| staged.before != staged.after);
         let mut changes: Vec<_> = self
@@ -389,8 +389,8 @@ impl Transaction {
     }
 }
 
-fn verify_image(path: &Path, expected: &Option<Image>) -> io::Result<()> {
-    if target_path(path)? != path || read_image(path)? != *expected {
+fn verify_image(path: &Path, expected: Option<&Image>) -> io::Result<()> {
+    if target_path(path)? != path || read_image(path)?.as_ref() != expected {
         return Err(io::Error::other(
             "file or parent changed during workspace edit",
         ));
@@ -480,7 +480,7 @@ impl Change {
     }
 
     fn apply(&mut self) -> io::Result<()> {
-        verify_image(&self.path, &self.staged.before)?;
+        verify_image(&self.path, self.staged.before.as_ref())?;
         if let Some(file) = self.replacement.take() {
             let result = if self.staged.before.is_none() {
                 file.persist_noclobber(&self.path)
@@ -497,7 +497,7 @@ impl Change {
 
     fn rollback(&mut self) -> io::Result<()> {
         // Do not overwrite a concurrent editor's work while undoing ours.
-        verify_image(&self.path, &self.staged.after)?;
+        verify_image(&self.path, self.staged.after.as_ref())?;
         if let Some(backup) = &self.backup
             && let Some(permissions) = self
                 .staged

@@ -16,6 +16,7 @@ fn text(path: &Path, start: u32, end: u32, value: &str) -> Value {
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn apply(steps: Vec<Value>) -> Result<super::super::ApplyOutcome> {
     let plan = parse_workspace_edit(&json!({"documentChanges": steps}))?;
     apply_workspace_edit(&plan, None)

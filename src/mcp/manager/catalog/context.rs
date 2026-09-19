@@ -104,9 +104,9 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
         })?;
     if !matches!(shape, ContextResult::ResourceContents)
         && let Some(cursor) = result.get("nextCursor")
-        && !cursor
+        && cursor
             .as_str()
-            .is_some_and(|cursor| cursor.len() <= MAX_CURSOR_BYTES)
+            .is_none_or(|cursor| cursor.len() > MAX_CURSOR_BYTES)
     {
         return Err(invalid_response(
             "MCP context nextCursor must be a bounded string",
@@ -462,7 +462,7 @@ mod tests {
             assert!(rendered(&second).contains("db://schema"));
             assert!(!rendered(&second).contains("secret"));
         });
-        let requests = McpManager::lock(&transport.requests);
+        let requests = McpManager::lock(&transport.requests).clone();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, "resources/list");
         assert_eq!(requests[0].1, json!({}));
@@ -792,9 +792,9 @@ mod tests {
 
     #[test]
     fn context_namespace_is_bounded_stable_and_disjoint_from_server_tools() {
+        use crate::tools::Tool;
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, _, _) = fixture(&temp, Vec::new(), true);
-        use crate::tools::Tool;
         let mut names = std::collections::HashSet::new();
         for server in ["docs", "doc.s", "doc_s", "文档", &"s".repeat(200)] {
             let tool = crate::mcp::McpContextTool::new(server, manager.clone());
