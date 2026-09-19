@@ -2766,6 +2766,11 @@ impl PiFtuiModel {
                             None
                         }
                     })
+                    // Application actions whose handler already exists on this
+                    // stack behind a slash command. Both keys are advertised by
+                    // /hotkeys and did nothing here until they were routed.
+                    .or_else(|| pick(AppAction::SelectModel))
+                    .or_else(|| pick(AppAction::Help))
                     // Editor-native actions come last so nothing above changes
                     // meaning. They are routed at all because the ftui editor
                     // handles only ctrl+a/k/z/y, arrows, Home/End, Backspace,
@@ -2857,6 +2862,15 @@ impl PiFtuiModel {
                         // End with an empty editor resumes tail-follow; with
                         // content it falls through to the editor's line-end.
                         self.scroll_from_tail = 0;
+                        return Cmd::none();
+                    }
+                    Some(AppAction::SelectModel) => {
+                        // The same path a bare `/model` takes.
+                        self.route_model_command("");
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Help) => {
+                        self.route_slash_command_tail("/help");
                         return Cmd::none();
                     }
                     // Editor-native actions, routed from pi's keybinding
@@ -5596,6 +5610,55 @@ mod tests {
         sim.inject_event(key(KeyCode::Char('b'), Modifiers::empty()));
         assert_eq!(sim.model().input.text(), "a\nb");
         assert_eq!(sim.model().input_rows(), 2);
+    }
+
+    #[test]
+    fn ctrl_l_opens_the_model_picker() {
+        // `/hotkeys` has always listed ctrl+l for SelectModel, and on this
+        // stack it did nothing: the action was in the catalog and in no
+        // resolution chain, so the key reached the editor and was dropped.
+        let (_tx, model) = new_model();
+        let model = model.with_available_models(vec![
+            "anthropic/claude-sonnet-5".to_string(),
+            "openai/gpt-5".to_string(),
+        ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        assert!(sim.model().picker.is_none(), "picker open before the key");
+
+        sim.inject_event(key(KeyCode::Char('l'), Modifiers::CTRL));
+        assert!(
+            sim.model().picker.is_some(),
+            "ctrl+l should open the same picker a bare /model opens"
+        );
+    }
+
+    #[test]
+    fn f1_prints_the_help_entry() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        sim.inject_event(key(KeyCode::F(1), Modifiers::empty()));
+        let added = &sim.model().transcript[before..];
+        assert_eq!(added.len(), 1, "f1 should add exactly one entry");
+        assert!(
+            added[0].text.contains("/model"),
+            "f1 should print the help entry, got {:?}",
+            added[0].text
+        );
+    }
+
+    #[test]
+    fn routing_the_two_new_hotkeys_leaves_typing_alone() {
+        // Both are chords the editor never claimed, but the picks sit in a
+        // shared chain, so it is worth pinning that ordinary input still
+        // reaches the editor.
+        assert_eq!(
+            after_key("hi", KeyCode::Char('x'), Modifiers::empty()),
+            "hix"
+        );
     }
 
     /// Type `text`, then send `code`+`modifiers`, and report what the editor
