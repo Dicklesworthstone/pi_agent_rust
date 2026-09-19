@@ -1642,10 +1642,8 @@ data: {"type":"message_stop"}
             bytes.extend_from_slice(invalid);
             bytes.extend_from_slice(b"after\"}\n\ndata: [DONE]\n\n");
             for split in 0..=bytes.len() {
-                let (events, errors) = parse_stream_chunks(vec![
-                    bytes[..split].to_vec(),
-                    bytes[split..].to_vec(),
-                ]);
+                let (events, errors) =
+                    parse_stream_chunks(vec![bytes[..split].to_vec(), bytes[split..].to_vec()]);
                 assert_eq!(events.len(), 1, "invalid={invalid:?}, split={split}");
                 assert_eq!(events[0].data, "☃", "split={split}");
                 assert_eq!(events[0].id.as_deref(), Some("good"), "split={split}");
@@ -1662,8 +1660,7 @@ data: {"type":"message_stop"}
             assert_eq!(polls, 0, "must not read beyond a corrupt transport chunk");
             polls += 1;
             Poll::Ready(Some(Ok::<_, std::io::Error>(
-                b"data: one\n\ndata: two\n\ndata: partial\xFF\n\ndata: after\n\n"
-                    .to_vec(),
+                b"data: one\n\ndata: two\n\ndata: partial\xFF\n\ndata: after\n\n".to_vec(),
             )))
         });
         let mut stream = SseStream::new(inner);
@@ -1946,7 +1943,11 @@ data: {"type":"message_stop"}
                     assert_eq!(event.data, expected, "split={split}");
                     assert_eq!(event.id.as_deref(), Some("good"));
                 }
-                let error = stream.next().await.expect("failure").expect_err("oversized");
+                let error = stream
+                    .next()
+                    .await
+                    .expect("failure")
+                    .expect_err("oversized");
                 assert_eq!(error.kind(), ErrorKind::InvalidData, "split={split}");
                 assert_eq!(error.to_string(), "SSE event data limit exceeded");
                 assert!(stream.next().await.is_none());
@@ -1957,16 +1958,21 @@ data: {"type":"message_stop"}
 
     #[test]
     fn data_limit_at_eof_is_a_terminal_stream_error() {
-        let mut stream = SseStream::new(stream::iter(vec![Ok(
-            b"data: good\n\ndata: xxxxx".to_vec(),
-        )]));
+        let mut stream =
+            SseStream::new(stream::iter(vec![
+                Ok(b"data: good\n\ndata: xxxxx".to_vec()),
+            ]));
         stream.parser = SseParser::with_max_event_data_bytes(5);
         futures::executor::block_on(async {
             assert_eq!(
                 stream.next().await.expect("prefix").expect("ok").data,
                 "good"
             );
-            let error = stream.next().await.expect("failure").expect_err("EOF limit");
+            let error = stream
+                .next()
+                .await
+                .expect("failure")
+                .expect_err("EOF limit");
             assert_eq!(error.kind(), ErrorKind::InvalidData);
             assert_eq!(error.to_string(), "SSE event data limit exceeded");
             assert!(stream.next().await.is_none());
@@ -2003,7 +2009,11 @@ data: {"type":"message_stop"}
                 stream.next().await.expect("prefix").expect("ok").data,
                 "good"
             );
-            let error = stream.next().await.expect("failure").expect_err("line limit");
+            let error = stream
+                .next()
+                .await
+                .expect("failure")
+                .expect_err("line limit");
             assert_eq!(error.kind(), ErrorKind::InvalidData);
             assert_eq!(error.to_string(), "SSE buffer limit exceeded");
             assert!(stream.next().await.is_none());
@@ -2017,7 +2027,11 @@ data: {"type":"message_stop"}
     fn failed_direct_parser_releases_payload_and_never_exposes_its_checkpoint() {
         let mut parser = SseParser::with_max_event_data_bytes(64 * 1024);
         let payload = "x".repeat(64 * 1024 - 1);
-        assert!(parser.feed(&format!("id: bad\ndata: {payload}\n")).is_empty());
+        assert!(
+            parser
+                .feed(&format!("id: bad\ndata: {payload}\n"))
+                .is_empty()
+        );
         assert!(parser.current.data.capacity() >= payload.len());
         let events = parser.feed("data: overflow\n\ndata: [DONE]\n\n");
         assert_eq!(events.len(), 1);
@@ -2069,12 +2083,14 @@ data: {"type":"message_stop"}
             bytes.extend_from_slice(&payload[invalid_at..]);
             bytes.extend_from_slice(b"\n\ndata: after\n\n");
             for split in 0..=bytes.len() {
-                let (events, errors) = parse_stream_chunks(vec![
-                    bytes[..split].to_vec(),
-                    bytes[split..].to_vec(),
-                ]);
+                let (events, errors) =
+                    parse_stream_chunks(vec![bytes[..split].to_vec(), bytes[split..].to_vec()]);
                 let data: Vec<_> = events.iter().map(|event| event.data.as_str()).collect();
-                assert_eq!(data, ["first", "second"], "invalid={invalid_at}, split={split}");
+                assert_eq!(
+                    data,
+                    ["first", "second"],
+                    "invalid={invalid_at}, split={split}"
+                );
                 assert_eq!(errors, [ErrorKind::InvalidData]);
             }
         }
@@ -2093,10 +2109,8 @@ data: {"type":"message_stop"}
             bytes.extend(invalid);
             bytes.extend_from_slice(b"\n\ndata: after\n\n");
             for split in 0..=bytes.len() {
-                let (events, errors) = parse_stream_chunks(vec![
-                    bytes[..split].to_vec(),
-                    bytes[split..].to_vec(),
-                ]);
+                let (events, errors) =
+                    parse_stream_chunks(vec![bytes[..split].to_vec(), bytes[split..].to_vec()]);
                 assert_eq!(events.len(), 1, "split={split}");
                 assert_eq!(events[0].data, "before");
                 assert_eq!(errors, [ErrorKind::InvalidData]);
@@ -2121,7 +2135,11 @@ data: {"type":"message_stop"}
 
     #[test]
     fn transport_error_never_flushes_or_resumes_a_partial_event() {
-        for partial in [b"data: partial".as_slice(), b"data: partial\n", b"data: \xe2"] {
+        for partial in [
+            b"data: partial".as_slice(),
+            b"data: partial\n",
+            b"data: \xe2",
+        ] {
             let chunks = vec![
                 Ok(b"data: before\n\n".to_vec()),
                 Ok(partial.to_vec()),
@@ -2154,7 +2172,10 @@ data: {"type":"message_stop"}
         )]));
         futures::executor::block_on(async {
             assert!(!stream.is_terminated());
-            assert_eq!(stream.next().await.expect("first").expect("ok").data, "first");
+            assert_eq!(
+                stream.next().await.expect("first").expect("ok").data,
+                "first"
+            );
             assert!(!stream.is_terminated());
             assert_eq!(
                 stream.next().await.expect("second").expect("ok").data,
@@ -2193,7 +2214,8 @@ data: {"type":"message_stop"}
             assert_eq!(count.0.load(Ordering::SeqCst), 1);
             assert!(Pin::new(&mut stream).poll_next_event(&mut cx).is_pending());
             assert_eq!(count.0.load(Ordering::SeqCst), 2);
-            let Poll::Ready(Some(Ok(event))) = Pin::new(&mut stream).poll_next_event(&mut cx) else {
+            let Poll::Ready(Some(Ok(event))) = Pin::new(&mut stream).poll_next_event(&mut cx)
+            else {
                 panic!("event must survive cooperative yields");
             };
             assert_eq!(event.data, "complete");

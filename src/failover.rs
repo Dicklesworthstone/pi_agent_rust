@@ -975,8 +975,8 @@ pub fn decide(
     let budget_left = progress.retry_count < policy.max_retries && progress.stream_can_retry;
     // A fallback also re-enters the provider. A surface that cannot retract
     // visible output must not bypass its no-retry boundary by changing models.
-    let may_fail_over = progress.stream_can_retry
-        && progress.failovers_this_turn < policy.max_failovers_per_turn;
+    let may_fail_over =
+        progress.stream_can_retry && progress.failovers_this_turn < policy.max_failovers_per_turn;
 
     // Each outcome shape decides only what is specific to it — whether the turn
     // is terminal, and whether its failure is retryable. The budget arithmetic
@@ -1084,7 +1084,10 @@ mod recovery_boundary_tests {
                 max_retries: retries,
                 ..policy()
             };
-            for outcome in [TurnOutcome::Completed(&message), TurnOutcome::Failed(&error)] {
+            for outcome in [
+                TurnOutcome::Completed(&message),
+                TurnOutcome::Failed(&error),
+            ] {
                 assert_eq!(
                     decide(outcome, &progress(false), &policy, Some(8_192)),
                     TurnDecision::Finish { success: false }
@@ -1129,7 +1132,12 @@ mod recovery_boundary_tests {
     fn explicit_context_overflow_does_not_walk_a_fallback_chain() {
         let error = crate::error::Error::api("maximum context length exceeded");
         assert_eq!(
-            decide(TurnOutcome::Failed(&error), &progress(true), &policy(), None),
+            decide(
+                TurnOutcome::Failed(&error),
+                &progress(true),
+                &policy(),
+                None
+            ),
             TurnDecision::Finish { success: false }
         );
     }
@@ -1155,7 +1163,12 @@ mod recovery_boundary_tests {
             (&persistence, TerminalReason::SessionPersistence),
         ] {
             assert_eq!(
-                decide(TurnOutcome::Failed(error), &progress(false), &policy(), None),
+                decide(
+                    TurnOutcome::Failed(error),
+                    &progress(false),
+                    &policy(),
+                    None
+                ),
                 TurnDecision::Terminal(reason)
             );
         }
