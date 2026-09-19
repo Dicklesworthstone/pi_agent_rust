@@ -177,7 +177,7 @@ impl StreamLifecycle {
     /// Missing delta payloads, orphan stops, and invalid signatures also take
     /// that path. Inspect only these non-emitting frames, keeping ordinary text
     /// and tool-token deltas on the existing single-decode hot path.
-    fn accept_silent(&mut self, raw: &str, partial: &AssistantMessage) -> Result<()> {
+    fn accept_silent(&mut self, raw: &str, partial: &mut AssistantMessage) -> Result<()> {
         let wire: Value = serde_json::from_str(raw)
             .map_err(|_| protocol_error("invalid non-emitting event JSON"))?;
         match wire.get("type").and_then(Value::as_str) {
@@ -191,6 +191,7 @@ impl StreamLifecycle {
                         "message_delta left unfinished content (unexpected EOF)",
                     ));
                 }
+                apply_usage_update(&wire, partial)?;
                 self.message_delta_seen = true;
                 // The shared parser already rejects unsupported stop reasons.
                 // Null/omitted reasons are valid metadata updates, but cannot
@@ -360,6 +361,48 @@ fn protocol_error(message: &str) -> Error {
     Error::api(format!("Anthropic stream protocol error: {message}"))
 }
 
+/// Complete the usage update after the shared parser applies output_tokens.
+/// Input/cache counts can be corrected in message_delta; like output_tokens,
+/// they are cumulative snapshots, not increments. Missing/null optional fields
+/// retain the last known count, whereas an explicit zero replaces it.
+fn apply_usage_update(wire: &Value, partial: &mut AssistantMessage) -> Result<()> {
+    let Some(usage) = wire.get("usage").filter(|usage| !usage.is_null()) else {
+        return Ok(());
+    };
+    let usage = usage
+        .as_object()
+        .ok_or_else(|| protocol_error("message_delta usage is not an object"))?;
+    let counter = |field: &str| -> Result<Option<u64>> {
+        match usage.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+                protocol_error(&format!("message_delta usage.{field} is not an unsigned integer"))
+            }),
+        }
+    };
+    // Validate every optional counter before changing any of them. Otherwise an
+    // invalid late field could leave a partially accepted accounting snapshot.
+    let input = counter("input_tokens")?;
+    let cache_read = counter("cache_read_input_tokens")?;
+    let cache_write = counter("cache_creation_input_tokens")?;
+    if let Some(input) = input {
+        partial.usage.input = input;
+    }
+    if let Some(cache_read) = cache_read {
+        partial.usage.cache_read = cache_read;
+    }
+    if let Some(cache_write) = cache_write {
+        partial.usage.cache_write = cache_write;
+    }
+    partial.usage.total_tokens = partial
+        .usage
+        .input
+        .saturating_add(partial.usage.output)
+        .saturating_add(partial.usage.cache_read)
+        .saturating_add(partial.usage.cache_write);
+    Ok(())
+}
+
 /// Bind the already-dispatched native Anthropic response to its current owner.
 /// This scopes body reads and cleanup, not the request dispatch that preceded it.
 /// Vertex uses the same driver with a response scoped before dispatch instead.
@@ -408,7 +451,8 @@ where
                                 return Some((Ok(event), (state, lifecycle)));
                             }
                             Ok(None) => {
-                                if let Err(error) = lifecycle.accept_silent(&msg.data, &state.partial)
+                                if let Err(error) =
+                                    lifecycle.accept_silent(&msg.data, &mut state.partial)
                                 {
                                     state.done = true;
                                     return Some((Err(error), (state, lifecycle)));
@@ -507,6 +551,14 @@ mod tests {
     }
 
     fn collect_wire(events: impl IntoIterator<Item = Value>) -> Vec<Result<StreamEvent>> {
+        collect_wire_for_api(events, "anthropic-messages", "anthropic")
+    }
+
+    fn collect_wire_for_api(
+        events: impl IntoIterator<Item = Value>,
+        api: &str,
+        provider: &str,
+    ) -> Vec<Result<StreamEvent>> {
         let chunks: Vec<_> = events
             .into_iter()
             .map(|event| Ok::<_, std::io::Error>(format!("data: {event}\n\n").into_bytes()))
@@ -518,8 +570,8 @@ mod tests {
                 wire_stream(
                     stream::iter(chunks),
                     "claude-test".to_string(),
-                    "anthropic-messages".to_string(),
-                    "anthropic".to_string(),
+                    api.to_string(),
+                    provider.to_string(),
                 )
                 .collect(),
             )
@@ -978,5 +1030,216 @@ mod tests {
             panic!("expected text");
         };
         assert_eq!(text.text, "retained");
+    }
+
+    #[test]
+    fn native_and_vertex_streams_keep_cumulative_usage_and_tool_content() {
+        for (api, provider) in [
+            ("anthropic-messages", "anthropic"),
+            ("google-vertex", "google-vertex"),
+        ] {
+            let events = collect_wire_for_api(
+                [
+                    json!({"type": "message_start", "message": {"usage": {
+                        "input_tokens": 10,
+                        "cache_read_input_tokens": 20,
+                        "cache_creation_input_tokens": 30
+                    }}}),
+                    tool_start(0, "call-a", &json!({})),
+                    tool_delta(0, "{\"path\":\"kept.txt\"}"),
+                    stop(0),
+                    json!({"type": "message_delta", "delta": {}, "usage": {
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 200,
+                        "cache_creation_input_tokens": 300,
+                        "output_tokens": 4
+                    }}),
+                    json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {
+                        "input_tokens": 110,
+                        "output_tokens": 5
+                    }}),
+                    json!({"type": "message_stop"}),
+                ],
+                api,
+                provider,
+            );
+            assert!(events.iter().all(Result::is_ok), "{api}: {events:?}");
+            let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                panic!("expected Done for {api}");
+            };
+            assert_eq!(*reason, StopReason::ToolUse);
+            assert_eq!(message.api, api);
+            assert_eq!(message.provider, provider);
+            assert_eq!(message.usage.input, 110);
+            assert_eq!(message.usage.output, 5);
+            assert_eq!(message.usage.cache_read, 200);
+            assert_eq!(message.usage.cache_write, 300);
+            assert_eq!(message.usage.total_tokens, 615);
+            let ContentBlock::ToolCall(call) = &message.content[0] else {
+                panic!("expected retained tool call");
+            };
+            assert_eq!(call.id, "call-a");
+            assert_eq!(call.arguments, json!({"path": "kept.txt"}));
+        }
+    }
+
+    #[test]
+    fn omitted_and_null_usage_fields_preserve_previous_counts() {
+        let events = collect_wire([
+            json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 30
+            }}}),
+            json!({"type": "message_delta", "delta": {}, "usage": {
+                "output_tokens": 7,
+                "input_tokens": null,
+                "cache_read_input_tokens": null,
+                "cache_creation_input_tokens": null
+            }}),
+            json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 7}}),
+            json!({"type": "message_delta", "delta": {}, "usage": null}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            json!({"type": "message_stop"}),
+        ]);
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let Some(Ok(StreamEvent::Done { message, .. })) = events.last() else {
+            panic!("expected Done");
+        };
+        assert_eq!(message.usage.input, 10);
+        assert_eq!(message.usage.cache_read, 20);
+        assert_eq!(message.usage.cache_write, 30);
+        assert_eq!(message.usage.output, 7);
+        assert_eq!(message.usage.total_tokens, 67);
+    }
+
+    #[test]
+    fn explicit_zero_resets_only_the_supplied_usage_counter() {
+        for (field, expected) in [
+            ("input_tokens", (0, 20, 30, 57)),
+            ("cache_read_input_tokens", (10, 0, 30, 47)),
+            ("cache_creation_input_tokens", (10, 20, 0, 37)),
+        ] {
+            let mut usage = json!({
+                "output_tokens": 7,
+                "input_tokens": null,
+                "cache_read_input_tokens": null,
+                "cache_creation_input_tokens": null
+            });
+            usage.as_object_mut().unwrap().insert(field.to_string(), json!(0));
+            let events = collect_wire([
+                json!({"type": "message_start", "message": {"usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 20,
+                    "cache_creation_input_tokens": 30
+                }}}),
+                json!({"type": "message_delta", "delta": {}, "usage": usage}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}}),
+                json!({"type": "message_stop"}),
+            ]);
+            assert!(events.iter().all(Result::is_ok), "{field}: {events:?}");
+            let Some(Ok(StreamEvent::Done { message, .. })) = events.last() else {
+                panic!("expected Done for {field}");
+            };
+            assert_eq!(
+                (
+                    message.usage.input,
+                    message.usage.cache_read,
+                    message.usage.cache_write,
+                    message.usage.total_tokens,
+                ),
+                expected,
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_usage_corrections_saturate_total_tokens() {
+        let events = collect_wire([
+            start(),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {
+                "input_tokens": u64::MAX,
+                "cache_read_input_tokens": u64::MAX,
+                "cache_creation_input_tokens": 1,
+                "output_tokens": 1
+            }}),
+            json!({"type": "message_stop"}),
+        ]);
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let Some(Ok(StreamEvent::Done { message, .. })) = events.last() else {
+            panic!("expected Done");
+        };
+        assert_eq!(message.usage.input, u64::MAX);
+        assert_eq!(message.usage.cache_read, u64::MAX);
+        assert_eq!(message.usage.cache_write, 1);
+        assert_eq!(message.usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn malformed_optional_usage_counters_never_publish_done() {
+        for field in ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"] {
+            for invalid in [json!(-1), json!(1.5), json!("7"), json!([]), json!({})] {
+                let mut usage = json!({"output_tokens": 1});
+                usage.as_object_mut().unwrap().insert(field.to_string(), invalid);
+                let events = collect_wire([
+                    start(),
+                    json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": usage}),
+                    json!({"type": "message_stop"}),
+                ]);
+                assert_terminal_error(&events);
+                assert!(
+                    events.last().unwrap().as_ref().unwrap_err().to_string().contains(field),
+                    "{field}: {events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_late_counter_does_not_partially_apply_optional_usage() {
+        let mut partial = AssistantMessage::default();
+        partial.usage.input = 7;
+        partial.usage.cache_read = 11;
+        partial.usage.cache_write = 13;
+        partial.usage.output = 5;
+        partial.usage.total_tokens = 36;
+        let wire = json!({"usage": {
+            "input_tokens": 100,
+            "cache_read_input_tokens": 200,
+            "cache_creation_input_tokens": "invalid"
+        }});
+        assert!(apply_usage_update(&wire, &mut partial).is_err());
+        assert_eq!(partial.usage.input, 7);
+        assert_eq!(partial.usage.cache_read, 11);
+        assert_eq!(partial.usage.cache_write, 13);
+        assert_eq!(partial.usage.output, 5);
+        assert_eq!(partial.usage.total_tokens, 36);
+    }
+
+    #[test]
+    fn provider_error_retains_preceding_usage_corrections() {
+        let events = collect_wire([
+            start(),
+            json!({"type": "message_delta", "delta": {}, "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 30,
+                "output_tokens": 7
+            }}),
+            json!({"type": "error", "error": {"message": "overloaded"}}),
+            json!({"type": "message_stop"}),
+        ]);
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let Some(Ok(StreamEvent::Error { error, .. })) = events.last() else {
+            panic!("expected terminal provider Error");
+        };
+        assert_eq!(error.error_message.as_deref(), Some("overloaded"));
+        assert_eq!(error.usage.input, 10);
+        assert_eq!(error.usage.cache_read, 20);
+        assert_eq!(error.usage.cache_write, 30);
+        assert_eq!(error.usage.output, 7);
+        assert_eq!(error.usage.total_tokens, 67);
+        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
     }
 }
