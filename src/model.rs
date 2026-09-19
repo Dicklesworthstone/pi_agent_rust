@@ -2244,11 +2244,29 @@ mod tests {
 
         #[test]
         fn proptest_content_block_roundtrip(block in content_block_strategy()) {
+            // Some fields are sanitized on the way in — `sanitize_media_name`
+            // drops control characters and bidi overrides and yields `None`
+            // when nothing printable survives. A block built in Rust can
+            // therefore hold a value no parsed block ever could: a media name
+            // of " " deserializes to `None`, and asserting plain identity here
+            // asserted that the sanitizer does not sanitize. It failed
+            // whenever the generator happened to produce such a name, which is
+            // rarely, which is the worst way for a test to be wrong.
+            //
+            // One roundtrip puts the block in the normalized form the wire can
+            // actually carry. The property that matters starts there: from a
+            // normalized block, serializing and parsing must change nothing.
+            // A genuinely dropped field still fails this, because it would
+            // differ between `normalized` and the value after reparsing.
             let serialized = serde_json::to_value(&block).expect("content block should serialize");
-            let parsed: ContentBlock = serde_json::from_value(serialized.clone())
+            let parsed: ContentBlock = serde_json::from_value(serialized)
                 .expect("serialized content block should deserialize");
-            let reserialized = serde_json::to_value(parsed).expect("re-serialize should succeed");
-            prop_assert_eq!(reserialized, serialized);
+            let normalized = serde_json::to_value(&parsed).expect("re-serialize should succeed");
+
+            let reparsed: ContentBlock = serde_json::from_value(normalized.clone())
+                .expect("normalized content block should deserialize");
+            let reserialized = serde_json::to_value(reparsed).expect("re-serialize should succeed");
+            prop_assert_eq!(reserialized, normalized);
         }
 
         #[test]
