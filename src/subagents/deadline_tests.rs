@@ -185,7 +185,7 @@ fn starting_callback_can_exhaust_budget_before_spawn() {
 fn chained_steps_do_not_get_a_fresh_timeout() {
     let (_root, tool) = fixture(
         &format!("printf 'started\\n' >> launches\n{}", end("first")),
-        Duration::from_secs(1),
+        Duration::from_secs(3),
     );
     let observed = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&observed);
@@ -201,7 +201,7 @@ fn chained_steps_do_not_get_a_fresh_timeout() {
                 .is_some_and(|value| value["result"]["status"] == "completed")
                 && !flag.swap(true, Ordering::SeqCst)
             {
-                std::thread::sleep(Duration::from_millis(1100));
+                std::thread::sleep(Duration::from_millis(3500));
             }
         })),
     )
@@ -220,7 +220,7 @@ fn chained_steps_do_not_get_a_fresh_timeout() {
 fn an_expired_budget_does_not_launch_a_corrective_retry() {
     let (_root, tool) = fixture(
         &format!("printf 'started\\n' >> launches\n{}", end("not JSON")),
-        Duration::from_secs(1),
+        Duration::from_secs(3),
     );
     let observed = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&observed);
@@ -236,7 +236,7 @@ fn an_expired_budget_does_not_launch_a_corrective_retry() {
                 .is_some_and(|value| value["result"]["schemaValid"] == false)
                 && !flag.swap(true, Ordering::SeqCst)
             {
-                std::thread::sleep(Duration::from_millis(1100));
+                std::thread::sleep(Duration::from_millis(3500));
             }
         })),
     )

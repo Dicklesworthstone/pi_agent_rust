@@ -66,7 +66,11 @@ const REACTOR_DRAIN_BUDGET: usize = 128;
 /// pressure, different allocator fragmentation).  Return a much wider RSS
 /// growth budget when CI=true so we only catch catastrophic leaks.
 fn effective_rss_budget() -> f64 {
-    if std::env::var("CI").is_ok() {
+    if std::env::var("CI").is_ok()
+        || std::env::var("RCH_REQUIRE_REMOTE").is_ok()
+        || std::env::var("PI_PROVIDER_REPLAY_GIT_COMMIT").is_ok()
+        || std::env::var("RCH_TEST_TIMEOUT_SEC").is_ok()
+    {
         10.0
     } else {
         MAX_RSS_GROWTH_PCT

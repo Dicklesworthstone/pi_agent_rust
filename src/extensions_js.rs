@@ -25369,8 +25369,8 @@ mod tests {
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            205_065,
-            "992b7def6f53d7d18690bd748f0df0b4f73b31058bc9676ce6c6aa107deaf17b",
+            205_300,
+            "0da93a4217162f652a4f99960a7393c241112a4f230a63feb354ac030cd6f9bb",
         ),
         (
             "node:fs",

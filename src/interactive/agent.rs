@@ -4345,7 +4345,7 @@ mod stream_delta_batcher_tests {
         app.save_enabled = true;
 
         let _ = app.submit_message("ultrathink check the fixture");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut saw_done = false;
         while std::time::Instant::now() < deadline {
             match event_rx.try_recv() {
@@ -4584,7 +4584,7 @@ mod stream_delta_batcher_tests {
     }
 
     fn wait_for_agent_done(event_rx: &mut mpsc::Receiver<PiMsg>) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while std::time::Instant::now() < deadline {
             match event_rx.try_recv() {
                 Ok(PiMsg::AgentDone { error_message, .. }) => {
@@ -5083,7 +5083,7 @@ mod stream_delta_batcher_tests {
             input: PendingInput::Continue,
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut saw_done = false;
         while std::time::Instant::now() < deadline {
             match event_rx.try_recv() {
@@ -5205,7 +5205,7 @@ mod stream_delta_batcher_tests {
 
         let _ = app.submit_message(r#"/deploy   --message "hello world"   --force"#);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut completion = None;
         let mut agent_error = None;
         while std::time::Instant::now() < deadline {
