@@ -11,6 +11,36 @@ use std::task::{Context, Poll};
 const MAX_EVENT_DATA_BYTES: usize = 100 * 1024 * 1024;
 const MAX_CHUNKS_PER_POLL: usize = 64;
 
+/// Local parser failures must not masquerade as an upstream `event: error`.
+/// The byte-stream adapter turns these into terminal I/O errors; the direct
+/// parser API emits one diagnostic event and then refuses further input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseParseError {
+    EventDataLimit,
+    BufferLimit,
+}
+
+impl SseParseError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::EventDataLimit => "SSE event data limit exceeded",
+            Self::BufferLimit => "SSE buffer limit exceeded",
+        }
+    }
+
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, self.message())
+    }
+
+    fn into_event(self) -> SseEvent {
+        SseEvent {
+            event: Cow::Borrowed("error"),
+            data: self.message().to_string(),
+            ..SseEvent::default()
+        }
+    }
+}
+
 /// A parsed SSE event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
@@ -53,6 +83,8 @@ pub struct SseParser {
     scanned_len: usize,
     /// Per-event data accumulation cap in bytes.
     max_event_data_bytes: usize,
+    /// A local limit failure poisons the parser until a new one is created.
+    failed: bool,
 }
 
 impl Default for SseParser {
@@ -64,6 +96,7 @@ impl Default for SseParser {
             bom_checked: false,
             scanned_len: 0,
             max_event_data_bytes: MAX_EVENT_DATA_BYTES,
+            failed: false,
         }
     }
 }
@@ -135,22 +168,22 @@ impl SseParser {
         value: &str,
         has_data: &mut bool,
         max_event_data_bytes: usize,
-    ) {
+    ) -> Result<(), SseParseError> {
         let projected_len = current
             .data
             .len()
             .saturating_add(value.len())
             .saturating_add(1);
         if projected_len > max_event_data_bytes {
-            // Preserve the event boundary even when we drop this data line.
-            // This avoids silently skipping oversized events, which can cause
-            // downstream state machines to hang waiting for a completion event.
-            *has_data = true;
-            return;
+            // Dropping only this line can turn tool arguments into different
+            // valid JSON or a truncated response into a completion event.
+            // Reject the entire frame and all later input instead.
+            return Err(SseParseError::EventDataLimit);
         }
         current.data.push_str(value);
         current.data.push('\n');
         *has_data = true;
+        Ok(())
     }
 
     #[inline]
@@ -168,7 +201,7 @@ impl SseParser {
         current: &mut SseEvent,
         has_data: &mut bool,
         max_event_data_bytes: usize,
-    ) {
+    ) -> Result<(), SseParseError> {
         if let Some(rest) = line.strip_prefix(':') {
             // Comment line - ignore (but could be used for keep-alive)
             let _ = rest;
@@ -177,7 +210,7 @@ impl SseParser {
             let value = value.strip_prefix(' ').unwrap_or(value);
             match field {
                 "event" => current.event = Self::intern_event_type(value),
-                "data" => Self::append_data_line(current, value, has_data, max_event_data_bytes),
+                "data" => Self::append_data_line(current, value, has_data, max_event_data_bytes)?,
                 "id" if !value.contains('\0') => {
                     current.id = Some(value.to_string());
                     current.id_was_explicit = true;
@@ -189,7 +222,7 @@ impl SseParser {
             // Field with no value
             match line {
                 "event" => current.event = Cow::Borrowed(""),
-                "data" => Self::append_data_line(current, "", has_data, max_event_data_bytes),
+                "data" => Self::append_data_line(current, "", has_data, max_event_data_bytes)?,
                 "id" => {
                     current.id = Some(String::new());
                     current.id_was_explicit = true;
@@ -197,6 +230,7 @@ impl SseParser {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     #[inline]
@@ -216,20 +250,12 @@ impl SseParser {
     }
 
     #[inline]
-    fn reset_after_buffer_limit<F>(&mut self, emit: &mut F)
-    where
-        F: FnMut(SseEvent),
-    {
+    fn discard_after_failure(&mut self) {
         self.buffer = String::new();
         self.current = SseEvent::default();
         self.has_data = false;
-        self.bom_checked = false;
         self.scanned_len = 0;
-        emit(SseEvent {
-            event: Cow::Borrowed("error"),
-            data: "SSE buffer limit exceeded".to_string(),
-            ..Default::default()
-        });
+        self.failed = true;
     }
 
     /// Process complete lines from `source`, dispatching events via `emit`.
@@ -243,7 +269,7 @@ impl SseParser {
         has_data: &mut bool,
         max_event_data_bytes: usize,
         emit: &mut F,
-    ) -> usize
+    ) -> Result<usize, SseParseError>
     where
         F: FnMut(SseEvent),
     {
@@ -314,15 +340,29 @@ impl SseParser {
                     Self::reset_current_for_next_event(current);
                 }
             } else {
-                Self::process_line(line, current, has_data, max_event_data_bytes);
+                Self::process_line(line, current, has_data, max_event_data_bytes)?;
             }
         }
 
-        start
+        Ok(start)
     }
 
     /// Feed data to the parser and emit any complete events to `emit`.
-    fn feed_into<F>(&mut self, data: &str, mut emit: F)
+    fn feed_into<F>(&mut self, data: &str, emit: F) -> Result<(), SseParseError>
+    where
+        F: FnMut(SseEvent),
+    {
+        if self.failed {
+            return Ok(());
+        }
+        let result = self.feed_validated(data, emit);
+        if result.is_err() {
+            self.discard_after_failure();
+        }
+        result
+    }
+
+    fn feed_validated<F>(&mut self, data: &str, mut emit: F) -> Result<(), SseParseError>
     where
         F: FnMut(SseEvent),
     {
@@ -337,13 +377,12 @@ impl SseParser {
                 &mut self.has_data,
                 self.max_event_data_bytes,
                 &mut emit,
-            );
+            )?;
             if consumed < data.len() {
-                self.buffer.push_str(&data[consumed..]);
-                if self.buffer.len() > MAX_BUFFER_SIZE {
-                    self.reset_after_buffer_limit(&mut emit);
-                    return;
+                if data.len() - consumed > MAX_BUFFER_SIZE {
+                    return Err(SseParseError::BufferLimit);
                 }
+                self.buffer.push_str(&data[consumed..]);
             }
         } else {
             // Slow path: parse against a temporary combined source so we only
@@ -360,26 +399,31 @@ impl SseParser {
                 &mut self.has_data,
                 self.max_event_data_bytes,
                 &mut emit,
-            );
+            )?;
             if consumed < combined.len() {
+                if combined.len() - consumed > MAX_BUFFER_SIZE {
+                    return Err(SseParseError::BufferLimit);
+                }
                 // Build buffer fresh from truly unprocessed tail only (no duplication).
                 self.buffer = combined[consumed..].to_string();
-            }
-            if self.buffer.len() > MAX_BUFFER_SIZE {
-                self.reset_after_buffer_limit(&mut emit);
-                return;
             }
         }
         // Whether we drained or not, the entire remaining buffer has been scanned.
         self.scanned_len = self.buffer.len();
+        Ok(())
     }
 
     /// Feed data to the parser and extract any complete events.
     ///
     /// Returns a vector of parsed events. Events are delimited by blank lines.
+    /// A local size-limit failure emits one `error` event after any complete
+    /// prefix events. The offending event is never emitted, and subsequent
+    /// `feed`/`flush` calls are empty; create a new parser for a new stream.
     pub fn feed(&mut self, data: &str) -> Vec<SseEvent> {
         let mut events = Vec::with_capacity(4);
-        self.feed_into(data, |event| events.push(event));
+        if let Err(error) = self.feed_into(data, |event| events.push(event)) {
+            events.push(error.into_event());
+        }
         events
     }
 
@@ -389,17 +433,30 @@ impl SseParser {
     }
 
     /// Flush any pending event (called when stream ends).
+    /// A local limit failure emits one diagnostic, never a truncated event.
     pub fn flush(&mut self) -> Option<SseEvent> {
+        self.try_flush()
+            .unwrap_or_else(|error| Some(error.into_event()))
+    }
+
+    fn try_flush(&mut self) -> Result<Option<SseEvent>, SseParseError> {
+        if self.failed {
+            return Ok(None);
+        }
         // First, process any remaining buffer content that doesn't end with newline
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
+            self.scanned_len = 0;
             let line = line.trim_end_matches('\r');
-            Self::process_line(
+            if let Err(error) = Self::process_line(
                 line,
                 &mut self.current,
                 &mut self.has_data,
                 self.max_event_data_bytes,
-            );
+            ) {
+                self.discard_after_failure();
+                return Err(error);
+            }
         }
 
         if self.has_data {
@@ -412,9 +469,9 @@ impl SseParser {
             let event = std::mem::take(&mut self.current);
             self.current = SseEvent::default();
             self.has_data = false;
-            Some(event)
+            Ok(Some(event))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -457,19 +514,25 @@ where
         )
     }
 
-    fn feed_parsed_chunk(parser: &mut SseParser, pending: &mut VecDeque<SseEvent>, s: &str) {
-        parser.feed_into(s, |event| pending.push_back(event));
+    fn feed_parsed_chunk(
+        parser: &mut SseParser,
+        pending: &mut VecDeque<SseEvent>,
+        s: &str,
+    ) -> Result<(), std::io::Error> {
+        parser
+            .feed_into(s, |event| pending.push_back(event))
+            .map_err(SseParseError::into_io_error)
     }
 
-    fn feed_to_pending(&mut self, s: &str) {
-        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
+    fn feed_to_pending(&mut self, s: &str) -> Result<(), std::io::Error> {
+        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s)
     }
 
     fn process_chunk_without_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         match std::str::from_utf8(bytes) {
             Ok(s) => {
                 if !s.is_empty() {
-                    self.feed_to_pending(s);
+                    self.feed_to_pending(s)?;
                 }
                 Ok(())
             }
@@ -478,7 +541,7 @@ where
                 if valid_len > 0 {
                     let s = std::str::from_utf8(&bytes[..valid_len])
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    self.feed_to_pending(s);
+                    self.feed_to_pending(s)?;
                 }
 
                 if err.error_len().is_some() {
@@ -504,7 +567,7 @@ where
         loop {
             match std::str::from_utf8(&self.utf8_buffer) {
                 Ok(s) => {
-                    Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
+                    Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s)?;
                     self.utf8_buffer.clear();
                     return self.process_chunk_without_utf8_tail(remaining);
                 }
@@ -554,12 +617,13 @@ where
             ));
         }
 
-        if let Some(event) = self.parser.flush() {
-            self.terminated = true;
-            return Poll::Ready(Some(Ok(event)));
+        match self.parser.try_flush() {
+            Ok(event) => {
+                self.terminated = true;
+                Poll::Ready(event.map(Ok))
+            }
+            Err(error) => self.finish_with_error(error.into_io_error()),
         }
-        self.terminated = true;
-        Poll::Ready(None)
     }
 
     /// Poll for the next SSE event.
@@ -1085,35 +1149,37 @@ mod tests {
         let mut current = SseEvent::default();
         let mut has_data = false;
 
-        SseParser::append_data_line(&mut current, "ab", &mut has_data, 3);
+        SseParser::append_data_line(&mut current, "ab", &mut has_data, 3).expect("at cap");
         assert_eq!(current.data, "ab\n");
         assert!(has_data);
 
-        SseParser::append_data_line(&mut current, "c", &mut has_data, 3);
+        assert_eq!(
+            SseParser::append_data_line(&mut current, "c", &mut has_data, 3),
+            Err(SseParseError::EventDataLimit)
+        );
         assert_eq!(current.data, "ab\n");
     }
 
     #[test]
     fn test_data_cap_single_oversized_line_via_feed() {
-        // A single oversized data line should still emit an event boundary
-        // (with empty data) rather than being silently dropped.
+        // The complete oversized frame is rejected, not replaced by empty data.
         let mut parser = SseParser::with_max_event_data_bytes(10);
         let events = parser.feed("data: this-is-longer-than-ten-bytes\n\n");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "");
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE event data limit exceeded");
+        assert!(!parser.has_pending());
     }
 
     #[test]
     fn test_data_cap_accumulation_via_feed() {
-        // Multiple small data lines that collectively exceed the cap:
-        // accepted lines are kept, the line that would push past the cap is rejected.
+        // No accepted prefix of a failed multi-line event may escape.
         let mut parser = SseParser::with_max_event_data_bytes(10);
         // "abc\n" = 4 bytes after first append
         let events = parser.feed("data: abc\ndata: def\ndata: ghi\n\n");
         assert_eq!(events.len(), 1);
-        // "abc\n" (4) + "def\n" (4) = 8 bytes; "ghi\n" (4) would make 12 > 10, rejected.
-        // Trailing newline stripped on emit → "abc\ndef"
-        assert_eq!(events[0].data, "abc\ndef");
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE event data limit exceeded");
     }
 
     #[test]
@@ -1127,15 +1193,15 @@ mod tests {
     }
 
     #[test]
-    fn test_data_cap_next_event_resets() {
-        // After a capped event, the next event should start fresh.
+    fn test_data_cap_stops_later_events() {
+        // A later completion marker must not hide the earlier size failure.
         let mut parser = SseParser::with_max_event_data_bytes(6);
         let events = parser.feed("data: abcde\ndata: rejected\n\ndata: ok\n\n");
-        assert_eq!(events.len(), 2);
-        // First event: "abcde\n" = 6 bytes at cap; "rejected\n" would exceed → dropped.
-        assert_eq!(events[0].data, "abcde");
-        // Second event starts fresh with a clean data buffer.
-        assert_eq!(events[1].data, "ok");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE event data limit exceeded");
+        assert!(parser.feed("data: later\n\n").is_empty());
+        assert!(parser.flush().is_none());
     }
 
     #[test]
@@ -1147,18 +1213,22 @@ mod tests {
         // "abc\n" (4) + "def\n" (4) = 8; "toolong\n" (8) would make 16 > 10
         let events = parser.feed("data: toolong\n\n");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "abc\ndef");
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE event data limit exceeded");
     }
 
     #[test]
     fn test_data_cap_flush_path() {
         // Cap must also be enforced when the stream ends without a trailing blank line.
         let mut parser = SseParser::with_max_event_data_bytes(6);
-        parser.feed("data: abcde\n");
-        parser.feed("data: no\n");
+        assert!(parser.feed("data: abcde\n").is_empty());
+        assert!(parser.feed("data: no").is_empty());
         // "abcde\n" = 6 bytes at cap; "no\n" (3) would make 9 > 6 → rejected.
-        let event = parser.flush().expect("should flush pending event");
-        assert_eq!(event.data, "abcde");
+        let event = parser.flush().expect("size failure at EOF");
+        assert_eq!(event.event, "error");
+        assert_eq!(event.data, "SSE event data limit exceeded");
+        assert!(parser.flush().is_none());
+        assert!(parser.feed("data: ok\n\n").is_empty());
     }
 
     #[test]
@@ -1247,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_limit_overflow_resets_parser_state() {
+    fn test_buffer_limit_overflow_discards_and_poisons_parser_state() {
         let mut parser = SseParser::new();
         assert!(parser.feed("data: stale\n").is_empty());
 
@@ -1261,7 +1331,9 @@ mod tests {
         assert!(parser.buffer.capacity() < 1024);
         assert!(parser.flush().is_none());
 
-        let fresh = parser.feed("data: fresh\n\n");
+        assert!(parser.feed("data: fresh\n\n").is_empty());
+        let mut fresh_parser = SseParser::new();
+        let fresh = fresh_parser.feed("data: fresh\n\n");
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].data, "fresh");
     }
@@ -1853,6 +1925,137 @@ data: {"type":"message_stop"}
             prop_assert_eq!(events, whole_events);
             prop_assert_eq!(whole_errors, vec![ErrorKind::InvalidData]);
         }
+    }
+
+    #[test]
+    fn oversized_frames_never_publish_completion_or_checkpoint_at_any_split() {
+        let bytes = concat!(
+            "id: good\ndata: first\n\ndata: second\n\n",
+            "event: response.completed\nid: bad\ndata: {}\n",
+            "data: this line exceeds the configured thirty-two byte budget\n\n",
+            "id: later\ndata: [DONE]\n\n"
+        )
+        .as_bytes();
+        for split in 0..=bytes.len() {
+            let chunks = vec![Ok(bytes[..split].to_vec()), Ok(bytes[split..].to_vec())];
+            let mut stream = SseStream::new(stream::iter(chunks));
+            stream.parser = SseParser::with_max_event_data_bytes(32);
+            futures::executor::block_on(async {
+                for expected in ["first", "second"] {
+                    let event = stream.next().await.expect("prefix").expect("valid");
+                    assert_eq!(event.data, expected, "split={split}");
+                    assert_eq!(event.id.as_deref(), Some("good"));
+                }
+                let error = stream.next().await.expect("failure").expect_err("oversized");
+                assert_eq!(error.kind(), ErrorKind::InvalidData, "split={split}");
+                assert_eq!(error.to_string(), "SSE event data limit exceeded");
+                assert!(stream.next().await.is_none());
+                assert!(stream.next().await.is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn data_limit_at_eof_is_a_terminal_stream_error() {
+        let mut stream = SseStream::new(stream::iter(vec![Ok(
+            b"data: good\n\ndata: xxxxx".to_vec(),
+        )]));
+        stream.parser = SseParser::with_max_event_data_bytes(5);
+        futures::executor::block_on(async {
+            assert_eq!(
+                stream.next().await.expect("prefix").expect("ok").data,
+                "good"
+            );
+            let error = stream.next().await.expect("failure").expect_err("EOF limit");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "SSE event data limit exceeded");
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn real_server_error_events_are_not_confused_with_local_limit_failures() {
+        let bytes = concat!(
+            "event: error\ndata: SSE event data limit exceeded\n\n",
+            "event: error\ndata: SSE buffer limit exceeded\n\n",
+            "data: ordinary\n\n"
+        );
+        let (events, errors) = parse_stream_single_chunk(bytes.as_bytes());
+        assert!(errors.is_empty());
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE event data limit exceeded");
+        assert_eq!(events[1].event, "error");
+        assert_eq!(events[2].data, "ordinary");
+    }
+
+    #[test]
+    fn buffered_line_limit_is_a_terminal_stream_error() {
+        let mut bytes = b"data: good\n\nid: bad\ndata: ".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 10 * 1024 * 1024 + 1));
+        let mut stream = SseStream::new(stream::iter(vec![
+            Ok(bytes),
+            Ok(b"\n\ndata: [DONE]\n\n".to_vec()),
+        ]));
+        futures::executor::block_on(async {
+            assert_eq!(
+                stream.next().await.expect("prefix").expect("ok").data,
+                "good"
+            );
+            let error = stream.next().await.expect("failure").expect_err("line limit");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "SSE buffer limit exceeded");
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+        });
+        assert!(!stream.parser.has_pending());
+        assert_eq!(stream.parser.buffer.capacity(), 0);
+    }
+
+    #[test]
+    fn failed_direct_parser_releases_payload_and_never_exposes_its_checkpoint() {
+        let mut parser = SseParser::with_max_event_data_bytes(64 * 1024);
+        let payload = "x".repeat(64 * 1024 - 1);
+        assert!(parser.feed(&format!("id: bad\ndata: {payload}\n")).is_empty());
+        assert!(parser.current.data.capacity() >= payload.len());
+        let events = parser.feed("data: overflow\n\ndata: [DONE]\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE event data limit exceeded");
+        assert!(events[0].id.is_none());
+        assert!(!events[0].id_was_explicit);
+        assert_eq!(parser.current.data.capacity(), 0);
+        assert!(parser.current.id.is_none());
+        assert!(parser.failed);
+        assert!(!parser.has_pending());
+        assert!(parser.feed("data: later\n\n").is_empty());
+        assert!(parser.flush().is_none());
+    }
+
+    #[test]
+    fn event_budget_resets_after_valid_events_and_counts_utf8_bytes() {
+        let mut parser = SseParser::with_max_event_data_bytes(5);
+        let events = parser.feed("data: 😀\n\ndata: 😀\n\n");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.data == "😀"));
+        // Four UTF-8 bytes + one ASCII byte + one newline exceeds five.
+        let events = parser.feed("data: 😀x\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE event data limit exceeded");
+    }
+
+    #[test]
+    fn zero_data_budget_rejects_even_empty_data_without_exposing_metadata() {
+        let mut parser = SseParser::with_max_event_data_bytes(0);
+        assert!(parser.feed(": ping\nevent: ping\n\n").is_empty());
+        let events = parser.feed("event: response.completed\nid: bad\ndata\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE event data limit exceeded");
+        assert!(events[0].id.is_none());
+        assert!(parser.flush().is_none());
     }
 
     #[test]
