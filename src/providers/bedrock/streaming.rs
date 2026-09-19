@@ -296,7 +296,9 @@ impl MessageState {
         // would authorize a second, local execution with a different trust
         // boundary. Fail closed until the model has a remote-tool vocabulary.
         if tool.get("type").is_some() {
-            return Err(invalid("server-managed or unknown tool type is not a local tool request"));
+            return Err(invalid(
+                "server-managed or unknown tool type is not a local tool request",
+            ));
         }
         let tool_id = string(tool, "toolUseId")?;
         let name = string(tool, "name")?;
@@ -322,6 +324,66 @@ impl MessageState {
             id: tool_id.to_string(),
             name: name.to_string(),
         });
+        Ok(())
+    }
+
+    /// A complete block is evidence of content, not permission to execute it.
+    /// The shared agent admits tools on Stop/Length too, so a Bedrock response
+    /// containing local calls must explicitly finish with tool_use. Refusals
+    /// stay on its fail-closed Error path; they are never retried as success.
+    fn stop_message(&mut self, value: &Value) -> Result<()> {
+        if !self.open.is_empty() {
+            return Err(invalid(
+                "messageStop arrived with unfinished content blocks",
+            ));
+        }
+        let wire_reason = string(value, "stopReason")?;
+        if wire_reason == "tool_use" && self.tool_ids.is_empty() {
+            return Err(invalid("tool_use stop reason has no local tool calls"));
+        }
+        let (reason, failure) = match wire_reason {
+            "end_turn" | "stop_sequence" => (StopReason::Stop, None),
+            "tool_use" => (StopReason::ToolUse, None),
+            "max_tokens" | "model_context_window_exceeded" => (StopReason::Length, None),
+            "guardrail_intervened" => (
+                StopReason::Error,
+                Some("Bedrock guardrail_intervened: response blocked; local tool calls withheld"),
+            ),
+            "content_filtered" => (
+                StopReason::Error,
+                Some("Bedrock content_filtered: response refused; local tool calls withheld"),
+            ),
+            "malformed_tool_use" => (
+                StopReason::Error,
+                Some("Bedrock malformed_tool_use: invalid tool request; local tool calls withheld"),
+            ),
+            "malformed_model_output" => (
+                StopReason::Error,
+                Some("Bedrock malformed_model_output: invalid model response; local tool calls withheld"),
+            ),
+            // Unknown provider strings can contain credentials or terminal
+            // controls. Keep a fixed diagnostic rather than echoing the wire.
+            _ => (
+                StopReason::Error,
+                Some("Bedrock returned an unsupported stop reason; local tool calls withheld"),
+            ),
+        };
+        let failure = failure.or_else(|| {
+            if self.tool_ids.is_empty() || reason == StopReason::ToolUse {
+                None
+            } else if reason == StopReason::Length {
+                Some("Bedrock response was truncated before tool_use authorization; local tool calls withheld")
+            } else {
+                Some("Bedrock ended without tool_use authorization; local tool calls withheld")
+            }
+        });
+        self.message.stop_reason = if failure.is_some() {
+            StopReason::Error
+        } else {
+            reason
+        };
+        self.message.error_message = failure.map(str::to_string);
+        self.stopped = true;
         Ok(())
     }
 
@@ -379,30 +441,7 @@ impl MessageState {
             "contentBlockStart" => self.start_block(value)?,
             "contentBlockDelta" => self.delta(value)?,
             "contentBlockStop" => self.end_block(block_id(value)?)?,
-            "messageStop" => {
-                if !self.open.is_empty() {
-                    return Err(invalid(
-                        "messageStop arrived with unfinished content blocks",
-                    ));
-                }
-                let reason = string(value, "stopReason")?;
-                if reason == "tool_use" && self.tool_ids.is_empty() {
-                    return Err(invalid("tool_use stop reason has no local tool calls"));
-                }
-                self.message.stop_reason = match reason {
-                    "end_turn" | "stop_sequence" => StopReason::Stop,
-                    "tool_use" => StopReason::ToolUse,
-                    "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
-                    // Unknown terminal outcomes must not authorize tool execution
-                    // or be committed as an ordinary successful answer.
-                    _ => StopReason::Error,
-                };
-                if self.message.stop_reason == StopReason::Error {
-                    self.message.error_message =
-                        Some("Bedrock returned a non-success stop reason".to_string());
-                }
-                self.stopped = true;
-            }
+            "messageStop" => self.stop_message(value)?,
             _ => return Err(invalid("unsupported ConverseStream event type")),
         }
         Ok(())
@@ -586,10 +625,17 @@ impl MessageState {
             return Err(invalid("unexpected EOF before a complete messageStop"));
         }
         let message = std::mem::take(&mut self.message);
-        Ok(StreamEvent::Done {
-            reason: message.stop_reason,
-            message,
-        })
+        if message.stop_reason == StopReason::Error {
+            Ok(StreamEvent::Error {
+                reason: StopReason::Error,
+                error: message,
+            })
+        } else {
+            Ok(StreamEvent::Done {
+                reason: message.stop_reason,
+                message,
+            })
+        }
     }
 }
 
@@ -1090,6 +1136,7 @@ mod tests {
         };
         assert_eq!(redacted.data, "AAE=");
     }
+
     #[test]
     fn metadata_after_message_stop_is_included_in_done() {
         let result = collect(vec![
@@ -1414,5 +1461,205 @@ mod tests {
         assert!(output.next().now_or_never().unwrap().unwrap().is_err());
         assert!(dropped.load(Ordering::SeqCst));
         assert!(output.next().now_or_never().unwrap().is_none());
+    }
+
+    fn usage_metadata() -> Vec<u8> {
+        event(
+            "metadata",
+            &json!({"usage": {
+                "inputTokens": 7,
+                "outputTokens": 3,
+                "cacheReadInputTokens": 20,
+                "cacheWriteInputTokens": 5,
+                "totalTokens": 35
+            }}),
+        )
+    }
+
+    fn terminal_failure(result: &[Result<StreamEvent>]) -> &AssistantMessage {
+        assert!(result.iter().all(Result::is_ok), "{result:?}");
+        assert!(
+            !result.iter().any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.iter().filter(|item| matches!(item, Ok(StreamEvent::Error { .. }))).count(),
+            1,
+            "{result:?}"
+        );
+        let Some(Ok(StreamEvent::Error { reason, error })) = result.last() else {
+            panic!("expected one terminal Error: {result:?}");
+        };
+        assert_eq!(*reason, StopReason::Error);
+        assert_eq!(error.stop_reason, StopReason::Error);
+        error
+    }
+
+    #[test]
+    fn completed_local_calls_require_terminal_tool_use_authorization() {
+        for reason in [
+            "end_turn",
+            "stop_sequence",
+            "max_tokens",
+            "model_context_window_exceeded",
+            "guardrail_intervened",
+            "content_filtered",
+            "malformed_tool_use",
+            "malformed_model_output",
+            "future_outcome",
+        ] {
+            let result = collect(vec![
+                start(),
+                tool_start(7, "call-a", "write"),
+                tool_input(7, "{\"path\":\"retained.txt\"}"),
+                block_stop(7),
+                event("messageStop", &json!({"stopReason": reason})),
+                usage_metadata(),
+            ]);
+            // Even a validated ToolCallEnd cannot make the final outcome a
+            // success. The call remains available for diagnostics, not execution.
+            assert_eq!(
+                result.iter().filter(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. }))).count(),
+                1,
+                "{reason}: {result:?}"
+            );
+            let message = terminal_failure(&result);
+            assert!(message.error_message.as_deref().unwrap().contains("local tool calls withheld"));
+            assert_eq!(message.usage.total_tokens, 35);
+            let ContentBlock::ToolCall(call) = &message.content[0] else {
+                panic!("expected retained diagnostic call");
+            };
+            assert_eq!(call.id, "call-a");
+            assert_eq!(call.arguments, json!({"path": "retained.txt"}));
+        }
+    }
+
+    #[test]
+    fn text_only_stops_preserve_normal_and_truncation_outcomes() {
+        for (wire_reason, expected) in [
+            ("end_turn", StopReason::Stop),
+            ("stop_sequence", StopReason::Stop),
+            ("max_tokens", StopReason::Length),
+            ("model_context_window_exceeded", StopReason::Length),
+        ] {
+            let result = collect(vec![
+                start(), text(), block_stop(0),
+                event("messageStop", &json!({"stopReason": wire_reason})),
+                usage_metadata(),
+            ]);
+            assert!(result.iter().all(Result::is_ok), "{result:?}");
+            assert!(!result.iter().any(|item| matches!(item, Ok(StreamEvent::Error { .. }))));
+            let Some(Ok(StreamEvent::Done { reason, message })) = result.last() else {
+                panic!("expected Done for {wire_reason}: {result:?}");
+            };
+            assert_eq!(*reason, expected);
+            assert_eq!(message.stop_reason, expected);
+            assert!(message.error_message.is_none());
+            assert_eq!(message.usage.total_tokens, 35);
+            let ContentBlock::Text(content) = &message.content[0] else {
+                panic!("expected retained text");
+            };
+            assert_eq!(content.text, "héllo");
+        }
+    }
+
+    #[test]
+    fn service_failure_outcomes_preserve_text_identity_and_usage() {
+        for wire_reason in [
+            "guardrail_intervened", "content_filtered",
+            "malformed_tool_use", "malformed_model_output",
+        ] {
+            let result = collect(vec![
+                start(), text(), block_stop(0),
+                event("messageStop", &json!({"stopReason": wire_reason})),
+                usage_metadata(),
+            ]);
+            let message = terminal_failure(&result);
+            assert!(message.error_message.as_deref().unwrap().contains(wire_reason));
+            assert_eq!(message.provider, "provider-a");
+            assert_eq!(message.model, "model-a");
+            assert_eq!(message.api, "bedrock-converse-stream");
+            assert_eq!(message.usage.input, 7);
+            assert_eq!(message.usage.output, 3);
+            assert_eq!(message.usage.cache_read, 20);
+            assert_eq!(message.usage.cache_write, 5);
+            assert_eq!(message.usage.total_tokens, 35);
+            let ContentBlock::Text(content) = &message.content[0] else {
+                panic!("expected retained text");
+            };
+            assert_eq!(content.text, "héllo");
+        }
+    }
+
+    #[test]
+    fn unknown_stop_outcomes_do_not_echo_untrusted_wire_strings() {
+        for wire_reason in ["", "future_status secret-canary\u{1b}[31m\n", "TOOL_USE"] {
+            let result = collect(vec![
+                start(),
+                event("messageStop", &json!({"stopReason": wire_reason})),
+            ]);
+            let message = terminal_failure(&result);
+            assert_eq!(
+                message.error_message.as_deref(),
+                Some("Bedrock returned an unsupported stop reason; local tool calls withheld")
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_failures_wait_for_metadata_then_finish_exactly_once() {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        tx.unbounded_send(Ok([
+            start(), text(), block_stop(0),
+            event("messageStop", &json!({"stopReason": "content_filtered"})),
+        ].concat())).unwrap();
+        let mut output = from_bytes(Box::pin(rx), "m".into(), "p".into(), Vec::new());
+        for _ in 0..4 {
+            let item = output.next().now_or_never().unwrap().unwrap().unwrap();
+            assert!(!matches!(item, StreamEvent::Done { .. } | StreamEvent::Error { .. }));
+        }
+        assert!(output.next().now_or_never().is_none());
+        tx.unbounded_send(Ok(usage_metadata())).unwrap();
+        drop(tx);
+        let result = output.next().now_or_never().unwrap().unwrap().unwrap();
+        let StreamEvent::Error { reason, error } = result else {
+            panic!("expected terminal Error");
+        };
+        assert_eq!(reason, StopReason::Error);
+        assert_eq!(error.usage.total_tokens, 35);
+        assert_eq!(error.content.len(), 1);
+        assert!(output.next().now_or_never().unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_stop_does_not_hide_a_corrupt_or_exception_tail() {
+        let mut exception_headers = Vec::new();
+        header(":message-type", "exception", &mut exception_headers);
+        header(":exception-type", "internalServerException", &mut exception_headers);
+        let exception = raw_frame(&exception_headers, br#"{"message":"tail failed"}"#);
+        for tail in [vec![0], vec![0; 12], exception] {
+            let result = collect(vec![
+                start(), text(), block_stop(0),
+                event("messageStop", &json!({"stopReason": "malformed_model_output"})),
+                tail,
+            ]);
+            assert_one_terminal_error(&result);
+            assert!(!result.iter().any(|item| matches!(item, Ok(StreamEvent::Error { .. }))));
+        }
+    }
+
+    #[test]
+    fn absent_or_non_string_stop_reasons_cannot_default_to_success() {
+        for payload in [
+            json!({}),
+            json!({"stopReason": null}),
+            json!({"stopReason": 1}),
+            json!({"stopReason": false}),
+            json!({"stopReason": []}),
+            json!({"stopReason": {}}),
+        ] {
+            let result = collect(vec![start(), event("messageStop", &payload)]);
+            assert_one_terminal_error(&result);
+        }
     }
 }
