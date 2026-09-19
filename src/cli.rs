@@ -437,8 +437,13 @@ pub struct Cli {
     pub no_session: bool,
 
     /// Launch the FrankenTUI interactive stack (default when built with `ftui`).
+    ///
+    /// Conflicts with `--classic`: the two select opposite stacks, and until
+    /// this conflict was declared, nothing read this flag at all — `--ftui`
+    /// appeared to work only because it names the default, and
+    /// `pi --classic --ftui` silently gave you classic.
     #[cfg(feature = "ftui")]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "classic")]
     pub ftui: bool,
 
     /// Force the classic charmed_rust TUI stack instead of the default ftui stack.
@@ -771,6 +776,32 @@ mod tests {
     /// is a message — including things that look like flags. This pins that
     /// `--session` placed BEFORE the message still binds, and that the message
     /// does not end up in `session`.
+    /// `--ftui` and `--classic` pick opposite stacks, so asking for both is a
+    /// mistake worth reporting rather than resolving silently. Before this,
+    /// `pi --classic --ftui` ran classic and said nothing.
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_and_classic_cannot_both_be_requested() {
+        let cli = Cli::parse_from(["pi", "--ftui"]);
+        assert!(cli.ftui);
+        assert!(!cli.classic);
+
+        let cli = Cli::parse_from(["pi", "--classic"]);
+        assert!(!cli.ftui);
+        assert!(cli.classic);
+
+        assert!(
+            Cli::try_parse_from(["pi", "--classic", "--ftui"]).is_err(),
+            "two stack selectors at once must be refused, not silently ordered"
+        );
+        assert!(
+            Cli::try_parse_from(["pi", "--ftui", "--classic"]).is_err(),
+            "and in the other order too"
+        );
+        // The documented aliases for --classic conflict as well.
+        assert!(Cli::try_parse_from(["pi", "--ftui", "--classic-tui"]).is_err());
+    }
+
     #[test]
     fn parse_session_path_in_a_full_print_mode_argv() {
         let cli = Cli::parse_from([
