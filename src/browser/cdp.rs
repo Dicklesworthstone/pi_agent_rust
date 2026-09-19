@@ -2,7 +2,7 @@
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
 use super::{
-    BrowserLaunchOptions, BrowserTabInfo, download, exports, interaction, launch, output, policy,
+    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, interaction, launch, output, policy,
     required,
 };
 use crate::agent_cx::AgentCx;
@@ -121,7 +121,9 @@ pub(super) struct Session {
 
 fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     let action = required(args, "action")?;
+    dialog::validate_action(args)?;
     match action {
+        "handle_dialog" => {}
         "start" | "status" | "stop" => {
             if args.as_object().is_some_and(|object| {
                 object
@@ -620,6 +622,12 @@ impl Session {
                     if action == "status" {
                         return Ok(None);
                     }
+                    if action == "handle_dialog" {
+                        return Err(Error::tool(
+                            "browser",
+                            "no owned browser is running; handling a dialog never launches a browser",
+                        ));
+                    }
                     startup = Some(launch::ManagedBrowser::launch(owner, cwd, options).await?);
                 }
                 let browser = self
@@ -787,6 +795,9 @@ impl Session {
         self.tabs.insert(tab.clone(), target.clone());
         self.active = Some(tab.clone());
         match action {
+            // No Runtime.evaluate or DOM query: a modal dialog can suspend
+            // page JavaScript. Target metadata already passed the URL guard.
+            "handle_dialog" => dialog::execute(owner, cdp, &tab, args).await,
             "open" | "goto" => {
                 let url = required(args, "url")?;
                 cdp.navigate(owner, url).await?;

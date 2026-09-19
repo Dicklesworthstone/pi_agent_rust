@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod cdp;
+mod dialog;
 mod download;
 mod exports;
 mod interaction;
@@ -156,7 +157,7 @@ impl Tool for BrowserTool {
     fn description(&self) -> &str {
         "Chromium automation with an owned isolated browser, or explicit loopback attachment \
          through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
-         workspace file uploads, screenshots and PDF export. start launches or attaches; \
+         workspace file uploads, JavaScript dialogs, screenshots and PDF export. start launches or attaches; \
          status never launches; stop only stops a Pi-owned browser. Failures are errors, \
          never simulated successes. Selecting upload files exposes them to page scripts."
     }
@@ -170,7 +171,8 @@ impl Tool for BrowserTool {
                     "type": "string",
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
                              "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
-                             "scroll", "wait_for", "upload", "download", "screenshot", "print_pdf"],
+                             "scroll", "wait_for", "upload", "download", "screenshot", "print_pdf",
+                             "handle_dialog"],
                     "description": "Browser action; ordinary actions lazily start the managed browser"
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
@@ -179,6 +181,8 @@ impl Tool for BrowserTool {
                 "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1"},
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
+                "accept": {"type": "boolean", "description": "handle_dialog: required explicit choice; true accepts, false dismisses the selected tab's current JavaScript dialog. Requires an explicit tab; never replays the triggering action."},
+                "prompt_text": {"type": "string", "description": "handle_dialog: exact prompt answer, at most 64 KiB. Only with accept=true; omit to retain the browser's default answer."},
                 "files": {"type": "array", "maxItems": 10, "items": {"type": "string"},
                           "description": "upload: workspace-relative regular files, no symlinks or parent traversal; [] clears selection. At most 20 MiB per call."},
                 "output_path": {"type": "string", "description": "New workspace-relative artifact destination; screenshot requires .png, print_pdf requires .pdf, download keeps any extension; existing files are never overwritten"},
@@ -212,11 +216,12 @@ impl Tool for BrowserTool {
             if matches!(
                 action,
                 "start" | "status" | "stop" | "upload" | "download" | "print_pdf"
+                    | "handle_dialog"
             ) || args.get("full_page").is_some()
             {
                 return Err(Error::tool(
                     "browser",
-                    "browser lifecycle, file uploads and page exports require the native backend",
+                    "browser lifecycle, file uploads, dialogs and page exports require the native backend",
                 ));
             }
             return self

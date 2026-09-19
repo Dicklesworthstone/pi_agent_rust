@@ -1,0 +1,261 @@
+//! The real browser tool against a bounded HTTP/WebSocket protocol peer.
+//! These fixtures do not substitute for a live Chromium or DSR run.
+
+use super::*;
+use crate::browser::BrowserTool;
+use crate::tools::Tool;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn headers(socket: &mut TcpStream) -> String {
+    socket.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    socket.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        assert!(bytes.len() < 16384);
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+fn accept(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match listener.accept() {
+            Ok((socket, _)) => return socket,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "dialog peer received no connection");
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("dialog peer accept: {error}"),
+        }
+    }
+}
+
+fn read_frame(socket: &mut TcpStream, method: &str) -> Value {
+    let mut head = [0; 2];
+    socket.read_exact(&mut head).unwrap();
+    assert_eq!(head[0], 0x81);
+    assert_ne!(head[1] & 0x80, 0);
+    let size = match head[1] & 0x7f {
+        126 => {
+            let mut bytes = [0; 2];
+            socket.read_exact(&mut bytes).unwrap();
+            usize::from(u16::from_be_bytes(bytes))
+        }
+        127 => {
+            let mut bytes = [0; 8];
+            socket.read_exact(&mut bytes).unwrap();
+            usize::try_from(u64::from_be_bytes(bytes)).unwrap()
+        }
+        size => usize::from(size),
+    };
+    assert!(size < 1024 * 1024);
+    let mut mask = [0; 4];
+    socket.read_exact(&mut mask).unwrap();
+    let mut bytes = vec![0; size];
+    socket.read_exact(&mut bytes).unwrap();
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["method"], method, "no unrelated action may be replayed");
+    if method.starts_with("Page.") || method.starts_with("Runtime.") {
+        assert_eq!(value["sessionId"], "session-1");
+    }
+    value
+}
+
+fn write_frame(socket: &mut TcpStream, value: Value) {
+    let bytes = serde_json::to_vec(&value).unwrap();
+    socket.write_all(&[0x81]).unwrap();
+    if bytes.len() < 126 {
+        socket.write_all(&[u8::try_from(bytes.len()).unwrap()]).unwrap();
+    } else {
+        socket.write_all(&[126]).unwrap();
+        socket.write_all(&u16::try_from(bytes.len()).unwrap().to_be_bytes()).unwrap();
+    }
+    socket.write_all(&bytes).unwrap();
+}
+
+fn reply(socket: &mut TcpStream, request: &Value, result: Value) {
+    let mut response = json!({"id":request["id"],"result":result});
+    if let Some(session) = request.get("sessionId") {
+        response["sessionId"] = session.clone();
+    }
+    write_frame(socket, response);
+}
+
+fn peer(
+    script: impl FnOnce(&mut TcpStream) + Send + 'static,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let mut discovery = accept(&listener);
+        assert!(headers(&mut discovery).starts_with("GET /json/version "));
+        let body = json!({"webSocketDebuggerUrl":format!("ws://{address}/devtools/browser/dialog")})
+            .to_string();
+        write!(discovery, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        drop(discovery);
+        let mut socket = accept(&listener);
+        let request = headers(&mut socket);
+        let key = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim())
+        }).unwrap();
+        let key = asupersync::net::websocket::compute_accept_key(key);
+        write!(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {key}\r\n\r\n").unwrap();
+        let request = read_frame(&mut socket, "Browser.setDownloadBehavior");
+        assert_eq!(request["params"]["behavior"], "deny");
+        reply(&mut socket, &request, json!({}));
+        let request = read_frame(&mut socket, "Target.getTargets");
+        reply(&mut socket, &request, json!({"targetInfos":[{
+            "targetId":"page-1","type":"page","url":"https://example.com/form","title":"Dialog fixture"
+        }]}));
+        script(&mut socket);
+    });
+    (format!("http://{address}"), handle)
+}
+
+fn attach(socket: &mut TcpStream) {
+    let request = read_frame(socket, "Target.attachToTarget");
+    assert_eq!(request["params"], json!({"targetId":"page-1","flatten":true}));
+    reply(socket, &request, json!({"sessionId":"session-1"}));
+}
+
+fn run(endpoint: String, args: Value, allowlist: Option<Vec<String>>) -> Result<ToolOutput> {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint)
+        .with_domain_allowlist(allowlist);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(tool.execute("dialog-test", args, None))
+}
+
+#[test]
+fn explicit_dialog_responses_preserve_literal_prompt_answers() {
+    for args in [
+        json!({"accept":false}),
+        json!({"accept":true}),
+        json!({"accept":true,"prompt_text":""}),
+        json!({"accept":true,"prompt_text":"  secret\n雪\"\\\u{0000}  "}),
+    ] {
+        let expected = response_parameters(&args).unwrap();
+        assert_eq!(expected["accept"], args["accept"]);
+        assert_eq!(expected.get("promptText"), args.get("prompt_text"));
+    }
+}
+
+#[test]
+fn malformed_or_ambiguous_dialog_responses_fail_before_connection() {
+    for args in [
+        json!({"action":"handle_dialog","tab":"page-1"}),
+        json!({"action":"handle_dialog","tab":"page-1","accept":"true"}),
+        json!({"action":"handle_dialog","tab":"page-1","accept":null}),
+        json!({"action":"handle_dialog","accept":true}),
+        json!({"action":"handle_dialog","tab":"","accept":true}),
+        json!({"action":"handle_dialog","tab":"page-1","accept":false,"prompt_text":"answer"}),
+        json!({"action":"handle_dialog","tab":"page-1","accept":true,"prompt_text":1}),
+        json!({"action":"handle_dialog","tab":"page-1","accept":true,"script":"must not run"}),
+        json!({"action":"evaluate","script":"42","accept":true}),
+    ] {
+        let error = run("not a CDP endpoint".into(), args, None).unwrap_err();
+        assert!(error.to_string().contains("BROWSER_DIALOG_INVALID"), "{error}");
+    }
+}
+
+#[test]
+fn prompt_size_limit_counts_utf8_bytes_and_does_not_echo_answers() {
+    assert!(response_parameters(&json!({"accept":true,"prompt_text":"a".repeat(MAX_PROMPT_BYTES)})).is_ok());
+    let secret = "雪".repeat(MAX_PROMPT_BYTES / 3 + 1);
+    let error = response_parameters(&json!({"accept":true,"prompt_text":secret})).unwrap_err();
+    assert!(!error.to_string().contains('雪'));
+}
+
+#[test]
+fn native_dialog_responses_never_evaluate_a_suspended_page_or_replay_input() {
+    for (accepted, answer) in [(false, None), (true, None), (true, Some("")), (true, Some("  雪\n  "))] {
+        let expected = answer.map(str::to_owned);
+        let (endpoint, handle) = peer(move |socket| {
+            attach(socket);
+            let request = read_frame(socket, "Page.handleJavaScriptDialog");
+            let mut params = json!({"accept":accepted});
+            if let Some(answer) = expected {
+                params["promptText"] = json!(answer);
+            }
+            assert_eq!(request["params"], params);
+            write_frame(socket, json!({"sessionId":"session-1","method":"Page.javascriptDialogClosed","params":{"result":accepted,"userInput":"not-for-output"}}));
+            reply(socket, &request, json!({}));
+        });
+        let mut args = json!({"action":"handle_dialog","tab":"page-1","accept":accepted});
+        if let Some(answer) = answer {
+            args["prompt_text"] = json!(answer);
+        }
+        let result = run(endpoint, args, None).unwrap();
+        let details = result.details.unwrap();
+        assert_eq!(details["accepted"], accepted);
+        assert_eq!(details["trigger_replayed"], false);
+        assert_eq!(details["prompt_text_supplied"], answer.is_some());
+        assert!(!details.to_string().contains("not-for-output"));
+        handle.join().unwrap();
+    }
+}
+
+#[test]
+fn native_dialog_failure_is_not_a_success_and_does_not_echo_prompt_data() {
+    let (endpoint, handle) = peer(|socket| {
+        attach(socket);
+        let request = read_frame(socket, "Page.handleJavaScriptDialog");
+        write_frame(socket, json!({"id":request["id"],"sessionId":"session-1","error":{"code":-32000,"message":"private-answer"}}));
+    });
+    let error = run(endpoint, json!({"action":"handle_dialog","tab":"page-1","accept":true,"prompt_text":"private-answer"}), None).unwrap_err();
+    assert!(error.to_string().contains("BROWSER_DIALOG_RESPONSE_FAILED"));
+    assert!(!error.to_string().contains("private-answer"));
+    handle.join().unwrap();
+}
+
+#[test]
+fn dialog_responses_obey_the_current_target_domain_guard() {
+    let (endpoint, handle) = peer(|_| {});
+    let result = run(endpoint, json!({"action":"handle_dialog","tab":"page-1","accept":true}), Some(vec!["allowed.invalid".into()]));
+    assert!(result.is_err());
+    handle.join().unwrap();
+}
+
+#[test]
+fn dialog_actions_reject_mock_successes_and_are_discoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(true);
+    assert!(tool.parameters()["properties"]["action"]["enum"].as_array().unwrap().contains(&json!("handle_dialog")));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    assert!(runtime.block_on(tool.execute("no-fake-dialog", json!({"action":"handle_dialog","tab":"page-1","accept":false}), None)).is_err());
+}
+
+#[test]
+fn handling_a_dialog_in_an_idle_managed_session_never_launches_a_browser() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_launch_options(crate::browser::BrowserLaunchOptions {
+            executable_path: Some(std::path::PathBuf::from("/nonexistent/do-not-launch")),
+            ..Default::default()
+        });
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let error = runtime
+        .block_on(tool.execute(
+            "idle-dialog",
+            json!({"action":"handle_dialog","tab":"page-1","accept":false}),
+            None,
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("no owned browser is running"));
+}
