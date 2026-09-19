@@ -25,49 +25,7 @@ impl PiApp {
     ///
     /// Groups actions by category and shows their key bindings.
     pub(super) fn format_hotkeys(&self) -> String {
-        use crate::keybindings::ActionCategory;
-        use std::fmt::Write;
-
-        let mut output = String::new();
-        let _ = writeln!(output, "Keyboard Shortcuts");
-        let _ = writeln!(output, "==================");
-        let _ = writeln!(output);
-        let _ = writeln!(
-            output,
-            "Config: {}",
-            KeyBindings::user_config_path().display()
-        );
-        let _ = writeln!(output);
-
-        for category in ActionCategory::all() {
-            let actions: Vec<_> = self.keybindings.iter_category(*category).collect();
-
-            // Skip empty categories
-            if actions.iter().all(|(_, bindings)| bindings.is_empty()) {
-                continue;
-            }
-
-            let _ = writeln!(output, "## {}", category.display_name());
-            let _ = writeln!(output);
-
-            for (action, bindings) in actions {
-                if bindings.is_empty() {
-                    continue;
-                }
-
-                // Format bindings as comma-separated list
-                let keys: Vec<_> = bindings
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect();
-                let keys_str = keys.join(", ");
-
-                let _ = writeln!(output, "  {:20} {}", keys_str, action.display_name());
-            }
-            let _ = writeln!(output);
-        }
-
-        output
+        crate::keybindings::format_hotkeys(&self.keybindings)
     }
 
     pub(super) fn resolve_action(&self, candidates: &[AppAction]) -> Option<AppAction> {

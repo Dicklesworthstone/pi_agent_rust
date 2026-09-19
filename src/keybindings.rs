@@ -1143,6 +1143,58 @@ impl<'de> Deserialize<'de> for KeyBinding {
 // Key Bindings Map
 // ============================================================================
 
+/// Render the `/hotkeys` listing for a catalog.
+///
+/// A free function rather than a method on either UI model because both stacks
+/// need it and they are behind different features: `interactive` is `tui`,
+/// `interactive_ftui` is `ftui`, and a build can have either. The body only
+/// ever read the catalog, so nothing is lost by moving it here.
+#[must_use]
+pub fn format_hotkeys(keybindings: &KeyBindings) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "Keyboard Shortcuts");
+    let _ = writeln!(output, "==================");
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Config: {}",
+        KeyBindings::user_config_path().display()
+    );
+    let _ = writeln!(output);
+
+    for category in ActionCategory::all() {
+        let actions: Vec<_> = keybindings.iter_category(*category).collect();
+
+        // Skip empty categories
+        if actions.iter().all(|(_, bindings)| bindings.is_empty()) {
+            continue;
+        }
+
+        let _ = writeln!(output, "## {}", category.display_name());
+        let _ = writeln!(output);
+
+        for (action, bindings) in actions {
+            if bindings.is_empty() {
+                continue;
+            }
+
+            // Format bindings as comma-separated list
+            let keys: Vec<_> = bindings
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            let keys_str = keys.join(", ");
+
+            let _ = writeln!(output, "  {:20} {}", keys_str, action.display_name());
+        }
+        let _ = writeln!(output);
+    }
+
+    output
+}
+
 /// Complete keybindings configuration.
 #[derive(Debug, Clone)]
 pub struct KeyBindings {

@@ -2425,14 +2425,25 @@ impl PiFtuiModel {
             }
             return true;
         }
+        if canon == "/hotkeys" || canon == "/keys" || canon == "/keybindings" {
+            // The same listing the classic stack prints, off the same catalog
+            // this stack now loads from the user's keybindings.json. Without
+            // it there was no way to see the key map on the default stack at
+            // all: the command answered "Unknown command: /hotkeys".
+            self.push_entry(
+                EntryRole::System,
+                crate::keybindings::format_hotkeys(&self.keybindings),
+            );
+            return true;
+        }
         if canon == "/help" || canon == "/h" || canon == "/?" {
             self.push_entry(
                 EntryRole::System,
                 String::from(
                     "ftui preview commands: /model [provider/model], /resume, /compact, \
                      /theme, /new, /clear, /session, /tree, /mcp, /thinking [level], \
-                     /name <name>, /exit, /help, !<cmd> (runs + sends output to the \
-                     agent), !!<cmd> (display-only)",
+                     /name <name>, /hotkeys, /exit, /help, !<cmd> (runs + sends output \
+                     to the agent), !!<cmd> (display-only)",
                 ),
             );
             return true;
@@ -5610,6 +5621,61 @@ mod tests {
         sim.inject_event(key(KeyCode::Char('b'), Modifiers::empty()));
         assert_eq!(sim.model().input.text(), "a\nb");
         assert_eq!(sim.model().input_rows(), 2);
+    }
+
+    #[test]
+    fn slash_hotkeys_prints_the_key_map_from_the_users_catalog() {
+        // Before this the command answered "Unknown command: /hotkeys (try
+        // /help)", so the key map was unreachable on the default stack.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "deleteWordBackward": ["ctrl+g"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings));
+        sim.init();
+        let before = sim.model().transcript.len();
+        for ch in "/hotkeys".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        // Submitting also echoes the typed line as a User entry, so the
+        // listing is the System one that follows it.
+        let listing = sim.model().transcript[before..]
+            .iter()
+            .find(|entry| entry.role == EntryRole::System)
+            .map(|entry| entry.text.clone())
+            .expect("a System entry carrying the listing");
+        assert!(
+            listing.contains("Keyboard Shortcuts"),
+            "not the key map: {listing:?}"
+        );
+        let text = &listing;
+        assert!(
+            text.contains("ctrl+g"),
+            "the listing should reflect the user's own override: {text:?}"
+        );
+    }
+
+    #[test]
+    fn slash_keys_is_an_alias_for_hotkeys() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+        for ch in "/keys".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model().transcript[before..]
+                .iter()
+                .any(|entry| entry.role == EntryRole::System
+                    && entry.text.contains("Keyboard Shortcuts")),
+            "/keys should print the same listing"
+        );
     }
 
     #[test]
