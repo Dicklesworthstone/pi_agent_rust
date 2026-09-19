@@ -182,7 +182,19 @@ impl Tool for BrowserTool {
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
                 "accept": {"type": "boolean", "description": "handle_dialog: required explicit choice; true accepts, false dismisses the selected tab's current JavaScript dialog. Requires an explicit tab; never replays the triggering action."},
-                "prompt_text": {"type": "string", "description": "handle_dialog: exact prompt answer, at most 64 KiB. Only with accept=true; omit to retain the browser's default answer."},
+                "prompt_text": {"type": "string", "description": "handle_dialog: exact prompt answer, at most 64 KiB. Only with accept=true; omit to send no promptText override."},
+                "dialog_response": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["type", "message", "url", "accept"],
+                    "description": "evaluate/click/type/fill/press: expect exactly one dialog on an explicit tab, matching type, message and URL exactly. Respond once and wait within timeout_ms; never replay the trigger. If no dialog appears, the operation times out. Not a persistent auto-accept policy.",
+                    "properties": {
+                        "type": {"type":"string","enum":["alert","confirm","prompt","beforeunload"]},
+                        "message": {"type":"string","description":"Exact dialog message, at most 64 KiB"},
+                        "url": {"type":"string","description":"Exact dialog source URL; must pass domainAllowlist"},
+                        "accept": {"type":"boolean"},
+                        "prompt_text": {"type":"string","description":"Exact answer for an accepted prompt only, at most 64 KiB; empty is allowed"}
+                    }
+                },
                 "files": {"type": "array", "maxItems": 10, "items": {"type": "string"},
                           "description": "upload: workspace-relative regular files, no symlinks or parent traversal; [] clears selection. At most 20 MiB per call."},
                 "output_path": {"type": "string", "description": "New workspace-relative artifact destination; screenshot requires .png, print_pdf requires .pdf, download keeps any extension; existing files are never overwritten"},
@@ -217,7 +229,7 @@ impl Tool for BrowserTool {
                 action,
                 "start" | "status" | "stop" | "upload" | "download" | "print_pdf"
                     | "handle_dialog"
-            ) || args.get("full_page").is_some()
+            ) || args.get("full_page").is_some() || args.get("dialog_response").is_some()
             {
                 return Err(Error::tool(
                     "browser",

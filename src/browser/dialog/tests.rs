@@ -259,3 +259,292 @@ fn handling_a_dialog_in_an_idle_managed_session_never_launches_a_browser() {
         .unwrap_err();
     assert!(error.to_string().contains("no owned browser is running"));
 }
+
+fn expectation(kind: &str, accepted: bool) -> Value {
+    json!({"type":kind,"message":"Continue?","url":"https://example.com/form","accept":accepted})
+}
+
+fn opening(kind: &str) -> Value {
+    json!({"sessionId":"session-1","method":"Page.javascriptDialogOpening","params":{
+        "type":kind,"message":"Continue?","url":"https://example.com/form",
+        "hasBrowserHandler":false,"defaultPrompt":"do-not-copy"
+    }})
+}
+
+fn triggered_args(expected: Value) -> Value {
+    let script = match expected["type"].as_str() {
+        Some("prompt") => "void prompt('Continue?')",
+        Some("alert") => "alert('Continue?'); 42",
+        _ => "confirm('Continue?')",
+    };
+    json!({"action":"evaluate","tab":"page-1","script":script,
+           "dialog_response":expected})
+}
+
+fn enable(socket: &mut TcpStream) {
+    attach(socket);
+    let request = read_frame(socket, "Page.enable");
+    reply(socket, &request, json!({}));
+}
+
+#[test]
+fn expected_dialog_validation_rejects_ambiguous_consent_before_connecting() {
+    let good = expectation("confirm", true);
+    for field in ["type", "message", "url", "accept"] {
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(Expected::from_args(&triggered_args(missing), None).is_err());
+    }
+    for value in [Value::Null, json!([]), json!(true), json!("accept")] {
+        assert!(Expected::from_args(&triggered_args(value), None).is_err());
+    }
+    for (field, value) in [
+        ("type", json!("file-chooser")), ("accept", json!("yes")),
+        ("message", json!(null)), ("url", json!("javascript:alert(1)")),
+        ("prompt_text", json!("not a prompt")), ("match_any", json!(true)),
+    ] {
+        let mut bad = good.clone();
+        bad[field] = value;
+        let error = run("not a CDP endpoint".into(), triggered_args(bad), None).unwrap_err();
+        assert!(error.to_string().contains("BROWSER_DIALOG_INVALID"), "{error}");
+    }
+    for action in ["start", "goto", "open", "download", "handle_dialog", "snapshot"] {
+        let mut args = triggered_args(good.clone());
+        args["action"] = json!(action);
+        assert!(Expected::from_args(&args, None).is_err());
+    }
+    let mut implicit = triggered_args(good);
+    implicit.as_object_mut().unwrap().remove("tab");
+    assert!(Expected::from_args(&implicit, None).is_err());
+}
+
+#[test]
+fn one_operation_consent_requires_exact_type_message_url_and_session() {
+    let args = triggered_args(expectation("confirm", false));
+    let mut state = State::default();
+    state.arm(Expected::from_args(&args, None).unwrap().unwrap());
+    let mut foreign = opening("confirm");
+    foreign["sessionId"] = json!("another-tab");
+    assert!(state.response_for(&foreign, Some("session-1"), false).unwrap().is_none());
+    assert_eq!(state.response_for(&opening("confirm"), Some("session-1"), false).unwrap(),
+        Some(json!({"accept":false})));
+    assert!(state.response_for(&opening("confirm"), Some("session-1"), false).is_err());
+    for field in ["type", "message", "url"] {
+        let mut state = State::default();
+        state.arm(Expected::from_args(&args, None).unwrap().unwrap());
+        let mut changed = opening("confirm");
+        changed["params"][field] = json!("mismatch-private-data");
+        let error = state.response_for(&changed, Some("session-1"), false).unwrap_err();
+        assert!(error.to_string().contains("BROWSER_DIALOG_MISMATCH"));
+        assert!(!error.to_string().contains("private-data"));
+    }
+}
+
+#[test]
+fn dialog_acknowledgement_requires_its_id_session_and_success_object() {
+    let mut state = State::default();
+    state.record_sent(9, false);
+    assert!(!state.acknowledge(&json!({"id":8,"result":{}}), Some("session-1")).unwrap());
+    for response in [
+        json!({"id":9,"result":{}}),
+        json!({"id":9,"sessionId":"other","result":{}}),
+        json!({"id":9,"sessionId":"session-1","result":null}),
+        json!({"id":9,"sessionId":"session-1","result":{},"error":{}}),
+    ] {
+        assert!(state.acknowledge(&response, Some("session-1")).is_err());
+        assert!(!state.completed());
+    }
+    assert!(state.acknowledge(&json!({"id":9,"sessionId":"session-1","result":{}}), Some("session-1")).unwrap());
+    assert!(state.completed());
+    assert!(!state.pending());
+}
+
+#[test]
+fn native_trigger_waits_for_both_replies_in_either_order() {
+    for primary_first in [false, true] {
+        let (endpoint, handle) = peer(move |socket| {
+            enable(socket);
+            let primary = read_frame(socket, "Runtime.evaluate");
+            let mut foreign = opening("confirm");
+            foreign["sessionId"] = json!("other-tab");
+            write_frame(socket, foreign);
+            write_frame(socket, opening("confirm"));
+            let handler = read_frame(socket, "Page.handleJavaScriptDialog");
+            assert_eq!(handler["params"], json!({"accept":false}));
+            assert_ne!(handler["id"], primary["id"]);
+            let result = json!({"result":{"type":"boolean","value":false}});
+            if primary_first {
+                reply(socket, &primary, result);
+                reply(socket, &handler, json!({}));
+            } else {
+                reply(socket, &handler, json!({}));
+                reply(socket, &primary, result);
+            }
+        });
+        let out = run(endpoint, triggered_args(expectation("confirm", false)), None).unwrap();
+        let details = out.details.unwrap();
+        assert_eq!(details["result"], false);
+        assert_eq!(details["dialog_response"], json!({"acknowledged":true,"accepted":false,"trigger_replayed":false}));
+        handle.join().unwrap();
+    }
+}
+
+#[test]
+fn native_trigger_waits_for_a_dialog_after_the_primary_command_acknowledgement() {
+    let (endpoint, handle) = peer(|socket| {
+        enable(socket);
+        let primary = read_frame(socket, "Runtime.evaluate");
+        reply(socket, &primary, json!({"result":{"type":"number","value":42}}));
+        write_frame(socket, opening("alert"));
+        let handler = read_frame(socket, "Page.handleJavaScriptDialog");
+        assert_eq!(handler["params"], json!({"accept":true}));
+        reply(socket, &handler, json!({}));
+    });
+    let mut args = triggered_args(expectation("alert", true));
+    args["script"] = json!("setTimeout(() => alert('Continue?'), 0); 42");
+    let out = run(endpoint, args, None).unwrap();
+    assert_eq!(out.details.unwrap()["result"], 42);
+    handle.join().unwrap();
+}
+
+#[test]
+fn native_expected_prompt_preserves_the_exact_answer_without_receipt_echo() {
+    let (endpoint, handle) = peer(|socket| {
+        enable(socket);
+        let primary = read_frame(socket, "Runtime.evaluate");
+        write_frame(socket, opening("prompt"));
+        let handler = read_frame(socket, "Page.handleJavaScriptDialog");
+        assert_eq!(handler["params"], json!({"accept":true,"promptText":"  private\n雪  "}));
+        reply(socket, &handler, json!({}));
+        reply(socket, &primary, json!({"result":{"type":"undefined"}}));
+    });
+    let mut expected = expectation("prompt", true);
+    expected["prompt_text"] = json!("  private\n雪  ");
+    let out = run(endpoint, triggered_args(expected), None).unwrap();
+    assert!(!out.details.unwrap().to_string().contains("private"));
+    handle.join().unwrap();
+}
+
+#[test]
+fn native_preexisting_dialog_does_not_spend_consent_for_a_future_trigger() {
+    let (endpoint, handle) = peer(|socket| {
+        attach(socket);
+        let _enable = read_frame(socket, "Page.enable");
+        write_frame(socket, opening("confirm"));
+        // No Runtime.evaluate or Page.handleJavaScriptDialog should be sent.
+    });
+    let error = run(endpoint, triggered_args(expectation("confirm", true)), None).unwrap_err();
+    assert!(error.to_string().contains("BROWSER_DIALOG_UNEXPECTED"), "{error}");
+    handle.join().unwrap();
+}
+
+#[test]
+fn native_mismatched_dialog_never_receives_automatic_consent() {
+    for field in ["type", "message", "url"] {
+        let (endpoint, handle) = peer(move |socket| {
+            enable(socket);
+            let _primary = read_frame(socket, "Runtime.evaluate");
+            let mut event = opening("confirm");
+            event["params"][field] = json!("unrelated-private-dialog");
+            write_frame(socket, event);
+        });
+        let error = run(endpoint, triggered_args(expectation("confirm", true)), None).unwrap_err();
+        assert!(error.to_string().contains("BROWSER_DIALOG_MISMATCH"), "{error}");
+        assert!(!error.to_string().contains("private-dialog"));
+        handle.join().unwrap();
+    }
+}
+
+#[test]
+fn native_second_dialog_cannot_reuse_the_first_response() {
+    let (endpoint, handle) = peer(|socket| {
+        enable(socket);
+        let _primary = read_frame(socket, "Runtime.evaluate");
+        write_frame(socket, opening("confirm"));
+        let _handler = read_frame(socket, "Page.handleJavaScriptDialog");
+        write_frame(socket, opening("confirm"));
+    });
+    let error = run(endpoint, triggered_args(expectation("confirm", true)), None).unwrap_err();
+    assert!(error.to_string().contains("BROWSER_DIALOG_UNEXPECTED"), "{error}");
+    handle.join().unwrap();
+}
+
+#[test]
+fn native_handler_error_invalidates_a_buffered_success_without_echoing_it() {
+    let (endpoint, handle) = peer(|socket| {
+        enable(socket);
+        let primary = read_frame(socket, "Runtime.evaluate");
+        write_frame(socket, opening("confirm"));
+        let handler = read_frame(socket, "Page.handleJavaScriptDialog");
+        reply(socket, &primary, json!({"result":{"type":"string","value":"private-result"}}));
+        write_frame(socket, json!({"id":handler["id"],"sessionId":"session-1",
+            "error":{"code":-32000,"message":"private-response"}}));
+    });
+    let error = run(endpoint, triggered_args(expectation("confirm", true)), None).unwrap_err();
+    assert!(error.to_string().contains("BROWSER_DIALOG_RESPONSE_FAILED"), "{error}");
+    assert!(!error.to_string().contains("private-"));
+    handle.join().unwrap();
+}
+
+#[test]
+fn native_trigger_error_is_not_hidden_by_a_successful_dialog_response() {
+    let (endpoint, handle) = peer(|socket| {
+        enable(socket);
+        let primary = read_frame(socket, "Runtime.evaluate");
+        write_frame(socket, opening("confirm"));
+        let handler = read_frame(socket, "Page.handleJavaScriptDialog");
+        reply(socket, &handler, json!({}));
+        write_frame(socket, json!({"id":primary["id"],"sessionId":"session-1",
+            "error":{"code":-32000,"message":"trigger failed"}}));
+    });
+    let error = run(endpoint, triggered_args(expectation("confirm", true)), None).unwrap_err();
+    assert!(error.to_string().contains("trigger failed"));
+    handle.join().unwrap();
+}
+
+#[test]
+fn expected_dialog_url_is_authorized_before_any_browser_connection() {
+    let error = run("not a CDP endpoint".into(), triggered_args(expectation("confirm", true)),
+        Some(vec!["elsewhere.invalid".into()])).unwrap_err();
+    assert!(error.to_string().contains("expected dialog URL is not allowed"));
+}
+
+#[test]
+fn mock_mode_cannot_silently_ignore_an_expected_dialog_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(true);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let error = runtime.block_on(tool.execute("mock-expectation",
+        triggered_args(expectation("confirm", true)), None)).unwrap_err();
+    assert!(error.to_string().contains("native backend"));
+}
+
+#[test]
+fn expected_dialog_missing_after_command_success_is_not_reported_as_success() {
+    let (endpoint, handle) = peer(|socket| {
+        enable(socket);
+        let primary = read_frame(socket, "Runtime.evaluate");
+        reply(socket, &primary, json!({"result":{"type":"number","value":42}}));
+        // The peer closes with no dialog. A future missing dialog is not a
+        // successful "no-op" response and must not replay the evaluate.
+    });
+    assert!(run(endpoint, triggered_args(expectation("confirm", true)), None).is_err());
+    handle.join().unwrap();
+}
+
+#[test]
+fn expected_dialog_wait_uses_the_existing_whole_operation_deadline() {
+    let (endpoint, handle) = peer(|socket| {
+        enable(socket);
+        let primary = read_frame(socket, "Runtime.evaluate");
+        reply(socket, &primary, json!({"result":{"type":"number","value":42}}));
+        // Wait for client teardown rather than racing a fixed server sleep.
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).unwrap(), 0);
+    });
+    let mut args = triggered_args(expectation("confirm", true));
+    args["timeout_ms"] = json!(5000);
+    let error = run(endpoint, args, None).unwrap_err();
+    assert!(error.to_string().contains("operation timed out"), "{error}");
+    handle.join().unwrap();
+}

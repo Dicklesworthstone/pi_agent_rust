@@ -122,6 +122,7 @@ pub(super) struct Session {
 fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     let action = required(args, "action")?;
     dialog::validate_action(args)?;
+    dialog::Expected::from_args(args, allowlist)?;
     match action {
         "handle_dialog" => {}
         "start" | "status" | "stop" => {
@@ -285,6 +286,7 @@ pub(super) struct Cdp {
     loaded: BTreeSet<(String, String)>,
     downloads: BTreeMap<String, DownloadRecord>,
     timeout_ms: u64,
+    dialog: dialog::State,
 }
 
 impl Cdp {
@@ -336,6 +338,7 @@ impl Cdp {
             loaded: BTreeSet::new(),
             downloads: BTreeMap::new(),
             timeout_ms: 30_000,
+            dialog: dialog::State::default(),
         })
     }
 
@@ -388,13 +391,13 @@ impl Cdp {
         }
     }
 
-    async fn call(
+    async fn send_request(
         &mut self,
         owner: &AgentCx,
         method: &str,
         params: Value,
         page: bool,
-    ) -> Result<Value> {
+    ) -> Result<u64> {
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -412,9 +415,66 @@ impl Cdp {
             .send(owner.cx(), Message::text(request.to_string()))
             .await
             .map_err(|e| Error::tool("browser", format!("CDP send failed: {e}")))?;
+        Ok(id)
+    }
+
+    /// Handle only this connection's expected dialog. Never recurse through
+    /// call(): the original command can reply before the dialog acknowledgement.
+    async fn process_dialog(
+        &mut self,
+        owner: &AgentCx,
+        value: &Value,
+        explicit_response: bool,
+    ) -> Result<bool> {
+        if self.dialog.acknowledge(value, self.session_id.as_deref())? {
+            return Ok(true);
+        }
+        if let Some(params) =
+            self.dialog
+                .response_for(value, self.session_id.as_deref(), explicit_response)?
+        {
+            owner.checkpoint().map_err(|_| dialog::response_failed())?;
+            let accepted = params["accept"] == true;
+            let id = self
+                .send_request(owner, "Page.handleJavaScriptDialog", params, true)
+                .await
+                .map_err(|_| dialog::response_failed())?;
+            self.dialog.record_sent(id, accepted);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn call(
+        &mut self,
+        owner: &AgentCx,
+        method: &str,
+        params: Value,
+        page: bool,
+    ) -> Result<Value> {
+        let id = self.send_request(owner, method, params, page).await?;
+        let mut primary = None;
         for _ in 0..MAX_EVENTS {
             let response = self.receive(owner).await?;
-            if response["id"].as_u64() == Some(id) {
+            if !self
+                .process_dialog(owner, &response, method == "Page.handleJavaScriptDialog")
+                .await?
+                && response["id"].as_u64() == Some(id)
+            {
+                if primary.is_some() {
+                    return Err(Error::tool("browser", "duplicate CDP command response"));
+                }
+                if page
+                    && (self.dialog.requested() || method == "Page.handleJavaScriptDialog")
+                    && response["sessionId"].as_str() != self.session_id.as_deref()
+                {
+                    return Err(dialog::response_failed());
+                }
+                primary = Some(response);
+            }
+            if !self.dialog.pending()
+                && let Some(response) = primary.take()
+            {
                 if let Some(error) = response.get("error") {
                     return Err(Error::tool("browser", format!("{method} failed: {error}")));
                 }
@@ -433,6 +493,25 @@ impl Cdp {
         Err(Error::tool(
             "browser",
             "too many CDP events without a command response",
+        ))
+    }
+
+    async fn finish_expected_dialog(&mut self, owner: &AgentCx) -> Result<()> {
+        // Input acknowledgement can precede the page's asynchronous dialog.
+        // Keep the same socket and total operation deadline until it is handled.
+        for _ in 0..MAX_EVENTS {
+            if self.dialog.completed() {
+                return Ok(());
+            }
+            let value = self.receive(owner).await?;
+            self.process_dialog(owner, &value, false).await?;
+        }
+        if self.dialog.completed() {
+            return Ok(());
+        }
+        Err(Error::tool(
+            "browser",
+            "too many CDP events waiting for the expected dialog",
         ))
     }
 
@@ -794,7 +873,13 @@ impl Session {
         cdp.session_id = Some(required(&attached, "sessionId")?.to_owned());
         self.tabs.insert(tab.clone(), target.clone());
         self.active = Some(tab.clone());
-        match action {
+        if let Some(expected) = dialog::Expected::from_args(args, allowlist)? {
+            // An already-open dialog surfaced by Page.enable is not consent
+            // for a future action. Arm only after enabling has completed.
+            cdp.command(owner, "Page.enable", json!({})).await?;
+            cdp.dialog.arm(expected);
+        }
+        let result = match action {
             // No Runtime.evaluate or DOM query: a modal dialog can suspend
             // page JavaScript. Target metadata already passed the URL guard.
             "handle_dialog" => dialog::execute(owner, cdp, &tab, args).await,
@@ -872,7 +957,13 @@ impl Session {
                 "browser",
                 format!("unsupported CDP action: {action}"),
             )),
+        };
+        let mut result = result?;
+        if cdp.dialog.requested() {
+            cdp.finish_expected_dialog(owner).await?;
+            cdp.dialog.annotate(&mut result);
         }
+        Ok(result)
     }
 }
 
