@@ -363,35 +363,7 @@ impl LspTool {
     }
 
     async fn run_rename(&self, input: &LspInput) -> Result<ToolOutput> {
-        let new_name = input
-            .new_name
-            .as_deref()
-            .ok_or_else(|| tool_err("LSP_USAGE", "lsp rename requires `newName`"))?;
-        if new_name.is_empty() {
-            return Ok(usage_error("lsp rename requires a non-empty `newName`"));
-        }
-        let (path, position) = self.require_position(input)?;
-        let (uri, entry) = self.synced(&path).await?;
-        let result = entry
-            .client
-            .call(
-                "textDocument/rename",
-                json!({"textDocument":{"uri":uri},"position":position,"newName":new_name}),
-                self.request_timeout(input),
-            )
-            .await?;
-        let plan = parse_workspace_edit(&result)?;
-        let outcome = apply_workspace_edit(&plan, None)?;
-        for changed in &outcome.files_changed {
-            entry.client.invalidate(&path_to_uri(changed));
-        }
-        let files: Vec<_> = outcome
-            .files_changed
-            .iter()
-            .map(|p| display_path(p, &self.cwd))
-            .collect();
-        let payload = json!({"action":"rename","newName":new_name,"filesChanged":files,"fileOps":outcome.file_ops_applied,"atomic":true});
-        Ok(text_output(payload.to_string(), payload))
+        self.rename_symbol_checked(input).await
     }
 
     async fn run_rename_file(&self, input: &LspInput) -> Result<ToolOutput> {

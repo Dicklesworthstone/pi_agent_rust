@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 
+mod refactor;
+
 const MAX_ACTIONS: usize = 128;
 const MAX_ACTION_BYTES: usize = 2 * 1024 * 1024;
 const MAX_APPLY_REQUESTS: usize = 32;
