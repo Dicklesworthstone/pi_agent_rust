@@ -101,29 +101,103 @@ pub fn classify(stop_reason: StopReason, text: &str) -> RecoveryClass {
     RecoveryClass::CleanStop
 }
 
-/// Odd number of code-fence delimiters means the last fence never closed.
+/// Track top-level fenced code blocks, including the delimiter's type and
+/// length. A fence may contain shorter fences or fences of the other type
+/// as literal code; counting delimiter-looking lines misclassifies both
+/// completed examples and genuinely truncated output.
 fn has_unclosed_fence(text: &str) -> bool {
-    let fences = text
-        .lines()
-        .filter(|line| line.trim_start().starts_with("```"))
-        .count();
-    fences % 2 == 1
+    let mut open_fence: Option<(u8, usize)> = None;
+    for line in text.lines() {
+        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+        // Four spaces (or a leading tab) introduce indented code, not a
+        // top-level fence. Only ASCII spaces were counted, so this slice
+        // always starts on a UTF-8 boundary.
+        if indent > 3 {
+            continue;
+        }
+        let line = &line[indent..];
+        let Some(marker @ (b'`' | b'~')) = line.as_bytes().first().copied() else {
+            continue;
+        };
+        let length = line.bytes().take_while(|byte| *byte == marker).count();
+        if length < 3 {
+            continue;
+        }
+        let suffix = &line[length..];
+        match open_fence {
+            Some((open_marker, open_length))
+                if marker == open_marker
+                    && length >= open_length
+                    && suffix.bytes().all(|byte| matches!(byte, b' ' | b'\t')) =>
+            {
+                open_fence = None;
+            }
+            // Backticks in a backtick fence's info string invalidate the
+            // opener. Tilde fences do not have that restriction.
+            None if marker != b'`' || !suffix.contains('`') => {
+                open_fence = Some((marker, length));
+            }
+            _ => {}
+        }
+    }
+    open_fence.is_some()
 }
 
-/// The final line is a bare list bullet ("- ", "3.") with no content.
+/// The final line is an empty list item. A bare ordered marker is only
+/// actionable after another item in the same list: a complete numeric
+/// answer such as "42." must not spend another model call or the recovery
+/// budget. Prefer a false negative over inventing work from ambiguous text.
 fn ends_on_dangling_bullet(text: &str) -> bool {
-    let Some(last) = text.lines().next_back() else {
+    let mut lines = text.lines().rev();
+    let Some(last) = lines.next() else {
         return false;
     };
-    let last = last.trim();
-    if last.is_empty() {
+    let indent = last.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 || last[indent..].starts_with('\t') {
         return false;
     }
+    let last = last.trim();
     if matches!(last, "-" | "*" | "+") {
         return true;
     }
-    last.strip_suffix('.')
-        .is_some_and(|head| !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()))
+    let Some((delimiter, remainder)) = ordered_bullet(last) else {
+        return false;
+    };
+    if !remainder.is_empty() {
+        return false;
+    }
+    let Some(previous) = lines.find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let previous_indent = previous.bytes().take_while(|byte| *byte == b' ').count();
+    if previous_indent != indent || previous[previous_indent..].starts_with('\t') {
+        return false;
+    }
+    ordered_bullet(previous.trim()).is_some_and(|(previous_delimiter, content)| {
+        previous_delimiter == delimiter && !content.trim().is_empty()
+    })
+}
+
+/// Recognize the one-to-nine-digit ordered-list markers supported by
+/// Markdown. Nonempty item content must be separated by a space or tab.
+fn ordered_bullet(line: &str) -> Option<(u8, &str)> {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=9).contains(&digits) {
+        return None;
+    }
+    let delimiter @ (b'.' | b')') = line.as_bytes().get(digits).copied()? else {
+        return None;
+    };
+    let remainder = &line[digits + 1..];
+    if remainder
+        .as_bytes()
+        .first()
+        .copied()
+        .is_some_and(|byte| !matches!(byte, b' ' | b'\t'))
+    {
+        return None;
+    }
+    Some((delimiter, remainder))
 }
 
 /// The message's closing sentence announces imminent action and nothing
@@ -291,6 +365,61 @@ mod tests {
     }
 
     #[test]
+    fn completed_fences_can_contain_literal_delimiters() {
+        for text in [
+            "````markdown\n```rust\nfn main() {}\n```\n````",
+            "~~~text\n``` is literal code\n~~~",
+            "```text\n~~~ is literal code\n```",
+            "~~~rust\nlet x = 1;\n~~~~",
+            "  ```text\npayload\n   ```\t",
+            "~~~example with `backticks`\ncontent\n~~~",
+            "```rust\nfn main() {}\n```\n~~~text\ndone\n~~~",
+        ] {
+            assert_eq!(
+                classify(StopReason::Stop, text),
+                RecoveryClass::CleanStop,
+                "completed fence: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fence_closers_must_match_the_opener() {
+        for text in [
+            "~~~rust\nfn main() {",
+            "````text\ncontent\n```",
+            "~~~text\ncontent\n```",
+            "```text\ncontent\n~~~",
+            "```text\ncontent\n```not a closing fence",
+            "```text\ncontent\n    ```",
+            "~~~text\ncontent\n~~",
+        ] {
+            assert_eq!(
+                classify(StopReason::Stop, text),
+                RecoveryClass::UnclosedStructure,
+                "unfinished fence: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_backticks_do_not_open_a_fence() {
+        for text in [
+            "    ```rust\n    literal indented code",
+            "\t```rust\n\tliteral indented code",
+            "```invalid`info\nordinary prose",
+            "Inline ```code``` is complete.",
+            "Unicode prose: 日本語, café, 🦀.",
+        ] {
+            assert_eq!(
+                classify(StopReason::Stop, text),
+                RecoveryClass::CleanStop,
+                "not a fence: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn dangling_bullet_detected() {
         let text = "Plan:\n1. read the file\n2.";
         assert_eq!(
@@ -299,6 +428,59 @@ mod tests {
         );
         let fine = "Plan:\n1. read the file\n2. edit it";
         assert_eq!(classify(StopReason::Stop, fine), RecoveryClass::CleanStop);
+    }
+
+    #[test]
+    fn ordered_dangling_bullets_require_list_context() {
+        for text in [
+            "42.",
+            "The answer is:\n42.",
+            "1.",
+            "Plan:\n1.read the file\n2.",
+            "Plan:\n1. read the file\n2)",
+            "Plan:\n1. read the file\n  2.",
+            "Plan:\n1. read the file\n1234567890.",
+            "    1. literal code\n    2.",
+            "    -",
+            "\t-",
+        ] {
+            assert_eq!(
+                classify(StopReason::Stop, text),
+                RecoveryClass::CleanStop,
+                "ambiguous or literal marker: {text:?}"
+            );
+        }
+        for text in [
+            "1. read the file\n2.",
+            "1) read the file\n2)",
+            "1. read the file\n\n2.   \n",
+            "  1. read the file\n  2.",
+            "1.\tread the file\n2.",
+            "Plan:\n-",
+            "Plan:\n*",
+            "Plan:\n+",
+        ] {
+            assert_eq!(
+                classify(StopReason::Stop, text),
+                RecoveryClass::UnclosedStructure,
+                "unfinished list: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_markdown_does_not_spend_recovery_budget() {
+        let mut state = TurnRecoveryState::new(TurnRecoveryMode::Conservative);
+        for text in [
+            "42.",
+            "~~~markdown\n``` literal fence\n~~~",
+            "    ``` literal indented code",
+        ] {
+            assert!(state.evaluate(StopReason::Stop, text).is_none(), "{text:?}");
+        }
+        assert_eq!(state.continuations(), 0);
+        assert!(state.evaluate(StopReason::Length, "cut off").is_some());
+        assert_eq!(state.continuations(), 1);
     }
 
     #[test]

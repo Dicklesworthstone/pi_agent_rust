@@ -52,13 +52,15 @@ impl Shaper {
             previous.text.push('\n');
             previous.text.push_str(text);
         } else {
-            self.content.push(ContentBlock::Text(TextContent::new(text)));
+            self.content
+                .push(ContentBlock::Text(TextContent::new(text)));
         }
     }
 
     fn warning(&mut self, index: Option<usize>, code: &str, reason: &str, invalid: bool) {
         self.is_error |= invalid;
-        self.warnings.push(json!({"index": index, "code": code, "reason": reason}));
+        self.warnings
+            .push(json!({"index": index, "code": code, "reason": reason}));
         let location = index.map_or_else(|| "result".to_string(), |i| format!("content block {i}"));
         self.text(&format!("[MCP {location}: {code}: {reason}]"));
     }
@@ -107,12 +109,16 @@ impl Shaper {
         }
         let mime = mime.to_ascii_lowercase();
         let (major, subtype) = mime.split_once('/').ok_or("invalid mimeType")?;
-        if major.is_empty() || subtype.is_empty() || subtype.contains('/')
+        if major.is_empty()
+            || subtype.is_empty()
+            || subtype.contains('/')
             || expected_major.is_some_and(|expected| expected != major)
         {
             return Err("binary mimeType does not match the content type");
         }
-        let data = block.get(data_field).and_then(Value::as_str)
+        let data = block
+            .get(data_field)
+            .and_then(Value::as_str)
             .ok_or("binary content must contain a base64 string")?;
         let bytes = self.decode(data, major == "audio")?;
         match major {
@@ -149,9 +155,13 @@ impl Shaper {
     }
 
     fn embedded_resource(&mut self, block: &Value) -> Result<(), &'static str> {
-        let resource = block.get("resource").filter(|resource| resource.is_object())
+        let resource = block
+            .get("resource")
+            .filter(|resource| resource.is_object())
             .ok_or("embedded resource must be an object")?;
-        let uri = resource.get("uri").and_then(Value::as_str)
+        let uri = resource
+            .get("uri")
+            .and_then(Value::as_str)
             .filter(|uri| !uri.is_empty())
             .ok_or("embedded resource must have a nonempty string uri")?;
         let text = resource.get("text");
@@ -171,10 +181,14 @@ impl Shaper {
     }
 
     fn resource_link(&mut self, block: &Value) -> Result<(), &'static str> {
-        let uri = block.get("uri").and_then(Value::as_str)
+        let uri = block
+            .get("uri")
+            .and_then(Value::as_str)
             .filter(|uri| !uri.is_empty())
             .ok_or("resource link must have a nonempty string uri")?;
-        let name = block.get("name").and_then(Value::as_str)
+        let name = block
+            .get("name")
+            .and_then(Value::as_str)
             .ok_or("resource link must have a string name")?;
         // Render only the public resource fields. _meta is client metadata,
         // not an instruction or a source of extra model-visible content.
@@ -192,7 +206,9 @@ impl Shaper {
     fn block(&mut self, index: usize, block: &Value) -> bool {
         let kind = block.get("type").and_then(Value::as_str);
         let result = match kind {
-            Some("text") => block.get("text").and_then(Value::as_str)
+            Some("text") => block
+                .get("text")
+                .and_then(Value::as_str)
                 .ok_or("text content must have a string text field")
                 .map(|text| self.text(text)),
             Some("image") => self.binary(block, "data", Some("image"), None),
@@ -201,8 +217,12 @@ impl Shaper {
             Some("resource_link") => self.resource_link(block),
             Some(kind) => {
                 self.warning(
-                    Some(index), "MCP_CONTENT_UNSUPPORTED",
-                    &format!("unsupported content type {}; original retained in tool details", quoted_label(kind)),
+                    Some(index),
+                    "MCP_CONTENT_UNSUPPORTED",
+                    &format!(
+                        "unsupported content type {}; original retained in tool details",
+                        quoted_label(kind)
+                    ),
                     false,
                 );
                 return false;
@@ -237,24 +257,37 @@ fn non_text_metadata(block: &Value) -> Value {
             if let Some(object) = metadata.as_object_mut()
                 && let Some(data) = object.remove("data")
             {
-                object.insert("encodedBytes".to_string(), json!(data.as_str().map_or(0, str::len)));
+                object.insert(
+                    "encodedBytes".to_string(),
+                    json!(data.as_str().map_or(0, str::len)),
+                );
                 object.insert("dataInNativeContent".to_string(), Value::Bool(true));
             }
         }
         Some("resource") => {
             if let Some(resource) = metadata.get_mut("resource").and_then(Value::as_object_mut) {
-                let mime = block.pointer("/resource/mimeType").and_then(Value::as_str)
-                    .unwrap_or_default().trim().to_ascii_lowercase();
+                let mime = block
+                    .pointer("/resource/mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
                 if resource.get("text").is_some_and(Value::is_string) {
                     resource.remove("text");
                     resource.insert("textInNativeContent".to_string(), Value::Bool(true));
                 }
-                if mime.starts_with("image/") || mime.starts_with("audio/")
-                    || mime.starts_with("video/") || mime.starts_with("text/")
-                    || mime == "application/json" || mime.ends_with("+json")
+                if mime.starts_with("image/")
+                    || mime.starts_with("audio/")
+                    || mime.starts_with("video/")
+                    || mime.starts_with("text/")
+                    || mime == "application/json"
+                    || mime.ends_with("+json")
                 {
                     if let Some(data) = resource.remove("blob") {
-                        resource.insert("encodedBytes".to_string(), json!(data.as_str().map_or(0, str::len)));
+                        resource.insert(
+                            "encodedBytes".to_string(),
+                            json!(data.as_str().map_or(0, str::len)),
+                        );
                         resource.insert("dataInNativeContent".to_string(), Value::Bool(true));
                     }
                 }
@@ -271,23 +304,41 @@ pub(super) fn tool_output(result: &Value) -> ToolOutput {
 
 fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
     let mut shaper = Shaper {
-        content: Vec::new(), warnings: Vec::new(), binary_bytes: 0,
-        is_error: result.get("isError").and_then(Value::as_bool).unwrap_or(false),
+        content: Vec::new(),
+        warnings: Vec::new(),
+        binary_bytes: 0,
+        is_error: result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         limits,
     };
     let mut details = json!({"mcp": true, "nonTextBlocks": 0});
     let mut non_text = Vec::new();
     if !result.is_object() {
-        shaper.warning(None, "MCP_RESULT_INVALID", "tool result must be an object", true);
+        shaper.warning(
+            None,
+            "MCP_RESULT_INVALID",
+            "tool result must be an object",
+            true,
+        );
     } else {
         if result.get("isError").is_some_and(|flag| !flag.is_boolean()) {
-            shaper.warning(None, "MCP_RESULT_INVALID", "isError must be a boolean", true);
+            shaper.warning(
+                None,
+                "MCP_RESULT_INVALID",
+                "isError must be a boolean",
+                true,
+            );
         }
         match result.get("content") {
             Some(Value::Array(blocks)) => {
-                details["nonTextBlocks"] = json!(blocks.iter()
-                    .filter(|block| block.get("type").and_then(Value::as_str) != Some("text"))
-                    .count());
+                details["nonTextBlocks"] = json!(
+                    blocks
+                        .iter()
+                        .filter(|block| block.get("type").and_then(Value::as_str) != Some("text"))
+                        .count()
+                );
                 for (index, block) in blocks.iter().take(limits.blocks).enumerate() {
                     let represented = shaper.block(index, block);
                     if block.get("type").and_then(Value::as_str) != Some("text") {
@@ -300,7 +351,12 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
                 }
                 if blocks.len() > limits.blocks {
                     details["omittedContentBlocks"] = json!(blocks.len() - limits.blocks);
-                    shaper.warning(None, "MCP_CONTENT_LIMIT", "result exceeds the content-block limit", true);
+                    shaper.warning(
+                        None,
+                        "MCP_CONTENT_LIMIT",
+                        "result exceeds the content-block limit",
+                        true,
+                    );
                 }
             }
             None if result.get("structuredContent").is_some() => {}
@@ -311,13 +367,21 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
             // Servers commonly supply the exact same JSON in a text block
             // for older clients. Avoid duplicating it, but a human summary
             // such as "Done" must not hide structured facts from the model.
-            let already_visible = result.get("content").and_then(Value::as_array)
-                .is_some_and(|blocks| blocks.iter().take(limits.blocks).any(|block| {
-                    block.get("type").and_then(Value::as_str) == Some("text")
-                        && block.get("text").and_then(Value::as_str)
-                            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                            .as_ref() == Some(structured)
-                }));
+            let already_visible =
+                result
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().take(limits.blocks).any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("text")
+                                && block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                                    .as_ref()
+                                    == Some(structured)
+                        })
+                    });
             if !already_visible {
                 shaper.text("MCP structured result:");
                 shaper.text(&json_text(structured));
@@ -337,7 +401,11 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
         details["contentWarnings"] = Value::Array(shaper.warnings);
     }
     details["decodedBinaryBytes"] = json!(shaper.binary_bytes);
-    ToolOutput { content: shaper.content, details: Some(details), is_error: shaper.is_error }
+    ToolOutput {
+        content: shaper.content,
+        details: Some(details),
+        is_error: shaper.is_error,
+    }
 }
 
 #[cfg(test)]
@@ -349,14 +417,23 @@ mod tests {
     }
 
     fn text(output: &ToolOutput) -> String {
-        output.content.iter().filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        }).collect::<Vec<_>>().join("\n")
+        output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn limits(bytes: usize) -> Limits {
-        Limits { blocks: 16, binary_bytes: bytes, audio_bytes: bytes }
+        Limits {
+            blocks: 16,
+            binary_bytes: bytes,
+            audio_bytes: bytes,
+        }
     }
 
     #[test]
@@ -372,7 +449,9 @@ mod tests {
         assert!(!output.is_error);
         assert_eq!(output.content.len(), 3);
         assert!(matches!(&output.content[0], ContentBlock::Text(t) if t.text == "before"));
-        assert!(matches!(&output.content[1], ContentBlock::Image(i) if i.data == image && i.mime_type == "image/png"));
+        assert!(
+            matches!(&output.content[1], ContentBlock::Image(i) if i.data == image && i.mime_type == "image/png")
+        );
         assert!(matches!(&output.content[2], ContentBlock::Text(t) if t.text == "after\ncaption"));
         assert!(!text(&output).contains(&image));
         let details = output.details.expect("details");
@@ -389,9 +468,14 @@ mod tests {
             "type":"audio", "mimeType":"audio/wav", "data":audio
         }]}));
         assert!(!output.is_error);
-        assert!(matches!(output.content.as_slice(), [ContentBlock::Media(media)]
-            if media.data == audio && media.mime_type == "audio/wav"));
-        assert!(text(&output).is_empty(), "audio must not become base64 text");
+        assert!(
+            matches!(output.content.as_slice(), [ContentBlock::Media(media)]
+            if media.data == audio && media.mime_type == "audio/wav")
+        );
+        assert!(
+            text(&output).is_empty(),
+            "audio must not become base64 text"
+        );
     }
 
     #[test]
@@ -399,8 +483,10 @@ mod tests {
         let output = tool_output(&json!({"content":[{
             "type":"image", "mimeType":"IMAGE/PNG", "data":"aGk"
         }]}));
-        assert!(matches!(output.content.as_slice(), [ContentBlock::Image(image)]
-            if image.data == "aGk=" && image.mime_type == "image/png"));
+        assert!(
+            matches!(output.content.as_slice(), [ContentBlock::Image(image)]
+            if image.data == "aGk=" && image.mime_type == "image/png")
+        );
     }
 
     #[test]
@@ -416,42 +502,85 @@ mod tests {
             assert!(output.is_error);
             assert!(text(&output).contains("MCP_CONTENT_INVALID"));
             assert!(!text(&output).contains("not-base64-secret"));
-            assert!(!output.content.iter().any(|block| matches!(block, ContentBlock::Image(_) | ContentBlock::Media(_))));
+            assert!(
+                !output
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Image(_) | ContentBlock::Media(_)))
+            );
         }
     }
 
     #[test]
     fn binary_budget_is_aggregate_and_keeps_valid_siblings() {
-        let output = tool_output_with_limits(&json!({"content":[
-            {"type":"image", "mimeType":"image/png", "data":encoded(b"1234")},
-            {"type":"image", "mimeType":"image/png", "data":encoded(b"5678")},
-            {"type":"text", "text":"still available"}
-        ]}), limits(6));
+        let output = tool_output_with_limits(
+            &json!({"content":[
+                {"type":"image", "mimeType":"image/png", "data":encoded(b"1234")},
+                {"type":"image", "mimeType":"image/png", "data":encoded(b"5678")},
+                {"type":"text", "text":"still available"}
+            ]}),
+            limits(6),
+        );
         assert!(output.is_error);
-        assert_eq!(output.content.iter().filter(|block| matches!(block, ContentBlock::Image(_))).count(), 1);
+        assert_eq!(
+            output
+                .content
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::Image(_)))
+                .count(),
+            1
+        );
         assert!(text(&output).contains("still available"));
         assert_eq!(output.details.expect("details")["decodedBinaryBytes"], 4);
     }
 
     #[test]
     fn decoded_size_check_catches_padding_boundary() {
-        let output = tool_output_with_limits(&json!({"content":[{
-            "type":"image", "mimeType":"image/png", "data":encoded(b"abc")
-        }]}), limits(2));
-        assert!(output.is_error, "four encoded characters can decode to three, not two, bytes");
-        assert!(!output.content.iter().any(|block| matches!(block, ContentBlock::Image(_))));
+        let output = tool_output_with_limits(
+            &json!({"content":[{
+                "type":"image", "mimeType":"image/png", "data":encoded(b"abc")
+            }]}),
+            limits(2),
+        );
+        assert!(
+            output.is_error,
+            "four encoded characters can decode to three, not two, bytes"
+        );
+        assert!(
+            !output
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+        );
     }
 
     #[test]
     fn audio_has_its_own_smaller_admission_limit() {
-        let cap = Limits { blocks: 4, binary_bytes: 16, audio_bytes: 2 };
-        let output = tool_output_with_limits(&json!({"content":[
-            {"type":"audio", "mimeType":"audio/wav", "data":encoded(b"abc")},
-            {"type":"image", "mimeType":"image/png", "data":encoded(b"abc")}
-        ]}), cap);
+        let cap = Limits {
+            blocks: 4,
+            binary_bytes: 16,
+            audio_bytes: 2,
+        };
+        let output = tool_output_with_limits(
+            &json!({"content":[
+                {"type":"audio", "mimeType":"audio/wav", "data":encoded(b"abc")},
+                {"type":"image", "mimeType":"image/png", "data":encoded(b"abc")}
+            ]}),
+            cap,
+        );
         assert!(output.is_error);
-        assert!(output.content.iter().any(|block| matches!(block, ContentBlock::Image(_))));
-        assert!(!output.content.iter().any(|block| matches!(block, ContentBlock::Media(_))));
+        assert!(
+            output
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+        );
+        assert!(
+            !output
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Media(_)))
+        );
     }
 
     #[test]
@@ -465,14 +594,20 @@ mod tests {
         assert!(!output.is_error);
         assert!(text(&output).contains(document));
         assert!(text(&output).contains("file:///remote/main.rs"));
-        assert!(output.details.expect("details")["nonText"][0]["resource"].get("text").is_none());
+        assert!(
+            output.details.expect("details")["nonText"][0]["resource"]
+                .get("text")
+                .is_none()
+        );
     }
 
     #[test]
     fn embedded_binary_images_audio_video_and_text_use_native_content() {
         for (mime, expected) in [
-            ("image/png", "image"), ("audio/wav", "media"),
-            ("video/mp4", "media"), ("text/plain", "text"),
+            ("image/png", "image"),
+            ("audio/wav", "media"),
+            ("video/mp4", "media"),
+            ("text/plain", "text"),
             ("application/problem+json", "text"),
         ] {
             let output = tool_output(&json!({"content":[{
@@ -481,12 +616,17 @@ mod tests {
                 }
             }]}));
             assert!(!output.is_error, "{mime}");
-            assert!(output.content.iter().any(|block| match block {
-                ContentBlock::Image(image) => expected == "image" && image.data == encoded(b"payload"),
-                ContentBlock::Media(media) => expected == "media" && media.data == encoded(b"payload"),
-                ContentBlock::Text(text) => expected == "text" && text.text.contains("payload"),
-                _ => false,
-            }), "{mime}");
+            assert!(
+                output.content.iter().any(|block| match block {
+                    ContentBlock::Image(image) =>
+                        expected == "image" && image.data == encoded(b"payload"),
+                    ContentBlock::Media(media) =>
+                        expected == "media" && media.data == encoded(b"payload"),
+                    ContentBlock::Text(text) => expected == "text" && text.text.contains("payload"),
+                    _ => false,
+                }),
+                "{mime}"
+            );
         }
     }
 
@@ -501,7 +641,10 @@ mod tests {
         assert!(!output.is_error);
         assert!(text(&output).contains("application/pdf"));
         assert!(!text(&output).contains(&blob));
-        assert_eq!(output.details.expect("details")["nonText"][0]["resource"]["blob"], blob);
+        assert_eq!(
+            output.details.expect("details")["nonText"][0]["resource"]["blob"],
+            blob
+        );
     }
 
     #[test]
@@ -512,7 +655,10 @@ mod tests {
         }]}));
         assert!(!output.is_error);
         assert!(text(&output).contains("application/octet-stream"));
-        assert_eq!(output.details.expect("details")["nonText"][0]["resource"]["blob"], blob);
+        assert_eq!(
+            output.details.expect("details")["nonText"][0]["resource"]["blob"],
+            blob
+        );
     }
 
     #[test]
@@ -553,7 +699,10 @@ mod tests {
         assert!(visible.contains("has not been fetched"));
         assert!(!visible.contains("private-link-meta"));
         assert!(!visible.contains("private-result-meta"));
-        assert_eq!(output.details.expect("details")["_meta"]["secret"], "private-result-meta");
+        assert_eq!(
+            output.details.expect("details")["_meta"]["secret"],
+            "private-result-meta"
+        );
     }
 
     #[test]
@@ -564,7 +713,10 @@ mod tests {
         assert!(!output.is_error);
         assert!(text(&output).contains("Done"));
         assert!(text(&output).contains("\"answer\": 42"));
-        assert_eq!(output.details.expect("details")["structuredContent"], structured);
+        assert_eq!(
+            output.details.expect("details")["structuredContent"],
+            structured
+        );
     }
 
     #[test]
@@ -589,12 +741,18 @@ mod tests {
 
     #[test]
     fn result_and_block_validation_keep_remote_error_flag() {
-        for result in [json!(null), json!("text"), json!({}), json!({"content":null}),
-            json!({"content":[], "isError":"false"}), json!({"content":[null]})]
-        {
+        for result in [
+            json!(null),
+            json!("text"),
+            json!({}),
+            json!({"content":null}),
+            json!({"content":[], "isError":"false"}),
+            json!({"content":[null]}),
+        ] {
             assert!(tool_output(&result).is_error, "{result}");
         }
-        let output = tool_output(&json!({"isError":true,"content":[{"type":"text","text":"remote error"}]}));
+        let output =
+            tool_output(&json!({"isError":true,"content":[{"type":"text","text":"remote error"}]}));
         assert!(output.is_error);
         assert_eq!(text(&output), "remote error");
     }
@@ -610,9 +768,16 @@ mod tests {
 
     #[test]
     fn too_many_blocks_is_a_bounded_partial_result_not_silent_success() {
-        let output = tool_output_with_limits(&json!({"content":[
-            {"type":"text","text":"first"}, {"type":"text","text":"second"}
-        ]}), Limits { blocks:1, binary_bytes:4, audio_bytes:4 });
+        let output = tool_output_with_limits(
+            &json!({"content":[
+                {"type":"text","text":"first"}, {"type":"text","text":"second"}
+            ]}),
+            Limits {
+                blocks: 1,
+                binary_bytes: 4,
+                audio_bytes: 4,
+            },
+        );
         assert!(output.is_error);
         assert!(text(&output).contains("first"));
         assert!(!text(&output).contains("second"));
