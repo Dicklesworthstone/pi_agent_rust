@@ -7,7 +7,7 @@ use super::{AnthropicProvider, StreamState};
 use crate::agent_cx::{AgentCx, AgentHttpResponse};
 use crate::error::{Error, Result};
 use crate::http::client::Response;
-use crate::model::{AssistantMessage, ContentBlock, StreamEvent};
+use crate::model::{AssistantMessage, ContentBlock, StopReason, StreamEvent};
 use crate::provider::{Context, Provider, StreamOptions};
 use crate::sse::SseStream;
 use futures::StreamExt;
@@ -139,8 +139,9 @@ struct StreamLifecycle {
     started: bool,
     /// Top-level deltas follow all content blocks, even when they only update usage.
     message_delta_seen: bool,
-    /// A default Stop value is not evidence of a provider completion decision.
-    stop_reason_seen: bool,
+    /// A final reason is immutable: later metadata cannot turn a refusal or
+    /// truncated response into permission to execute already streamed calls.
+    stop_reason: Option<String>,
     blocks: Vec<ContentState>,
     tool_ids: HashSet<String>,
 }
@@ -191,12 +192,17 @@ impl StreamLifecycle {
                         "message_delta left unfinished content (unexpected EOF)",
                     ));
                 }
-                apply_usage_update(&wire, partial)?;
-                self.message_delta_seen = true;
                 // The shared parser already rejects unsupported stop reasons.
                 // Null/omitted reasons are valid metadata updates, but cannot
                 // authorize Done until an explicit reason has actually arrived.
-                self.stop_reason_seen |= wire["delta"]["stop_reason"].is_string();
+                if let Some(reason) = wire["delta"]["stop_reason"].as_str() {
+                    if self.stop_reason.as_deref().is_some_and(|seen| seen != reason) {
+                        return Err(protocol_error("conflicting final stop reasons"));
+                    }
+                    self.stop_reason.get_or_insert_with(|| reason.to_string());
+                }
+                apply_usage_update(&wire, partial)?;
+                self.message_delta_seen = true;
                 Ok(())
             }
             Some("content_block_delta")
@@ -340,7 +346,7 @@ impl StreamLifecycle {
                         "message_stop left unfinished content (unexpected EOF)",
                     ));
                 }
-                if !self.stop_reason_seen {
+                if self.stop_reason.is_none() {
                     return Err(protocol_error(
                         "message_stop arrived without a final stop reason (unexpected EOF)",
                     ));
@@ -360,6 +366,52 @@ impl StreamLifecycle {
 
 fn protocol_error(message: &str) -> Error {
     Error::api(format!("Anthropic stream protocol error: {message}"))
+}
+
+/// A closed client tool block is content, not execution authority. Require the
+/// provider's explicit tool_use outcome before giving it to the shared agent,
+/// which also accepts calls attached to ordinary Stop/Length/Refusal messages.
+/// Text-only refusal, truncation and pause outcomes retain their public meaning.
+/// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+fn authorize_terminal(event: StreamEvent) -> StreamEvent {
+    let StreamEvent::Done { reason, mut message } = event else {
+        return event;
+    };
+    let has_calls = message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolCall(_)));
+    let failure = match reason {
+        StopReason::ToolUse if !has_calls => {
+            Some("Anthropic tool_use completion has no client tool calls")
+        }
+        StopReason::Stop if has_calls => {
+            Some("Anthropic ended without tool_use authorization; local tool calls withheld")
+        }
+        StopReason::Length if has_calls => {
+            Some("Anthropic response was truncated before tool_use authorization; local tool calls withheld")
+        }
+        StopReason::Refusal if has_calls => {
+            Some("Anthropic refused the response; local tool calls withheld")
+        }
+        StopReason::PauseTurn if has_calls => {
+            Some("Anthropic pause_turn cannot authorize client tool calls; local tool calls withheld")
+        }
+        _ => None,
+    };
+    if let Some(failure) = failure {
+        // Keep content, stop_details, usage and provider identity for diagnostics.
+        // Error is the shared agent's non-execution path; merely changing the
+        // outer event variant while retaining the old message reason is unsafe.
+        message.stop_reason = StopReason::Error;
+        message.error_message = Some(failure.to_string());
+        StreamEvent::Error {
+            reason: StopReason::Error,
+            error: message,
+        }
+    } else {
+        StreamEvent::Done { reason, message }
+    }
 }
 
 /// Complete the usage update after the shared parser applies output_tokens.
@@ -445,6 +497,7 @@ where
                                     state.done = true;
                                     return Some((Err(error), (state, lifecycle)));
                                 }
+                                let event = authorize_terminal(event);
                                 if matches!(
                                     &event,
                                     StreamEvent::Done { .. } | StreamEvent::Error { .. }
@@ -1305,5 +1358,200 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
         );
+    }
+
+    fn final_delta(reason: &str) -> Value {
+        json!({"type": "message_delta", "delta": {
+            "stop_reason": reason,
+            "stop_details": if reason == "refusal" {
+                json!({"type": "refusal", "category": "fixture", "explanation": "retained"})
+            } else {
+                Value::Null
+            }
+        }, "usage": {
+            "input_tokens": 10, "cache_read_input_tokens": 20,
+            "cache_creation_input_tokens": 30, "output_tokens": 7
+        }})
+    }
+
+    fn terminal_failure(events: &[Result<StreamEvent>]) -> &AssistantMessage {
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
+        assert_eq!(
+            events.iter().filter(|event| matches!(event, Ok(StreamEvent::Error { .. }))).count(),
+            1
+        );
+        let Some(Ok(StreamEvent::Error { reason, error })) = events.last() else {
+            panic!("expected terminal Error: {events:?}");
+        };
+        assert_eq!(*reason, StopReason::Error);
+        assert_eq!(error.stop_reason, StopReason::Error);
+        error
+    }
+
+    #[test]
+    fn native_and_vertex_client_calls_require_explicit_terminal_authorization() {
+        for (api, provider) in [
+            ("anthropic-messages", "anthropic"),
+            ("google-vertex", "google-vertex"),
+        ] {
+            for reason in [
+                "end_turn", "stop_sequence", "max_tokens",
+                "model_context_window_exceeded", "refusal", "pause_turn",
+            ] {
+                let events = collect_wire_for_api([
+                    start(),
+                    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+                    json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "retained"}}),
+                    stop(0),
+                    tool_start(1, "call-a", &json!({"path": "must-not-run.txt"})),
+                    stop(1),
+                    final_delta(reason),
+                    json!({"type": "message_stop"}),
+                ], api, provider);
+                // ToolCallEnd is still a content event, not permission to run.
+                assert_eq!(events.iter().filter(|event| matches!(
+                    event, Ok(StreamEvent::ToolCallEnd { .. })
+                )).count(), 1);
+                let error = terminal_failure(&events);
+                assert!(error.error_message.as_deref().unwrap().contains("local tool calls withheld"));
+                assert_eq!(error.api, api);
+                assert_eq!(error.provider, provider);
+                assert_eq!(error.model, "claude-test");
+                assert_eq!(error.usage.total_tokens, 67);
+                assert_eq!(error.content.len(), 2);
+                let ContentBlock::Text(text) = &error.content[0] else {
+                    panic!("expected retained text");
+                };
+                assert_eq!(text.text, "retained");
+                let ContentBlock::ToolCall(call) = &error.content[1] else {
+                    panic!("expected diagnostic tool content");
+                };
+                assert_eq!(call.id, "call-a");
+                assert_eq!(call.arguments, json!({"path": "must-not-run.txt"}));
+                if reason == "refusal" {
+                    let details = error.stop_details.as_ref().expect("refusal details");
+                    assert_eq!(details.kind, "refusal");
+                    assert_eq!(details.category.as_deref(), Some("fixture"));
+                    assert_eq!(details.explanation.as_deref(), Some("retained"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_only_outcomes_keep_refusal_pause_and_truncation_semantics() {
+        for (reason, expected) in [
+            ("end_turn", StopReason::Stop),
+            ("stop_sequence", StopReason::Stop),
+            ("max_tokens", StopReason::Length),
+            ("model_context_window_exceeded", StopReason::Length),
+            ("refusal", StopReason::Refusal),
+            ("pause_turn", StopReason::PauseTurn),
+        ] {
+            let events = collect_wire([
+                start(),
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "retained"}}),
+                stop(0), final_delta(reason), json!({"type": "message_stop"}),
+            ]);
+            assert!(events.iter().all(Result::is_ok), "{reason}: {events:?}");
+            assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Error { .. }))));
+            let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                panic!("expected a coherent Done");
+            };
+            assert_eq!(*reason, expected);
+            assert_eq!(message.stop_reason, expected);
+            assert!(message.error_message.is_none());
+            assert_eq!(message.usage.total_tokens, 67);
+            if expected == StopReason::Refusal {
+                assert_eq!(message.stop_details.as_ref().unwrap().category.as_deref(), Some("fixture"));
+            }
+        }
+    }
+
+    #[test]
+    fn tool_use_cannot_complete_without_client_calls() {
+        for with_text in [false, true] {
+            let mut input = vec![start()];
+            if with_text {
+                input.extend([
+                    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+                    stop(0),
+                ]);
+            }
+            input.extend([final_delta("tool_use"), json!({"type": "message_stop"})]);
+            let events = collect_wire(input);
+            let error = terminal_failure(&events);
+            assert!(error.error_message.as_deref().unwrap().contains("no client tool calls"));
+            assert_eq!(error.usage.total_tokens, 67);
+        }
+    }
+
+    #[test]
+    fn conflicting_stop_reasons_never_reauthorize_a_streamed_call() {
+        let reasons = [
+            "tool_use", "end_turn", "stop_sequence", "max_tokens",
+            "model_context_window_exceeded", "refusal", "pause_turn",
+        ];
+        for first in reasons {
+            for second in reasons {
+                if first == second {
+                    continue;
+                }
+                let events = collect_wire([
+                    start(), tool_start(0, "call-a", &json!({})), stop(0),
+                    final_delta(first), final_delta(second), json!({"type": "message_stop"}),
+                ]);
+                assert_terminal_error(&events);
+                assert!(events.last().unwrap().as_ref().unwrap_err().to_string()
+                    .contains("conflicting final stop reasons"), "{first} -> {second}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_or_null_metadata_cannot_erase_valid_tool_authorization() {
+        let events = collect_wire([
+            start(), tool_start(0, "call-a", &json!({})), stop(0),
+            final_delta("tool_use"),
+            json!({"type": "message_delta", "delta": {"stop_reason": null}, "usage": {"output_tokens": 8}}),
+            final_delta("tool_use"),
+            json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 9}}),
+            json!({"type": "message_stop"}),
+        ]);
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+            panic!("expected authorized completion");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        assert_eq!(message.usage.output, 9);
+        assert_eq!(message.usage.total_tokens, 69);
+        assert_eq!(message.content.len(), 1);
+    }
+
+    #[test]
+    fn terminal_authorization_survives_every_transport_split() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for reason in ["refusal", "tool_use"] {
+            let bytes = [
+                start(), tool_start(0, "call-a", &json!({})),
+                tool_delta(0, "{\"path\":\"héllo.txt\"}"), stop(0),
+                final_delta(reason), json!({"type": "message_stop"}),
+            ].into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>().into_bytes();
+            for split in 0..=bytes.len() {
+                let chunks = [Ok(bytes[..split].to_vec()), Ok(bytes[split..].to_vec())];
+                let events: Vec<_> = runtime.block_on(wire_stream(
+                    stream::iter(chunks), "claude-test".into(),
+                    "anthropic-messages".into(), "anthropic".into(),
+                ).collect());
+                if reason == "refusal" {
+                    terminal_failure(&events);
+                } else {
+                    assert!(events.iter().all(Result::is_ok), "split {split}: {events:?}");
+                    assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { reason: StopReason::ToolUse, .. }))));
+                }
+            }
+        }
     }
 }
