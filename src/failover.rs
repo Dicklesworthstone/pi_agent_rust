@@ -130,11 +130,12 @@ pub struct FailoverChain {
     pub entries: Vec<String>,
 }
 
-/// Resolve the chain for a role name or an exact `provider/model` spec from
-/// `retry.fallbackChains`. Role keys take precedence over exact model specs.
-/// Provider aliases and surrounding spec whitespace follow model resolution.
-/// An exact key wins over equivalent spellings; otherwise the lexicographically
-/// first matching key wins, independent of `HashMap` iteration order.
+/// Resolve the chain for a role name or an exact `provider/model` spec.
+///
+/// Looks up fallback chains from `retry.fallbackChains`. Role keys take precedence
+/// over exact model specs. Provider aliases and surrounding spec whitespace follow
+/// model resolution. An exact key wins over equivalent spellings; otherwise the
+/// lexicographically first matching key wins, independent of `HashMap` iteration order.
 pub fn chain_for<S: std::hash::BuildHasher>(
     chains: &HashMap<String, Vec<String>, S>,
     role: &str,
@@ -231,7 +232,8 @@ impl CooldownTracker {
     ) -> Self {
         let mut tracker = Self::new(cooldown_secs);
         if now < deadline {
-            let remaining_millis = (deadline - now).num_milliseconds().max(0) as u64;
+            let remaining_millis =
+                u64::try_from((deadline - now).num_milliseconds().max(0)).unwrap_or(0);
             let total_millis = cooldown_secs.saturating_mul(1000);
             let elapsed_millis = total_millis.saturating_sub(remaining_millis);
             let failed_at = Instant::now()
@@ -436,6 +438,15 @@ pub struct FailoverState {
     lifecycle_id: Option<String>,
 }
 
+/// Constituent components of a `FailoverState`.
+pub type FailoverParts = (
+    Option<CooldownTracker>,
+    Option<FailoverPrimary>,
+    Option<(String, String)>,
+    usize,
+    Option<String>,
+);
+
 impl FailoverState {
     /// Build from configuration. The cooldown tracker is absent when no
     /// fallback chain is configured: with no chain there is nothing to fail
@@ -583,15 +594,7 @@ impl FailoverState {
 
     /// Deconstruct into constituent state components.
     #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        Option<CooldownTracker>,
-        Option<FailoverPrimary>,
-        Option<(String, String)>,
-        usize,
-        Option<String>,
-    ) {
+    pub fn into_parts(self) -> FailoverParts {
         (
             self.cooldown,
             self.primary,
@@ -813,10 +816,11 @@ pub fn error_result_is_retryable(
     crate::error::is_retryable_error(error_text, Some(message.usage.input), context_window)
 }
 
-/// Only provider/transport failures can justify another provider call. A local
-/// tool, configuration, extension or session failure cannot be repaired by
+/// Only provider/transport failures can justify another provider call.
+///
+/// A local tool, configuration, extension or session failure cannot be repaired by
 /// re-entering the provider, even when its diagnostic quotes a transient error.
-fn is_provider_call_error(error: &crate::error::Error) -> bool {
+const fn is_provider_call_error(error: &crate::error::Error) -> bool {
     matches!(
         error,
         crate::error::Error::Api(_)

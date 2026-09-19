@@ -357,7 +357,7 @@ fn parse_npm(text: &str, path: &str, builder: &mut Builder) -> Result<()> {
             builder.exclude(location, "registry_origin_not_recorded");
             continue;
         };
-        let public = url::Url::parse(resolved).ok().is_some_and(|url| {
+        let public = url::Url::parse(resolved).is_ok_and(|url| {
             url.scheme() == "https"
                 && url.host_str() == Some("registry.npmjs.org")
                 && url.port_or_known_default() == Some(443)

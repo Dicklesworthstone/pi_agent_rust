@@ -59,14 +59,15 @@ struct ScanOutput {
 }
 
 fn artifacts_root() -> PathBuf {
-    if let Ok(path) = std::env::var("PI_TEST_ARTIFACTS_ROOT") {
-        PathBuf::from(path)
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("ext_conformance")
-            .join("artifacts")
-    }
+    std::env::var("PI_TEST_ARTIFACTS_ROOT").map_or_else(
+        |_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("ext_conformance")
+                .join("artifacts")
+        },
+        PathBuf::from,
+    )
 }
 
 fn normalize_platform_line_endings(input: &str) -> String {
@@ -428,13 +429,14 @@ fn scan_extension_entry_points() {
     };
 
     // Validate the committed output, or regenerate it only when explicitly requested.
-    let output_path = std::env::var("PI_TEST_ENTRY_SCAN_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+    let output_path = std::env::var("PI_TEST_ENTRY_SCAN_PATH").map_or_else(
+        |_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("docs")
                 .join("extension-entry-scan.json")
-        });
+        },
+        PathBuf::from,
+    );
     let json = serde_json::to_string_pretty(&output).expect("serialize scan output");
     let generate = matches!(
         std::env::var("PI_GENERATE_EXT_ENTRY_SCAN").as_deref(),

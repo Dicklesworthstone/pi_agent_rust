@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
@@ -54,7 +55,7 @@ impl Report {
         self.operations.extend(outcome.file_ops_applied);
     }
 
-    fn changed(&self) -> bool {
+    const fn changed(&self) -> bool {
         !self.files.is_empty() || !self.operations.is_empty()
     }
 }
@@ -115,6 +116,7 @@ impl ActionState {
             entry: Arc::downgrade(entry),
             report: Report::default(),
         });
+        drop(active);
         Ok(CommandLease {
             state: Arc::clone(self),
             id,
@@ -146,6 +148,7 @@ impl ActionState {
         match outcome {
             Ok(outcome) => {
                 grant.report.record(outcome);
+                drop(active);
                 entry.client.invalidate_all();
                 lock(&self.cache).clear();
                 json!({"applied":true})
@@ -192,6 +195,7 @@ impl ActionState {
             action,
             bytes,
         });
+        drop(cache);
         Ok(id)
     }
 
@@ -239,7 +243,6 @@ fn file_hash(path: &Path) -> Result<u64> {
         ));
     }
     let mut content = String::new();
-    use std::io::Read as _;
     file.take(16 * 1024 * 1024 + 1)
         .read_to_string(&mut content)?;
     if content.len() > 16 * 1024 * 1024 {

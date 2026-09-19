@@ -12816,7 +12816,7 @@ impl AgentSession {
 
     /// Whether a background compaction task is currently pending.
     #[must_use]
-    pub fn has_pending_background_compaction(&self) -> bool {
+    pub const fn has_pending_background_compaction(&self) -> bool {
         self.compaction_worker.has_pending()
     }
 
@@ -13371,19 +13371,21 @@ impl AgentSession {
 
         let primary_provider = request
             .primary
-            .map(|p| p.provider.clone())
-            .unwrap_or_else(|| request.from_provider.to_string());
+            .as_ref()
+            .map_or_else(|| request.from_provider.to_string(), |p| p.provider.clone());
         let primary_model_id = request
             .primary
-            .map(|p| p.model_id.clone())
-            .unwrap_or_else(|| request.from_model.to_string());
+            .as_ref()
+            .map_or_else(|| request.from_model.to_string(), |p| p.model_id.clone());
         let primary_thinking_level = request
             .primary
+            .as_ref()
             .map(|p| p.requested_thinking_level.to_string())
             .or_else(|| Some(request.thinking_level_to_clamp.to_string()));
         let cooldown_secs = request.cooldown_secs.unwrap_or(0);
         let now = chrono::Utc::now();
-        let deadline = now + chrono::Duration::seconds(cooldown_secs as i64);
+        let cooldown_i64 = i64::try_from(cooldown_secs).unwrap_or(i64::MAX);
+        let deadline = now + chrono::Duration::seconds(cooldown_i64);
         let cooldown_deadline = Some(deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         let lifecycle_id = request.lifecycle_id.map(String::from).or_else(|| {
             inner

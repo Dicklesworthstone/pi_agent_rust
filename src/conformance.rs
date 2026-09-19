@@ -1393,7 +1393,7 @@ pub mod snapshot {
     impl TreeCompletenessReport {
         /// Returns true if all tracked files exist on disk.
         #[must_use]
-        pub fn is_complete(&self) -> bool {
+        pub const fn is_complete(&self) -> bool {
             self.missing_files.is_empty()
         }
     }
@@ -1521,15 +1521,16 @@ pub mod snapshot {
 
         let mut missing_files = Vec::new();
         for rel_path in &tracked_lines {
-            let full_path = if let Some(prefix) = rel_prefix {
-                let stripped = rel_path
-                    .strip_prefix(prefix)
-                    .unwrap_or(rel_path)
-                    .trim_start_matches('/');
-                target_dir.join(stripped)
-            } else {
-                repo_root.join(rel_path)
-            };
+            let full_path = rel_prefix.map_or_else(
+                || repo_root.join(rel_path),
+                |prefix| {
+                    let stripped = rel_path
+                        .strip_prefix(prefix)
+                        .unwrap_or(rel_path)
+                        .trim_start_matches('/');
+                    target_dir.join(stripped)
+                },
+            );
 
             if !full_path.is_file() {
                 missing_files.push(rel_path.clone());

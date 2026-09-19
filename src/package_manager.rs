@@ -3082,6 +3082,7 @@ fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_supported_extension_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;

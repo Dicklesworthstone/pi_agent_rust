@@ -10137,7 +10137,7 @@ mod tests {
     }
 
     /// gh #223: a failure loading configured skills/prompts/themes/extensions carries its own
-    /// exit code (4) and distinct fatal error code "resource.load_failed".
+    /// exit code (4) and distinct fatal error code "`resource.load_failed`".
     #[test]
     fn configured_resource_load_failed_has_its_own_exit_code() {
         let err = anyhow::Error::new(ConfiguredResourceLoadFailed(

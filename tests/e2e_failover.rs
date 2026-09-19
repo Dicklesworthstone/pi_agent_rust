@@ -773,6 +773,7 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_failure() {
 /// vacuous. Here the fallback refuses once before answering, so both
 /// lifecycles are real and the event stream has to keep them apart.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_failover_json_mode_gives_the_fallback_its_own_retry_lifecycle() {
     let harness =
         TestHarness::new("e2e_failover_json_mode_gives_the_fallback_its_own_retry_lifecycle");
@@ -960,6 +961,7 @@ fn e2e_failover_json_mode_gives_the_fallback_its_own_retry_lifecycle() {
 /// loop's own `agent_end` per attempt and emits the closers after the last one,
 /// while RPC defers its terminal `agent_end` and closes the lifecycle first.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_failover_rpc_mode_gives_the_fallback_its_own_retry_lifecycle() {
     let harness =
         TestHarness::new("e2e_failover_rpc_mode_gives_the_fallback_its_own_retry_lifecycle");

@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("failed to build runtime");
 
-    runtime.block_on(async { run().await })?;
+    runtime.block_on(Box::pin(run()))?;
     Ok(())
 }
 

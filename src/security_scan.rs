@@ -79,7 +79,7 @@ impl Tool for SecurityScanTool {
         schema["properties"]["paths"]["description"] = json!(
             "Source ops: relative files/directories. Dependency ops: up to 32 relative Cargo.lock or package-lock.json/npm-shrinkwrap.json files; default root Cargo.lock and package-lock.json only."
         );
-        schema["properties"]["timeoutMs"] = json!({"type":"integer","minimum":1,"maximum":120000,"default":60000,
+        schema["properties"]["timeoutMs"] = json!({"type":"integer","minimum":1,"maximum":120_000,"default":60_000,
             "description":"audit_dependencies only: total inventory/network deadline; blocking filesystem calls are not preemptible"});
         schema["properties"]["sarifOut"]["description"] = json!(
             "run: source report path. audit_dependencies: optional NEW root-level .sarif filename; existing files are never overwritten, no default export."

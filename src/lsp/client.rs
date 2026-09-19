@@ -1,6 +1,7 @@
 //! LSP initialization, synchronized document versions, requests and diagnostics.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,10 +97,9 @@ pub fn path_to_uri(path: &Path) -> String {
     for byte in raw.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(byte as char)
+                out.push(byte as char);
             }
             _ => {
-                use std::fmt::Write as _;
                 out.push('%');
                 let _ = write!(out, "{byte:02X}");
             }

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -504,51 +505,62 @@ impl Detail {
                 {
                     continue;
                 }
-                if let Some(ranges) = affected.get("ranges") {
-                    let ranges = ranges.as_array().ok_or_else(invalid)?;
-                    if ranges.len() > 128 {
-                        return Err(invalid());
-                    }
-                    for range in ranges {
-                        // Git fix hashes and unfamiliar range types are not
-                        // package upgrade versions, even when they look numeric.
-                        if !matches!(
-                            range.get("type").and_then(Value::as_str),
-                            Some("SEMVER" | "ECOSYSTEM")
-                        ) {
-                            continue;
-                        }
-                        let events = range
-                            .get("events")
-                            .and_then(Value::as_array)
-                            .ok_or_else(invalid)?;
-                        if events.len() > 1024 {
-                            return Err(invalid());
-                        }
-                        for event in events {
-                            if let Some(version) = event.get("fixed") {
-                                let version = version
-                                    .as_str()
-                                    .filter(|version| version.len() <= 256)
-                                    .ok_or_else(invalid)?;
-                                if semver::Version::parse(version).is_ok() {
-                                    let versions = detail
-                                        .fixed
-                                        .entry((ecosystem.to_string(), name.to_string()))
-                                        .or_default();
-                                    if versions.len() == 128 && !versions.contains(version) {
-                                        return Err(invalid());
-                                    }
-                                    versions.insert(version.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
+                parse_affected_ranges(&mut detail, ecosystem, name, affected, &invalid)?;
             }
         }
         Ok(detail)
     }
+}
+
+fn parse_affected_ranges(
+    detail: &mut Detail,
+    ecosystem: &str,
+    name: &str,
+    affected: &Value,
+    invalid: &impl Fn() -> Failure,
+) -> std::result::Result<(), Failure> {
+    if let Some(ranges) = affected.get("ranges") {
+        let ranges = ranges.as_array().ok_or_else(invalid)?;
+        if ranges.len() > 128 {
+            return Err(invalid());
+        }
+        for range in ranges {
+            // Git fix hashes and unfamiliar range types are not
+            // package upgrade versions, even when they look numeric.
+            if !matches!(
+                range.get("type").and_then(Value::as_str),
+                Some("SEMVER" | "ECOSYSTEM")
+            ) {
+                continue;
+            }
+            let events = range
+                .get("events")
+                .and_then(Value::as_array)
+                .ok_or_else(invalid)?;
+            if events.len() > 1024 {
+                return Err(invalid());
+            }
+            for event in events {
+                if let Some(version) = event.get("fixed") {
+                    let version = version
+                        .as_str()
+                        .filter(|version| version.len() <= 256)
+                        .ok_or_else(invalid)?;
+                    if semver::Version::parse(version).is_ok() {
+                        let versions = detail
+                            .fixed
+                            .entry((ecosystem.to_string(), name.to_string()))
+                            .or_default();
+                        if versions.len() == 128 && !versions.contains(version) {
+                            return Err(invalid());
+                        }
+                        versions.insert(version.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 struct Report {
@@ -631,7 +643,7 @@ impl Report {
         Ok(next)
     }
 
-    fn status(&self) -> &'static str {
+    const fn status(&self) -> &'static str {
         if self.inventory.packages.is_empty() {
             "not_checked"
         } else if !self.query_complete {
@@ -685,7 +697,6 @@ impl Report {
             self.queries.len(),
             self.inventory.excluded.len()
         );
-        use std::fmt::Write as _;
         for (index, id, _) in self.matches().take(20) {
             let package = &self.inventory.packages[index];
             let _ = write!(

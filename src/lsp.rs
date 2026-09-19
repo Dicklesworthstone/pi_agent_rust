@@ -81,6 +81,7 @@ fn parse_symbol_selector(raw: &str) -> (String, Option<usize>) {
 }
 
 /// One instance owns its language servers and cached code-action identities.
+///
 /// Whole workflows are serialized so another tool call cannot interleave
 /// document synchronization or edits with a selected action's command window.
 pub struct LspTool {

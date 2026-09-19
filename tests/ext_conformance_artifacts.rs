@@ -380,9 +380,10 @@ fn test_ext_conformance_artifacts_match_manifest_checksums() {
 #[test]
 fn test_ext_conformance_artifact_provenance_matches_master_catalog_checksums() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/artifacts"));
+    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/artifacts"),
+        PathBuf::from,
+    );
 
     // Verify tree completeness first (bd-s7hzz)
     pi::conformance::snapshot::verify_tree_completeness(
@@ -1868,9 +1869,10 @@ fn find_entry_point(ext_dir: &Path, artifacts_dir: &Path) -> Option<String> {
 #[test]
 fn test_generate_validated_manifest() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let artifacts_dir = std::env::var("PI_TEST_ARTIFACTS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/artifacts"));
+    let artifacts_dir = std::env::var("PI_TEST_ARTIFACTS_ROOT").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/artifacts"),
+        PathBuf::from,
+    );
 
     let ext_dirs = discover_extension_dirs(&artifacts_dir);
     assert!(
@@ -1952,9 +1954,10 @@ fn test_generate_validated_manifest() {
         extensions: entries,
     };
 
-    let manifest_path = std::env::var("PI_TEST_MANIFEST_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/VALIDATED_MANIFEST.json"));
+    let manifest_path = std::env::var("PI_TEST_MANIFEST_PATH").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/VALIDATED_MANIFEST.json"),
+        PathBuf::from,
+    );
     let json = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
     let generate = matches!(
         std::env::var("PI_GENERATE_VALIDATED_MANIFEST").as_deref(),
@@ -2170,9 +2173,10 @@ fn test_snapshot_protocol_provenance_entries_valid() {
     };
 
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/artifacts"));
+    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/artifacts"),
+        PathBuf::from,
+    );
 
     // Verify tree completeness first (bd-s7hzz)
     pi::conformance::snapshot::verify_tree_completeness(

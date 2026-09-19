@@ -155,7 +155,7 @@ mod tests {
             "enabled":true,"focused":false,"children":[]})
     }
 
-    fn reply(root: Value) -> Vec<u8> {
+    fn reply(root: &Value) -> Vec<u8> {
         serde_json::to_vec(&json!({"root":root,"node_count":1,"truncated":false,
             "omitted_children":0,"values_included":false}))
         .unwrap()
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn actual_snapshot_shape_round_trips_without_invented_nodes() {
-        let snapshot = parse_response(&reply(node())).unwrap();
+        let snapshot = parse_response(&reply(&node())).unwrap();
         assert_eq!(snapshot.root.title.as_deref(), Some("Submit"));
         assert_eq!(snapshot.node_count, 1);
         assert!(!snapshot.truncated);
@@ -173,12 +173,12 @@ mod tests {
     fn forbidden_values_and_password_contents_are_rejected() {
         let mut root = node();
         root["value"] = json!("private-secret");
-        assert!(parse_response(&reply(root)).is_err());
+        assert!(parse_response(&reply(&root)).is_err());
         let mut root = node();
         root["role"] = json!("password text");
-        assert!(parse_response(&reply(root.clone())).is_err());
+        assert!(parse_response(&reply(&root)).is_err());
         root["title"] = Value::Null;
-        assert!(parse_response(&reply(root)).is_ok());
+        assert!(parse_response(&reply(&root)).is_ok());
     }
 
     #[test]
@@ -193,13 +193,13 @@ mod tests {
         }
         let mut root = node();
         root["children"] = json!([node()]);
-        assert!(parse_response(&reply(root)).is_err());
+        assert!(parse_response(&reply(&root)).is_err());
         let mut root = node();
         for _ in 0..10 {
             let mut parent = node();
             parent["children"] = json!([root]);
             root = parent;
         }
-        assert!(parse_response(&reply(root)).is_err());
+        assert!(parse_response(&reply(&root)).is_err());
     }
 }

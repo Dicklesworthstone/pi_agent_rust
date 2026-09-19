@@ -45,11 +45,11 @@ fn run_pi(harness: &TestHarness, env_vars: &[(&str, &str)], args: &[&str]) -> Ex
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let mut argv = vec![binary_path.display().to_string()];
-    argv.extend(args.iter().map(|s| (*s).to_string()));
+    let mut captured_argv = vec![binary_path.display().to_string()];
+    captured_argv.extend(args.iter().map(|s| (*s).to_string()));
 
     ExecOutput {
-        argv,
+        argv: captured_argv,
         exit_code,
         stdout,
         stderr,
@@ -65,6 +65,7 @@ fn parse_fatal_error_records(stdout: &str) -> Vec<Value> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_resource_load_failure_modes() {
     let harness = TestHarness::new("e2e_resource_load_failure_modes");
 

@@ -6,6 +6,7 @@ use std::time::Instant;
 
 const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 pub(super) fn validate_name(name: &str) -> Result<()> {
     if name.len() > 240
         || name.len() <= ".sarif".len()
@@ -40,6 +41,19 @@ impl<W: std::io::Write> std::io::Write for BoundedWriter<W> {
 }
 
 #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+struct Stage<'a> {
+    root: &'a rustix::fd::OwnedFd,
+    name: String,
+}
+
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+impl Drop for Stage<'_> {
+    fn drop(&mut self) {
+        let _ = rustix::fs::unlinkat(self.root, self.name.as_str(), rustix::fs::AtFlags::empty());
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
 pub(super) fn publish(
     cwd: &Path,
     name: &str,
@@ -63,15 +77,6 @@ pub(super) fn publish(
         Mode::from_bits_truncate(0o600),
     )
     .map_err(|_| tool_error("cannot create private dependency report staging file"))?;
-    struct Stage<'a> {
-        root: &'a std::os::fd::OwnedFd,
-        name: String,
-    }
-    impl Drop for Stage<'_> {
-        fn drop(&mut self) {
-            let _ = rustix::fs::unlinkat(self.root, self.name.as_str(), AtFlags::empty());
-        }
-    }
     let _stage = Stage {
         root: &root,
         name: stage.clone(),

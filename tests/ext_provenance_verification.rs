@@ -116,11 +116,13 @@ struct ArtifactException {
 // ── Main test ──────────────────────────────────────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn provenance_verification_evidence_log() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/artifacts"));
+    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/artifacts"),
+        std::path::PathBuf::from,
+    );
 
     // Verify tree completeness first (bd-s7hzz)
     pi::conformance::snapshot::verify_tree_completeness(
@@ -322,11 +324,10 @@ fn provenance_verification_evidence_log() {
     };
 
     let evidence_json = serde_json::to_string_pretty(&evidence).expect("serialize evidence log");
-    let output_path = std::env::var("PI_TEST_PROVENANCE_OUTPUT_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            repo_root.join("tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json")
-        });
+    let output_path = std::env::var("PI_TEST_PROVENANCE_OUTPUT_PATH").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json"),
+        std::path::PathBuf::from,
+    );
 
     // Collect failure details before touching the committed evidence. A failed
     // verification must never overwrite the last reviewed PASS artifact.
