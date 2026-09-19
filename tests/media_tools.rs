@@ -419,7 +419,7 @@ fn test_registry_forwards_image_model_and_tts_provider_defaults() {
             // Invalid as an adapter model id on purpose: if the registry drops
             // this setting, execution reaches credential resolution instead.
             image_gen_model: Some("invalid?configured-model".to_string()),
-            tts_provider: Some("unsupported-provider".to_string()),
+            tts_provider: Some("anthropic".to_string()),
             ..MediaSettings::default()
         }),
         ..Default::default()

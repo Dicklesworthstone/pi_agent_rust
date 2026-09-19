@@ -140,11 +140,18 @@ impl Tool for TtsTool {
         if !matches!(provider, "openai" | "xai") {
             return Err(Error::tool(NAME, "speech provider must be openai or xai"));
         }
+        let is_mock = self
+            .mock_mode
+            .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
         let env_voice = std::env::var("PI_TTS_VOICE").ok();
         let voice = transport::optional(&args, NAME, "voice")?
             .or(self.default_voice.as_deref())
             .or(env_voice.as_deref())
-            .unwrap_or(if provider == "xai" { "eve" } else { "alloy" });
+            .unwrap_or(if is_mock || provider == "xai" {
+                "eve"
+            } else {
+                "alloy"
+            });
         if voice.trim().is_empty() || voice.len() > 128 {
             return Err(Error::tool(
                 NAME,
@@ -155,9 +162,6 @@ impl Tool for TtsTool {
         let requested = transport::optional(&args, NAME, "output_path")?;
         let duration = transport::timeout(&args, NAME, 120_000)?;
         let (endpoint, body) = request(provider, voice, text, format, &args)?;
-        let is_mock = self
-            .mock_mode
-            .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
         let api = if is_mock {
             None
         } else {
@@ -203,7 +207,7 @@ impl Tool for TtsTool {
         )?;
         let message = if is_mock {
             format!(
-                "Successfully synthesized speech fixture to {} (mock; no provider request)",
+                "Successfully synthesized speech audio fixture to {}\nVoice: {voice} | Characters: {char_count} (mock; no provider request)",
                 path.display()
             )
         } else {

@@ -158,7 +158,7 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
             "Staged structural code rewrite using tree-sitter AST patterns (ast-grep syntax)"
         }
         "lsp" => {
-            "IDE-grade code intelligence (definition, references, rename) via language servers"
+            "IDE-grade code intelligence via language servers: diagnostics, definition, references, ho…"
         }
         "debug" => {
             "Drive a real debugger (DAP): launch/attach, breakpoints, step, evaluate, stack/memory rea…"

@@ -916,7 +916,7 @@ fn smoke_native_bedrock_baseline() {
     let harness = TestHarness::new("smoke_native_bedrock_baseline");
     let server = harness.start_mock_http_server();
     let bedrock_model = "anthropic.claude-3-5-sonnet-v1";
-    let expected_path = format!("/model/{bedrock_model}/converse");
+    let expected_path = format!("/model/{bedrock_model}/converse-stream");
     server.add_route(
         "POST",
         &expected_path,

@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 202 current source files.
+- `rg --files src -g '*.rs' | sort` -> 290 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\\[cfg\\(test\\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 236 (230 recorded rows plus two Bedrock, two memory, and two Cohere modules).
+- Source-file rows below: 290.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -39,9 +39,12 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/advisor.rs` | Advisor turns | `tests/e2e_advisor.rs` (concern injection, failure isolation). |
 | `src/agent.rs` | Agent loop | Unit; `tests/agent_loop_vcr.rs`, `tests/agent_loop_reliability.rs`, `tests/e2e_agent_loop.rs`, `tests/rpc_mode.rs`. |
 | `src/agent_cx.rs` | Agent context | Unit; covered through agent/RPC suites. |
+| `src/agent_cx/http.rs` | Agent context HTTP | Unit; covered through agent/RPC suites. |
+| `src/agent_cx/process.rs` | Agent context process execution | Unit; covered through agent/RPC suites. |
 | `src/agent_hub.rs` | Agent hub registry (bd-cv653.5.3): session-scoped roster of spawned child agents | Unit (7 tests); `tests/agent_hub.rs`. |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
 | `src/approval.rs` | Tool approval flow | `tests/e2e_plan_mode.rs`, `tests/e2e_rpc.rs` approval paths. |
+| `src/artifact_output.rs` | Artifact output formatting | Unit; covered through agent/tools suites. |
 | `src/ask.rs` | Ask prompts | Interactive coverage via `tests/tui_state.rs` and RPC suites. |
 | `src/ast_tools.rs` | AST tools | `tests/ast_tools.rs`, `tests/e2e_ast_tools.rs`. |
 | `src/auth.rs` | Auth and OAuth | Unit; `tests/auth_oauth_refresh_vcr.rs`, `tests/extensions_provider_oauth.rs`. |
@@ -51,6 +54,14 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/bin/pi_mcp_fixture.rs` | MCP test fixture binary | Waived glue; test-support binary driven by `tests/mcp.rs`. |
 | `src/bpe.rs` | Vendored tiktoken BPE core (bd-w8q6u): rank tables loaded from gzip assets for token counting | Unit (2 tests); exercised through `src/token_count.rs` and its tests. |
 | `src/browser.rs` | Opt-in headless Chromium automation tool via CDP attach (bd-cv653.2.4) | `tests/browser.rs`, `tests/cross_surface_parity.rs`. |
+| `src/browser/cdp.rs` | Browser CDP protocol transport | Unit; `tests/e2e_browser.rs`, `tests/browser_cdp.rs`. |
+| `src/browser/download.rs` | Browser download lifecycle and management | Unit; `tests/e2e_browser.rs`. |
+| `src/browser/exports.rs` | Browser module exports and public surface | Waived glue; re-exports for browser submodules. |
+| `src/browser/interaction.rs` | Browser interaction and navigation | Unit; `tests/e2e_browser.rs`. |
+| `src/browser/interaction/upload.rs` | Browser file upload interaction | Unit; `tests/e2e_browser.rs`. |
+| `src/browser/launch.rs` | Browser process launch and attach | Unit; `tests/e2e_browser.rs`. |
+| `src/browser/mock.rs` | Browser mock backend and fixtures | Unit; `tests/browser_mock.rs`. |
+| `src/browser/policy.rs` | Browser security and access policy | Unit; `tests/browser_policy.rs`. |
 | `src/btw.rs` | `/btw` ephemeral side questions (bd-cv653.3.16) | Unit (6 tests); `tests/btw_tan.rs`. |
 | `src/buffer_shim.rs` | Node buffer shim | `tests/node_buffer_shim.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/checkpoint.rs` | Session checkpoints | `tests/checkpoint.rs` (checkpoint/rewind/fresh/retry). |
@@ -61,6 +72,11 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/compaction_worker.rs` | Compaction worker | Unit; exercised by compaction suites. |
 | `src/completions.rs` | Shell completions | CLI coverage via `tests/main_cli_selection.rs`, `tests/cli_edge_cases.rs`. |
 | `src/computer.rs` | Opt-in desktop computer automation tool (bd-cv653.2.5) | `tests/computer.rs`, `tests/cross_surface_parity.rs`. |
+| `src/computer/mock.rs` | Computer tool mock backend | Unit; `tests/computer_mock.rs`. |
+| `src/computer/native.rs` | Computer tool native platform backend | Unit; `tests/computer_tool.rs`. |
+| `src/computer/native/accessibility.rs` | Computer tool native accessibility tree | Unit; `tests/computer_tool.rs`. |
+| `src/computer/native/input.rs` | Computer tool native input simulation | Unit; `tests/computer_tool.rs`. |
+| `src/computer/process.rs` | Computer tool process supervision | Unit; `tests/computer_tool.rs`. |
 | `src/config.rs` | Config loading | Unit; `tests/config_precedence.rs`, `tests/config_edge_cases.rs`. |
 | `src/conformance.rs` | Conformance runner | Unit; `tests/conformance_*.rs`, `tests/tools_conformance.rs`. |
 | `src/conformance_shapes.rs` | Conformance schemas | Unit; `tests/ext_conformance_shapes.rs`. |
@@ -72,8 +88,16 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/current_time.rs` | `current_time` tool, the shipped implementation since 82fd0468 (2026-09-02) routed the registry to this module; `src/tools.rs` still carries an older in-file `CurrentTimeTool` that nothing constructs (its own unit tests keep it compiling) pending the maintainer's decision | Unit tests in the module (offset rendering, snapshot fields); registry membership in `src/tools.rs` tests; `src/xdev.rs` one-liner drift test; CLI default-list goldens; `tests/readme_tool_inventory.rs`. |
 | `src/debug.rs` | Debug (DAP) facade | `tests/debug.rs`. |
 | `src/debug/adapters.rs` | DAP adapters | `tests/debug.rs`. |
+| `src/debug/breakpoints.rs` | DAP breakpoint management | Unit; `tests/debug_tool.rs`. |
 | `src/debug/dap.rs` | DAP protocol | `tests/debug.rs`. |
+| `src/debug/dap/delve.rs` | Delve DAP adapter transport | Unit; `tests/debug_delve.rs`. |
+| `src/debug/dap/reliability.rs` | DAP connection reliability and timeout handling | Unit; `tests/debug_tool.rs`. |
+| `src/debug/dap/tests.rs` | DAP test harness and fixtures | Test support module; exercises DAP adapters. |
+| `src/debug/delve_tests.rs` | Delve DAP integration test cases | Test support module; exercises Go debugging workflows. |
 | `src/debug/session.rs` | DAP sessions | `tests/debug.rs`. |
+| `src/debug/session/execution.rs` | Debug session execution loop and lifecycle | Unit; `tests/debug_tool.rs`. |
+| `src/debug/session/inspection.rs` | Debug session state and stack inspection | Unit; `tests/debug_tool.rs`. |
+| `src/debug/tests.rs` | Debug tool test suite and mock adapters | Test support module; exercises debug actions. |
 | `src/delight.rs` | Premium delight layer (OMP-ADOPT / bd-cv653.9.9) | Unit (6 tests); `tests/delight.rs`, `tests/e2e_tui.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/dialects.rs` | Provider dialects | Provider conformance suites; `tests/json_mode_parity.rs`. |
 | `src/doctor.rs` | Doctor and diagnostics | Unit; `tests/doctor_swarm_temp_dir_json.rs`, `tests/franken_node_compatibility_doctor_contract.rs`. |
@@ -169,22 +193,36 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/keybindings.rs` | Keybinding config | Unit; interactive/TUI tests. |
 | `src/lib.rs` | Crate exports | Waived glue: exported module surface is compiled by all targets; no behavior-only row. |
 | `src/lsp.rs` | LSP facade | `tests/lsp.rs`, `tests/e2e_lsp.rs`. |
+| `src/lsp/actions.rs` | LSP code action and refactoring execution | Unit; `tests/lsp.rs`. |
+| `src/lsp/actions/protocol_tests.rs` | LSP code action protocol test cases | Test support module; exercises code actions. |
 | `src/lsp/client.rs` | LSP client | `tests/lsp.rs`. |
 | `src/lsp/edits.rs` | LSP edits | `tests/lsp.rs`. |
 | `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
 | `src/lsp/registry.rs` | LSP registry | `tests/lsp.rs`. |
 | `src/lsp/text.rs` | LSP text mapping | `tests/lsp.rs`. |
 | `src/magic_keywords.rs` | Magic keywords | `tests/magic_keywords.rs`. |
-| `src/markdown_rich.rs` | Markdown, math, mermaid, and visual rendering (OMP-ADOPT / bd-cv653.9.7) | Unit (9 tests); `tests/markdown_rich.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/main.rs` | CLI entry | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/markdown_rich.rs` | Markdown, math, mermaid, and visual rendering (OMP-ADOPT / bd-cv653.9.7) | Unit (9 tests); `tests/markdown_rich.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/mcp.rs` | MCP facade | `tests/mcp.rs`. |
 | `src/mcp/config.rs` | MCP config | `tests/mcp.rs`. |
+| `src/mcp/content.rs` | MCP content block shaper and serialization | Unit; `tests/mcp_conformance.rs`. |
 | `src/mcp/manager.rs` | MCP manager | `tests/mcp.rs`. |
+| `src/mcp/manager/catalog.rs` | MCP tool catalog discovery and pagination | Unit; `tests/mcp_conformance.rs`. |
 | `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
 | `src/mcp/trust.rs` | MCP trust | `tests/mcp.rs`. |
 | `src/media_tools.rs` | Opt-in media trio tools `inspect_image` / `generate_image` / `tts` (bd-cv653.2.7) | `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
+| `src/media_tools/artifact.rs` | Media tools artifact publishing and staging | Unit; `tests/media_tools.rs`. |
+| `src/media_tools/generation.rs` | Image generation tool backend | Unit; `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
+| `src/media_tools/generation/inputs.rs` | Image generation input resolution and validation | Unit; `tests/media_tools.rs`. |
+| `src/media_tools/speech.rs` | Text-to-speech audio synthesis tool | Unit; `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
+| `src/media_tools/transport.rs` | Media tools shared HTTP transport and auth | Unit; `tests/media_tools.rs`. |
+| `src/media_tools/vision.rs` | Vision image analysis tool | Unit; `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
 | `src/memory.rs` | Project memory bank and atomic supersession | Unit; `tests/memory.rs` exercises the public tools, registry gate and startup injection. Mutation tests are also in `src/memory/transactions.rs`. New coverage added, not executed on the editing host. |
 | `src/memory/reflection.rs` | Authenticated bounded memory synthesis and citation identity checks | Unit (10 tests); `tests/memory.rs` uses the public tool and Gemini over loopback HTTP for successful synthesis, terminal failures, unknown citations and credential redaction. Added, not executed: DSR unavailable. |
+| `src/memory/shared.rs` | Shared cross-session memory bank | Unit; `tests/memory.rs`. |
+| `src/memory/shared/delegation.rs` | Shared memory agent delegation and filtering | Unit; `tests/memory.rs`. |
+| `src/memory/shared/delegation_tests.rs` | Shared memory delegation test cases | Test support module; exercises memory delegation. |
+| `src/memory/shared_tests.rs` | Shared memory test suite | Test support module; exercises shared memory backend. |
 | `src/memory/transactions.rs` | Atomic primary/FTS/audit writes and supersession | Unit (11 real-SQLite tests), including late audit failure, rollback after reopening, competing writers, stale supersession, index repair and the retain tool. Added, not executed: DSR unavailable. |
 | `src/migrations.rs` | Migrations | Unit; SQLite/session migration coverage through `tests/session_sqlite.rs`. |
 | `src/model.rs` | Message/content model | Unit; `tests/model_serialization.rs`. |
@@ -215,6 +253,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/cursor.rs` | Cursor Connect provider | Unit; `tests/provider_smoke_matrix.rs`, `tests/provider_native_contract.rs`, and provider factory suites. |
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
 | `src/providers/gemini/files.rs` | Credential-scoped Gemini Files API staging for large inline media | Unit (in-module, loopback HTTP fixtures); two concurrency cases are timing-flaky, see bd-eg6ng. |
+| `src/providers/gemini/reasoning.rs` | Gemini reasoning and thinking trace handling | Unit; `tests/provider_streaming/gemini.rs`. |
 | `src/providers/gemini/thinking.rs` | Gemini thinking-budget mapping | Unit (in-module). |
 | `src/providers/gitlab.rs` | GitLab Duo provider | Unit; `tests/provider_streaming/gitlab.rs`, provider error/path suites. |
 | `src/providers/mod.rs` | Provider factory | Unit; `tests/provider_factory.rs`, `tests/provider_native_verify.rs`; branch export baseline marks this family partly branch-SIGSEGV fallback. |
@@ -231,10 +270,18 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/sdk.rs` | SDK API | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
 | `src/secrets.rs` | Secret handling | `tests/secrets.rs`. |
 | `src/security_scan.rs` | Agent-facing security scanner tool: plan/run/disposition/compare (bd-cv653.2.6) | Unit (6 tests); `tests/security_scan.rs`. |
+| `src/security_scan/dependencies.rs` | Cargo dependency security analysis | Unit; `tests/security_scan.rs`. |
+| `src/security_scan/dependencies/tests.rs` | Dependency security scanning tests | Test support module; exercises dependency scanner. |
+| `src/security_scan/osv.rs` | OSV vulnerability database client | Unit; `tests/security_scan.rs`. |
+| `src/security_scan/osv/artifact.rs` | OSV vulnerability report artifact serialization | Unit; `tests/security_scan.rs`. |
+| `src/security_scan/osv/tests.rs` | OSV client test cases | Test support module; exercises OSV integration. |
+| `src/security_scan/source.rs` | Source code vulnerability analysis | Unit; `tests/security_scan.rs`. |
 | `src/self_update.rs` | Self-update | `tests/self_update.rs`. |
 | `src/semantic_workspace_graph.rs` | Semantic workspace graph and context bundles | Unit; `tests/semantic_workspace_graph_contract.rs`, `tests/semantic_workspace_graph_builder.rs`, and agent integration tests. |
 | `src/session.rs` | Session JSONL/tree | Unit; `tests/session_conformance.rs`, `tests/e2e_session_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/session_import.rs` | Session import | `tests/session_import.rs`. |
+| `src/session_import/conversion.rs` | Session import format conversion and mapping | Unit; `tests/session_import.rs`. |
+| `src/session_import/transcript.rs` | Session import transcript parser | Unit; `tests/session_import.rs`. |
 | `src/session_index.rs` | Session index | Unit; `tests/session_index_tests.rs`, `tests/reproduce_index_gap.rs`. |
 | `src/session_metrics.rs` | Session metrics | Unit; `tests/provider_session_coverage.rs` and session evidence suites. |
 | `src/session_picker.rs` | Session picker UI | Unit; `tests/session_picker.rs`. |
@@ -247,6 +294,11 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/status_line.rs` | Powerline status line, footer, and sticky HUDs (OMP-ADOPT / bd-cv653.9.4) | Unit (7 tests); `tests/status_line.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/stream_rules.rs` | Stream rules | `tests/stream_rules.rs`. |
 | `src/subagents.rs` | Native isolated child-agent tool | Unit tests in this module; opt-in registration coverage through built-in tool tests. |
+| `src/subagents/deadline.rs` | Child subagent deadline and timeout tracking | Unit; `tests/subagent.rs`. |
+| `src/subagents/deadline_tests.rs` | Subagent deadline test cases | Test support module; exercises deadline enforcement. |
+| `src/subagents/execution.rs` | Subagent process execution and lifecycle | Unit; `tests/subagent.rs`. |
+| `src/subagents/execution_tests.rs` | Subagent execution tests | Test support module; exercises subagent runner. |
+| `src/subagents/protocol.rs` | Subagent inter-process protocol messages | Unit; `tests/subagent.rs`. |
 | `src/swarm_activity_ledger.rs` | Swarm activity ledger | Unit; evidence docs in `docs/swarm-activity-ledger.md`, CI evidence bundle tests. |
 | `src/swarm_flight_recorder.rs` | Swarm flight recorder | Unit and E2E; `tests/e2e_swarm_flight_recorder.rs` covers deterministic multi-agent replay artifacts. |
 | `src/swarm_progress_slo.rs` | Swarm progress SLO evaluation | Unit; `tests/swarm_progress_slo_contract.rs`, `tests/swarm_progress_cli.rs`, and `tests/swarm_progress_slo_e2e.rs`. |
@@ -270,6 +322,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/workspace.rs` | Multi-root workspace state and the unified path-confinement helper (bd-cv653.3.12) | Unit (7 tests); `tests/tools_conformance.rs`, `tests/main_cli_selection.rs`, `tests/branch_edge_failure_coverage.rs`. |
 | `src/workspace_trust.rs` | Workspace trust | Covered through config/CLI suites. |
 | `src/worktree_iso.rs` | Worktree isolation | `tests/worktree_iso.rs`. |
+| `src/worktree_iso/snapshot.rs` | Worktree isolation snapshot and rollback | Unit; `tests/worktree_iso.rs`. |
+| `src/worktree_iso/snapshot_tests.rs` | Worktree isolation snapshot test cases | Test support module; exercises snapshotting. |
 | `src/xdev.rs` | xdev tool development | `tests/e2e_xdev.rs`. |
 
 ---

@@ -6,7 +6,7 @@
     {
       "request": {
         "method": "POST",
-        "url": "https://us-central1-aiplatform.googleapis.com/v1/projects/verify-project/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent",
+        "url": "https://us-central1-aiplatform.googleapis.com/v1/projects/verify-project/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent?alt=sse",
         "headers": [
           [
             "Content-Type",

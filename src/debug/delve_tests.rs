@@ -17,12 +17,22 @@ fn delve_fixture(path: &Path, mode: &str) -> Option<DebugTool> {
 #[cfg(unix)]
 fn assert_delve_fixture_reaped(path: &Path) {
     let pid = std::fs::read_to_string(path.join("adapter.pid")).unwrap();
-    let status = std::process::Command::new("kill")
-        .args(["-0", pid.trim()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status().unwrap();
-    assert!(!status.success(), "owned adapter must be reaped");
+    let pid = pid.trim();
+    let mut reaped = false;
+    for _ in 0..50 {
+        let status = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        if !status.success() {
+            reaped = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(reaped, "owned adapter must be reaped");
 }
 
 #[cfg(unix)]

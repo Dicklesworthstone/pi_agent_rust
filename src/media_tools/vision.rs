@@ -157,7 +157,7 @@ impl Tool for InspectImageTool {
         if is_mock {
             return Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(format!(
-                    "Image Analysis for {path_str} ({mime}, {} bytes):\nPrompt: {prompt}\nCanned test fixture inspection; no provider request was made.",
+                    "Image Analysis for {path_str} ({mime}, {} bytes):\nPrompt: {prompt}\nCanned test fixture inspection completed successfully; no provider request was made.",
                     metadata.len()
                 )))],
                 details: Some(

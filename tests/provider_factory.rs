@@ -1156,7 +1156,7 @@ fn bedrock_provider_uses_bearer_auth_and_converse_payload() {
     let bedrock_model = "anthropic.claude-3-5-sonnet-20240620-v1:0";
     server.add_route(
         "POST",
-        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse",
+        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream",
         MockHttpResponse::json(
             200,
             &serde_json::json!({
@@ -1210,7 +1210,7 @@ fn bedrock_provider_uses_bearer_auth_and_converse_payload() {
     let request = &requests[0];
     assert_eq!(
         request.path,
-        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse"
+        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream"
     );
     assert_eq!(
         request_header(&request.headers, "authorization").as_deref(),
@@ -1238,7 +1238,7 @@ fn bedrock_provider_surfaces_access_denied_error_without_live_credentials() {
     let bedrock_model = "anthropic.claude-3-5-sonnet-20240620-v1:0";
     server.add_route(
         "POST",
-        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse",
+        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream",
         MockHttpResponse::json(
             403,
             &serde_json::json!({
@@ -1290,7 +1290,7 @@ fn bedrock_provider_surfaces_rate_limit_error_without_live_credentials() {
     let bedrock_model = "anthropic.claude-3-5-sonnet-20240620-v1:0";
     server.add_route(
         "POST",
-        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse",
+        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream",
         MockHttpResponse::json(
             429,
             &serde_json::json!({

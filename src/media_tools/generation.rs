@@ -208,8 +208,13 @@ impl Tool for GenerateImageTool {
             NAME,
         )?;
         let message = if is_mock {
+            let size_str = payload
+                .get("size")
+                .and_then(Value::as_str)
+                .map(|s| format!("\nSize: {s}"))
+                .unwrap_or_default();
             format!(
-                "Successfully generated image fixture and saved to {} (mock; no provider request)",
+                "Successfully generated image for '{prompt}' and saved to {} (mock; no provider request){size_str}",
                 path.display()
             )
         } else {
