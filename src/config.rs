@@ -14,6 +14,17 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
+/// The tracing target of the settings diagnostics in this module.
+///
+/// The binary's default log filter names this target so that an unrecognised
+/// key or an unparseable queue mode reaches the user without `RUST_LOG` being
+/// set. It is `module_path!()` and not a written-out string because a filter
+/// directive that matches no target is not an error — it simply never fires, so
+/// a rename would take the diagnostics away in silence. That already happened
+/// once here: `pi_agent_rust::config` looks right and matches nothing, because
+/// the library is `[lib] name = "pi"`.
+pub const LOG_TARGET: &str = module_path!();
+
 /// Main configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -764,6 +775,7 @@ impl Config {
                 path.display()
             ))
         })?;
+        warn_unrecognised_setting_keys(path, &content);
         Ok(config)
     }
 
@@ -1588,6 +1600,99 @@ pub(crate) fn parse_queue_mode_or_default(mode: Option<&str>) -> QueueMode {
     parse_queue_mode(mode).unwrap_or(QueueMode::OneAtATime)
 }
 
+/// Is this exact settings diagnostic being reported for the first time?
+///
+/// Startup reads the same settings file more than once — the HTTP proxy, the
+/// workspace-trust probe and the main load each call [`Config::load`] — so one
+/// mistake in `settings.json` otherwise produces three identical warnings.
+fn first_report_of(scope: &str, item: &str) -> bool {
+    static REPORTED: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+
+    let Ok(mut seen) = REPORTED
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+    else {
+        // A lock poisoned by an unrelated panic must not swallow a diagnostic,
+        // so a lost set warns again rather than going quiet.
+        return true;
+    };
+    seen.insert((scope.to_string(), item.to_string()))
+}
+
+/// Warn once per process for each unrecognised key in a settings file.
+fn warn_unrecognised_setting_keys(path: &Path, content: &str) {
+    let keys = unrecognised_setting_keys(content);
+    if keys.is_empty() {
+        return;
+    }
+
+    let file = path.display().to_string();
+    for key in keys {
+        if first_report_of(&file, &key) {
+            tracing::warn!(
+                setting = key,
+                file = file.as_str(),
+                "Unrecognised setting; it is being ignored"
+            );
+        }
+    }
+}
+
+/// Top-level settings keys this build does not recognise.
+///
+/// `Config` is `#[serde(default)]` with no `deny_unknown_fields`, so an
+/// unknown key is dropped in silence. That is the right default for forward
+/// compatibility — a settings file written by a newer pi must not stop an older
+/// one from starting — and the wrong outcome for a typo, which is the common
+/// case and currently produces no signal at all. `"hide_thinking_blocks"`,
+/// where the field is `hide_thinking_block`, simply does nothing, for ever,
+/// with no message.
+///
+/// Recognition is asked of serde rather than of a hand-kept list: each key is
+/// deserialized ALONE into a `Config` and the result compared against
+/// `Config::default()`. A recognised key moves something; an unknown one is
+/// dropped and leaves the default untouched. That cannot drift as fields and
+/// their camelCase aliases are added, which a list would, and it needs no
+/// knowledge of the aliases at all — there are 73 of them in this file.
+///
+/// Every field of `Config` is an `Option`, so any non-null value differs from
+/// the default. Three things are deliberately not reported:
+///
+///   * an explicit `null`, which is indistinguishable from "not set" by
+///     construction and is not a typo;
+///   * keys beginning with `$`, the convention for editor metadata such as
+///     `$schema`;
+///   * anything if the file is not a JSON object, which the caller has already
+///     rejected with a parse error.
+fn unrecognised_setting_keys(content: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(content)
+    else {
+        return Vec::new();
+    };
+    let Ok(default) = serde_json::to_value(Config::default()) else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .filter(|(key, value)| {
+            !key.starts_with('$') && !value.is_null() && !moves_config(key, value, &default)
+        })
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Does deserializing just this one key change anything about a default config?
+fn moves_config(key: &str, value: &serde_json::Value, default: &serde_json::Value) -> bool {
+    let mut probe = serde_json::Map::new();
+    probe.insert(key.to_string(), value.clone());
+    // A type error means serde KNOWS the key and disliked the value. The caller
+    // has already failed the whole parse in that case, so it is not an
+    // unrecognised key and must not be reported as one.
+    let Ok(parsed) = serde_json::from_value::<Config>(serde_json::Value::Object(probe)) else {
+        return true;
+    };
+    serde_json::to_value(&parsed).is_ok_and(|round_trip| &round_trip != default)
+}
+
 fn emit_queue_mode_diagnostic(setting: &'static str, mode: Option<&str>) {
     let Some(mode) = mode else {
         return;
@@ -1595,6 +1700,10 @@ fn emit_queue_mode_diagnostic(setting: &'static str, mode: Option<&str>) {
 
     let trimmed = mode.trim();
     if parse_queue_mode(Some(trimmed)).is_some() {
+        return;
+    }
+    // Same triple-load as the unrecognised-key warning; see `first_report_of`.
+    if !first_report_of(setting, trimmed) {
         return;
     }
 
@@ -2201,10 +2310,10 @@ mod tests {
         BranchSummarySettings, CompactionSettings, Config, ExtensionPolicyConfig,
         ExtensionRiskConfig, ImageSettings, MarkdownSpacing, RepairPolicyConfig, RetrySettings,
         SettingsScope, TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
-        extension_index_path_from_env, global_dir_from_env, merge_branch_summary, merge_compaction,
-        merge_extension_policy, merge_extension_risk, merge_images, merge_repair_policy,
-        merge_retry, merge_terminal, merge_thinking_budgets, package_dir_from_env,
-        sessions_dir_from_env,
+        extension_index_path_from_env, first_report_of, global_dir_from_env, merge_branch_summary,
+        merge_compaction, merge_extension_policy, merge_extension_risk, merge_images,
+        merge_repair_policy, merge_retry, merge_terminal, merge_thinking_budgets,
+        package_dir_from_env, sessions_dir_from_env, unrecognised_setting_keys,
     };
     use crate::agent::QueueMode;
     use proptest::prelude::*;
@@ -3046,6 +3155,114 @@ mod tests {
         assert_eq!(config.autocomplete_max_visible, Some(15));
         assert_eq!(config.session_picker_input, Some(2));
         assert_eq!(config.session_durability.as_deref(), Some("throughput"));
+    }
+
+    #[test]
+    fn a_settings_key_this_build_does_not_know_is_reported() {
+        // The failure worth catching is a name that looks right and does
+        // nothing: `hide_thinking_blocks` is the real field, pluralised.
+        let keys = unrecognised_setting_keys(
+            r#"{ "hide_thinking_block": true, "hide_thinking_blocks": true }"#,
+        );
+        assert_eq!(keys, vec!["hide_thinking_blocks".to_string()]);
+    }
+
+    #[test]
+    fn recognised_camel_case_aliases_are_not_reported() {
+        // None of the 73 aliases in this file are named by the detector, which
+        // is the whole reason it asks serde instead of keeping a list.
+        let keys = unrecognised_setting_keys(
+            r#"{
+                "hideThinkingBlock": true,
+                "editorPaddingX": 5,
+                "sessionDurability": "throughput"
+            }"#,
+        );
+        assert!(keys.is_empty(), "recognised aliases reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_nested_struct_key_is_recognised_by_its_own_name() {
+        let keys = unrecognised_setting_keys(r#"{ "retry": { "maxRetries": 9 } }"#);
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn editor_metadata_and_explicit_nulls_are_not_typos() {
+        // `$schema` is what an editor writes; `null` is indistinguishable from
+        // "not set" by construction, so neither is a misspelling.
+        let keys = unrecognised_setting_keys(
+            r#"{ "$schema": "https://example.invalid/pi.json", "theme": null }"#,
+        );
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_known_key_holding_the_wrong_type_is_not_called_unrecognised() {
+        // The caller has already failed the whole file with a parse error. A
+        // second, wrong diagnosis would send the reader hunting for a spelling
+        // mistake that is not there.
+        let keys = unrecognised_setting_keys(r#"{ "editor_padding_x": "five" }"#);
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_diagnostic_is_reported_once_per_process() {
+        // Startup loads settings three times, so without this a single typo
+        // warned three times. The key is unique to this test because the set
+        // is process-global by design.
+        let scope = "test::a_diagnostic_is_reported_once_per_process";
+        assert!(
+            first_report_of(scope, "key"),
+            "the first report was suppressed"
+        );
+        assert!(
+            !first_report_of(scope, "key"),
+            "the second report was not suppressed"
+        );
+        assert!(
+            first_report_of(scope, "another key"),
+            "a different key in the same file was suppressed"
+        );
+        assert!(
+            first_report_of("another scope", "key"),
+            "the same key in a second settings file was suppressed"
+        );
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_an_object_reports_nothing() {
+        assert!(unrecognised_setting_keys("[1, 2, 3]").is_empty());
+        assert!(unrecognised_setting_keys("not json at all").is_empty());
+        assert!(unrecognised_setting_keys("").is_empty());
+    }
+
+    #[test]
+    fn every_documented_settings_key_survives_the_detector() {
+        // A false positive here is worse than the silence it replaces: it would
+        // tell users their working configuration is misspelled. So the guard is
+        // the canonical name of every field, taken from a serialized Config
+        // rather than typed out, which cannot drift as fields are added.
+        let serialized = serde_json::to_value(Config::default()).expect("serialize config");
+        let object = serialized.as_object().expect("config is an object");
+        assert!(
+            object.len() >= 60,
+            "expected the full field set, got {} keys",
+            object.len()
+        );
+
+        let populated: serde_json::Map<String, serde_json::Value> = object
+            .keys()
+            .map(|key| (key.clone(), serde_json::Value::Bool(true)))
+            .collect();
+        let probe =
+            serde_json::to_string(&serde_json::Value::Object(populated)).expect("serialize probe");
+
+        // Most fields reject `true`, which `moves_config` treats as recognised;
+        // the assertion that matters is that no canonical name is ever reported
+        // as unknown.
+        let reported = unrecognised_setting_keys(&probe);
+        assert!(reported.is_empty(), "canonical keys reported: {reported:?}");
     }
 
     #[test]

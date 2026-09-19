@@ -681,6 +681,37 @@ fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
 }
 
 #[allow(clippy::too_many_lines)]
+/// The tracing filter to install when the user has not asked for one.
+///
+/// `EnvFilter::from_default_env()` with `RUST_LOG` unset enables nothing above
+/// `ERROR`, which meant the settings diagnostics in `pi::config` — an
+/// unrecognised key, an unparseable queue mode — were emitted and then dropped
+/// on the floor for every user who had not set `RUST_LOG`. Those two warnings
+/// are addressed to the person holding the misspelled settings file, not to
+/// someone debugging pi, so the default turns that one target on and leaves the
+/// rest of the crate exactly as quiet as it was.
+///
+/// Setting `RUST_LOG` still replaces this wholesale, including to silence it.
+fn default_log_filter() -> EnvFilter {
+    default_log_filter_for(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+/// [`default_log_filter`] with `RUST_LOG` supplied, so it can be tested without
+/// mutating the environment of a parallel test binary. `None` means unset;
+/// `Some("")` is `RUST_LOG=`, which has always meant "no directives".
+fn default_log_filter_for(rust_log: Option<&str>) -> EnvFilter {
+    let filter = EnvFilter::new(rust_log.unwrap_or_default());
+    if rust_log.is_some() {
+        return filter;
+    }
+    match format!("{}=warn", pi::config::LOG_TARGET).parse() {
+        Ok(directive) => filter.add_directive(directive),
+        // A module path and a level always parse. If that ever stops being
+        // true, losing the settings warnings beats refusing to start.
+        Err(_) => filter,
+    }
+}
+
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
     let Some((mut cli, extension_flags, raw_args)) = parse_cli_from_env()? else {
@@ -1012,7 +1043,7 @@ fn main_impl() -> Result<()> {
     // terminal, so tracing output (e.g. RUST_LOG=info) can never be painted
     // into the alt-screen transcript (bd-trkef).
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(default_log_filter())
         .with_target(false)
         .with_writer(|| pi::tui::TuiAwareLogWriter)
         .init();
@@ -10054,6 +10085,108 @@ mod tests {
     fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
         let policy = print_mode_retry_policy(config, 0);
         pi::failover::retry_delay_ms(policy.base_delay_ms, policy.max_delay_ms, attempt)
+    }
+
+    /// A `MakeWriter` that keeps what a subscriber wrote, so a filter can be
+    /// asserted on what actually comes out rather than on its own opinion of
+    /// itself.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        // A panic inside the emitting closure poisons this buffer, and the
+        // assertion that follows says far more than a second panic about a
+        // lock would, so poisoning recovers rather than propagates.
+        fn with_bytes<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+            f(&mut self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.with_bytes(|bytes| bytes.extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn logged_under(filter: EnvFilter, emit: impl FnOnce()) -> String {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = captured.with_bytes(|bytes| bytes.clone());
+        String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
+    #[test]
+    fn settings_diagnostics_reach_the_user_without_rust_log() {
+        // The bug this pins: `EnvFilter::from_default_env()` with `RUST_LOG`
+        // unset enabled nothing above ERROR, so every settings warning pi
+        // emitted was formatted and then dropped. Asserting on the rendered
+        // output is deliberate — the first attempt at this filter named the
+        // target `pi_agent_rust::config`, which is not a target that exists,
+        // and a directive matching nothing is not an error.
+        let seen = logged_under(default_log_filter_for(None), || {
+            tracing::warn!(target: pi::config::LOG_TARGET, "misspelled key");
+            tracing::info!(target: pi::config::LOG_TARGET, "routine chatter");
+            tracing::warn!(target: "pi::agent", "somebody else's warning");
+            tracing::error!(target: "pi::agent", "somebody else's error");
+        });
+
+        assert!(
+            seen.contains("misspelled key"),
+            "the settings warning was dropped: {seen:?}"
+        );
+        assert!(
+            !seen.contains("routine chatter"),
+            "the default filter got louder than WARN: {seen:?}"
+        );
+        assert!(
+            !seen.contains("somebody else's warning"),
+            "the default filter reached past pi::config: {seen:?}"
+        );
+        assert!(
+            seen.contains("somebody else's error"),
+            "errors elsewhere went quiet, which is a regression: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn rust_log_replaces_the_default_filter_wholesale() {
+        let silenced = logged_under(default_log_filter_for(Some("off")), || {
+            tracing::warn!(target: pi::config::LOG_TARGET, "misspelled key");
+        });
+        assert!(
+            silenced.is_empty(),
+            "RUST_LOG=off did not silence settings warnings: {silenced:?}"
+        );
+
+        let asked_for = logged_under(default_log_filter_for(Some("pi::agent=info")), || {
+            tracing::info!(target: "pi::agent", "what the user asked for");
+        });
+        assert!(
+            asked_for.contains("what the user asked for"),
+            "RUST_LOG was not honored: {asked_for:?}"
+        );
     }
 
     fn spawn_auth_response_server(status: u16, body: &str) -> String {
