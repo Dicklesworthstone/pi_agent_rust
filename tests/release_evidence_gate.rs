@@ -1426,6 +1426,15 @@ fn manual_release_lane_is_actions_independent_and_preserves_ambiguous_crates_sta
     );
 }
 
+// The preamble this executes is Linux-only by construction: it reads
+// `/proc/$$/environ`, and the lane around it is launched under bubblewrap on
+// `trj`. Running it on macOS never reached the contract under test — it died
+// on line 11 with "BASH_ALIASES: unbound variable", because /bin/bash there is
+// 3.2, where that array is undefined until an alias exists and `set -u` makes
+// reading it fatal. Fixing that would only have moved the failure to `/proc`.
+// Same gate as `manual_release_token_handoff_is_not_argv_and_propagates_
+// publish_failure` above, for the same reason.
+#[cfg(target_os = "linux")]
 #[test]
 fn manual_release_controller_preamble_rejects_dispatch_shadowing() {
     let runbook = require_text("docs/releasing.md");
