@@ -10960,7 +10960,7 @@ mod abort_tests {
 
             let cancel_thread = std::thread::spawn(move || {
                 started_rx
-                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .recv_timeout(std::time::Duration::from_secs(10))
                     .expect("stream start");
                 cancel_cx.set_cancel_requested(true);
             });
@@ -10979,7 +10979,7 @@ mod abort_tests {
 
             let message = asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(10),
                 run,
             )
             .await

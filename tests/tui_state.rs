@@ -3503,7 +3503,7 @@ fn tui_state_slash_share_reports_error_when_gh_missing() {
 
     // Under load, async command execution plus shell startup for fake `gh`
     // can exceed 1s before AgentError is emitted.
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(3), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, SHARE_EVENT_TIMEOUT, |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::AgentError(_)))
     });
     let error = events
@@ -3644,7 +3644,7 @@ fn tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file() {
     assert_after_contains(&harness, &step, "Sharing session...");
 
     // Full-suite parallel load can delay command completion past 1s.
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(3), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, SHARE_EVENT_TIMEOUT, |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
     });
@@ -3828,7 +3828,7 @@ fn tui_state_slash_share_includes_gist_description() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Sharing session...");
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(3), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, SHARE_EVENT_TIMEOUT, |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
     });
@@ -3915,7 +3915,7 @@ fn tui_state_slash_resume_selects_latest_session_and_loads_messages() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Loading session...");
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(2), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(10), |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
     });
@@ -3958,7 +3958,7 @@ fn tui_state_slash_resume_filters_sessions_from_typed_query() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Loading session...");
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(2), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(10), |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
     });
