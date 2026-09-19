@@ -87,6 +87,15 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CODE_FAILURE: i32 = 1;
 const EXIT_CODE_USAGE: i32 = 2;
+
+/// A print-mode run whose stdout reader closed the pipe first, e.g.
+/// `pi --print --mode json ... | head -5`.
+///
+/// Zero, because this is not a failure: `head` asked for five lines, got five
+/// lines, and left. The exit status a shell reports for that pipeline is the
+/// reader's anyway. What matters is that the run STOPS here rather than
+/// panicking on every subsequent write (bd-print-json-panics-on-closed-stdout).
+const EXIT_CODE_STDOUT_CLOSED: i32 = 0;
 /// A non-interactive run in which every gated tool call was denied for lack of
 /// an approval surface (gh #224). Distinct from a provider or usage failure so
 /// a script can tell "the model could not use tools" from "the request broke".
@@ -1827,12 +1836,11 @@ async fn run(
         }
     });
     let is_print_mode = mode.eq("text") || mode.eq("json");
-    if is_print_mode
-        && cli.session.is_none()
-        && cli.session_dir.is_none()
-        && !cli.r#continue
-        && !cli.resume
-    {
+    // `pi::app::normalize_cli` has already applied this for `--print`; this
+    // covers `--mode text|json` without `-p`, and keeps the policy stated at
+    // the point of use. The two conditions must stay identical, which is why
+    // both call the same predicate (bd-print-session-path-persists-nothing).
+    if is_print_mode && !pi::app::requested_a_session(&cli) {
         cli.no_session = true;
     }
     if mode.eq("text") && initial.is_none() && messages.is_empty() {
@@ -8791,12 +8799,12 @@ async fn run_print_mode(
             .lock(cx.cx())
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        println!("{}", serde_json::to_string(&session.header)?);
+        write_print_line(&serde_json::to_string(&session.header)?);
         note_machine_stream_opened();
     }
     if initial.is_none() && messages.is_empty() {
         if mode.eq("json") {
-            io::stdout().flush()?;
+            flush_stdout()?;
             return Ok(());
         }
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
@@ -8864,7 +8872,7 @@ async fn run_print_mode(
 
     if initial.is_none() && messages.is_empty() {
         if mode.eq("json") {
-            io::stdout().flush()?;
+            flush_stdout()?;
             return Ok(());
         }
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
@@ -8969,13 +8977,13 @@ async fn run_print_mode(
 
     if sent_prompts.eq(&0) {
         if mode.eq("json") {
-            io::stdout().flush()?;
+            flush_stdout()?;
             return Ok(());
         }
         bail!("No messages were sent");
     }
 
-    io::stdout().flush()?;
+    flush_stdout()?;
     // gh #224: the turn may have "completed" having had every tool call denied
     // for want of a surface that could approve it. Flush the stream first so a
     // JSON host still receives the whole transcript, then fail: the caller gets
@@ -9025,11 +9033,27 @@ const fn streamed_text_delta(event: &AgentEvent) -> Option<&str> {
     }
 }
 
+/// End the run quietly when the failure is only that nobody is reading.
+///
+/// The text half of what [`write_print_line`] does for `--mode json`: a reader
+/// that closed the pipe (`pi -p "..." | head -1`) is not an error, and pi must
+/// not turn it into one. Every other I/O failure is left to the caller.
+fn exit_if_stdout_closed(err: &io::Error) {
+    if err.kind() == io::ErrorKind::BrokenPipe {
+        std::process::exit(EXIT_CODE_STDOUT_CLOSED);
+    }
+}
+
+fn flush_stdout() -> io::Result<()> {
+    io::stdout().flush().inspect_err(exit_if_stdout_closed)
+}
+
 fn emit_text_delta(delta: &str) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    out.write_all(delta.as_bytes())?;
-    out.flush()
+    out.write_all(delta.as_bytes())
+        .and_then(|()| out.flush())
+        .inspect_err(exit_if_stdout_closed)
 }
 
 fn emit_trailing_print_newline(state: PrintTextStreamState) -> io::Result<()> {
@@ -9038,8 +9062,9 @@ fn emit_trailing_print_newline(state: PrintTextStreamState) -> io::Result<()> {
     }
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    out.write_all(b"\n")?;
-    out.flush()
+    out.write_all(b"\n")
+        .and_then(|()| out.flush())
+        .inspect_err(exit_if_stdout_closed)
 }
 
 fn snapshot_print_text_stream_state(
@@ -9134,7 +9159,42 @@ async fn sleep_with_current_timer(duration: Duration) {
 /// Emit a JSON-serialized [`AgentEvent`] to stdout (for JSON print mode).
 fn emit_json_event(event: &AgentEvent) {
     if let Ok(serialized) = print_mode_json_record(event) {
-        println!("{serialized}");
+        write_print_line(&serialized);
+    }
+}
+
+/// Write one print-mode record to stdout, ending the run quietly if the reader
+/// has gone away.
+///
+/// `println!` PANICS when the write fails, so `pi --print --mode json | head`
+/// used to end in
+///
+///     panic: failed printing to stdout: Broken pipe (os error 32)
+///
+/// plus a crash bundle, which then announced itself as "previous run crashed"
+/// on the next invocation. Piping structured output into `head`, `jq`,
+/// `grep -m1` or a pager is the normal way to read a stream and every one of
+/// those closes the pipe on purpose; Rust disables SIGPIPE at startup, so the
+/// closed reader arrives here as EPIPE on every later write instead of ending
+/// the process the way it would for any other CLI.
+///
+/// A broken pipe is therefore not an error: the consumer got what it asked for
+/// and there is nobody left to tell. Any OTHER write failure — a full disk on
+/// `pi -p > out.json`, say — is a real failure and must not be reported as
+/// success, so it is named on stderr and exits non-zero.
+fn write_print_line(line: &str) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let written = out
+        .write_all(line.as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush());
+    if let Err(err) = written {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(EXIT_CODE_STDOUT_CLOSED);
+        }
+        eprintln!("pi: failed writing to stdout: {err}");
+        std::process::exit(EXIT_CODE_FAILURE);
     }
 }
 
@@ -13328,6 +13388,39 @@ mod tests {
         let fatal_io = std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf-8");
         let fatal = build_error_turn(pi::error::Error::sse(&fatal_io).to_string());
         assert!(!is_retryable_prompt_result(&fatal));
+    }
+
+    /// bd-print-json-panics-on-closed-stdout: a closed stdout reader is the one
+    /// write failure that must NOT end the run loudly.
+    ///
+    /// The exit itself cannot be asserted in-process — `exit_if_stdout_closed`
+    /// calls `std::process::exit`, so a test that triggered it would take the
+    /// test binary with it. What is checkable here is the classification, which
+    /// is the part that was wrong: BrokenPipe is the quiet case and everything
+    /// else is not. `tests/e2e_cli.rs` drives the real pipeline end to end.
+    #[test]
+    fn only_a_broken_pipe_is_a_quiet_stdout_ending() {
+        assert_eq!(
+            EXIT_CODE_STDOUT_CLOSED, 0,
+            "a reader that took what it asked for and left is not a failure"
+        );
+        assert_eq!(
+            io::Error::from(io::ErrorKind::BrokenPipe).kind(),
+            io::ErrorKind::BrokenPipe,
+            "the kind this hinges on"
+        );
+        for loud in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::StorageFull,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert_ne!(
+                loud,
+                io::ErrorKind::BrokenPipe,
+                "a full disk or a denied write on `pi -p > out.json` must stay loud"
+            );
+        }
     }
 
     #[test]

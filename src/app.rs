@@ -88,13 +88,36 @@ pub fn apply_piped_stdin(cli: &mut cli::Cli, stdin_content: Option<String>) {
     }
 }
 
+/// Did the caller name a session, in any of the four ways pi accepts?
+///
+/// `--session <file>` and `--session-dir <dir>` name one directly; `--continue`
+/// and `--resume` name one indirectly, by asking for the most recent or for a
+/// picker. Any of them means "persist", including in print mode.
+#[must_use]
+pub const fn requested_a_session(cli: &cli::Cli) -> bool {
+    cli.session.is_some() || cli.session_dir.is_some() || cli.r#continue || cli.resume
+}
+
 #[allow(clippy::missing_const_for_fn)]
 pub fn normalize_cli(cli: &mut cli::Cli) {
     if cli.rpc && cli.mode.is_none() {
         cli.mode = Some("rpc".to_string());
     }
 
-    if cli.print {
+    // Print mode is ephemeral by default and NOT when the caller asked for a
+    // session. This used to be an unconditional `if cli.print`, which made
+    // `--session`, `--session-dir`, `--continue` and `--resume` inert on the
+    // print surface: the flags parsed, main.rs stopped short of forcing
+    // `no_session` for exactly these four cases — the same condition, written
+    // out there — and then this line overrode that decision before main.rs ever
+    // looked. `Session::new` took its `if cli.no_session` branch, returned an
+    // in-memory session, and a `pi -p --session run.jsonl` wrote nothing and
+    // said nothing.
+    //
+    // Keep the two conditions identical. main.rs's copy is now a no-op that
+    // documents the policy at the point of use; this one is what enforces it,
+    // because it runs first.
+    if cli.print && !requested_a_session(cli) {
         cli.no_session = true;
     }
 
@@ -1874,6 +1897,36 @@ mod tests {
         assert_eq!(cli.provider.as_deref(), Some("openai"));
     }
 
+    /// bd-print-session-path-persists-nothing: a print run that NAMED a session
+    /// keeps it.
+    ///
+    /// This used to be unconditional, which made all four session flags inert
+    /// on the print surface — the flag parsed, `Session::new` took its
+    /// `if cli.no_session` branch, and `pi -p --session run.jsonl` wrote nothing
+    /// and said nothing. Each case below is a user asking for persistence in a
+    /// different way.
+    #[test]
+    fn normalize_cli_keeps_the_session_a_print_run_asked_for() {
+        for argv in [
+            vec!["pi", "--print", "--session", "/tmp/run.jsonl", "hello"],
+            vec!["pi", "--print", "--session-dir", "/tmp/sessions", "hello"],
+            vec!["pi", "--print", "--continue", "hello"],
+            vec!["pi", "--print", "--resume", "hello"],
+        ] {
+            let mut cli = cli::Cli::parse_from(argv.clone());
+            normalize_cli(&mut cli);
+            assert!(
+                !cli.no_session,
+                "{argv:?} asked for a session and must get one"
+            );
+        }
+
+        // ...and a print run that asked for nothing is still ephemeral.
+        let mut bare = cli::Cli::parse_from(["pi", "--print", "hello"]);
+        normalize_cli(&mut bare);
+        assert!(bare.no_session, "print mode stays ephemeral by default");
+    }
+
     #[test]
     fn validate_rpc_args_rejects_file_arguments() {
         let cli = cli::Cli::parse_from(["pi", "--mode", "rpc", "@src/main.rs", "hello"]);
@@ -2994,6 +3047,9 @@ mod tests {
                 normalize_cli(&mut cli);
 
                 let expected_provider = provider.map(|value: String| value.to_ascii_lowercase());
+                // `Cli::parse_from(["pi"])` names no session, so a print run
+                // here is the ephemeral-by-default case
+                // (bd-print-session-path-persists-nothing covers the other).
                 let expected_no_session = if print { true } else { initial_no_session };
 
                 prop_assert_eq!(cli.provider, expected_provider);
