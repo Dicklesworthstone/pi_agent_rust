@@ -13,6 +13,8 @@ use super::jsonrpc::{JsonRpcClient, TransportError};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 
+mod document_sync;
+
 const WAIT_TICK: Duration = Duration::from_millis(10);
 const WARMUP_RETRY_CADENCE: Duration = Duration::from_millis(250);
 const WARMUP_EMPTY_RESULT_WINDOW: Duration = Duration::from_secs(60);
@@ -143,6 +145,8 @@ struct OpenDoc {
     version: u64,
     disk_hash: u64,
     language_id: String,
+    text: std::sync::Arc<str>,
+    opened: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,9 +201,10 @@ impl LspClient {
             "workspaceFolders":[{"uri":root_uri,"name":"workspace"}],
             "clientInfo":{"name":"pi_agent_rust","version":crate::platform::VERSION},
             "capabilities":{
+                "general":{"positionEncodings":["utf-16"]},
                 "textDocument":{
                     "synchronization":{"didSave":true,"dynamicRegistration":false},
-                    "publishDiagnostics":{"relatedInformation":true,"versionSupport":false},
+                    "publishDiagnostics":{"relatedInformation":true,"versionSupport":true},
                     "hover":{"contentFormat":["markdown","plaintext"]},
                     "definition":{"linkSupport":false},"typeDefinition":{"linkSupport":false},
                     "implementation":{"linkSupport":false},"references":{},
@@ -238,12 +243,12 @@ impl LspClient {
         let will_rename_files = caps
             .pointer("/workspace/fileOperations/willRenameFiles")
             .is_some();
-        let sync_kind = caps.get("textDocumentSync").map_or(1, |sync| {
-            sync.get("change")
-                .and_then(Value::as_u64)
-                .or_else(|| sync.as_u64())
-                .unwrap_or(1)
-        });
+        let sync_kind = document_sync::SyncPolicy::parse(&caps)
+            .map_err(|error| {
+                client.rpc.kill();
+                error
+            })?
+            .change;
         let server_name = result
             .get("serverInfo")
             .and_then(|info| info.get("name"))
@@ -308,6 +313,7 @@ impl LspClient {
     pub fn document_snapshots(&self) -> HashMap<PathBuf, DocumentSnapshot> {
         Self::lock(&self.open_docs)
             .iter()
+            .filter(|(_, doc)| doc.version != 0)
             .filter_map(|(uri, doc)| {
                 uri_to_path(uri).map(|path| {
                     (
@@ -324,16 +330,8 @@ impl LspClient {
 
     pub fn poll_notifications(&self) {
         for notification in self.rpc.drain_notifications() {
-            if notification.method == "textDocument/publishDiagnostics"
-                && let (Some(uri), Some(diags)) = (
-                    notification.params.get("uri").and_then(Value::as_str),
-                    notification
-                        .params
-                        .get("diagnostics")
-                        .and_then(Value::as_array),
-                )
-            {
-                Self::lock(&self.diagnostics).insert(uri.to_string(), diags.clone());
+            if notification.method == "textDocument/publishDiagnostics" {
+                self.accept_diagnostics(&notification.params);
             } else if notification.method == "experimental/serverStatus"
                 && let Some(quiescent) = notification
                     .params
@@ -470,83 +468,6 @@ impl LspClient {
                 return Err(LspCallError::Cancelled);
             }
             asupersync::time::sleep(now, WAIT_TICK).await;
-        }
-    }
-
-    /// Synchronize actual file bytes. Reopening a changed document allocates a
-    /// fresh version rather than recycling a version from an earlier request.
-    pub fn ensure_synced(&self, path: &Path, language_id: &str) -> Result<String> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let uri = path_to_uri(&canonical);
-        let content = std::fs::read_to_string(&canonical).map_err(|err| {
-            Error::tool(
-                "lsp",
-                format!(
-                    "[LSP_FILE_UNREADABLE] cannot read {}: {err}",
-                    canonical.display()
-                ),
-            )
-        })?;
-        let disk_hash = content_hash(&content);
-        let prior = Self::lock(&self.open_docs).get(&uri).cloned();
-        match prior {
-            Some(doc) if doc.disk_hash == disk_hash => Ok(uri),
-            Some(_) => {
-                let _ = self.rpc.notify(
-                    "textDocument/didClose",
-                    serde_json::json!({"textDocument":{"uri":uri}}),
-                );
-                Self::lock(&self.open_docs).remove(&uri);
-                Self::lock(&self.diagnostics).remove(&uri);
-                self.open_document(&uri, &content, disk_hash, language_id)
-            }
-            None => self.open_document(&uri, &content, disk_hash, language_id),
-        }
-    }
-
-    fn open_document(
-        &self,
-        uri: &str,
-        content: &str,
-        disk_hash: u64,
-        language_id: &str,
-    ) -> Result<String> {
-        let version = self.next_document_version.try_update(Ordering::SeqCst, Ordering::SeqCst,
-            |value| (value < 2_147_483_647).then_some(value + 1))
-            .map_err(|_| Error::tool("lsp", "[LSP_VERSION_EXHAUSTED] reload the language server before reopening more documents"))?;
-        self.rpc
-            .notify(
-                "textDocument/didOpen",
-                serde_json::json!({"textDocument":{
-                    "uri":uri,"languageId":language_id,"version":version,"text":content
-                }}),
-            )
-            .map_err(|err| Error::tool("lsp", format!("[{}] {}", err.code(), err.message())))?;
-        Self::lock(&self.open_docs).insert(
-            uri.to_string(),
-            OpenDoc {
-                version,
-                disk_hash,
-                language_id: language_id.to_string(),
-            },
-        );
-        Ok(uri.to_string())
-    }
-
-    pub fn invalidate(&self, uri: &str) {
-        if Self::lock(&self.open_docs).remove(uri).is_some() {
-            let _ = self.rpc.notify(
-                "textDocument/didClose",
-                serde_json::json!({"textDocument":{"uri":uri}}),
-            );
-        }
-        Self::lock(&self.diagnostics).remove(uri);
-    }
-
-    pub fn invalidate_all(&self) {
-        let uris: Vec<_> = Self::lock(&self.open_docs).keys().cloned().collect();
-        for uri in uris {
-            self.invalidate(&uri);
         }
     }
 
