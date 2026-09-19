@@ -7,6 +7,8 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+mod attachments;
+
 /// Suffixes of every auxiliary file the fsqlite engine may create or read
 /// beside a database file. `-journal` covers legacy rollback-journal
 /// artifacts from the previous libsqlite3-backed engine; the four
@@ -396,7 +398,7 @@ fn read_stored_entries(conn: &SqliteConnection) -> Result<Vec<StoredEntry>> {
             )));
         }
         let json = row_get_string(&row, 1, "json")?;
-        let entry: SessionEntry = parse_sqlite_json("session entry", &json)?;
+        let entry = attachments::decode_entry(conn, &json)?;
         let canonical_json = serde_json::to_string(&entry)?;
         entries.push(StoredEntry {
             entry,
@@ -546,6 +548,9 @@ fn insert_entry_jsons(
         .checked_add(1)
         .ok_or_else(|| Error::session("SQLite session sequence overflow"))?;
     let mut remaining = json.len();
+    // The caller owns the transaction: blobs and the entries referencing them
+    // must commit or roll back together, on full saves and incremental appends.
+    let mut encoder = attachments::EntryEncoder::new(conn);
     for chunk in json.chunks(200) {
         let mut sql = String::with_capacity(64 + chunk.len() * 16);
         sql.push_str("INSERT INTO pi_session_entries (seq,json) VALUES ");
@@ -556,7 +561,7 @@ fn insert_entry_jsons(
             }
             let _ = write!(sql, "(?{},?{})", index * 2 + 1, index * 2 + 2);
             params.push(SqliteValue::from(seq));
-            params.push(SqliteValue::from(entry_json.clone()));
+            params.push(SqliteValue::from(encoder.encode(entry_json)?));
             remaining -= 1;
             if remaining > 0 {
                 seq = seq
