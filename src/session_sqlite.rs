@@ -222,15 +222,6 @@ fn row_get_string(row: &SqliteRow, index: usize, column: &str) -> Result<String>
     }
 }
 
-fn row_get_i64(row: &SqliteRow, index: usize, column: &str) -> Result<i64> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(*value),
-        other => Err(Error::session(format!(
-            "SQLite row read failed: expected INTEGER for column {column}, got {other:?}"
-        ))),
-    }
-}
-
 fn malformed_json_error(kind: &str, json: &str, error: &serde_json::Error) -> Error {
     let digest = crate::package_manager::hex_encode(&Sha256::digest(json.as_bytes()));
     Error::session(format!(
@@ -266,8 +257,9 @@ fn parse_sqlite_json<T: serde::de::DeserializeOwned>(kind: &str, json: &str) -> 
 }
 
 fn read_stored_header(conn: &SqliteConnection) -> Result<Option<SessionHeader>> {
+    entry_io::preflight_header(conn)?;
     let mut rows = map_sqlite_result(
-        conn.query_sync("SELECT id,json FROM pi_session_header ORDER BY id", &[]),
+        conn.query_sync("SELECT id,json FROM pi_session_header ORDER BY id LIMIT 2", &[]),
     )?;
     if rows.len() > 1 {
         return Err(Error::session(
@@ -374,27 +366,7 @@ fn ensure_private_sqlite_permissions(path: &Path) -> Result<()> {
 }
 
 fn read_stored_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
-    let entry_rows = map_sqlite_result(conn.query_sync(
-        "SELECT seq,json FROM pi_session_entries ORDER BY seq ASC",
-        &[],
-    ))?;
-
-    let mut entries = Vec::with_capacity(entry_rows.len());
-    for (index, row) in entry_rows.into_iter().enumerate() {
-        let seq = row_get_i64(&row, 0, "seq")?;
-        let expected_seq = i64::try_from(index)
-            .map_err(|_| Error::session("SQLite session entry count exceeds i64"))?
-            .checked_add(1)
-            .ok_or_else(|| Error::session("SQLite session sequence overflow"))?;
-        if seq != expected_seq {
-            return Err(Error::session(format!(
-                "SQLite session entry sequence is not contiguous: expected={expected_seq} actual={seq}"
-            )));
-        }
-        let json = row_get_string(&row, 1, "json")?;
-        entries.push(attachments::decode_entry(conn, &json)?);
-    }
-    Ok(entries)
+    entry_io::read_entries(conn)
 }
 
 fn read_all_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
@@ -583,11 +555,13 @@ pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntr
 
     run_on_sqlite_thread(|| {
         let conn = open_sqlite_connection_read_only(path)?;
+        let snapshot = entry_io::ReadSnapshot::begin(&conn)?;
 
         let header = read_stored_header(&conn)?
             .ok_or_else(|| Error::session("SQLite session missing header row"))?;
 
         let entries = read_all_entries(&conn)?;
+        snapshot.finish()?;
 
         Ok((header, entries))
     })
@@ -609,6 +583,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
 
     run_on_sqlite_thread(|| {
         let conn = open_sqlite_connection_read_only(path)?;
+        let snapshot = entry_io::ReadSnapshot::begin(&conn)?;
 
         let header = read_stored_header(&conn)?
             .ok_or_else(|| Error::session("SQLite session missing header row"))?;
@@ -653,6 +628,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
             }
         }
 
+        snapshot.finish()?;
         Ok(SqliteSessionMeta {
             header,
             message_count: message_count.unwrap_or(0),
