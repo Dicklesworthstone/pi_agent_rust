@@ -15,6 +15,7 @@ fn state() -> TestState {
     )
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn feed(state: &mut TestState, delta: Value, finish_reason: Option<&str>) {
     state
         .process_event(
