@@ -467,34 +467,32 @@ where
     }
 
     fn process_chunk_without_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
-        let mut processed = 0;
-        let mut first_error: Option<std::io::Error> = None;
-        loop {
-            match std::str::from_utf8(&bytes[processed..]) {
-                Ok(s) => {
-                    if !s.is_empty() {
-                        self.feed_to_pending(s);
-                    }
-                    return first_error.map_or(Ok(()), Err);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => {
+                if !s.is_empty() {
+                    self.feed_to_pending(s);
                 }
-                Err(err) => {
-                    let valid_len = err.valid_up_to();
-                    if valid_len > 0 {
-                        let s = std::str::from_utf8(&bytes[processed..processed + valid_len])
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                        self.feed_to_pending(s);
-                        processed += valid_len;
-                    }
+                Ok(())
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len > 0 {
+                    let s = std::str::from_utf8(&bytes[..valid_len])
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    self.feed_to_pending(s);
+                }
 
-                    if let Some(invalid_len) = err.error_len() {
-                        processed += invalid_len;
-                        if first_error.is_none() {
-                            first_error = Some(Self::invalid_utf8_error());
-                        }
-                    } else {
-                        self.utf8_buffer.extend_from_slice(&bytes[processed..]);
-                        return first_error.map_or(Ok(()), Err);
-                    }
+                if err.error_len().is_some() {
+                    // Never skip corrupt bytes and parse their suffix. Doing so
+                    // can turn a malformed tool argument into valid, different
+                    // JSON, or publish a completion/checkpoint past the error.
+                    // Only complete events from the valid prefix may drain.
+                    Err(Self::invalid_utf8_error())
+                } else {
+                    // An incomplete code point is not corruption: it may be
+                    // completed by the next transport chunk (at most 3 bytes).
+                    self.utf8_buffer.extend_from_slice(&bytes[valid_len..]);
+                    Ok(())
                 }
             }
         }
@@ -502,40 +500,32 @@ where
 
     fn process_chunk_with_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         self.utf8_buffer.extend_from_slice(bytes);
-        let mut processed = 0;
-        let mut first_error: Option<std::io::Error> = None;
-        loop {
-            match std::str::from_utf8(&self.utf8_buffer[processed..]) {
-                Ok(s) => {
-                    if !s.is_empty() {
-                        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
-                    }
-                    self.utf8_buffer.clear();
-                    return first_error.map_or(Ok(()), Err);
+        match std::str::from_utf8(&self.utf8_buffer) {
+            Ok(s) => {
+                if !s.is_empty() {
+                    Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
                 }
-                Err(err) => {
-                    let valid_len = err.valid_up_to();
-                    if valid_len > 0 {
-                        let s = std::str::from_utf8(
-                            &self.utf8_buffer[processed..processed + valid_len],
-                        )
+                self.utf8_buffer.clear();
+                Ok(())
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len > 0 {
+                    let s = std::str::from_utf8(&self.utf8_buffer[..valid_len])
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
-                        processed += valid_len;
-                    }
+                    Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
+                }
 
-                    if let Some(invalid_len) = err.error_len() {
-                        processed += invalid_len;
-                        if first_error.is_none() {
-                            first_error = Some(Self::invalid_utf8_error());
-                        }
-                    } else {
-                        // Move remaining bytes to start of utf8_buffer
-                        let remaining = self.utf8_buffer.len() - processed;
-                        self.utf8_buffer.copy_within(processed.., 0);
-                        self.utf8_buffer.truncate(remaining);
-                        return first_error.map_or(Ok(()), Err);
-                    }
+                if err.error_len().is_some() {
+                    self.utf8_buffer.clear();
+                    Err(Self::invalid_utf8_error())
+                } else {
+                    // Retain only the incomplete code point, never the parsed
+                    // prefix. This path has the same failure boundary as above.
+                    let remaining = self.utf8_buffer.len() - valid_len;
+                    self.utf8_buffer.copy_within(valid_len.., 0);
+                    self.utf8_buffer.truncate(remaining);
+                    Ok(())
                 }
             }
         }
@@ -1493,9 +1483,8 @@ data: {"type":"message_stop"}
     #[test]
     fn test_stream_surfaces_pending_event_before_utf8_error() {
         // Input: "data: ok\n\ndata: \xFF\n\n"
-        // The parser feeds valid prefix "data: ok\n\ndata: " → emits event("ok"),
-        // then recovers remainder "\n\n" after the 0xFF → completes partial "data: "
-        // → emits event(""). All pending events drain before the error.
+        // The valid prefix yields "ok". The corrupt event must not be repaired
+        // into an empty event by deleting 0xFF and processing the suffix.
         let chunks = vec![Ok(b"data: ok\n\ndata: \xFF\n\n".to_vec())];
         let mut stream = SseStream::new(stream::iter(chunks));
 
@@ -1504,37 +1493,29 @@ data: {"type":"message_stop"}
             let diag = json!({
                 "fixture_id": "sse-valid-event-before-invalid-utf8",
                 "seed": "deterministic-static",
-                "expected_sequence": ["Ok(data=ok)", "Ok(data=)", "Err(invalid utf8)"],
+                "expected_sequence": ["Ok(data=ok)", "Err(invalid utf8)", "None"],
                 "actual_first": {"event": first.event, "data": first.data},
             })
             .to_string();
             assert_eq!(first.data, "ok", "{diag}");
 
-            // The recovered remainder "\n\n" completes the partial "data: " line,
-            // producing an empty-data event before the error surfaces.
-            let second = stream
-                .next()
-                .await
-                .expect("second item")
-                .expect("second ok");
-            assert_eq!(second.data, "", "{diag}");
-
             let err = stream
                 .next()
                 .await
-                .expect("third item")
-                .expect_err("third should be utf8 error");
+                .expect("second item")
+                .expect_err("second should be utf8 error");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{diag}");
+            assert!(stream.next().await.is_none(), "{diag}");
+            assert!(stream.next().await.is_none(), "{diag}");
         });
     }
 
     #[test]
-    fn test_stream_resumes_parsing_remainder_after_utf8_error() {
+    fn test_stream_rejects_remainder_after_utf8_error() {
         // "data: ok\n\n" (valid) + 0xFF (invalid) + "data: after\n\n" (valid)
         // Sent in one chunk.
-        // The recovery code feeds remainder "data: after\n\n" to pending_events
-        // before the error is stored, so events drain first:
-        // Expect: Ok(ok), Ok(after), Err(invalid)
+        // A valid-looking event after corruption is not a recoverable suffix.
+        // Expect: Ok(ok), Err(invalid), None, independent of chunk boundaries.
 
         let mut bytes = b"data: ok\n\n".to_vec();
         bytes.push(0xFF);
@@ -1547,13 +1528,9 @@ data: {"type":"message_stop"}
             let first = stream.next().await.expect("1").expect("ok");
             assert_eq!(first.data, "ok");
 
-            // 2. "after" — recovered from remainder after 0xFF (pending events drain first)
-            let second = stream.next().await.expect("2").expect("after");
-            assert_eq!(second.data, "after");
-
-            // 3. Error — surfaces after all pending events are delivered
-            let err = stream.next().await.expect("3").expect_err("error");
+            let err = stream.next().await.expect("2").expect_err("error");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(stream.next().await.is_none());
         });
     }
 
@@ -1575,6 +1552,62 @@ data: {"type":"message_stop"}
                 stream.next().await.is_none(),
                 "utf-8 parse errors should terminate the stream without flushing a partial tail"
             );
+        });
+    }
+
+    #[test]
+    fn test_corrupt_tool_json_and_checkpoints_are_rejected_at_every_byte_split() {
+        let invalid_sequences: &[&[u8]] = &[
+            b"\xFF",
+            b"\x80",
+            b"\xC0\xAF",
+            b"\xE2(",
+            b"\xF0\x9F(",
+            b"\xED\xA0\x80",
+            b"\xF4\x90\x80\x80",
+        ];
+        for invalid in invalid_sequences {
+            // Splits inside the snowman exercise the buffered UTF-8 path too.
+            let mut bytes = "id: good\ndata: ☃\n\n".as_bytes().to_vec();
+            bytes.extend_from_slice(b"id: bad\ndata: {\"path\":\"before");
+            bytes.extend_from_slice(invalid);
+            bytes.extend_from_slice(b"after\"}\n\ndata: [DONE]\n\n");
+            for split in 0..=bytes.len() {
+                let (events, errors) = parse_stream_chunks(vec![
+                    bytes[..split].to_vec(),
+                    bytes[split..].to_vec(),
+                ]);
+                assert_eq!(events.len(), 1, "invalid={invalid:?}, split={split}");
+                assert_eq!(events[0].data, "☃", "split={split}");
+                assert_eq!(events[0].id.as_deref(), Some("good"), "split={split}");
+                assert!(events[0].id_was_explicit, "split={split}");
+                assert_eq!(errors, vec![ErrorKind::InvalidData], "split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_corruption_drains_only_complete_prefix_without_polling_source_again() {
+        let mut polls = 0;
+        let inner = stream::poll_fn(move |_| {
+            assert_eq!(polls, 0, "must not read beyond a corrupt transport chunk");
+            polls += 1;
+            Poll::Ready(Some(Ok::<_, std::io::Error>(
+                b"data: one\n\ndata: two\n\ndata: partial\xFF\n\ndata: after\n\n"
+                    .to_vec(),
+            )))
+        });
+        let mut stream = SseStream::new(inner);
+        futures::executor::block_on(async {
+            for expected in ["one", "two"] {
+                assert_eq!(stream.next().await.unwrap().unwrap().data, expected);
+            }
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+            assert!(!stream.parser.has_pending());
+            assert!(stream.utf8_buffer.is_empty());
         });
     }
 
@@ -1816,15 +1849,12 @@ data: {"type":"message_stop"}
             bytes.extend(format!("data: {suffix}\n\n").as_bytes());
 
             let (events, errors) = parse_stream_chunked_limited(&bytes, &chunk_sizes, 32);
-            prop_assert!(
-                events.iter().any(|event| event.data == prefix),
-                "event before invalid sequence should still be surfaced"
-            );
-            prop_assert!(!errors.is_empty(), "invalid UTF-8 should emit at least one error");
-            prop_assert!(
-                errors.iter().all(|kind| *kind == ErrorKind::InvalidData),
-                "all stream decoding errors must be InvalidData"
-            );
+            prop_assert_eq!(events.len(), 1, "only the valid prefix may be emitted");
+            prop_assert_eq!(events[0].data.as_str(), prefix.as_str());
+            prop_assert_eq!(errors, vec![ErrorKind::InvalidData]);
+            let (whole_events, whole_errors) = parse_stream_single_chunk(&bytes);
+            prop_assert_eq!(events, whole_events);
+            prop_assert_eq!(whole_errors, vec![ErrorKind::InvalidData]);
         }
     }
 }
