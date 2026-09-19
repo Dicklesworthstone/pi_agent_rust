@@ -2603,3 +2603,72 @@ fn cli_continue_tmux_loads_existing_session() {
 
     write_jsonl_artifacts(&harness, test_name);
 }
+
+#[test]
+fn e2e_print_mode_session_path_persists_and_continues() {
+    let harness = TestHarness::new("print_session_path_persists");
+    let env = isolated_cli_env(&harness);
+    let session_path = harness.temp_path("print_session.jsonl");
+
+    // Process 1: run with --session pointing to a non-existent path
+    let session_str = session_path.to_str().unwrap();
+    let result1 = run_cli(
+        &harness,
+        &env,
+        &[
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            session_str,
+            "hello first turn",
+        ],
+        None,
+    );
+
+    // Process 1 must have persisted the session file to session_path
+    assert!(
+        session_path.exists(),
+        "session file must exist at explicit --session path; stderr:\n{}",
+        result1.stderr
+    );
+    let content = std::fs::read_to_string(&session_path).expect("read session file");
+    assert!(
+        content.contains("\"type\":\"session\""),
+        "session file must contain session header: {content}"
+    );
+
+    // Extract the session ID from the persisted file
+    let first_line = content.lines().next().expect("first line");
+    let header_val: Value = serde_json::from_str(first_line).expect("parse header json");
+    let session_id = header_val["id"].as_str().expect("session id").to_string();
+
+    // Process 2: run with the same --session path
+    let result2 = run_cli(
+        &harness,
+        &env,
+        &[
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            session_str,
+            "hello second turn",
+        ],
+        None,
+    );
+
+    // The session header emitted in process 2 stdout must have the same session ID
+    let first_line_out2 = result2
+        .stdout
+        .lines()
+        .next()
+        .expect("first line of stdout in process 2");
+    let header_out2: Value =
+        serde_json::from_str(first_line_out2).expect("parse stdout header json");
+    assert_eq!(
+        header_out2["id"].as_str(),
+        Some(session_id.as_str()),
+        "second process must adopt existing session ID from persisted session"
+    );
+}

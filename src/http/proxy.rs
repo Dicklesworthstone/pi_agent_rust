@@ -31,6 +31,8 @@
 //! while an unsupported scheme written explicitly into settings.json is
 //! reported as a configuration warning at startup.
 
+use std::fmt;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
@@ -39,7 +41,7 @@ use std::sync::RwLock;
 /// Always a plain-HTTP hop: the origin's TLS runs end-to-end inside a CONNECT
 /// tunnel, so the hop to the proxy itself is never TLS. A `https://` proxy URL
 /// is rejected by [`parse_proxy_url`] rather than silently downgraded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProxyEndpoint {
     /// Proxy host (no brackets for IPv6 — ready for `TcpStream::connect`).
     pub host: String,
@@ -47,6 +49,19 @@ pub struct ProxyEndpoint {
     pub port: u16,
     /// `Proxy-Authorization` header value derived from the URL's userinfo.
     pub authorization: Option<String>,
+}
+
+impl fmt::Debug for ProxyEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ProxyEndpoint {
@@ -68,7 +83,7 @@ impl ProxyEndpoint {
 }
 
 /// `[http]` section of settings.json (`Config::http`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct HttpSettings {
     /// Proxy for both `http://` and `https://` requests.
@@ -83,13 +98,29 @@ pub struct HttpSettings {
     ///
     /// Entries match the standard way: `*` bypasses everything, a leading dot
     /// (`.example.com`) or a bare domain (`example.com`) matches the domain and
-    /// its subdomains, and `host:port` restricts the match to that port.
+    /// its subdomains, and `host:port` restricts the match to that port. IPv4
+    /// and IPv6 CIDR ranges match literal request addresses without DNS
+    /// resolution. Malformed entries never widen the bypass policy.
     #[serde(alias = "noProxy")]
     pub no_proxy: Option<Vec<String>>,
     /// Ignore the ambient `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` /
     /// `NO_PROXY` variables; only the settings above (and `PI_*_PROXY`) apply.
     #[serde(alias = "ignoreEnvProxy")]
     pub ignore_env_proxy: Option<bool>,
+}
+
+impl fmt::Debug for HttpSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Even malformed URLs can contain credentials. Do not attempt to
+        // parse them to decide which parts are safe to print.
+        f.debug_struct("HttpSettings")
+            .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
+            .field("https_proxy", &self.https_proxy.as_ref().map(|_| "<redacted>"))
+            .field("http_proxy", &self.http_proxy.as_ref().map(|_| "<redacted>"))
+            .field("no_proxy", &self.no_proxy)
+            .field("ignore_env_proxy", &self.ignore_env_proxy)
+            .finish()
+    }
 }
 
 /// Environment variable names read for proxy configuration, most specific
@@ -109,6 +140,125 @@ fn is_disable_value(value: &str) -> bool {
     )
 }
 
+/// Parsed once at configuration time, not once per outbound request. Network
+/// rules intentionally match only literal IPs: resolving a hostname locally
+/// to decide whether to use a proxy would leak DNS and change routing policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoProxyRule {
+    Domain {
+        name: String,
+        port: Option<u16>,
+    },
+    Address {
+        address: IpAddr,
+        port: Option<u16>,
+    },
+    Network {
+        address: IpAddr,
+        prefix: u8,
+    },
+}
+
+impl NoProxyRule {
+    fn parse(entry: &str) -> Option<Self> {
+        if let Some((network, prefix)) = entry.split_once('/') {
+            if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let prefix = prefix.parse::<u8>().ok()?;
+            let address: IpAddr = if let Some(inner) = network.strip_prefix('[') {
+                inner.strip_suffix(']')?.parse::<Ipv6Addr>().ok()?.into()
+            } else {
+                network.parse().ok()?
+            };
+            let bits = if address.is_ipv4() { 32 } else { 128 };
+            return (prefix <= bits).then_some(Self::Network { address, prefix });
+        }
+
+        // An unbracketed IPv6 literal must be recognized before looking for
+        // a port; its final numeric component is part of the address.
+        if let Ok(address) = entry.parse::<IpAddr>() {
+            return Some(Self::Address {
+                address,
+                port: None,
+            });
+        }
+
+        if let Some(inner) = entry.strip_prefix('[') {
+            let (address, tail) = inner.split_once(']')?;
+            let address = address.parse::<Ipv6Addr>().ok()?.into();
+            let port = if tail.is_empty() {
+                None
+            } else {
+                // Never turn an invalid port/suffix into an unqualified
+                // bypass. `[::1]:oops` must not mean "all ports on ::1".
+                Some(parse_proxy_port(tail.strip_prefix(':')?).ok()?)
+            };
+            return Some(Self::Address { address, port });
+        }
+
+        let (name, port) = if let Some((name, port)) = entry.split_once(':') {
+            (name, Some(parse_proxy_port(port).ok()?))
+        } else {
+            (entry, None)
+        };
+        let name = name.strip_prefix('.').unwrap_or(name);
+        let name = name.strip_suffix('.').unwrap_or(name);
+        if let Ok(address) = name.parse::<IpAddr>() {
+            return Some(Self::Address { address, port });
+        }
+        if name.split('.').any(str::is_empty)
+            || !name
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+        {
+            return None;
+        }
+        Some(Self::Domain {
+            name: name.to_string(),
+            port,
+        })
+    }
+
+    fn matches(&self, host: &str, address: Option<IpAddr>, port: u16) -> bool {
+        match self {
+            Self::Domain {
+                name,
+                port: rule_port,
+            } => {
+                address.is_none()
+                    && rule_port.is_none_or(|expected| expected == port)
+                    && (host == name.as_str()
+                        || host
+                            .strip_suffix(name.as_str())
+                            .is_some_and(|prefix| prefix.ends_with('.')))
+            }
+            Self::Address {
+                address: expected,
+                port: rule_port,
+            } => {
+                address == Some(*expected) && rule_port.is_none_or(|expected| expected == port)
+            }
+            Self::Network {
+                address: network,
+                prefix,
+            } => match (*network, address) {
+                (IpAddr::V4(network), Some(IpAddr::V4(address))) => {
+                    // checked_shl maps /0 to a zero mask; /32 and /128 use
+                    // shift zero. parse() bounds prefixes to their family.
+                    let mask = u32::MAX.checked_shl(32 - u32::from(*prefix)).unwrap_or(0);
+                    (u32::from(network) & mask) == (u32::from(address) & mask)
+                }
+                (IpAddr::V6(network), Some(IpAddr::V6(address))) => {
+                    let mask = u128::MAX.checked_shl(128 - u32::from(*prefix)).unwrap_or(0);
+                    (u128::from(network) & mask) == (u128::from(address) & mask)
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
 /// A fully merged proxy configuration: settings.json plus the environment,
 /// resolved once and then consulted per request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -116,6 +266,7 @@ pub struct ProxyConfig {
     https: Option<ProxyEndpoint>,
     http: Option<ProxyEndpoint>,
     no_proxy: Vec<String>,
+    no_proxy_rules: Vec<NoProxyRule>,
     /// `*` (or `NO_PROXY=*`) — everything is direct.
     bypass_all: bool,
 }
@@ -154,7 +305,7 @@ impl ProxyConfig {
                 match parse_proxy_url(value) {
                     Ok(endpoint) => return Some(endpoint),
                     Err(err) => {
-                        warnings.push(format!("ignoring http proxy setting {value:?}: {err}"));
+                        warnings.push(format!("ignoring http proxy setting: {err}"));
                     }
                 }
             }
@@ -179,7 +330,7 @@ impl ProxyConfig {
                         // An unusable ambient value must not fail requests:
                         // `ALL_PROXY` is routinely a SOCKS endpoint meant for
                         // other tools. Warn once and keep looking.
-                        warnings.push(format!("ignoring {name}={value:?}: {err}"));
+                        warnings.push(format!("ignoring {name}: {err}"));
                     }
                 }
             }
@@ -231,9 +382,13 @@ impl ProxyConfig {
         warnings.dedup();
 
         let bypass_all = no_proxy_raw.iter().any(|entry| entry == "*");
-        let no_proxy = no_proxy_raw
+        let no_proxy: Vec<String> = no_proxy_raw
             .into_iter()
             .map(|entry| entry.to_ascii_lowercase())
+            .collect();
+        let no_proxy_rules = no_proxy
+            .iter()
+            .filter_map(|entry| NoProxyRule::parse(entry))
             .collect();
 
         (
@@ -241,6 +396,7 @@ impl ProxyConfig {
                 https,
                 http,
                 no_proxy,
+                no_proxy_rules,
                 bypass_all,
             },
             warnings,
@@ -286,41 +442,25 @@ impl ProxyConfig {
     }
 
     fn matches_no_proxy(&self, host: &str, port: u16) -> bool {
-        let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-        self.no_proxy.iter().any(|entry| {
-            // `[::1]:8443` / `[::1]` — split the bracketed host from its port
-            // before the generic rule, which cannot tell an IPv6 colon from a
-            // port separator.
-            let (pattern, entry_port) = entry.strip_prefix('[').map_or_else(
-                || match entry.rsplit_once(':') {
-                    // Only treat the tail as a port when it parses AND the head
-                    // is not an unbracketed IPv6 literal.
-                    Some((head, tail)) if !head.contains(':') => tail
-                        .parse::<u16>()
-                        .map_or((entry.as_str(), None), |value| (head, Some(value))),
-                    _ => (entry.as_str(), None),
-                },
-                |rest| {
-                    rest.split_once(']')
-                        .map_or((entry.as_str(), None), |(host, tail)| {
-                            (
-                                host,
-                                tail.strip_prefix(':')
-                                    .and_then(|port| port.parse::<u16>().ok()),
-                            )
-                        })
-                },
-            );
-            if entry_port.is_some_and(|expected| expected != port) {
+        if self.no_proxy_rules.is_empty() {
+            return false;
+        }
+        let host = if let Some(inner) = host.strip_prefix('[') {
+            let Some(host) = inner.strip_suffix(']') else {
+                return false;
+            };
+            if host.parse::<Ipv6Addr>().is_err() {
                 return false;
             }
-            let pattern = pattern.trim_matches(['[', ']']);
-            if pattern.is_empty() {
-                return false;
-            }
-            let bare = pattern.strip_prefix('.').unwrap_or(pattern);
-            host == bare || host.ends_with(&format!(".{bare}"))
-        })
+            host
+        } else {
+            host
+        };
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        let address = host.parse::<IpAddr>().ok();
+        self.no_proxy_rules
+            .iter()
+            .any(|rule| rule.matches(&host, address, port))
     }
 }
 
@@ -334,20 +474,25 @@ impl ProxyConfig {
 ///
 /// Returns a human-readable message for an unsupported scheme (`https://`
 /// proxies would need TLS-in-TLS, and SOCKS is not implemented), a missing
-/// host, or an unparseable port.
+/// host, a malformed authority, an invalid port, or invalid Basic credentials.
+/// Error messages never include input values, which may contain secrets even
+/// when the URL is malformed.
 pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("empty proxy URL".to_string());
     }
+    if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return Err("proxy URL contains unescaped whitespace or control characters".to_string());
+    }
     let rest = match raw.split_once("://") {
         Some((scheme, rest)) => {
             if !scheme.eq_ignore_ascii_case("http") {
-                return Err(format!(
-                    "unsupported proxy scheme {:?} (only http:// proxy endpoints are supported; \
-                     https:// targets are proxied through an http:// proxy with CONNECT)",
-                    scheme.to_ascii_lowercase()
-                ));
+                return Err(
+                    "unsupported proxy scheme (only http:// proxy endpoints are supported; \
+                     https:// targets are proxied through an http:// proxy with CONNECT)"
+                        .to_string(),
+                );
             }
             rest
         }
@@ -372,24 +517,23 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
         let (host, tail) = rest
             .split_once(']')
             .ok_or_else(|| "unterminated IPv6 proxy host".to_string())?;
-        let port = match tail.strip_prefix(':') {
-            Some(port) => Some(
-                port.parse::<u16>()
-                    .map_err(|_| format!("invalid proxy port {port:?}"))?,
-            ),
-            None => None,
+        let host = host
+            .parse::<Ipv6Addr>()
+            .map_err(|_| "invalid IPv6 proxy host".to_string())?;
+        let port = if tail.is_empty() {
+            None
+        } else {
+            let port = tail
+                .strip_prefix(':')
+                .ok_or_else(|| "unexpected suffix after IPv6 proxy host".to_string())?;
+            Some(parse_proxy_port(port)?)
         };
         (host.to_string(), port)
-    } else if let Some((host, port)) = hostport.rsplit_once(':')
-        && !host.contains(':')
-    {
-        (
-            host.to_string(),
-            Some(
-                port.parse::<u16>()
-                    .map_err(|_| format!("invalid proxy port {port:?}"))?,
-            ),
-        )
+    } else if let Some((host, port)) = hostport.rsplit_once(':') {
+        if host.contains(':') {
+            return Err("IPv6 proxy hosts must be bracketed".to_string());
+        }
+        (host.to_string(), Some(parse_proxy_port(port)?))
     } else {
         (hostport, None)
     };
@@ -397,13 +541,31 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
     if host.is_empty() {
         return Err("proxy URL has no host".to_string());
     }
+    if host.contains(['[', ']', '@', '\\', '%']) {
+        return Err("invalid proxy host".to_string());
+    }
 
     let port = port.unwrap_or(80);
 
-    let authorization = userinfo.filter(|info| !info.is_empty()).map(|info| {
-        let decoded = percent_decode_userinfo(&info);
-        format!("Basic {}", base64_encode(decoded.as_bytes()))
-    });
+    let authorization = userinfo
+        .filter(|info| !info.is_empty())
+        .map(|info| {
+            // Split before decoding: an escaped colon in a password is data,
+            // not the username/password delimiter. Basic usernames cannot
+            // contain a colon; a username alone implies an empty password.
+            let (username, password) = info.split_once(':').unwrap_or((info.as_str(), ""));
+            let mut decoded = percent_decode_userinfo(username);
+            if decoded.contains(&b':') {
+                return Err("proxy username must not contain a colon".to_string());
+            }
+            decoded.push(b':');
+            decoded.extend(percent_decode_userinfo(password));
+            if decoded.iter().any(u8::is_ascii_control) {
+                return Err("proxy credentials contain control characters".to_string());
+            }
+            Ok(format!("Basic {}", base64_encode(&decoded)))
+        })
+        .transpose()?;
 
     Ok(ProxyEndpoint {
         host,
@@ -412,9 +574,17 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
     })
 }
 
-/// Percent-decode a `user:password` pair (proxy credentials commonly encode
-/// `@` and `:` this way).
-fn percent_decode_userinfo(raw: &str) -> String {
+fn parse_proxy_port(raw: &str) -> std::result::Result<u16, String> {
+    raw.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0 && raw.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "invalid proxy port (expected an integer from 1 to 65535)".to_string())
+}
+
+/// Percent-decode credential bytes without lossy UTF-8 conversion. Basic
+/// authentication encodes octets; replacing a non-UTF-8 password byte changes
+/// the credential and causes authentication to fail.
+fn percent_decode_userinfo(raw: &str) -> Vec<u8> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -434,7 +604,7 @@ fn percent_decode_userinfo(raw: &str) -> String {
         out.push(bytes[index]);
         index += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// Minimal standard base64 encoder (proxy credentials only; no dependency).
@@ -618,6 +788,99 @@ mod tests {
         assert!(parse_proxy_url("http://proxy:notaport").is_err());
         assert!(parse_proxy_url("   ").is_err());
         assert!(parse_proxy_url("http://").is_err());
+    }
+
+    #[test]
+    fn malformed_authorities_are_rejected_before_connecting() {
+        for raw in [
+            "http://[::1]ignored",
+            "http://[::1]:",
+            "http://[not-an-ip]:8080",
+            "http://[]:8080",
+            "http://::1",
+            "http://proxy]:8080",
+            "http://proxy\\other:8080",
+            "http://proxy%0ahost:8080",
+            "http://proxy host:8080",
+            "http://proxy\r\nInjected:8080",
+            "http://proxy:0",
+            "http://proxy:+8080",
+            "http://proxy:65536",
+        ] {
+            assert!(parse_proxy_url(raw).is_err(), "accepted {raw:?}");
+        }
+        let endpoint = parse_proxy_url("http://[0:0:0:0:0:0:0:1]:65535").expect("IPv6");
+        assert_eq!(endpoint.authority(), "[::1]:65535");
+    }
+
+    #[test]
+    fn basic_credentials_preserve_octets_and_empty_passwords() {
+        for (raw, expected) in [
+            ("http://user@proxy", "Basic dXNlcjo="),
+            ("http://user:%FF%3A%FE@proxy", "Basic dXNlcjr/Ov4="),
+            ("http://u:p%40ss%3Aword@proxy", "Basic dTpwQHNzOndvcmQ="),
+        ] {
+            let endpoint = parse_proxy_url(raw).expect("valid credentials");
+            assert_eq!(endpoint.authorization.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn basic_credentials_reject_ambiguous_usernames_and_controls() {
+        for raw in [
+            "http://user%3Aother:password@proxy",
+            "http://user:password%0D%0A@proxy",
+            "http://user%00:password@proxy",
+            "http://user:password%7F@proxy",
+        ] {
+            assert!(parse_proxy_url(raw).is_err(), "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn proxy_diagnostics_never_echo_malformed_values() {
+        for raw in [
+            "socks5://sentinel-user:sentinel-secret@proxy:1080",
+            "sentinel-scheme://proxy:8080",
+            "http://user:sentinel-secret@proxy:sentinel-port",
+            "http://user:sentinel-secret@[::1]sentinel-suffix",
+            "http://user:sentinel-secret@proxy\r\nInjected:8080",
+        ] {
+            let error = parse_proxy_url(raw).expect_err("invalid proxy");
+            assert!(!error.contains("sentinel"), "{error}");
+            let settings = HttpSettings {
+                proxy: Some(raw.to_string()),
+                ..HttpSettings::default()
+            };
+            let (_, warnings) = ProxyConfig::resolve(Some(&settings), &env_from(&[]));
+            assert!(!warnings.is_empty());
+            assert!(!format!("{warnings:?} {settings:?}").contains("sentinel"));
+            let (_, warnings) = ProxyConfig::resolve(
+                None,
+                &env_from(&[("HTTPS_PROXY", raw), ("HTTP_PROXY", raw)]),
+            );
+            assert!(!warnings.is_empty());
+            assert!(warnings.iter().all(|warning| !warning.contains("sentinel")));
+            assert!(warnings.iter().any(|warning| warning.contains("HTTPS_PROXY")));
+        }
+    }
+
+    #[test]
+    fn debug_redacts_plaintext_and_encoded_proxy_credentials() {
+        let settings = HttpSettings {
+            proxy: Some("http://sentinel-user:sentinel-secret@proxy:8080".to_string()),
+            https_proxy: Some("http://sentinel-user:sentinel-secret@proxy:8080".to_string()),
+            http_proxy: Some("http://sentinel-user:sentinel-secret@proxy:8080".to_string()),
+            ..HttpSettings::default()
+        };
+        let config = resolve(Some(&settings), &[]);
+        let endpoint = config.endpoint_for(true, "api.example.com", 443).expect("proxy");
+        let authorization = endpoint.authorization.as_deref().expect("credentials");
+        let diagnostic = format!("{settings:?} {config:?} {endpoint:?}");
+        assert!(!diagnostic.contains("sentinel"));
+        assert!(!diagnostic.contains(authorization));
+        assert!(diagnostic.contains("<redacted>"));
+        assert_eq!(endpoint.redacted_url(), "http://proxy:8080");
     }
 
     // ─── Precedence ─────────────────────────────────────────────────────
@@ -844,6 +1107,170 @@ mod tests {
             with_port.endpoint_for(true, "::1", 443).is_some(),
             "a port-qualified bypass entry must not match other ports"
         );
+    }
+
+    #[test]
+    fn no_proxy_ipv4_cidr_matches_subnet_boundaries() {
+        let config = resolve(
+            None,
+            &[
+                ("ALL_PROXY", "http://p:8080"),
+                ("NO_PROXY", "10.16.0.0/12,192.0.2.9/32"),
+            ],
+        );
+        for (host, bypass) in [
+            ("10.15.255.255", false),
+            ("10.16.0.0", true),
+            ("10.31.255.255", true),
+            ("10.32.0.0", false),
+            ("192.0.2.9", true),
+            ("192.0.2.8", false),
+            ("service.10.16.0.1", false),
+        ] {
+            for (https, port) in [(true, 443), (false, 80)] {
+                assert_eq!(
+                    config.endpoint_for(https, host, port).is_none(),
+                    bypass,
+                    "{host}:{port}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_proxy_ipv6_cidr_matches_subnets_and_single_addresses() {
+        for rules in ["2001:db8::/32,fc00::1/128", "[2001:db8::]/32,fc00::1/128"] {
+            let config = resolve(
+                None,
+                &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rules)],
+            );
+            for (host, bypass) in [
+                ("2001:db7:ffff:ffff::1", false),
+                ("[2001:db8::]", true),
+                ("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", true),
+                ("2001:db9::", false),
+                ("fc00:0:0:0:0:0:0:1", true),
+                ("fc00::2", false),
+                ("192.0.2.1", false),
+            ] {
+                assert_eq!(config.endpoint_for(true, host, 443).is_none(), bypass, "{host}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_proxy_zero_prefixes_are_family_specific_and_never_resolve_names() {
+        for (rule, direct, proxied) in [
+            ("0.0.0.0/0", "203.0.113.9", "::1"),
+            ("::/0", "::ffff:192.0.2.1", "127.0.0.1"),
+        ] {
+            let config = resolve(
+                None,
+                &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)],
+            );
+            assert!(config.endpoint_for(true, direct, 443).is_none());
+            assert!(config.endpoint_for(true, proxied, 443).is_some());
+            assert!(config.endpoint_for(true, "localhost", 443).is_some());
+            assert!(config.endpoint_for(true, "api.example.com", 443).is_some());
+        }
+    }
+
+    #[test]
+    fn no_proxy_addresses_use_numeric_equality_not_dns_suffixes() {
+        let config = resolve(
+            None,
+            &[
+                ("ALL_PROXY", "http://p:8080"),
+                ("NO_PROXY", "127.0.0.1:8080,[::1]:8443"),
+            ],
+        );
+        assert!(config.endpoint_for(false, "127.0.0.1", 8080).is_none());
+        assert!(config.endpoint_for(false, "127.0.0.1", 80).is_some());
+        assert!(config.endpoint_for(true, "[0:0:0:0:0:0:0:1]", 8443).is_none());
+        assert!(config.endpoint_for(true, "0:0:0:0:0:0:0:1", 443).is_some());
+        assert!(config.endpoint_for(false, "leak.127.0.0.1", 8080).is_some());
+    }
+
+    #[test]
+    fn invalid_no_proxy_entries_cannot_disable_the_proxy() {
+        for rule in [
+            "[::1]:oops",
+            "[::1]:",
+            "[::1]:65536",
+            "[::1]:+443",
+            "[::1]ignored",
+            "[::1",
+            "[[::1]]",
+            "[127.0.0.1]",
+            "127.0.0.1:invalid",
+            "127.0.0.1:0",
+            "127.0.0.0/33",
+            "127.0.0.0/-1",
+            "127.0.0.0/+1",
+            "127.0.0.0/8:443",
+            "::1/129",
+            "::1/256",
+            "::1/",
+            "api.example.com/0",
+            "*/0",
+        ] {
+            let config = resolve(
+                None,
+                &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)],
+            );
+            for host in ["::1", "127.0.0.1", "api.example.com"] {
+                for port in [80, 443, 8443] {
+                    assert!(
+                        config.endpoint_for(true, host, port).is_some(),
+                        "invalid rule {rule:?} bypassed {host}:{port}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_proxy_dns_names_normalize_case_and_root_dots() {
+        let settings = HttpSettings {
+            proxy: Some("http://p:8080".to_string()),
+            no_proxy: Some(vec![".Corp.Example.".to_string(), "127.0.0.0/8".to_string()]),
+            ..HttpSettings::default()
+        };
+        let config = resolve(Some(&settings), &[("NO_PROXY", "ignored.example")]);
+        for host in ["CORP.EXAMPLE", "corp.example.", "api.Corp.Example.", "127.2.3.4"] {
+            assert!(config.endpoint_for(true, host, 443).is_none(), "{host}");
+        }
+        for host in ["notcorp.example", "corp.example.attacker", "ignored.example"] {
+            assert!(config.endpoint_for(true, host, 443).is_some(), "{host}");
+        }
+        assert_eq!(
+            config.no_proxy_entries(),
+            &[".corp.example.".to_string(), "127.0.0.0/8".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_proxy_network_masks_cover_every_valid_prefix_width() {
+        let network_v4 = 0xc000_0281_u32;
+        for prefix in 0..=32 {
+            let rule = NoProxyRule::parse(&format!("192.0.2.129/{prefix}")).expect("IPv4 CIDR");
+            for value in [0, u32::MAX, network_v4, network_v4 ^ 1, network_v4 ^ 0x8000_0000] {
+                let address = IpAddr::V4(std::net::Ipv4Addr::from(value));
+                // Independent reference: count common leading bits rather
+                // than constructing the mask used by the implementation.
+                let expected = (network_v4 ^ value).leading_zeros() >= prefix;
+                assert_eq!(rule.matches("", Some(address), 443), expected, "{address}/{prefix}");
+            }
+        }
+        let network_v6 = u128::from("2001:db8::1".parse::<Ipv6Addr>().expect("IPv6"));
+        for prefix in 0..=128 {
+            let rule = NoProxyRule::parse(&format!("2001:db8::1/{prefix}")).expect("IPv6 CIDR");
+            for value in [0, u128::MAX, network_v6, network_v6 ^ 1, network_v6 ^ (1 << 127)] {
+                let address = IpAddr::V6(Ipv6Addr::from(value));
+                let expected = (network_v6 ^ value).leading_zeros() >= prefix;
+                assert_eq!(rule.matches("", Some(address), 443), expected, "{address}/{prefix}");
+            }
+        }
     }
 
     // ─── Child-process env ──────────────────────────────────────────────
