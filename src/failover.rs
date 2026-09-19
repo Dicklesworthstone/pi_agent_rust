@@ -777,7 +777,7 @@ pub fn retry_delay_ms(base_delay_ms: u32, max_delay_ms: u32, attempt: u32) -> u3
 /// session-persistence failure?
 ///
 /// Such a failure means provider or tool side effects may already have
-/// happened while the durable record is missing or stale. Re-entering the
+/// happened while the durable session record is missing or stale. Re-entering the
 /// provider — retry, credential rotation, or model failover — could repeat
 /// those effects, so callers must treat this as final regardless of what the
 /// wrapped prose looks like.
@@ -973,7 +973,10 @@ pub fn decide(
         ),
     };
     let budget_left = progress.retry_count < policy.max_retries && progress.stream_can_retry;
-    let may_fail_over = progress.failovers_this_turn < policy.max_failovers_per_turn;
+    // A fallback also re-enters the provider. A surface that cannot retract
+    // visible output must not bypass its no-retry boundary by changing models.
+    let may_fail_over = progress.stream_can_retry
+        && progress.failovers_this_turn < policy.max_failovers_per_turn;
 
     // Each outcome shape decides only what is specific to it — whether the turn
     // is terminal, and whether its failure is retryable. The budget arithmetic
@@ -995,6 +998,16 @@ pub fn decide(
             if is_auth_failure(&error_text.to_ascii_lowercase()) {
                 return TurnDecision::Finish { success: false };
             }
+            // Keep token-count evidence here, before the chain walk reduces
+            // an error to prose. Otherwise a silent overflow becomes a 503
+            // failover when classify_failover can no longer see the usage.
+            if crate::error::is_context_overflow(
+                error_text,
+                Some(message.usage.input),
+                context_window,
+            ) {
+                return TurnDecision::Finish { success: false };
+            }
             error_result_is_retryable(message, context_window)
         }
         TurnOutcome::Failed(error) => {
@@ -1007,7 +1020,10 @@ pub fn decide(
             if marks_session_persistence(&error_text) {
                 return TurnDecision::Terminal(TerminalReason::SessionPersistence);
             }
-            if !is_provider_call_error(error) || is_auth_failure(&error_text.to_ascii_lowercase()) {
+            if !is_provider_call_error(error)
+                || is_auth_failure(&error_text.to_ascii_lowercase())
+                || crate::error::is_context_overflow(&error_text, None, context_window)
+            {
                 return TurnDecision::Finish { success: false };
             }
             call_error_is_retryable(error)
@@ -1021,6 +1037,129 @@ pub fn decide(
         return TurnDecision::FailOver;
     }
     TurnDecision::Finish { success: false }
+}
+
+#[cfg(test)]
+mod recovery_boundary_tests {
+    use super::*;
+    use crate::model::{AssistantMessage, StopReason, Usage};
+
+    fn failure() -> AssistantMessage {
+        AssistantMessage {
+            content: Vec::new(),
+            api: "test-api".into(),
+            provider: "test-provider".into(),
+            model: "test-model".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            stop_details: None,
+            error_message: Some("503 service unavailable".into()),
+            timestamp: 0,
+        }
+    }
+
+    fn policy() -> RetryPolicy {
+        RetryPolicy {
+            max_retries: 3,
+            max_failovers_per_turn: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        }
+    }
+
+    fn progress(stream_can_retry: bool) -> TurnProgress {
+        TurnProgress {
+            retry_count: 0,
+            failovers_this_turn: 0,
+            stream_can_retry,
+        }
+    }
+
+    #[test]
+    fn visible_output_boundary_blocks_same_provider_and_cross_provider_reentry() {
+        let message = failure();
+        let error = crate::error::Error::api("503 service unavailable");
+        for retries in [0, 3] {
+            let policy = RetryPolicy {
+                max_retries: retries,
+                ..policy()
+            };
+            for outcome in [TurnOutcome::Completed(&message), TurnOutcome::Failed(&error)] {
+                assert_eq!(
+                    decide(outcome, &progress(false), &policy, Some(8_192)),
+                    TurnDecision::Finish { success: false }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_token_overflow_cannot_become_a_prose_only_failover() {
+        let mut message = failure();
+        message.usage.input = 8_193;
+        for retries in [0, 3] {
+            let policy = RetryPolicy {
+                max_retries: retries,
+                ..policy()
+            };
+            assert_eq!(
+                decide(
+                    TurnOutcome::Completed(&message),
+                    &progress(true),
+                    &policy,
+                    Some(8_192)
+                ),
+                TurnDecision::Finish { success: false }
+            );
+        }
+        // Missing evidence is not fabricated: unknown windows retain the
+        // existing retry behavior for a genuinely transient-looking error.
+        assert!(matches!(
+            decide(
+                TurnOutcome::Completed(&message),
+                &progress(true),
+                &policy(),
+                None
+            ),
+            TurnDecision::Retry { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_context_overflow_does_not_walk_a_fallback_chain() {
+        let error = crate::error::Error::api("maximum context length exceeded");
+        assert_eq!(
+            decide(TurnOutcome::Failed(&error), &progress(true), &policy(), None),
+            TurnDecision::Finish { success: false }
+        );
+    }
+
+    #[test]
+    fn recovery_boundaries_preserve_success_and_typed_terminal_reasons() {
+        let mut message = failure();
+        message.stop_reason = StopReason::Stop;
+        message.error_message = None;
+        assert_eq!(
+            decide(
+                TurnOutcome::Completed(&message),
+                &progress(false),
+                &policy(),
+                None
+            ),
+            TurnDecision::Finish { success: true }
+        );
+        let aborted = crate::error::Error::Aborted;
+        let persistence = crate::error::Error::session_persistence("503 while saving");
+        for (error, reason) in [
+            (&aborted, TerminalReason::Aborted),
+            (&persistence, TerminalReason::SessionPersistence),
+        ] {
+            assert_eq!(
+                decide(TurnOutcome::Failed(error), &progress(false), &policy(), None),
+                TurnDecision::Terminal(reason)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1712,7 +1851,7 @@ mod tests {
         // model's context window here and print mode passes None. It only
         // changes the verdict for a SILENT overflow, where the prose reads
         // transient and input tokens > window is the only evidence — see
-        // a_silent_context_overflow_stops_retrying_only_once_the_window_is_known.
+        // a_silent_context_overflow_stops_all_reentry_once_the_window_is_known.
         let overflow = errored_message(Some("prompt is too long: 250000 tokens > 200000"), 250_000);
         assert!(!error_result_is_retryable(&overflow, Some(200_000)));
     }
@@ -1824,16 +1963,16 @@ mod tests {
     }
 
     #[test]
-    fn a_surface_that_has_already_shown_output_does_not_retry_but_may_fail_over() {
-        // Print mode refuses a retry once visible bytes have reached the
-        // terminal; the chain is still admissible because a swap resumes the
-        // turn rather than replaying it.
+    fn a_surface_that_has_already_shown_output_cannot_reenter_another_provider() {
+        // A model swap resumes the incomplete request too. It cannot retract
+        // bytes already emitted by a text-only surface, so it must respect
+        // the same re-entry boundary as a same-provider retry.
         let message = errored_message(Some("503 service unavailable"), 0);
         let mut stalled = progress(0, 0);
         stalled.stream_can_retry = false;
         assert_eq!(
             decide(TurnOutcome::Completed(&message), &stalled, &policy(), None),
-            TurnDecision::FailOver
+            TurnDecision::Finish { success: false }
         );
     }
 
@@ -2140,12 +2279,11 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_context_overflow_stops_retrying_only_once_the_window_is_known() {
+    fn a_silent_context_overflow_stops_all_reentry_once_the_window_is_known() {
         // A SILENT overflow: the provider's prose reads transient, and only
         // input tokens > context window reveals that the request can never fit.
-        // This is the case the context window actually decides, and it is where
-        // print mode and RPC diverge — RPC refuses the retry, print spends its
-        // whole budget re-sending a prompt that cannot fit, billed each time.
+        // Once known, the overflow must block both retries and chain swaps;
+        // prose-only failover classification cannot recover that evidence.
         let silent = errored_message(Some("500 internal server error"), 250_000);
         let p = policy();
         assert_eq!(
@@ -2155,8 +2293,8 @@ mod tests {
                 &p,
                 Some(200_000)
             ),
-            TurnDecision::FailOver,
-            "a silent overflow must not burn the retry budget"
+            TurnDecision::Finish { success: false },
+            "a silent overflow must not burn retry or failover budgets"
         );
         assert!(
             matches!(
@@ -2182,7 +2320,7 @@ mod tests {
                     &p,
                     window
                 ),
-                TurnDecision::FailOver,
+                TurnDecision::Finish { success: false },
                 "window={window:?}"
             );
         }
