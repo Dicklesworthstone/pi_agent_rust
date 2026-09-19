@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 
 mod document_sync;
 mod file_uri;
+mod pull_diagnostics;
 mod request;
 #[cfg(test)]
 mod test_server;
@@ -129,6 +130,7 @@ pub struct LspClient {
     root_uri: String,
     open_docs: Mutex<HashMap<String, OpenDoc>>,
     diagnostics: Mutex<HashMap<String, Vec<Value>>>,
+    pull_reports: Mutex<pull_diagnostics::ReportCache>,
     request_lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
     capabilities: Mutex<ServerCapabilities>,
     connected_at: std::time::Instant,
@@ -158,6 +160,7 @@ impl LspClient {
             root_uri: root_uri.clone(),
             open_docs: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(HashMap::new()),
+            pull_reports: Mutex::new(pull_diagnostics::ReportCache::default()),
             request_lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
             capabilities: Mutex::new(ServerCapabilities::default()),
             connected_at: std::time::Instant::now(),
@@ -173,6 +176,7 @@ impl LspClient {
                 "textDocument":{
                     "synchronization":{"didSave":true,"dynamicRegistration":false},
                     "publishDiagnostics":{"relatedInformation":true,"versionSupport":true},
+                    "diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false},
                     "hover":{"contentFormat":["markdown","plaintext"]},
                     "definition":{"linkSupport":false},"typeDefinition":{"linkSupport":false},
                     "implementation":{"linkSupport":false},"references":{},
@@ -314,12 +318,18 @@ impl LspClient {
         let Some(uri) = file_uri::normalize_uri(uri) else {
             return false;
         };
+        if self.has_pull_diagnostics() && !wait.is_zero() {
+            return self.refresh_document_diagnostics(&uri, wait).await.is_ok();
+        }
         let cx = AgentCx::for_current_or_request();
         let start = cx
             .cx()
             .timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         loop {
+            if cx.checkpoint().is_err() || !self.is_alive() {
+                return false;
+            }
             self.poll_notifications();
             {
                 let cache = Self::lock(&self.diagnostics);
@@ -339,7 +349,8 @@ impl LspClient {
             if Duration::from_nanos(now.duration_since(start)) >= wait {
                 return Self::lock(&self.diagnostics).contains_key(&uri);
             }
-            asupersync::time::sleep(now, WAIT_TICK).await;
+            let remaining = wait.saturating_sub(Duration::from_nanos(now.duration_since(start)));
+            cx.time().sleep(WAIT_TICK.min(remaining)).await;
         }
     }
 
