@@ -330,23 +330,23 @@ impl Provider for AzureOpenAIProvider {
         let stream = stream::unfold(
             StreamState::new(event_source, model, api, provider),
             |mut state| async move {
-                if state.done {
-                    return None;
-                }
                 loop {
                     if let Some(event) = state.pending_events.pop_front() {
                         return Some((Ok(event), state));
+                    }
+                    // A terminal frame can enqueue block-end events before Done.
+                    // Drain that queue even after the transport is finished.
+                    if state.done {
+                        return None;
                     }
 
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
                             state.transient_error_count = 0;
                             // Azure also sends "[DONE]" as final message
-                            if msg.data == "[DONE]" {
-                                state.done = true;
-                                let reason = state.partial.stop_reason;
-                                let message = std::mem::take(&mut state.partial);
-                                return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            if msg.data.trim() == "[DONE]" {
+                                state.finish_response();
+                                continue;
                             }
 
                             if let Err(e) = state.process_event(&msg.data) {
@@ -417,6 +417,8 @@ where
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     done: bool,
+    /// Block-end events and strict tool arguments have been finalized once.
+    finalized: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
 }
@@ -451,30 +453,108 @@ where
             pending_events: VecDeque::new(),
             started: false,
             done: false,
+            finalized: false,
             transient_error_count: 0,
         }
     }
 
-    fn finalize_tool_call_arguments(&mut self) {
-        for tc in &self.tool_calls {
-            let arguments: serde_json::Value = match serde_json::from_str(&tc.arguments) {
-                Ok(args) => args,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        raw = %tc.arguments,
-                        "Failed to parse tool arguments as JSON"
-                    );
-                    serde_json::Value::Null
-                }
-            };
+    fn record_error(&mut self, message: String) {
+        self.partial.stop_reason = StopReason::Error;
+        // A trailing finish reason or secondary parse error must not conceal
+        // the provider's original failure.
+        if self.partial.error_message.is_none() {
+            self.partial.error_message = Some(message);
+        }
+    }
 
+    fn finalize_tool_call_arguments(&mut self) -> Result<()> {
+        // Validate the whole batch before exposing any completed tool call.
+        // Best-effort streaming snapshots are for display, never execution.
+        let arguments = self
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                super::openai::parse_final_tool_arguments(&tc.arguments).map_err(|message| {
+                    Error::api(format!(
+                        "Invalid Azure OpenAI tool arguments at index {}: {message}",
+                        tc.index
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (tc, arguments) in self.tool_calls.iter().zip(arguments) {
             if let Some(ContentBlock::ToolCall(block)) =
                 self.partial.content.get_mut(tc.content_index)
             {
                 block.arguments = arguments;
             }
         }
+        Ok(())
+    }
+
+    fn finalize_content(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+
+        if let Err(error) = self.finalize_tool_call_arguments() {
+            self.record_error(error.to_string());
+            // Do not persist a synthetically completed argument snapshot as
+            // the final arguments of an invalid response.
+            for tc in &self.tool_calls {
+                if let Some(ContentBlock::ToolCall(block)) =
+                    self.partial.content.get_mut(tc.content_index)
+                {
+                    block.arguments = serde_json::Value::Null;
+                }
+            }
+        }
+
+        for (content_index, block) in self.partial.content.iter().enumerate() {
+            match block {
+                ContentBlock::Text(text) => {
+                    self.pending_events.push_back(StreamEvent::TextEnd {
+                        content_index,
+                        content: text.text.clone(),
+                    });
+                }
+                ContentBlock::Thinking(thinking) => {
+                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                        content_index,
+                        content: thinking.thinking.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if self.partial.stop_reason != StopReason::Error {
+            for tc in &self.tool_calls {
+                if let Some(ContentBlock::ToolCall(tool_call)) =
+                    self.partial.content.get(tc.content_index)
+                {
+                    self.pending_events.push_back(StreamEvent::ToolCallEnd {
+                        content_index: tc.content_index,
+                        tool_call: tool_call.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn finish_response(&mut self) {
+        if self.done {
+            return;
+        }
+        self.ensure_started();
+        self.finalize_content();
+        self.done = true;
+        let reason = self.partial.stop_reason;
+        let message = std::mem::take(&mut self.partial);
+        self.pending_events
+            .push_back(StreamEvent::Done { reason, message });
     }
 
     fn push_text_delta(&mut self, text: String) -> StreamEvent {
@@ -520,6 +600,16 @@ where
             self.partial.usage.total_tokens = usage.total_tokens;
         }
 
+        if let Some(error) = chunk.error {
+            let message = error
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("Azure OpenAI returned an error while streaming");
+            self.record_error(message.to_string());
+        }
+
         let choices = chunk.choices;
         if !self.started {
             let first = choices.first();
@@ -538,6 +628,30 @@ where
         // TextEnd/ToolCallEnd events always follow the final delta (matching the
         // OpenAI provider event ordering contract).
         for choice in choices {
+            if self.finalized {
+                if matches!(
+                    choice.finish_reason.as_deref(),
+                    Some("content_filter" | "error")
+                ) {
+                    self.record_error("Azure OpenAI reported a terminal stream failure".to_string());
+                }
+                let has_content = choice
+                    .delta
+                    .content
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                    || choice
+                        .delta
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty());
+                if has_content {
+                    self.record_error(
+                        "Azure OpenAI sent content after a terminal finish reason".to_string(),
+                    );
+                }
+                continue;
+            }
             // Handle text content
             if let Some(text) = choice.delta.content {
                 self.ensure_started();
@@ -635,49 +749,25 @@ where
                 self.ensure_started();
             }
             if let Some(reason) = choice.finish_reason {
-                self.partial.stop_reason = match reason.as_str() {
-                    "length" => StopReason::Length,
-                    "content_filter" => StopReason::Error,
-                    "tool_calls" => StopReason::ToolUse,
-                    // "stop" and any other reason treated as normal stop
-                    _ => StopReason::Stop,
-                };
-
-                // Finalize tool call arguments
-                self.finalize_tool_call_arguments();
-
-                // Emit TextEnd/ThinkingEnd for all open text/thinking blocks.
-                for (content_index, block) in self.partial.content.iter().enumerate() {
-                    if let ContentBlock::Text(t) = block {
-                        self.pending_events.push_back(StreamEvent::TextEnd {
-                            content_index,
-                            content: t.text.clone(),
-                        });
-                    } else if let ContentBlock::Thinking(t) = block {
-                        self.pending_events.push_back(StreamEvent::ThinkingEnd {
-                            content_index,
-                            content: t.thinking.clone(),
-                        });
-                    }
+                if self.partial.stop_reason != StopReason::Error {
+                    self.partial.stop_reason = match reason.as_str() {
+                        "length" => StopReason::Length,
+                        "content_filter" | "error" => StopReason::Error,
+                        "tool_calls" => StopReason::ToolUse,
+                        _ => StopReason::Stop,
+                    };
                 }
-
-                // Emit ToolCallEnd for each accumulated tool call
-                for tc in &self.tool_calls {
-                    if let Some(ContentBlock::ToolCall(tool_call)) =
-                        self.partial.content.get(tc.content_index)
-                    {
-                        self.pending_events.push_back(StreamEvent::ToolCallEnd {
-                            content_index: tc.content_index,
-                            tool_call: tool_call.clone(),
-                        });
-                    }
-                }
+                self.finalize_content();
             }
         }
 
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "azure_terminal_safety_tests.rs"]
+mod terminal_safety_tests;
 
 // ============================================================================
 // Request Types
@@ -774,6 +864,14 @@ struct AzureStreamChunk {
     choices: Vec<AzureChoice>,
     #[serde(default)]
     usage: Option<AzureUsage>,
+    #[serde(default)]
+    error: Option<AzureStreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AzureStreamError {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
