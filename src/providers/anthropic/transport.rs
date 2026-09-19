@@ -137,6 +137,10 @@ struct ContentState {
 #[derive(Default)]
 struct StreamLifecycle {
     started: bool,
+    /// Top-level deltas follow all content blocks, even when they only update usage.
+    message_delta_seen: bool,
+    /// A default Stop value is not evidence of a provider completion decision.
+    stop_reason_seen: bool,
     blocks: Vec<ContentState>,
     tool_ids: HashSet<String>,
 }
@@ -169,12 +173,69 @@ impl StreamLifecycle {
             .ok_or_else(|| protocol_error("content event does not match an open block"))
     }
 
+    /// `Ok(None)` from the shared parser is not automatically a harmless frame.
+    /// Missing delta payloads, orphan stops, and invalid signatures also take
+    /// that path. Inspect only these non-emitting frames, keeping ordinary text
+    /// and tool-token deltas on the existing single-decode hot path.
+    fn accept_silent(&mut self, raw: &str, partial: &AssistantMessage) -> Result<()> {
+        let wire: Value = serde_json::from_str(raw)
+            .map_err(|_| protocol_error("invalid non-emitting event JSON"))?;
+        match wire.get("type").and_then(Value::as_str) {
+            Some("ping") => Ok(()),
+            Some("message_delta") => {
+                if !self.started {
+                    return Err(protocol_error("message_delta arrived before message_start"));
+                }
+                if self.blocks.iter().any(|block| !block.closed) {
+                    return Err(protocol_error(
+                        "message_delta left unfinished content (unexpected EOF)",
+                    ));
+                }
+                self.message_delta_seen = true;
+                // The shared parser already rejects unsupported stop reasons.
+                // Null/omitted reasons are valid metadata updates, but cannot
+                // authorize Done until an explicit reason has actually arrived.
+                self.stop_reason_seen |= wire["delta"]["stop_reason"].is_string();
+                Ok(())
+            }
+            Some("content_block_delta")
+                if wire["delta"]["type"].as_str() == Some("signature_delta") =>
+            {
+                if self.message_delta_seen {
+                    return Err(protocol_error("signature arrived after message_delta"));
+                }
+                let index = wire
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .ok_or_else(|| protocol_error("signature has an invalid block index"))?;
+                self.active(index, ContentKind::Thinking)?;
+                if !matches!(partial.content.get(index), Some(ContentBlock::Thinking(_)))
+                    || !wire["delta"]["signature"].is_string()
+                {
+                    return Err(protocol_error(
+                        "signature does not update an open thinking block",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(protocol_error(
+                "content event did not produce its required update",
+            )),
+        }
+    }
+
     fn accept(
         &mut self,
         event: &mut StreamEvent,
         raw: &str,
         partial: &mut AssistantMessage,
     ) -> Result<()> {
+        if self.message_delta_seen
+            && !matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. })
+        {
+            return Err(protocol_error("content event arrived after message_delta"));
+        }
         match event {
             StreamEvent::Start { .. } => {
                 if self.started {
@@ -220,6 +281,12 @@ impl StreamLifecycle {
             }
             StreamEvent::ThinkingDelta { content_index, .. } => {
                 self.active(*content_index, ContentKind::Thinking)?;
+                if !matches!(
+                    partial.content.get(*content_index),
+                    Some(ContentBlock::Thinking(_))
+                ) {
+                    return Err(protocol_error("thinking delta targets opaque content"));
+                }
             }
             StreamEvent::ToolCallDelta { content_index, .. } => {
                 self.active(*content_index, ContentKind::Tool)?
@@ -269,6 +336,11 @@ impl StreamLifecycle {
                 if self.blocks.iter().any(|block| !block.closed) {
                     return Err(protocol_error(
                         "message_stop left unfinished content (unexpected EOF)",
+                    ));
+                }
+                if !self.stop_reason_seen {
+                    return Err(protocol_error(
+                        "message_stop arrived without a final stop reason (unexpected EOF)",
                     ));
                 }
                 if message.content.len() != self.blocks.len() {
@@ -335,7 +407,13 @@ where
                                 }
                                 return Some((Ok(event), (state, lifecycle)));
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                if let Err(error) = lifecycle.accept_silent(&msg.data, &state.partial)
+                                {
+                                    state.done = true;
+                                    return Some((Err(error), (state, lifecycle)));
+                                }
+                            }
                             Err(error) => {
                                 state.done = true;
                                 return Some((Err(error), (state, lifecycle)));
@@ -739,5 +817,166 @@ mod tests {
             panic!("expected provider Error");
         };
         assert_eq!(error.error_message.as_deref(), Some("overloaded"));
+    }
+
+    #[test]
+    fn missing_or_null_delta_payloads_never_become_completed_content() {
+        for (kind, delta_kind, field) in [
+            ("text", "text_delta", "text"),
+            ("thinking", "thinking_delta", "thinking"),
+            ("tool_use", "input_json_delta", "partial_json"),
+        ] {
+            for payload in [None, Some(Value::Null)] {
+                let mut delta = json!({"type": delta_kind});
+                if let Some(payload) = payload {
+                    delta.as_object_mut().unwrap().insert(field.to_string(), payload);
+                }
+                let events = collect_wire([
+                    start(),
+                    json!({"type": "content_block_start", "index": 0, "content_block": {
+                        "type": kind, "id": "call-a", "name": "read", "input": {}
+                    }}),
+                    json!({"type": "content_block_delta", "index": 0, "delta": delta}),
+                    stop(0),
+                ].into_iter().chain(finish()));
+                assert_terminal_error(&events);
+                assert!(
+                    !events.iter().any(|event| matches!(event,
+                        Ok(StreamEvent::TextEnd { .. }
+                            | StreamEvent::ThinkingEnd { .. }
+                            | StreamEvent::ToolCallEnd { .. })
+                    )),
+                    "{kind}: {events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn orphan_and_duplicate_tool_stops_are_not_silently_discarded() {
+        for input in [
+            vec![start(), stop(0)],
+            vec![start(), tool_start(0, "call-a", &json!({})), stop(9)],
+            vec![start(), tool_start(0, "call-a", &json!({})), stop(0), stop(0)],
+        ] {
+            assert_terminal_error(&collect_wire(input.into_iter().chain(finish())));
+        }
+    }
+
+    #[test]
+    fn signatures_cannot_target_non_thinking_or_closed_blocks() {
+        for kind in ["text", "tool_use", "redacted_thinking", "thinking"] {
+            let mut input = vec![
+                start(),
+                json!({"type": "content_block_start", "index": 0, "content_block": {
+                    "type": kind, "id": "call-a", "name": "read", "input": {}, "data": "opaque"
+                }}),
+            ];
+            if kind == "thinking" {
+                input.push(stop(0));
+            }
+            input.push(json!({"type": "content_block_delta", "index": 0, "delta": {
+                "type": "signature_delta", "signature": "signature"
+            }}));
+            input.extend(finish());
+            assert_terminal_error(&collect_wire(input));
+        }
+    }
+
+    #[test]
+    fn missing_signatures_and_orphan_signatures_are_terminal() {
+        for delta in [
+            json!({"type": "signature_delta"}),
+            json!({"type": "signature_delta", "signature": null}),
+        ] {
+            let events = collect_wire([
+                start(),
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": delta}),
+                stop(0),
+            ].into_iter().chain(finish()));
+            assert_terminal_error(&events);
+        }
+        assert_terminal_error(&collect_wire([
+            start(),
+            json!({"type": "content_block_delta", "index": 9, "delta": {
+                "type": "signature_delta", "signature": "orphan"
+            }}),
+        ].into_iter().chain(finish())));
+    }
+
+    #[test]
+    fn redacted_thinking_cannot_silently_discard_thinking_text() {
+        assert_terminal_error(&collect_wire([
+            start(),
+            json!({"type": "content_block_start", "index": 0, "content_block": {
+                "type": "redacted_thinking", "data": "opaque"
+            }}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {
+                "type": "thinking_delta", "thinking": "must not disappear"
+            }}),
+            stop(0),
+        ].into_iter().chain(finish())));
+    }
+
+    #[test]
+    fn message_stop_requires_an_explicit_completion_reason() {
+        for mut input in [
+            vec![start()],
+            vec![start(), json!({"type": "message_delta", "delta": {}})],
+            vec![start(), json!({"type": "message_delta", "delta": {"stop_reason": null}})],
+        ] {
+            input.push(json!({"type": "message_stop"}));
+            let events = collect_wire(input);
+            assert_terminal_error(&events);
+            assert!(events.last().unwrap().as_ref().unwrap_err().to_string()
+                .contains("without a final stop reason"));
+        }
+    }
+
+    #[test]
+    fn top_level_deltas_require_a_started_message_and_finish_content() {
+        assert_terminal_error(&collect_wire(finish()));
+        for reason in [Value::Null, json!("end_turn")] {
+            let events = collect_wire([
+                start(),
+                json!({"type": "message_delta", "delta": {"stop_reason": reason}}),
+                tool_start(0, "too-late", &json!({})),
+                stop(0),
+            ].into_iter().chain(finish()));
+            assert_terminal_error(&events);
+            assert!(!events.iter().any(|event| matches!(
+                event, Ok(StreamEvent::ToolCallStart { .. })
+            )));
+        }
+    }
+
+    #[test]
+    fn empty_text_deltas_and_multiple_metadata_updates_remain_valid() {
+        let events = collect_wire([
+            json!({"type": "ping"}),
+            start(),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "retained"}}),
+            stop(0),
+            json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 1}}),
+            json!({"type": "ping"}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+            json!({"type": "message_stop"}),
+        ]);
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert_eq!(events.iter().filter(|event| matches!(
+            event, Ok(StreamEvent::Done { .. })
+        )).count(), 1);
+        let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+            panic!("expected Done");
+        };
+        assert_eq!(*reason, StopReason::Stop);
+        assert_eq!(message.usage.output, 2);
+        let ContentBlock::Text(text) = &message.content[0] else {
+            panic!("expected text");
+        };
+        assert_eq!(text.text, "retained");
     }
 }
