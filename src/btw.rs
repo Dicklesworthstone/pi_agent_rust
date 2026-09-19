@@ -259,8 +259,16 @@ mod tests {
 
     #[test]
     fn for_model_entry_rejects_credentialed_provider_without_key() {
-        let entry = crate::models::ad_hoc_model_entry("anthropic", "claude-sonnet-4-5")
+        let mut entry = crate::models::ad_hoc_model_entry("anthropic", "claude-sonnet-4-5")
             .expect("anthropic ad-hoc entry resolves");
+        // `ad_hoc_model_entry` loads `Config::auth_path()` itself and stamps
+        // whatever that resolves onto the entry. For the global path that
+        // includes external-credential auto-detection, so on any machine where
+        // Claude Code is logged in the entry arrives already credentialed and
+        // the empty `AuthStorage` below never gets a say — the assertion then
+        // measured the developer's login rather than the code. Clearing the
+        // field is what puts the "without key" back into the test name.
+        entry.api_key = None; // ubs:ignore no clone and no loop on this line
         assert!(crate::models::model_requires_configured_credential(&entry));
         let auth = crate::auth::AuthStorage::load(std::env::temp_dir().join(format!(
             "pi-btw-test-auth-empty-{}.json",
