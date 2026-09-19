@@ -13,6 +13,8 @@ use super::{
 use crate::lsp::client::{DocumentSnapshot, try_path_to_uri, uri_to_path};
 use crate::lsp::edits::WorkspaceEditPlan;
 
+mod versions;
+
 struct RefactorSnapshot {
     source: PathBuf,
     source_hash: u64,
@@ -60,22 +62,7 @@ fn validate_versions(
     requested: &HashMap<PathBuf, DocumentSnapshot>,
     current: &HashMap<PathBuf, DocumentSnapshot>,
 ) -> Result<()> {
-    let Some(changes) = raw.get("documentChanges").and_then(Value::as_array) else { return Ok(()) };
-    for change in changes {
-        let Some(document) = change.get("textDocument") else { continue };
-        let Some(version) = document.get("version").filter(|version| !version.is_null()) else { continue };
-        let path = document.get("uri").and_then(Value::as_str).and_then(uri_to_path)
-            .ok_or_else(|| tool_err("LSP_EDIT_MALFORMED", "invalid versioned document URI"))?;
-        let matches = version.as_u64().filter(|version| *version > 0 && *version <= i32::MAX as u64)
-            .zip(requested.get(&path)).zip(current.get(&path))
-            .is_some_and(|((version, before), now)| {
-                before.version == version && now.version == version && before.hash == now.hash
-            });
-        if !matches {
-            return Err(tool_err("LSP_EDIT_CONFLICT", "server edit does not match the requested document version"));
-        }
-    }
-    Ok(())
+    versions::validate(raw, requested, current)
 }
 
 fn check_response_size(raw: &Value) -> Result<()> {
