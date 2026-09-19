@@ -20981,6 +20981,7 @@ function __pi_register_provider(provider_id, spec) {
         if (m && m.cost) out.cost = m.cost;
         if (m && m.contextWindow !== undefined) out.contextWindow = m.contextWindow;
         if (m && m.maxTokens !== undefined) out.maxTokens = m.maxTokens;
+        if (m && m.headers && typeof m.headers === 'object') out.headers = Object.assign({}, m.headers);
         return out;
     }) : [];
 
@@ -21021,6 +21022,9 @@ function __pi_register_provider(provider_id, spec) {
         models: models,
         hasStreamSimple: effectiveHasStreamSimple,
     };
+    if (spec.headers && typeof spec.headers === 'object') {
+        providerSpec.headers = Object.assign({}, spec.headers);
+    }
     if (spec.oauth && typeof spec.oauth === 'object') {
         const oauth = {};
         if (spec.oauth.authUrl !== undefined && spec.oauth.authUrl !== null) {

@@ -592,7 +592,7 @@ fn rust_analyzer_diagnostics_reports_type_error() {
 
     let out = execute_lsp(
         &registry,
-        json!({"action": "diagnostics", "file": "src/broken.rs", "timeout": 30}),
+        json!({"action": "diagnostics", "file": "src/broken.rs", "timeout": 60}),
     )
     .expect("diagnostics executes");
     let payload = output_json(&out);

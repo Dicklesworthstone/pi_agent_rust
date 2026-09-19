@@ -1469,6 +1469,39 @@ pub mod snapshot {
     ///
     /// If git is unavailable or fails, returns `CompletenessError::GitCommand`.
     /// If any tracked files are missing, returns `CompletenessError::IncompleteTree`.
+    fn collect_disk_subpath_files(
+        repo_root: &Path,
+        subpath: &str,
+    ) -> Result<Vec<String>, CompletenessError> {
+        let base_subpath = repo_root.join(subpath);
+        if base_subpath.is_dir() {
+            let mut disk_files = Vec::new();
+            collect_files_recursive(&base_subpath, &mut disk_files)
+                .map_err(CompletenessError::Io)?;
+            Ok(disk_files
+                .into_iter()
+                .filter_map(|p| {
+                    p.strip_prefix(repo_root)
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().into_owned())
+                })
+                .collect())
+        } else if base_subpath.is_file() {
+            Ok(vec![subpath.to_string()])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Query git for tracked files under `subpath` relative to `repo_root`, and verify that
+    /// all tracked files exist on disk.
+    ///
+    /// Supports `PI_TEST_ARTIFACTS_ROOT` environment override when verifying test copies:
+    /// if `subpath == "tests/ext_conformance/artifacts"` (or matches `ARTIFACT_ROOT`), and
+    /// `PI_TEST_ARTIFACTS_ROOT` is set, tracked files are checked within the overridden directory.
+    ///
+    /// If git is unavailable or fails, returns `CompletenessError::GitCommand`.
+    /// If any tracked files are missing, returns `CompletenessError::IncompleteTree`.
     pub fn verify_tree_completeness(
         repo_root: &Path,
         subpath: &str,
@@ -1501,24 +1534,7 @@ pub mod snapshot {
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     if !repo_root.join(".git").exists() || stderr.contains("not a git repository") {
-                        let base_subpath = repo_root.join(subpath);
-                        if base_subpath.is_dir() {
-                            let mut disk_files = Vec::new();
-                            collect_files_recursive(&base_subpath, &mut disk_files)
-                                .map_err(CompletenessError::Io)?;
-                            disk_files
-                                .into_iter()
-                                .filter_map(|p| {
-                                    p.strip_prefix(repo_root)
-                                        .ok()
-                                        .map(|rel| rel.to_string_lossy().into_owned())
-                                })
-                                .collect()
-                        } else if base_subpath.is_file() {
-                            vec![subpath.to_string()]
-                        } else {
-                            Vec::new()
-                        }
+                        collect_disk_subpath_files(repo_root, subpath)?
                     } else {
                         return Err(CompletenessError::GitCommand(format!(
                             "git ls-files exited with {}: {stderr}",
@@ -1527,30 +1543,12 @@ pub mod snapshot {
                     }
                 }
                 Err(e) => {
-                    if !repo_root.join(".git").exists() {
-                        let base_subpath = repo_root.join(subpath);
-                        if base_subpath.is_dir() {
-                            let mut disk_files = Vec::new();
-                            collect_files_recursive(&base_subpath, &mut disk_files)
-                                .map_err(CompletenessError::Io)?;
-                            disk_files
-                                .into_iter()
-                                .filter_map(|p| {
-                                    p.strip_prefix(repo_root)
-                                        .ok()
-                                        .map(|rel| rel.to_string_lossy().into_owned())
-                                })
-                                .collect()
-                        } else if base_subpath.is_file() {
-                            vec![subpath.to_string()]
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
+                    if repo_root.join(".git").exists() {
                         return Err(CompletenessError::GitCommand(format!(
                             "failed to execute git ls-files: {e}"
                         )));
                     }
+                    collect_disk_subpath_files(repo_root, subpath)?
                 }
             }
         };

@@ -209,9 +209,8 @@ impl LspClient {
             .pointer("/workspace/fileOperations/willRenameFiles")
             .is_some();
         let sync_kind = document_sync::SyncPolicy::parse(&caps)
-            .map_err(|error| {
+            .inspect_err(|_| {
                 client.rpc.kill();
-                error
             })?
             .change;
         let server_name = result
@@ -309,7 +308,9 @@ impl LspClient {
     }
 
     pub async fn wait_for_diagnostics(&self, uri: &str, wait: Duration) -> bool {
-        let Some(uri) = file_uri::normalize_uri(uri) else { return false };
+        let Some(uri) = file_uri::normalize_uri(uri) else {
+            return false;
+        };
         let cx = AgentCx::for_current_or_request();
         let start = cx
             .cx()

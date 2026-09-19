@@ -25,22 +25,31 @@ pub fn path_to_uri(path: &Path) -> String {
 /// Returns `LSP_FILE_URI` for relative paths, parent traversal, or filenames
 /// that cannot be represented without changing their native identity.
 pub fn try_path_to_uri(path: &Path) -> Result<String> {
-    let invalid = || Error::tool("lsp", "[LSP_FILE_URI] path has no unambiguous absolute file URI");
+    let invalid = || {
+        Error::tool(
+            "lsp",
+            "[LSP_FILE_URI] path has no unambiguous absolute file URI",
+        )
+    };
     if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
         return Err(invalid());
     }
     // This existing dependency handles native drive prefixes, verbatim disk
     // and UNC paths, and percent-encodes Unix bytes without UTF-8 replacement.
-    let uri = url::Url::from_file_path(path).map_err(|()| invalid())?.to_string();
+    let uri = url::Url::from_file_path(path)
+        .map_err(|()| invalid())?
+        .to_string();
     // Reject NULs, unsupported Windows device names and other identities our
     // inverse cannot safely represent. No filesystem access is performed.
     let native = uri_to_path(&uri).ok_or_else(invalid)?;
     // Use the inverse's normalized drive letter / UNC hostname on Windows
     // so local snapshots and equivalent server URI spellings use one key.
-    url::Url::from_file_path(native).map(String::from).map_err(|()| invalid())
+    url::Url::from_file_path(native)
+        .map(String::from)
+        .map_err(|()| invalid())
 }
 
-fn hex(byte: u8) -> Option<u8> {
+const fn hex(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -69,21 +78,27 @@ fn decode_path(raw: &str) -> Option<Vec<u8>> {
         }
         decoded.push(byte);
     }
-    if decoded.split(|byte| *byte == b'/').any(|part| matches!(part, b"." | b"..")) {
+    if decoded
+        .split(|byte| *byte == b'/')
+        .any(|part| matches!(part, b"." | b".."))
+    {
         return None;
     }
     Some(decoded)
 }
 
-/// Convert a file URI into an absolute native path. Non-file schemes,
-/// queries/fragments, malformed escapes, NULs and traversal are rejected.
-/// A remote authority is a UNC host on Windows and unsupported on Unix;
-/// it can never become a path relative to the current workspace.
+/// Convert a file URI into an absolute native path.
+///
+/// Non-file schemes, queries/fragments, malformed escapes, NULs and traversal
+/// are rejected. A remote authority is a UNC host on Windows and unsupported on
+/// Unix; it can never become a path relative to the current workspace.
 #[must_use]
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let (scheme, rest) = uri.split_once("://")?;
     if !scheme.eq_ignore_ascii_case("file")
-        || rest.bytes().any(|byte| byte.is_ascii_control() || matches!(byte, b' ' | b'\\' | b'?' | b'#'))
+        || rest
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b' ' | b'\\' | b'?' | b'#'))
     {
         return None;
     }
@@ -93,7 +108,9 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     // escapes or Windows drive letters misplaced in the authority slot.
     if !authority.is_empty()
         && (authority.split('.').any(str::is_empty)
-            || !authority.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')))
+            || !authority
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')))
     {
         return None;
     }
@@ -141,7 +158,10 @@ fn windows_path(authority: &str, bytes: &[u8]) -> Option<String> {
         if drive.len() != 2 || !drive[0].is_ascii_alphabetic() || drive[1] != b':' {
             return None;
         }
-        (format!("{}:\\", char::from(drive[0].to_ascii_uppercase())), tail)
+        (
+            format!("{}:\\", char::from(drive[0].to_ascii_uppercase())),
+            tail,
+        )
     } else {
         if text.is_empty() || text.starts_with('/') {
             return None;
@@ -153,7 +173,9 @@ fn windows_path(authority: &str, bytes: &[u8]) -> Option<String> {
         // spaces and treats reserved basenames as devices. A file URI cannot
         // authorize those aliases or alternate data streams.
         if part.ends_with(['.', ' '])
-            || part.chars().any(|ch| ch.is_control() || matches!(ch, '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+            || part.chars().any(|ch| {
+                ch.is_control() || matches!(ch, '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+            })
             || windows_device_name(part)
         {
             return None;
@@ -164,11 +186,21 @@ fn windows_path(authority: &str, bytes: &[u8]) -> Option<String> {
 
 #[cfg(any(windows, test))]
 fn windows_device_name(part: &str) -> bool {
-    let name = part.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
-    matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
-        || name.strip_prefix("COM").or_else(|| name.strip_prefix("LPT"))
-            .is_some_and(|suffix| matches!(suffix.as_bytes(), [b'1'..=b'9'])
-                || matches!(suffix, "¹" | "²" | "³"))
+    let name = part
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    matches!(
+        name.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || name
+        .strip_prefix("COM")
+        .or_else(|| name.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(suffix.as_bytes(), [b'1'..=b'9']) || matches!(suffix, "¹" | "²" | "³")
+        })
 }
 
 /// Canonical lexical identity shared by notifications and local snapshots.

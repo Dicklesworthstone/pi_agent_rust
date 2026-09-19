@@ -1131,6 +1131,23 @@ const MUST_PASS_SOURCE_PATHS: &[&str] = &[
 ];
 
 fn current_git_commit(root: &Path) -> Result<String, String> {
+    if let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        && output.status.success()
+        && let Ok(commit_str) = String::from_utf8(output.stdout)
+    {
+        let commit = commit_str.trim();
+        if matches!(commit.len(), 40 | 64)
+            && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && !commit.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
+            return Ok(commit.to_string());
+        }
+    }
+
     if let Ok(commit) = std::env::var("PI_PROVIDER_REPLAY_GIT_COMMIT") {
         let commit = commit.trim();
         if matches!(commit.len(), 40 | 64)
@@ -1153,30 +1170,7 @@ fn current_git_commit(root: &Path) -> Result<String, String> {
     if !root.join(".git").exists() {
         return Ok("0000000000000000000000000000000000000000".to_string());
     }
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|err| format!("failed to execute git rev-parse HEAD: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git rev-parse HEAD failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let commit = String::from_utf8(output.stdout)
-        .map_err(|err| format!("git rev-parse HEAD returned non-UTF-8 output: {err}"))?;
-    let commit = commit.trim();
-    if !matches!(commit.len(), 40 | 64)
-        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || commit.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        return Err(format!(
-            "git rev-parse HEAD returned invalid commit: {commit}"
-        ));
-    }
-    Ok(commit.to_string())
+    Err("git rev-parse HEAD failed and no commit fallback available".to_string())
 }
 
 fn ensure_must_pass_worktree_matches_commit(

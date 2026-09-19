@@ -196,6 +196,10 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/actions.rs` | LSP code action and refactoring execution | Unit; `tests/lsp.rs`. |
 | `src/lsp/actions/protocol_tests.rs` | LSP code action protocol test cases | Test support module; exercises code actions. |
 | `src/lsp/client.rs` | LSP client | `tests/lsp.rs`. |
+| `src/lsp/client/document_sync.rs` | LSP client live document synchronization | Unit; `src/lsp/client/document_sync/tests.rs`. |
+| `src/lsp/client/document_sync/tests.rs` | LSP document synchronization tests | Test module; document sync tests. |
+| `src/lsp/client/file_uri.rs` | LSP file URI parser and path resolution | Unit; `src/lsp/client/file_uri/tests.rs`. |
+| `src/lsp/client/file_uri/tests.rs` | LSP file URI test suite | Test module; file URI tests. |
 | `src/lsp/edits.rs` | LSP edits | `tests/lsp.rs`. |
 | `src/lsp/edits/sequence.rs` | LSP workspace edit sequence parser and validator | Unit; in-module tests. |
 | `src/lsp/edits/sequence/tests.rs` | LSP workspace edit sequence test suite | Test module; sequence tests. |

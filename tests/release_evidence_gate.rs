@@ -4051,7 +4051,7 @@ where
         after_unbound_probe()?;
         let bound_summary = parse_release_json(&probed_bytes)
             .map_err(|err| format!("source-bound performance summary is invalid JSON: {err}"))?;
-        return Ok((bound_summary, false));
+        return Ok((bound_summary, true));
     }
     let context = performance_git_context(root)?;
     let full_path = contained_regular_artifact_path(&context, artifact_path)?;

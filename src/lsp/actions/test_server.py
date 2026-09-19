@@ -81,7 +81,7 @@ def main():
             reply(request, {"capabilities": {"textDocumentSync": 1,
                   "codeActionProvider": {"resolveProvider": True},
                   "executeCommandProvider": {"commands": ["test.finish"]}}})
-        elif method == "textDocument/didOpen":
+        elif method in ("textDocument/didOpen", "textDocument/didChange"):
             VERSIONS.append(params["textDocument"]["version"])
         elif method == "textDocument/codeAction":
             SOURCE = params["textDocument"]["uri"]

@@ -216,10 +216,18 @@ impl McpContextTool {
 #[derive(serde::Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum McpContextAction {
-    ListResources { cursor: Option<String> },
-    ListResourceTemplates { cursor: Option<String> },
-    ReadResource { uri: String },
-    ListPrompts { cursor: Option<String> },
+    ListResources {
+        cursor: Option<String>,
+    },
+    ListResourceTemplates {
+        cursor: Option<String>,
+    },
+    ReadResource {
+        uri: String,
+    },
+    ListPrompts {
+        cursor: Option<String>,
+    },
     GetPrompt {
         name: String,
         arguments: Option<std::collections::BTreeMap<String, String>>,
@@ -245,9 +253,7 @@ fn resource_catalog_output(result: Value, templates: bool) -> ToolOutput {
                     public.insert(key.to_string(), value.clone());
                 }
             }
-            if !templates
-                && let Some(size) = entry.get("size")
-            {
+            if !templates && let Some(size) = entry.get("size") {
                 public.insert("size".to_string(), size.clone());
             }
             Value::Object(public)
