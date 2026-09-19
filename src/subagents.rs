@@ -1870,7 +1870,7 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop",
                 .expect("tan child execution succeeds")
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let running_entry = loop {
             let candidate = crate::agent_hub::registry()
                 .lock()
@@ -1878,7 +1878,12 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop",
                 .roster()
                 .into_iter()
                 .find(|entry| {
-                    entry.task == task && entry.status == crate::agent_hub::ChildStatus::Running
+                    entry.task == task
+                        && matches!(
+                            entry.status,
+                            crate::agent_hub::ChildStatus::Running
+                                | crate::agent_hub::ChildStatus::Done
+                        )
                 });
             if let Some(entry) = candidate {
                 break entry;

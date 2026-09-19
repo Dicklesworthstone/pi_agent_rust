@@ -91,7 +91,7 @@ fn invalid_request_timeouts_never_launch() {
 fn an_uncooperative_running_child_is_terminated_by_the_parent() {
     let (_root, tool) = fixture(
         "printf 'started\\n' > launched\nexec sleep 30",
-        Duration::from_secs(1),
+        Duration::from_secs(3),
     );
     let started = Instant::now();
     let output = run(&tool, request(), None).unwrap();
@@ -119,7 +119,7 @@ fn an_uncooperative_running_child_is_terminated_by_the_parent() {
 fn a_terminal_frame_cannot_hide_a_process_that_never_exits() {
     let (_root, tool) = fixture(
         &format!("{}exec sleep 30", end("looks complete")),
-        Duration::from_secs(1),
+        Duration::from_secs(3),
     );
     let output = run(&tool, request(), None).unwrap();
     assert!(output.is_error);
@@ -131,7 +131,7 @@ fn a_terminal_frame_cannot_hide_a_process_that_never_exits() {
 fn queued_parallel_work_consumes_the_original_budget() {
     let (_root, tool) = fixture(
         "printf 'started\\n' >> launches\nexec sleep 30",
-        Duration::from_secs(1),
+        Duration::from_secs(3),
     );
     let output = run(
         &tool,
@@ -280,7 +280,7 @@ fn corrective_processes_receive_the_same_absolute_deadline() {
 fn expired_isolated_work_is_preserved_and_never_applied() {
     let (_root, tool) = fixture(
         "printf 'unaccepted\\n' > tracked.txt\nexec sleep 30",
-        Duration::from_secs(2),
+        Duration::from_secs(5),
     );
     for args in [
         vec!["init", "--quiet", "-b", "main"],
@@ -333,7 +333,7 @@ fn expired_isolated_work_is_preserved_and_never_applied() {
 
 #[test]
 fn background_tan_uses_the_same_host_budget() {
-    let (_root, tool) = fixture("exec sleep 30", Duration::from_secs(1));
+    let (_root, tool) = fixture("exec sleep 30", Duration::from_secs(3));
     let completion = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .unwrap()

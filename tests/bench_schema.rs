@@ -1276,7 +1276,7 @@ elif [[ -n "$bench_name" ]]; then
       expected_args=(
         bench --bench pijs_workload --profile perf
         --no-default-features
-        --features clipboard,image,image-resize,sqlite-sessions,tui,wasm-host
+        --features clipboard,image,image-resize,sqlite-sessions,wasm-host
         -- --regression-gate-pair
       )
       args=("$@")

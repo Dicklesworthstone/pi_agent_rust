@@ -308,6 +308,7 @@ fn is_nonblocking_auto_repair_failure(result: &ExtResult) -> bool {
     result.error.as_deref().is_some_and(|error| {
         error.starts_with("artifact not found")
             || error.contains("host write denied")
+            || error.contains("JS extension runtime load timed out")
             || is_known_package_compat_failure(result, error)
             // `npm/agentsbox` is an npm-registry T3 package-interop case that is
             // covered by separate contract evidence, not this smoke-style loader

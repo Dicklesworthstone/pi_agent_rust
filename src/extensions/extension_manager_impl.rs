@@ -4047,6 +4047,16 @@ impl ExtensionManager {
                     })
                 });
 
+            // Extract provider-level headers if present.
+            let mut provider_headers = HashMap::new();
+            if let Some(headers_obj) = provider_spec.get("headers").and_then(Value::as_object) {
+                for (k, v) in headers_obj {
+                    if let Some(s) = v.as_str() {
+                        provider_headers.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+
             let models = provider_spec
                 .get("models")
                 .and_then(Value::as_array)
@@ -4111,6 +4121,38 @@ impl ExtensionManager {
                         },
                     );
 
+                let mut model_headers = provider_headers.clone();
+                if let Some(headers_obj) = model_spec.get("headers").and_then(Value::as_object) {
+                    for (k, v) in headers_obj {
+                        if let Some(s) = v.as_str() {
+                            model_headers.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+
+                let cost = model_spec.get("cost").and_then(Value::as_object).map_or(
+                    ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    |c| ModelCost {
+                        input: c.get("input").and_then(Value::as_f64).unwrap_or(0.0),
+                        output: c.get("output").and_then(Value::as_f64).unwrap_or(0.0),
+                        cache_read: c
+                            .get("cacheRead")
+                            .or_else(|| c.get("cache_read"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0),
+                        cache_write: c
+                            .get("cacheWrite")
+                            .or_else(|| c.get("cache_write"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0),
+                    },
+                );
+
                 entries.push(crate::models::ModelEntry {
                     model: Model {
                         id: model_id,
@@ -4120,18 +4162,13 @@ impl ExtensionManager {
                         base_url: base_url.clone(),
                         reasoning,
                         input,
-                        cost: ModelCost {
-                            input: 0.0,
-                            output: 0.0,
-                            cache_read: 0.0,
-                            cache_write: 0.0,
-                        },
+                        cost,
                         context_window,
                         max_tokens,
-                        headers: HashMap::new(),
+                        headers: model_headers.clone(),
                     },
                     api_key: resolved_key.clone(),
-                    headers: HashMap::new(),
+                    headers: model_headers,
                     auth_header: true,
                     compat: None,
                     oauth_config: oauth_config.clone(),

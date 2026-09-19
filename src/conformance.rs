@@ -1486,26 +1486,73 @@ pub mod snapshot {
             let output = std::process::Command::new("git")
                 .current_dir(repo_root)
                 .args(["ls-files", "--", subpath])
-                .output()
-                .map_err(|e| {
-                    CompletenessError::GitCommand(format!("failed to execute git ls-files: {e}"))
-                })?;
+                .output();
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(CompletenessError::GitCommand(format!(
-                    "git ls-files exited with {}: {stderr}",
-                    output.status
-                )));
+            match output {
+                Ok(out) if out.status.success() => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    stdout
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(ToString::to_string)
+                        .collect()
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !repo_root.join(".git").exists() || stderr.contains("not a git repository") {
+                        let base_subpath = repo_root.join(subpath);
+                        if base_subpath.is_dir() {
+                            let mut disk_files = Vec::new();
+                            collect_files_recursive(&base_subpath, &mut disk_files)
+                                .map_err(CompletenessError::Io)?;
+                            disk_files
+                                .into_iter()
+                                .filter_map(|p| {
+                                    p.strip_prefix(repo_root)
+                                        .ok()
+                                        .map(|rel| rel.to_string_lossy().into_owned())
+                                })
+                                .collect()
+                        } else if base_subpath.is_file() {
+                            vec![subpath.to_string()]
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        return Err(CompletenessError::GitCommand(format!(
+                            "git ls-files exited with {}: {stderr}",
+                            out.status
+                        )));
+                    }
+                }
+                Err(e) => {
+                    if !repo_root.join(".git").exists() {
+                        let base_subpath = repo_root.join(subpath);
+                        if base_subpath.is_dir() {
+                            let mut disk_files = Vec::new();
+                            collect_files_recursive(&base_subpath, &mut disk_files)
+                                .map_err(CompletenessError::Io)?;
+                            disk_files
+                                .into_iter()
+                                .filter_map(|p| {
+                                    p.strip_prefix(repo_root)
+                                        .ok()
+                                        .map(|rel| rel.to_string_lossy().into_owned())
+                                })
+                                .collect()
+                        } else if base_subpath.is_file() {
+                            vec![subpath.to_string()]
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        return Err(CompletenessError::GitCommand(format!(
+                            "failed to execute git ls-files: {e}"
+                        )));
+                    }
+                }
             }
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToString::to_string)
-                .collect()
         };
 
         // Determine target directory on disk. Check for PI_TEST_ARTIFACTS_ROOT override.

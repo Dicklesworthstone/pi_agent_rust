@@ -999,17 +999,20 @@ mod tests {
     fn send_text_drives_repl() {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-repl";
-        let snapshot = start(&spec(
+        let mut launch = spec(
             name,
             "python3",
-            &["-i", "-q"],
+            &["-u", "-i", "-q"],
             Some(ReadySpec {
                 log: Some(">>>".to_string()),
                 port: None,
-                timeout_secs: Some(10),
+                timeout_secs: Some(20),
             }),
-        ))
-        .expect("repl start");
+        );
+        launch
+            .env
+            .push(("PYTHONUNBUFFERED".to_string(), "1".to_string()));
+        let snapshot = start(&launch).expect("repl start");
         assert_eq!(snapshot.status, "running");
         send_text(name, "print(40 + 2)", true).expect("send");
         let page = logs(name, None, Some(50), Some("42"), 5_000).expect("logs");

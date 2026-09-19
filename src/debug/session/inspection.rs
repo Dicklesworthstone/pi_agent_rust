@@ -293,13 +293,15 @@ pub(super) async fn call(
                     "threadId does not own the supplied frame/object handle",
                 ));
             }
-            if suspension(&state, at.thread)? != at {
-                return Err(tool_err(
-                    "DAP_STALE_REFERENCE",
-                    "debugger handle outlived its suspension",
-                ));
+            match suspension(&state, at.thread) {
+                Ok(current) if current == at => at,
+                _ => {
+                    return Err(tool_err(
+                        "DAP_STALE_REFERENCE",
+                        "debugger handle outlived its suspension",
+                    ));
+                }
             }
-            at
         } else {
             let thread = state.execution.require(selected)?;
             if thread == 0 {

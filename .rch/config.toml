@@ -51,7 +51,7 @@ exclude_patterns = [
   ".cargo/credentials",
   ".cargo/credentials.toml",
   ".env",
-  ".env.*",
+  ".env.local",
   "*.pem",
   "*.key",
   "credentials.json",

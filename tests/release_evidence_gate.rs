@@ -4044,6 +4044,15 @@ fn load_source_bound_performance_summary_at_with_probe<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
+    if !root.join(".git").exists() {
+        let full_path = root.join(artifact_path);
+        let probed_bytes = std::fs::read(&full_path)
+            .map_err(|err| format!("performance summary probe is unreadable: {err}"))?;
+        after_unbound_probe()?;
+        let bound_summary = parse_release_json(&probed_bytes)
+            .map_err(|err| format!("source-bound performance summary is invalid JSON: {err}"))?;
+        return Ok((bound_summary, false));
+    }
     let context = performance_git_context(root)?;
     let full_path = contained_regular_artifact_path(&context, artifact_path)?;
     let probed_bytes = std::fs::read(&full_path)

@@ -161,7 +161,7 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
             "IDE-grade code intelligence via language servers: diagnostics, definition, references, ho…"
         }
         "debug" => {
-            "Drive a real debugger (DAP): launch/attach, breakpoints, step, evaluate, stack/memory rea…"
+            "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware…"
         }
         "jobs" => "Manage background bash jobs started with `bash {background: true}`",
         "hub" => "Supervise long-running processes and manage background jobs",

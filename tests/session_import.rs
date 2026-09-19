@@ -42,6 +42,7 @@ fn sample_claude_jsonl() -> String {
         r#"{"type":"assistant","timestamp":"2026-02-01T10:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"I will examine the grammar."},{"type":"thinking","thinking":"Analyzing BNF"}],"model":"claude-3-5-sonnet"}}"#,
         "INVALID_JSON_CORRUPT_LINE",
         r#"{"type":"assistant","timestamp":"2026-02-01T10:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_123","name":"read","input":{"path":"src/grammar.rs"}}]}}"#,
+        r#"{"type":"user","timestamp":"2026-02-01T10:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_123","content":"// grammar content"}]}}"#,
     ]
     .join("\n")
 }
@@ -52,6 +53,7 @@ fn sample_codex_jsonl() -> String {
         r#"{"type":"response_item","timestamp":"2026-02-01T10:00:01.000Z","payload":{"type":"message","role":"user","content":[{"text":"Fix unit tests"}]}}"#,
         r#"{"type":"response_item","timestamp":"2026-02-01T10:00:02.000Z","payload":{"type":"reasoning","summary":[{"text":"Running cargo test first"}]}}"#,
         r#"{"type":"response_item","timestamp":"2026-02-01T10:00:03.000Z","payload":{"type":"function_call","name":"bash","arguments":"{\"command\":\"cargo test\"}","call_id":"call_456"}}"#,
+        r#"{"type":"response_item","timestamp":"2026-02-01T10:00:04.000Z","payload":{"type":"function_call_output","call_id":"call_456","output":"test result: ok"}}"#,
     ]
     .join("\n")
 }
@@ -71,7 +73,7 @@ fn claude_end_to_end_fidelity_and_idempotency() {
             outcome.imported, outcome.skipped, outcome.session_path
         ),
     );
-    assert_eq!(outcome.imported, 3, "{:?}", outcome.report);
+    assert_eq!(outcome.imported, 4, "{:?}", outcome.report);
     assert_eq!(outcome.skipped, 1, "{:?}", outcome.report);
     assert!(!outcome.already_imported);
     assert!(
@@ -90,7 +92,7 @@ fn claude_end_to_end_fidelity_and_idempotency() {
     harness
         .log()
         .info("verify", format!("replayed {} messages", messages.len()));
-    assert_eq!(messages.len(), 3);
+    assert_eq!(messages.len(), 4);
     let has_tool_call = messages.iter().any(|message| match message {
         pi::model::Message::Assistant(assistant) => assistant
             .content
@@ -117,11 +119,11 @@ fn codex_reasoning_and_tools_import() {
             outcome.imported, outcome.session_path
         ),
     );
-    assert_eq!(outcome.imported, 3, "{:?}", outcome.report);
+    assert_eq!(outcome.imported, 4, "{:?}", outcome.report);
 
     let session = futures::executor::block_on(Session::open(&outcome.session_path)).expect("open");
     let messages = session.to_messages_for_current_path();
-    assert_eq!(messages.len(), 3);
+    assert_eq!(messages.len(), 4);
     let has_thinking = messages.iter().any(|message| match message {
         pi::model::Message::Assistant(assistant) => assistant
             .content
@@ -159,7 +161,7 @@ fn corruption_never_aborts_import() {
         ),
     );
     assert_eq!(
-        outcome.imported, 3,
+        outcome.imported, 4,
         "valid lines still import: {:?}",
         outcome.report
     );
