@@ -113,8 +113,14 @@ impl fmt::Debug for HttpSettings {
         // parse them to decide which parts are safe to print.
         f.debug_struct("HttpSettings")
             .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
-            .field("https_proxy", &self.https_proxy.as_ref().map(|_| "<redacted>"))
-            .field("http_proxy", &self.http_proxy.as_ref().map(|_| "<redacted>"))
+            .field(
+                "https_proxy",
+                &self.https_proxy.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "http_proxy",
+                &self.http_proxy.as_ref().map(|_| "<redacted>"),
+            )
             .field("no_proxy", &self.no_proxy)
             .field("ignore_env_proxy", &self.ignore_env_proxy)
             .finish()
@@ -750,7 +756,11 @@ mod tests {
             );
             assert!(!warnings.is_empty());
             assert!(warnings.iter().all(|warning| !warning.contains("sentinel")));
-            assert!(warnings.iter().any(|warning| warning.contains("HTTPS_PROXY")));
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("HTTPS_PROXY"))
+            );
         }
     }
 
@@ -763,7 +773,9 @@ mod tests {
             ..HttpSettings::default()
         };
         let config = resolve(Some(&settings), &[]);
-        let endpoint = config.endpoint_for(true, "api.example.com", 443).expect("proxy");
+        let endpoint = config
+            .endpoint_for(true, "api.example.com", 443)
+            .expect("proxy");
         let authorization = endpoint.authorization.as_deref().expect("credentials");
         let diagnostic = format!("{settings:?} {config:?} {endpoint:?}");
         assert!(!diagnostic.contains("sentinel"));
