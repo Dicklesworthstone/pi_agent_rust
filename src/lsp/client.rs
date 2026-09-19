@@ -181,6 +181,7 @@ impl LspClient {
                     "definition":{"linkSupport":false},"typeDefinition":{"linkSupport":false},
                     "implementation":{"linkSupport":false},"references":{},
                     "callHierarchy":{"dynamicRegistration":false},
+                    "typeHierarchy":{"dynamicRegistration":false},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
                     "rename":{"prepareSupport":false,"honorsChangeAnnotations":false},
                     "codeAction":{

@@ -563,19 +563,19 @@ impl Tool for LspTool {
         "lsp"
     }
     fn description(&self) -> &str {
-        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities and request. Call hierarchy queries start at file + symbol, then follow returned hierarchyId handles. Code actions return stable actionId values; apply with apply:true plus actionId or a title/index query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. Formatting range positions are zero-based UTF-16."
+        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities and request. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. Code actions return stable actionId values; apply with apply:true plus actionId or a title/index query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. Formatting range positions are zero-based UTF-16."
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request"]},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request"]},
                 "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics also accepts a glob over cached reports (not a workspace scan)"},
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
                 "query":{"type":"string","description":"Workspace-symbol query, or fresh code-action title/index selection"},
                 "actionId":{"type":"string","description":"Opaque ID from a prior code_actions listing; requires apply:true and no query"},
-                "hierarchyId":{"type":"string","description":"Opaque call-hierarchy item from a previous result; use instead of file/line/symbol to traverse one more level. Handles expire with their source or server."},
+                "hierarchyId":{"type":"string","description":"Opaque hierarchy item from a previous result; use instead of file/line/symbol to traverse one more level. Call and type handles are not interchangeable. Handles expire with their source or server."},
                 "newName":{"type":"string","description":"New symbol name for rename"},
                 "newFile":{"type":"string","description":"Destination path for rename_file"},
                 "apply":{"type":"boolean","description":"Apply the selected code action, or write formatting changes instead of previewing"},
@@ -661,7 +661,7 @@ impl Tool for LspTool {
                 .await
             }
             "symbols" => self.run_symbols(&input).await,
-            "incoming_calls" | "outgoing_calls" => self.run_hierarchy(&input).await,
+            "incoming_calls" | "outgoing_calls" | "supertypes" | "subtypes" => self.run_hierarchy(&input).await,
             "rename" => self.run_rename(&input).await,
             "rename_file" => self.run_rename_file(&input).await,
             "code_actions" => self.run_code_actions(&input).await,
@@ -671,7 +671,7 @@ impl Tool for LspTool {
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request"
             ))),
         }
     }

@@ -1,4 +1,4 @@
-//! One-hop call-graph exploration with server-owned item identities.
+//! One-hop call and type exploration with server-owned item identities.
 //!
 //! Preparation resolves a position once; subsequent hops send the exact item
 //! (including opaque data) back to the same live server. Handles retain a
@@ -148,6 +148,7 @@ struct Origin {
     uri: String,
     text: Arc<str>,
     created: Instant,
+    family: Family,
 }
 
 impl Origin {
@@ -246,15 +247,44 @@ fn retained_bytes(entries: &VecDeque<CachedItem>, incoming: &Arc<Origin>) -> usi
     bytes
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Family { Call, Type }
+
+impl Family {
+    const fn name(self) -> &'static str {
+        match self { Self::Call => "call", Self::Type => "type" }
+    }
+
+    const fn prepare(self) -> &'static str {
+        match self {
+            Self::Call => "textDocument/prepareCallHierarchy",
+            Self::Type => "textDocument/prepareTypeHierarchy",
+        }
+    }
+
+    const fn capability(self) -> &'static str {
+        match self { Self::Call => "callHierarchyProvider", Self::Type => "typeHierarchyProvider" }
+    }
+}
+
 #[derive(Clone, Copy)]
-enum Direction { Incoming, Outgoing }
+enum Direction { Incoming, Outgoing, Supertypes, Subtypes }
 
 impl Direction {
     fn from_action(action: &str) -> Result<Self> {
         match action {
             "incoming_calls" => Ok(Self::Incoming),
             "outgoing_calls" => Ok(Self::Outgoing),
+            "supertypes" => Ok(Self::Supertypes),
+            "subtypes" => Ok(Self::Subtypes),
             _ => Err(tool_err("LSP_USAGE", "unknown hierarchy action")),
+        }
+    }
+
+    const fn family(self) -> Family {
+        match self {
+            Self::Incoming | Self::Outgoing => Family::Call,
+            Self::Supertypes | Self::Subtypes => Family::Type,
         }
     }
 
@@ -262,20 +292,27 @@ impl Direction {
         match self {
             Self::Incoming => "callHierarchy/incomingCalls",
             Self::Outgoing => "callHierarchy/outgoingCalls",
+            Self::Supertypes => "typeHierarchy/supertypes",
+            Self::Subtypes => "typeHierarchy/subtypes",
         }
     }
 
     fn capability(self, capabilities: &Value) -> Result<()> {
-        match capabilities.get("callHierarchyProvider") {
+        let name = self.family().capability();
+        match capabilities.get(name) {
             Some(Value::Bool(true) | Value::Object(_)) => Ok(()),
-            None | Some(Value::Bool(false)) => Err(tool_err("LSP_HIERARCHY_UNSUPPORTED", "server did not advertise call hierarchy support")),
-            _ => Err(malformed("invalid call hierarchy capability")),
+            None | Some(Value::Bool(false)) => Err(tool_err("LSP_HIERARCHY_UNSUPPORTED", format!("server did not advertise {name}"))),
+            _ => Err(malformed("invalid hierarchy capability")),
         }
     }
 }
 
 struct Related {
     item: Item,
+    calls: Option<CallSites>,
+}
+
+struct CallSites {
     site_uri: String,
     sites: Vec<Range>,
 }
@@ -284,7 +321,14 @@ fn related(raw: &Value, selected: &Item, direction: Direction) -> Result<Vec<Rel
     let mut out = Vec::new();
     let mut site_count = 0usize;
     for call in response_items(raw)? {
-        let key = match direction { Direction::Incoming => "from", Direction::Outgoing => "to" };
+        let key = match direction {
+            Direction::Incoming => "from",
+            Direction::Outgoing => "to",
+            Direction::Supertypes | Direction::Subtypes => {
+                out.push(Related { item: Item::parse(call)?, calls: None });
+                continue;
+            }
+        };
         let item = Item::parse(&call[key])?;
         let sites = call.get("fromRanges").and_then(Value::as_array)
             .ok_or_else(|| malformed("call hierarchy entry needs fromRanges"))?;
@@ -293,9 +337,9 @@ fn related(raw: &Value, selected: &Item, direction: Direction) -> Result<Vec<Rel
             return Err(tool_err("LSP_HIERARCHY_LIMIT", "too many call-site ranges"));
         }
         let sites = sites.iter().map(range).collect::<Result<Vec<_>>>()?;
-        let caller = match direction { Direction::Incoming => &item, Direction::Outgoing => selected };
+        let caller = if matches!(direction, Direction::Incoming) { &item } else { selected };
         let site_uri = caller.raw["uri"].as_str().expect("validated URI").to_string();
-        out.push(Related { item, site_uri, sites });
+        out.push(Related { item, calls: Some(CallSites { site_uri, sites }) });
     }
     Ok(out)
 }
@@ -335,6 +379,11 @@ impl LspTool {
                 return Err(tool_err("LSP_USAGE", "use hierarchyId instead of file, line and symbol"));
             }
             let cached = self.hierarchies.get(id)?;
+            // The two item structures intentionally look alike on the wire,
+            // but opaque data belongs to the family that prepared the item.
+            if cached.origin.family != direction.family() {
+                return Err(tool_err("LSP_USAGE", "hierarchyId belongs to another hierarchy kind; prepare a new file/symbol query"));
+            }
             let entry = cached.origin.entry.upgrade().ok_or_else(expired)?;
             (entry, cached.origin, cached.item)
         } else {
@@ -346,10 +395,12 @@ impl LspTool {
             direction.capability(&entry.client.capabilities().raw)?;
             let text = entry.client.synchronized_text(&uri).ok_or_else(expired)?;
             let position = Self::resolve_position_in(&path, &text, input.line, symbol)?;
-            let origin = Arc::new(Origin { entry: Arc::downgrade(&entry), path, uri, text, created: Instant::now() });
+            let origin = Arc::new(Origin {
+                entry: Arc::downgrade(&entry), path, uri, text, created: Instant::now(), family: direction.family(),
+            });
             origin.check(&entry, &budget.owner)?;
             let raw = entry.client.call(
-                "textDocument/prepareCallHierarchy", json!({"textDocument":{"uri":origin.uri},"position":position}), budget.remaining()?,
+                direction.family().prepare(), json!({"textDocument":{"uri":origin.uri},"position":position}), budget.remaining()?,
             ).await?;
             origin.check(&entry, &budget.owner)?;
             let mut items = response_items(&raw)?.iter().map(Item::parse).collect::<Result<Vec<_>>>()?;
@@ -376,10 +427,12 @@ impl LspTool {
         let total = related.len();
         let rows = related.into_iter().map(|related| {
             let mut row = related.item.summary(&self.cwd);
-            row["callSiteUri"] = json!(related.site_uri);
-            row["fromRanges"] = json!(related.sites.iter().take(MAX_SHOWN_CALL_SITES).collect::<Vec<_>>());
-            row["callSiteCount"] = json!(related.sites.len());
-            row["callSitesTruncated"] = json!(related.sites.len() > MAX_SHOWN_CALL_SITES);
+            if let Some(calls) = related.calls {
+                row["callSiteUri"] = json!(calls.site_uri);
+                row["fromRanges"] = json!(calls.sites.iter().take(MAX_SHOWN_CALL_SITES).collect::<Vec<_>>());
+                row["callSiteCount"] = json!(calls.sites.len());
+                row["callSitesTruncated"] = json!(calls.sites.len() > MAX_SHOWN_CALL_SITES);
+            }
             (related.item, row)
         }).collect();
         budget.remaining()?;
@@ -395,6 +448,7 @@ impl LspTool {
     ) -> Result<ToolOutput> {
         let mut payload = json!({
             "action":input.action,"server":entry.spec_name,"source":source.as_ref().map(|item| item.summary(&self.cwd)),
+            "hierarchyKind":origin.family.name(),
             "selectionRequired":selection_required,"count":0,"total":total,"truncated":false,"items":[],
             "rangeEncoding":"zero-based UTF-16",
             "note":"One server-reported hop, not a whole-program graph. Reuse hierarchyId to traverse; source changes and server restarts expire handles."

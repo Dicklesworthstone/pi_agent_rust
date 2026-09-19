@@ -18,6 +18,12 @@ def item(name, path='source.graphfixture'):
             'selectionRange': span(), 'detail': 'signature ' + name, 'tags': [1],
             'data': {'token': name, 'nested': [None, {'opaque': 7}]}, 'x-fixture': 'preserve me'}
 items = {'root': item('root'), 'leaf': item('leaf'), 'caller': item('caller', 'caller.graphfixture')}
+types = json.loads(json.dumps(items))
+for value in types.values():
+    value['kind'] = 5
+    value['data']['family'] = 'type'
+if mode == 'type_external':
+    types['caller']['uri'] = 'unresolved-type://library/ExternalBase'
 def send(message):
     body = json.dumps(message).encode('utf-8')
     sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode('ascii') + body)
@@ -44,8 +50,14 @@ while True:
     reply = {'jsonrpc': '2.0', 'id': message['id']}
     if method == 'initialize':
         caps = {'textDocumentSync': 0 if mode == 'unversioned' else 1,
-                'callHierarchyProvider': False if mode == 'unsupported' else {}}
+                'callHierarchyProvider': False if mode in ('unsupported', 'types_only') else {},
+                'typeHierarchyProvider': False if mode == 'type_unsupported' else {}}
+        if mode == 'type_bad_capability':
+            caps['typeHierarchyProvider'] = 'true'
+        if mode == 'calls_only':
+            del caps['typeHierarchyProvider']
         assert params['capabilities']['textDocument']['callHierarchy']['dynamicRegistration'] is False
+        assert params['capabilities']['textDocument']['typeHierarchy']['dynamicRegistration'] is False
         reply['result'] = {'capabilities': caps}
     elif method == 'textDocument/prepareCallHierarchy':
         if mode == 'hang_prepare':
@@ -66,6 +78,33 @@ while True:
             send({'jsonrpc':'2.0', 'id':700, 'method':'workspace/applyEdit', 'params':{'edit':{'changes':{
                 (root / 'source.graphfixture').as_uri(): [{'range':span(), 'newText':'UNAUTHORIZED'}]
             }}}})
+    elif method == 'textDocument/prepareTypeHierarchy':
+        reply['result'] = [types['root']]
+        if mode == 'type_ambiguous':
+            reply['result'].append(types['leaf'])
+        elif mode == 'type_none':
+            reply['result'] = None
+    elif method in ('typeHierarchy/supertypes', 'typeHierarchy/subtypes'):
+        selected = params['item']
+        assert selected == types[selected['name']], 'type identity was not preserved exactly'
+        target = types['caller'] if method == 'typeHierarchy/supertypes' else types['leaf']
+        if selected['name'] != 'root':
+            target = types['root']
+        reply['result'] = [target]
+        if mode == 'type_empty':
+            reply['result'] = []
+        elif mode == 'type_error':
+            del reply['result']
+            reply['error'] = {'code': -32603, 'message': 'type hierarchy failed'}
+        elif mode == 'type_malformed':
+            reply['result'].append({'from': items['caller'], 'fromRanges': [span()]})
+        elif mode == 'type_many':
+            reply['result'] = [target for _ in range(150)]
+        elif mode == 'type_drift':
+            (root / 'source.graphfixture').write_text('source changed\n', encoding='utf-8')
+        elif mode == 'type_hang':
+            (root / 'held').write_text('type', encoding='utf-8')
+            continue
     elif method in ('callHierarchy/incomingCalls', 'callHierarchy/outgoingCalls'):
         selected = params['item']
         assert selected == items[selected['name']], 'opaque hierarchy item was changed'
@@ -382,6 +421,7 @@ fn expired_handles_do_not_renew_their_lifetime_on_lookup() {
         cached.origin = Arc::new(Origin {
             entry: old.entry.clone(), path: old.path.clone(), uri: old.uri.clone(),
             text: Arc::clone(&old.text), created: Instant::now() - HANDLE_TTL,
+            family: old.family,
         });
     }
     assert!(tool.hierarchies.get(id).is_err());
@@ -401,4 +441,135 @@ fn caller_without_io_authority_cannot_reuse_a_live_handle() {
         AgentCx::for_current_or_request()
     };
     assert!(cached.origin.check(&entry, &owner).unwrap_err().to_string().contains("LSP_HIERARCHY_AUTHORITY"));
+}
+
+#[test]
+fn supertypes_and_subtypes_follow_exact_type_items_without_repreparing() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let first = start(&tool, &runtime, "supertypes").unwrap();
+    assert_eq!(first["hierarchyKind"], "type");
+    assert_eq!(first["items"][0]["name"], "caller");
+    assert_eq!(first["items"][0]["kind"], 5);
+    assert!(first["items"][0].get("fromRanges").is_none());
+    assert!(first["items"][0].get("callSiteUri").is_none());
+    assert!(first["items"][0].get("data").is_none());
+    let second = run(&tool, &runtime, json!({"action":"subtypes","hierarchyId":first["items"][0]["hierarchyId"]})).unwrap();
+    assert_eq!(second["items"][0]["name"], "root");
+    let log = frames(temp.path());
+    assert_eq!(log.iter().filter(|frame| frame["method"] == "textDocument/prepareTypeHierarchy").count(), 1);
+    assert_eq!(log.iter().filter(|frame| frame["method"] == "typeHierarchy/subtypes").count(), 1);
+}
+
+#[test]
+fn call_and_type_handles_are_not_interchangeable_in_either_direction() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let calls = start(&tool, &runtime, "incoming_calls").unwrap();
+    let types = start(&tool, &runtime, "supertypes").unwrap();
+    let before = frames(temp.path()).len();
+    for (result, action) in [(&calls, "subtypes"), (&types, "outgoing_calls")] {
+        let error = run(&tool, &runtime, json!({"action":action,"hierarchyId":result["source"]["hierarchyId"]})).unwrap_err();
+        assert!(error.to_string().contains("another hierarchy kind"));
+    }
+    assert_eq!(frames(temp.path()).len(), before, "family mismatch must fail before dispatch");
+}
+
+#[test]
+fn type_capabilities_are_negotiated_independently_of_call_capabilities() {
+    for mode in ["types_only", "calls_only", "type_unsupported", "type_bad_capability"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        if mode == "types_only" {
+            assert_eq!(start(&tool, &runtime, "subtypes").unwrap()["items"][0]["name"], "leaf");
+            assert!(start(&tool, &runtime, "outgoing_calls").is_err());
+        } else {
+            assert!(start(&tool, &runtime, "subtypes").is_err());
+            assert!(!frames(temp.path()).iter().any(|frame| frame["method"] == "textDocument/prepareTypeHierarchy"));
+        }
+    }
+}
+
+#[test]
+fn ambiguous_types_return_choices_without_querying_a_guessed_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "type_ambiguous") else { return };
+    let result = start(&tool, &runtime, "subtypes").unwrap();
+    assert_eq!(result["selectionRequired"], true);
+    assert_eq!(result["hierarchyKind"], "type");
+    assert_eq!(result["count"], 2);
+    assert!(!frames(temp.path()).iter().any(|frame| frame["method"] == "typeHierarchy/subtypes"));
+    let next = run(&tool, &runtime, json!({"action":"subtypes","hierarchyId":result["items"][1]["hierarchyId"]})).unwrap();
+    assert_eq!(next["source"]["name"], "leaf");
+}
+
+#[test]
+fn unknown_and_leaf_types_are_empty_results_not_failures() {
+    for mode in ["type_none", "type_empty"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let result = start(&tool, &runtime, "supertypes").unwrap();
+        assert_eq!(result["count"], 0);
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["truncated"], false);
+    }
+}
+
+#[test]
+fn type_errors_malformed_tails_and_drift_do_not_publish_partial_results() {
+    for (mode, expected) in [("type_error", "type hierarchy failed"),
+        ("type_malformed", "LSP_HIERARCHY_PROTOCOL"), ("type_drift", "LSP_HIERARCHY_EXPIRED")]
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        assert!(start(&tool, &runtime, "subtypes").unwrap_err().to_string().contains(expected));
+        assert!(lock(&tool.hierarchies.entries).is_empty());
+    }
+}
+
+#[test]
+fn external_type_resources_are_opaque_labels_and_can_be_followed_without_opening_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "type_external") else { return };
+    let result = start(&tool, &runtime, "supertypes").unwrap();
+    assert_eq!(result["items"][0]["uri"], "unresolved-type://library/ExternalBase");
+    let next = run(&tool, &runtime, json!({"action":"subtypes","hierarchyId":result["items"][0]["hierarchyId"]})).unwrap();
+    assert_eq!(next["source"]["uri"], "unresolved-type://library/ExternalBase");
+    assert_eq!(next["items"][0]["name"], "root");
+}
+
+#[test]
+fn type_output_limits_return_only_complete_reusable_items() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "type_many") else { return };
+    let result = run(&tool, &runtime, json!({"action":"subtypes","file":"source.graphfixture","symbol":"root","limit":2})).unwrap();
+    assert_eq!(result["count"], 2);
+    assert_eq!(result["total"], 150);
+    assert_eq!(result["truncated"], true);
+    for row in result["items"].as_array().unwrap() {
+        assert!(tool.hierarchies.get(row["hierarchyId"].as_str().unwrap()).is_ok());
+    }
+}
+
+#[test]
+fn dropping_type_expansion_cancels_the_pending_protocol_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "type_hang") else { return };
+    runtime.block_on(async {
+        let mut request = Box::pin(tool.execute("cancel-types", json!({"action":"supertypes","file":"source.graphfixture","symbol":"root"}), None));
+        let owner = AgentCx::for_current_or_request();
+        let start = Instant::now();
+        loop {
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            if temp.path().join("held").exists() { break; }
+            assert!(start.elapsed() < Duration::from_secs(10));
+            owner.time().sleep(Duration::from_millis(10)).await;
+        }
+        drop(request);
+    });
+    run(&tool, &runtime, json!({"action":"request","file":"source.graphfixture","method":"test/barrier"})).unwrap();
+    let log = frames(temp.path());
+    let request = log.iter().find(|frame| frame["method"] == "typeHierarchy/supertypes").unwrap();
+    assert!(log.iter().any(|frame| frame["method"] == "$/cancelRequest" && frame["params"]["id"] == request["id"]));
+    assert!(lock(&tool.hierarchies.entries).is_empty());
 }
