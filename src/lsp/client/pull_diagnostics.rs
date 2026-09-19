@@ -232,8 +232,14 @@ impl LspClient {
         let received = if self.has_pull_diagnostics() && !wait.is_zero() {
             let budget = RequestBudget::new(wait);
             loop {
-                let remaining = budget.remaining().map_err(Error::from)?;
-                self.refresh_document_diagnostics(&uri, remaining).await?;
+                match self.refresh_document_diagnostics(&uri, remaining).await {
+                    Ok(()) => {}
+                    Err(err)
+                        if err.to_string().contains("-32802")
+                            || err.to_string().contains("-32801")
+                            || err.to_string().contains("server cancelled") => {}
+                    Err(err) => return Err(err),
+                }
                 let diags = Self::lock(&self.diagnostics)
                     .get(&uri)
                     .cloned()

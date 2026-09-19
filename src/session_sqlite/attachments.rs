@@ -106,10 +106,7 @@ fn message_blocks(value: &mut Value) -> Option<&mut Vec<Value>> {
     if value.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }
-    value
-        .get_mut("message")?
-        .get_mut("content")?
-        .as_array_mut()
+    value.get_mut("message")?.get_mut("content")?.as_array_mut()
 }
 
 fn is_attachment(block: &Value) -> bool {
@@ -122,9 +119,7 @@ fn is_attachment(block: &Value) -> bool {
 /// Invalid or noncanonical historical payloads are preserved inline, not
 /// silently repaired. Exact base64 spelling matters to immutable entry IDs.
 fn prepare(data: &str) -> Result<Option<(BlobRef, Vec<u8>)>> {
-    if data.len() <= INLINE_BYTES
-        || data.len() > Encoding::Standard.encoded_len(MAX_BLOB_BYTES)?
-    {
+    if data.len() <= INLINE_BYTES || data.len() > Encoding::Standard.encoded_len(MAX_BLOB_BYTES)? {
         return Ok(None);
     }
     let (encoding, bytes) = if let Ok(bytes) = STANDARD.decode(data) {
@@ -399,7 +394,10 @@ mod tests {
     }
 
     fn fixture(id: &str, byte: u8) -> SessionEntry {
-        entry(id, vec![image(STANDARD.encode(vec![byte; INLINE_BYTES + 11]))])
+        entry(
+            id,
+            vec![image(STANDARD.encode(vec![byte; INLINE_BYTES + 11]))],
+        )
     }
 
     fn with_database<T: Send>(f: impl FnOnce(&SqliteConnection) -> Result<T> + Send) -> T {
@@ -445,7 +443,11 @@ mod tests {
             let stored = EntryEncoder::new(conn).encode(&json)?;
             assert!(stored.len() < 2048);
             assert!(!stored.contains(&data));
-            assert_eq!(count(conn), 1, "identical bytes deduplicate across MIME types");
+            assert_eq!(
+                count(conn),
+                1,
+                "identical bytes deduplicate across MIME types"
+            );
             let restored = decode_entry(conn, &stored)?;
             assert_eq!(encoded(&restored), json);
             let wire = serde_json::to_value(restored)?;
@@ -508,7 +510,10 @@ mod tests {
         for length in [INLINE_BYTES + 1, INLINE_BYTES + 2, INLINE_BYTES + 3] {
             let bytes = vec![3; length];
             let padded = encoded(&entry("padded", vec![image(STANDARD.encode(&bytes))]));
-            let unpadded = encoded(&entry("unpadded", vec![image(STANDARD_NO_PAD.encode(&bytes))]));
+            let unpadded = encoded(&entry(
+                "unpadded",
+                vec![image(STANDARD_NO_PAD.encode(&bytes))],
+            ));
             with_database(|conn| {
                 let mut encoder = EntryEncoder::new(conn);
                 let first = encoder.encode(&padded)?;
@@ -598,7 +603,11 @@ mod tests {
             value["message"]["content"][0]["data"]["$piBlob"] =
                 Value::String(format!("sha256:{}", "0".repeat(64)));
             let error = decode_entry(conn, &value.to_string()).expect_err("missing blob");
-            assert!(error.to_string().contains("referenced attachment is missing"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("referenced attachment is missing")
+            );
             Ok(())
         });
     }
@@ -618,9 +627,8 @@ mod tests {
             EntryEncoder::new(conn)
                 .encode(&original)
                 .expect_err("do not heal corruption");
-            let rows = map_sqlite_result(
-                conn.query_sync("SELECT data FROM pi_session_blobs", &[]),
-            )?;
+            let rows =
+                map_sqlite_result(conn.query_sync("SELECT data FROM pi_session_blobs", &[]))?;
             assert!(
                 matches!(rows[0].get(0), Some(SqliteValue::Blob(bytes)) if bytes.as_ref() == corrupt.as_slice())
             );
@@ -692,7 +700,11 @@ mod tests {
             // There is no blob table: an attempted lookup would fail with a
             // table error instead of the required pre-allocation budget error.
             let error = decode_entry(conn, &value.to_string()).expect_err("expansion bomb");
-            assert!(error.to_string().contains("hydrated entry exceeds JSON limit"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("hydrated entry exceeds JSON limit")
+            );
             Ok(())
         });
     }

@@ -7,9 +7,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 309 current source files.
+- `rg --files src -g '*.rs' | sort` -> 312 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
-- `rg -n '#\\[cfg\\(test\\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
+- `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
 - `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 202-file current tree.
 - Drift guard: `cargo test --test traceability_staleness source_coverage_matrix_matches_current_src_inventory`.
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 309.
+- Source-file rows below: 312.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -195,6 +195,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp.rs` | LSP facade | `tests/lsp.rs`, `tests/e2e_lsp.rs`. |
 | `src/lsp/actions.rs` | LSP code action and refactoring execution | Unit; `tests/lsp.rs`. |
 | `src/lsp/actions/protocol_tests.rs` | LSP code action protocol test cases | Test support module; exercises code actions. |
+| `src/lsp/actions/refactor.rs` | LSP symbol rename and refactor operations | Unit; `src/lsp/actions/refactor/tests.rs`, `tests/lsp.rs`. |
+| `src/lsp/actions/refactor/tests.rs` | LSP symbol refactor test suite | Test module; refactor tests. |
 | `src/lsp/client.rs` | LSP client | `tests/lsp.rs`. |
 | `src/lsp/client/document_sync.rs` | LSP client live document synchronization | Unit; `src/lsp/client/document_sync/tests.rs`. |
 | `src/lsp/client/document_sync/tests.rs` | LSP document synchronization tests | Test module; document sync tests. |
@@ -305,6 +307,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_metrics.rs` | Session metrics | Unit; `tests/provider_session_coverage.rs` and session evidence suites. |
 | `src/session_picker.rs` | Session picker UI | Unit; `tests/session_picker.rs`. |
 | `src/session_sqlite.rs` | SQLite session backend | Unit; `tests/session_sqlite.rs`, `tests/fault_injection_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/session_sqlite/attachments.rs` | SQLite session attachment and media blob storage | Unit; `tests/session_sqlite.rs`. |
 | `src/session_store_v2.rs` | Session store v2 | Unit; `tests/session_store_v2.rs`, `tests/session_store_v2_contract.rs`. |
 | `src/session_test.rs` | Session test helpers | Waived test-support module; compiled by session tests. |
 | `src/skills_managed.rs` | Managed skills | `tests/skills_managed.rs`. |

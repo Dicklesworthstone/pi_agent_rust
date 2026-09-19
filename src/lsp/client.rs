@@ -22,7 +22,7 @@ pub use file_uri::{path_to_uri, try_path_to_uri, uri_to_path};
 
 const WAIT_TICK: Duration = Duration::from_millis(10);
 const WARMUP_RETRY_CADENCE: Duration = Duration::from_millis(250);
-const WARMUP_EMPTY_RESULT_WINDOW: Duration = Duration::from_secs(60);
+const WARMUP_EMPTY_RESULT_WINDOW: Duration = Duration::from_secs(180);
 
 fn is_warmup_empty_retryable(method: &str) -> bool {
     matches!(

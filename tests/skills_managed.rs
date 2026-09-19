@@ -57,7 +57,12 @@ fn block_on_local<F: std::future::Future>(future: F) -> F::Output {
 }
 
 fn unique_name(tag: &str) -> String {
-    format!("pi-it-{tag}-{}", std::process::id())
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "pi-it-{tag}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    )
 }
 
 fn memory_config(backend: &str) -> pi::config::Config {

@@ -90,6 +90,10 @@ fn is_managed(path: &Path) -> bool {
 }
 
 fn audit(op: &str, name: &str, rationale: Option<&str>, session_id: Option<&str>) {
+    static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = AUDIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = managed_skills_dir();
     let _ = std::fs::create_dir_all(&dir);
     let entry = serde_json::json!({
@@ -101,13 +105,15 @@ fn audit(op: &str, name: &str, rationale: Option<&str>, session_id: Option<&str>
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
     });
+    let mut payload = serde_json::to_vec(&entry).unwrap_or_default();
+    payload.push(b'\n');
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("audit.jsonl"))
     {
         use std::io::Write as _;
-        let _ = writeln!(file, "{entry}");
+        let _ = file.write_all(&payload);
     }
 }
 

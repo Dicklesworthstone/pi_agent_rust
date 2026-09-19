@@ -122,10 +122,13 @@ impl LspClient {
             let attempt = self.call_once(method, params.clone(), budget).await;
             // Only idempotent lookups participate in the warmup policy.
             // A failed command is not evidence that its effects were undone.
-            let retryable = is_warmup_empty_retryable(method)
+            let retryable = (is_warmup_empty_retryable(method)
+                || method == "textDocument/diagnostic")
                 && matches!(
                     &attempt, Err(LspCallError::Transport(TransportError::Server(err)))
-                        if (err.code == -32602 && err.message.contains("No references found")) || err.code == -32801
+                        if (err.code == -32602 && err.message.contains("No references found"))
+                            || err.code == -32801
+                            || err.code == -32802
                 );
             let empty_during_warmup = matches!(&attempt, Ok(value) if is_empty_result(value))
                 && is_warmup_empty_retryable(method)

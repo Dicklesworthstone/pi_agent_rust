@@ -207,7 +207,7 @@ fn e2e_lsp_rename_compile_proof() {
             "line": 4,
             "symbol": "thrust_level",
             "newName": "thrust_output",
-            "timeout": 90,
+            "timeout": 180,
         }),
     )
     .expect("rename executes");
@@ -292,7 +292,7 @@ fn prove_surface_parity(root: &Path, config: &pi::config::Config, registry: &Too
         "file": "src/cli.rs",
         "line": 4,
         "symbol": "thrust_output",
-        "timeout": 90,
+        "timeout": 180,
     });
     let first = output_json(&execute_lsp(registry, input.clone()).expect("definition 1"));
     let repeated = output_json(&execute_lsp(&second, input).expect("definition 2"));

@@ -597,10 +597,7 @@ fn write_session_meta(conn: &SqliteConnection, entries: &[SessionEntry]) -> Resu
     ))?;
     map_sqlite_result(conn.execute_sync(
         "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
-        &[
-            SqliteValue::from("name_json"),
-            SqliteValue::from(name_json),
-        ],
+        &[SqliteValue::from("name_json"), SqliteValue::from(name_json)],
     ))?;
     Ok(())
 }
@@ -1171,10 +1168,7 @@ mod tests {
         with_write_connection(&path, |conn| {
             map_sqlite_result(conn.execute_sync(
                 "DELETE FROM pi_session_meta WHERE key IN (?1,?2)",
-                &[
-                    SqliteValue::from("name"),
-                    SqliteValue::from("name_json"),
-                ],
+                &[SqliteValue::from("name"), SqliteValue::from("name_json")],
             ))
         })
         .expect("remove both cached name representations");
@@ -1216,8 +1210,8 @@ mod tests {
                 Ok(())
             })
             .expect("inspect cache and poison history");
-            let meta = futures::executor::block_on(load_session_meta(&path))
-                .expect("metadata-only read");
+            let meta =
+                futures::executor::block_on(load_session_meta(&path)).expect("metadata-only read");
             assert_eq!(meta.name, name);
             assert_eq!(meta.message_count, 1);
             futures::executor::block_on(load_session(&path))
@@ -1240,8 +1234,7 @@ mod tests {
             base: dummy_base(),
             message: SessionMessage::User {
                 content: UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
-                    data: base64::engine::general_purpose::STANDARD
-                        .encode(vec![1u8; 65 * 1024]),
+                    data: base64::engine::general_purpose::STANDARD.encode(vec![1u8; 65 * 1024]),
                     mime_type: "image/png".to_string(),
                 })]),
                 timestamp: None,
@@ -1276,20 +1269,17 @@ mod tests {
                 id: "legacy-name".to_string(),
                 ..SessionHeader::default()
             };
-            let entries = vec![
-                message_entry(),
-                session_info_entry(Some(name.to_string())),
-            ];
+            let entries = vec![message_entry(), session_info_entry(Some(name.to_string()))];
             futures::executor::block_on(save_session(&path, &header, &entries, true))
                 .expect("seed legacy name fixture");
             with_write_connection(&path, |conn| {
-                map_sqlite_result(conn.execute_raw(
-                    "DELETE FROM pi_session_meta WHERE key = 'name_json'",
-                ))
+                map_sqlite_result(
+                    conn.execute_raw("DELETE FROM pi_session_meta WHERE key = 'name_json'"),
+                )
             })
             .expect("leave the legacy plain-text name row");
-            let meta = futures::executor::block_on(load_session_meta(&path))
-                .expect("legacy metadata");
+            let meta =
+                futures::executor::block_on(load_session_meta(&path)).expect("legacy metadata");
             assert_eq!(meta.name.as_deref(), Some(name));
             assert_eq!(meta.message_count, 1);
         }
