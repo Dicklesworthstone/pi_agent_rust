@@ -2451,6 +2451,24 @@ impl SessionStoreKind {
         Self::Jsonl
     }
 
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        let ext = path.extension()?.to_str()?;
+        if ext.eq_ignore_ascii_case("jsonl") {
+            Some(Self::Jsonl)
+        } else if ext.eq_ignore_ascii_case("sqlite") {
+            #[cfg(feature = "sqlite-sessions")]
+            {
+                Some(Self::Sqlite)
+            }
+            #[cfg(not(feature = "sqlite-sessions"))]
+            {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     const fn extension(self) -> &'static str {
         match self {
             Self::Jsonl => "jsonl",
@@ -3238,10 +3256,28 @@ impl Session {
         }
 
         if let Some(path) = &cli.session {
-            let mut session = Self::open(path).await?;
-            session.session_dir = session_dir
+            let session_path = Path::new(path);
+            if session_path_try_exists(session_path).map_err(|err| Error::Io(Box::new(err)))? {
+                let mut session = Self::open(path).await?;
+                session.session_dir = session_dir
+                    .clone()
+                    .or_else(|| infer_session_root_from_path(session_path));
+                session.set_autosave_durability_mode(durability_mode);
+                return Ok(session);
+            }
+
+            let store_kind = SessionStoreKind::from_path(session_path)
+                .unwrap_or_else(|| SessionStoreKind::from_config(config));
+            let inferred_dir = session_dir
                 .clone()
-                .or_else(|| infer_session_root_from_path(Path::new(path)));
+                .or_else(|| infer_session_root_from_path(session_path));
+            let mut session = Self::create_with_dir_and_store(inferred_dir, store_kind);
+            if let Some(parent) = session_path.parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            session.path = Some(session_path.to_path_buf());
             session.set_autosave_durability_mode(durability_mode);
             return Ok(session);
         }
@@ -10543,6 +10579,42 @@ mod tests {
             session.autosave_durability_mode(),
             AutosaveDurabilityMode::Throughput
         );
+    }
+
+    #[test]
+    fn test_session_new_with_explicit_new_session_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_file = temp_dir.path().join("new_session.jsonl");
+        let cli = crate::cli::Cli::parse_from([
+            "pi",
+            "--session",
+            session_file.to_str().expect("session file str"),
+        ]);
+        let config = Config::default();
+        let session =
+            run_async(async { Session::new(&cli, &config).await }).expect("create session");
+        assert_eq!(session.path, Some(session_file));
+        assert_eq!(session.store_kind, SessionStoreKind::Jsonl);
+    }
+
+    #[test]
+    fn test_session_new_with_explicit_existing_session_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_file = temp_dir.path().join("existing.jsonl");
+        let mut initial_session = Session::create();
+        initial_session.path = Some(session_file.clone());
+        run_async(async { initial_session.save().await }).expect("save initial session");
+
+        let cli = crate::cli::Cli::parse_from([
+            "pi",
+            "--session",
+            session_file.to_str().expect("session file str"),
+        ]);
+        let config = Config::default();
+        let session =
+            run_async(async { Session::new(&cli, &config).await }).expect("open existing session");
+        assert_eq!(session.path, Some(session_file));
+        assert_eq!(session.header.id, initial_session.header.id);
     }
 
     #[test]
