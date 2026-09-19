@@ -2526,6 +2526,143 @@ mod startup_changelog_tests {
     }
 }
 
+#[cfg(test)]
+mod editor_keybinding_tests {
+    use super::{AppAction, KeyBindings, TextArea, apply_editor_keybinding_overrides};
+
+    fn keys_of(binding: &bubbles::key::Binding) -> Vec<String> {
+        binding.get_keys().to_vec()
+    }
+
+    #[test]
+    fn a_rebound_editor_action_reaches_the_editor() {
+        // The failure this replaces: pi parsed the override, stored it,
+        // matched it against the pressed key, and then handed the raw key to
+        // a TextArea that had never heard of it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "deleteWordBackward": ["ctrl+q"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let mut input = TextArea::new();
+        let before = keys_of(&input.key_map.delete_word_backward);
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
+
+        assert_eq!(
+            keys_of(&input.key_map.delete_word_backward),
+            vec!["ctrl+q".to_string()],
+            "the override did not reach the editor (was {before:?})"
+        );
+    }
+
+    #[test]
+    fn an_untouched_action_keeps_every_key_the_editor_shipped() {
+        // pi's catalog mirrors this widget's defaults but is not identical to
+        // them — the widget also answers ctrl+h here — so overwriting entries
+        // nobody asked about would silently remove working keys.
+        let mut input = TextArea::new();
+        let shipped = keys_of(&input.key_map.delete_character_backward);
+        assert!(
+            shipped.iter().any(|key| key == "ctrl+h"),
+            "test premise changed: the widget no longer ships ctrl+h ({shipped:?})"
+        );
+
+        apply_editor_keybinding_overrides(&KeyBindings::new(), &mut input);
+        assert_eq!(
+            keys_of(&input.key_map.delete_character_backward),
+            shipped,
+            "defaults must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn application_actions_are_not_pushed_into_the_editor() {
+        // Submit belongs to pi's dispatcher; handing it to the editor would
+        // make enter insert a newline instead of sending the message.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "submit": ["ctrl+j"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+        assert_eq!(
+            keybindings.get_bindings(AppAction::Submit),
+            KeyBindings::load(&path)
+                .expect("reload")
+                .get_bindings(AppAction::Submit),
+            "premise: the override loaded"
+        );
+
+        let mut input = TextArea::new();
+        let shipped = keys_of(&input.key_map.insert_newline);
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
+        assert_eq!(
+            keys_of(&input.key_map.insert_newline),
+            shipped,
+            "Submit must not reach the editor's newline entry"
+        );
+    }
+}
+
+/// The `TextArea` keymap entry an editor action drives, if it drives one.
+///
+/// `None` for everything pi's own dispatcher owns (Submit, Interrupt, the
+/// pickers) and for the editor actions the widget has no entry for: `Yank`,
+/// `YankPop` and `Undo`.
+const fn editor_keymap_entry(
+    key_map: &mut bubbles::textarea::KeyMap,
+    action: AppAction,
+) -> Option<&mut bubbles::key::Binding> {
+    Some(match action {
+        AppAction::CursorLeft => &mut key_map.character_backward,
+        AppAction::CursorRight => &mut key_map.character_forward,
+        AppAction::CursorWordLeft => &mut key_map.word_backward,
+        AppAction::CursorWordRight => &mut key_map.word_forward,
+        AppAction::CursorLineStart => &mut key_map.line_start,
+        AppAction::CursorLineEnd => &mut key_map.line_end,
+        AppAction::CursorUp => &mut key_map.line_previous,
+        AppAction::CursorDown => &mut key_map.line_next,
+        AppAction::JumpBackward => &mut key_map.input_begin,
+        AppAction::JumpForward => &mut key_map.input_end,
+        AppAction::DeleteCharBackward => &mut key_map.delete_character_backward,
+        AppAction::DeleteCharForward => &mut key_map.delete_character_forward,
+        AppAction::DeleteWordBackward => &mut key_map.delete_word_backward,
+        AppAction::DeleteWordForward => &mut key_map.delete_word_forward,
+        AppAction::DeleteToLineStart => &mut key_map.delete_before_cursor,
+        AppAction::DeleteToLineEnd => &mut key_map.delete_after_cursor,
+        AppAction::NewLine => &mut key_map.insert_newline,
+        _ => return None,
+    })
+}
+
+/// Teach the editor the editor keys the user rebound.
+///
+/// `keybindings.json` accepts all 59 actions, and for the editor-native ones
+/// pi stored the override, matched it against the pressed key, and then
+/// forwarded the raw key to a `TextArea` that had never heard of it. So
+/// rebinding `deleteWordBackward` — the example in `load_from_user_config`'s
+/// own documentation — did nothing at all.
+///
+/// Only overridden actions are pushed. pi's defaults were written to mirror
+/// this widget's, but not exactly: the widget also answers `ctrl+h` for
+/// delete-character-backward and `ctrl+home`/`ctrl+end` for the document
+/// jumps, which pi's catalog does not list. Replacing untouched entries would
+/// quietly take those away, so untouched entries are left alone and only a
+/// deliberate override moves anything.
+fn apply_editor_keybinding_overrides(keybindings: &KeyBindings, input: &mut TextArea) {
+    let defaults = KeyBindings::new();
+    for &action in AppAction::all() {
+        let bound = keybindings.get_bindings(action);
+        if bound.is_empty() || bound == defaults.get_bindings(action) {
+            continue;
+        }
+        let Some(entry) = editor_keymap_entry(&mut input.key_map, action) else {
+            continue;
+        };
+        let rendered: Vec<String> = bound.iter().map(ToString::to_string).collect();
+        let keys: Vec<&str> = rendered.iter().map(String::as_str).collect();
+        entry.set_keys(&keys);
+    }
+}
+
 /// The main interactive TUI application model.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
@@ -2959,6 +3096,9 @@ impl PiApp {
             }
             keybindings_result.bindings
         });
+        // The editor owns its own key handling, so an override of an
+        // editor-native action only takes effect if it is handed over.
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
 
         // Initialize autocomplete with catalog from resources
         let mut autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
