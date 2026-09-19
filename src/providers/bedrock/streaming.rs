@@ -359,7 +359,9 @@ impl MessageState {
             ),
             "malformed_model_output" => (
                 StopReason::Error,
-                Some("Bedrock malformed_model_output: invalid model response; local tool calls withheld"),
+                Some(
+                    "Bedrock malformed_model_output: invalid model response; local tool calls withheld",
+                ),
             ),
             // Unknown provider strings can contain credentials or terminal
             // controls. Keep a fixed diagnostic rather than echoing the wire.
@@ -1560,11 +1562,16 @@ mod tests {
     fn terminal_failure(result: &[Result<StreamEvent>]) -> &AssistantMessage {
         assert!(result.iter().all(Result::is_ok), "{result:?}");
         assert!(
-            !result.iter().any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            !result
+                .iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
             "{result:?}"
         );
         assert_eq!(
-            result.iter().filter(|item| matches!(item, Ok(StreamEvent::Error { .. }))).count(),
+            result
+                .iter()
+                .filter(|item| matches!(item, Ok(StreamEvent::Error { .. })))
+                .count(),
             1,
             "{result:?}"
         );
@@ -1600,12 +1607,21 @@ mod tests {
             // Even a validated ToolCallEnd cannot make the final outcome a
             // success. The call remains available for diagnostics, not execution.
             assert_eq!(
-                result.iter().filter(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. }))).count(),
+                result
+                    .iter()
+                    .filter(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. })))
+                    .count(),
                 1,
                 "{reason}: {result:?}"
             );
             let message = terminal_failure(&result);
-            assert!(message.error_message.as_deref().unwrap().contains("local tool calls withheld"));
+            assert!(
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("local tool calls withheld")
+            );
             assert_eq!(message.usage.total_tokens, 35);
             let ContentBlock::ToolCall(call) = &message.content[0] else {
                 panic!("expected retained diagnostic call");
@@ -1624,12 +1640,18 @@ mod tests {
             ("model_context_window_exceeded", StopReason::Length),
         ] {
             let result = collect(vec![
-                start(), text(), block_stop(0),
+                start(),
+                text(),
+                block_stop(0),
                 event("messageStop", &json!({"stopReason": wire_reason})),
                 usage_metadata(),
             ]);
             assert!(result.iter().all(Result::is_ok), "{result:?}");
-            assert!(!result.iter().any(|item| matches!(item, Ok(StreamEvent::Error { .. }))));
+            assert!(
+                !result
+                    .iter()
+                    .any(|item| matches!(item, Ok(StreamEvent::Error { .. })))
+            );
             let Some(Ok(StreamEvent::Done { reason, message })) = result.last() else {
                 panic!("expected Done for {wire_reason}: {result:?}");
             };
@@ -1647,16 +1669,26 @@ mod tests {
     #[test]
     fn service_failure_outcomes_preserve_text_identity_and_usage() {
         for wire_reason in [
-            "guardrail_intervened", "content_filtered",
-            "malformed_tool_use", "malformed_model_output",
+            "guardrail_intervened",
+            "content_filtered",
+            "malformed_tool_use",
+            "malformed_model_output",
         ] {
             let result = collect(vec![
-                start(), text(), block_stop(0),
+                start(),
+                text(),
+                block_stop(0),
                 event("messageStop", &json!({"stopReason": wire_reason})),
                 usage_metadata(),
             ]);
             let message = terminal_failure(&result);
-            assert!(message.error_message.as_deref().unwrap().contains(wire_reason));
+            assert!(
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains(wire_reason)
+            );
             assert_eq!(message.provider, "provider-a");
             assert_eq!(message.model, "model-a");
             assert_eq!(message.api, "bedrock-converse-stream");
@@ -1691,13 +1723,20 @@ mod tests {
     fn terminal_failures_wait_for_metadata_then_finish_exactly_once() {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         tx.unbounded_send(Ok([
-            start(), text(), block_stop(0),
+            start(),
+            text(),
+            block_stop(0),
             event("messageStop", &json!({"stopReason": "content_filtered"})),
-        ].concat())).unwrap();
+        ]
+        .concat()))
+            .unwrap();
         let mut output = from_bytes(Box::pin(rx), "m".into(), "p".into(), Vec::new());
         for _ in 0..4 {
             let item = output.next().now_or_never().unwrap().unwrap().unwrap();
-            assert!(!matches!(item, StreamEvent::Done { .. } | StreamEvent::Error { .. }));
+            assert!(!matches!(
+                item,
+                StreamEvent::Done { .. } | StreamEvent::Error { .. }
+            ));
         }
         assert!(output.next().now_or_never().is_none());
         tx.unbounded_send(Ok(usage_metadata())).unwrap();
@@ -1716,16 +1755,29 @@ mod tests {
     fn failed_stop_does_not_hide_a_corrupt_or_exception_tail() {
         let mut exception_headers = Vec::new();
         header(":message-type", "exception", &mut exception_headers);
-        header(":exception-type", "internalServerException", &mut exception_headers);
+        header(
+            ":exception-type",
+            "internalServerException",
+            &mut exception_headers,
+        );
         let exception = raw_frame(&exception_headers, br#"{"message":"tail failed"}"#);
         for tail in [vec![0], vec![0; 12], exception] {
             let result = collect(vec![
-                start(), text(), block_stop(0),
-                event("messageStop", &json!({"stopReason": "malformed_model_output"})),
+                start(),
+                text(),
+                block_stop(0),
+                event(
+                    "messageStop",
+                    &json!({"stopReason": "malformed_model_output"}),
+                ),
                 tail,
             ]);
             assert_one_terminal_error(&result);
-            assert!(!result.iter().any(|item| matches!(item, Ok(StreamEvent::Error { .. }))));
+            assert!(
+                !result
+                    .iter()
+                    .any(|item| matches!(item, Ok(StreamEvent::Error { .. })))
+            );
         }
     }
 

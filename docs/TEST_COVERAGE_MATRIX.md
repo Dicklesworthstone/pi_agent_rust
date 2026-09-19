@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 317 current source files.
+- `rg --files src -g '*.rs' | sort` -> 319 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 317.
+- Source-file rows below: 319.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -218,6 +218,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/edits/sequence/tests.rs` | LSP workspace edit sequence test suite | Test module; sequence tests. |
 | `src/lsp/edits/transaction.rs` | LSP atomic workspace edit transaction engine | Unit; in-module tests. |
 | `src/lsp/edits/transaction/tests.rs` | LSP workspace edit transaction test suite | Test module; transaction tests. |
+| `src/lsp/hierarchy.rs` | LSP call hierarchy navigation | Unit; `src/lsp/hierarchy/tests.rs`, `tests/lsp.rs`. |
+| `src/lsp/hierarchy/tests.rs` | LSP call hierarchy test suite | Test module; hierarchy tests. |
 | `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
 | `src/lsp/registry.rs` | LSP registry | `tests/lsp.rs`. |
 | `src/lsp/text.rs` | LSP text mapping | `tests/lsp.rs`. |
