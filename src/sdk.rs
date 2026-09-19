@@ -19,6 +19,8 @@
 //! use pi::sdk::RpcSharedState;
 //! ```
 
+mod extension_bootstrap;
+
 use crate::app;
 use crate::auth::AuthStorage;
 use crate::cli::Cli;
@@ -1702,7 +1704,7 @@ impl AgentSessionHandle {
         self.ask_tool.clone()
     }
 
-    /// Multi-root workspace handle, when the session was created with one
+    /// Multi-root workspace handle when the session was created with one
     /// (bd-cv653.3.12). Clones share the live root set.
     #[must_use]
     pub fn workspace(&self) -> Option<crate::workspace::WorkspaceHandle> {
@@ -3105,7 +3107,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // never the ambient process cwd — before prompt discovery sees them.
     let package_dir = crate::app::stable_package_dir(&raw_package_dir, Some(&cwd));
     let models_path = default_models_path(&global_dir);
-    let model_registry = ModelRegistry::load(&auth, Some(models_path));
+    let mut model_registry = ModelRegistry::load(&auth, Some(models_path));
 
     let mut session = Session::new(&cli, &config).await?;
     if resolved_session_path.is_none() {
@@ -3122,16 +3124,26 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
     };
 
-    let selection = app::select_model_and_thinking(
-        &cli,
-        &config,
-        &session,
-        &model_registry,
-        &scoped_models,
-        &global_dir,
-    )
-    .map_err(|err| Error::validation(err.to_string()))?;
-    app::update_session_for_selection(&mut session, &selection);
+    // The session owns the extension runtime, so registration must precede
+    // final provider selection. Do not persist a provisional model: resumed
+    // extension identities and explicit selectors must survive registration.
+    let has_extensions = !options.extension_paths.is_empty();
+    let selection = if has_extensions {
+        extension_bootstrap::provisional_selection(&model_registry)?
+    } else {
+        app::select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &model_registry,
+            &scoped_models,
+            &global_dir,
+        )
+        .map_err(|err| Error::validation(err.to_string()))?
+    };
+    if !has_extensions {
+        app::update_session_for_selection(&mut session, &selection);
+    }
 
     let enabled_tools_owned = cli
         .enabled_tools()
@@ -3169,9 +3181,14 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let provider = providers::create_provider(&selection.model_entry, None)
         .map_err(|e| Error::provider("sdk", e.to_string()))?;
 
-    let api_key = app::resolve_api_key(&auth, &cli, &selection.model_entry)
-        .map_err(|err| Error::validation(err.to_string()))?;
-    if cli.api_key.is_none()
+    let api_key = if has_extensions {
+        None
+    } else {
+        app::resolve_api_key(&auth, &cli, &selection.model_entry)
+            .map_err(|err| Error::validation(err.to_string()))?
+    };
+    if !has_extensions
+        && cli.api_key.is_none()
         && let Some(failure) = oauth_refresh.failure_for(&selection.model_entry.model.provider)
     {
         return Err(Error::auth(format!(
@@ -3285,7 +3302,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             )));
     }
 
-    if !options.extension_paths.is_empty() {
+    if has_extensions {
         let extension_paths = options
             .extension_paths
             .iter()
@@ -3312,6 +3329,20 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 },
             )
             .await?;
+        extension_bootstrap::finish_selection(
+            &mut agent_session,
+            &mut model_registry,
+            &mut auth,
+            extension_bootstrap::SelectionInputs {
+                cli: &cli,
+                config: &config,
+                scoped_patterns: &scoped_patterns,
+                global_dir: &global_dir,
+                oauth_refresh: &oauth_refresh,
+                preserve_compaction_window: options.compaction_settings.is_some(),
+            },
+        )
+        .await?;
     }
 
     // Extensions observe through a coalescer that spawns onto a runtime
