@@ -135,9 +135,10 @@ async fn finish_selection_inner(
         // An extension's explicit OAuth configuration supersedes a built-in
         // refresher for the same provider. Otherwise retain native startup's
         // selected-provider error behavior.
-        if !bindings.iter().any(|binding| {
-            binding.provider == *selected_provider && binding.oauth_config.is_some()
-        }) && let Some(failure) = inputs.oauth_refresh.failure_for(selected_provider)
+        if !bindings
+            .iter()
+            .any(|binding| binding.provider == *selected_provider && binding.oauth_config.is_some())
+            && let Some(failure) = inputs.oauth_refresh.failure_for(selected_provider)
         {
             return Err(Error::auth(format!(
                 "OAuth token refresh failed for: {} ({})",
@@ -166,7 +167,11 @@ async fn finish_selection_inner(
         .agent
         .set_tool_call_dialect(selection.model_entry.tool_call_dialect());
     session.agent.set_model_accepts_images(
-        selection.model_entry.model.input.contains(&InputType::Image),
+        selection
+            .model_entry
+            .model
+            .input
+            .contains(&InputType::Image),
     );
     {
         let options = session.agent.stream_options_mut();

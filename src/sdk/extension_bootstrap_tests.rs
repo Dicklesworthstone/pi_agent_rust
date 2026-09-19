@@ -185,7 +185,10 @@ fn unresolved_explicit_provider_is_an_error_after_extensions_load() {
     let mut options = options(dir.path());
     options.provider = Some("unregistered-sdk-provider".to_string());
     let result = run_async(create_agent_session(options));
-    assert!(result.is_err(), "bootstrap must never become a silent fallback");
+    assert!(
+        result.is_err(),
+        "bootstrap must never become a silent fallback"
+    );
 }
 
 #[test]
