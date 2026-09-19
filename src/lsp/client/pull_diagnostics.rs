@@ -232,6 +232,10 @@ impl LspClient {
         let received = if self.has_pull_diagnostics() && !wait.is_zero() {
             let budget = RequestBudget::new(wait);
             loop {
+                // Recomputed per iteration so the wait shrinks across retries
+                // and a cancelled or exhausted budget ends the loop, matching
+                // `refresh_document_diagnostics` itself.
+                let remaining = budget.remaining().map_err(Error::from)?;
                 match self.refresh_document_diagnostics(&uri, remaining).await {
                     Ok(()) => {}
                     Err(err)
