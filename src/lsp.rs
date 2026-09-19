@@ -13,6 +13,7 @@ mod hierarchy;
 pub mod jsonrpc;
 pub mod registry;
 pub mod text;
+mod workspace_diagnostics;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -588,14 +589,14 @@ impl Tool for LspTool {
         "lsp"
     }
     fn description(&self) -> &str {
-        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities and request. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
+        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request and workspace_diagnostics. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request"]},
-                "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics also accepts a glob over cached reports (not a workspace scan)"},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics"]},
+                "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics globs inspect cached reports. workspace_diagnostics uses a positive workspace-relative glob to actively check matching nonignored regular files; it may start language servers."},
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
                 "query":{"type":"string","description":"Workspace-symbol query, or fresh code-action title/index selection"},
@@ -616,10 +617,10 @@ impl Tool for LspTool {
                     "insertFinalNewline":{"type":"boolean"},
                     "trimFinalNewlines":{"type":"boolean"}
                 }},
-                "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default)"},
+                "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default). workspace_diagnostics instead budgets the whole scan (default 30 seconds, capped at 120); synchronous filesystem operations are not preemptible."},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
                 "payload":{"description":"Raw JSON params for request"},
-                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128"}
+                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. workspace_diagnostics checks at most this many files (default 100, capped at 256)."}
             }
         })
     }
@@ -649,6 +650,12 @@ impl Tool for LspTool {
                 .map_err(|_| tool_err("LSP_CANCELLED", "LSP workflow cancelled while queued"))?;
         match input.action.as_str() {
             "diagnostics" => self.run_diagnostics(&input).await,
+            "workspace_diagnostics" => {
+                let pattern = input.file.as_deref().ok_or_else(|| {
+                    tool_err("LSP_USAGE", "workspace_diagnostics requires file (a workspace-relative glob)")
+                })?;
+                self.run_workspace_diagnostics(&input, pattern).await
+            }
             "definition" => {
                 self.run_position_request(
                     &input,
@@ -702,7 +709,7 @@ impl Tool for LspTool {
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics"
             ))),
         }
     }
