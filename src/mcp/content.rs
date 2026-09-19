@@ -276,20 +276,19 @@ fn non_text_metadata(block: &Value) -> Value {
                     resource.remove("text");
                     resource.insert("textInNativeContent".to_string(), Value::Bool(true));
                 }
-                if mime.starts_with("image/")
+                if (mime.starts_with("image/")
                     || mime.starts_with("audio/")
                     || mime.starts_with("video/")
                     || mime.starts_with("text/")
                     || mime == "application/json"
-                    || mime.ends_with("+json")
+                    || mime.ends_with("+json"))
+                    && let Some(data) = resource.remove("blob")
                 {
-                    if let Some(data) = resource.remove("blob") {
-                        resource.insert(
-                            "encodedBytes".to_string(),
-                            json!(data.as_str().map_or(0, str::len)),
-                        );
-                        resource.insert("dataInNativeContent".to_string(), Value::Bool(true));
-                    }
+                    resource.insert(
+                        "encodedBytes".to_string(),
+                        json!(data.as_str().map_or(0, str::len)),
+                    );
+                    resource.insert("dataInNativeContent".to_string(), Value::Bool(true));
                 }
             }
         }
@@ -315,14 +314,7 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
     };
     let mut details = json!({"mcp": true, "nonTextBlocks": 0});
     let mut non_text = Vec::new();
-    if !result.is_object() {
-        shaper.warning(
-            None,
-            "MCP_RESULT_INVALID",
-            "tool result must be an object",
-            true,
-        );
-    } else {
+    if result.is_object() {
         if result.get("isError").is_some_and(|flag| !flag.is_boolean()) {
             shaper.warning(
                 None,
@@ -390,6 +382,13 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
         if let Some(metadata) = result.get("_meta") {
             details["_meta"] = metadata.clone();
         }
+    } else {
+        shaper.warning(
+            None,
+            "MCP_RESULT_INVALID",
+            "tool result must be an object",
+            true,
+        );
     }
     if shaper.content.is_empty() {
         shaper.text("[MCP tool returned no content]");

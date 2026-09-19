@@ -13396,7 +13396,7 @@ mod tests {
     /// The exit itself cannot be asserted in-process — `exit_if_stdout_closed`
     /// calls `std::process::exit`, so a test that triggered it would take the
     /// test binary with it. What is checkable here is the classification, which
-    /// is the part that was wrong: BrokenPipe is the quiet case and everything
+    /// is the part that was wrong: `BrokenPipe` is the quiet case and everything
     /// else is not. `tests/e2e_cli.rs` drives the real pipeline end to end.
     #[test]
     fn only_a_broken_pipe_is_a_quiet_stdout_ending() {

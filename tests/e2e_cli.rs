@@ -1629,7 +1629,6 @@ fn e2e_cli_fetch_models_rejects_unsafe_static_fallback_ids() {
     assert_contains(&harness.harness, &result.stderr, "not printable ASCII");
 }
 
-#[test]
 /// bd-print-json-panics-on-closed-stdout: `pi --print --mode json | head` must
 /// end quietly, not panic and file a crash report against the user.
 ///

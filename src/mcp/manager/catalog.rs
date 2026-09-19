@@ -352,25 +352,30 @@ mod tests {
             vec!["first", "second", "third"]
         );
         assert_eq!(manager.mounted_tool_metas()[0].1.len(), 3);
-        let requests = McpManager::lock(&transport.requests);
+        let (params, all_within_timeout, monotonic) = {
+            let requests = McpManager::lock(&transport.requests);
+            (
+                requests
+                    .iter()
+                    .map(|(params, _)| params.clone())
+                    .collect::<Vec<_>>(),
+                requests
+                    .iter()
+                    .all(|(_, timeout)| *timeout <= DEFAULT_MCP_TIMEOUT),
+                requests.windows(2).all(|pair| pair[1].1 <= pair[0].1),
+            )
+        };
         assert_eq!(
-            requests
-                .iter()
-                .map(|(params, _)| params.clone())
-                .collect::<Vec<_>>(),
+            params,
             vec![
                 json!({}),
                 json!({"cursor":"opaque +/="}),
                 json!({"cursor":""})
             ]
         );
+        assert!(all_within_timeout);
         assert!(
-            requests
-                .iter()
-                .all(|(_, timeout)| *timeout <= DEFAULT_MCP_TIMEOUT)
-        );
-        assert!(
-            requests.windows(2).all(|pair| pair[1].1 <= pair[0].1),
+            monotonic,
             "later pages must spend the same timeout, not reset it"
         );
         assert!(!transport.closed.load(Ordering::Acquire));
@@ -519,7 +524,9 @@ mod tests {
         );
         assert_eq!(
             remaining_budget(deadline, start + Duration::from_secs(5)).expect("remaining"),
-            DEFAULT_MCP_TIMEOUT - Duration::from_secs(5)
+            DEFAULT_MCP_TIMEOUT
+                .checked_sub(Duration::from_secs(5))
+                .expect("valid timeout")
         );
         for now in [deadline, deadline + Duration::from_secs(1)] {
             assert!(

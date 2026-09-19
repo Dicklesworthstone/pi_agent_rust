@@ -3272,10 +3272,11 @@ impl Session {
                 .clone()
                 .or_else(|| infer_session_root_from_path(session_path));
             let mut session = Self::create_with_dir_and_store(inferred_dir, store_kind);
-            if let Some(parent) = session_path.parent() {
-                if !parent.as_os_str().is_empty() && !parent.exists() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
+            if let Some(parent) = session_path.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.exists()
+            {
+                let _ = std::fs::create_dir_all(parent);
             }
             session.path = Some(session_path.to_path_buf());
             session.set_autosave_durability_mode(durability_mode);
