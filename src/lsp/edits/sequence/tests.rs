@@ -61,7 +61,8 @@ fn delete_then_create_edits_a_new_empty_document() {
         json!({"kind":"delete", "uri":path_to_uri(&path)}),
         json!({"kind":"create", "uri":path_to_uri(&path)}),
         text(&path, 0, 0, "replacement"),
-    ]).unwrap();
+    ])
+    .unwrap();
     assert_eq!(std::fs::read(path).unwrap(), b"replacement");
 }
 
@@ -133,10 +134,14 @@ fn ignore_missing_delete_uses_the_current_staged_state() {
     let outcome = apply(vec![
         json!({"kind":"delete", "uri":path_to_uri(&path)}),
         json!({"kind":"delete", "uri":path_to_uri(&path), "options":{"ignoreIfNotExists":true}}),
-    ]).unwrap();
+    ])
+    .unwrap();
     assert!(!path.exists());
     assert_eq!(outcome.file_ops_applied.len(), 1);
-    apply(vec![json!({"kind":"delete", "uri":path_to_uri(&path), "options":{"ignoreIfNotExists":true}})]).unwrap();
+    apply(vec![
+        json!({"kind":"delete", "uri":path_to_uri(&path), "options":{"ignoreIfNotExists":true}}),
+    ])
+    .unwrap();
     assert!(apply(vec![json!({"kind":"delete", "uri":path_to_uri(&path)})]).is_err());
 }
 
@@ -212,7 +217,10 @@ fn renamed_text_is_checked_against_the_original_source_hash() {
     assert!(apply_workspace_edit(&plan, Some(&hashes)).is_err());
     assert_eq!(std::fs::read(&source).unwrap(), b"abc");
     assert!(!destination.exists());
-    hashes.insert(source.clone(), crate::lsp::text::content_hash_for_drift("abc"));
+    hashes.insert(
+        source.clone(),
+        crate::lsp::text::content_hash_for_drift("abc"),
+    );
     apply_workspace_edit(&plan, Some(&hashes)).unwrap();
     assert!(!source.exists());
     assert_eq!(std::fs::read(destination).unwrap(), b"Zbc");
@@ -220,10 +228,15 @@ fn renamed_text_is_checked_against_the_original_source_hash() {
 
 #[test]
 fn operation_and_text_edit_counts_have_finite_admission_limits() {
-    let entries = vec![json!({"textDocument":{"uri":"file:///tmp/a","version":null},"edits":[]}); MAX_STEPS + 1];
+    let entries = vec![
+        json!({"textDocument":{"uri":"file:///tmp/a","version":null},"edits":[]});
+        MAX_STEPS + 1
+    ];
     let error = parse_workspace_edit(&json!({"documentChanges":entries})).expect_err("step bound");
     assert!(error.to_string().contains("LSP_EDIT_LIMIT"));
     let edit = json!({"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":""});
-    let error = parse_workspace_edit(&json!({"changes":{"file:///tmp/a":vec![edit; MAX_TEXT_EDITS + 1]}})).expect_err("edit bound");
+    let error =
+        parse_workspace_edit(&json!({"changes":{"file:///tmp/a":vec![edit; MAX_TEXT_EDITS + 1]}}))
+            .expect_err("edit bound");
     assert!(error.to_string().contains("LSP_EDIT_LIMIT"));
 }

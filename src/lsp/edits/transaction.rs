@@ -56,19 +56,32 @@ fn target_path(path: &Path) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    if absolute.components().any(|part| part == Component::ParentDir) {
+    if absolute
+        .components()
+        .any(|part| part == Component::ParentDir)
+    {
         return Err(io::Error::other("parent traversal in edit path"));
     }
-    let name = absolute.file_name().ok_or_else(|| io::Error::other("invalid file path"))?;
-    let mut parent = absolute.parent().ok_or_else(|| io::Error::other("missing parent"))?;
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| io::Error::other("invalid file path"))?;
+    let mut parent = absolute
+        .parent()
+        .ok_or_else(|| io::Error::other("missing parent"))?;
     let mut suffix = Vec::new();
     loop {
         match std::fs::metadata(parent) {
             Ok(metadata) if metadata.is_dir() => break,
             Ok(_) => return Err(io::Error::other("edit parent is not a directory")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                suffix.push(parent.file_name().ok_or_else(|| io::Error::other("invalid parent"))?);
-                parent = parent.parent().ok_or_else(|| io::Error::other("missing ancestor"))?;
+                suffix.push(
+                    parent
+                        .file_name()
+                        .ok_or_else(|| io::Error::other("invalid parent"))?,
+                );
+                parent = parent
+                    .parent()
+                    .ok_or_else(|| io::Error::other("missing ancestor"))?;
             }
             Err(error) => return Err(error),
         }
@@ -88,13 +101,17 @@ fn read_image(path: &Path) -> io::Result<Option<Image>> {
         Err(error) => return Err(error),
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::other("workspace edits require regular files, not directories or symlinks"));
+        return Err(io::Error::other(
+            "workspace edits require regular files, not directories or symlinks",
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if metadata.nlink() != 1 {
-            return Err(io::Error::other("workspace edits cannot replace shared hard links"));
+            return Err(io::Error::other(
+                "workspace edits cannot replace shared hard links",
+            ));
         }
     }
     if metadata.len() > MAX_FILE_BYTES as u64 {
@@ -102,18 +119,29 @@ fn read_image(path: &Path) -> io::Result<Option<Image>> {
     }
     let file = File::open(path)?;
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(io::Error::other("workspace edit file exceeds 16 MiB"));
     }
-    Ok(Some(Image { bytes: bytes.into(), permissions: Some(metadata.permissions()) }))
+    Ok(Some(Image {
+        bytes: bytes.into(),
+        permissions: Some(metadata.permissions()),
+    }))
 }
 
 impl Transaction {
     fn spend(&mut self, bytes: usize) -> Result<()> {
-        self.bytes = self.bytes.checked_add(bytes)
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
             .filter(|total| *total <= MAX_TRANSACTION_BYTES)
-            .ok_or_else(|| plan_error("LSP_EDIT_LIMIT", "workspace edit snapshots and replacements exceed 64 MiB"))?;
+            .ok_or_else(|| {
+                plan_error(
+                    "LSP_EDIT_LIMIT",
+                    "workspace edit snapshots and replacements exceed 64 MiB",
+                )
+            })?;
         Ok(())
     }
 
@@ -121,68 +149,121 @@ impl Transaction {
         let path = target_path(path).map_err(|error| io_context(path, error))?;
         if !self.files.contains_key(&path) {
             if self.files.len() >= MAX_TRANSACTION_FILES {
-                return Err(plan_error("LSP_EDIT_LIMIT", "workspace edit exceeds 1024 files"));
+                return Err(plan_error(
+                    "LSP_EDIT_LIMIT",
+                    "workspace edit exceeds 1024 files",
+                ));
             }
             // A regular-file transaction cannot safely turn a target into an
             // ancestor directory (or the reverse), even via a delete first.
-            if self.files.keys().any(|other| path.starts_with(other) || other.starts_with(&path)) {
-                return Err(conflict("workspace edit has overlapping file/directory paths"));
+            if self
+                .files
+                .keys()
+                .any(|other| path.starts_with(other) || other.starts_with(&path))
+            {
+                return Err(conflict(
+                    "workspace edit has overlapping file/directory paths",
+                ));
             }
             let before = read_image(&path).map_err(|error| io_context(&path, error))?;
             self.spend(before.as_ref().map_or(0, |image| image.bytes.len()))?;
-            self.files.insert(path.clone(), StagedFile { after: before.clone(), before });
+            self.files.insert(
+                path.clone(),
+                StagedFile {
+                    after: before.clone(),
+                    before,
+                },
+            );
         }
         Ok(path)
     }
 
     pub(super) fn edit(&mut self, path: &Path, edits: &[TextEdit]) -> Result<()> {
         let normalized = self.load(path)?;
-        let image = self.files[&normalized].after.as_ref()
-            .ok_or_else(|| conflict(format!("cannot read {}: file missing at this edit step", path.display())))?;
+        let image = self.files[&normalized].after.as_ref().ok_or_else(|| {
+            conflict(format!(
+                "cannot read {}: file missing at this edit step",
+                path.display()
+            ))
+        })?;
         let original = std::str::from_utf8(&image.bytes)
             .map_err(|_| conflict(format!("{}: text edit requires UTF-8", path.display())))?;
         // Bound output allocation before the splicer runs, even for hostile
         // insertion arrays. This conservative bound does not credit deletions.
-        let projected = edits.iter().try_fold(original.len(), |size, edit| {
-            size.checked_add(edit.new_text.len()).filter(|size| *size <= MAX_FILE_BYTES)
-        }).ok_or_else(|| plan_error("LSP_EDIT_LIMIT", "text replacement exceeds 16 MiB"))?;
+        let projected = edits
+            .iter()
+            .try_fold(original.len(), |size, edit| {
+                size.checked_add(edit.new_text.len())
+                    .filter(|size| *size <= MAX_FILE_BYTES)
+            })
+            .ok_or_else(|| plan_error("LSP_EDIT_LIMIT", "text replacement exceeds 16 MiB"))?;
         if projected > MAX_TRANSACTION_BYTES.saturating_sub(self.bytes) {
-            return Err(plan_error("LSP_EDIT_LIMIT", "workspace edit snapshots and replacements exceed 64 MiB"));
+            return Err(plan_error(
+                "LSP_EDIT_LIMIT",
+                "workspace edit snapshots and replacements exceed 64 MiB",
+            ));
         }
         let updated = apply_text_edits(original, edits)
             .map_err(|error| conflict(format!("{}: {error}", path.display())))?;
         let permissions = image.permissions.clone();
         self.spend(projected)?;
-        self.files.get_mut(&normalized).expect("loaded target").after = Some(Image {
-            bytes: updated.into_bytes().into(), permissions,
+        self.files
+            .get_mut(&normalized)
+            .expect("loaded target")
+            .after = Some(Image {
+            bytes: updated.into_bytes().into(),
+            permissions,
         });
         self.text_paths.insert(path.to_path_buf());
         Ok(())
     }
 
-    pub(super) fn file_op(&mut self, operation: &FileOp, ignore_exists: bool, ignore_missing: bool) -> Result<()> {
+    pub(super) fn file_op(
+        &mut self,
+        operation: &FileOp,
+        ignore_exists: bool,
+        ignore_missing: bool,
+    ) -> Result<()> {
         match operation {
             FileOp::Create { path, overwrite } => {
                 let path = self.load(path)?;
                 let current = &self.files[&path].after;
                 if current.is_some() && !overwrite {
-                    if ignore_exists { return Ok(()); }
-                    return Err(conflict(format!("create target exists: {}", path.display())));
+                    if ignore_exists {
+                        return Ok(());
+                    }
+                    return Err(conflict(format!(
+                        "create target exists: {}",
+                        path.display()
+                    )));
                 }
                 let permissions = current.as_ref().and_then(|image| image.permissions.clone());
                 self.files.get_mut(&path).expect("loaded target").after = Some(Image {
-                    bytes: Arc::from([]), permissions,
+                    bytes: Arc::from([]),
+                    permissions,
                 });
             }
-            FileOp::Rename { old_path, new_path, overwrite } => {
+            FileOp::Rename {
+                old_path,
+                new_path,
+                overwrite,
+            } => {
                 let old = self.load(old_path)?;
-                let source = self.files[&old].after.clone()
-                    .ok_or_else(|| conflict(format!("rename source missing: {}", old_path.display())))?;
+                let source = self.files[&old].after.clone().ok_or_else(|| {
+                    conflict(format!("rename source missing: {}", old_path.display()))
+                })?;
                 let new = self.load(new_path)?;
-                if old == new { return Ok(()); }
+                if old == new {
+                    return Ok(());
+                }
                 if self.files[&new].after.is_some() && !overwrite {
-                    if ignore_exists { return Ok(()); }
-                    return Err(conflict(format!("rename target exists: {}", new_path.display())));
+                    if ignore_exists {
+                        return Ok(());
+                    }
+                    return Err(conflict(format!(
+                        "rename target exists: {}",
+                        new_path.display()
+                    )));
                 }
                 self.files.get_mut(&old).expect("loaded source").after = None;
                 self.files.get_mut(&new).expect("loaded target").after = Some(source);
@@ -190,8 +271,13 @@ impl Transaction {
             FileOp::Delete { path } => {
                 let path = self.load(path)?;
                 if self.files[&path].after.is_none() {
-                    if ignore_missing { return Ok(()); }
-                    return Err(conflict(format!("delete target missing: {}", path.display())));
+                    if ignore_missing {
+                        return Ok(());
+                    }
+                    return Err(conflict(format!(
+                        "delete target missing: {}",
+                        path.display()
+                    )));
                 }
                 self.files.get_mut(&path).expect("loaded target").after = None;
             }
@@ -204,12 +290,19 @@ impl Transaction {
         if let Some(hashes) = hashes {
             for (path, expected) in hashes {
                 let normalized = target_path(path).map_err(|error| io_context(path, error))?;
-                let Some(staged) = self.files.get(&normalized) else { continue };
-                let actual = staged.before.as_ref()
+                let Some(staged) = self.files.get(&normalized) else {
+                    continue;
+                };
+                let actual = staged
+                    .before
+                    .as_ref()
                     .and_then(|image| std::str::from_utf8(&image.bytes).ok())
                     .map(content_hash_for_drift);
                 if actual != Some(*expected) {
-                    return Err(conflict(format!("{} changed on disk since the edit was computed; re-run the request", path.display())));
+                    return Err(conflict(format!(
+                        "{} changed on disk since the edit was computed; re-run the request",
+                        path.display()
+                    )));
                 }
             }
         }
@@ -222,15 +315,26 @@ impl Transaction {
 
     // The callback is a deterministic failure/interleaving seam for real-file
     // tests. Production uses the same commit path with a no-op callback.
-    fn commit_with(mut self, mut after_change: impl FnMut(usize, &Path) -> io::Result<()>) -> Result<ApplyOutcome> {
+    fn commit_with(
+        mut self,
+        mut after_change: impl FnMut(usize, &Path) -> io::Result<()>,
+    ) -> Result<ApplyOutcome> {
         // Validate ALL read preimages, including no-op targets, before commit.
         for (path, staged) in &self.files {
             verify_image(path, &staged.before).map_err(|error| io_context(path, error))?;
         }
         self.files.retain(|_, staged| staged.before != staged.after);
-        let mut changes: Vec<_> = self.files.into_iter().map(|(path, staged)| Change {
-            path, staged, backup: None, replacement: None, applied: false,
-        }).collect();
+        let mut changes: Vec<_> = self
+            .files
+            .into_iter()
+            .map(|(path, staged)| Change {
+                path,
+                staged,
+                backup: None,
+                replacement: None,
+                applied: false,
+            })
+            .collect();
         // Publish destinations before removing sources. All final images were
         // computed from the ordered virtual state, not from this commit order.
         changes.sort_by_key(|change| change.staged.after.is_none());
@@ -257,13 +361,25 @@ impl Transaction {
             drop(changes);
             for directory in directories.iter().rev() {
                 if let Err(error) = std::fs::remove_dir(directory) {
-                    failures.push(format!("cannot remove created directory {}: {error}", directory.display()));
+                    failures.push(format!(
+                        "cannot remove created directory {}: {error}",
+                        directory.display()
+                    ));
                 }
             }
             return Err(if failures.is_empty() {
-                plan_error("LSP_EDIT_APPLY", format!("workspace edit failed; original files restored: {error}"))
+                plan_error(
+                    "LSP_EDIT_APPLY",
+                    format!("workspace edit failed; original files restored: {error}"),
+                )
             } else {
-                plan_error("LSP_EDIT_ROLLBACK", format!("workspace edit failed: {error}; rollback incomplete: {}", failures.join("; ")))
+                plan_error(
+                    "LSP_EDIT_ROLLBACK",
+                    format!(
+                        "workspace edit failed: {error}; rollback incomplete: {}",
+                        failures.join("; ")
+                    ),
+                )
             });
         }
         Ok(ApplyOutcome {
@@ -275,17 +391,23 @@ impl Transaction {
 
 fn verify_image(path: &Path, expected: &Option<Image>) -> io::Result<()> {
     if target_path(path)? != path || read_image(path)? != *expected {
-        return Err(io::Error::other("file or parent changed during workspace edit"));
+        return Err(io::Error::other(
+            "file or parent changed during workspace edit",
+        ));
     }
     Ok(())
 }
 
 fn ensure_parents(path: &Path, created: &mut Vec<PathBuf>) -> io::Result<()> {
     let mut missing = Vec::new();
-    let mut parent = path.parent().ok_or_else(|| io::Error::other("missing parent"))?;
+    let mut parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing parent"))?;
     while !parent.try_exists()? {
         missing.push(parent.to_path_buf());
-        parent = parent.parent().ok_or_else(|| io::Error::other("missing ancestor"))?;
+        parent = parent
+            .parent()
+            .ok_or_else(|| io::Error::other("missing ancestor"))?;
     }
     for directory in missing.into_iter().rev() {
         match std::fs::create_dir(&directory) {
@@ -298,7 +420,10 @@ fn ensure_parents(path: &Path, created: &mut Vec<PathBuf>) -> io::Result<()> {
 }
 
 fn scratch(path: &Path, image: &Image, prefix: &str) -> io::Result<tempfile::NamedTempFile> {
-    let mut file = tempfile::Builder::new().prefix(prefix).tempfile_in(path.parent().ok_or_else(|| io::Error::other("missing parent"))?)?;
+    let mut file = tempfile::Builder::new().prefix(prefix).tempfile_in(
+        path.parent()
+            .ok_or_else(|| io::Error::other("missing parent"))?,
+    )?;
     file.write_all(&image.bytes)?;
     // Backups stay private and writable until needed for restoration. In
     // particular, a Windows read-only preimage must not make its successful
@@ -317,22 +442,37 @@ struct Change {
 
 impl Change {
     fn prepare(&mut self, directories: &mut Vec<PathBuf>) -> io::Result<()> {
-        if self.staged.after.is_some() { ensure_parents(&self.path, directories)?; }
+        if self.staged.after.is_some() {
+            ensure_parents(&self.path, directories)?;
+        }
         if let Some(image) = &self.staged.before {
             self.backup = Some(scratch(&self.path, image, ".pi-lsp-backup-")?);
         }
         if let Some(image) = &self.staged.after {
             self.replacement = Some(scratch(&self.path, image, ".pi-lsp-edit-")?);
             if let Some(permissions) = &image.permissions {
-                let file = self.replacement.as_ref().expect("replacement file").as_file();
+                let file = self
+                    .replacement
+                    .as_ref()
+                    .expect("replacement file")
+                    .as_file();
                 file.set_permissions(permissions.clone())?;
                 file.sync_all()?;
             }
             // Newly created files have tempfile's restrictive permissions.
             // Capture those actual permissions for drift-safe rollback checks.
             if image.permissions.is_none() {
-                self.staged.after.as_mut().expect("replacement image").permissions = Some(
-                    self.replacement.as_ref().expect("replacement file").as_file().metadata()?.permissions(),
+                self.staged
+                    .after
+                    .as_mut()
+                    .expect("replacement image")
+                    .permissions = Some(
+                    self.replacement
+                        .as_ref()
+                        .expect("replacement file")
+                        .as_file()
+                        .metadata()?
+                        .permissions(),
                 );
             }
         }
@@ -342,7 +482,11 @@ impl Change {
     fn apply(&mut self) -> io::Result<()> {
         verify_image(&self.path, &self.staged.before)?;
         if let Some(file) = self.replacement.take() {
-            let result = if self.staged.before.is_none() { file.persist_noclobber(&self.path) } else { file.persist(&self.path) };
+            let result = if self.staged.before.is_none() {
+                file.persist_noclobber(&self.path)
+            } else {
+                file.persist(&self.path)
+            };
             result.map_err(|error| error.error)?;
         } else {
             std::fs::remove_file(&self.path)?;
@@ -355,13 +499,21 @@ impl Change {
         // Do not overwrite a concurrent editor's work while undoing ours.
         verify_image(&self.path, &self.staged.after)?;
         if let Some(backup) = &self.backup
-            && let Some(permissions) = self.staged.before.as_ref().and_then(|image| image.permissions.as_ref())
+            && let Some(permissions) = self
+                .staged
+                .before
+                .as_ref()
+                .and_then(|image| image.permissions.as_ref())
         {
             backup.as_file().set_permissions(permissions.clone())?;
             backup.as_file().sync_all()?;
         }
         if let Some(backup) = self.backup.take() {
-            let result = if self.staged.after.is_none() { backup.persist_noclobber(&self.path) } else { backup.persist(&self.path) };
+            let result = if self.staged.after.is_none() {
+                backup.persist_noclobber(&self.path)
+            } else {
+                backup.persist(&self.path)
+            };
             if let Err(error) = result {
                 self.backup = Some(error.file);
                 return Err(error.error);
@@ -374,7 +526,9 @@ impl Change {
     }
 
     fn retain_backup(&mut self) -> String {
-        let Some(backup) = self.backup.take() else { return String::new() };
+        let Some(backup) = self.backup.take() else {
+            return String::new();
+        };
         match backup.keep() {
             Ok((file, path)) => {
                 drop(file);
@@ -387,13 +541,20 @@ impl Change {
                 let (file, temporary_path) = error.file.into_parts();
                 drop(file);
                 std::mem::forget(temporary_path);
-                format!("; could not finalize recovery file {}: {}", path.display(), error.error)
+                format!(
+                    "; could not finalize recovery file {}: {}",
+                    path.display(),
+                    error.error
+                )
             }
         }
     }
 }
 
-pub(super) fn apply(plan: &WorkspaceEditPlan, hashes: Option<&HashMap<PathBuf, u64>>) -> Result<ApplyOutcome> {
+pub(super) fn apply(
+    plan: &WorkspaceEditPlan,
+    hashes: Option<&HashMap<PathBuf, u64>>,
+) -> Result<ApplyOutcome> {
     let transaction = super::sequence::stage(plan)?;
     transaction.check_hashes(hashes)?;
     transaction.commit()

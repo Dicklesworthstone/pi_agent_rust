@@ -43,9 +43,9 @@ fn checked_identifier(value: &str, limit: usize, field: &str) -> Result<()> {
 
 fn page_params(cursor: Option<&str>) -> Result<Value> {
     match cursor {
-        Some(cursor) if cursor.len() > MAX_CURSOR_BYTES => {
-            Err(invalid_request("MCP pagination cursor exceeds the byte limit"))
-        }
+        Some(cursor) if cursor.len() > MAX_CURSOR_BYTES => Err(invalid_request(
+            "MCP pagination cursor exceeds the byte limit",
+        )),
         Some(cursor) => Ok(json!({"cursor": cursor})),
         None => Ok(json!({})),
     }
@@ -99,12 +99,18 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
         .get(field)
         .and_then(Value::as_array)
         .filter(|items| items.len() <= MAX_CONTEXT_ITEMS)
-        .ok_or_else(|| invalid_response("MCP context result has a missing or oversized item array"))?;
+        .ok_or_else(|| {
+            invalid_response("MCP context result has a missing or oversized item array")
+        })?;
     if !matches!(shape, ContextResult::ResourceContents)
         && let Some(cursor) = result.get("nextCursor")
-        && !cursor.as_str().is_some_and(|cursor| cursor.len() <= MAX_CURSOR_BYTES)
+        && !cursor
+            .as_str()
+            .is_some_and(|cursor| cursor.len() <= MAX_CURSOR_BYTES)
     {
-        return Err(invalid_response("MCP context nextCursor must be a bounded string"));
+        return Err(invalid_response(
+            "MCP context nextCursor must be a bounded string",
+        ));
     }
     for item in items {
         optional_strings(item, &["title", "description", "mimeType"])?;
@@ -118,16 +124,20 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
                 };
                 response_string(item, uri_field, MAX_RESOURCE_URI_BYTES)?;
                 if item.get("size").is_some_and(|size| size.as_u64().is_none()) {
-                    return Err(invalid_response("MCP resource size must be an unsigned integer"));
+                    return Err(invalid_response(
+                        "MCP resource size must be an unsigned integer",
+                    ));
                 }
             }
             ContextResult::ResourceContents => {
                 response_string(item, "uri", MAX_RESOURCE_URI_BYTES)?;
                 match (item.get("text"), item.get("blob")) {
                     (Some(Value::String(_)), None) | (None, Some(Value::String(_))) => {}
-                    _ => return Err(invalid_response(
-                        "MCP resource content must contain exactly one string text or blob",
-                    )),
+                    _ => {
+                        return Err(invalid_response(
+                            "MCP resource content must contain exactly one string text or blob",
+                        ));
+                    }
                 }
             }
         }
@@ -150,7 +160,10 @@ impl Drop for ContextRequestGuard {
             McpManager::fail_transport_generation(
                 &self.entry,
                 &self.transport,
-                &tool_err("MCP_CANCELLED", "MCP context request was cancelled; it was not replayed"),
+                &tool_err(
+                    "MCP_CANCELLED",
+                    "MCP context request was cancelled; it was not replayed",
+                ),
             );
         }
     }
@@ -163,15 +176,24 @@ impl McpManager {
     /// # Errors
     /// Returns trust, connection, server, or response-validation errors.
     pub async fn list_resources(&self, server: &str, cursor: Option<&str>) -> Result<Value> {
-        self.request_context(server, "resources/list", page_params(cursor)?, ContextResult::Resources)
-            .await
+        self.request_context(
+            server,
+            "resources/list",
+            page_params(cursor)?,
+            ContextResult::Resources,
+        )
+        .await
     }
 
     /// List URI templates without expanding them or reading their resources.
     ///
     /// # Errors
     /// Returns trust, connection, server, or response-validation errors.
-    pub async fn list_resource_templates(&self, server: &str, cursor: Option<&str>) -> Result<Value> {
+    pub async fn list_resource_templates(
+        &self,
+        server: &str,
+        cursor: Option<&str>,
+    ) -> Result<Value> {
         self.request_context(
             server,
             "resources/templates/list",
@@ -187,8 +209,13 @@ impl McpManager {
     /// Returns invalid-input, trust, connection, server, or content errors.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
         checked_identifier(uri, MAX_RESOURCE_URI_BYTES, "resource URI")?;
-        self.request_context(server, "resources/read", json!({"uri": uri}), ContextResult::ResourceContents)
-            .await
+        self.request_context(
+            server,
+            "resources/read",
+            json!({"uri": uri}),
+            ContextResult::ResourceContents,
+        )
+        .await
     }
 
     /// Eligible context tools are derived from configuration and current trust,
@@ -223,7 +250,10 @@ impl McpManager {
             .is_some_and(|current| Arc::ptr_eq(current, transport));
         if !current {
             transport.abort();
-            return Err(tool_err("MCP_TRANSPORT_SUPERSEDED", "connection changed during MCP context access"));
+            return Err(tool_err(
+                "MCP_TRANSPORT_SUPERSEDED",
+                "connection changed during MCP context access",
+            ));
         }
         Ok(())
     }
@@ -238,7 +268,10 @@ impl McpManager {
         let entry = self.entry(server)?;
         self.ensure_ready(&entry).await?;
         let transport = Self::lock(&entry.transport).clone().ok_or_else(|| {
-            tool_err("MCP_TRANSPORT_CLOSED", "connection disappeared before MCP context access")
+            tool_err(
+                "MCP_TRANSPORT_CLOSED",
+                "connection disappeared before MCP context access",
+            )
         })?;
         self.check_context_transport(&entry, &transport).await?;
         let mut guard = ContextRequestGuard {
@@ -264,7 +297,10 @@ impl McpManager {
             return Err(error);
         }
         if started.elapsed() >= DEFAULT_MCP_TIMEOUT {
-            let error = tool_err("MCP_TIMEOUT", "MCP context response arrived after its deadline");
+            let error = tool_err(
+                "MCP_TIMEOUT",
+                "MCP context response arrived after its deadline",
+            );
             Self::fail_transport_generation(&entry, &transport, &error);
             return Err(error);
         }
@@ -296,21 +332,38 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for ContextTransport {
-        async fn request(&self, method: &str, params: Value, timeout: std::time::Duration) -> Result<Value> {
+        async fn request(
+            &self,
+            method: &str,
+            params: Value,
+            timeout: std::time::Duration,
+        ) -> Result<Value> {
             McpManager::lock(&self.requests).push((method.to_string(), params, timeout));
             let reply = McpManager::lock(&self.replies)
                 .pop_front()
                 .expect("unexpected extra request or replay");
             let hook = McpManager::lock(&self.after_response).clone();
-            if let Some(hook) = hook { hook(); }
+            if let Some(hook) = hook {
+                hook();
+            }
             reply
         }
 
-        async fn notify(&self, _method: &str, _params: Value) -> Result<()> { Ok(()) }
-        fn is_alive(&self) -> bool { !self.closed.load(Ordering::Acquire) }
-        fn abort(&self) { self.closed.store(true, Ordering::Release); }
-        async fn close(&self) { self.abort(); }
-        fn diagnostics_tail(&self) -> String { String::new() }
+        async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+            Ok(())
+        }
+        fn is_alive(&self) -> bool {
+            !self.closed.load(Ordering::Acquire)
+        }
+        fn abort(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
+        async fn close(&self) {
+            self.abort();
+        }
+        fn diagnostics_tail(&self) -> String {
+            String::new()
+        }
     }
 
     fn fixture(
@@ -329,12 +382,18 @@ mod tests {
             provenance: Provenance::ProjectPi,
             source_file: temp.path().join("mcp.json"),
         };
-        let manager = Arc::new(McpManager::new(temp.path(), temp.path(), McpDiscovery {
-            servers: vec![config], warnings: Vec::new(),
-        }));
+        let manager = Arc::new(McpManager::new(
+            temp.path(),
+            temp.path(),
+            McpDiscovery {
+                servers: vec![config],
+                warnings: Vec::new(),
+            },
+        ));
         let entry = manager.entry("docs").expect("server");
         if trusted {
-            TrustStore::load(&manager.inner.trust_path).expect("trust store")
+            TrustStore::load(&manager.inner.trust_path)
+                .expect("trust store")
                 .acknowledge("docs", &manager.trust_fingerprint_for(&entry), "operator")
                 .expect("trust server");
         }
@@ -350,33 +409,56 @@ mod tests {
     }
 
     fn runtime() -> asupersync::runtime::Runtime {
-        asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime")
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
     }
 
     fn rendered(output: &crate::tools::ToolOutput) -> String {
-        output.content.iter().filter_map(|block| match block {
-            crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        }).collect::<Vec<_>>().join("\n")
+        output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
     fn mounted_resource_tool_lists_one_page_and_preserves_opaque_cursors() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, _, transport) = fixture(&temp, vec![
-            Ok(json!({"resources": [], "nextCursor": "", "_meta": {"private": "secret"}})),
-            Ok(json!({"resources": [{"name":"schema","uri":"db://schema","_meta":{"private":"secret"}}]})),
-        ], true);
+        let (manager, _, transport) = fixture(
+            &temp,
+            vec![
+                Ok(json!({"resources": [], "nextCursor": "", "_meta": {"private": "secret"}})),
+                Ok(
+                    json!({"resources": [{"name":"schema","uri":"db://schema","_meta":{"private":"secret"}}]}),
+                ),
+            ],
+            true,
+        );
         let tools = crate::mcp::mount_tools(&manager);
         assert_eq!(tools.len(), 1, "resource-only server gets a context tool");
         let tool = &tools[0];
         runtime().block_on(async {
-            let first = tool.execute("one", json!({"action":"list_resources"}), None).await.expect("page");
-            assert_eq!(transport.requests.lock().unwrap().len(), 1, "no eager page traversal");
+            let first = tool
+                .execute("one", json!({"action":"list_resources"}), None)
+                .await
+                .expect("page");
+            assert_eq!(
+                transport.requests.lock().unwrap().len(),
+                1,
+                "no eager page traversal"
+            );
             assert!(rendered(&first).contains("nextCursor"));
             assert!(!rendered(&first).contains("secret"));
             assert!(first.details.unwrap()["_meta"].is_object());
-            let second = tool.execute("two", json!({"action":"list_resources","cursor":""}), None).await.expect("page");
+            let second = tool
+                .execute("two", json!({"action":"list_resources","cursor":""}), None)
+                .await
+                .expect("page");
             assert!(rendered(&second).contains("db://schema"));
             assert!(!rendered(&second).contains("secret"));
         });
@@ -385,19 +467,33 @@ mod tests {
         assert_eq!(requests[0].0, "resources/list");
         assert_eq!(requests[0].1, json!({}));
         assert_eq!(requests[1].1, json!({"cursor":""}));
-        assert!(requests.iter().all(|(_, _, timeout)| *timeout == DEFAULT_MCP_TIMEOUT));
+        assert!(
+            requests
+                .iter()
+                .all(|(_, _, timeout)| *timeout == DEFAULT_MCP_TIMEOUT)
+        );
     }
 
     #[test]
     fn resource_templates_are_discovered_without_reading_or_expanding_them() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, _, transport) = fixture(&temp, vec![Ok(json!({"resourceTemplates":[
+        let (manager, _, transport) = fixture(
+            &temp,
+            vec![Ok(json!({"resourceTemplates":[
             {"name":"source","uriTemplate":"repo://{path}{?ref}","description":"Sources"}
-        ],"nextCursor":"+/= opaque"}))], true);
+        ],"nextCursor":"+/= opaque"}))],
+            true,
+        );
         let tools = crate::mcp::mount_server_tools(&manager, "docs");
-        let output = runtime().block_on(tools[0].execute("templates", json!({
-            "action":"list_resource_templates", "cursor":" +/= "
-        }), None)).expect("templates");
+        let output = runtime()
+            .block_on(tools[0].execute(
+                "templates",
+                json!({
+                    "action":"list_resource_templates", "cursor":" +/= "
+                }),
+                None,
+            ))
+            .expect("templates");
         assert!(rendered(&output).contains("repo://{path}{?ref}"));
         let requests = McpManager::lock(&transport.requests);
         assert_eq!(requests.len(), 1);
@@ -410,14 +506,24 @@ mod tests {
     fn resource_reads_preserve_text_and_native_images_without_fetching_uris_locally() {
         let temp = tempfile::tempdir().expect("tempdir");
         let uri = "file:///path-that-does-not-exist/secret.txt";
-        let (manager, _, transport) = fixture(&temp, vec![Ok(json!({"contents":[
-            {"uri":uri,"text":"server document","_meta":{"secret":"not-prompt-text"}},
-            {"uri":"image://diagram","mimeType":"image/png","blob":"AQID"}
-        ]}))], true);
+        let (manager, _, transport) = fixture(
+            &temp,
+            vec![Ok(json!({"contents":[
+                {"uri":uri,"text":"server document","_meta":{"secret":"not-prompt-text"}},
+                {"uri":"image://diagram","mimeType":"image/png","blob":"AQID"}
+            ]}))],
+            true,
+        );
         let tools = crate::mcp::mount_tools(&manager);
-        let output = runtime().block_on(tools[0].execute("read", json!({
-            "action":"read_resource", "uri":uri
-        }), None)).expect("resource");
+        let output = runtime()
+            .block_on(tools[0].execute(
+                "read",
+                json!({
+                    "action":"read_resource", "uri":uri
+                }),
+                None,
+            ))
+            .expect("resource");
         assert!(!output.is_error);
         assert!(rendered(&output).contains("server document"));
         assert!(!rendered(&output).contains("not-prompt-text"));
@@ -434,18 +540,32 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, _, transport) = fixture(&temp, Vec::new(), false);
         assert!(crate::mcp::mount_tools(&manager).is_empty());
-        assert!(runtime().block_on(manager.read_resource("docs", "db://secret")).is_err());
+        assert!(
+            runtime()
+                .block_on(manager.read_resource("docs", "db://secret"))
+                .is_err()
+        );
         assert!(McpManager::lock(&transport.requests).is_empty());
 
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(&temp, Vec::new(), true);
         let tools = crate::mcp::mount_tools(&manager);
-        TrustStore::load(&manager.inner.trust_path).expect("trust store")
-            .deny("docs", &manager.trust_fingerprint_for(&entry), "operator").expect("revoke");
+        TrustStore::load(&manager.inner.trust_path)
+            .expect("trust store")
+            .deny("docs", &manager.trust_fingerprint_for(&entry), "operator")
+            .expect("revoke");
         assert!(crate::mcp::mount_tools(&manager).is_empty());
-        assert!(runtime().block_on(tools[0].execute("revoked", json!({
-            "action":"read_resource", "uri":"db://secret"
-        }), None)).is_err());
+        assert!(
+            runtime()
+                .block_on(tools[0].execute(
+                    "revoked",
+                    json!({
+                        "action":"read_resource", "uri":"db://secret"
+                    }),
+                    None
+                ))
+                .is_err()
+        );
         assert!(McpManager::lock(&transport.requests).is_empty());
     }
 
@@ -475,15 +595,24 @@ mod tests {
     #[test]
     fn revocation_during_response_prevents_context_publication() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(&temp, vec![Ok(json!({"contents":[
-            {"uri":"db://secret","text":"must not escape"}
-        ]}))], true);
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![Ok(json!({"contents":[
+                {"uri":"db://secret","text":"must not escape"}
+            ]}))],
+            true,
+        );
         let path = manager.inner.trust_path.clone();
         let fingerprint = manager.trust_fingerprint_for(&entry);
         *McpManager::lock(&transport.after_response) = Some(Arc::new(move || {
-            TrustStore::load(&path).expect("trust store").deny("docs", &fingerprint, "operator").expect("revoke");
+            TrustStore::load(&path)
+                .expect("trust store")
+                .deny("docs", &fingerprint, "operator")
+                .expect("revoke");
         }));
-        let error = runtime().block_on(manager.read_resource("docs", "db://secret")).expect_err("revoked");
+        let error = runtime()
+            .block_on(manager.read_resource("docs", "db://secret"))
+            .expect_err("revoked");
         assert!(error.to_string().contains("MCP_TRUST_DENIED"));
         assert!(!error.to_string().contains("must not escape"));
         assert!(transport.closed.load(Ordering::Acquire));
@@ -494,15 +623,20 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, old) = fixture(&temp, vec![Ok(json!({"resources":[]}))], true);
         let replacement = Arc::new(ContextTransport {
-            replies: Mutex::new(VecDeque::new()), requests: Mutex::new(Vec::new()),
-            closed: AtomicBool::new(false), after_response: Mutex::new(None),
+            replies: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            after_response: Mutex::new(None),
         });
         let erased: Arc<dyn McpTransport> = replacement.clone();
         let weak_entry = Arc::downgrade(&entry);
         *McpManager::lock(&old.after_response) = Some(Arc::new(move || {
-            *McpManager::lock(&weak_entry.upgrade().expect("entry").transport) = Some(erased.clone());
+            *McpManager::lock(&weak_entry.upgrade().expect("entry").transport) =
+                Some(erased.clone());
         }));
-        let error = runtime().block_on(manager.list_resources("docs", None)).expect_err("superseded");
+        let error = runtime()
+            .block_on(manager.list_resources("docs", None))
+            .expect_err("superseded");
         assert!(error.to_string().contains("MCP_TRANSPORT_SUPERSEDED"));
         assert!(old.closed.load(Ordering::Acquire));
         assert!(!replacement.closed.load(Ordering::Acquire));
@@ -515,7 +649,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(&temp, Vec::new(), true);
         let erased: Arc<dyn McpTransport> = transport.clone();
-        drop(ContextRequestGuard { entry: entry.clone(), transport: erased, armed: true });
+        drop(ContextRequestGuard {
+            entry: entry.clone(),
+            transport: erased,
+            armed: true,
+        });
         assert!(transport.closed.load(Ordering::Acquire));
         assert!(McpManager::lock(&entry.transport).is_none());
         assert_eq!(McpManager::lock(&entry.restarts).count, 1);
@@ -525,10 +663,17 @@ mod tests {
     #[test]
     fn server_errors_do_not_trigger_a_replay_or_poison_the_connection() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(&temp, vec![
-            Err(tool_err("MCP_SERVER_ERROR", "server error -32601: unsupported")),
-            Ok(json!({"contents":[{"uri":"db://known","text":"available"}]})),
-        ], true);
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                Err(tool_err(
+                    "MCP_SERVER_ERROR",
+                    "server error -32601: unsupported",
+                )),
+                Ok(json!({"contents":[{"uri":"db://known","text":"available"}]})),
+            ],
+            true,
+        );
         runtime().block_on(async {
             assert!(manager.list_resources("docs", None).await.is_err());
             assert!(manager.read_resource("docs", "db://known").await.is_ok());
@@ -541,15 +686,31 @@ mod tests {
     #[test]
     fn initial_missing_tools_method_keeps_resource_only_servers_usable() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(&temp, vec![
-            Err(tool_err("MCP_SERVER_ERROR", "server error -32601: no tools")),
-            Ok(json!({"resources":[]})),
-        ], true);
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                Err(tool_err(
+                    "MCP_SERVER_ERROR",
+                    "server error -32601: no tools",
+                )),
+                Ok(json!({"resources":[]})),
+            ],
+            true,
+        );
         runtime().block_on(async {
-            assert!(manager.list_and_cache_tools(&entry).await.expect("no tools").is_empty());
+            assert!(
+                manager
+                    .list_and_cache_tools(&entry)
+                    .await
+                    .expect("no tools")
+                    .is_empty()
+            );
             assert!(manager.list_resources("docs", None).await.is_ok());
         });
-        let methods: Vec<_> = McpManager::lock(&transport.requests).iter().map(|(method, _, _)| method.clone()).collect();
+        let methods: Vec<_> = McpManager::lock(&transport.requests)
+            .iter()
+            .map(|(method, _, _)| method.clone())
+            .collect();
         assert_eq!(methods, vec!["tools/list", "resources/list"]);
         assert_eq!(McpManager::lock(&entry.restarts).count, 0);
         assert!(!transport.closed.load(Ordering::Acquire));
@@ -558,11 +719,19 @@ mod tests {
     #[test]
     fn missing_tools_method_on_later_page_is_not_a_successful_partial_catalog() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(&temp, vec![
-            Ok(json!({"tools":[],"nextCursor":"next"})),
-            Err(tool_err("MCP_SERVER_ERROR", "server error -32601: gone")),
-        ], true);
-        assert!(runtime().block_on(manager.list_and_cache_tools(&entry)).is_err());
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                Ok(json!({"tools":[],"nextCursor":"next"})),
+                Err(tool_err("MCP_SERVER_ERROR", "server error -32601: gone")),
+            ],
+            true,
+        );
+        assert!(
+            runtime()
+                .block_on(manager.list_and_cache_tools(&entry))
+                .is_err()
+        );
         assert!(McpManager::lock(&entry.tools_cache).is_none());
         assert!(transport.closed.load(Ordering::Acquire));
     }
@@ -580,7 +749,9 @@ mod tests {
         ] {
             let temp = tempfile::tempdir().expect("tempdir");
             let (manager, _, transport) = fixture(&temp, vec![Ok(result)], true);
-            let error = runtime().block_on(manager.list_resources("docs", None)).expect_err("invalid response");
+            let error = runtime()
+                .block_on(manager.list_resources("docs", None))
+                .expect_err("invalid response");
             assert!(error.to_string().contains("MCP_PROTOCOL"));
             assert_eq!(McpManager::lock(&transport.requests).len(), 1);
             assert!(transport.closed.load(Ordering::Acquire));
@@ -590,18 +761,30 @@ mod tests {
             json!({"uri":"db://x","text":"a","blob":"Yg=="}),
             json!({"uri":"db://x","text":7}),
         ] {
-            assert!(validate_response(&json!({"contents":[resource]}), ContextResult::ResourceContents).is_err());
+            assert!(
+                validate_response(
+                    &json!({"contents":[resource]}),
+                    ContextResult::ResourceContents
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn method_not_found_classification_uses_the_error_code_not_arbitrary_prose() {
-        assert!(is_method_not_found(&tool_err("MCP_SERVER_ERROR", "server error -32601: unsupported")));
+        assert!(is_method_not_found(&tool_err(
+            "MCP_SERVER_ERROR",
+            "server error -32601: unsupported"
+        )));
         for error in [
             tool_err("MCP_SERVER_ERROR", "server error -32600: mentions -32601"),
             tool_err("MCP_SERVER_ERROR", "server error -326010: different code"),
             tool_err("MCP_TRANSPORT_IO", "server error -32601: invalid taxonomy"),
-            Error::tool("other", "[MCP_SERVER_ERROR] server error -32601: wrong tool"),
+            Error::tool(
+                "other",
+                "[MCP_SERVER_ERROR] server error -32601: wrong tool",
+            ),
         ] {
             assert!(!is_method_not_found(&error));
         }
@@ -617,9 +800,16 @@ mod tests {
             let tool = crate::mcp::McpContextTool::new(server, manager.clone());
             assert!(tool.name().len() <= 64);
             assert!(!tool.name().starts_with("mcp__"));
-            assert!(tool.name().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+            assert!(
+                tool.name()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            );
             assert!(names.insert(tool.name().to_string()));
-            assert_eq!(tool.name(), crate::mcp::McpContextTool::new(server, manager.clone()).name());
+            assert_eq!(
+                tool.name(),
+                crate::mcp::McpContextTool::new(server, manager.clone()).name()
+            );
         }
     }
 
@@ -631,7 +821,12 @@ mod tests {
         runtime().block_on(async {
             manager.shutdown_all().await;
             assert!(crate::mcp::mount_tools(&manager).is_empty());
-            assert!(tools[0].execute("old-session", json!({"action":"list_resources"}), None).await.is_err());
+            assert!(
+                tools[0]
+                    .execute("old-session", json!({"action":"list_resources"}), None)
+                    .await
+                    .is_err()
+            );
         });
         assert!(McpManager::lock(&transport.requests).is_empty());
     }
