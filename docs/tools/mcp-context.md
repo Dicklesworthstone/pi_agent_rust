@@ -7,7 +7,7 @@ startup, runtime trust, and extension-registration paths as other MCP tools.
 Pending or denied servers do not expose context tools. Existing wrappers recheck
 trust on every call, including after a server has returned its response.
 
-These are the five supported actions. They run against the server attached to the
+These are the six supported actions. They run against the server attached to the
 tool; there is no argument for selecting another server or an arbitrary RPC method.
 
 ```json
@@ -16,6 +16,7 @@ tool; there is no argument for selecting another server or an arbitrary RPC meth
 {"action":"read_resource","uri":"repo://src/main.rs"}
 {"action":"list_prompts"}
 {"action":"get_prompt","name":"code_review","arguments":{"code":"fn main() {}"}}
+{"action":"complete_argument","reference":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"code","value":""}}
 ```
 
 ## Resource discovery and reads
@@ -72,11 +73,47 @@ errors, including failures on later tool-catalog pages, are not swallowed.
 Unsupported resource or prompt methods return their server error explicitly.
 
 This surface is on-demand; it does not add resource subscriptions, prompt
-execution, argument completion, or automatic change-notification refresh.
+execution, or automatic change-notification refresh.
 
 ## Rust API
 
 `McpManager` exposes `list_resources`, `list_resource_templates`, `read_resource`,
-`list_prompts`, and `get_prompt`. Listings take an optional borrowed cursor;
+`list_prompts`, `get_prompt`, and `complete_argument`. Listings take an optional borrowed cursor;
 `get_prompt` takes an optional borrowed `BTreeMap<String, String>`. Methods return
 validated raw JSON. Native content conversion happens in the mounted context tool.
+
+## Server-guided argument completion
+
+The same server-bound tool supports `complete_argument`. For example:
+
+```json
+{"action":"complete_argument","reference":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"framework","value":"fl"},"context":{"language":"python"}}
+```
+
+For a resource template, use its exact advertised URI template, not an expanded
+URI, as the completion reference:
+
+```json
+{"action":"complete_argument","reference":{"type":"ref/resource","uri":"repo://{branch}/{path}"},"argument":{"name":"path","value":"src/"},"context":{"branch":"main"}}
+```
+
+`context` maps previously resolved argument names to string values. Pi sends it
+as `context.arguments` in one `completion/complete` request. Prefixes may be
+empty. Prefixes, argument values, and the server's relevance order are preserved
+exactly. This does not fetch the resource, retrieve a prompt, apply a suggestion,
+or poll for more suggestions when `hasMore` is true.
+
+Only `completion.values`, `total`, and `hasMore` enter model-visible output;
+client-only metadata remains in tool details. Input size and argument count,
+response bytes, and the protocol's 100-suggestion limit are enforced. Unsupported
+completion returns the server error without disabling its other features.
+Prefixes accept up to 64 KiB; the complete serialized completion request accepts
+up to 128 KiB, including JSON escaping and previously resolved arguments.
+Trust revocation, cancellation, and connection-generation checks are the same
+as for resource reads.
+
+SDK callers can use `McpManager::complete_argument` with the typed
+`pi::mcp::McpCompletionReference::{Prompt, Resource}`. There is no automatic
+keystroke-triggered requester; interactive embedders should debounce their calls.
+
+Wire contract: MCP specification 2025-06-18, Server Utilities / Completion.

@@ -20,6 +20,10 @@ const MAX_CONTEXT_PAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CONTEXT_CONTENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_PROMPT_ARGUMENTS: usize = 128;
 const MAX_PROMPT_ARGUMENT_BYTES: usize = 64 * 1024;
+// MCP 2025-06-18 CompleteResult defines at most 100 suggestions per response.
+const MAX_COMPLETION_VALUES: usize = 100;
+const MAX_COMPLETION_VALUE_BYTES: usize = 16 * 1024;
+const MAX_COMPLETION_REQUEST_BYTES: usize = 128 * 1024;
 // Each message becomes a role label plus a native content block. Leave room
 // within the shared content shaper's block budget for the reference heading.
 const MAX_PROMPT_MESSAGES: usize = 256;
@@ -31,6 +35,7 @@ enum ContextResult {
     ResourceContents,
     Prompts,
     PromptMessages,
+    Completion,
 }
 
 fn invalid_request(reason: &str) -> Error {
@@ -120,6 +125,60 @@ fn validate_prompt_definition(prompt: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_arguments(arguments: &BTreeMap<String, String>) -> Result<()> {
+    if arguments.len() > MAX_PROMPT_ARGUMENTS {
+        return Err(invalid_request("MCP context has too many arguments"));
+    }
+    for key in arguments.keys() {
+        checked_identifier(key, MAX_CONTEXT_NAME_BYTES, "argument name")?;
+    }
+    let mut budget = CatalogByteBudget {
+        remaining: MAX_PROMPT_ARGUMENT_BYTES,
+    };
+    serde_json::to_writer(&mut budget, arguments)
+        .map_err(|_| invalid_request("MCP context arguments exceed the byte limit"))
+}
+
+fn validate_completion(result: &Value) -> Result<()> {
+    let completion = result
+        .get("completion")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| invalid_response("MCP completion result must contain a completion object"))?;
+    let values = completion
+        .get("values")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() <= MAX_COMPLETION_VALUES)
+        .ok_or_else(|| {
+            invalid_response("MCP completion values must be an array of at most 100 strings")
+        })?;
+    if values.iter().any(|value| {
+        value
+            .as_str()
+            .is_none_or(|value| value.len() > MAX_COMPLETION_VALUE_BYTES)
+    }) {
+        return Err(invalid_response(
+            "MCP completion suggestions must be bounded strings",
+        ));
+    }
+    if let Some(total) = completion.get("total") {
+        let total = total
+            .as_u64()
+            .ok_or_else(|| invalid_response("MCP completion total must be an unsigned integer"))?;
+        if total < u64::try_from(values.len()).unwrap_or(u64::MAX) {
+            return Err(invalid_response(
+                "MCP completion total is smaller than its returned values",
+            ));
+        }
+    }
+    if completion
+        .get("hasMore")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(invalid_response("MCP completion hasMore must be a boolean"));
+    }
+    Ok(())
+}
+
 fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
     if !result.is_object() {
         return Err(invalid_response("MCP context result must be an object"));
@@ -130,10 +189,14 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
         ContextResult::ResourceContents => ("contents", MAX_CONTEXT_CONTENT_BYTES),
         ContextResult::Prompts => ("prompts", MAX_CONTEXT_PAGE_BYTES),
         ContextResult::PromptMessages => ("messages", MAX_CONTEXT_CONTENT_BYTES),
+        ContextResult::Completion => ("completion", MAX_CONTEXT_PAGE_BYTES),
     };
     let mut budget = CatalogByteBudget { remaining: limit };
     serde_json::to_writer(&mut budget, result)
         .map_err(|_| invalid_response("MCP context response exceeds the byte limit"))?;
+    if matches!(shape, ContextResult::Completion) {
+        return validate_completion(result);
+    }
     let item_limit = if matches!(shape, ContextResult::PromptMessages) {
         MAX_PROMPT_MESSAGES
     } else {
@@ -204,6 +267,9 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
                         invalid_response("MCP prompt message must contain a content object")
                     })?;
                 response_string(content, "type", MAX_CONTEXT_NAME_BYTES)?;
+            }
+            ContextResult::Completion => {
+                return Err(invalid_response("MCP completion was not validated as an object"));
             }
         }
     }
@@ -313,21 +379,70 @@ impl McpManager {
         checked_identifier(name, MAX_CONTEXT_NAME_BYTES, "prompt name")?;
         let mut params = json!({"name": name});
         if let Some(arguments) = arguments {
-            if arguments.len() > MAX_PROMPT_ARGUMENTS {
-                return Err(invalid_request("MCP prompt has too many arguments"));
-            }
-            for key in arguments.keys() {
-                checked_identifier(key, MAX_CONTEXT_NAME_BYTES, "prompt argument name")?;
-            }
-            let mut budget = CatalogByteBudget {
-                remaining: MAX_PROMPT_ARGUMENT_BYTES,
-            };
-            serde_json::to_writer(&mut budget, arguments)
-                .map_err(|_| invalid_request("MCP prompt arguments exceed the byte limit"))?;
+            validate_arguments(arguments)?;
             params["arguments"] = serde_json::to_value(arguments)?;
         }
         self.request_context(server, "prompts/get", params, ContextResult::PromptMessages)
             .await
+    }
+
+    /// Ask the trusted server for argument suggestions for a prompt or URI
+    /// template. Empty prefixes and already-resolved values are preserved.
+    /// This performs one on-demand request; it never polls or fetches the
+    /// referenced resource, retrieves the prompt, or accepts a suggestion.
+    ///
+    /// # Errors
+    /// Returns invalid-input, trust, connection, server, or response errors.
+    pub async fn complete_argument(
+        &self,
+        server: &str,
+        reference: &crate::mcp::McpCompletionReference,
+        argument_name: &str,
+        argument_value: &str,
+        context: Option<&BTreeMap<String, String>>,
+    ) -> Result<Value> {
+        match reference {
+            crate::mcp::McpCompletionReference::Prompt { name } => {
+                checked_identifier(name, MAX_CONTEXT_NAME_BYTES, "prompt name")?;
+            }
+            crate::mcp::McpCompletionReference::Resource { uri } => {
+                checked_identifier(uri, MAX_RESOURCE_URI_BYTES, "resource URI template")?;
+            }
+        }
+        checked_identifier(
+            argument_name,
+            MAX_CONTEXT_NAME_BYTES,
+            "completion argument name",
+        )?;
+        if argument_value.len() > MAX_PROMPT_ARGUMENT_BYTES {
+            return Err(invalid_request(
+                "MCP completion argument exceeds the byte limit",
+            ));
+        }
+        let mut params = json!({
+            "ref": reference,
+            "argument": {"name": argument_name, "value": argument_value},
+        });
+        if let Some(context) = context {
+            validate_arguments(context)?;
+            params["context"] = json!({"arguments": context});
+        }
+        // Prefixes may contain JSON-escaped control characters. Bound the
+        // complete encoded request, not only its unescaped component lengths,
+        // before acquiring a connection or allowing a server-side effect.
+        let mut budget = CatalogByteBudget {
+            remaining: MAX_COMPLETION_REQUEST_BYTES,
+        };
+        serde_json::to_writer(&mut budget, &params).map_err(|_| {
+            invalid_request("MCP completion request exceeds the encoded byte limit")
+        })?;
+        self.request_context(
+            server,
+            "completion/complete",
+            params,
+            ContextResult::Completion,
+        )
+        .await
     }
 
     /// Eligible context tools are derived from configuration and current trust,
@@ -536,6 +651,236 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn completion_preserves_prefix_context_and_server_relevance_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let result = json!({"completion": {
+            "values": ["z-last-alphabetically", "a-first-alphabetically", "", "Ω"],
+            "total": 9, "hasMore": true, "_meta": {"secret": "private-inner"}
+        }, "_meta": {"secret": "private-outer"}});
+        let (manager, _, transport) = fixture(&temp, vec![Ok(result.clone())], true);
+        let tools = crate::mcp::mount_tools(&manager);
+        let output = runtime().block_on(tools[0].execute("complete", json!({
+            "action": "complete_argument",
+            "reference": {"type": "ref/prompt", "name": "code_review"},
+            "argument": {"name": "framework", "value": "  fl\n"},
+            "context": {"language": "日本語", "source": "line 1\n\"line 2\""}
+        }), None)).expect("completion");
+        assert!(!output.is_error);
+        let public: Value = serde_json::from_str(&rendered(&output)).expect("public JSON");
+        assert_eq!(public["completion"]["values"], result["completion"]["values"]);
+        assert_eq!(public["completion"]["total"], 9);
+        assert_eq!(public["completion"]["hasMore"], true);
+        assert!(!rendered(&output).contains("private-"));
+        assert_eq!(output.details, Some(result));
+        let requests = McpManager::lock(&transport.requests);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "completion/complete");
+        assert_eq!(requests[0].1, json!({
+            "ref": {"type": "ref/prompt", "name": "code_review"},
+            "argument": {"name": "framework", "value": "  fl\n"},
+            "context": {"arguments": {"language": "日本語", "source": "line 1\n\"line 2\""}}
+        }));
+    }
+
+    #[test]
+    fn resource_completions_keep_templates_opaque_and_do_not_fetch_them() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, transport) = fixture(&temp, vec![
+            Ok(json!({"completion": {"values": []}})),
+            Ok(json!({"completion": {"values": [""], "hasMore": false}})),
+        ], true);
+        let reference = crate::mcp::McpCompletionReference::Resource {
+            uri: "file:///{+path}{?revision}".to_string(),
+        };
+        runtime().block_on(async {
+            manager.complete_argument("docs", &reference, "path", "", None)
+                .await.expect("empty prefix");
+            manager.complete_argument("docs", &reference, "path", "", Some(&BTreeMap::new()))
+                .await.expect("explicit empty context");
+        });
+        let requests = McpManager::lock(&transport.requests);
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.0 == "completion/complete"));
+        assert_eq!(requests[0].1["ref"]["uri"], "file:///{+path}{?revision}");
+        assert_eq!(requests[0].1["argument"]["value"], "");
+        assert!(requests[0].1.get("context").is_none());
+        assert_eq!(requests[1].1["context"], json!({"arguments": {}}));
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn completion_input_errors_have_no_transport_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, transport) = fixture(&temp, Vec::new(), true);
+        let tools = crate::mcp::mount_tools(&manager);
+        runtime().block_on(async {
+            for reference in [
+                json!({"type": "ref/tool", "name": "exec"}),
+                json!({"type": "ref/prompt", "name": "", "uri": "db://ignored"}),
+                json!({"type": "ref/prompt", "name": ""}),
+                json!({"type": "ref/resource", "uri": "db://secret\nother"}),
+                json!({"type": "ref/resource", "uri": 9}),
+            ] {
+                assert!(tools[0].execute("bad", json!({
+                    "action": "complete_argument", "reference": reference,
+                    "argument": {"name": "arg", "value": ""}
+                }), None).await.is_err());
+            }
+            for argument in [
+                json!({"name": "arg"}),
+                json!({"name": "arg", "value": 1}),
+                json!({"name": "", "value": ""}),
+                json!({"name": "arg", "value": "", "secret": true}),
+                json!({"name": "arg", "value": "x".repeat(MAX_PROMPT_ARGUMENT_BYTES + 1)}),
+            ] {
+                assert!(tools[0].execute("bad", json!({
+                    "action": "complete_argument",
+                    "reference": {"type": "ref/prompt", "name": "review"},
+                    "argument": argument
+                }), None).await.is_err());
+            }
+            assert!(tools[0].execute("bad", json!({
+                "action": "complete_argument",
+                "reference": {"type": "ref/prompt", "name": "review"},
+                "argument": {"name": "arg", "value": ""},
+                "context": {"arg": 1}
+            }), None).await.is_err());
+        });
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn completion_context_is_bounded_before_connection_or_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, transport) = fixture(&temp, Vec::new(), true);
+        let reference = crate::mcp::McpCompletionReference::Prompt { name: "review".to_string() };
+        let too_many: BTreeMap<String, String> = (0..=MAX_PROMPT_ARGUMENTS)
+            .map(|index| (format!("arg{index}"), String::new())).collect();
+        let too_large = BTreeMap::from([("source".to_string(), "\n".repeat(MAX_PROMPT_ARGUMENT_BYTES))]);
+        let bad_name = BTreeMap::from([("\0name".to_string(), String::new())]);
+        runtime().block_on(async {
+            for arguments in [&too_many, &too_large, &bad_name] {
+                let error = manager.complete_argument("docs", &reference, "arg", "", Some(arguments))
+                    .await.expect_err("reject invalid context");
+                assert!(error.to_string().contains("MCP_REQUEST_INVALID"));
+            }
+        });
+        assert!(McpManager::lock(&transport.requests).is_empty());
+    }
+
+    #[test]
+    fn completion_request_budget_counts_prefix_escaping_before_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, _, transport) = fixture(
+            &temp,
+            vec![Ok(json!({"completion": {"values": []}}))],
+            true,
+        );
+        let reference = crate::mcp::McpCompletionReference::Prompt {
+            name: "review".to_string(),
+        };
+        let prefix = "\0".repeat(MAX_PROMPT_ARGUMENT_BYTES / 2);
+        let error = runtime()
+            .block_on(manager.complete_argument("docs", &reference, "code", &prefix, None))
+            .expect_err("escaping exceeds the aggregate request budget");
+        assert!(error.to_string().contains("encoded byte limit"));
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(!transport.closed.load(Ordering::Acquire));
+
+        let prefix = "x".repeat(MAX_PROMPT_ARGUMENT_BYTES);
+        runtime()
+            .block_on(manager.complete_argument("docs", &reference, "code", &prefix, None))
+            .expect("unescaped prefix at its exact bound remains supported");
+        let requests = McpManager::lock(&transport.requests);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1["argument"]["value"], prefix);
+    }
+
+    #[test]
+    fn completion_response_limits_and_types_are_enforced() {
+        for completion in [
+            json!(null),
+            json!({}),
+            json!({"values": null}),
+            json!({"values": [7]}),
+            json!({"values": vec!["x"; MAX_COMPLETION_VALUES + 1]}),
+            json!({"values": ["x".repeat(MAX_COMPLETION_VALUE_BYTES + 1)]}),
+            json!({"values": ["x"], "total": 0}),
+            json!({"values": [], "total": -1}),
+            json!({"values": [], "total": 1.5}),
+            json!({"values": [], "total": "100"}),
+            json!({"values": [], "hasMore": "yes"}),
+        ] {
+            assert!(validate_response(&json!({"completion": completion}), ContextResult::Completion).is_err());
+        }
+        for completion in [
+            json!({"values": []}),
+            json!({"values": [""], "total": 1, "hasMore": false}),
+            json!({"values": vec!["x"; MAX_COMPLETION_VALUES], "hasMore": true}),
+            json!({"values": ["x".repeat(MAX_COMPLETION_VALUE_BYTES)]}),
+        ] {
+            validate_response(&json!({"completion": completion}), ContextResult::Completion)
+                .expect("valid bounded completion");
+        }
+        assert!(validate_response(&json!({"completion": {"values": []},
+            "_meta": "x".repeat(MAX_CONTEXT_PAGE_BYTES)}), ContextResult::Completion).is_err());
+    }
+
+    #[test]
+    fn malformed_completion_retires_the_connection_without_retrying() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![
+            Ok(json!({"completion": {"values": [null]}})),
+        ], true);
+        let reference = crate::mcp::McpCompletionReference::Prompt { name: "review".to_string() };
+        let error = runtime().block_on(manager.complete_argument("docs", &reference, "arg", "", None))
+            .expect_err("invalid response");
+        assert!(error.to_string().contains("MCP_PROTOCOL"));
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+    }
+
+    #[test]
+    fn unsupported_completion_does_not_disable_other_server_features() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![
+            Err(tool_err("MCP_SERVER_ERROR", "server error -32601: no completions")),
+            Ok(json!({"resources": []})),
+        ], true);
+        let reference = crate::mcp::McpCompletionReference::Prompt { name: "review".to_string() };
+        runtime().block_on(async {
+            assert!(manager.complete_argument("docs", &reference, "arg", "", None).await.is_err());
+            manager.list_resources("docs", None).await.expect("resource access remains available");
+        });
+        assert_eq!(McpManager::lock(&transport.requests).len(), 2);
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn revocation_during_completion_blocks_sensitive_suggestions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![
+            Ok(json!({"completion": {"values": ["sensitive-candidate"]}})),
+        ], true);
+        let path = manager.inner.trust_path.clone();
+        let fingerprint = manager.trust_fingerprint_for(&entry);
+        *McpManager::lock(&transport.after_response) = Some(Arc::new(move || {
+            TrustStore::load(&path).expect("trust store")
+                .deny("docs", &fingerprint, "operator").expect("revoke");
+        }));
+        let reference = crate::mcp::McpCompletionReference::Prompt { name: "review".to_string() };
+        let error = runtime().block_on(manager.complete_argument("docs", &reference, "arg", "", None))
+            .expect_err("revoked suggestions");
+        assert!(error.to_string().contains("MCP_TRUST_DENIED"));
+        assert!(!error.to_string().contains("sensitive-candidate"));
+        assert!(transport.closed.load(Ordering::Acquire));
     }
 
     #[test]
