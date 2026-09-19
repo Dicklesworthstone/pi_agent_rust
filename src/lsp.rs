@@ -661,7 +661,9 @@ impl Tool for LspTool {
                 .await
             }
             "symbols" => self.run_symbols(&input).await,
-            "incoming_calls" | "outgoing_calls" | "supertypes" | "subtypes" => self.run_hierarchy(&input).await,
+            "incoming_calls" | "outgoing_calls" | "supertypes" | "subtypes" => {
+                self.run_hierarchy(&input).await
+            }
             "rename" => self.run_rename(&input).await,
             "rename_file" => self.run_rename_file(&input).await,
             "code_actions" => self.run_code_actions(&input).await,

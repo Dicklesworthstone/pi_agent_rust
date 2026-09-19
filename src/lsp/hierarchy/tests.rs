@@ -139,11 +139,18 @@ while True:
 
 fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Runtime)> {
     let python = ["python3", "python"].into_iter().find(|program| {
-        Command::new(program).arg("--version").stdout(Stdio::null()).stderr(Stdio::null())
-            .status().is_ok_and(|status| status.success())
+        Command::new(program)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     });
     let Some(python) = python else {
-        assert!(std::env::var_os("PI_LSP_REQUIRE_PROTOCOL").is_none(), "Python required for hierarchy protocol coverage");
+        assert!(
+            std::env::var_os("PI_LSP_REQUIRE_PROTOCOL").is_none(),
+            "Python required for hierarchy protocol coverage"
+        );
         eprintln!("SKIP hierarchy protocol test: Python unavailable");
         return None;
     };
@@ -151,7 +158,13 @@ fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Run
     std::fs::write(root.join("caller.graphfixture"), "root\n").unwrap();
     let settings = LspServerSettings {
         command: Some(python.into()),
-        args: Some(vec!["-I".into(), "-u".into(), "-c".into(), SERVER.into(), mode.into()]),
+        args: Some(vec![
+            "-I".into(),
+            "-u".into(),
+            "-c".into(),
+            SERVER.into(),
+            mode.into(),
+        ]),
         extensions: Some(vec![".graphfixture".into()]),
         languages: Some(vec!["plaintext".into()]),
         root_markers: Some(vec![]),
@@ -165,8 +178,15 @@ fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Run
         ..Default::default()
     };
     let runtime = asupersync::runtime::RuntimeBuilder::new()
-        .enable_parking(false).worker_threads(1).blocking_threads(1, 8).build().unwrap();
-    Some((LspTool::new(&root.canonicalize().unwrap(), Some(&config)), runtime))
+        .enable_parking(false)
+        .worker_threads(1)
+        .blocking_threads(1, 8)
+        .build()
+        .unwrap();
+    Some((
+        LspTool::new(&root.canonicalize().unwrap(), Some(&config)),
+        runtime,
+    ))
 }
 
 fn run(tool: &LspTool, runtime: &asupersync::runtime::Runtime, input: Value) -> Result<Value> {
@@ -176,12 +196,19 @@ fn run(tool: &LspTool, runtime: &asupersync::runtime::Runtime, input: Value) -> 
 }
 
 fn start(tool: &LspTool, runtime: &asupersync::runtime::Runtime, action: &str) -> Result<Value> {
-    run(tool, runtime, json!({"action":action,"file":"source.graphfixture","symbol":"root"}))
+    run(
+        tool,
+        runtime,
+        json!({"action":action,"file":"source.graphfixture","symbol":"root"}),
+    )
 }
 
 fn frames(root: &Path) -> Vec<Value> {
-    std::fs::read_to_string(root.join("requests.jsonl")).unwrap().lines()
-        .map(|line| serde_json::from_str(line).unwrap()).collect()
+    std::fs::read_to_string(root.join("requests.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 fn sample_item() -> Value {
@@ -194,61 +221,116 @@ fn sample_item() -> Value {
 #[test]
 fn outgoing_handles_reuse_the_exact_item_without_repreparing() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     let first = start(&tool, &runtime, "outgoing_calls").unwrap();
     assert_eq!(first["items"][0]["name"], "leaf");
     assert_eq!(first["items"][0]["callSiteUri"], first["source"]["uri"]);
     assert!(first["items"][0].get("data").is_none());
     let id = first["items"][0]["hierarchyId"].clone();
-    let second = run(&tool, &runtime, json!({"action":"outgoing_calls","hierarchyId":id})).unwrap();
+    let second = run(
+        &tool,
+        &runtime,
+        json!({"action":"outgoing_calls","hierarchyId":id}),
+    )
+    .unwrap();
     assert_eq!(second["items"][0]["name"], "root");
     let log = frames(temp.path());
-    assert_eq!(log.iter().filter(|frame| frame["method"] == "textDocument/prepareCallHierarchy").count(), 1);
-    assert_eq!(log.iter().filter(|frame| frame["method"] == "callHierarchy/outgoingCalls").count(), 2);
+    assert_eq!(
+        log.iter()
+            .filter(|frame| frame["method"] == "textDocument/prepareCallHierarchy")
+            .count(),
+        1
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|frame| frame["method"] == "callHierarchy/outgoingCalls")
+            .count(),
+        2
+    );
 }
 
 #[test]
 fn incoming_call_sites_belong_to_the_caller_not_the_selected_callee() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     let result = start(&tool, &runtime, "incoming_calls").unwrap();
     assert_eq!(result["items"][0]["name"], "caller");
     assert_eq!(result["items"][0]["callSiteUri"], result["items"][0]["uri"]);
     assert_ne!(result["items"][0]["callSiteUri"], result["source"]["uri"]);
     let id = result["items"][0]["hierarchyId"].clone();
-    let next = run(&tool, &runtime, json!({"action":"outgoing_calls","hierarchyId":id})).unwrap();
+    let next = run(
+        &tool,
+        &runtime,
+        json!({"action":"outgoing_calls","hierarchyId":id}),
+    )
+    .unwrap();
     assert_eq!(next["source"]["name"], "caller");
 }
 
 #[test]
 fn ambiguous_preparation_returns_selectable_handles_without_guessing() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "ambiguous") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "ambiguous") else {
+        return;
+    };
     let result = start(&tool, &runtime, "incoming_calls").unwrap();
     assert_eq!(result["selectionRequired"], true);
     assert_eq!(result["count"], 2);
-    assert!(!frames(temp.path()).iter().any(|frame| frame["method"] == "callHierarchy/incomingCalls"));
-    let next = run(&tool, &runtime, json!({"action":"incoming_calls","hierarchyId":result["items"][1]["hierarchyId"]})).unwrap();
+    assert!(
+        !frames(temp.path())
+            .iter()
+            .any(|frame| frame["method"] == "callHierarchy/incomingCalls")
+    );
+    let next = run(
+        &tool,
+        &runtime,
+        json!({"action":"incoming_calls","hierarchyId":result["items"][1]["hierarchyId"]}),
+    )
+    .unwrap();
     assert_eq!(next["source"]["name"], "leaf");
 }
 
 #[test]
 fn source_drift_expires_handles_before_wire_dispatch() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     let result = start(&tool, &runtime, "outgoing_calls").unwrap();
     std::fs::write(temp.path().join("source.graphfixture"), "external change\n").unwrap();
-    let error = run(&tool, &runtime, json!({"action":"outgoing_calls","hierarchyId":result["items"][0]["hierarchyId"]})).unwrap_err();
+    let error = run(
+        &tool,
+        &runtime,
+        json!({"action":"outgoing_calls","hierarchyId":result["items"][0]["hierarchyId"]}),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("LSP_HIERARCHY_EXPIRED"));
-    assert_eq!(frames(temp.path()).iter().filter(|frame| frame["method"] == "callHierarchy/outgoingCalls").count(), 1);
+    assert_eq!(
+        frames(temp.path())
+            .iter()
+            .filter(|frame| frame["method"] == "callHierarchy/outgoingCalls")
+            .count(),
+        1
+    );
 }
 
 #[test]
 fn source_changes_during_either_stage_never_publish_a_graph() {
     for mode in ["drift_prepare", "drift_calls"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
-        assert!(start(&tool, &runtime, "outgoing_calls").unwrap_err().to_string().contains("LSP_HIERARCHY_EXPIRED"));
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
+        assert!(
+            start(&tool, &runtime, "outgoing_calls")
+                .unwrap_err()
+                .to_string()
+                .contains("LSP_HIERARCHY_EXPIRED")
+        );
         assert!(lock(&tool.hierarchies.entries).is_empty());
     }
 }
@@ -256,34 +338,75 @@ fn source_changes_during_either_stage_never_publish_a_graph() {
 #[test]
 fn closed_and_reopened_identical_unversioned_sources_retire_handles() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "unversioned") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "unversioned") else {
+        return;
+    };
     let result = start(&tool, &runtime, "outgoing_calls").unwrap();
     let id = result["items"][0]["hierarchyId"].as_str().unwrap();
     let cached = tool.hierarchies.get(id).unwrap();
     let entry = cached.origin.entry.upgrade().unwrap();
     entry.client.invalidate(&cached.origin.uri);
-    entry.client.ensure_synced(&cached.origin.path, "plaintext").unwrap();
-    assert!(run(&tool, &runtime, json!({"action":"incoming_calls","hierarchyId":id})).unwrap_err().to_string().contains("LSP_HIERARCHY_EXPIRED"));
+    entry
+        .client
+        .ensure_synced(&cached.origin.path, "plaintext")
+        .unwrap();
+    assert!(
+        run(
+            &tool,
+            &runtime,
+            json!({"action":"incoming_calls","hierarchyId":id})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("LSP_HIERARCHY_EXPIRED")
+    );
 }
 
 #[test]
 fn server_reload_retires_handles_without_automatically_starting_another_server() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     let result = start(&tool, &runtime, "incoming_calls").unwrap();
     run(&tool, &runtime, json!({"action":"reload"})).unwrap();
-    assert!(run(&tool, &runtime, json!({"action":"incoming_calls","hierarchyId":result["items"][0]["hierarchyId"]})).unwrap_err().to_string().contains("LSP_HIERARCHY_EXPIRED"));
-    assert_eq!(frames(temp.path()).iter().filter(|frame| frame["method"] == "initialize").count(), 1);
+    assert!(
+        run(
+            &tool,
+            &runtime,
+            json!({"action":"incoming_calls","hierarchyId":result["items"][0]["hierarchyId"]})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("LSP_HIERARCHY_EXPIRED")
+    );
+    assert_eq!(
+        frames(temp.path())
+            .iter()
+            .filter(|frame| frame["method"] == "initialize")
+            .count(),
+        1
+    );
 }
 
 #[test]
 fn unsupported_and_failed_servers_are_not_empty_graphs() {
-    for (mode, expected) in [("unsupported", "LSP_HIERARCHY_UNSUPPORTED"), ("error", "hierarchy fixture failed"),
-        ("malformed_item", "LSP_HIERARCHY_PROTOCOL"), ("malformed_calls", "LSP_HIERARCHY_PROTOCOL")]
-    {
+    for (mode, expected) in [
+        ("unsupported", "LSP_HIERARCHY_UNSUPPORTED"),
+        ("error", "hierarchy fixture failed"),
+        ("malformed_item", "LSP_HIERARCHY_PROTOCOL"),
+        ("malformed_calls", "LSP_HIERARCHY_PROTOCOL"),
+    ] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
-        assert!(start(&tool, &runtime, "outgoing_calls").unwrap_err().to_string().contains(expected));
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
+        assert!(
+            start(&tool, &runtime, "outgoing_calls")
+                .unwrap_err()
+                .to_string()
+                .contains(expected)
+        );
         assert!(lock(&tool.hierarchies.entries).is_empty());
     }
 }
@@ -292,7 +415,9 @@ fn unsupported_and_failed_servers_are_not_empty_graphs() {
 fn null_preparation_and_null_calls_are_explicit_successful_empty_results() {
     for mode in ["none", "empty"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
         let result = start(&tool, &runtime, "outgoing_calls").unwrap();
         assert_eq!(result["count"], 0);
         assert_eq!(result["truncated"], false);
@@ -305,7 +430,9 @@ fn null_preparation_and_null_calls_are_explicit_successful_empty_results() {
 fn item_and_site_limits_preserve_whole_ranges_and_advertise_truncation() {
     for mode in ["many", "many_sites"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
         let result = start(&tool, &runtime, "outgoing_calls").unwrap();
         assert!(result.to_string().len() <= super::super::MAX_PAYLOAD_BYTES);
         if mode == "many" {
@@ -314,11 +441,18 @@ fn item_and_site_limits_preserve_whole_ranges_and_advertise_truncation() {
             assert_eq!(result["truncated"], true);
         } else {
             assert_eq!(result["items"][0]["callSiteCount"], 100);
-            assert_eq!(result["items"][0]["fromRanges"].as_array().unwrap().len(), MAX_SHOWN_CALL_SITES);
+            assert_eq!(
+                result["items"][0]["fromRanges"].as_array().unwrap().len(),
+                MAX_SHOWN_CALL_SITES
+            );
             assert_eq!(result["items"][0]["callSitesTruncated"], true);
         }
         for row in result["items"].as_array().unwrap() {
-            assert!(tool.hierarchies.get(row["hierarchyId"].as_str().unwrap()).is_ok());
+            assert!(
+                tool.hierarchies
+                    .get(row["hierarchyId"].as_str().unwrap())
+                    .is_ok()
+            );
         }
     }
 }
@@ -327,9 +461,17 @@ fn item_and_site_limits_preserve_whole_ranges_and_advertise_truncation() {
 fn malformed_ranges_selections_and_items_are_rejected_before_caching() {
     let valid = sample_item();
     assert!(Item::parse(&valid).is_ok());
-    for (field, value) in [("kind", json!(99)), ("name", json!("")), ("uri", json!("relative")),
-        ("detail", json!(false)), ("tags", json!(["bad"])), ("selectionRange", json!({"start":{"line":3,"character":0},"end":{"line":3,"character":1}}))]
-    {
+    for (field, value) in [
+        ("kind", json!(99)),
+        ("name", json!("")),
+        ("uri", json!("relative")),
+        ("detail", json!(false)),
+        ("tags", json!(["bad"])),
+        (
+            "selectionRange",
+            json!({"start":{"line":3,"character":0},"end":{"line":3,"character":1}}),
+        ),
+    ] {
         let mut raw = valid.clone();
         raw[field] = value;
         assert!(Item::parse(&raw).is_err(), "field {field}");
@@ -344,29 +486,51 @@ fn malformed_ranges_selections_and_items_are_rejected_before_caching() {
 #[test]
 fn prepare_positions_use_the_synchronized_unicode_and_crlf_source() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     std::fs::write(temp.path().join("source.graphfixture"), "😀root\r\nleaf").unwrap();
     start(&tool, &runtime, "outgoing_calls").unwrap();
     let log = frames(temp.path());
-    let prepare = log.iter().find(|frame| frame["method"] == "textDocument/prepareCallHierarchy").unwrap();
-    assert_eq!(prepare["params"]["position"], json!({"line":0,"character":2}));
+    let prepare = log
+        .iter()
+        .find(|frame| frame["method"] == "textDocument/prepareCallHierarchy")
+        .unwrap();
+    assert_eq!(
+        prepare["params"]["position"],
+        json!({"line":0,"character":2})
+    );
 }
 
 #[test]
 fn unsolicited_workspace_edits_remain_denied_during_hierarchy_queries() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "unsolicited") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "unsolicited") else {
+        return;
+    };
     start(&tool, &runtime, "outgoing_calls").unwrap();
-    let reply: Value = serde_json::from_str(&std::fs::read_to_string(temp.path().join("callback.json")).unwrap()).unwrap();
+    let reply: Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("callback.json")).unwrap())
+            .unwrap();
     assert_eq!(reply["result"]["applied"], false);
-    assert_eq!(std::fs::read_to_string(temp.path().join("source.graphfixture")).unwrap(), "root leaf caller\n");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("source.graphfixture")).unwrap(),
+        "root leaf caller\n"
+    );
 }
 
 #[test]
 fn preparation_and_expansion_share_one_deadline() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "shared_timeout") else { return };
-    let error = run(&tool, &runtime, json!({"action":"outgoing_calls","file":"source.graphfixture","symbol":"root","timeout":1})).unwrap_err();
+    let Some((tool, runtime)) = fixture(temp.path(), "shared_timeout") else {
+        return;
+    };
+    let error = run(
+        &tool,
+        &runtime,
+        json!({"action":"outgoing_calls","file":"source.graphfixture","symbol":"root","timeout":1}),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("LSP_TIMEOUT"));
     assert!(lock(&tool.hierarchies.entries).is_empty());
 }
@@ -375,21 +539,41 @@ fn preparation_and_expansion_share_one_deadline() {
 fn dropping_each_request_stage_cancels_it_without_leaking_handles() {
     for mode in ["hang_prepare", "hang_calls"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
         runtime.block_on(async {
-            let mut request = Box::pin(tool.execute("cancelled", json!({"action":"outgoing_calls","file":"source.graphfixture","symbol":"root"}), None));
+            let mut request = Box::pin(tool.execute(
+                "cancelled",
+                json!({"action":"outgoing_calls","file":"source.graphfixture","symbol":"root"}),
+                None,
+            ));
             let owner = AgentCx::for_current_or_request();
             let start = Instant::now();
             loop {
                 assert!(futures::poll!(request.as_mut()).is_pending());
-                if temp.path().join("held").exists() { break; }
-                assert!(start.elapsed() < Duration::from_secs(10), "fixture did not reach the held stage");
+                if temp.path().join("held").exists() {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "fixture did not reach the held stage"
+                );
                 owner.time().sleep(Duration::from_millis(10)).await;
             }
             drop(request);
         });
-        run(&tool, &runtime, json!({"action":"request","file":"source.graphfixture","method":"test/barrier"})).unwrap();
-        assert!(frames(temp.path()).iter().any(|frame| frame["method"] == "$/cancelRequest"));
+        run(
+            &tool,
+            &runtime,
+            json!({"action":"request","file":"source.graphfixture","method":"test/barrier"}),
+        )
+        .unwrap();
+        assert!(
+            frames(temp.path())
+                .iter()
+                .any(|frame| frame["method"] == "$/cancelRequest")
+        );
         assert!(lock(&tool.hierarchies.entries).is_empty());
     }
 }
@@ -397,13 +581,23 @@ fn dropping_each_request_stage_cancels_it_without_leaking_handles() {
 #[test]
 fn cache_evicts_old_handles_without_evicting_the_just_returned_batch() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "many") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "many") else {
+        return;
+    };
     let first = start(&tool, &runtime, "outgoing_calls").unwrap();
     start(&tool, &runtime, "outgoing_calls").unwrap();
     let latest = start(&tool, &runtime, "outgoing_calls").unwrap();
-    assert!(tool.hierarchies.get(first["source"]["hierarchyId"].as_str().unwrap()).is_err());
+    assert!(
+        tool.hierarchies
+            .get(first["source"]["hierarchyId"].as_str().unwrap())
+            .is_err()
+    );
     for item in latest["items"].as_array().unwrap() {
-        assert!(tool.hierarchies.get(item["hierarchyId"].as_str().unwrap()).is_ok());
+        assert!(
+            tool.hierarchies
+                .get(item["hierarchyId"].as_str().unwrap())
+                .is_ok()
+        );
     }
     assert!(lock(&tool.hierarchies.entries).len() <= MAX_CACHE_ITEMS);
 }
@@ -411,7 +605,9 @@ fn cache_evicts_old_handles_without_evicting_the_just_returned_batch() {
 #[test]
 fn expired_handles_do_not_renew_their_lifetime_on_lookup() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     let result = start(&tool, &runtime, "outgoing_calls").unwrap();
     let id = result["items"][0]["hierarchyId"].as_str().unwrap();
     {
@@ -419,8 +615,11 @@ fn expired_handles_do_not_renew_their_lifetime_on_lookup() {
         let cached = entries.iter_mut().find(|cached| cached.id == id).unwrap();
         let old = &cached.origin;
         cached.origin = Arc::new(Origin {
-            entry: old.entry.clone(), path: old.path.clone(), uri: old.uri.clone(),
-            text: Arc::clone(&old.text), created: Instant::now() - HANDLE_TTL,
+            entry: old.entry.clone(),
+            path: old.path.clone(),
+            uri: old.uri.clone(),
+            text: Arc::clone(&old.text),
+            created: Instant::now() - HANDLE_TTL,
             family: old.family,
         });
     }
@@ -431,22 +630,36 @@ fn expired_handles_do_not_renew_their_lifetime_on_lookup() {
 #[test]
 fn caller_without_io_authority_cannot_reuse_a_live_handle() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     let result = start(&tool, &runtime, "outgoing_calls").unwrap();
-    let cached = tool.hierarchies.get(result["items"][0]["hierarchyId"].as_str().unwrap()).unwrap();
+    let cached = tool
+        .hierarchies
+        .get(result["items"][0]["hierarchyId"].as_str().unwrap())
+        .unwrap();
     let entry = cached.origin.entry.upgrade().unwrap();
     let restricted = asupersync::Cx::for_request().restrict::<asupersync::cx::cap::None>();
     let owner = {
         let _guard = restricted.set_current_restricted();
         AgentCx::for_current_or_request()
     };
-    assert!(cached.origin.check(&entry, &owner).unwrap_err().to_string().contains("LSP_HIERARCHY_AUTHORITY"));
+    assert!(
+        cached
+            .origin
+            .check(&entry, &owner)
+            .unwrap_err()
+            .to_string()
+            .contains("LSP_HIERARCHY_AUTHORITY")
+    );
 }
 
 #[test]
 fn supertypes_and_subtypes_follow_exact_type_items_without_repreparing() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     let first = start(&tool, &runtime, "supertypes").unwrap();
     assert_eq!(first["hierarchyKind"], "type");
     assert_eq!(first["items"][0]["name"], "caller");
@@ -454,38 +667,78 @@ fn supertypes_and_subtypes_follow_exact_type_items_without_repreparing() {
     assert!(first["items"][0].get("fromRanges").is_none());
     assert!(first["items"][0].get("callSiteUri").is_none());
     assert!(first["items"][0].get("data").is_none());
-    let second = run(&tool, &runtime, json!({"action":"subtypes","hierarchyId":first["items"][0]["hierarchyId"]})).unwrap();
+    let second = run(
+        &tool,
+        &runtime,
+        json!({"action":"subtypes","hierarchyId":first["items"][0]["hierarchyId"]}),
+    )
+    .unwrap();
     assert_eq!(second["items"][0]["name"], "root");
     let log = frames(temp.path());
-    assert_eq!(log.iter().filter(|frame| frame["method"] == "textDocument/prepareTypeHierarchy").count(), 1);
-    assert_eq!(log.iter().filter(|frame| frame["method"] == "typeHierarchy/subtypes").count(), 1);
+    assert_eq!(
+        log.iter()
+            .filter(|frame| frame["method"] == "textDocument/prepareTypeHierarchy")
+            .count(),
+        1
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|frame| frame["method"] == "typeHierarchy/subtypes")
+            .count(),
+        1
+    );
 }
 
 #[test]
 fn call_and_type_handles_are_not_interchangeable_in_either_direction() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "normal") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "normal") else {
+        return;
+    };
     let calls = start(&tool, &runtime, "incoming_calls").unwrap();
     let types = start(&tool, &runtime, "supertypes").unwrap();
     let before = frames(temp.path()).len();
     for (result, action) in [(&calls, "subtypes"), (&types, "outgoing_calls")] {
-        let error = run(&tool, &runtime, json!({"action":action,"hierarchyId":result["source"]["hierarchyId"]})).unwrap_err();
+        let error = run(
+            &tool,
+            &runtime,
+            json!({"action":action,"hierarchyId":result["source"]["hierarchyId"]}),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("another hierarchy kind"));
     }
-    assert_eq!(frames(temp.path()).len(), before, "family mismatch must fail before dispatch");
+    assert_eq!(
+        frames(temp.path()).len(),
+        before,
+        "family mismatch must fail before dispatch"
+    );
 }
 
 #[test]
 fn type_capabilities_are_negotiated_independently_of_call_capabilities() {
-    for mode in ["types_only", "calls_only", "type_unsupported", "type_bad_capability"] {
+    for mode in [
+        "types_only",
+        "calls_only",
+        "type_unsupported",
+        "type_bad_capability",
+    ] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
         if mode == "types_only" {
-            assert_eq!(start(&tool, &runtime, "subtypes").unwrap()["items"][0]["name"], "leaf");
+            assert_eq!(
+                start(&tool, &runtime, "subtypes").unwrap()["items"][0]["name"],
+                "leaf"
+            );
             assert!(start(&tool, &runtime, "outgoing_calls").is_err());
         } else {
             assert!(start(&tool, &runtime, "subtypes").is_err());
-            assert!(!frames(temp.path()).iter().any(|frame| frame["method"] == "textDocument/prepareTypeHierarchy"));
+            assert!(
+                !frames(temp.path())
+                    .iter()
+                    .any(|frame| frame["method"] == "textDocument/prepareTypeHierarchy")
+            );
         }
     }
 }
@@ -493,13 +746,24 @@ fn type_capabilities_are_negotiated_independently_of_call_capabilities() {
 #[test]
 fn ambiguous_types_return_choices_without_querying_a_guessed_root() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "type_ambiguous") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "type_ambiguous") else {
+        return;
+    };
     let result = start(&tool, &runtime, "subtypes").unwrap();
     assert_eq!(result["selectionRequired"], true);
     assert_eq!(result["hierarchyKind"], "type");
     assert_eq!(result["count"], 2);
-    assert!(!frames(temp.path()).iter().any(|frame| frame["method"] == "typeHierarchy/subtypes"));
-    let next = run(&tool, &runtime, json!({"action":"subtypes","hierarchyId":result["items"][1]["hierarchyId"]})).unwrap();
+    assert!(
+        !frames(temp.path())
+            .iter()
+            .any(|frame| frame["method"] == "typeHierarchy/subtypes")
+    );
+    let next = run(
+        &tool,
+        &runtime,
+        json!({"action":"subtypes","hierarchyId":result["items"][1]["hierarchyId"]}),
+    )
+    .unwrap();
     assert_eq!(next["source"]["name"], "leaf");
 }
 
@@ -507,7 +771,9 @@ fn ambiguous_types_return_choices_without_querying_a_guessed_root() {
 fn unknown_and_leaf_types_are_empty_results_not_failures() {
     for mode in ["type_none", "type_empty"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
         let result = start(&tool, &runtime, "supertypes").unwrap();
         assert_eq!(result["count"], 0);
         assert_eq!(result["total"], 0);
@@ -517,12 +783,21 @@ fn unknown_and_leaf_types_are_empty_results_not_failures() {
 
 #[test]
 fn type_errors_malformed_tails_and_drift_do_not_publish_partial_results() {
-    for (mode, expected) in [("type_error", "type hierarchy failed"),
-        ("type_malformed", "LSP_HIERARCHY_PROTOCOL"), ("type_drift", "LSP_HIERARCHY_EXPIRED")]
-    {
+    for (mode, expected) in [
+        ("type_error", "type hierarchy failed"),
+        ("type_malformed", "LSP_HIERARCHY_PROTOCOL"),
+        ("type_drift", "LSP_HIERARCHY_EXPIRED"),
+    ] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
-        assert!(start(&tool, &runtime, "subtypes").unwrap_err().to_string().contains(expected));
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
+        assert!(
+            start(&tool, &runtime, "subtypes")
+                .unwrap_err()
+                .to_string()
+                .contains(expected)
+        );
         assert!(lock(&tool.hierarchies.entries).is_empty());
     }
 }
@@ -530,46 +805,88 @@ fn type_errors_malformed_tails_and_drift_do_not_publish_partial_results() {
 #[test]
 fn external_type_resources_are_opaque_labels_and_can_be_followed_without_opening_them() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "type_external") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "type_external") else {
+        return;
+    };
     let result = start(&tool, &runtime, "supertypes").unwrap();
-    assert_eq!(result["items"][0]["uri"], "unresolved-type://library/ExternalBase");
-    let next = run(&tool, &runtime, json!({"action":"subtypes","hierarchyId":result["items"][0]["hierarchyId"]})).unwrap();
-    assert_eq!(next["source"]["uri"], "unresolved-type://library/ExternalBase");
+    assert_eq!(
+        result["items"][0]["uri"],
+        "unresolved-type://library/ExternalBase"
+    );
+    let next = run(
+        &tool,
+        &runtime,
+        json!({"action":"subtypes","hierarchyId":result["items"][0]["hierarchyId"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        next["source"]["uri"],
+        "unresolved-type://library/ExternalBase"
+    );
     assert_eq!(next["items"][0]["name"], "root");
 }
 
 #[test]
 fn type_output_limits_return_only_complete_reusable_items() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "type_many") else { return };
-    let result = run(&tool, &runtime, json!({"action":"subtypes","file":"source.graphfixture","symbol":"root","limit":2})).unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "type_many") else {
+        return;
+    };
+    let result = run(
+        &tool,
+        &runtime,
+        json!({"action":"subtypes","file":"source.graphfixture","symbol":"root","limit":2}),
+    )
+    .unwrap();
     assert_eq!(result["count"], 2);
     assert_eq!(result["total"], 150);
     assert_eq!(result["truncated"], true);
     for row in result["items"].as_array().unwrap() {
-        assert!(tool.hierarchies.get(row["hierarchyId"].as_str().unwrap()).is_ok());
+        assert!(
+            tool.hierarchies
+                .get(row["hierarchyId"].as_str().unwrap())
+                .is_ok()
+        );
     }
 }
 
 #[test]
 fn dropping_type_expansion_cancels_the_pending_protocol_request() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "type_hang") else { return };
+    let Some((tool, runtime)) = fixture(temp.path(), "type_hang") else {
+        return;
+    };
     runtime.block_on(async {
-        let mut request = Box::pin(tool.execute("cancel-types", json!({"action":"supertypes","file":"source.graphfixture","symbol":"root"}), None));
+        let mut request = Box::pin(tool.execute(
+            "cancel-types",
+            json!({"action":"supertypes","file":"source.graphfixture","symbol":"root"}),
+            None,
+        ));
         let owner = AgentCx::for_current_or_request();
         let start = Instant::now();
         loop {
             assert!(futures::poll!(request.as_mut()).is_pending());
-            if temp.path().join("held").exists() { break; }
+            if temp.path().join("held").exists() {
+                break;
+            }
             assert!(start.elapsed() < Duration::from_secs(10));
             owner.time().sleep(Duration::from_millis(10)).await;
         }
         drop(request);
     });
-    run(&tool, &runtime, json!({"action":"request","file":"source.graphfixture","method":"test/barrier"})).unwrap();
+    run(
+        &tool,
+        &runtime,
+        json!({"action":"request","file":"source.graphfixture","method":"test/barrier"}),
+    )
+    .unwrap();
     let log = frames(temp.path());
-    let request = log.iter().find(|frame| frame["method"] == "typeHierarchy/supertypes").unwrap();
-    assert!(log.iter().any(|frame| frame["method"] == "$/cancelRequest" && frame["params"]["id"] == request["id"]));
+    let request = log
+        .iter()
+        .find(|frame| frame["method"] == "typeHierarchy/supertypes")
+        .unwrap();
+    assert!(log.iter().any(
+        |frame| frame["method"] == "$/cancelRequest" && frame["params"]["id"] == request["id"]
+    ));
     assert!(lock(&tool.hierarchies.entries).is_empty());
 }
