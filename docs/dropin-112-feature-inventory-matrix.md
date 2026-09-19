@@ -463,28 +463,28 @@
 | Event | TS Pi | Rust Pi | Notes |
 |-------|-------|---------|-------|
 | `session_start` | Y | Y | Initial session load |
-| `session_before_switch` | Y | ? | Cancellable |
-| `session_switch` | Y | ? | After switching |
-| `session_before_fork` | Y | ? | Cancellable |
-| `session_fork` | Y | ? | After forking |
-| `session_before_compact` | Y | ? | Cancellable, customizable |
-| `session_compact` | Y | ? | After compaction |
-| `session_before_tree` | Y | ? | Cancellable |
-| `session_tree` | Y | ? | After tree navigation |
+| `session_before_switch` | Y | Y | Cancellable; `dispatch_cancellable_event` from interactive.rs |
+| `session_switch` | Y | Y | After switching |
+| `session_before_fork` | Y | Y | Cancellable |
+| `session_fork` | Y | Y | After forking |
+| `session_before_compact` | Y | Y | Cancellable, customizable |
+| `session_compact` | Y | Y | After compaction |
+| `session_before_tree` | Y | Y | Cancellable |
+| `session_tree` | Y | Y | After tree navigation; emitted from interactive/tree_ui.rs |
 | `session_shutdown` | Y | Y | On exit |
-| `resources_discover` | Y | ? | Resource discovery |
+| `resources_discover` | Y | Y | Resource discovery; emitted from extension_manager_impl.rs |
 
 ### Agent Events
 
 | Event | TS Pi | Rust Pi | Notes |
 |-------|-------|---------|-------|
 | `context` | Y | Y | Before LLM call (can modify) |
-| `before_agent_start` | Y | ? | Cancellable |
+| `before_agent_start` | Y | Y | Cancellable; emitted from agent.rs |
 | `agent_start` | Y | Y | Loop start |
 | `agent_end` | Y | Y | Loop end |
 | `turn_start` | Y | Y | Turn start |
 | `turn_end` | Y | Y | Turn end |
-| `model_select` | Y | ? | Model selection |
+| `model_select` | Y | Y | Model selection; dispatched from interactive/commands.rs |
 
 ### Tool Events
 
@@ -497,8 +497,8 @@
 
 | Event | TS Pi | Rust Pi | Notes |
 |-------|-------|---------|-------|
-| `user_bash` | Y | ? | User shell with ! prefix |
-| `input` | Y | ? | User input (can transform) |
+| `user_bash` | Y | Y | User shell with ! prefix; dispatched from interactive/commands.rs |
+| `input` | Y | Y | User input (can transform); dispatched from agent.rs |
 
 ---
 
