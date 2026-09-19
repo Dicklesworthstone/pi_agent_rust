@@ -680,7 +680,6 @@ fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
     pi::agent::context_window_tokens_for_entry(entry)
 }
 
-#[allow(clippy::too_many_lines)]
 /// The tracing filter to install when the user has not asked for one.
 ///
 /// `EnvFilter::from_default_env()` with `RUST_LOG` unset enables nothing above
@@ -712,6 +711,7 @@ fn default_log_filter_for(rust_log: Option<&str>) -> EnvFilter {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
     let Some((mut cli, extension_flags, raw_args)) = parse_cli_from_env()? else {
