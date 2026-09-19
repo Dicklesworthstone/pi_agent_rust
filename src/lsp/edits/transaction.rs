@@ -146,6 +146,9 @@ impl Transaction {
         let projected = edits.iter().try_fold(original.len(), |size, edit| {
             size.checked_add(edit.new_text.len()).filter(|size| *size <= MAX_FILE_BYTES)
         }).ok_or_else(|| plan_error("LSP_EDIT_LIMIT", "text replacement exceeds 16 MiB"))?;
+        if projected > MAX_TRANSACTION_BYTES.saturating_sub(self.bytes) {
+            return Err(plan_error("LSP_EDIT_LIMIT", "workspace edit snapshots and replacements exceed 64 MiB"));
+        }
         let updated = apply_text_edits(original, edits)
             .map_err(|error| conflict(format!("{}: {error}", path.display())))?;
         let permissions = image.permissions.clone();
@@ -391,11 +394,7 @@ impl Change {
 }
 
 pub(super) fn apply(plan: &WorkspaceEditPlan, hashes: Option<&HashMap<PathBuf, u64>>) -> Result<ApplyOutcome> {
-    let mut transaction = Transaction::default();
-    let mut text: Vec<_> = plan.text_edits.iter().collect();
-    text.sort_by_key(|(path, _)| *path);
-    for (path, edits) in text { transaction.edit(path, edits)?; }
-    for operation in &plan.file_ops { transaction.file_op(operation, false, false)?; }
+    let transaction = super::sequence::stage(plan)?;
     transaction.check_hashes(hashes)?;
     transaction.commit()
 }

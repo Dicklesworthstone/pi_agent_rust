@@ -13,9 +13,9 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use super::client::uri_to_path;
 use super::text::TextEdit;
 
+mod sequence;
 mod transaction;
 
 /// A file operation from `documentChanges`.
@@ -40,6 +40,9 @@ pub struct WorkspaceEditPlan {
     pub text_edits: HashMap<PathBuf, Vec<TextEdit>>,
     /// File operations in document order.
     pub file_ops: Vec<FileOp>,
+    /// Interleaving indices into the public collections, retained for parsed
+    /// documentChanges. Application validates these indices before staging.
+    sequence: Option<Vec<sequence::Step>>,
 }
 
 /// Errors carry a machine-readable taxonomy prefix.
@@ -53,109 +56,7 @@ fn plan_error(code: &str, message: impl Into<String>) -> crate::error::Error {
 ///
 /// Returns `[LSP_EDIT_MALFORMED]` when the payload cannot be interpreted.
 pub fn parse_workspace_edit(raw: &Value) -> Result<WorkspaceEditPlan, crate::error::Error> {
-    let mut plan = WorkspaceEditPlan::default();
-    if raw.is_null() {
-        return Ok(plan);
-    }
-    let Some(obj) = raw.as_object() else {
-        return Err(plan_error(
-            "LSP_EDIT_MALFORMED",
-            "WorkspaceEdit is not an object",
-        ));
-    };
-
-    if let Some(changes) = obj.get("changes").and_then(Value::as_object) {
-        for (uri, edits) in changes {
-            let path = uri_to_path(uri).ok_or_else(|| {
-                plan_error("LSP_EDIT_MALFORMED", format!("unsupported uri {uri:?}"))
-            })?;
-            let parsed = parse_text_edit_array(edits)?;
-            plan.text_edits.entry(path).or_default().extend(parsed);
-        }
-    }
-
-    if let Some(document_changes) = obj.get("documentChanges").and_then(Value::as_array) {
-        for entry in document_changes {
-            let kind = entry.get("kind").and_then(Value::as_str);
-            match kind {
-                None => {
-                    // TextDocumentEdit.
-                    let uri = entry
-                        .get("textDocument")
-                        .and_then(|doc| doc.get("uri"))
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            plan_error(
-                                "LSP_EDIT_MALFORMED",
-                                "TextDocumentEdit missing textDocument.uri",
-                            )
-                        })?;
-                    let path = uri_to_path(uri).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", format!("unsupported uri {uri:?}"))
-                    })?;
-                    let edits = entry.get("edits").ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", "TextDocumentEdit missing edits")
-                    })?;
-                    let parsed = parse_text_edit_array(edits)?;
-                    plan.text_edits.entry(path).or_default().extend(parsed);
-                }
-                Some("create") => {
-                    let uri = entry.get("uri").and_then(Value::as_str).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", "CreateFile missing uri")
-                    })?;
-                    let path = uri_to_path(uri).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", format!("unsupported uri {uri:?}"))
-                    })?;
-                    let overwrite = entry
-                        .get("options")
-                        .and_then(|o| o.get("overwrite"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    plan.file_ops.push(FileOp::Create { path, overwrite });
-                }
-                Some("rename") => {
-                    let old_uri = entry.get("oldUri").and_then(Value::as_str).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", "RenameFile missing oldUri")
-                    })?;
-                    let new_uri = entry.get("newUri").and_then(Value::as_str).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", "RenameFile missing newUri")
-                    })?;
-                    let old_path = uri_to_path(old_uri).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", format!("unsupported uri {old_uri:?}"))
-                    })?;
-                    let new_path = uri_to_path(new_uri).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", format!("unsupported uri {new_uri:?}"))
-                    })?;
-                    let overwrite = entry
-                        .get("options")
-                        .and_then(|o| o.get("overwrite"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    plan.file_ops.push(FileOp::Rename {
-                        old_path,
-                        new_path,
-                        overwrite,
-                    });
-                }
-                Some("delete") => {
-                    let uri = entry.get("uri").and_then(Value::as_str).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", "DeleteFile missing uri")
-                    })?;
-                    let path = uri_to_path(uri).ok_or_else(|| {
-                        plan_error("LSP_EDIT_MALFORMED", format!("unsupported uri {uri:?}"))
-                    })?;
-                    plan.file_ops.push(FileOp::Delete { path });
-                }
-                Some(other) => {
-                    return Err(plan_error(
-                        "LSP_EDIT_MALFORMED",
-                        format!("unknown documentChanges kind {other:?}"),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(plan)
+    sequence::parse(raw)
 }
 
 fn parse_text_edit_array(raw: &Value) -> Result<Vec<TextEdit>, crate::error::Error> {
@@ -164,7 +65,8 @@ fn parse_text_edit_array(raw: &Value) -> Result<Vec<TextEdit>, crate::error::Err
     };
     let mut out = Vec::with_capacity(edits.len());
     for edit in edits {
-        // AnnotatedTextEdit wraps the edit under `textEdit` + annotationId.
+        // Standard AnnotatedTextEdit has range/newText/annotationId directly.
+        // Also accept the textEdit wrapper used by existing captured fixtures.
         let edit = edit.get("textEdit").unwrap_or(edit);
         let range = edit
             .get("range")
