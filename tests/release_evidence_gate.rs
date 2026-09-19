@@ -3879,7 +3879,7 @@ fn performance_path_is_packaged(
     let cargo_expression = format!("{source_commit}:Cargo.toml");
     let cargo_toml = String::from_utf8(perf_git_output_at(context, &["show", &cargo_expression])?)
         .map_err(|err| format!("source Cargo.toml is not UTF-8: {err}"))?;
-    let document: toml::Value = toml::from_str(&cargo_toml).map_err(|err| {
+    let document: toml::Table = toml::from_str(&cargo_toml).map_err(|err| {
         format!("unable to parse source Cargo.toml package include policy: {err}")
     })?;
     let patterns = document

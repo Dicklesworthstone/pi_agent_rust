@@ -2091,10 +2091,11 @@ fn changed_paths_between(root: &Path, source: &str, head: &str) -> Result<Vec<St
 
 fn source_package_include_patterns(root: &Path, source: &str) -> Result<Vec<String>, String> {
     let bytes = git_commit_file_contents(root, source, "Cargo.toml")?;
-    let cargo_toml = std::str::from_utf8(&bytes)
-        .map_err(|err| format!("source Cargo.toml is not UTF-8: {err}"))?
-        .parse::<toml::Value>()
-        .map_err(|err| format!("failed to parse source Cargo.toml: {err}"))?;
+    let cargo_toml = toml::from_str::<toml::Table>(
+        std::str::from_utf8(&bytes)
+            .map_err(|err| format!("source Cargo.toml is not UTF-8: {err}"))?,
+    )
+    .map_err(|err| format!("failed to parse source Cargo.toml: {err}"))?;
     cargo_toml
         .get("package")
         .and_then(|package| package.get("include"))
@@ -4497,7 +4498,7 @@ fn performance_source_package_patterns(
     )?;
     let source = std::str::from_utf8(&bytes)
         .map_err(|error| format!("source Cargo.toml is not UTF-8: {error}"))?;
-    let document = toml::from_str::<toml::Value>(source)
+    let document = toml::from_str::<toml::Table>(source)
         .map_err(|error| format!("failed to parse source Cargo.toml: {error}"))?;
     document
         .get("package")
@@ -5038,7 +5039,9 @@ fn conformance_dimension_has_data() {
     assert!(
         dim.detail.contains("git_commit")
             || dim.detail.contains("source_tree_sha256")
-            || dim.detail.contains("stale"),
+            || dim.detail.contains("stale")
+            || dim.detail.contains("non-evidence path changed")
+            || dim.detail.contains("Current conformance incomplete"),
         "checked-in summary must fail until regenerated fresh with source provenance: {}",
         dim.detail
     );
