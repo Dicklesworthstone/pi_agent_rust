@@ -3773,7 +3773,61 @@ impl Agent {
         // (block) before any provider sees them. The vault is in-memory and
         // dies with the session.
         let context = self.apply_secrets_outbound(context)?;
-        let mut stream = provider.stream(&context, &stream_options).await?;
+
+        if checkpoint_cx.checkpoint().is_err()
+            || abort.as_ref().is_some_and(AbortSignal::is_aborted)
+        {
+            let abort_arc = Arc::new(self.build_abort_message(None));
+            on_event(AgentEvent::MessageStart {
+                message: Message::Assistant(Arc::clone(&abort_arc)),
+            });
+            self.messages
+                .push(Message::Assistant(Arc::clone(&abort_arc)));
+            on_event(AgentEvent::MessageUpdate {
+                message: Message::Assistant(Arc::clone(&abort_arc)),
+                assistant_message_event: AssistantMessageEvent::Error {
+                    reason: StopReason::Aborted,
+                    error: Arc::clone(&abort_arc),
+                },
+            });
+            return Ok(self.finalize_assistant_message(
+                Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
+                &on_event,
+                true,
+            ));
+        }
+
+        let stream_fut = provider.stream(&context, &stream_options);
+        let mut stream = if let Some(signal) = abort.as_ref() {
+            let abort_fut = signal.wait().fuse();
+            let stream_fut = stream_fut.fuse();
+            futures::pin_mut!(abort_fut, stream_fut);
+            match futures::future::select(abort_fut, stream_fut).await {
+                futures::future::Either::Left(((), _)) => {
+                    let abort_arc = Arc::new(self.build_abort_message(None));
+                    on_event(AgentEvent::MessageStart {
+                        message: Message::Assistant(Arc::clone(&abort_arc)),
+                    });
+                    self.messages
+                        .push(Message::Assistant(Arc::clone(&abort_arc)));
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(Arc::clone(&abort_arc)),
+                        assistant_message_event: AssistantMessageEvent::Error {
+                            reason: StopReason::Aborted,
+                            error: Arc::clone(&abort_arc),
+                        },
+                    });
+                    return Ok(self.finalize_assistant_message(
+                        Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
+                        &on_event,
+                        true,
+                    ));
+                }
+                futures::future::Either::Right((res, _)) => res?,
+            }
+        } else {
+            stream_fut.await?
+        };
 
         let mut added_partial = false;
         // Track whether we've already emitted `MessageStart` for this streaming response.
