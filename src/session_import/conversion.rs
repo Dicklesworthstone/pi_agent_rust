@@ -98,8 +98,8 @@ fn assistant(content: Vec<ContentBlock>, timestamp: i64) -> Message {
     };
     Message::assistant(AssistantMessage {
         content,
-        timestamp,
         stop_reason,
+        timestamp,
         ..AssistantMessage::default()
     })
 }
@@ -191,7 +191,9 @@ fn content_blocks(value: &Value, notes: &mut Vec<String>) -> Vec<ContentBlock> {
                         if let Some(image) = image_block(item) {
                             blocks.push(image);
                         } else {
-                            notes.push("non-inline or malformed image retained as attachment".into());
+                            notes.push(
+                                "non-inline or malformed image retained as attachment".into(),
+                            );
                             blocks.push(ContentBlock::Text(TextContent::new(
                                 "[Imported image is retained in the source attachment]",
                             )));
@@ -224,7 +226,10 @@ fn convert_claude(entry: &Value) -> ConvertedEntry {
         return converted;
     };
     let ts = timestamp(entry);
-    let Some(content) = entry.pointer("/message/content").or_else(|| entry.get("content")) else {
+    let Some(content) = entry
+        .pointer("/message/content")
+        .or_else(|| entry.get("content"))
+    else {
         converted.notes.push("message has no content field".into());
         return converted;
     };
@@ -235,7 +240,9 @@ fn convert_claude(entry: &Value) -> ConvertedEntry {
         return converted;
     }
     let Some(blocks) = content.as_array() else {
-        converted.notes.push("message content is not text or an array".into());
+        converted
+            .notes
+            .push("message content is not text or an array".into());
         return converted;
     };
     let mut pending = Vec::new();
@@ -243,23 +250,7 @@ fn convert_claude(entry: &Value) -> ConvertedEntry {
         match block.get("type").and_then(Value::as_str) {
             Some("tool_result") if role == "user" => {
                 flush_blocks(role, &mut pending, ts, &mut converted.messages);
-                let Some(id) = nonempty_string(block, "tool_use_id") else {
-                    converted.notes.push("tool result has no tool_use_id".into());
-                    continue;
-                };
-                let Some(output) = block.get("content") else {
-                    converted.notes.push(format!("tool result {id} has no content"));
-                    continue;
-                };
-                let content = content_blocks(output, &mut converted.notes);
-                converted.messages.push(Message::tool_result(ToolResultMessage {
-                    tool_call_id: id.to_string(),
-                    tool_name: String::new(),
-                    content,
-                    is_error: block.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-                    timestamp: ts,
-                    details: None,
-                }));
+                convert_claude_tool_result(block, ts, &mut converted);
             }
             Some("tool_use") if role == "assistant" => {
                 let (Some(id), Some(name), Some(input)) = (
@@ -267,7 +258,9 @@ fn convert_claude(entry: &Value) -> ConvertedEntry {
                     nonempty_string(block, "name"),
                     block.get("input").filter(|value| value.is_object()),
                 ) else {
-                    converted.notes.push("tool_use requires id, name and object input".into());
+                    converted
+                        .notes
+                        .push("tool_use requires id, name and object input".into());
                     continue;
                 };
                 pending.push(ContentBlock::ToolCall(ToolCall {
@@ -286,23 +279,58 @@ fn convert_claude(entry: &Value) -> ConvertedEntry {
                         thinking_signature: None,
                     }));
                 } else {
-                    converted.notes.push("thinking block has no thinking text".into());
+                    converted
+                        .notes
+                        .push("thinking block has no thinking text".into());
                 }
                 if block.get("signature").is_some() {
-                    converted.notes.push("thinking signature retained only in source attachment".into());
+                    converted
+                        .notes
+                        .push("thinking signature retained only in source attachment".into());
                 }
             }
             Some("text" | "image") => {
                 pending.extend(content_blocks(&json!([block]), &mut converted.notes));
             }
             Some(kind) => {
-                converted.notes.push(format!("unsupported {role} block: {kind}"));
+                converted
+                    .notes
+                    .push(format!("unsupported {role} block: {kind}"));
             }
             None => converted.notes.push("content block has no type".into()),
         }
     }
     flush_blocks(role, &mut pending, ts, &mut converted.messages);
     converted
+}
+
+fn convert_claude_tool_result(block: &Value, ts: i64, converted: &mut ConvertedEntry) {
+    let Some(id) = nonempty_string(block, "tool_use_id") else {
+        converted
+            .notes
+            .push("tool result has no tool_use_id".into());
+        return;
+    };
+    let Some(output) = block.get("content") else {
+        converted
+            .notes
+            .push(format!("tool result {id} has no content"));
+        return;
+    };
+    let content = content_blocks(output, &mut converted.notes);
+    converted
+        .messages
+        .push(Message::tool_result(ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: String::new(),
+            content,
+            is_error: block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            timestamp: ts,
+            details: None,
+        }));
 }
 
 fn convert_codex(entry: &Value) -> ConvertedEntry {
@@ -314,13 +342,18 @@ fn convert_codex(entry: &Value) -> ConvertedEntry {
         return converted;
     }
     let Some(payload) = entry.get("payload").filter(|value| value.is_object()) else {
-        converted.notes.push("response_item has no object payload".into());
+        converted
+            .notes
+            .push("response_item has no object payload".into());
         return converted;
     };
     let ts = timestamp(entry);
     match payload.get("type").and_then(Value::as_str) {
         Some("message") => {
-            let role = payload.get("role").and_then(Value::as_str).unwrap_or("user");
+            let role = payload
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
             let Some(content) = payload.get("content") else {
                 converted.notes.push("message has no content".into());
                 return converted;
@@ -330,10 +363,14 @@ fn convert_codex(entry: &Value) -> ConvertedEntry {
                 // session's active system prompt or an unlabelled user request.
                 converted.metadata = true;
                 let content = content_blocks(content, &mut converted.notes);
-                let text = content.iter().filter_map(|block| match block {
-                    ContentBlock::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("\n");
+                let text = content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 converted.messages.push(Message::Custom(CustomMessage {
                     content: format!("[Historical {role} instructions from Codex; not active session instructions]\n{text}"),
                     custom_type: "foreign_instructions".to_string(),
@@ -351,95 +388,139 @@ fn convert_codex(entry: &Value) -> ConvertedEntry {
                     flush_blocks(role, &mut blocks, ts, &mut converted.messages);
                 }
             } else {
-                converted.notes.push(format!("unsupported message role: {role}"));
+                converted
+                    .notes
+                    .push(format!("unsupported message role: {role}"));
             }
         }
         Some("reasoning") => {
-            let mut blocks = Vec::new();
-            for key in ["summary", "content"] {
-                if let Some(items) = payload.get(key).filter(|value| !value.is_null()) {
-                    for block in content_blocks(items, &mut converted.notes) {
-                        if let ContentBlock::Text(text) = block {
-                            if !text.text.is_empty() {
-                                blocks.push(ContentBlock::Thinking(ThinkingContent {
-                                    thinking: text.text,
-                                    thinking_signature: None,
-                                }));
-                            }
-                        } else {
-                            converted.notes.push("non-text reasoning retained as attachment".into());
-                        }
-                    }
-                }
-            }
-            if payload.get("encrypted_content").is_some_and(|value| !value.is_null()) {
-                converted.notes.push("encrypted reasoning retained only in source attachment".into());
-            }
-            if !blocks.is_empty() {
-                converted.messages.push(assistant(blocks, ts));
-            }
+            convert_codex_reasoning(payload, ts, &mut converted);
         }
         Some(kind @ ("function_call" | "custom_tool_call")) => {
-            let (Some(name), Some(id)) = (
-                nonempty_string(payload, "name"),
-                nonempty_string(payload, "call_id"),
-            ) else {
-                converted.notes.push(format!("{kind} requires name and call_id"));
-                return converted;
-            };
-            let arguments = if kind == "custom_tool_call" {
-                let Some(input) = payload.get("input").and_then(Value::as_str) else {
-                    converted.notes.push("custom_tool_call has no text input".into());
-                    return converted;
-                };
-                // Custom tools carry arbitrary text, not a JSON arguments
-                // string. Preserve it in an explicit input field for native
-                // history; importing never executes the foreign tool.
-                json!({"input": input})
-            } else {
-                let arguments = match payload.get("arguments") {
-                    Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).ok(),
-                    Some(value @ Value::Object(_)) => Some(value.clone()),
-                    _ => None,
-                };
-                let Some(arguments) = arguments.filter(Value::is_object) else {
-                    converted.notes.push(format!("function call {id} has invalid JSON object arguments"));
-                    return converted;
-                };
-                arguments
-            };
-            converted.messages.push(assistant(vec![ContentBlock::ToolCall(ToolCall {
-                id: id.to_string(),
-                name: name.to_string(),
-                arguments,
-                thought_signature: None,
-            })], ts));
+            convert_codex_call(payload, kind, ts, &mut converted);
         }
         Some(kind @ ("function_call_output" | "custom_tool_call_output")) => {
-            let Some(id) = nonempty_string(payload, "call_id") else {
-                converted.notes.push(format!("{kind} has no call_id"));
-                return converted;
-            };
-            let Some(output) = payload.get("output") else {
-                converted.notes.push(format!("tool output {id} has no output field"));
-                return converted;
-            };
-            let content = content_blocks(output, &mut converted.notes);
-            let is_error = payload.get("is_error").and_then(Value::as_bool)
-                .unwrap_or_else(|| payload.get("success").and_then(Value::as_bool) == Some(false));
-            converted.messages.push(Message::tool_result(ToolResultMessage {
-                tool_call_id: id.to_string(),
-                tool_name: payload.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-                content,
-                is_error,
-                timestamp: ts,
-                details: None,
-            }));
+            convert_codex_output(payload, kind, ts, &mut converted);
         }
-        Some(kind) => converted.notes.push(format!("unsupported response_item: {kind}")),
-        None => converted.notes.push("response_item payload has no type".into()),
+        Some(kind) => converted
+            .notes
+            .push(format!("unsupported response_item: {kind}")),
+        None => converted
+            .notes
+            .push("response_item payload has no type".into()),
     }
     converted
+}
+
+fn convert_codex_reasoning(payload: &Value, ts: i64, converted: &mut ConvertedEntry) {
+    let mut blocks = Vec::new();
+    for key in ["summary", "content"] {
+        if let Some(items) = payload.get(key).filter(|value| !value.is_null()) {
+            for block in content_blocks(items, &mut converted.notes) {
+                if let ContentBlock::Text(text) = block {
+                    if !text.text.is_empty() {
+                        blocks.push(ContentBlock::Thinking(ThinkingContent {
+                            thinking: text.text,
+                            thinking_signature: None,
+                        }));
+                    }
+                } else {
+                    converted
+                        .notes
+                        .push("non-text reasoning retained as attachment".into());
+                }
+            }
+        }
+    }
+    if payload
+        .get("encrypted_content")
+        .is_some_and(|value| !value.is_null())
+    {
+        converted
+            .notes
+            .push("encrypted reasoning retained only in source attachment".into());
+    }
+    if !blocks.is_empty() {
+        converted.messages.push(assistant(blocks, ts));
+    }
+}
+
+fn convert_codex_call(payload: &Value, kind: &str, ts: i64, converted: &mut ConvertedEntry) {
+    let (Some(name), Some(id)) = (
+        nonempty_string(payload, "name"),
+        nonempty_string(payload, "call_id"),
+    ) else {
+        converted
+            .notes
+            .push(format!("{kind} requires name and call_id"));
+        return;
+    };
+    let arguments = if kind == "custom_tool_call" {
+        let Some(input) = payload.get("input").and_then(Value::as_str) else {
+            converted
+                .notes
+                .push("custom_tool_call has no text input".into());
+            return;
+        };
+        // Custom tools carry arbitrary text, not a JSON arguments
+        // string. Preserve it in an explicit input field for native
+        // history; importing never executes the foreign tool.
+        json!({"input": input})
+    } else {
+        let arguments = match payload.get("arguments") {
+            Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).ok(),
+            Some(value @ Value::Object(_)) => Some(value.clone()),
+            _ => None,
+        };
+        let Some(arguments) = arguments.filter(Value::is_object) else {
+            converted.notes.push(format!(
+                "function call {id} has invalid JSON object arguments"
+            ));
+            return;
+        };
+        arguments
+    };
+    converted.messages.push(assistant(
+        vec![ContentBlock::ToolCall(ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments,
+            thought_signature: None,
+        })],
+        ts,
+    ));
+}
+
+fn convert_codex_output(payload: &Value, kind: &str, ts: i64, converted: &mut ConvertedEntry) {
+    let Some(id) = nonempty_string(payload, "call_id") else {
+        converted.notes.push(format!("{kind} has no call_id"));
+        return;
+    };
+    let Some(output) = payload.get("output") else {
+        converted
+            .notes
+            .push(format!("tool output {id} has no output field"));
+        return;
+    };
+    let content = content_blocks(output, &mut converted.notes);
+    let is_error = payload
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| payload.get("success").and_then(Value::as_bool) == Some(false));
+    converted
+        .messages
+        .push(Message::tool_result(ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            content,
+            is_error,
+            timestamp: ts,
+            details: None,
+        }));
 }
 
 #[cfg(test)]
@@ -447,7 +528,14 @@ mod tests {
     use super::*;
 
     fn codex(payload: Value) -> Value {
-        json!({"type": "response_item", "timestamp": "2026-01-01T00:00:01Z", "payload": payload})
+        let mut map = serde_json::Map::new();
+        map.insert("type".into(), Value::String("response_item".into()));
+        map.insert(
+            "timestamp".into(),
+            Value::String("2026-01-01T00:00:01Z".into()),
+        );
+        map.insert("payload".into(), payload);
+        Value::Object(map)
     }
 
     fn call(reader: &mut ForeignReader, id: &str, name: &str) {
@@ -455,7 +543,9 @@ mod tests {
             ImportSource::Claude => json!({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": id, "name": name, "input": {}}
             ]}}),
-            ImportSource::Codex => codex(json!({"type": "function_call", "call_id": id, "name": name, "arguments": "{}"})),
+            ImportSource::Codex => codex(
+                json!({"type": "function_call", "call_id": id, "name": name, "arguments": "{}"}),
+            ),
         };
         let converted = reader.convert(&entry);
         assert!(converted.notes.is_empty(), "{:?}", converted.notes);
@@ -469,10 +559,13 @@ mod tests {
     }
 
     fn text(blocks: &[ContentBlock]) -> Vec<&str> {
-        blocks.iter().filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        }).collect()
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -516,8 +609,13 @@ mod tests {
     fn codex_function_outputs_round_trip_plain_and_structured_content() {
         let mut reader = ForeignReader::new(ImportSource::Codex);
         call(&mut reader, "a", "exec_command");
-        for output in [json!("  exact\nbytes\t"), json!([{"type": "input_text", "text": "  exact\nbytes\t"}])] {
-            let converted = reader.convert(&codex(json!({"type": "function_call_output", "call_id": "a", "output": output})));
+        for output in [
+            json!("  exact\nbytes\t"),
+            json!([{"type": "input_text", "text": "  exact\nbytes\t"}]),
+        ] {
+            let converted = reader.convert(&codex(
+                json!({"type": "function_call_output", "call_id": "a", "output": output}),
+            ));
             assert!(converted.notes.is_empty(), "{:?}", converted.notes);
             let result = result(&converted.messages[0]);
             assert_eq!(result.tool_name, "exec_command");
@@ -531,8 +629,12 @@ mod tests {
         let mut reader = ForeignReader::new(ImportSource::Codex);
         let patch = "*** Begin Patch\n*** Add File: x\n+hello\n*** End Patch";
         let converted = reader.convert(&codex(json!({"type": "custom_tool_call", "call_id": "p", "name": "apply_patch", "input": patch})));
-        let Message::Assistant(message) = &converted.messages[0] else { panic!("assistant") };
-        let ContentBlock::ToolCall(call) = &message.content[0] else { panic!("tool call") };
+        let Message::Assistant(message) = &converted.messages[0] else {
+            panic!("assistant")
+        };
+        let ContentBlock::ToolCall(call) = &message.content[0] else {
+            panic!("tool call")
+        };
         assert_eq!(call.arguments, json!({"input": patch}));
         assert_eq!(message.stop_reason, StopReason::ToolUse);
         let converted = reader.convert(&codex(json!({"type": "custom_tool_call_output", "call_id": "p", "output": "applied", "success": false})));
@@ -556,8 +658,12 @@ mod tests {
     fn object_arguments_are_supported_without_reencoding() {
         let mut reader = ForeignReader::new(ImportSource::Codex);
         let converted = reader.convert(&codex(json!({"type": "function_call", "call_id": "a", "name": "read", "arguments": {"path": "x"}})));
-        let Message::Assistant(message) = &converted.messages[0] else { panic!("assistant") };
-        let ContentBlock::ToolCall(call) = &message.content[0] else { panic!("tool call") };
+        let Message::Assistant(message) = &converted.messages[0] else {
+            panic!("assistant")
+        };
+        let ContentBlock::ToolCall(call) = &message.content[0] else {
+            panic!("tool call")
+        };
         assert_eq!(call.arguments, json!({"path": "x"}));
         assert!(converted.notes.is_empty());
     }
@@ -571,7 +677,9 @@ mod tests {
         ]}}));
         assert_eq!(converted.messages.len(), 1);
         assert_eq!(converted.notes.len(), 1);
-        let Message::Assistant(message) = &converted.messages[0] else { panic!("assistant") };
+        let Message::Assistant(message) = &converted.messages[0] else {
+            panic!("assistant")
+        };
         assert_eq!(text(&message.content), ["kept"]);
     }
 
@@ -580,8 +688,12 @@ mod tests {
         for source in [ImportSource::Claude, ImportSource::Codex] {
             let mut reader = ForeignReader::new(source);
             let entry = match source {
-                ImportSource::Claude => json!({"type": "user", "message": {"content": [{"type": "tool_result", "content": "output"}]}}),
-                ImportSource::Codex => codex(json!({"type": "function_call_output", "output": "output"})),
+                ImportSource::Claude => {
+                    json!({"type": "user", "message": {"content": [{"type": "tool_result", "content": "output"}]}})
+                }
+                ImportSource::Codex => {
+                    codex(json!({"type": "function_call_output", "output": "output"}))
+                }
             };
             let converted = reader.convert(&entry);
             assert!(converted.messages.is_empty());
@@ -593,12 +705,16 @@ mod tests {
     fn inline_images_survive_in_tool_results_without_fetching_remote_urls() {
         let mut reader = ForeignReader::new(ImportSource::Codex);
         call(&mut reader, "a", "view_image");
-        let converted = reader.convert(&codex(json!({"type": "function_call_output", "call_id": "a", "output": [
-            {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
-            {"type": "input_image", "image_url": "https://example.invalid/private"}
-        ]})));
+        let converted = reader.convert(&codex(
+            json!({"type": "function_call_output", "call_id": "a", "output": [
+                {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+                {"type": "input_image", "image_url": "https://example.invalid/private"}
+            ]}),
+        ));
         let result = result(&converted.messages[0]);
-        assert!(matches!(&result.content[0], ContentBlock::Image(image) if image.data == "aGVsbG8=" && image.mime_type == "image/png"));
+        assert!(
+            matches!(&result.content[0], ContentBlock::Image(image) if image.data == "aGVsbG8=" && image.mime_type == "image/png")
+        );
         assert!(matches!(&result.content[1], ContentBlock::Text(_)));
         assert_eq!(converted.notes.len(), 1);
     }
@@ -608,7 +724,9 @@ mod tests {
         let mut reader = ForeignReader::new(ImportSource::Codex);
         for role in ["system", "developer"] {
             let converted = reader.convert(&codex(json!({"type": "message", "role": role, "content": [{"type": "input_text", "text": "old instructions"}]})));
-            let Message::Custom(message) = &converted.messages[0] else { panic!("historical context") };
+            let Message::Custom(message) = &converted.messages[0] else {
+                panic!("historical context")
+            };
             assert_eq!(message.custom_type, "foreign_instructions");
             assert!(message.content.contains("not active session instructions"));
             assert!(message.content.ends_with("old instructions"));
@@ -620,7 +738,8 @@ mod tests {
     fn codex_events_and_metadata_are_not_duplicate_user_messages() {
         let mut reader = ForeignReader::new(ImportSource::Codex);
         for kind in ["event_msg", "session_meta", "turn_context"] {
-            let converted = reader.convert(&json!({"type": kind, "payload": {"message": "already present"}}));
+            let converted =
+                reader.convert(&json!({"type": kind, "payload": {"message": "already present"}}));
             assert!(converted.messages.is_empty());
             assert!(converted.metadata);
         }

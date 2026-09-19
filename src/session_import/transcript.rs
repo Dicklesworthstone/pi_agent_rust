@@ -71,7 +71,9 @@ impl Batch {
     }
 
     fn join(&mut self, line: usize, message: Arc<AssistantMessage>) {
-        self.assistant.content.extend(message.content.iter().cloned());
+        self.assistant
+            .content
+            .extend(message.content.iter().cloned());
         self.lines.insert(line);
         self.original.push(Message::Assistant(message));
         self.assistant_count += 1;
@@ -85,7 +87,10 @@ impl Batch {
 }
 
 fn has_calls(message: &AssistantMessage) -> bool {
-    message.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(_)))
+    message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolCall(_)))
 }
 
 pub(super) fn normalize(records: Vec<SourceRecord>) -> Normalized {
@@ -101,7 +106,10 @@ pub(super) fn normalize(records: Vec<SourceRecord>) -> Normalized {
                     }
                 }
                 Message::ToolResult(result) => {
-                    counts.entry(result.tool_call_id.clone()).or_default().results += 1;
+                    counts
+                        .entry(result.tool_call_id.clone())
+                        .or_default()
+                        .results += 1;
                 }
                 _ => {}
             }
@@ -111,9 +119,18 @@ pub(super) fn normalize(records: Vec<SourceRecord>) -> Normalized {
     let mut out = Normalized::default();
     let mut pending: Option<Batch> = None;
     for record in records {
-        let has_results = record.messages.iter().any(|message| matches!(message, Message::ToolResult(_)));
-        let has_user = record.messages.iter().any(|message| matches!(message, Message::User(_)));
-        let only_user_envelope = record.messages.iter().all(|message| matches!(message, Message::User(_) | Message::ToolResult(_)));
+        let has_results = record
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(_)));
+        let has_user = record
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::User(_)));
+        let only_user_envelope = record
+            .messages
+            .iter()
+            .all(|message| matches!(message, Message::User(_) | Message::ToolResult(_)));
         let messages = if has_results && has_user && only_user_envelope {
             // Claude permits text and results in one user envelope. Native
             // messages split them, but all paired results must precede that
@@ -121,11 +138,15 @@ pub(super) fn normalize(records: Vec<SourceRecord>) -> Normalized {
             // result ahead of an assistant call in another record shape.
             out.reconciliations.push(Reconciliation {
                 source_lines: vec![record.line],
-                reason: "placed co-record tool outputs before user text for a complete tool exchange".into(),
+                reason:
+                    "placed co-record tool outputs before user text for a complete tool exchange"
+                        .into(),
                 unresolved: false,
                 original_messages: record.messages.clone(),
             });
-            let (mut results, others): (Vec<_>, Vec<_>) = record.messages.into_iter()
+            let (mut results, others): (Vec<_>, Vec<_>) = record
+                .messages
+                .into_iter()
                 .partition(|message| matches!(message, Message::ToolResult(_)));
             results.extend(others);
             results
@@ -135,7 +156,8 @@ pub(super) fn normalize(records: Vec<SourceRecord>) -> Normalized {
         for message in messages {
             match message {
                 Message::Assistant(assistant) if has_calls(&assistant) => {
-                    if let Some(batch) = pending.as_mut().filter(|batch| batch.can_join(&assistant)) {
+                    if let Some(batch) = pending.as_mut().filter(|batch| batch.can_join(&assistant))
+                    {
                         batch.join(record.line, assistant);
                     } else {
                         flush_batch(&mut pending, &counts, &mut out);
@@ -171,7 +193,10 @@ pub(super) fn normalize(records: Vec<SourceRecord>) -> Normalized {
 }
 
 fn clear_ambiguous_name(result: &mut Arc<ToolResultMessage>, counts: &HashMap<String, Counts>) {
-    if counts.get(&result.tool_call_id).is_some_and(|count| count.calls > 1) {
+    if counts
+        .get(&result.tool_call_id)
+        .is_some_and(|count| count.calls > 1)
+    {
         // The streaming reader may have filled a missing name from the first
         // occurrence before it discovered id reuse. Do not present that guess
         // as the name of an ambiguous result. The original remains in audit.
@@ -179,25 +204,37 @@ fn clear_ambiguous_name(result: &mut Arc<ToolResultMessage>, counts: &HashMap<St
     }
 }
 
-fn flush_batch(pending: &mut Option<Batch>, counts: &HashMap<String, Counts>, out: &mut Normalized) {
+fn flush_batch(
+    pending: &mut Option<Batch>,
+    counts: &HashMap<String, Counts>,
+    out: &mut Normalized,
+) {
     let Some(mut batch) = pending.take() else {
         return;
     };
     // Indexed membership keeps large parallel batches out of a quadratic
     // call-by-output scan. Owned ids let the result vector be consumed below.
-    let observed: BTreeSet<String> = batch.results.iter()
-        .map(|result| result.tool_call_id.clone()).collect();
-    let valid: HashMap<String, String> = batch.assistant.content.iter().filter_map(|block| {
-        let ContentBlock::ToolCall(call) = block else {
-            return None;
-        };
-        let count = counts.get(&call.id)?;
-        if count.calls == 1 && count.results == 1 && observed.contains(&call.id) {
-            Some((call.id.clone(), call.name.clone()))
-        } else {
-            None
-        }
-    }).collect();
+    let observed: BTreeSet<String> = batch
+        .results
+        .iter()
+        .map(|result| result.tool_call_id.clone())
+        .collect();
+    let valid: HashMap<String, String> = batch
+        .assistant
+        .content
+        .iter()
+        .filter_map(|block| {
+            let ContentBlock::ToolCall(call) = block else {
+                return None;
+            };
+            let count = counts.get(&call.id)?;
+            if count.calls == 1 && count.results == 1 && observed.contains(&call.id) {
+                Some((call.id.clone(), call.name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut unresolved = false;
     for block in &mut batch.assistant.content {
         if let ContentBlock::ToolCall(call) = block
@@ -241,7 +278,8 @@ fn flush_batch(pending: &mut Option<Batch>, counts: &HashMap<String, Counts>, ou
                 "incomplete or ambiguous tool exchanges retained as non-executable history"
             } else {
                 "combined adjacent foreign assistant tool-call envelopes into one native batch"
-            }.to_string(),
+            }
+            .to_string(),
             unresolved,
             original_messages: batch.original,
         });
@@ -251,7 +289,11 @@ fn flush_batch(pending: &mut Option<Batch>, counts: &HashMap<String, Counts>, ou
 fn historical_result(result: &ToolResultMessage) -> Message {
     let mut text = format!(
         "[Historical tool output for {} ({}); no unambiguous paired call in this import. Recorded output, not a pending tool action. Error: {}]",
-        if result.tool_name.is_empty() { "unknown tool" } else { &result.tool_name },
+        if result.tool_name.is_empty() {
+            "unknown tool"
+        } else {
+            &result.tool_name
+        },
         result.tool_call_id,
         result.is_error,
     );
@@ -278,12 +320,17 @@ mod tests {
 
     fn calls(ids: &[&str]) -> Message {
         Message::assistant(AssistantMessage {
-            content: ids.iter().map(|id| ContentBlock::ToolCall(ToolCall {
-                id: (*id).to_string(),
-                name: format!("tool_{id}"),
-                arguments: json!({"id": id}),
-                thought_signature: None,
-            })).collect(),
+            content: ids
+                .iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        id: (*id).to_string(),
+                        name: format!("tool_{id}"),
+                        arguments: json!({"id": id}),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
             stop_reason: StopReason::ToolUse,
             timestamp: 1,
             ..AssistantMessage::default()
@@ -302,14 +349,21 @@ mod tests {
     }
 
     fn user(text: &str) -> Message {
-        Message::User(UserMessage { content: UserContent::Text(text.to_string()), timestamp: 3 })
+        Message::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 3,
+        })
     }
 
     fn records(messages: Vec<Message>) -> Vec<SourceRecord> {
-        messages.into_iter().enumerate().map(|(index, message)| SourceRecord {
-            line: index + 1,
-            messages: vec![message],
-        }).collect()
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| SourceRecord {
+                line: index + 1,
+                messages: vec![message],
+            })
+            .collect()
     }
 
     /// Protocol postcondition: every tool batch has exactly its matching
@@ -332,7 +386,10 @@ mod tests {
                                 pending.insert(call.id.clone(), call.name.clone());
                             }
                         }
-                        assert_eq!(assistant.stop_reason == StopReason::ToolUse, !pending.is_empty());
+                        assert_eq!(
+                            assistant.stop_reason == StopReason::ToolUse,
+                            !pending.is_empty()
+                        );
                     }
                 }
             }
@@ -341,19 +398,35 @@ mod tests {
     }
 
     fn native_call_count(messages: &[Message]) -> usize {
-        messages.iter().filter_map(|message| match message {
-            Message::Assistant(assistant) => Some(assistant.content.iter().filter(|block| matches!(block, ContentBlock::ToolCall(_))).count()),
-            _ => None,
-        }).sum()
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(assistant) => Some(
+                    assistant
+                        .content
+                        .iter()
+                        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+                        .count(),
+                ),
+                _ => None,
+            })
+            .sum()
     }
 
     #[test]
     fn codex_parallel_call_envelopes_become_one_complete_native_batch() {
-        let out = normalize(records(vec![calls(&["a"]), calls(&["b"]), result("b"), result("a")]));
+        let out = normalize(records(vec![
+            calls(&["a"]),
+            calls(&["b"]),
+            result("b"),
+            result("a"),
+        ]));
         assert_complete(&out.messages);
         assert_eq!(out.messages.len(), 3);
         assert_eq!(native_call_count(&out.messages), 2);
-        let Message::ToolResult(first) = &out.messages[1] else { panic!("tool result") };
+        let Message::ToolResult(first) = &out.messages[1] else {
+            panic!("tool result")
+        };
         assert_eq!(first.tool_call_id, "b");
         assert_eq!(first.tool_name, "tool_b");
         assert!(first.is_error);
@@ -366,13 +439,19 @@ mod tests {
         let out = normalize(records(vec![calls(&["delete_file"])]));
         assert_complete(&out.messages);
         assert_eq!(native_call_count(&out.messages), 0);
-        let Message::Assistant(last) = &out.messages[0] else { panic!("assistant") };
+        let Message::Assistant(last) = &out.messages[0] else {
+            panic!("assistant")
+        };
         assert_eq!(last.stop_reason, StopReason::Stop);
-        let ContentBlock::Text(text) = &last.content[0] else { panic!("historical text") };
+        let ContentBlock::Text(text) = &last.content[0] else {
+            panic!("historical text")
+        };
         assert!(text.text.contains("Pi did not execute it"));
         assert!(text.text.contains("delete_file"));
         assert!(out.reconciliations[0].unresolved);
-        let Message::Assistant(original) = &out.reconciliations[0].original_messages[0] else { panic!("original") };
+        let Message::Assistant(original) = &out.reconciliations[0].original_messages[0] else {
+            panic!("original")
+        };
         assert!(matches!(&original.content[0], ContentBlock::ToolCall(_)));
     }
 
@@ -380,19 +459,40 @@ mod tests {
     fn orphan_output_keeps_exact_content_error_and_structured_details() {
         let out = normalize(records(vec![result("b")]));
         assert_complete(&out.messages);
-        let Message::Custom(message) = &out.messages[0] else { panic!("historical output") };
+        let Message::Custom(message) = &out.messages[0] else {
+            panic!("historical output")
+        };
         assert!(message.content.ends_with("output b"));
         assert!(message.content.contains("Error: true"));
-        assert_eq!(message.details.as_ref().and_then(|value| value.pointer("/toolResult/toolCallId")).and_then(serde_json::Value::as_str), Some("b"));
+        assert_eq!(
+            message
+                .details
+                .as_ref()
+                .and_then(|value| value.pointer("/toolResult/toolCallId"))
+                .and_then(serde_json::Value::as_str),
+            Some("b")
+        );
         assert!(out.reconciliations[0].unresolved);
     }
 
     #[test]
     fn repeated_call_ids_are_not_guessed_or_replayed() {
-        let out = normalize(records(vec![calls(&["a"]), result("a"), user("next"), calls(&["a"]), result("a")]));
+        let out = normalize(records(vec![
+            calls(&["a"]),
+            result("a"),
+            user("next"),
+            calls(&["a"]),
+            result("a"),
+        ]));
         assert_complete(&out.messages);
         assert_eq!(native_call_count(&out.messages), 0);
-        assert_eq!(out.messages.iter().filter(|message| matches!(message, Message::Custom(_))).count(), 2);
+        assert_eq!(
+            out.messages
+                .iter()
+                .filter(|message| matches!(message, Message::Custom(_)))
+                .count(),
+            2
+        );
         assert!(out.reconciliations.iter().all(|notice| notice.unresolved));
     }
 
@@ -402,12 +502,22 @@ mod tests {
         assert_complete(&out.messages);
         assert_eq!(native_call_count(&out.messages), 0);
         assert_eq!(out.messages.len(), 3);
-        assert_eq!(out.messages.iter().filter(|message| matches!(message, Message::Custom(_))).count(), 2);
+        assert_eq!(
+            out.messages
+                .iter()
+                .filter(|message| matches!(message, Message::Custom(_)))
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn call_ids_do_not_pair_across_a_new_user_turn() {
-        let out = normalize(records(vec![calls(&["a"]), user("different turn"), result("a")]));
+        let out = normalize(records(vec![
+            calls(&["a"]),
+            user("different turn"),
+            result("a"),
+        ]));
         assert_complete(&out.messages);
         assert_eq!(native_call_count(&out.messages), 0);
         assert!(matches!(&out.messages[1], Message::User(_)));
@@ -417,16 +527,35 @@ mod tests {
     #[test]
     fn mixed_claude_envelope_closes_tools_before_preserving_all_user_text() {
         let out = normalize(vec![
-            SourceRecord { line: 1, messages: vec![calls(&["a", "b"])] },
-            SourceRecord { line: 2, messages: vec![user("before"), result("b"), user("between"), result("a"), user("after")] },
+            SourceRecord {
+                line: 1,
+                messages: vec![calls(&["a", "b"])],
+            },
+            SourceRecord {
+                line: 2,
+                messages: vec![
+                    user("before"),
+                    result("b"),
+                    user("between"),
+                    result("a"),
+                    user("after"),
+                ],
+            },
         ]);
         assert_complete(&out.messages);
         assert_eq!(native_call_count(&out.messages), 2);
         assert_eq!(out.messages.len(), 6);
-        let texts: Vec<&str> = out.messages.iter().filter_map(|message| match message {
-            Message::User(UserMessage { content: UserContent::Text(text), .. }) => Some(text.as_str()),
-            _ => None,
-        }).collect();
+        let texts: Vec<&str> = out
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(texts, ["before", "between", "after"]);
         assert_eq!(out.reconciliations[0].original_messages.len(), 5);
         assert!(!out.reconciliations[0].unresolved);
@@ -438,7 +567,9 @@ mod tests {
         assert_complete(&out.messages);
         assert_eq!(native_call_count(&out.messages), 1);
         assert_eq!(out.messages.len(), 2);
-        let Message::ToolResult(result) = &out.messages[1] else { panic!("result") };
+        let Message::ToolResult(result) = &out.messages[1] else {
+            panic!("result")
+        };
         assert_eq!(result.tool_call_id, "b");
         assert!(result.is_error);
         assert!(out.reconciliations[0].unresolved);
@@ -446,16 +577,27 @@ mod tests {
 
     #[test]
     fn complete_output_permutations_preserve_pairing_and_arrival_order() {
-        for ids in [["a", "b", "c"], ["a", "c", "b"], ["b", "a", "c"], ["b", "c", "a"], ["c", "a", "b"], ["c", "b", "a"]] {
+        for ids in [
+            ["a", "b", "c"],
+            ["a", "c", "b"],
+            ["b", "a", "c"],
+            ["b", "c", "a"],
+            ["c", "a", "b"],
+            ["c", "b", "a"],
+        ] {
             let mut messages = vec![calls(&["a"]), calls(&["b"]), calls(&["c"])];
             messages.extend(ids.iter().map(|id| result(id)));
             let out = normalize(records(messages));
             assert_complete(&out.messages);
             assert_eq!(native_call_count(&out.messages), 3);
-            let actual: Vec<&str> = out.messages.iter().filter_map(|message| match message {
-                Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
-                _ => None,
-            }).collect();
+            let actual: Vec<&str> = out
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(actual, ids);
         }
     }
@@ -472,8 +614,20 @@ mod tests {
                     }
                     let out = normalize(records(messages));
                     assert_complete(&out.messages);
-                    assert_eq!(native_call_count(&out.messages), usize::from(a == 1) + usize::from(b == 1) + usize::from(c == 1));
-                    assert_eq!(out.messages.iter().filter(|message| matches!(message, Message::ToolResult(_) | Message::Custom(_))).count(), a + b + c);
+                    assert_eq!(
+                        native_call_count(&out.messages),
+                        usize::from(a == 1) + usize::from(b == 1) + usize::from(c == 1)
+                    );
+                    assert_eq!(
+                        out.messages
+                            .iter()
+                            .filter(|message| matches!(
+                                message,
+                                Message::ToolResult(_) | Message::Custom(_)
+                            ))
+                            .count(),
+                        a + b + c
+                    );
                 }
             }
         }
@@ -481,7 +635,10 @@ mod tests {
 
     #[test]
     fn a_native_call_and_result_in_one_record_are_not_reordered() {
-        let out = normalize(vec![SourceRecord { line: 1, messages: vec![calls(&["a"]), result("a")] }]);
+        let out = normalize(vec![SourceRecord {
+            line: 1,
+            messages: vec![calls(&["a"]), result("a")],
+        }]);
         assert_complete(&out.messages);
         assert_eq!(native_call_count(&out.messages), 1);
         assert_eq!(out.messages.len(), 2);
@@ -490,17 +647,24 @@ mod tests {
 
     #[test]
     fn ambiguous_outputs_do_not_inherit_a_guessed_name() {
-        let mut output = match result("a") {
-            Message::ToolResult(result) => result,
-            _ => unreachable!(),
+        let Message::ToolResult(mut output) = result("a") else {
+            unreachable!()
         };
         Arc::make_mut(&mut output).tool_name = "first_guess".to_string();
-        let out = normalize(records(vec![calls(&["a"]), calls(&["a"]), Message::ToolResult(output)]));
+        let out = normalize(records(vec![
+            calls(&["a"]),
+            calls(&["a"]),
+            Message::ToolResult(output),
+        ]));
         assert_complete(&out.messages);
-        let historical = out.messages.iter().find_map(|message| match message {
-            Message::Custom(message) => Some(message),
-            _ => None,
-        }).expect("historical result");
+        let historical = out
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                Message::Custom(message) => Some(message),
+                _ => None,
+            })
+            .expect("historical result");
         assert!(historical.content.contains("unknown tool"));
         assert!(!historical.content.contains("first_guess"));
     }

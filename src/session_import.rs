@@ -86,23 +86,40 @@ fn session_id_for(source: ImportSource, content: &[u8]) -> String {
 
 fn read_source(path: &Path) -> Result<Vec<u8>> {
     let file = std::fs::File::open(path).map_err(|error| {
-        Error::tool("import", format!("failed to open {}: {error}", path.display()))
+        Error::tool(
+            "import",
+            format!("failed to open {}: {error}", path.display()),
+        )
     })?;
     let metadata = file.metadata().map_err(|error| {
-        Error::tool("import", format!("failed to stat {}: {error}", path.display()))
+        Error::tool(
+            "import",
+            format!("failed to stat {}: {error}", path.display()),
+        )
     })?;
     if !metadata.is_file() {
         return Err(Error::tool("import", "source must be a regular file"));
     }
     if metadata.len() > MAX_IMPORT_BYTES {
-        return Err(Error::tool("import", "source exceeds the 128 MiB import limit"));
+        return Err(Error::tool(
+            "import",
+            "source exceeds the 128 MiB import limit",
+        ));
     }
     let mut raw = Vec::new();
-    file.take(MAX_IMPORT_BYTES + 1).read_to_end(&mut raw).map_err(|error| {
-        Error::tool("import", format!("failed to read {}: {error}", path.display()))
-    })?;
+    file.take(MAX_IMPORT_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|error| {
+            Error::tool(
+                "import",
+                format!("failed to read {}: {error}", path.display()),
+            )
+        })?;
     if raw.len() as u64 > MAX_IMPORT_BYTES {
-        return Err(Error::tool("import", "source grew beyond the 128 MiB import limit"));
+        return Err(Error::tool(
+            "import",
+            "source grew beyond the 128 MiB import limit",
+        ));
     }
     Ok(raw)
 }
@@ -153,17 +170,27 @@ fn find_imported_session(root: &Path, id: &str) -> Result<Option<PathBuf>> {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(Error::tool("import", format!(
-                    "cannot check existing imports in {}: {error}", dir.display()
-                )));
+                return Err(Error::tool(
+                    "import",
+                    format!(
+                        "cannot check existing imports in {}: {error}",
+                        dir.display()
+                    ),
+                ));
             }
         };
         for entry in entries {
             let entry = entry.map_err(|error| {
-                Error::tool("import", format!("cannot inspect destination entry: {error}"))
+                Error::tool(
+                    "import",
+                    format!("cannot inspect destination entry: {error}"),
+                )
             })?;
             let kind = entry.file_type().map_err(|error| {
-                Error::tool("import", format!("cannot inspect destination type: {error}"))
+                Error::tool(
+                    "import",
+                    format!("cannot inspect destination type: {error}"),
+                )
             })?;
             let path = entry.path();
             // Do not follow child symlinks out of the session root or into
@@ -171,7 +198,9 @@ fn find_imported_session(root: &Path, id: &str) -> Result<Option<PathBuf>> {
             if kind.is_dir() {
                 stack.push(path);
             } else if kind.is_file()
-                && path.file_name().and_then(|name| name.to_str())
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
                     .is_some_and(|name| name.ends_with(&suffix))
                 && header_has_id(&path, id)
             {
@@ -189,10 +218,14 @@ fn import_bytes(
     target_dir: Option<&Path>,
 ) -> Result<ImportOutcome> {
     if raw.len() as u64 > MAX_IMPORT_BYTES {
-        return Err(Error::tool("import", "source exceeds the 128 MiB import limit"));
+        return Err(Error::tool(
+            "import",
+            "source exceeds the 128 MiB import limit",
+        ));
     }
     let id = session_id_for(source, raw);
-    let target_root = target_dir.map_or_else(crate::config::Config::sessions_dir, Path::to_path_buf);
+    let target_root =
+        target_dir.map_or_else(crate::config::Config::sessions_dir, Path::to_path_buf);
     if let Some(existing_path) = find_imported_session(&target_root, &id)? {
         return Ok(ImportOutcome {
             schema: IMPORT_SCHEMA.to_string(),
@@ -216,60 +249,23 @@ fn import_bytes(
     session.header.cwd = std::env::current_dir()
         .map(|cwd| cwd.display().to_string())
         .unwrap_or_default();
-    session.append_custom_entry("foreign_import".to_string(), Some(json!({
-        "schema": IMPORT_SCHEMA,
-        "formatRevision": IMPORT_FORMAT_REVISION,
-        "source": source.as_str(),
-        "originalPath": original_path.display().to_string(),
-        "sourceSha256": crate::package_manager::hex_encode(&sha2::Sha256::digest(raw)),
-        "importedAtMs": now_ms(),
-    })));
+    session.append_custom_entry(
+        "foreign_import".to_string(),
+        Some(json!({
+            "schema": IMPORT_SCHEMA,
+            "formatRevision": IMPORT_FORMAT_REVISION,
+            "source": source.as_str(),
+            "originalPath": original_path.display().to_string(),
+            "sourceSha256": crate::package_manager::hex_encode(&sha2::Sha256::digest(raw)),
+            "importedAtMs": now_ms(),
+        })),
+    );
 
-    let mut reader = conversion::ForeignReader::new(source);
-    let mut records = Vec::new();
-    let mut unresolved_lines = BTreeSet::new();
-    let mut report = Vec::new();
-    // Parse bytes per line. Lossy UTF-8 decoding would change corrupt input
-    // before it could be archived, making the claimed preservation false.
-    for (line_no, line) in raw.split(|byte| *byte == b'\n').enumerate() {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let entry = match serde_json::from_slice::<Value>(line) {
-            Ok(entry) => entry,
-            Err(_) => {
-                record_unmappable_line(
-                    &mut session, line_no, "corrupt JSON or UTF-8", line,
-                    &mut unresolved_lines, &mut report,
-                );
-                continue;
-            }
-        };
-        let converted = reader.convert(&entry);
-        if !converted.notes.is_empty() {
-            record_unmappable_line(
-                &mut session, line_no, &converted.notes.join("; "), line,
-                &mut unresolved_lines, &mut report,
-            );
-        } else if converted.metadata {
-            session.append_custom_entry("foreign_metadata".to_string(), Some(json!({
-                "schema": IMPORT_SCHEMA, "line": line_no + 1, "entry": entry,
-            })));
-        }
-        // Provider/model information is provenance, not a configuration change.
-        if let Some(model) = entry.pointer("/message/model") {
-            session.append_custom_entry("foreign_model".to_string(), Some(json!({
-                "source": source.as_str(), "line": line_no + 1, "model": model,
-                "usage": entry.pointer("/message/usage"),
-            })));
-        }
-        if !converted.messages.is_empty() {
-            records.push(transcript::SourceRecord {
-                line: line_no + 1,
-                messages: converted.messages,
-            });
-        }
-    }
+    let ParseImportLinesOutcome {
+        records,
+        mut unresolved_lines,
+        mut report,
+    } = parse_import_lines(source, raw, &mut session);
 
     let normalized = transcript::normalize(records);
     for reconciliation in normalized.reconciliations {
@@ -277,7 +273,8 @@ fn import_bytes(
             unresolved_lines.extend(reconciliation.source_lines.iter().copied());
         }
         report.push(format!(
-            "source lines {:?}: {}", reconciliation.source_lines, reconciliation.reason
+            "source lines {:?}: {}",
+            reconciliation.source_lines, reconciliation.reason
         ));
         session.append_custom_entry(
             "foreign_transcript_reconciliation".to_string(),
@@ -312,6 +309,80 @@ fn import_bytes(
     })
 }
 
+struct ParseImportLinesOutcome {
+    records: Vec<transcript::SourceRecord>,
+    unresolved_lines: BTreeSet<usize>,
+    report: Vec<String>,
+}
+
+fn parse_import_lines(
+    source: ImportSource,
+    raw: &[u8],
+    session: &mut Session,
+) -> ParseImportLinesOutcome {
+    let mut reader = conversion::ForeignReader::new(source);
+    let mut records = Vec::new();
+    let mut unresolved_lines = BTreeSet::new();
+    let mut report = Vec::new();
+    // Parse bytes per line. Lossy UTF-8 decoding would change corrupt input
+    // before it could be archived, making the claimed preservation false.
+    for (line_no, line) in raw.split(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+            record_unmappable_line(
+                session,
+                line_no,
+                "corrupt JSON or UTF-8",
+                line,
+                &mut unresolved_lines,
+                &mut report,
+            );
+            continue;
+        };
+        let converted = reader.convert(&entry);
+        if !converted.notes.is_empty() {
+            record_unmappable_line(
+                session,
+                line_no,
+                &converted.notes.join("; "),
+                line,
+                &mut unresolved_lines,
+                &mut report,
+            );
+        } else if converted.metadata {
+            session.append_custom_entry(
+                "foreign_metadata".to_string(),
+                Some(json!({
+                    "schema": IMPORT_SCHEMA, "line": line_no + 1, "entry": entry,
+                })),
+            );
+        }
+        // Provider/model information is provenance, not a configuration change.
+        if let Some(model) = entry.pointer("/message/model") {
+            session.append_custom_entry(
+                "foreign_model".to_string(),
+                Some(json!({
+                    "source": source.as_str(), "line": line_no + 1, "model": model,
+                    "usage": entry.pointer("/message/usage"),
+                })),
+            );
+        }
+        if !converted.messages.is_empty() {
+            records.push(transcript::SourceRecord {
+                line: line_no + 1,
+                messages: converted.messages,
+            });
+        }
+    }
+    ParseImportLinesOutcome {
+        records,
+        unresolved_lines,
+        report,
+    }
+}
+
 fn record_unmappable_line(
     session: &mut Session,
     line_no: usize,
@@ -321,16 +392,18 @@ fn record_unmappable_line(
     report: &mut Vec<String>,
 ) {
     unresolved_lines.insert(line_no + 1);
-    report.push(format!("line {}: {note}; original retained as attachment", line_no + 1));
+    report.push(format!(
+        "line {}: {note}; original retained as attachment",
+        line_no + 1
+    ));
     let mut attachment = json!({
         "schema": IMPORT_SCHEMA, "line": line_no + 1, "reason": note,
     });
     match std::str::from_utf8(line) {
         Ok(raw) => attachment["raw"] = Value::String(raw.to_string()),
         Err(_) => {
-            attachment["rawBase64"] = Value::String(
-                base64::engine::general_purpose::STANDARD.encode(line)
-            );
+            attachment["rawBase64"] =
+                Value::String(base64::engine::general_purpose::STANDARD.encode(line));
         }
     }
     session.append_custom_entry("foreign_attachment".to_string(), Some(attachment));
@@ -339,7 +412,9 @@ fn record_unmappable_line(
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]
@@ -379,7 +454,8 @@ mod tests {
         let again = import_claude(&source, Some(dir.path())).expect("re-import");
         assert!(again.already_imported);
         assert_eq!(again.session_id, outcome.session_id);
-        let session = futures::executor::block_on(Session::open(&outcome.session_path)).expect("load");
+        let session =
+            futures::executor::block_on(Session::open(&outcome.session_path)).expect("load");
         let messages = session.to_messages_for_current_path();
         assert_eq!(messages.len(), 4);
         assert!(matches!(&messages[3], Message::ToolResult(result) if result.tool_name == "read"));
@@ -394,18 +470,26 @@ mod tests {
         std::fs::write(&source, codex_fixture()).expect("write");
         let outcome = import_codex(&source, Some(dir.path())).expect("import");
         assert_eq!(outcome.imported, 4, "{:?}", outcome.report);
-        let session = futures::executor::block_on(Session::open(&outcome.session_path)).expect("load");
+        let session =
+            futures::executor::block_on(Session::open(&outcome.session_path)).expect("load");
         let messages = session.to_messages_for_current_path();
-        assert!(messages.iter().any(|message| match message {
-            Message::Assistant(assistant) => assistant.content.iter()
-                .any(|block| matches!(block, ContentBlock::Thinking(_))),
-            _ => false,
+        assert!(messages.iter().any(|message| {
+            match message {
+                Message::Assistant(assistant) => assistant
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Thinking(_))),
+                _ => false,
+            }
         }));
         assert!(matches!(&messages[3], Message::ToolResult(result) if result.tool_name == "read"));
         assert!(session.header.provider.is_none());
         assert!(session.header.model_id.is_none());
         let saved = std::fs::read_to_string(&outcome.session_path).expect("saved");
-        assert!(saved.contains("/tmp/proj"), "foreign cwd remains provenance");
+        assert!(
+            saved.contains("/tmp/proj"),
+            "foreign cwd remains provenance"
+        );
     }
 
     #[test]
@@ -413,7 +497,10 @@ mod tests {
         let first = session_id_for(ImportSource::Claude, b"a");
         assert_eq!(first, session_id_for(ImportSource::Claude, b"a"));
         assert_ne!(first, session_id_for(ImportSource::Codex, b"a"));
-        assert_ne!(&first[..8], &session_id_for(ImportSource::Claude, b"b")[..8]);
+        assert_ne!(
+            &first[..8],
+            &session_id_for(ImportSource::Claude, b"b")[..8]
+        );
         assert!(!first.starts_with("import-"));
     }
 
@@ -422,7 +509,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("session.jsonl");
         let id = session_id_for(ImportSource::Codex, b"fixture");
-        std::fs::write(&path, json!({"id": "other", "description": id}).to_string()).expect("write");
+        std::fs::write(&path, json!({"id": "other", "description": id}).to_string())
+            .expect("write");
         assert!(!header_has_id(&path, &id));
         std::fs::write(&path, json!({"id": id}).to_string()).expect("write");
         assert!(header_has_id(&path, &id));
@@ -436,15 +524,30 @@ mod tests {
         let mut raw = unknown.as_bytes().to_vec();
         raw.push(b'\n');
         raw.extend_from_slice(&invalid);
-        let outcome = import_bytes(ImportSource::Codex, &raw, Path::new("foreign.jsonl"), Some(dir.path())).expect("import");
+        let outcome = import_bytes(
+            ImportSource::Codex,
+            &raw,
+            Path::new("foreign.jsonl"),
+            Some(dir.path()),
+        )
+        .expect("import");
         assert_eq!(outcome.skipped, 2);
         let saved = std::fs::read_to_string(&outcome.session_path).expect("saved");
-        let values: Vec<Value> = saved.lines()
+        let values: Vec<Value> = saved
+            .lines()
             .map(|line| serde_json::from_str(line).expect("native JSONL"))
             .collect();
-        assert!(values.iter().any(|entry| entry.pointer("/data/raw").and_then(Value::as_str) == Some(unknown.as_str())));
+        assert!(
+            values
+                .iter()
+                .any(|entry| entry.pointer("/data/raw").and_then(Value::as_str)
+                    == Some(unknown.as_str()))
+        );
         let encoded = base64::engine::general_purpose::STANDARD.encode(invalid);
-        assert!(values.iter().any(|entry| entry.pointer("/data/rawBase64").and_then(Value::as_str) == Some(encoded.as_str())));
+        assert!(values.iter().any(
+            |entry| entry.pointer("/data/rawBase64").and_then(Value::as_str)
+                == Some(encoded.as_str())
+        ));
     }
 
     #[test]
@@ -466,24 +569,46 @@ mod tests {
             json!({"type": "custom_tool_call_output", "call_id": "b", "output": "patch failed", "is_error": true}),
             json!({"type": "function_call_output", "call_id": "a", "output": "file contents"}),
         ];
-        let raw = payloads.into_iter().map(|payload| {
-            json!({"type": "response_item", "payload": payload}).to_string()
-        }).collect::<Vec<_>>().join("\n");
-        let outcome = import_bytes(ImportSource::Codex, raw.as_bytes(), Path::new("codex.jsonl"), Some(dir.path())).expect("import");
+        let raw = payloads
+            .into_iter()
+            .map(|payload| json!({"type": "response_item", "payload": payload}).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outcome = import_bytes(
+            ImportSource::Codex,
+            raw.as_bytes(),
+            Path::new("codex.jsonl"),
+            Some(dir.path()),
+        )
+        .expect("import");
         assert_eq!(outcome.imported, 3);
         assert_eq!(outcome.skipped, 0);
-        let mut session = futures::executor::block_on(Session::open(&outcome.session_path)).expect("open");
+        let mut session =
+            futures::executor::block_on(Session::open(&outcome.session_path)).expect("open");
         let messages = session.to_messages_for_current_path();
-        let Message::Assistant(assistant) = &messages[0] else { panic!("assistant batch") };
+        let Message::Assistant(assistant) = &messages[0] else {
+            panic!("assistant batch")
+        };
         assert_eq!(assistant.stop_reason, StopReason::ToolUse);
-        assert_eq!(assistant.content.iter().filter(|block| matches!(block, ContentBlock::ToolCall(_))).count(), 2);
-        assert!(matches!(&messages[1], Message::ToolResult(result) if result.tool_call_id == "b" && result.is_error));
+        assert_eq!(
+            assistant
+                .content
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+                .count(),
+            2
+        );
+        assert!(
+            matches!(&messages[1], Message::ToolResult(result) if result.tool_call_id == "b" && result.is_error)
+        );
         assert!(matches!(&messages[2], Message::ToolResult(result) if result.tool_call_id == "a"));
         session.append_model_message(Message::User(UserMessage {
-            content: UserContent::Text("continue in Pi".to_string()), timestamp: 4,
+            content: UserContent::Text("continue in Pi".to_string()),
+            timestamp: 4,
         }));
         futures::executor::block_on(session.save()).expect("save native continuation");
-        let reopened = futures::executor::block_on(Session::open(&outcome.session_path)).expect("reopen");
+        let reopened =
+            futures::executor::block_on(Session::open(&outcome.session_path)).expect("reopen");
         assert_eq!(reopened.to_messages_for_current_path().len(), 4);
         let saved = std::fs::read_to_string(&outcome.session_path).expect("saved");
         assert!(saved.contains("foreign_transcript_reconciliation"));
@@ -495,13 +620,27 @@ mod tests {
         let raw = json!({"type": "response_item", "payload": {
             "type": "custom_tool_call", "call_id": "unfinished", "name": "apply_patch", "input": "unexecuted patch"
         }}).to_string();
-        let outcome = import_bytes(ImportSource::Codex, raw.as_bytes(), Path::new("cutoff.jsonl"), Some(dir.path())).expect("import");
+        let outcome = import_bytes(
+            ImportSource::Codex,
+            raw.as_bytes(),
+            Path::new("cutoff.jsonl"),
+            Some(dir.path()),
+        )
+        .expect("import");
         assert_eq!(outcome.skipped, 1);
-        let session = futures::executor::block_on(Session::open(&outcome.session_path)).expect("open");
+        let session =
+            futures::executor::block_on(Session::open(&outcome.session_path)).expect("open");
         let messages = session.to_messages_for_current_path();
-        let Message::Assistant(last) = messages.last().expect("historical message") else { panic!("assistant") };
+        let Message::Assistant(last) = messages.last().expect("historical message") else {
+            panic!("assistant")
+        };
         assert_eq!(last.stop_reason, StopReason::Stop);
-        assert!(!last.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(_))));
+        assert!(
+            !last
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        );
         assert!(last.content.iter().any(|block| matches!(block, ContentBlock::Text(text) if text.text.contains("unexecuted patch"))));
         let saved = std::fs::read_to_string(&outcome.session_path).expect("saved");
         assert!(saved.contains("originalMessages"));
