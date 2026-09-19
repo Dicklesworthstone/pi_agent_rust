@@ -31,6 +31,8 @@
 //! while an unsupported scheme written explicitly into settings.json is
 //! reported as a configuration warning at startup.
 
+use std::fmt;
+use std::net::Ipv6Addr;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
@@ -39,7 +41,7 @@ use std::sync::RwLock;
 /// Always a plain-HTTP hop: the origin's TLS runs end-to-end inside a CONNECT
 /// tunnel, so the hop to the proxy itself is never TLS. A `https://` proxy URL
 /// is rejected by [`parse_proxy_url`] rather than silently downgraded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProxyEndpoint {
     /// Proxy host (no brackets for IPv6 — ready for `TcpStream::connect`).
     pub host: String,
@@ -47,6 +49,19 @@ pub struct ProxyEndpoint {
     pub port: u16,
     /// `Proxy-Authorization` header value derived from the URL's userinfo.
     pub authorization: Option<String>,
+}
+
+impl fmt::Debug for ProxyEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ProxyEndpoint {
@@ -68,7 +83,7 @@ impl ProxyEndpoint {
 }
 
 /// `[http]` section of settings.json (`Config::http`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct HttpSettings {
     /// Proxy for both `http://` and `https://` requests.
@@ -90,6 +105,20 @@ pub struct HttpSettings {
     /// `NO_PROXY` variables; only the settings above (and `PI_*_PROXY`) apply.
     #[serde(alias = "ignoreEnvProxy")]
     pub ignore_env_proxy: Option<bool>,
+}
+
+impl fmt::Debug for HttpSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Even malformed URLs can contain credentials. Do not attempt to
+        // parse them to decide which parts are safe to print.
+        f.debug_struct("HttpSettings")
+            .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
+            .field("https_proxy", &self.https_proxy.as_ref().map(|_| "<redacted>"))
+            .field("http_proxy", &self.http_proxy.as_ref().map(|_| "<redacted>"))
+            .field("no_proxy", &self.no_proxy)
+            .field("ignore_env_proxy", &self.ignore_env_proxy)
+            .finish()
+    }
 }
 
 /// Environment variable names read for proxy configuration, most specific
@@ -154,7 +183,7 @@ impl ProxyConfig {
                 match parse_proxy_url(value) {
                     Ok(endpoint) => return Some(endpoint),
                     Err(err) => {
-                        warnings.push(format!("ignoring http proxy setting {value:?}: {err}"));
+                        warnings.push(format!("ignoring http proxy setting: {err}"));
                     }
                 }
             }
@@ -179,7 +208,7 @@ impl ProxyConfig {
                         // An unusable ambient value must not fail requests:
                         // `ALL_PROXY` is routinely a SOCKS endpoint meant for
                         // other tools. Warn once and keep looking.
-                        warnings.push(format!("ignoring {name}={value:?}: {err}"));
+                        warnings.push(format!("ignoring {name}: {err}"));
                     }
                 }
             }
@@ -334,20 +363,25 @@ impl ProxyConfig {
 ///
 /// Returns a human-readable message for an unsupported scheme (`https://`
 /// proxies would need TLS-in-TLS, and SOCKS is not implemented), a missing
-/// host, or an unparseable port.
+/// host, a malformed authority, an invalid port, or invalid Basic credentials.
+/// Error messages never include input values, which may contain secrets even
+/// when the URL is malformed.
 pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("empty proxy URL".to_string());
     }
+    if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return Err("proxy URL contains unescaped whitespace or control characters".to_string());
+    }
     let rest = match raw.split_once("://") {
         Some((scheme, rest)) => {
             if !scheme.eq_ignore_ascii_case("http") {
-                return Err(format!(
-                    "unsupported proxy scheme {:?} (only http:// proxy endpoints are supported; \
-                     https:// targets are proxied through an http:// proxy with CONNECT)",
-                    scheme.to_ascii_lowercase()
-                ));
+                return Err(
+                    "unsupported proxy scheme (only http:// proxy endpoints are supported; \
+                     https:// targets are proxied through an http:// proxy with CONNECT)"
+                        .to_string(),
+                );
             }
             rest
         }
@@ -372,24 +406,23 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
         let (host, tail) = rest
             .split_once(']')
             .ok_or_else(|| "unterminated IPv6 proxy host".to_string())?;
-        let port = match tail.strip_prefix(':') {
-            Some(port) => Some(
-                port.parse::<u16>()
-                    .map_err(|_| format!("invalid proxy port {port:?}"))?,
-            ),
-            None => None,
+        let host = host
+            .parse::<Ipv6Addr>()
+            .map_err(|_| "invalid IPv6 proxy host".to_string())?;
+        let port = if tail.is_empty() {
+            None
+        } else {
+            let port = tail
+                .strip_prefix(':')
+                .ok_or_else(|| "unexpected suffix after IPv6 proxy host".to_string())?;
+            Some(parse_proxy_port(port)?)
         };
         (host.to_string(), port)
-    } else if let Some((host, port)) = hostport.rsplit_once(':')
-        && !host.contains(':')
-    {
-        (
-            host.to_string(),
-            Some(
-                port.parse::<u16>()
-                    .map_err(|_| format!("invalid proxy port {port:?}"))?,
-            ),
-        )
+    } else if let Some((host, port)) = hostport.rsplit_once(':') {
+        if host.contains(':') {
+            return Err("IPv6 proxy hosts must be bracketed".to_string());
+        }
+        (host.to_string(), Some(parse_proxy_port(port)?))
     } else {
         (hostport, None)
     };
@@ -397,13 +430,31 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
     if host.is_empty() {
         return Err("proxy URL has no host".to_string());
     }
+    if host.contains(['[', ']', '@', '\\', '%']) {
+        return Err("invalid proxy host".to_string());
+    }
 
     let port = port.unwrap_or(80);
 
-    let authorization = userinfo.filter(|info| !info.is_empty()).map(|info| {
-        let decoded = percent_decode_userinfo(&info);
-        format!("Basic {}", base64_encode(decoded.as_bytes()))
-    });
+    let authorization = userinfo
+        .filter(|info| !info.is_empty())
+        .map(|info| {
+            // Split before decoding: an escaped colon in a password is data,
+            // not the username/password delimiter. Basic usernames cannot
+            // contain a colon; a username alone implies an empty password.
+            let (username, password) = info.split_once(':').unwrap_or((info.as_str(), ""));
+            let mut decoded = percent_decode_userinfo(username);
+            if decoded.contains(&b':') {
+                return Err("proxy username must not contain a colon".to_string());
+            }
+            decoded.push(b':');
+            decoded.extend(percent_decode_userinfo(password));
+            if decoded.iter().any(u8::is_ascii_control) {
+                return Err("proxy credentials contain control characters".to_string());
+            }
+            Ok(format!("Basic {}", base64_encode(&decoded)))
+        })
+        .transpose()?;
 
     Ok(ProxyEndpoint {
         host,
@@ -412,9 +463,17 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
     })
 }
 
-/// Percent-decode a `user:password` pair (proxy credentials commonly encode
-/// `@` and `:` this way).
-fn percent_decode_userinfo(raw: &str) -> String {
+fn parse_proxy_port(raw: &str) -> std::result::Result<u16, String> {
+    raw.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0 && raw.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "invalid proxy port (expected an integer from 1 to 65535)".to_string())
+}
+
+/// Percent-decode credential bytes without lossy UTF-8 conversion. Basic
+/// authentication encodes octets; replacing a non-UTF-8 password byte changes
+/// the credential and causes authentication to fail.
+fn percent_decode_userinfo(raw: &str) -> Vec<u8> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -434,7 +493,7 @@ fn percent_decode_userinfo(raw: &str) -> String {
         out.push(bytes[index]);
         index += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// Minimal standard base64 encoder (proxy credentials only; no dependency).
@@ -618,6 +677,99 @@ mod tests {
         assert!(parse_proxy_url("http://proxy:notaport").is_err());
         assert!(parse_proxy_url("   ").is_err());
         assert!(parse_proxy_url("http://").is_err());
+    }
+
+    #[test]
+    fn malformed_authorities_are_rejected_before_connecting() {
+        for raw in [
+            "http://[::1]ignored",
+            "http://[::1]:",
+            "http://[not-an-ip]:8080",
+            "http://[]:8080",
+            "http://::1",
+            "http://proxy]:8080",
+            "http://proxy\\other:8080",
+            "http://proxy%0ahost:8080",
+            "http://proxy host:8080",
+            "http://proxy\r\nInjected:8080",
+            "http://proxy:0",
+            "http://proxy:+8080",
+            "http://proxy:65536",
+        ] {
+            assert!(parse_proxy_url(raw).is_err(), "accepted {raw:?}");
+        }
+        let endpoint = parse_proxy_url("http://[0:0:0:0:0:0:0:1]:65535").expect("IPv6");
+        assert_eq!(endpoint.authority(), "[::1]:65535");
+    }
+
+    #[test]
+    fn basic_credentials_preserve_octets_and_empty_passwords() {
+        for (raw, expected) in [
+            ("http://user@proxy", "Basic dXNlcjo="),
+            ("http://user:%FF%3A%FE@proxy", "Basic dXNlcjr/Ov4="),
+            ("http://u:p%40ss%3Aword@proxy", "Basic dTpwQHNzOndvcmQ="),
+        ] {
+            let endpoint = parse_proxy_url(raw).expect("valid credentials");
+            assert_eq!(endpoint.authorization.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn basic_credentials_reject_ambiguous_usernames_and_controls() {
+        for raw in [
+            "http://user%3Aother:password@proxy",
+            "http://user:password%0D%0A@proxy",
+            "http://user%00:password@proxy",
+            "http://user:password%7F@proxy",
+        ] {
+            assert!(parse_proxy_url(raw).is_err(), "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn proxy_diagnostics_never_echo_malformed_values() {
+        for raw in [
+            "socks5://sentinel-user:sentinel-secret@proxy:1080",
+            "sentinel-scheme://proxy:8080",
+            "http://user:sentinel-secret@proxy:sentinel-port",
+            "http://user:sentinel-secret@[::1]sentinel-suffix",
+            "http://user:sentinel-secret@proxy\r\nInjected:8080",
+        ] {
+            let error = parse_proxy_url(raw).expect_err("invalid proxy");
+            assert!(!error.contains("sentinel"), "{error}");
+            let settings = HttpSettings {
+                proxy: Some(raw.to_string()),
+                ..HttpSettings::default()
+            };
+            let (_, warnings) = ProxyConfig::resolve(Some(&settings), &env_from(&[]));
+            assert!(!warnings.is_empty());
+            assert!(!format!("{warnings:?} {settings:?}").contains("sentinel"));
+            let (_, warnings) = ProxyConfig::resolve(
+                None,
+                &env_from(&[("HTTPS_PROXY", raw), ("HTTP_PROXY", raw)]),
+            );
+            assert!(!warnings.is_empty());
+            assert!(warnings.iter().all(|warning| !warning.contains("sentinel")));
+            assert!(warnings.iter().any(|warning| warning.contains("HTTPS_PROXY")));
+        }
+    }
+
+    #[test]
+    fn debug_redacts_plaintext_and_encoded_proxy_credentials() {
+        let settings = HttpSettings {
+            proxy: Some("http://sentinel-user:sentinel-secret@proxy:8080".to_string()),
+            https_proxy: Some("http://sentinel-user:sentinel-secret@proxy:8080".to_string()),
+            http_proxy: Some("http://sentinel-user:sentinel-secret@proxy:8080".to_string()),
+            ..HttpSettings::default()
+        };
+        let config = resolve(Some(&settings), &[]);
+        let endpoint = config.endpoint_for(true, "api.example.com", 443).expect("proxy");
+        let authorization = endpoint.authorization.as_deref().expect("credentials");
+        let diagnostic = format!("{settings:?} {config:?} {endpoint:?}");
+        assert!(!diagnostic.contains("sentinel"));
+        assert!(!diagnostic.contains(authorization));
+        assert!(diagnostic.contains("<redacted>"));
+        assert_eq!(endpoint.redacted_url(), "http://proxy:8080");
     }
 
     // ─── Precedence ─────────────────────────────────────────────────────
