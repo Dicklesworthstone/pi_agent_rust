@@ -1069,6 +1069,7 @@ const fn is_editor_action(action: AppAction) -> bool {
             | AppAction::DeleteCharForward
             | AppAction::DeleteWordBackward
             | AppAction::DeleteWordForward
+            | AppAction::DeleteToLineStart
             | AppAction::DeleteToLineEnd
             | AppAction::Undo
     )
@@ -1084,10 +1085,9 @@ const fn is_editor_action(action: AppAction) -> bool {
 /// before this, an override of `deleteWordBackward` was parsed, stored,
 /// matched, and then discarded.
 ///
-/// Three declared actions are deliberately absent, because the editor has no
-/// operation to call and inventing one is a feature, not a wiring fix:
-/// `DeleteToLineStart` (no kill-to-start), and `Yank`/`YankPop` (no kill
-/// ring — `ctrl+y` reaches the editor and redoes instead).
+/// `Yank` and `YankPop` are deliberately absent: there is no kill ring to
+/// paste from, and building one is a feature rather than a wiring fix.
+/// `ctrl+y` reaches the editor and redoes instead.
 fn apply_editor_action(input: &mut TextArea, action: AppAction) {
     match action {
         AppAction::CursorLeft => input.move_left(),
@@ -1101,6 +1101,15 @@ fn apply_editor_action(input: &mut TextArea, action: AppAction) {
         AppAction::DeleteCharForward => input.delete_forward(),
         AppAction::DeleteWordBackward => input.delete_word_backward(),
         AppAction::DeleteWordForward => input.delete_word_forward(),
+        AppAction::DeleteToLineStart => {
+            // The editor has no kill-to-start, but it has both halves of one:
+            // the cursor's grapheme offset within its line, and a backward
+            // delete. The count stops at column 0, so this cannot run on and
+            // join the previous line.
+            for _ in 0..input.cursor().grapheme {
+                input.delete_backward();
+            }
+        }
         AppAction::DeleteToLineEnd => input.delete_to_end_of_line(),
         AppAction::Undo => input.undo(),
         _ => {}
@@ -2761,6 +2770,7 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::JumpForward))
                     .or_else(|| pick(AppAction::DeleteWordBackward))
                     .or_else(|| pick(AppAction::DeleteWordForward))
+                    .or_else(|| pick(AppAction::DeleteToLineStart))
                     .or_else(|| pick(AppAction::DeleteToLineEnd))
                     .or_else(|| pick(AppAction::DeleteCharBackward))
                     .or_else(|| pick(AppAction::DeleteCharForward))
@@ -5626,13 +5636,58 @@ mod tests {
             "ctrl+a then ctrl+d should delete the first character"
         );
 
-        // ctrl+w after a word move takes the word the cursor is now inside.
+        // ctrl+u kills back to line start; at end of line that is everything.
         assert_eq!(
             after_key("one two", KeyCode::Char('u'), Modifiers::CTRL),
-            "one two",
-            "ctrl+u (DeleteToLineStart) is declared but the editor has no \
-             kill-to-start, so it is deliberately not routed"
+            "",
+            "ctrl+u (DeleteToLineStart)"
         );
+    }
+
+    #[test]
+    fn ctrl_u_kills_back_to_line_start_and_stops_there() {
+        // Built from the editor's cursor offset plus backward delete, so the
+        // thing worth pinning is that it stops at column 0 rather than running
+        // on and joining the line above.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "keep".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
+        for ch in "drop".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        assert_eq!(sim.model().input.text(), "keep\ndrop");
+
+        sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
+        assert_eq!(
+            sim.model().input.text(),
+            "keep\n",
+            "ctrl+u must clear the line it is on and leave the one above"
+        );
+
+        // A second press at column 0 has nothing to take and must not eat the
+        // newline.
+        sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep\n", "ctrl+u at column 0");
+    }
+
+    #[test]
+    fn ctrl_u_in_the_middle_of_a_line_keeps_what_is_ahead_of_the_cursor() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "drop keep".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        // Move to just before "keep": four lefts from the end.
+        for _ in 0..4 {
+            sim.inject_event(key(KeyCode::Left, Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep");
     }
 
     #[test]
