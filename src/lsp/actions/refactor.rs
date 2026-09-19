@@ -12,6 +12,7 @@ use super::{
 use crate::lsp::client::{DocumentSnapshot, try_path_to_uri, uri_to_path};
 use crate::lsp::edits::WorkspaceEditPlan;
 
+mod formatting;
 mod versions;
 
 struct RefactorSnapshot {

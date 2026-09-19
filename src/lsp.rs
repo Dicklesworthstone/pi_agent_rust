@@ -535,6 +535,8 @@ struct LspInput {
     method: Option<String>,
     payload: Option<Value>,
     limit: Option<usize>,
+    range: Option<text::Range>,
+    format_options: Option<Value>,
 }
 
 #[async_trait]
@@ -547,13 +549,13 @@ impl Tool for LspTool {
         "lsp"
     }
     fn description(&self) -> &str {
-        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, rename, rename_file, code_actions, type_definition, implementation, status, reload, capabilities and request. Code actions return stable actionId values; apply with apply:true plus actionId or a title/index query. Lazy actions are resolved and edits precede commands. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence."
+        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities and request. Code actions return stable actionId values; apply with apply:true plus actionId or a title/index query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. Formatting range positions are zero-based UTF-16."
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","rename","rename_file","code_actions","type_definition","implementation","status","reload","capabilities","request"]},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request"]},
                 "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics also accepts a glob over cached reports (not a workspace scan)"},
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
@@ -561,7 +563,18 @@ impl Tool for LspTool {
                 "actionId":{"type":"string","description":"Opaque ID from a prior code_actions listing; requires apply:true and no query"},
                 "newName":{"type":"string","description":"New symbol name for rename"},
                 "newFile":{"type":"string","description":"Destination path for rename_file"},
-                "apply":{"type":"boolean","description":"Apply the selected code action instead of listing"},
+                "apply":{"type":"boolean","description":"Apply the selected code action, or write formatting changes instead of previewing"},
+                "range":{"type":"object","description":"Optional format selection with zero-based lines and UTF-16 character offsets; omit to format the whole document. The server may expand to a syntactic construct.","required":["start","end"],"properties":{
+                    "start":{"type":"object","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
+                    "end":{"type":"object","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}}
+                }},
+                "formatOptions":{"type":"object","maxProperties":64,"description":"Formatting options; defaults to tabSize 4 and insertSpaces true. Additional server options must be boolean, 32-bit integer or bounded string values.","properties":{
+                    "tabSize":{"type":"integer","minimum":1,"maximum":32,"default":4},
+                    "insertSpaces":{"type":"boolean","default":true},
+                    "trimTrailingWhitespace":{"type":"boolean"},
+                    "insertFinalNewline":{"type":"boolean"},
+                    "trimFinalNewlines":{"type":"boolean"}
+                }},
                 "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default)"},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
                 "payload":{"description":"Raw JSON params for request"},
@@ -636,12 +649,13 @@ impl Tool for LspTool {
             "rename" => self.run_rename(&input).await,
             "rename_file" => self.run_rename_file(&input).await,
             "code_actions" => self.run_code_actions(&input).await,
+            "format" => self.run_format(&input).await,
             "status" => self.run_status().await,
             "reload" => self.run_reload(&input).await,
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|rename|rename_file|code_actions|type_definition|implementation|status|reload|capabilities|request"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request"
             ))),
         }
     }
