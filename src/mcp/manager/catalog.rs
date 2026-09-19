@@ -10,8 +10,8 @@ use std::io::Write;
 use serde_json::json;
 
 use super::{
-    Arc, DEFAULT_MCP_TIMEOUT, Duration, Instant, MAX_SERVER_TOOLS, McpManager,
-    McpToolMeta, McpTransport, Result, ServerEntry, Value, parse_tool_list, tool_err,
+    Arc, DEFAULT_MCP_TIMEOUT, Duration, Instant, MAX_SERVER_TOOLS, McpManager, McpToolMeta,
+    McpTransport, Result, ServerEntry, Value, parse_tool_list, tool_err,
 };
 
 const MAX_CATALOG_PAGES: usize = 128;
@@ -27,7 +27,10 @@ struct CatalogByteBudget {
 impl Write for CatalogByteBudget {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.remaining = self.remaining.checked_sub(bytes.len()).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "catalog byte limit exceeded")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "catalog byte limit exceeded",
+            )
         })?;
         Ok(bytes.len())
     }
@@ -60,7 +63,10 @@ impl Catalog {
 
     fn append_page(&mut self, result: &Value) -> Result<Option<String>> {
         if self.pages >= MAX_CATALOG_PAGES {
-            return Err(tool_err("MCP_PROTOCOL", "tools/list exceeded the page limit"));
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "tools/list exceeded the page limit",
+            ));
         }
         serde_json::to_writer(&mut self.bytes, result).map_err(|_| {
             tool_err(
@@ -109,7 +115,10 @@ impl Catalog {
         };
         self.pages += 1;
         if next.is_some() && self.pages == MAX_CATALOG_PAGES {
-            return Err(tool_err("MCP_PROTOCOL", "tools/list exceeded the page limit"));
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "tools/list exceeded the page limit",
+            ));
         }
         self.tools.extend(tools);
         Ok(next)
@@ -205,8 +214,8 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::*;
     use super::super::{ConfiguredServer, McpDiscovery, Provenance, ServerHealth, TrustStore};
+    use super::*;
 
     type PageHook = dyn Fn(usize) + Send + Sync;
 
@@ -220,7 +229,10 @@ mod tests {
     #[async_trait]
     impl McpTransport for PagedTransport {
         async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-            assert_eq!(method, "tools/list", "a catalog traversal must not call tools");
+            assert_eq!(
+                method, "tools/list",
+                "a catalog traversal must not call tools"
+            );
             let index = {
                 let mut requests = McpManager::lock(&self.requests);
                 requests.push((params, timeout));
@@ -288,7 +300,11 @@ mod tests {
         let entry = manager.entry("catalog").expect("fixture server");
         TrustStore::load(&manager.inner.trust_path)
             .expect("trust store")
-            .acknowledge("catalog", &manager.trust_fingerprint_for(&entry), "operator")
+            .acknowledge(
+                "catalog",
+                &manager.trust_fingerprint_for(&entry),
+                "operator",
+            )
             .expect("trust fixture");
         let transport = Arc::new(PagedTransport {
             pages: Mutex::new(pages.into()),
@@ -329,16 +345,30 @@ mod tests {
             .block_on(manager.list_and_cache_tools(&entry))
             .expect("whole catalog");
         assert_eq!(
-            tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["first", "second", "third"]
         );
         assert_eq!(manager.mounted_tool_metas()[0].1.len(), 3);
         let requests = McpManager::lock(&transport.requests);
         assert_eq!(
-            requests.iter().map(|(params, _)| params.clone()).collect::<Vec<_>>(),
-            vec![json!({}), json!({"cursor":"opaque +/="}), json!({"cursor":""})]
+            requests
+                .iter()
+                .map(|(params, _)| params.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({}),
+                json!({"cursor":"opaque +/="}),
+                json!({"cursor":""})
+            ]
         );
-        assert!(requests.iter().all(|(_, timeout)| *timeout <= DEFAULT_MCP_TIMEOUT));
+        assert!(
+            requests
+                .iter()
+                .all(|(_, timeout)| *timeout <= DEFAULT_MCP_TIMEOUT)
+        );
         assert!(
             requests.windows(2).all(|pair| pair[1].1 <= pair[0].1),
             "later pages must spend the same timeout, not reset it"
@@ -379,7 +409,10 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let (manager, entry, transport) = fixture(
                 &temp,
-                vec![json!({"tools":[tool("duplicate")],"nextCursor":"again"}), second],
+                vec![
+                    json!({"tools":[tool("duplicate")],"nextCursor":"again"}),
+                    second,
+                ],
                 None,
             );
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -403,7 +436,8 @@ mod tests {
             .map(|index| tool(&format!("tool-{index}")))
             .collect();
         assert_eq!(
-            catalog.append_page(&json!({"tools":first,"nextCursor":"more"}))
+            catalog
+                .append_page(&json!({"tools":first,"nextCursor":"more"}))
                 .expect("first page"),
             Some("more".to_string())
         );
@@ -417,7 +451,8 @@ mod tests {
     fn unique_empty_pages_cannot_extend_discovery_without_bound() {
         let mut catalog = Catalog::new();
         for index in 0..MAX_CATALOG_PAGES - 1 {
-            catalog.append_page(&json!({"tools":[],"nextCursor":format!("page-{index}")}))
+            catalog
+                .append_page(&json!({"tools":[],"nextCursor":format!("page-{index}")}))
                 .expect("within page budget");
         }
         let error = catalog
@@ -430,11 +465,14 @@ mod tests {
     fn a_final_page_at_the_page_limit_is_accepted() {
         let mut catalog = Catalog::new();
         for index in 0..MAX_CATALOG_PAGES - 1 {
-            catalog.append_page(&json!({"tools":[],"nextCursor":index.to_string()}))
+            catalog
+                .append_page(&json!({"tools":[],"nextCursor":index.to_string()}))
                 .expect("page");
         }
         assert_eq!(
-            catalog.append_page(&json!({"tools":[tool("last")]})).expect("last page"),
+            catalog
+                .append_page(&json!({"tools":[tool("last")]}))
+                .expect("last page"),
             None
         );
         assert_eq!(catalog.tools[0].name, "last");
@@ -444,7 +482,9 @@ mod tests {
     fn cursor_cycles_and_oversized_tokens_fail_without_echoing_tokens() {
         let mut catalog = Catalog::new();
         for cursor in ["secret-cursor-a", "secret-cursor-b"] {
-            catalog.append_page(&json!({"tools":[],"nextCursor":cursor})).expect("distinct cursor");
+            catalog
+                .append_page(&json!({"tools":[],"nextCursor":cursor}))
+                .expect("distinct cursor");
         }
         let error = catalog
             .append_page(&json!({"tools":[],"nextCursor":"secret-cursor-a"}))
@@ -483,8 +523,10 @@ mod tests {
         );
         for now in [deadline, deadline + Duration::from_secs(1)] {
             assert!(
-                remaining_budget(deadline, now).expect_err("expired")
-                    .to_string().contains("MCP_TIMEOUT")
+                remaining_budget(deadline, now)
+                    .expect_err("expired")
+                    .to_string()
+                    .contains("MCP_TIMEOUT")
             );
         }
     }
@@ -541,7 +583,10 @@ mod tests {
         let weak_entry = Arc::downgrade(&entry);
         let replacement_for_hook: Arc<dyn McpTransport> = replacement.clone();
         *McpManager::lock(&old.after_page) = Some(Arc::new(move |index| {
-            assert_eq!(index, 1, "old transport must not receive another page request");
+            assert_eq!(
+                index, 1,
+                "old transport must not receive another page request"
+            );
             let entry = weak_entry.upgrade().expect("entry remains alive");
             *McpManager::lock(&entry.transport) = Some(Arc::clone(&replacement_for_hook));
             *McpManager::lock(&entry.tools_cache) = Some((
@@ -560,7 +605,10 @@ mod tests {
         let error = runtime
             .block_on(manager.list_and_cache_tools(&entry))
             .expect_err("superseded catalog");
-        assert!(error.to_string().contains("MCP_TRANSPORT_SUPERSEDED"), "{error}");
+        assert!(
+            error.to_string().contains("MCP_TRANSPORT_SUPERSEDED"),
+            "{error}"
+        );
         assert_eq!(McpManager::lock(&old.requests).len(), 1);
         assert!(McpManager::lock(&replacement.requests).is_empty());
         assert!(old.closed.load(Ordering::Acquire));

@@ -218,7 +218,9 @@ fn read_snapshot(path: &Path) -> io::Result<Option<Vec<u8>>> {
         Err(err) => return Err(err),
     };
     if !metadata.is_file() || metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
-        return Err(snapshot_error("undo snapshots require bounded regular files"));
+        return Err(snapshot_error(
+            "undo snapshots require bounded regular files",
+        ));
     }
     let identity = FileIdentity::of_path_nofollow(path)?;
 
@@ -300,7 +302,9 @@ fn validate_mutation_path(file: &FileMutation) -> io::Result<Option<std::fs::Met
         .as_ref()
         .ok_or_else(|| snapshot_error("undo parent directory was not recorded"))?;
     if capture_parent(&file.path)? != *parent {
-        return Err(snapshot_error("undo parent directory changed; refusing replay"));
+        return Err(snapshot_error(
+            "undo parent directory changed; refusing replay",
+        ));
     }
     match std::fs::symlink_metadata(&file.path) {
         Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
@@ -316,8 +320,9 @@ fn validate_mutation_path(file: &FileMutation) -> io::Result<Option<std::fs::Met
 /// matches: units with omitted snapshots refuse replay instead of guessing.
 fn state_matches_disk(state: &FileState, path: &Path) -> bool {
     match state {
-        FileState::Absent => std::fs::symlink_metadata(path)
-            .is_err_and(|err| err.kind() == io::ErrorKind::NotFound),
+        FileState::Absent => {
+            std::fs::symlink_metadata(path).is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+        }
         FileState::Present(id) => read_snapshot(path).is_ok_and(|content| {
             content.is_some_and(|content| BlobId::from(sha2::Sha256::digest(&content)) == *id)
         }),
@@ -333,11 +338,7 @@ fn snapshot_available(store: &BlobStore, state: &FileState) -> bool {
     }
 }
 
-fn validate_replay_state(
-    file: &FileMutation,
-    expected: &FileState,
-    force: bool,
-) -> io::Result<()> {
+fn validate_replay_state(file: &FileMutation, expected: &FileState, force: bool) -> io::Result<()> {
     validate_mutation_path(file)?;
     if !force && !state_matches_disk(expected, &file.path) {
         return Err(io::Error::new(
@@ -383,7 +384,12 @@ fn restore_file(
                 .ok_or_else(|| snapshot_error("undo snapshot bytes are unavailable"))?;
             let report = RestoredFile {
                 path: file.path.display().to_string(),
-                action: if metadata.is_some() { "restored" } else { "recreated" }.to_string(),
+                action: if metadata.is_some() {
+                    "restored"
+                } else {
+                    "recreated"
+                }
+                .to_string(),
                 lines_added: line_count(content),
                 lines_removed: line_count(&current_bytes),
             };
@@ -906,7 +912,11 @@ mod tests {
             read_bounded_snapshot(b"12345678".as_slice(), 8).expect("exact limit"),
             b"12345678"
         );
-        assert!(read_bounded_snapshot(b"".as_slice(), 0).expect("empty").is_empty());
+        assert!(
+            read_bounded_snapshot(b"".as_slice(), 0)
+                .expect("empty")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -923,7 +933,10 @@ mod tests {
         recorder.commit("large");
         for force in [false, true] {
             let outcome = recorder.undo(1, force);
-            assert!(matches!(outcome.stopped, Some(UndoStop::SnapshotOmitted { .. })));
+            assert!(matches!(
+                outcome.stopped,
+                Some(UndoStop::SnapshotOmitted { .. })
+            ));
             assert!(outcome.applied.is_empty());
             assert_eq!(read(&file), "replacement");
         }
@@ -937,7 +950,10 @@ mod tests {
         recorder.begin_file("directory", "edit", dir.path());
         recorder.commit("directory");
         let outcome = recorder.undo(1, true);
-        assert!(matches!(outcome.stopped, Some(UndoStop::SnapshotOmitted { .. })));
+        assert!(matches!(
+            outcome.stopped,
+            Some(UndoStop::SnapshotOmitted { .. })
+        ));
         assert_eq!(recorder.stats().unrecorded_files, 2);
         assert!(dir.path().is_dir());
     }
@@ -954,7 +970,10 @@ mod tests {
         recorder.inner.lock().expect("recorder").store.blobs.clear();
 
         let outcome = recorder.undo(1, true);
-        assert!(matches!(outcome.stopped, Some(UndoStop::SnapshotOmitted { .. })));
+        assert!(matches!(
+            outcome.stopped,
+            Some(UndoStop::SnapshotOmitted { .. })
+        ));
         assert!(outcome.applied.is_empty());
         assert_eq!(read(&file), "after");
         assert_eq!(recorder.stats().undo_depth, 1);
@@ -977,7 +996,10 @@ mod tests {
         std::fs::create_dir(&second).expect("replacement directory");
 
         let outcome = recorder.undo(1, true);
-        assert!(matches!(outcome.stopped, Some(UndoStop::RestoreFailed { .. })));
+        assert!(matches!(
+            outcome.stopped,
+            Some(UndoStop::RestoreFailed { .. })
+        ));
         assert!(outcome.applied.is_empty());
         assert_eq!(read(&first), "first after");
         assert!(second.is_dir());
@@ -1042,10 +1064,18 @@ mod tests {
         symlink(&target, &file).expect("replacement symlink");
         for force in [false, true] {
             let outcome = recorder.undo(1, force);
-            assert!(matches!(outcome.stopped, Some(UndoStop::RestoreFailed { .. })));
+            assert!(matches!(
+                outcome.stopped,
+                Some(UndoStop::RestoreFailed { .. })
+            ));
             assert!(outcome.applied.is_empty());
             assert_eq!(read(&target), "after");
-            assert!(std::fs::symlink_metadata(&file).expect("link").file_type().is_symlink());
+            assert!(
+                std::fs::symlink_metadata(&file)
+                    .expect("link")
+                    .file_type()
+                    .is_symlink()
+            );
         }
         assert_eq!(recorder.stats().undo_depth, 1);
     }
@@ -1066,7 +1096,10 @@ mod tests {
         symlink(&target, &file).expect("dangling symlink");
         for force in [false, true] {
             let outcome = recorder.redo(1, force);
-            assert!(matches!(outcome.stopped, Some(UndoStop::RestoreFailed { .. })));
+            assert!(matches!(
+                outcome.stopped,
+                Some(UndoStop::RestoreFailed { .. })
+            ));
             assert!(outcome.applied.is_empty());
             assert!(!target.exists());
         }
@@ -1100,7 +1133,10 @@ mod tests {
             write(&file, "after");
             for force in [false, true] {
                 let outcome = recorder.undo(1, force);
-                assert!(matches!(outcome.stopped, Some(UndoStop::RestoreFailed { .. })));
+                assert!(matches!(
+                    outcome.stopped,
+                    Some(UndoStop::RestoreFailed { .. })
+                ));
                 assert!(outcome.applied.is_empty());
                 assert_eq!(read(&file), "after");
                 assert_eq!(read(&moved.join("edit.txt")), "after");
@@ -1143,8 +1179,14 @@ mod tests {
         write(&file, "after\n");
         recorder.commit("edit");
         assert_eq!(recorder.undo(1, false).applied.len(), 1);
-        assert_eq!(std::fs::metadata(&file).expect("mode").permissions().mode() & 0o777, 0o751);
+        assert_eq!(
+            std::fs::metadata(&file).expect("mode").permissions().mode() & 0o777,
+            0o751
+        );
         assert_eq!(recorder.redo(1, false).applied.len(), 1);
-        assert_eq!(std::fs::metadata(&file).expect("mode").permissions().mode() & 0o777, 0o751);
+        assert_eq!(
+            std::fs::metadata(&file).expect("mode").permissions().mode() & 0o777,
+            0o751
+        );
     }
 }
