@@ -3381,9 +3381,13 @@ mod tests {
             }),
         );
         let entry = manager.entry("cwd-srv").expect("registered cwd server");
+        // The message has always said "canonicalized" and the expectation was
+        // the raw path. On macOS a tempdir lives under `/var`, a symlink into
+        // `/private/var`, so the two never matched there.
+        let expected_cwd = std::fs::canonicalize(&helper_dir).expect("canonicalize ext cwd");
         assert_eq!(
             entry.cwd_override.as_deref(),
-            Some(helper_dir.as_path()),
+            Some(expected_cwd.as_path()),
             "cwd override stored (canonicalized)"
         );
 
