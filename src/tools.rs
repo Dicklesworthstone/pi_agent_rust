@@ -7554,8 +7554,11 @@ impl Tool for BashTool {
         };
 
         // Mediation gate (bd-cv653.1.7): classify before spawn against
-        // `bash.mediation`. `forced` beats any approval override; off mode
-        // is byte-identical to the pre-mediation path.
+        // `bash.mediation`. This runs on the execution path, so it applies
+        // whatever the approval mode said — including yolo — and `off` is
+        // byte-identical to the pre-mediation path. (`bash.mediationForced`
+        // was meant to select this; it turned out to be the only behaviour,
+        // and nothing reads the field. See `config::BashSettings`.)
         if let Some(mediation) = &self.mediation {
             let mode =
                 crate::bash_mediation::MediationMode::from_setting(mediation.mediation.as_deref());

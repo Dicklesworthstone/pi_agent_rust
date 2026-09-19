@@ -515,7 +515,7 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
                 }
             };
 
-            let serde_json::Value::Object(map) = value else {
+            let serde_json::Value::Object(_) = value else {
                 findings.push(
                     Finding::fail(
                         cat,
@@ -527,25 +527,18 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
                 return;
             };
 
-            // `$`-prefixed names are the editor-metadata convention (`$schema`
-            // above all), not settings, and pi ignores them on purpose.
-            let unknown: Vec<&String> = map
-                .keys()
-                .filter(|k| !k.starts_with('$') && !is_known_config_key(k))
-                .collect();
+            // The same walk pi runs at startup, so the two surfaces cannot
+            // disagree about what counts as a typo. It reaches inside settings
+            // objects — `bash.mediatoin` is reported as such — and it leaves
+            // `$schema`, explicit nulls, and the keys of map-valued settings
+            // alone.
+            let unknown = crate::config::unrecognised_setting_keys(&content);
             if unknown.is_empty() {
                 findings.push(Finding::pass(cat, label.to_string()));
             } else {
                 findings.push(
                     Finding::warn(cat, format!("{label}: unknown keys"))
-                        .with_detail(format!(
-                            "Unknown keys: {}",
-                            unknown
-                                .iter()
-                                .map(|k| k.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ))
+                        .with_detail(format!("Unknown keys: {}", unknown.join(", ")))
                         .with_remediation("Check for typos in settings key names"),
                 );
             }
@@ -571,8 +564,8 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
 /// nothing, and a list like that drifts every time a field is added, in
 /// exactly this direction.
 ///
-/// So the question is put to serde instead, which cannot drift; see
-/// [`crate::config::recognises_setting_key`].
+/// So the question is put to serde instead, which cannot drift.
+#[cfg(test)]
 fn is_known_config_key(key: &str) -> bool {
     crate::config::recognises_setting_key(key)
 }
@@ -11086,6 +11079,23 @@ mod tests {
             unknown.is_empty(),
             "doctor would report these valid settings as unknown: {unknown:?}"
         );
+    }
+
+    #[test]
+    fn doctor_reports_a_typo_inside_a_settings_object() {
+        // Doctor used to look only at top-level names, so the costly half of
+        // the mistake — `bash.mediatoin`, which is no command-mediation policy
+        // at all — read as PASS.
+        let unknown = crate::config::unrecognised_setting_keys(
+            r#"{
+                "bash": { "mediation": "block-high", "mediatoin": "block-high" },
+                "retry": {
+                    "maxRetries": 5,
+                    "fallbackChains": { "whatever the user calls it": ["openai/gpt-5"] }
+                }
+            }"#,
+        );
+        assert_eq!(unknown, vec!["bash.mediatoin".to_string()]);
     }
 
     #[test]

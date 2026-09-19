@@ -565,16 +565,24 @@ pub struct ReadSettings {
 /// Bash-tool mediation configuration (bd-cv653.1.7).
 ///
 /// `bash.mediation`: `off` (default) | `warn` | `block-critical` | `block-high`.
-/// `bash.mediationForced`: when true, mediation applies even under yolo-style
-/// approval overrides (forced beats yolo). `bash.mediationDcg`: use a `dcg`
-/// binary on PATH as the authoritative verdict source when present
-/// (default true); the in-tree classifier is the fallback.
+/// `bash.mediationDcg`: use a `dcg` binary on PATH as the authoritative verdict
+/// source when present (default true); the in-tree classifier is the fallback.
+///
+/// `bash.mediationForced` is accepted and has no effect. It was specified to
+/// mean "mediation applies even under yolo-style approval overrides", but
+/// mediation ended up unconditional in both places it runs — as a hard policy
+/// gate in `ApprovalState::evaluate`, ahead of every mode check, and again in
+/// the bash tool before spawn — so there is no weaker behaviour for it to
+/// select. `approval::tests::test_yolo_mode_respects_hard_policy_gates` pins
+/// that guarantee, and it passes with `mediation_forced` unset. Nothing reads
+/// the field; whether to give it meaning or retire it is open (bd-cv653.1.7).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BashSettings {
     /// Mediation mode: off | warn | block-critical | block-high.
     pub mediation: Option<String>,
-    /// Forced mediation: applies regardless of yolo/approval overrides.
+    /// Accepted and unread; mediation is already unconditional. See the type
+    /// doc above.
     #[serde(alias = "mediationForced")]
     pub mediation_forced: Option<bool>,
     /// Prefer the `dcg` binary's verdicts when available (default true).
@@ -1638,75 +1646,120 @@ fn warn_unrecognised_setting_keys(path: &Path, content: &str) {
     }
 }
 
-/// Top-level settings keys this build does not recognise.
+/// Settings keys this build does not recognise, as dotted paths.
 ///
 /// `Config` is `#[serde(default)]` with no `deny_unknown_fields`, so an
 /// unknown key is dropped in silence. That is the right default for forward
 /// compatibility — a settings file written by a newer pi must not stop an older
 /// one from starting — and the wrong outcome for a typo, which is the common
-/// case and currently produces no signal at all. `"hide_thinking_blocks"`,
+/// case and otherwise produces no signal at all. `"hide_thinking_blocks"`,
 /// where the field is `hide_thinking_block`, simply does nothing, for ever,
-/// with no message.
+/// with no message. So does `"bash": { "mediatoin": "block-high" }`, and that
+/// one costs more.
 ///
-/// Recognition is asked of serde rather than of a hand-kept list: each key is
-/// deserialized ALONE into a `Config` and the result compared against
-/// `Config::default()`. A recognised key moves something; an unknown one is
-/// dropped and leaves the default untouched. That cannot drift as fields and
-/// their camelCase aliases are added, which a list would, and it needs no
-/// knowledge of the aliases at all — there are 73 of them in this file.
+/// Recognition is asked of serde rather than of a hand-kept list: the name is
+/// placed alone in a `Config`-shaped probe and the round-trip compared against
+/// the same probe with nothing in it. A recognised key moves something; an
+/// unknown one is dropped and leaves the shape untouched. That cannot drift as
+/// fields and their camelCase aliases are added, which a list would — and it
+/// needs no knowledge of the aliases at all, of which there are 73 here.
 ///
-/// Every field of `Config` is an `Option`, so any non-null value differs from
-/// the default. Three things are deliberately not reported:
+/// Every field is an `Option`, so any non-null value differs from the default.
+/// Four things are deliberately not reported:
 ///
 ///   * an explicit `null`, which is indistinguishable from "not set" by
 ///     construction and is not a typo;
 ///   * keys beginning with `$`, the convention for editor metadata such as
 ///     `$schema`;
-///   * anything if the file is not a JSON object, which the caller has already
-///     rejected with a parse error.
-fn unrecognised_setting_keys(content: &str) -> Vec<String> {
+///   * a name serde knows but whose value has the wrong type, because the
+///     caller has already failed the whole file with a parse error and
+///     "unknown key" would be a second, wrong diagnosis;
+///   * the keys of a map-valued setting — `retry.fallbackChains` is keyed by
+///     role, `lsp.servers` by server name, `lsp.servers.<name>.env` by
+///     variable — which are the user's data and cannot be misspelled. Those
+///     need no special case: serde KEEPS them, so they move the shape, which
+///     is the same evidence of being read that a struct field gives.
+pub(crate) fn unrecognised_setting_keys(content: &str) -> Vec<String> {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(content)
     else {
         return Vec::new();
     };
-    let Ok(default) = serde_json::to_value(Config::default()) else {
-        return Vec::new();
+    let mut found = Vec::new();
+    collect_unrecognised_keys(&[], &map, &mut found);
+    found
+}
+
+fn collect_unrecognised_keys(
+    path: &[&str],
+    map: &serde_json::Map<String, serde_json::Value>,
+    found: &mut Vec<String>,
+) {
+    let Some(empty) = config_shape_with(path, empty_object()) else {
+        return;
     };
-    map.into_iter()
-        .filter(|(key, value)| {
-            !key.starts_with('$') && !value.is_null() && !moves_config(key, value, &default)
-        })
-        .map(|(key, _)| key)
-        .collect()
+
+    for (key, value) in map {
+        if key.starts_with('$') || value.is_null() {
+            continue;
+        }
+        // `None` is a type error, which is serde saying it knows this name and
+        // disliked the value — not an unrecognised key.
+        let recognised =
+            config_shape_with(path, one_key(key, value.clone())).is_none_or(|shape| shape != empty);
+        if !recognised {
+            found.push(dotted(path, key));
+            continue;
+        }
+
+        if let serde_json::Value::Object(nested) = value {
+            let mut deeper: Vec<&str> = path.to_vec();
+            deeper.push(key);
+            collect_unrecognised_keys(&deeper, nested, found);
+        }
+    }
 }
 
 /// Does this build recognise `key` as a top-level settings key, by any spelling?
 ///
-/// The same question as [`unrecognised_setting_keys`] asked about one name with
-/// no value to hand, which is the shape `pi doctor` needs. Any non-null probe
-/// value answers it: a recognised key either accepts the probe (and then
-/// differs from the default, since every `Config` field is an `Option`) or
-/// rejects it with a type error, which is itself proof that serde knows the
-/// name. An unrecognised key is dropped in silence whatever the value, and the
-/// result is indistinguishable from `Config::default()`.
+/// The same question asked about one name with no value to hand, which is the
+/// shape `pi doctor` needs.
 pub(crate) fn recognises_setting_key(key: &str) -> bool {
-    let Ok(default) = serde_json::to_value(Config::default()) else {
+    let Some(empty) = config_shape_with(&[], empty_object()) else {
         return true;
     };
-    moves_config(key, &serde_json::Value::Bool(true), &default)
+    config_shape_with(&[], one_key(key, serde_json::Value::Bool(true)))
+        .is_none_or(|shape| shape != empty)
 }
 
-/// Does deserializing just this one key change anything about a default config?
-fn moves_config(key: &str, value: &serde_json::Value, default: &serde_json::Value) -> bool {
-    let mut probe = serde_json::Map::new();
-    probe.insert(key.to_string(), value.clone());
-    // A type error means serde KNOWS the key and disliked the value. The caller
-    // has already failed the whole parse in that case, so it is not an
-    // unrecognised key and must not be reported as one.
-    let Ok(parsed) = serde_json::from_value::<Config>(serde_json::Value::Object(probe)) else {
-        return true;
-    };
-    serde_json::to_value(&parsed).is_ok_and(|round_trip| &round_trip != default)
+/// A whole `Config`, round-tripped, with `value` placed at `path`.
+///
+/// `None` means serde refused the shape, which only happens when it recognises
+/// a name and rejects its value.
+fn config_shape_with(path: &[&str], value: serde_json::Value) -> Option<serde_json::Value> {
+    let mut probe = value;
+    for key in path.iter().rev() {
+        probe = one_key(key, probe);
+    }
+    let parsed: Config = serde_json::from_value(probe).ok()?;
+    serde_json::to_value(parsed).ok()
+}
+
+fn one_key(key: &str, value: serde_json::Value) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(key.to_string(), value);
+    serde_json::Value::Object(map)
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+fn dotted(path: &[&str], key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}.{key}", path.join("."))
+    }
 }
 
 fn emit_queue_mode_diagnostic(setting: &'static str, mode: Option<&str>) {
@@ -3200,6 +3253,92 @@ mod tests {
     #[test]
     fn a_nested_struct_key_is_recognised_by_its_own_name() {
         let keys = unrecognised_setting_keys(r#"{ "retry": { "maxRetries": 9 } }"#);
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_typo_inside_a_settings_object_is_reported_by_its_path() {
+        // The costly version of the same mistake: `bash.mediation` selects a
+        // command-mediation policy, and a misspelling of it is silently no
+        // policy at all.
+        let keys = unrecognised_setting_keys(
+            r#"{ "bash": { "mediation": "block-high", "mediatoin": "block-high" } }"#,
+        );
+        assert_eq!(keys, vec!["bash.mediatoin".to_string()]);
+    }
+
+    #[test]
+    fn nested_aliases_and_nulls_are_as_quiet_as_top_level_ones() {
+        let keys = unrecognised_setting_keys(
+            r#"{
+                "bash": { "mediationDcg": false, "mediation_forced": null },
+                "terminal": { "showImages": true },
+                "thinkingBudgets": { "low": 1024 },
+                "markdown": { "codeBlockIndent": 4 }
+            }"#,
+        );
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_map_valued_setting_has_no_typos_below_it() {
+        // `retry.fallbackChains` is keyed by role or `provider/model` spec and
+        // `lsp.servers.<name>.env` by variable, so every name under them is the
+        // user's data. Reporting those would make the warning useless to anyone
+        // who configures failover or a language server. No special case makes
+        // this work: serde keeps these keys, so they move the shape exactly as
+        // a struct field does.
+        let keys = unrecognised_setting_keys(
+            r#"{
+                "retry": {
+                    "fallbackChains": {
+                        "default": ["anthropic/claude-sonnet-5"],
+                        "anything the user likes": ["openai/gpt-5"]
+                    }
+                },
+                "lsp": {
+                    "servers": {
+                        "a server the user named": {
+                            "command": "rust-analyzer",
+                            "rootMarkers": ["Cargo.toml"],
+                            "env": { "RA_LOG": "info", "ANYTHING_AT_ALL": "1" }
+                        }
+                    }
+                }
+            }"#,
+        );
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn the_walk_reaches_a_typo_three_levels_down() {
+        // `lsp.servers.<name>` is a struct inside a map, which is as deep as
+        // the settings schema goes.
+        let keys = unrecognised_setting_keys(
+            r#"{
+                "lsp": {
+                    "servers": {
+                        "rust-analyzer": { "command": "rust-analyzer", "commnad": "typo" }
+                    }
+                }
+            }"#,
+        );
+        assert_eq!(keys, vec!["lsp.servers.rust-analyzer.commnad".to_string()]);
+    }
+
+    #[test]
+    fn a_typo_stops_the_walk_rather_than_raining_paths() {
+        // Everything under an unknown key is equally unread; naming the one
+        // key the user can act on beats naming its whole subtree.
+        let keys = unrecognised_setting_keys(
+            r#"{ "bahs": { "mediation": "block-high", "pty": "always" } }"#,
+        );
+        assert_eq!(keys, vec!["bahs".to_string()]);
+    }
+
+    #[test]
+    fn a_nested_key_with_the_wrong_type_is_left_to_the_parse_error() {
+        let keys = unrecognised_setting_keys(r#"{ "bash": { "mediation": 5 } }"#);
         assert!(keys.is_empty(), "reported: {keys:?}");
     }
 
