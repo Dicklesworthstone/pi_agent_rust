@@ -988,6 +988,18 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
             name: "review",
             description: "Review the current changes",
         },
+        BuiltinSlashCommand {
+            name: "add-dir",
+            description: "Add a directory to the workspace roots",
+        },
+        BuiltinSlashCommand {
+            name: "remove-dir",
+            description: "Remove a directory from the workspace roots",
+        },
+        BuiltinSlashCommand {
+            name: "crash",
+            description: "List recorded crash bundles",
+        },
     ]
 }
 
@@ -2281,6 +2293,39 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), orig_len, "Duplicate slash command names found");
+    }
+
+    #[test]
+    fn every_offered_completion_is_a_command_that_runs() {
+        // A completion the parser rejects hands the user a command that does
+        // nothing when they press enter.
+        let mut dead = Vec::new();
+        for cmd in builtin_slash_commands() {
+            let typed = format!("/{}", cmd.name);
+            if crate::interactive::SlashCommand::parse(&typed).is_none() {
+                dead.push(typed);
+            }
+        }
+        assert!(dead.is_empty(), "offered but the parser rejects: {dead:?}");
+    }
+
+    #[test]
+    fn every_command_the_parser_knows_is_offered() {
+        // The gap this closes: `/add-dir`, `/remove-dir` and `/crash` all
+        // worked and none of them could be completed, so the only way to find
+        // them was to read the source or already know they existed.
+        use crate::interactive::SlashCommand;
+        let offered: std::collections::HashSet<&str> =
+            builtin_slash_commands().iter().map(|c| c.name).collect();
+        let missing: Vec<&str> = SlashCommand::ALL
+            .iter()
+            .map(|cmd| cmd.canonical())
+            .filter(|name| !offered.contains(name.trim_start_matches('/')))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the parser accepts these and nothing offers them: {missing:?}"
+        );
     }
 
     // ── set_max_items ────────────────────────────────────────────────

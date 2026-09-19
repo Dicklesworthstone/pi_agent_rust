@@ -213,6 +213,126 @@ pub enum SlashCommand {
 }
 
 impl SlashCommand {
+    /// The spelling this command is written as in the help text and the
+    /// completion menu — the first alternative [`Self::parse`] accepts.
+    ///
+    /// Exhaustive on purpose. A new variant will not compile until it is named
+    /// here, and the tests below then force it into `/help` and the completion
+    /// menu. Four commands had reached users without either (`/checkpoint`,
+    /// `/rewind`, `/fresh`, `/retry`) and three more without a completion
+    /// (`/add-dir`, `/remove-dir`, `/crash`), because nothing connected the
+    /// parser to the two lists that advertise it.
+    ///
+    /// Adding a variant means adding it here AND to [`Self::ALL`].
+    #[must_use]
+    pub const fn canonical(self) -> &'static str {
+        match self {
+            Self::Help => "/help",
+            Self::Login => "/login",
+            Self::Logout => "/logout",
+            Self::Clear => "/clear",
+            Self::Model => "/model",
+            Self::Thinking => "/thinking",
+            Self::ScopedModels => "/scoped-models",
+            Self::Exit => "/exit",
+            Self::History => "/history",
+            Self::Export => "/export",
+            Self::Session => "/session",
+            Self::Settings => "/settings",
+            Self::Theme => "/theme",
+            Self::Resume => "/resume",
+            Self::New => "/new",
+            Self::Copy => "/copy",
+            Self::Name => "/name",
+            Self::Hotkeys => "/hotkeys",
+            Self::Changelog => "/changelog",
+            Self::Tree => "/tree",
+            Self::Fork => "/fork",
+            Self::Compact => "/compact",
+            Self::Reload => "/reload",
+            Self::Template => "/template",
+            Self::Share => "/share",
+            Self::Mcp => "/mcp",
+            Self::Plan => "/plan",
+            Self::Advisor => "/advisor",
+            Self::Checkpoint => "/checkpoint",
+            Self::Rewind => "/rewind",
+            Self::Fresh => "/fresh",
+            Self::Retry => "/retry",
+            Self::Undo => "/undo",
+            Self::Redo => "/redo",
+            Self::Usage => "/usage",
+            Self::Approval => "/approval",
+            Self::Handoff => "/handoff",
+            Self::Review => "/review",
+            Self::Rules => "/rules",
+            Self::AddDir => "/add-dir",
+            Self::RemoveDir => "/remove-dir",
+            Self::Btw => "/btw",
+            Self::Tan => "/tan",
+            Self::Crash => "/crash",
+            Self::Omfg => "/omfg",
+            Self::Commit => "/commit",
+        }
+    }
+
+    /// Every slash command, so the help text and the completion menu can be
+    /// checked against the parser rather than against each other.
+    ///
+    /// Hand-kept, unavoidably: Rust cannot enumerate a plain enum. The
+    /// mitigation is that [`Self::canonical`] is exhaustive, so a new variant
+    /// stops the build at a doc comment that says to add it here too; and
+    /// `every_listed_command_parses_back_to_itself` catches a wrong entry.
+    /// A forgotten entry is the one mistake that still slips.
+    pub const ALL: &'static [Self] = &[
+        Self::Help,
+        Self::Login,
+        Self::Logout,
+        Self::Clear,
+        Self::Model,
+        Self::Thinking,
+        Self::ScopedModels,
+        Self::Exit,
+        Self::History,
+        Self::Export,
+        Self::Session,
+        Self::Settings,
+        Self::Theme,
+        Self::Resume,
+        Self::New,
+        Self::Copy,
+        Self::Name,
+        Self::Hotkeys,
+        Self::Changelog,
+        Self::Tree,
+        Self::Fork,
+        Self::Compact,
+        Self::Reload,
+        Self::Template,
+        Self::Share,
+        Self::Mcp,
+        Self::Plan,
+        Self::Advisor,
+        Self::Checkpoint,
+        Self::Rewind,
+        Self::Fresh,
+        Self::Retry,
+        Self::Undo,
+        Self::Redo,
+        Self::Usage,
+        Self::Approval,
+        Self::Handoff,
+        Self::Review,
+        Self::Rules,
+        Self::AddDir,
+        Self::RemoveDir,
+        Self::Btw,
+        Self::Tan,
+        Self::Crash,
+        Self::Omfg,
+        Self::Commit,
+    ];
+
     /// Parse a slash command from input.
     pub fn parse(input: &str) -> Option<(Self, &str)> {
         let input = input.trim();
@@ -316,6 +436,10 @@ impl SlashCommand {
   /commit [dry-run|all|bead] - Create dependency-ordered atomic commits from changes
   /review [target]   - Run prioritized code review on changes with ship verdict card
   /advisor [status|pause|resume] - Manage the turn-review advisor model
+  /checkpoint, /cp2 [name] [note] - Mark a restore point on the current branch
+  /rewind [name]     - Collapse everything since a checkpoint into a summary
+  /fresh             - Reset provider stream state; the transcript is untouched
+  /retry             - Re-send the last user turn as a sibling branch
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
   /usage [refresh]   - Show provider usage/quota state
@@ -5606,6 +5730,51 @@ mod tests {
         assert_eq!(plan.effective, crate::model::ThinkingLevel::Off);
         assert!(!plan.thinking_changed);
         assert!(plan.persist_needed);
+    }
+
+    #[test]
+    fn every_listed_command_parses_back_to_itself() {
+        // Catches a wrong entry in ALL or a canonical spelling the parser does
+        // not actually accept. It cannot catch a variant missing from ALL —
+        // see the note there.
+        for command in SlashCommand::ALL {
+            let spelling = command.canonical();
+            let parsed = SlashCommand::parse(spelling)
+                .unwrap_or_else(|| panic!("{spelling} is listed but the parser rejects it"));
+            assert_eq!(
+                parsed.0, *command,
+                "{spelling} parses as a different command than the one that claims it"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_commands_claim_the_same_spelling() {
+        let mut spellings: Vec<&str> = SlashCommand::ALL
+            .iter()
+            .map(|command| command.canonical())
+            .collect();
+        let before = spellings.len();
+        spellings.sort_unstable();
+        spellings.dedup();
+        assert_eq!(before, spellings.len(), "duplicate canonical spelling");
+    }
+
+    #[test]
+    fn every_command_the_parser_knows_is_in_the_help_text() {
+        // `/checkpoint`, `/rewind`, `/fresh` and `/retry` shipped as working
+        // commands that `/help` never mentioned. The help text is the only
+        // place a user who does not know a command's name can find it.
+        let help = SlashCommand::help_text();
+        let missing: Vec<&str> = SlashCommand::ALL
+            .iter()
+            .map(|command| command.canonical())
+            .filter(|spelling| !help.contains(*spelling))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the parser accepts these and /help never names them: {missing:?}"
+        );
     }
 
     #[test]
