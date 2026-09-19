@@ -151,18 +151,9 @@ fn is_disable_value(value: &str) -> bool {
 /// to decide whether to use a proxy would leak DNS and change routing policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NoProxyRule {
-    Domain {
-        name: String,
-        port: Option<u16>,
-    },
-    Address {
-        address: IpAddr,
-        port: Option<u16>,
-    },
-    Network {
-        address: IpAddr,
-        prefix: u8,
-    },
+    Domain { name: String, port: Option<u16> },
+    Address { address: IpAddr, port: Option<u16> },
+    Network { address: IpAddr, prefix: u8 },
 }
 
 impl NoProxyRule {
@@ -242,9 +233,7 @@ impl NoProxyRule {
             Self::Address {
                 address: expected,
                 port: rule_port,
-            } => {
-                address == Some(*expected) && rule_port.is_none_or(|expected| expected == port)
-            }
+            } => address == Some(*expected) && rule_port.is_none_or(|expected| expected == port),
             Self::Network {
                 address: network,
                 prefix,
@@ -277,6 +266,87 @@ pub struct ProxyConfig {
     bypass_all: bool,
 }
 
+fn pick_proxy_endpoint(
+    explicit: &[Option<&str>],
+    pi_vars: &[&str],
+    std_vars: &[&str],
+    ignore_env: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<ProxyEndpoint> {
+    for value in explicit.iter().flatten() {
+        if is_disable_value(value) {
+            return None;
+        }
+        match parse_proxy_url(value) {
+            Ok(endpoint) => return Some(endpoint),
+            Err(err) => {
+                warnings.push(format!("ignoring http proxy setting: {err}"));
+            }
+        }
+    }
+    let env_names: Vec<&str> = if ignore_env {
+        pi_vars.to_vec()
+    } else {
+        pi_vars
+            .iter()
+            .chain(std_vars.iter())
+            .chain(STD_ALL_PROXY_VARS.iter())
+            .copied()
+            .collect()
+    };
+    for name in env_names {
+        let Some(value) = env(name) else { continue };
+        if is_disable_value(&value) {
+            return None;
+        }
+        match parse_proxy_url(&value) {
+            Ok(endpoint) => return Some(endpoint),
+            Err(err) => {
+                // An unusable ambient value must not fail requests:
+                // `ALL_PROXY` is routinely a SOCKS endpoint meant for
+                // other tools. Warn once and keep looking.
+                warnings.push(format!("ignoring {name}: {err}"));
+            }
+        }
+    }
+    None
+}
+
+fn resolve_no_proxy_raw(
+    settings_no_proxy: Option<Vec<String>>,
+    ignore_env: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    settings_no_proxy.map_or_else(
+        || {
+            if ignore_env {
+                Vec::new()
+            } else {
+                STD_NO_PROXY_VARS
+                    .iter()
+                    .find_map(|name| env(name))
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|entry| !entry.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+        },
+        |entries| {
+            entries
+                .into_iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect()
+        },
+    )
+}
+
 impl ProxyConfig {
     /// Merge settings and environment into the effective configuration.
     ///
@@ -300,89 +370,24 @@ impl ProxyConfig {
             .any(|value| is_disable_value(&value));
         let ignore_env = settings.ignore_env_proxy.unwrap_or(false) || pi_disable;
 
-        let pick = |explicit: &[Option<&str>],
-                    pi_vars: &[&str],
-                    std_vars: &[&str],
-                    warnings: &mut Vec<String>| {
-            for value in explicit.iter().flatten() {
-                if is_disable_value(value) {
-                    return None;
-                }
-                match parse_proxy_url(value) {
-                    Ok(endpoint) => return Some(endpoint),
-                    Err(err) => {
-                        warnings.push(format!("ignoring http proxy setting: {err}"));
-                    }
-                }
-            }
-            let env_names: Vec<&str> = if ignore_env {
-                pi_vars.to_vec()
-            } else {
-                pi_vars
-                    .iter()
-                    .chain(std_vars.iter())
-                    .chain(STD_ALL_PROXY_VARS.iter())
-                    .copied()
-                    .collect()
-            };
-            for name in env_names {
-                let Some(value) = env(name) else { continue };
-                if is_disable_value(&value) {
-                    return None;
-                }
-                match parse_proxy_url(&value) {
-                    Ok(endpoint) => return Some(endpoint),
-                    Err(err) => {
-                        // An unusable ambient value must not fail requests:
-                        // `ALL_PROXY` is routinely a SOCKS endpoint meant for
-                        // other tools. Warn once and keep looking.
-                        warnings.push(format!("ignoring {name}: {err}"));
-                    }
-                }
-            }
-            None
-        };
-
-        let https = pick(
+        let https = pick_proxy_endpoint(
             &[settings.https_proxy.as_deref(), settings.proxy.as_deref()],
             &PI_HTTPS_PROXY_VARS,
             &STD_HTTPS_PROXY_VARS,
+            ignore_env,
+            env,
             &mut warnings,
         );
-        let http = pick(
+        let http = pick_proxy_endpoint(
             &[settings.http_proxy.as_deref(), settings.proxy.as_deref()],
             &PI_HTTP_PROXY_VARS,
             &STD_HTTP_PROXY_VARS,
+            ignore_env,
+            env,
             &mut warnings,
         );
 
-        let no_proxy_raw = settings.no_proxy.map_or_else(
-            || {
-                if ignore_env {
-                    Vec::new()
-                } else {
-                    STD_NO_PROXY_VARS
-                        .iter()
-                        .find_map(|name| env(name))
-                        .map(|value| {
-                            value
-                                .split(',')
-                                .map(str::trim)
-                                .filter(|entry| !entry.is_empty())
-                                .map(str::to_string)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                }
-            },
-            |entries| {
-                entries
-                    .into_iter()
-                    .map(|entry| entry.trim().to_string())
-                    .filter(|entry| !entry.is_empty())
-                    .collect()
-            },
-        );
+        let no_proxy_raw = resolve_no_proxy_raw(settings.no_proxy, ignore_env, env);
         // The two `pick` passes share `http.proxy` and `ALL_PROXY`, so an
         // unusable value would otherwise be reported twice.
         warnings.dedup();
@@ -1152,10 +1157,7 @@ mod tests {
     #[test]
     fn no_proxy_ipv6_cidr_matches_subnets_and_single_addresses() {
         for rules in ["2001:db8::/32,fc00::1/128", "[2001:db8::]/32,fc00::1/128"] {
-            let config = resolve(
-                None,
-                &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rules)],
-            );
+            let config = resolve(None, &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rules)]);
             for (host, bypass) in [
                 ("2001:db7:ffff:ffff::1", false),
                 ("[2001:db8::]", true),
@@ -1165,7 +1167,11 @@ mod tests {
                 ("fc00::2", false),
                 ("192.0.2.1", false),
             ] {
-                assert_eq!(config.endpoint_for(true, host, 443).is_none(), bypass, "{host}");
+                assert_eq!(
+                    config.endpoint_for(true, host, 443).is_none(),
+                    bypass,
+                    "{host}"
+                );
             }
         }
     }
@@ -1176,10 +1182,7 @@ mod tests {
             ("0.0.0.0/0", "203.0.113.9", "::1"),
             ("::/0", "::ffff:192.0.2.1", "127.0.0.1"),
         ] {
-            let config = resolve(
-                None,
-                &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)],
-            );
+            let config = resolve(None, &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)]);
             assert!(config.endpoint_for(true, direct, 443).is_none());
             assert!(config.endpoint_for(true, proxied, 443).is_some());
             assert!(config.endpoint_for(true, "localhost", 443).is_some());
@@ -1198,7 +1201,11 @@ mod tests {
         );
         assert!(config.endpoint_for(false, "127.0.0.1", 8080).is_none());
         assert!(config.endpoint_for(false, "127.0.0.1", 80).is_some());
-        assert!(config.endpoint_for(true, "[0:0:0:0:0:0:0:1]", 8443).is_none());
+        assert!(
+            config
+                .endpoint_for(true, "[0:0:0:0:0:0:0:1]", 8443)
+                .is_none()
+        );
         assert!(config.endpoint_for(true, "0:0:0:0:0:0:0:1", 443).is_some());
         assert!(config.endpoint_for(false, "leak.127.0.0.1", 8080).is_some());
     }
@@ -1226,10 +1233,7 @@ mod tests {
             "api.example.com/0",
             "*/0",
         ] {
-            let config = resolve(
-                None,
-                &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)],
-            );
+            let config = resolve(None, &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)]);
             for host in ["::1", "127.0.0.1", "api.example.com"] {
                 for port in [80, 443, 8443] {
                     assert!(
@@ -1245,14 +1249,26 @@ mod tests {
     fn no_proxy_dns_names_normalize_case_and_root_dots() {
         let settings = HttpSettings {
             proxy: Some("http://p:8080".to_string()),
-            no_proxy: Some(vec![".Corp.Example.".to_string(), "127.0.0.0/8".to_string()]),
+            no_proxy: Some(vec![
+                ".Corp.Example.".to_string(),
+                "127.0.0.0/8".to_string(),
+            ]),
             ..HttpSettings::default()
         };
         let config = resolve(Some(&settings), &[("NO_PROXY", "ignored.example")]);
-        for host in ["CORP.EXAMPLE", "corp.example.", "api.Corp.Example.", "127.2.3.4"] {
+        for host in [
+            "CORP.EXAMPLE",
+            "corp.example.",
+            "api.Corp.Example.",
+            "127.2.3.4",
+        ] {
             assert!(config.endpoint_for(true, host, 443).is_none(), "{host}");
         }
-        for host in ["notcorp.example", "corp.example.attacker", "ignored.example"] {
+        for host in [
+            "notcorp.example",
+            "corp.example.attacker",
+            "ignored.example",
+        ] {
             assert!(config.endpoint_for(true, host, 443).is_some(), "{host}");
         }
         assert_eq!(
@@ -1266,21 +1282,41 @@ mod tests {
         let network_v4 = 0xc000_0281_u32;
         for prefix in 0..=32 {
             let rule = NoProxyRule::parse(&format!("192.0.2.129/{prefix}")).expect("IPv4 CIDR");
-            for value in [0, u32::MAX, network_v4, network_v4 ^ 1, network_v4 ^ 0x8000_0000] {
+            for value in [
+                0,
+                u32::MAX,
+                network_v4,
+                network_v4 ^ 1,
+                network_v4 ^ 0x8000_0000,
+            ] {
                 let address = IpAddr::V4(std::net::Ipv4Addr::from(value));
                 // Independent reference: count common leading bits rather
                 // than constructing the mask used by the implementation.
                 let expected = (network_v4 ^ value).leading_zeros() >= prefix;
-                assert_eq!(rule.matches("", Some(address), 443), expected, "{address}/{prefix}");
+                assert_eq!(
+                    rule.matches("", Some(address), 443),
+                    expected,
+                    "{address}/{prefix}"
+                );
             }
         }
         let network_v6 = u128::from("2001:db8::1".parse::<Ipv6Addr>().expect("IPv6"));
         for prefix in 0..=128 {
             let rule = NoProxyRule::parse(&format!("2001:db8::1/{prefix}")).expect("IPv6 CIDR");
-            for value in [0, u128::MAX, network_v6, network_v6 ^ 1, network_v6 ^ (1 << 127)] {
+            for value in [
+                0,
+                u128::MAX,
+                network_v6,
+                network_v6 ^ 1,
+                network_v6 ^ (1 << 127),
+            ] {
                 let address = IpAddr::V6(Ipv6Addr::from(value));
                 let expected = (network_v6 ^ value).leading_zeros() >= prefix;
-                assert_eq!(rule.matches("", Some(address), 443), expected, "{address}/{prefix}");
+                assert_eq!(
+                    rule.matches("", Some(address), 443),
+                    expected,
+                    "{address}/{prefix}"
+                );
             }
         }
     }
