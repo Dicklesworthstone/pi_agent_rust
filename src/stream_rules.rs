@@ -6,6 +6,7 @@
 //! same conversation state. Injections are recorded in session history and survive
 //! compaction so course-corrections remain durable without taxing every turn's prompt context.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as IoWrite;
@@ -21,8 +22,11 @@ use crate::memory::screen_secrets;
 /// halting to avoid infinite abort loops.
 pub const DEFAULT_MAX_INJECTIONS_PER_TURN: usize = 3;
 
-/// Default rolling lookback buffer size in bytes (4KB).
+/// Default per-channel rolling lookback in bytes (4KB). One preceding
+/// character is also retained as regex boundary context, never as match input.
 pub const DEFAULT_ROLLING_LOOKBACK_BYTES: usize = 4096;
+
+const MAX_MATCHED_EXCERPT_BYTES: usize = 4096;
 
 /// Custom session entry type name for TTSR stream rule injections.
 pub const TTSR_CUSTOM_ENTRY_TYPE: &str = "stream_rule_injection";
@@ -94,11 +98,64 @@ pub enum TtsrAction {
     },
 }
 
-/// Rolling window text matcher that evaluates active regex rules across chunk boundaries.
+/// One channel's retained history. `search_start` skips the preceding character
+/// when a window rolls, while letting regex anchors and word boundaries inspect
+/// its real context. Slicing it away would make a rolling tail look like a new
+/// stream (`^`, `\A`) or invent a word boundary in the middle of a word.
+#[derive(Debug, Default)]
+struct ChannelWindow {
+    text: String,
+    search_start: usize,
+}
+
+impl ChannelWindow {
+    fn reset(&mut self) {
+        self.text.clear();
+        self.search_start = 0;
+    }
+
+    fn retain_tail(&mut self, text: &str, limit: usize) {
+        let mut start = text.len().saturating_sub(limit);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let context_start = text[..start]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index);
+        self.search_start = start - context_start;
+        // Only the bounded tail ever enters this allocation. A huge coalesced
+        // delta must not leave a huge-capacity String resident between feeds.
+        self.text.clear();
+        self.text.push_str(&text[context_start..]);
+    }
+}
+
+fn screened_excerpt(text: &str) -> String {
+    // Screen before truncation: cutting through a secret first could make its
+    // remaining prefix evade the detector. Only the diagnostic is shortened;
+    // matching always considers the entire supplied delta.
+    let mut text = screen_secrets(text);
+    if text.len() > MAX_MATCHED_EXCERPT_BYTES {
+        let mut end = MAX_MATCHED_EXCERPT_BYTES - '…'.len_utf8();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
+/// Evaluate the entire incoming delta plus bounded same-channel history.
+/// Lookback limits cross-delta history, not the portion of a delta inspected.
+/// Matches that need more historical bytes than the lookback are not promised;
+/// regex end anchors still observe the current, not a future, stream prefix.
 #[derive(Debug)]
 pub struct RollingStreamMatcher {
     lookback_limit: usize,
-    buffer: String,
+    assistant: ChannelWindow,
+    thinking: ChannelWindow,
     compiled_rules: Vec<(StreamRule, Regex)>,
 }
 
@@ -118,14 +175,16 @@ impl RollingStreamMatcher {
             } else {
                 lookback_limit
             },
-            buffer: String::with_capacity(lookback_limit.min(8192)),
+            assistant: ChannelWindow::default(),
+            thinking: ChannelWindow::default(),
             compiled_rules: compiled,
         }
     }
 
-    /// Reset the rolling window buffer (e.g. at the start of a turn or attempt).
+    /// Reset both channels at the start of a turn or retry attempt.
     pub fn reset(&mut self) {
-        self.buffer.clear();
+        self.assistant.reset();
+        self.thinking.reset();
     }
 
     /// Feed a streaming delta and check for matches.
@@ -150,36 +209,36 @@ impl RollingStreamMatcher {
             return None;
         }
 
-        self.buffer.push_str(chunk);
-
-        // Keep buffer bounded by lookback_limit while preserving UTF-8 character boundaries
-        if self.buffer.len() > self.lookback_limit {
-            let overflow = self.buffer.len() - self.lookback_limit;
-            let mut cut_idx = overflow;
-            while cut_idx < self.buffer.len() && !self.buffer.is_char_boundary(cut_idx) {
-                cut_idx += 1;
-            }
-            self.buffer.drain(..cut_idx);
-        }
-
-        let matched_rule = self.compiled_rules.iter().find_map(|(rule, regex)| {
+        let window = match channel {
+            StreamChannel::AssistantText => &mut self.assistant,
+            StreamChannel::Thinking => &mut self.thinking,
+            StreamChannel::ToolCallArgument => return None,
+        };
+        // Inspect before trimming: providers can coalesce many tokens into one
+        // delta, including a complete answer larger than the lookback budget.
+        // Thinking and visible prose must never synthesize each other's text.
+        let text = if window.text.is_empty() {
+            Cow::Borrowed(chunk)
+        } else {
+            let mut text = window.text.clone();
+            text.push_str(chunk);
+            Cow::Owned(text)
+        };
+        let matched = self.compiled_rules.iter().find_map(|(rule, regex)| {
             if !admit(&rule.id) {
                 return None;
             }
-            regex.find(&self.buffer).map(|mat| (rule, mat.as_str()))
+            regex
+                .find_at(&text, window.search_start)
+                .map(|matched| StreamRuleMatch {
+                    rule_id: rule.id.clone(),
+                    rule_name: rule.name.clone(),
+                    rule_body: rule.body.clone(),
+                    matched_excerpt: screened_excerpt(matched.as_str()),
+                })
         });
-
-        if let Some((rule, mat_str)) = matched_rule {
-            let screened = screen_secrets(mat_str);
-            Some(StreamRuleMatch {
-                rule_id: rule.id.clone(),
-                rule_name: rule.name.clone(),
-                rule_body: rule.body.clone(),
-                matched_excerpt: screened,
-            })
-        } else {
-            None
-        }
+        window.retain_tail(&text, self.lookback_limit);
+        matched
     }
 }
 
@@ -380,7 +439,7 @@ impl StreamRuleStore {
         &self.project_rules
     }
 
-    /// List only global rules.
+    /// List only global-scoped rules.
     #[must_use]
     pub fn list_global_rules(&self) -> &[StreamRule] {
         &self.global_rules
@@ -694,6 +753,283 @@ impl GrievancesLedger {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn stream_rule(id: &str, pattern: &str) -> StreamRule {
+        StreamRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            pattern: pattern.to_string(),
+            body: "Keep the user-defined constraint.".to_string(),
+            enabled: true,
+            created_from: None,
+            cooldown_turns: None,
+        }
+    }
+
+    #[test]
+    fn complete_large_deltas_are_checked_before_retaining_the_tail() {
+        for offset in [0, 4096, 8192] {
+            for channel in [StreamChannel::AssistantText, StreamChannel::Thinking] {
+                let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "DANGER")], 16);
+                let text = format!("{}DANGER{}", "x".repeat(offset), "y".repeat(8192 - offset));
+                let found = matcher.feed(&text, channel).expect("whole delta checked");
+                assert_eq!(found.matched_excerpt, "DANGER");
+                assert_eq!(found.rule_id, "bad");
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_following_delta_cannot_erase_a_cross_chunk_match() {
+        let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "DANGER")], 16);
+        assert!(
+            matcher
+                .feed("prefix DAN", StreamChannel::AssistantText)
+                .is_none()
+        );
+        let next = format!("GER{}", "x".repeat(8192));
+        let found = matcher.feed(&next, StreamChannel::AssistantText).unwrap();
+        assert_eq!(found.matched_excerpt, "DANGER");
+    }
+
+    #[test]
+    fn full_delta_matches_may_be_longer_than_the_history_budget() {
+        let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "BEGINx+END")], 4);
+        let found = matcher
+            .feed("BEGINxxxxxxxxEND", StreamChannel::AssistantText)
+            .unwrap();
+        assert_eq!(found.matched_excerpt, "BEGINxxxxxxxxEND");
+    }
+
+    #[test]
+    fn thinking_and_prose_do_not_synthesize_a_violation_together() {
+        let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "DANGER")], 16);
+        assert!(matcher.feed("DAN", StreamChannel::AssistantText).is_none());
+        assert!(matcher.feed("GER", StreamChannel::Thinking).is_none());
+        let found = matcher.feed("GER", StreamChannel::AssistantText).unwrap();
+        assert_eq!(found.matched_excerpt, "DANGER");
+    }
+
+    #[test]
+    fn interleaved_channels_keep_their_own_cross_chunk_history() {
+        for (first, other) in [
+            (StreamChannel::AssistantText, StreamChannel::Thinking),
+            (StreamChannel::Thinking, StreamChannel::AssistantText),
+        ] {
+            let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "DANGER")], 16);
+            assert!(matcher.feed("DAN", first).is_none());
+            assert!(matcher.feed(&"safe".repeat(100), other).is_none());
+            assert_eq!(
+                matcher.feed("GER", first).unwrap().matched_excerpt,
+                "DANGER"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_and_empty_deltas_neither_match_nor_change_history() {
+        let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "DANGER")], 16);
+        assert!(matcher.feed("DAN", StreamChannel::AssistantText).is_none());
+        assert!(matcher.feed("DAN", StreamChannel::Thinking).is_none());
+        assert!(
+            matcher
+                .feed("DANGER", StreamChannel::ToolCallArgument)
+                .is_none()
+        );
+        assert!(matcher.feed("", StreamChannel::AssistantText).is_none());
+        assert_eq!(matcher.assistant.text, "DAN");
+        assert_eq!(matcher.thinking.text, "DAN");
+        assert_eq!(
+            matcher
+                .feed("GER", StreamChannel::Thinking)
+                .unwrap()
+                .matched_excerpt,
+            "DANGER"
+        );
+    }
+
+    #[test]
+    fn rolling_history_does_not_invent_stream_start_anchors() {
+        for pattern in [r"^danger!", r"\Adanger!"] {
+            let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", pattern)], 6);
+            assert!(
+                matcher
+                    .feed("xxdanger", StreamChannel::AssistantText)
+                    .is_none()
+            );
+            assert!(matcher.feed("!", StreamChannel::AssistantText).is_none());
+            matcher.reset();
+            assert!(
+                matcher
+                    .feed("danger!", StreamChannel::AssistantText)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn rolling_history_preserves_the_real_word_boundary_context() {
+        for prefix in ["x", "é", "_", "9"] {
+            let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", r"\bdanger!")], 6);
+            assert!(
+                matcher
+                    .feed(&format!("{prefix}danger"), StreamChannel::AssistantText)
+                    .is_none()
+            );
+            assert!(
+                matcher.feed("!", StreamChannel::AssistantText).is_none(),
+                "{prefix}"
+            );
+        }
+        let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", r"\bdanger!")], 6);
+        assert!(
+            matcher
+                .feed(" danger", StreamChannel::AssistantText)
+                .is_none()
+        );
+        assert!(matcher.feed("!", StreamChannel::AssistantText).is_some());
+    }
+
+    #[test]
+    fn retained_newlines_still_authorize_real_multiline_start_anchors() {
+        let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", r"(?m)^danger!")], 6);
+        assert!(
+            matcher
+                .feed("safe\ndanger", StreamChannel::AssistantText)
+                .is_none()
+        );
+        assert_eq!(
+            matcher
+                .feed("!", StreamChannel::AssistantText)
+                .unwrap()
+                .matched_excerpt,
+            "danger!"
+        );
+    }
+
+    #[test]
+    fn unicode_literals_match_across_every_valid_transport_split() {
+        let literal = "🦀café危险";
+        let text = format!("prefix {literal} suffix");
+        for split in text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([text.len()])
+        {
+            let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", literal)], 32);
+            let first = matcher.feed(&text[..split], StreamChannel::AssistantText);
+            let second = matcher.feed(&text[split..], StreamChannel::AssistantText);
+            let found = first.or(second).expect("literal survives any valid split");
+            assert_eq!(found.matched_excerpt, literal, "split {split}");
+        }
+    }
+
+    #[test]
+    fn retained_memory_is_bounded_even_after_large_unicode_chunks() {
+        let large = "🦀éx".repeat(16_384);
+        for limit in [1, 2, 3, 4, 17, 4096] {
+            let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "absent")], limit);
+            for channel in [StreamChannel::AssistantText, StreamChannel::Thinking] {
+                for chunk in [large.as_str(), "🦀", "é", "x"] {
+                    assert!(matcher.feed(chunk, channel).is_none());
+                }
+            }
+            for window in [&matcher.assistant, &matcher.thinking] {
+                assert!(window.text.len() <= limit + 4);
+                assert!(window.text.is_char_boundary(window.search_start));
+                assert!(window.text.len() - window.search_start <= limit);
+                assert!(window.text.capacity() < large.len() / 2);
+            }
+        }
+    }
+
+    #[test]
+    fn reset_clears_both_histories_and_anchor_context() {
+        let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", "DANGER")], 3);
+        assert!(matcher.feed("xxDAN", StreamChannel::AssistantText).is_none());
+        assert!(matcher.feed("xxDAN", StreamChannel::Thinking).is_none());
+        matcher.reset();
+        for channel in [StreamChannel::AssistantText, StreamChannel::Thinking] {
+            assert!(matcher.feed("GER", channel).is_none());
+        }
+        assert_eq!(matcher.assistant.search_start, 0);
+        assert_eq!(matcher.thinking.search_start, 0);
+    }
+
+    #[test]
+    fn admitted_rule_order_remains_deterministic_for_a_coalesced_delta() {
+        let rules = [stream_rule("first", "LATE"), stream_rule("second", "EARLY")];
+        let text = format!("EARLY{}LATE{}", "x".repeat(4096), "x".repeat(4096));
+        let mut matcher = RollingStreamMatcher::new(&rules, 16);
+        assert_eq!(
+            matcher
+                .feed(&text, StreamChannel::AssistantText)
+                .unwrap()
+                .rule_id,
+            "first"
+        );
+        matcher.reset();
+        assert_eq!(
+            matcher
+                .feed_filtered(&text, StreamChannel::AssistantText, |id| id != "first")
+                .unwrap()
+                .rule_id,
+            "second"
+        );
+    }
+
+    #[test]
+    fn coordinator_enforces_large_deltas_through_retry_cap_and_cooldowns() {
+        let rules = [stream_rule("bad", "DANGER")];
+        let mut coordinator = TtsrCoordinator::new(&rules, 1, 16);
+        let text = format!("DANGER{}", "x".repeat(8192));
+        coordinator.advance_turn(1);
+        assert!(matches!(
+            coordinator.process_chunk(&text, StreamChannel::Thinking),
+            TtsrAction::AbortAndInject { .. }
+        ));
+        coordinator.reset_attempt();
+        assert!(matches!(
+            coordinator.process_chunk(&text, StreamChannel::AssistantText),
+            TtsrAction::CapExceeded {
+                total_injections: 1,
+                ..
+            }
+        ));
+        coordinator.advance_turn(2);
+        assert!(matches!(
+            coordinator.process_chunk(&text, StreamChannel::AssistantText),
+            TtsrAction::AbortAndInject { .. }
+        ));
+
+        let mut cooling = stream_rule("cooling", "COOL");
+        cooling.cooldown_turns = Some(2);
+        let mut coordinator = TtsrCoordinator::new(&[cooling, stream_rule("bad", "DANGER")], 3, 16);
+        coordinator.advance_turn(1);
+        assert!(matches!(
+            coordinator.process_chunk("COOL", StreamChannel::AssistantText),
+            TtsrAction::AbortAndInject { .. }
+        ));
+        coordinator.advance_turn(2);
+        let text = format!("COOL {text}");
+        let TtsrAction::AbortAndInject { rule, .. } =
+            coordinator.process_chunk(&text, StreamChannel::AssistantText)
+        else {
+            panic!("a cooling rule must not hide an admitted rule");
+        };
+        assert_eq!(rule.id, "bad");
+    }
+
+    #[test]
+    fn large_match_diagnostics_are_screened_then_bounded_on_utf8_boundaries() {
+        let mut matcher = RollingStreamMatcher::new(&[stream_rule("bad", r"(?s).+")], 16);
+        let text = "é🦀".repeat(4096);
+        let found = matcher.feed(&text, StreamChannel::AssistantText).unwrap();
+        assert!(found.matched_excerpt.len() <= MAX_MATCHED_EXCERPT_BYTES);
+        assert!(found.matched_excerpt.ends_with('…'));
+        let short = "password=secret-canary";
+        assert_eq!(screened_excerpt(short), screen_secrets(short));
+    }
 
     #[test]
     fn test_rolling_stream_matcher_chunk_boundary_split() {
