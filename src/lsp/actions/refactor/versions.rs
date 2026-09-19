@@ -28,7 +28,10 @@ fn path(entry: &Value, key: &str) -> Result<PathBuf> {
 }
 
 fn ignored_if_present(entry: &Value) -> bool {
-    entry.pointer("/options/ignoreIfExists").and_then(Value::as_bool) == Some(true)
+    entry
+        .pointer("/options/ignoreIfExists")
+        .and_then(Value::as_bool)
+        == Some(true)
         && entry.pointer("/options/overwrite").and_then(Value::as_bool) != Some(true)
 }
 
@@ -50,7 +53,9 @@ pub(super) fn validate(
                 let target = path(change, "uri")?;
                 let identity = if ignored_if_present(change) {
                     match identities.get(&target) {
-                        Some(identity @ (Identity::Original(_) | Identity::Fresh)) => identity.clone(),
+                        Some(identity @ (Identity::Original(_) | Identity::Fresh)) => {
+                            identity.clone()
+                        }
                         Some(Identity::Absent) => Identity::Fresh,
                         _ => Identity::Unknown,
                     }
@@ -79,7 +84,9 @@ pub(super) fn validate(
                         }
                     }
                 }
-                let identity = identities.insert(old, Identity::Absent).unwrap_or(Identity::Unknown);
+                let identity = identities
+                    .insert(old, Identity::Absent)
+                    .unwrap_or(Identity::Unknown);
                 identities.insert(new, identity);
             }
             // The caller has already validated the complete WorkspaceEdit.
@@ -102,11 +109,15 @@ pub(super) fn validate(
                     .filter(|value| *value > 0 && *value <= i32::MAX as u64)
                     .zip(origin)
                     .and_then(|(version, origin)| {
-                        requested.get(origin).zip(current.get(origin))
+                        requested
+                            .get(origin)
+                            .zip(current.get(origin))
                             .map(|(before, now)| (version, before, now))
                     })
                     .is_some_and(|(version, before, now)| {
-                        before.version == version && now.version == version && before.hash == now.hash
+                        before.version == version
+                            && now.version == version
+                            && before.hash == now.hash
                     });
                 if !matches {
                     return Err(tool_err(

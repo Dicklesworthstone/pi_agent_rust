@@ -74,9 +74,7 @@ fn line_ranges(content: &str) -> impl Iterator<Item = std::ops::Range<usize>> + 
             let end = start + relative;
             let span = start..end;
             start = end + 1;
-            if content.as_bytes()[end] == b'\r'
-                && content.as_bytes().get(start) == Some(&b'\n')
-            {
+            if content.as_bytes()[end] == b'\r' && content.as_bytes().get(start) == Some(&b'\n') {
                 start += 1;
             }
             Some(span)
@@ -131,7 +129,10 @@ pub fn offset_to_position(content: &str, offset: usize) -> Option<Position> {
         return None;
     }
     let character = byte_col_to_utf16(&content[span.clone()], offset - span.start)?;
-    Some(Position { line: u32::try_from(line).ok()?, character })
+    Some(Position {
+        line: u32::try_from(line).ok()?,
+        character,
+    })
 }
 
 /// One text replacement: splice `new_text` over `range`.
@@ -191,9 +192,12 @@ pub fn apply_text_edits(content: &str, edits: &[TextEdit]) -> Result<String, Str
     let mut output_len = content.len();
     for &(start, end, new_text) in &mapped {
         if start < cursor {
-            return Err(format!("edits overlap: byte range [{start}, {end}) starts before {cursor}"));
+            return Err(format!(
+                "edits overlap: byte range [{start}, {end}) starts before {cursor}"
+            ));
         }
-        output_len = output_len.checked_sub(end - start)
+        output_len = output_len
+            .checked_sub(end - start)
             .and_then(|size| size.checked_add(new_text.len()))
             .ok_or_else(|| "edited document length overflow".to_string())?;
         cursor = end;
@@ -234,7 +238,10 @@ pub fn find_occurrences(hay: &str, needle: &str, only_line: Option<u32>) -> Vec<
     }
     let (region_start, region) = match only_line {
         None => (0, hay),
-        Some(line) => match usize::try_from(line).ok().and_then(|line| line_ranges(hay).nth(line)) {
+        Some(line) => match usize::try_from(line)
+            .ok()
+            .and_then(|line| line_ranges(hay).nth(line))
+        {
             None => return out,
             Some(span) => (span.start, &hay[span]),
         },
@@ -255,8 +262,14 @@ mod tests {
     fn replacement(line: u32, start: u32, end: u32, text: &str) -> TextEdit {
         TextEdit {
             range: Range {
-                start: Position { line, character: start },
-                end: Position { line, character: end },
+                start: Position {
+                    line,
+                    character: start,
+                },
+                end: Position {
+                    line,
+                    character: end,
+                },
             },
             new_text: text.to_string(),
         }
@@ -275,7 +288,11 @@ mod tests {
     #[test]
     fn insertion_after_same_start_replacement_is_rejected() {
         let edits = [replacement(0, 1, 3, "Z"), replacement(0, 1, 1, "X")];
-        assert!(apply_text_edits("abcd", &edits).unwrap_err().contains("overlap"));
+        assert!(
+            apply_text_edits("abcd", &edits)
+                .unwrap_err()
+                .contains("overlap")
+        );
     }
 
     #[test]
@@ -307,30 +324,82 @@ mod tests {
             }
         }
         assert_eq!(line_count("é\r🦀\r\nx\n"), 4);
-        assert_eq!(offset_to_position("é\r🦀", 3), Some(Position { line: 1, character: 0 }));
+        assert_eq!(
+            offset_to_position("é\r🦀", 3),
+            Some(Position {
+                line: 1,
+                character: 0
+            })
+        );
     }
 
     #[test]
     fn explicit_positions_reject_clamping_and_surrogate_interiors() {
         let content = "a🦀b\r\n";
-        assert_eq!(position_to_offset_exact(content, Position { line: 0, character: 3 }), Some(5));
-        assert_eq!(position_to_offset_exact(content, Position { line: 0, character: 2 }), None);
-        assert_eq!(position_to_offset_exact(content, Position { line: 0, character: 99 }), None);
-        assert_eq!(position_to_offset(content, Position { line: 0, character: 99 }), Some(6));
+        assert_eq!(
+            position_to_offset_exact(
+                content,
+                Position {
+                    line: 0,
+                    character: 3
+                }
+            ),
+            Some(5)
+        );
+        assert_eq!(
+            position_to_offset_exact(
+                content,
+                Position {
+                    line: 0,
+                    character: 2
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            position_to_offset_exact(
+                content,
+                Position {
+                    line: 0,
+                    character: 99
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            position_to_offset(
+                content,
+                Position {
+                    line: 0,
+                    character: 99
+                }
+            ),
+            Some(6)
+        );
     }
 
     #[test]
     fn edits_cannot_split_surrogates_but_retain_protocol_end_clamping() {
         for edit in [replacement(0, 2, 2, "X"), replacement(0, 1, 2, "X")] {
-            assert!(apply_text_edits("a🦀b", &[edit]).unwrap_err().contains("surrogate"));
+            assert!(
+                apply_text_edits("a🦀b", &[edit])
+                    .unwrap_err()
+                    .contains("surrogate")
+            );
         }
-        assert_eq!(apply_text_edits("a🦀b", &[replacement(0, 3, 99, "Z")]).unwrap(), "a🦀Z");
+        assert_eq!(
+            apply_text_edits("a🦀b", &[replacement(0, 3, 99, "Z")]).unwrap(),
+            "a🦀Z"
+        );
     }
 
     #[test]
     fn inverted_ranges_are_rejected_even_when_both_columns_clamp_to_eol() {
-        assert!(apply_text_edits("abc", &[replacement(0, 99, 98, "X")])
-            .unwrap_err().contains("inverted"));
+        assert!(
+            apply_text_edits("abc", &[replacement(0, 99, 98, "X")])
+                .unwrap_err()
+                .contains("inverted")
+        );
     }
 
     #[test]
@@ -339,14 +408,23 @@ mod tests {
         assert_eq!(find_occurrences(content, "old", Some(1)), vec![(9, 3)]);
         assert!(find_occurrences(content, "last", Some(1)).is_empty());
         assert!(find_occurrences(content, "\r", Some(1)).is_empty());
-        assert_eq!(apply_text_edits(content, &[replacement(1, 2, 5, "new")]).unwrap(), "first\ré new\r\nlast");
+        assert_eq!(
+            apply_text_edits(content, &[replacement(1, 2, 5, "new")]).unwrap(),
+            "first\ré new\r\nlast"
+        );
     }
 
     #[test]
     fn large_reversed_batch_uses_original_positions() {
         let content = "old\r\n".repeat(4096);
-        let edits: Vec<_> = (0..4096).rev().map(|line| replacement(line, 0, 3, "formatted")).collect();
-        assert_eq!(apply_text_edits(&content, &edits).unwrap(), "formatted\r\n".repeat(4096));
+        let edits: Vec<_> = (0..4096)
+            .rev()
+            .map(|line| replacement(line, 0, 3, "formatted"))
+            .collect();
+        assert_eq!(
+            apply_text_edits(&content, &edits).unwrap(),
+            "formatted\r\n".repeat(4096)
+        );
     }
 
     #[test]

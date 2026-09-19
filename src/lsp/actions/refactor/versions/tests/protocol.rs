@@ -75,13 +75,18 @@ while True:
 
 fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Runtime)> {
     let python = ["python3", "python"].into_iter().find(|program| {
-        Command::new(program).arg("--version")
-            .stdout(Stdio::null()).stderr(Stdio::null())
-            .status().is_ok_and(|status| status.success())
+        Command::new(program)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     });
     let Some(python) = python else {
-        assert!(std::env::var_os("PI_LSP_REQUIRE_PROTOCOL").is_none(),
-            "Python required for version-identity protocol tests");
+        assert!(
+            std::env::var_os("PI_LSP_REQUIRE_PROTOCOL").is_none(),
+            "Python required for version-identity protocol tests"
+        );
         eprintln!("SKIP version-identity protocol fixture: Python unavailable");
         return None;
     };
@@ -93,19 +98,29 @@ fn fixture(root: &Path, mode: &str) -> Option<(LspTool, asupersync::runtime::Run
     std::fs::write(&script, SERVER).unwrap();
     let config = Config {
         lsp: Some(LspSettings {
-            servers: Some(HashMap::from([("identity-fixture".to_string(), LspServerSettings {
-                command: Some(python.to_string()),
-                args: Some(vec!["-I".to_string(), "-u".to_string(), script.display().to_string(), mode.to_string()]),
-                extensions: Some(vec![".identity".to_string()]),
-                languages: Some(vec!["plaintext".to_string()]),
-                root_markers: Some(vec![".identity-root".to_string()]),
-                ..Default::default()
-            })])),
+            servers: Some(HashMap::from([(
+                "identity-fixture".to_string(),
+                LspServerSettings {
+                    command: Some(python.to_string()),
+                    args: Some(vec![
+                        "-I".to_string(),
+                        "-u".to_string(),
+                        script.display().to_string(),
+                        mode.to_string(),
+                    ]),
+                    extensions: Some(vec![".identity".to_string()]),
+                    languages: Some(vec!["plaintext".to_string()]),
+                    root_markers: Some(vec![".identity-root".to_string()]),
+                    ..Default::default()
+                },
+            )])),
             ..Default::default()
         }),
         ..Default::default()
     };
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     Some((LspTool::new(&root, Some(&config)), runtime))
 }
 
@@ -115,43 +130,78 @@ fn input() -> Value {
 
 fn assert_request_logged(root: &Path) {
     let log = std::fs::read_to_string(root.join("requests.jsonl")).unwrap();
-    let events: Vec<Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    assert!(events.iter().any(|event| event["method"] == "textDocument/rename"));
-    assert!(!events.iter().any(|event| event["method"] == "workspace/executeCommand"));
+    let events: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["method"] == "textDocument/rename")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["method"] == "workspace/executeCommand")
+    );
 }
 
 #[test]
 fn public_rename_moves_then_edits_a_versioned_document() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "move") else { return };
-    let result = runtime.block_on(tool.execute("identity-move", input(), None)).unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "move") else {
+        return;
+    };
+    let result = runtime
+        .block_on(tool.execute("identity-move", input(), None))
+        .unwrap();
     assert!(!result.is_error);
     assert!(!temp.path().join("source.identity").exists());
-    assert_eq!(std::fs::read_to_string(temp.path().join("moved.identity")).unwrap(), "renamed\n");
-    assert_eq!(std::fs::read_to_string(temp.path().join("sibling.identity")).unwrap(), "untouched\n");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("moved.identity")).unwrap(),
+        "renamed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("sibling.identity")).unwrap(),
+        "untouched\n"
+    );
     assert_request_logged(temp.path());
 }
 
 #[test]
 fn public_rename_preserves_identity_across_multiple_moves_and_edits() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "chain") else { return };
-    let result = runtime.block_on(tool.execute("identity-chain", input(), None)).unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "chain") else {
+        return;
+    };
+    let result = runtime
+        .block_on(tool.execute("identity-chain", input(), None))
+        .unwrap();
     assert!(!result.is_error);
     assert!(!temp.path().join("source.identity").exists());
     assert!(!temp.path().join("moved.identity").exists());
-    assert_eq!(std::fs::read_to_string(temp.path().join("final.identity")).unwrap(), "complete\n");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("final.identity")).unwrap(),
+        "complete\n"
+    );
     assert_request_logged(temp.path());
 }
 
 #[test]
 fn public_rename_uses_source_version_after_destination_overwrite() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((tool, runtime)) = fixture(temp.path(), "overwrite") else { return };
-    let result = runtime.block_on(tool.execute("identity-overwrite", input(), None)).unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "overwrite") else {
+        return;
+    };
+    let result = runtime
+        .block_on(tool.execute("identity-overwrite", input(), None))
+        .unwrap();
     assert!(!result.is_error);
     assert!(!temp.path().join("source.identity").exists());
-    assert_eq!(std::fs::read_to_string(temp.path().join("sibling.identity")).unwrap(), "renamed\n");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("sibling.identity")).unwrap(),
+        "renamed\n"
+    );
     assert_request_logged(temp.path());
 }
 
@@ -159,13 +209,30 @@ fn public_rename_uses_source_version_after_destination_overwrite() {
 fn public_rename_rejects_recreated_stale_and_drifted_identities_before_writing() {
     for mode in ["recreate", "stale", "drift"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
-        let error = runtime.block_on(tool.execute("identity-conflict", input(), None)).unwrap_err();
-        assert!(error.to_string().contains("LSP_EDIT_CONFLICT"), "{mode}: {error}");
-        let expected = if mode == "drift" { "external\n" } else { "old\n" };
-        assert_eq!(std::fs::read_to_string(temp.path().join("source.identity")).unwrap(), expected);
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+            return;
+        };
+        let error = runtime
+            .block_on(tool.execute("identity-conflict", input(), None))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("LSP_EDIT_CONFLICT"),
+            "{mode}: {error}"
+        );
+        let expected = if mode == "drift" {
+            "external\n"
+        } else {
+            "old\n"
+        };
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("source.identity")).unwrap(),
+            expected
+        );
         assert!(!temp.path().join("moved.identity").exists());
-        assert_eq!(std::fs::read_to_string(temp.path().join("sibling.identity")).unwrap(), "untouched\n");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("sibling.identity")).unwrap(),
+            "untouched\n"
+        );
         assert_request_logged(temp.path());
     }
 }

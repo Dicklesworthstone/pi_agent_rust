@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 312 current source files.
+- `rg --files src -g '*.rs' | sort` -> 317 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 312.
+- Source-file rows below: 317.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -196,7 +196,12 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/actions.rs` | LSP code action and refactoring execution | Unit; `tests/lsp.rs`. |
 | `src/lsp/actions/protocol_tests.rs` | LSP code action protocol test cases | Test support module; exercises code actions. |
 | `src/lsp/actions/refactor.rs` | LSP symbol rename and refactor operations | Unit; `src/lsp/actions/refactor/tests.rs`, `tests/lsp.rs`. |
+| `src/lsp/actions/refactor/formatting.rs` | LSP document and range formatting | Unit; `src/lsp/actions/refactor/formatting/tests.rs`. |
+| `src/lsp/actions/refactor/formatting/tests.rs` | LSP document formatting test suite | Test module; document formatting tests. |
 | `src/lsp/actions/refactor/tests.rs` | LSP symbol refactor test suite | Test module; refactor tests. |
+| `src/lsp/actions/refactor/versions.rs` | LSP request-time document version tracking across resource operations | Unit; `src/lsp/actions/refactor/versions/tests.rs`. |
+| `src/lsp/actions/refactor/versions/tests.rs` | LSP document version tracking test suite | Test module; version tracking tests. |
+| `src/lsp/actions/refactor/versions/tests/protocol.rs` | LSP document version tracking protocol test cases | Test support module; exercises version tracking. |
 | `src/lsp/client.rs` | LSP client | `tests/lsp.rs`. |
 | `src/lsp/client/document_sync.rs` | LSP client live document synchronization | Unit; `src/lsp/client/document_sync/tests.rs`. |
 | `src/lsp/client/document_sync/tests.rs` | LSP document synchronization tests | Test module; document sync tests. |

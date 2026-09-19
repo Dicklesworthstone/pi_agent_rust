@@ -143,7 +143,9 @@ fn validate_completion(result: &Value) -> Result<()> {
     let completion = result
         .get("completion")
         .filter(|value| value.is_object())
-        .ok_or_else(|| invalid_response("MCP completion result must contain a completion object"))?;
+        .ok_or_else(|| {
+            invalid_response("MCP completion result must contain a completion object")
+        })?;
     let values = completion
         .get("values")
         .and_then(Value::as_array)
@@ -269,7 +271,9 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
                 response_string(content, "type", MAX_CONTEXT_NAME_BYTES)?;
             }
             ContextResult::Completion => {
-                return Err(invalid_response("MCP completion was not validated as an object"));
+                return Err(invalid_response(
+                    "MCP completion was not validated as an object",
+                ));
             }
         }
     }
@@ -662,15 +666,24 @@ mod tests {
         }, "_meta": {"secret": "private-outer"}});
         let (manager, _, transport) = fixture(&temp, vec![Ok(result.clone())], true);
         let tools = crate::mcp::mount_tools(&manager);
-        let output = runtime().block_on(tools[0].execute("complete", json!({
-            "action": "complete_argument",
-            "reference": {"type": "ref/prompt", "name": "code_review"},
-            "argument": {"name": "framework", "value": "  fl\n"},
-            "context": {"language": "日本語", "source": "line 1\n\"line 2\""}
-        }), None)).expect("completion");
+        let output = runtime()
+            .block_on(tools[0].execute(
+                "complete",
+                json!({
+                    "action": "complete_argument",
+                    "reference": {"type": "ref/prompt", "name": "code_review"},
+                    "argument": {"name": "framework", "value": "  fl\n"},
+                    "context": {"language": "日本語", "source": "line 1\n\"line 2\""}
+                }),
+                None,
+            ))
+            .expect("completion");
         assert!(!output.is_error);
         let public: Value = serde_json::from_str(&rendered(&output)).expect("public JSON");
-        assert_eq!(public["completion"]["values"], result["completion"]["values"]);
+        assert_eq!(
+            public["completion"]["values"],
+            result["completion"]["values"]
+        );
         assert_eq!(public["completion"]["total"], 9);
         assert_eq!(public["completion"]["hasMore"], true);
         assert!(!rendered(&output).contains("private-"));
@@ -678,32 +691,47 @@ mod tests {
         let requests = McpManager::lock(&transport.requests);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, "completion/complete");
-        assert_eq!(requests[0].1, json!({
-            "ref": {"type": "ref/prompt", "name": "code_review"},
-            "argument": {"name": "framework", "value": "  fl\n"},
-            "context": {"arguments": {"language": "日本語", "source": "line 1\n\"line 2\""}}
-        }));
+        assert_eq!(
+            requests[0].1,
+            json!({
+                "ref": {"type": "ref/prompt", "name": "code_review"},
+                "argument": {"name": "framework", "value": "  fl\n"},
+                "context": {"arguments": {"language": "日本語", "source": "line 1\n\"line 2\""}}
+            })
+        );
     }
 
     #[test]
     fn resource_completions_keep_templates_opaque_and_do_not_fetch_them() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, _, transport) = fixture(&temp, vec![
-            Ok(json!({"completion": {"values": []}})),
-            Ok(json!({"completion": {"values": [""], "hasMore": false}})),
-        ], true);
+        let (manager, _, transport) = fixture(
+            &temp,
+            vec![
+                Ok(json!({"completion": {"values": []}})),
+                Ok(json!({"completion": {"values": [""], "hasMore": false}})),
+            ],
+            true,
+        );
         let reference = crate::mcp::McpCompletionReference::Resource {
             uri: "file:///{+path}{?revision}".to_string(),
         };
         runtime().block_on(async {
-            manager.complete_argument("docs", &reference, "path", "", None)
-                .await.expect("empty prefix");
-            manager.complete_argument("docs", &reference, "path", "", Some(&BTreeMap::new()))
-                .await.expect("explicit empty context");
+            manager
+                .complete_argument("docs", &reference, "path", "", None)
+                .await
+                .expect("empty prefix");
+            manager
+                .complete_argument("docs", &reference, "path", "", Some(&BTreeMap::new()))
+                .await
+                .expect("explicit empty context");
         });
         let requests = McpManager::lock(&transport.requests);
         assert_eq!(requests.len(), 2);
-        assert!(requests.iter().all(|request| request.0 == "completion/complete"));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.0 == "completion/complete")
+        );
         assert_eq!(requests[0].1["ref"]["uri"], "file:///{+path}{?revision}");
         assert_eq!(requests[0].1["argument"]["value"], "");
         assert!(requests[0].1.get("context").is_none());
@@ -724,10 +752,19 @@ mod tests {
                 json!({"type": "ref/resource", "uri": "db://secret\nother"}),
                 json!({"type": "ref/resource", "uri": 9}),
             ] {
-                assert!(tools[0].execute("bad", json!({
-                    "action": "complete_argument", "reference": reference,
-                    "argument": {"name": "arg", "value": ""}
-                }), None).await.is_err());
+                assert!(
+                    tools[0]
+                        .execute(
+                            "bad",
+                            json!({
+                                "action": "complete_argument", "reference": reference,
+                                "argument": {"name": "arg", "value": ""}
+                            }),
+                            None
+                        )
+                        .await
+                        .is_err()
+                );
             }
             for argument in [
                 json!({"name": "arg"}),
@@ -736,18 +773,36 @@ mod tests {
                 json!({"name": "arg", "value": "", "secret": true}),
                 json!({"name": "arg", "value": "x".repeat(MAX_PROMPT_ARGUMENT_BYTES + 1)}),
             ] {
-                assert!(tools[0].execute("bad", json!({
-                    "action": "complete_argument",
-                    "reference": {"type": "ref/prompt", "name": "review"},
-                    "argument": argument
-                }), None).await.is_err());
+                assert!(
+                    tools[0]
+                        .execute(
+                            "bad",
+                            json!({
+                                "action": "complete_argument",
+                                "reference": {"type": "ref/prompt", "name": "review"},
+                                "argument": argument
+                            }),
+                            None
+                        )
+                        .await
+                        .is_err()
+                );
             }
-            assert!(tools[0].execute("bad", json!({
-                "action": "complete_argument",
-                "reference": {"type": "ref/prompt", "name": "review"},
-                "argument": {"name": "arg", "value": ""},
-                "context": {"arg": 1}
-            }), None).await.is_err());
+            assert!(
+                tools[0]
+                    .execute(
+                        "bad",
+                        json!({
+                            "action": "complete_argument",
+                            "reference": {"type": "ref/prompt", "name": "review"},
+                            "argument": {"name": "arg", "value": ""},
+                            "context": {"arg": 1}
+                        }),
+                        None
+                    )
+                    .await
+                    .is_err()
+            );
         });
         assert!(McpManager::lock(&transport.requests).is_empty());
         assert!(!transport.closed.load(Ordering::Acquire));
@@ -757,15 +812,21 @@ mod tests {
     fn completion_context_is_bounded_before_connection_or_dispatch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, _, transport) = fixture(&temp, Vec::new(), true);
-        let reference = crate::mcp::McpCompletionReference::Prompt { name: "review".to_string() };
+        let reference = crate::mcp::McpCompletionReference::Prompt {
+            name: "review".to_string(),
+        };
         let too_many: BTreeMap<String, String> = (0..=MAX_PROMPT_ARGUMENTS)
-            .map(|index| (format!("arg{index}"), String::new())).collect();
-        let too_large = BTreeMap::from([("source".to_string(), "\n".repeat(MAX_PROMPT_ARGUMENT_BYTES))]);
+            .map(|index| (format!("arg{index}"), String::new()))
+            .collect();
+        let too_large =
+            BTreeMap::from([("source".to_string(), "\n".repeat(MAX_PROMPT_ARGUMENT_BYTES))]);
         let bad_name = BTreeMap::from([("\0name".to_string(), String::new())]);
         runtime().block_on(async {
             for arguments in [&too_many, &too_large, &bad_name] {
-                let error = manager.complete_argument("docs", &reference, "arg", "", Some(arguments))
-                    .await.expect_err("reject invalid context");
+                let error = manager
+                    .complete_argument("docs", &reference, "arg", "", Some(arguments))
+                    .await
+                    .expect_err("reject invalid context");
                 assert!(error.to_string().contains("MCP_REQUEST_INVALID"));
             }
         });
@@ -775,11 +836,8 @@ mod tests {
     #[test]
     fn completion_request_budget_counts_prefix_escaping_before_dispatch() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, _, transport) = fixture(
-            &temp,
-            vec![Ok(json!({"completion": {"values": []}}))],
-            true,
-        );
+        let (manager, _, transport) =
+            fixture(&temp, vec![Ok(json!({"completion": {"values": []}}))], true);
         let reference = crate::mcp::McpCompletionReference::Prompt {
             name: "review".to_string(),
         };
@@ -815,7 +873,13 @@ mod tests {
             json!({"values": [], "total": "100"}),
             json!({"values": [], "hasMore": "yes"}),
         ] {
-            assert!(validate_response(&json!({"completion": completion}), ContextResult::Completion).is_err());
+            assert!(
+                validate_response(
+                    &json!({"completion": completion}),
+                    ContextResult::Completion
+                )
+                .is_err()
+            );
         }
         for completion in [
             json!({"values": []}),
@@ -823,21 +887,35 @@ mod tests {
             json!({"values": vec!["x"; MAX_COMPLETION_VALUES], "hasMore": true}),
             json!({"values": ["x".repeat(MAX_COMPLETION_VALUE_BYTES)]}),
         ] {
-            validate_response(&json!({"completion": completion}), ContextResult::Completion)
-                .expect("valid bounded completion");
+            validate_response(
+                &json!({"completion": completion}),
+                ContextResult::Completion,
+            )
+            .expect("valid bounded completion");
         }
-        assert!(validate_response(&json!({"completion": {"values": []},
-            "_meta": "x".repeat(MAX_CONTEXT_PAGE_BYTES)}), ContextResult::Completion).is_err());
+        assert!(
+            validate_response(
+                &json!({"completion": {"values": []},
+            "_meta": "x".repeat(MAX_CONTEXT_PAGE_BYTES)}),
+                ContextResult::Completion
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn malformed_completion_retires_the_connection_without_retrying() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(&temp, vec![
-            Ok(json!({"completion": {"values": [null]}})),
-        ], true);
-        let reference = crate::mcp::McpCompletionReference::Prompt { name: "review".to_string() };
-        let error = runtime().block_on(manager.complete_argument("docs", &reference, "arg", "", None))
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![Ok(json!({"completion": {"values": [null]}}))],
+            true,
+        );
+        let reference = crate::mcp::McpCompletionReference::Prompt {
+            name: "review".to_string(),
+        };
+        let error = runtime()
+            .block_on(manager.complete_argument("docs", &reference, "arg", "", None))
             .expect_err("invalid response");
         assert!(error.to_string().contains("MCP_PROTOCOL"));
         assert_eq!(McpManager::lock(&transport.requests).len(), 1);
@@ -849,14 +927,31 @@ mod tests {
     #[test]
     fn unsupported_completion_does_not_disable_other_server_features() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(&temp, vec![
-            Err(tool_err("MCP_SERVER_ERROR", "server error -32601: no completions")),
-            Ok(json!({"resources": []})),
-        ], true);
-        let reference = crate::mcp::McpCompletionReference::Prompt { name: "review".to_string() };
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                Err(tool_err(
+                    "MCP_SERVER_ERROR",
+                    "server error -32601: no completions",
+                )),
+                Ok(json!({"resources": []})),
+            ],
+            true,
+        );
+        let reference = crate::mcp::McpCompletionReference::Prompt {
+            name: "review".to_string(),
+        };
         runtime().block_on(async {
-            assert!(manager.complete_argument("docs", &reference, "arg", "", None).await.is_err());
-            manager.list_resources("docs", None).await.expect("resource access remains available");
+            assert!(
+                manager
+                    .complete_argument("docs", &reference, "arg", "", None)
+                    .await
+                    .is_err()
+            );
+            manager
+                .list_resources("docs", None)
+                .await
+                .expect("resource access remains available");
         });
         assert_eq!(McpManager::lock(&transport.requests).len(), 2);
         assert_eq!(McpManager::lock(&entry.restarts).count, 0);
@@ -866,17 +961,26 @@ mod tests {
     #[test]
     fn revocation_during_completion_blocks_sensitive_suggestions() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(&temp, vec![
-            Ok(json!({"completion": {"values": ["sensitive-candidate"]}})),
-        ], true);
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![Ok(
+                json!({"completion": {"values": ["sensitive-candidate"]}}),
+            )],
+            true,
+        );
         let path = manager.inner.trust_path.clone();
         let fingerprint = manager.trust_fingerprint_for(&entry);
         *McpManager::lock(&transport.after_response) = Some(Arc::new(move || {
-            TrustStore::load(&path).expect("trust store")
-                .deny("docs", &fingerprint, "operator").expect("revoke");
+            TrustStore::load(&path)
+                .expect("trust store")
+                .deny("docs", &fingerprint, "operator")
+                .expect("revoke");
         }));
-        let reference = crate::mcp::McpCompletionReference::Prompt { name: "review".to_string() };
-        let error = runtime().block_on(manager.complete_argument("docs", &reference, "arg", "", None))
+        let reference = crate::mcp::McpCompletionReference::Prompt {
+            name: "review".to_string(),
+        };
+        let error = runtime()
+            .block_on(manager.complete_argument("docs", &reference, "arg", "", None))
             .expect_err("revoked suggestions");
         assert!(error.to_string().contains("MCP_TRUST_DENIED"));
         assert!(!error.to_string().contains("sensitive-candidate"));

@@ -1275,10 +1275,12 @@ mod tests {
     fn assert_one_terminal_error(result: &[Result<StreamEvent>]) {
         assert!(result.last().is_some_and(Result::is_err), "{result:?}");
         assert_eq!(result.iter().filter(|item| item.is_err()).count(), 1);
-        assert!(!result.iter().any(|item| matches!(
-            item,
-            Ok(StreamEvent::Done { .. })
-        )), "{result:?}");
+        assert!(
+            !result
+                .iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1295,11 +1297,22 @@ mod tests {
             ]);
             let result = collect(frames);
             assert_one_terminal_error(&result);
-            assert_eq!(result.iter().filter(|item| matches!(
-                item, Ok(StreamEvent::ToolCallStart { .. })
-            )).count(), 1);
-            assert!(result.last().unwrap().as_ref().unwrap_err().to_string()
-                .contains("duplicate tool-call id"));
+            assert_eq!(
+                result
+                    .iter()
+                    .filter(|item| matches!(item, Ok(StreamEvent::ToolCallStart { .. })))
+                    .count(),
+                1
+            );
+            assert!(
+                result
+                    .last()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate tool-call id")
+            );
         }
     }
 
@@ -1312,10 +1325,16 @@ mod tests {
                 } else {
                     ("call-a", invalid_identity)
                 };
-                let result = collect(vec![start(), tool_start(0, id, name), block_stop(0), tool_stop()]);
+                let result = collect(vec![
+                    start(),
+                    tool_start(0, id, name),
+                    block_stop(0),
+                    tool_stop(),
+                ]);
                 assert_one_terminal_error(&result);
                 assert!(!result.iter().any(|item| matches!(
-                    item, Ok(StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. })
+                    item,
+                    Ok(StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. })
                 )));
             }
         }
@@ -1328,22 +1347,38 @@ mod tests {
 
     #[test]
     fn server_managed_and_unknown_tool_types_never_enter_local_execution() {
-        for kind in [json!("server_tool_use"), json!("future_type"), Value::Null, json!(false)] {
+        for kind in [
+            json!("server_tool_use"),
+            json!("future_type"),
+            Value::Null,
+            json!(false),
+        ] {
             let result = collect(vec![
                 start(),
-                event("contentBlockStart", &json!({"contentBlockIndex": 0, "start": {
-                    "toolUse": {"toolUseId": "call-a", "name": "bash", "type": kind}
-                }})),
+                event(
+                    "contentBlockStart",
+                    &json!({"contentBlockIndex": 0, "start": {
+                        "toolUse": {"toolUseId": "call-a", "name": "bash", "type": kind}
+                    }}),
+                ),
                 tool_input(0, "{\"command\":\"must-not-run\"}"),
                 block_stop(0),
                 tool_stop(),
             ]);
             assert_one_terminal_error(&result);
             assert!(!result.iter().any(|item| matches!(
-                item, Ok(StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. })
+                item,
+                Ok(StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. })
             )));
-            assert!(result.last().unwrap().as_ref().unwrap_err().to_string()
-                .contains("not a local tool request"));
+            assert!(
+                result
+                    .last()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not a local tool request")
+            );
         }
     }
 
@@ -1353,10 +1388,21 @@ mod tests {
             let mut payload = json!({"contentBlockIndex": 0, "start": {
                 "toolUse": {"toolUseId": "call-a", "name": "read"}
             }});
-            payload["start"].as_object_mut().unwrap().insert(extra.to_string(), json!({}));
-            let result = collect(vec![start(), event("contentBlockStart", &payload), tool_stop()]);
+            payload["start"]
+                .as_object_mut()
+                .unwrap()
+                .insert(extra.to_string(), json!({}));
+            let result = collect(vec![
+                start(),
+                event("contentBlockStart", &payload),
+                tool_stop(),
+            ]);
             assert_one_terminal_error(&result);
-            assert!(!result.iter().any(|item| matches!(item, Ok(StreamEvent::ToolCallStart { .. }))));
+            assert!(
+                !result
+                    .iter()
+                    .any(|item| matches!(item, Ok(StreamEvent::ToolCallStart { .. })))
+            );
         }
     }
 
@@ -1364,13 +1410,19 @@ mod tests {
     fn supplied_tool_arguments_must_finish_as_a_json_object() {
         for input in ["", " ", "null", "[]", "42", "true", "\"text\"", "{", "{}{}"] {
             let result = collect(vec![
-                start(), tool_start(0, "call-a", "read"), tool_input(0, input),
-                block_stop(0), tool_stop(),
+                start(),
+                tool_start(0, "call-a", "read"),
+                tool_input(0, input),
+                block_stop(0),
+                tool_stop(),
             ]);
             assert_one_terminal_error(&result);
-            assert!(!result.iter().any(|item| matches!(
-                item, Ok(StreamEvent::ToolCallEnd { .. })
-            )), "{input}: {result:?}");
+            assert!(
+                !result
+                    .iter()
+                    .any(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. }))),
+                "{input}: {result:?}"
+            );
         }
     }
 
@@ -1396,22 +1448,35 @@ mod tests {
     #[test]
     fn parallel_calls_keep_dense_content_indices_and_independent_argument_buffers() {
         let bytes = [
-            start(), text(), block_stop(0),
+            start(),
+            text(),
+            block_stop(0),
             tool_start(u64::MAX, "provider:call.1", "read"),
             tool_start(7, "provider:call.2", "read"),
             tool_input(7, "{\"path\":"),
             tool_input(u64::MAX, "{\"path\":\"first.txt\"}"),
             block_stop(u64::MAX),
             tool_input(7, "\"second.txt\"}"),
-            block_stop(7), tool_stop(),
-        ].concat();
-        for chunks in [vec![bytes.clone()], bytes.chunks(3).map(<[u8]>::to_vec).collect()] {
+            block_stop(7),
+            tool_stop(),
+        ]
+        .concat();
+        for chunks in [
+            vec![bytes.clone()],
+            bytes.chunks(3).map(<[u8]>::to_vec).collect(),
+        ] {
             let result = collect(chunks);
             assert!(result.iter().all(Result::is_ok), "{result:?}");
-            let completed: Vec<_> = result.iter().filter_map(|item| match item {
-                Ok(StreamEvent::ToolCallEnd { content_index, tool_call }) => Some((*content_index, tool_call)),
-                _ => None,
-            }).collect();
+            let completed: Vec<_> = result
+                .iter()
+                .filter_map(|item| match item {
+                    Ok(StreamEvent::ToolCallEnd {
+                        content_index,
+                        tool_call,
+                    }) => Some((*content_index, tool_call)),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(completed.len(), 2);
             assert_eq!(completed[0].0, 1);
             assert_eq!(completed[0].1.id, "provider:call.1");
@@ -1440,8 +1505,15 @@ mod tests {
         ] {
             let result = collect(frames);
             assert_one_terminal_error(&result);
-            assert!(result.last().unwrap().as_ref().unwrap_err().to_string()
-                .contains("no local tool calls"));
+            assert!(
+                result
+                    .last()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no local tool calls")
+            );
         }
     }
 
@@ -1450,10 +1522,19 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let mut output = from_bytes(
             Box::pin(DropProbe {
-                frame: Some([start(), tool_start(0, "call-a", "read"), tool_start(1, "call-a", "write")].concat()),
+                frame: Some(
+                    [
+                        start(),
+                        tool_start(0, "call-a", "read"),
+                        tool_start(1, "call-a", "write"),
+                    ]
+                    .concat(),
+                ),
                 dropped: Arc::clone(&dropped),
             }),
-            "m".into(), "p".into(), Vec::new(),
+            "m".into(),
+            "p".into(),
+            Vec::new(),
         );
         for _ in 0..2 {
             assert!(output.next().now_or_never().unwrap().unwrap().is_ok());

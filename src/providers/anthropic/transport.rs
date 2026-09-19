@@ -376,7 +376,9 @@ fn apply_usage_update(wire: &Value, partial: &mut AssistantMessage) -> Result<()
         match usage.get(field) {
             None | Some(Value::Null) => Ok(None),
             Some(value) => value.as_u64().map(Some).ok_or_else(|| {
-                protocol_error(&format!("message_delta usage.{field} is not an unsigned integer"))
+                protocol_error(&format!(
+                    "message_delta usage.{field} is not an unsigned integer"
+                ))
             }),
         }
     };
@@ -881,19 +883,27 @@ mod tests {
             for payload in [None, Some(Value::Null)] {
                 let mut delta = json!({"type": delta_kind});
                 if let Some(payload) = payload {
-                    delta.as_object_mut().unwrap().insert(field.to_string(), payload);
+                    delta
+                        .as_object_mut()
+                        .unwrap()
+                        .insert(field.to_string(), payload);
                 }
-                let events = collect_wire([
-                    start(),
-                    json!({"type": "content_block_start", "index": 0, "content_block": {
-                        "type": kind, "id": "call-a", "name": "read", "input": {}
-                    }}),
-                    json!({"type": "content_block_delta", "index": 0, "delta": delta}),
-                    stop(0),
-                ].into_iter().chain(finish()));
+                let events = collect_wire(
+                    [
+                        start(),
+                        json!({"type": "content_block_start", "index": 0, "content_block": {
+                            "type": kind, "id": "call-a", "name": "read", "input": {}
+                        }}),
+                        json!({"type": "content_block_delta", "index": 0, "delta": delta}),
+                        stop(0),
+                    ]
+                    .into_iter()
+                    .chain(finish()),
+                );
                 assert_terminal_error(&events);
                 assert!(
-                    !events.iter().any(|event| matches!(event,
+                    !events.iter().any(|event| matches!(
+                        event,
                         Ok(StreamEvent::TextEnd { .. }
                             | StreamEvent::ThinkingEnd { .. }
                             | StreamEvent::ToolCallEnd { .. })
@@ -909,7 +919,12 @@ mod tests {
         for input in [
             vec![start(), stop(0)],
             vec![start(), tool_start(0, "call-a", &json!({})), stop(9)],
-            vec![start(), tool_start(0, "call-a", &json!({})), stop(0), stop(0)],
+            vec![
+                start(),
+                tool_start(0, "call-a", &json!({})),
+                stop(0),
+                stop(0),
+            ],
         ] {
             assert_terminal_error(&collect_wire(input.into_iter().chain(finish())));
         }
@@ -949,26 +964,34 @@ mod tests {
             ].into_iter().chain(finish()));
             assert_terminal_error(&events);
         }
-        assert_terminal_error(&collect_wire([
-            start(),
-            json!({"type": "content_block_delta", "index": 9, "delta": {
-                "type": "signature_delta", "signature": "orphan"
-            }}),
-        ].into_iter().chain(finish())));
+        assert_terminal_error(&collect_wire(
+            [
+                start(),
+                json!({"type": "content_block_delta", "index": 9, "delta": {
+                    "type": "signature_delta", "signature": "orphan"
+                }}),
+            ]
+            .into_iter()
+            .chain(finish()),
+        ));
     }
 
     #[test]
     fn redacted_thinking_cannot_silently_discard_thinking_text() {
-        assert_terminal_error(&collect_wire([
-            start(),
-            json!({"type": "content_block_start", "index": 0, "content_block": {
-                "type": "redacted_thinking", "data": "opaque"
-            }}),
-            json!({"type": "content_block_delta", "index": 0, "delta": {
-                "type": "thinking_delta", "thinking": "must not disappear"
-            }}),
-            stop(0),
-        ].into_iter().chain(finish())));
+        assert_terminal_error(&collect_wire(
+            [
+                start(),
+                json!({"type": "content_block_start", "index": 0, "content_block": {
+                    "type": "redacted_thinking", "data": "opaque"
+                }}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {
+                    "type": "thinking_delta", "thinking": "must not disappear"
+                }}),
+                stop(0),
+            ]
+            .into_iter()
+            .chain(finish()),
+        ));
     }
 
     #[test]
@@ -976,13 +999,23 @@ mod tests {
         for mut input in [
             vec![start()],
             vec![start(), json!({"type": "message_delta", "delta": {}})],
-            vec![start(), json!({"type": "message_delta", "delta": {"stop_reason": null}})],
+            vec![
+                start(),
+                json!({"type": "message_delta", "delta": {"stop_reason": null}}),
+            ],
         ] {
             input.push(json!({"type": "message_stop"}));
             let events = collect_wire(input);
             assert_terminal_error(&events);
-            assert!(events.last().unwrap().as_ref().unwrap_err().to_string()
-                .contains("without a final stop reason"));
+            assert!(
+                events
+                    .last()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("without a final stop reason")
+            );
         }
     }
 
@@ -990,16 +1023,22 @@ mod tests {
     fn top_level_deltas_require_a_started_message_and_finish_content() {
         assert_terminal_error(&collect_wire(finish()));
         for reason in [Value::Null, json!("end_turn")] {
-            let events = collect_wire([
-                start(),
-                json!({"type": "message_delta", "delta": {"stop_reason": reason}}),
-                tool_start(0, "too-late", &json!({})),
-                stop(0),
-            ].into_iter().chain(finish()));
+            let events = collect_wire(
+                [
+                    start(),
+                    json!({"type": "message_delta", "delta": {"stop_reason": reason}}),
+                    tool_start(0, "too-late", &json!({})),
+                    stop(0),
+                ]
+                .into_iter()
+                .chain(finish()),
+            );
             assert_terminal_error(&events);
-            assert!(!events.iter().any(|event| matches!(
-                event, Ok(StreamEvent::ToolCallStart { .. })
-            )));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Ok(StreamEvent::ToolCallStart { .. })))
+            );
         }
     }
 
@@ -1018,9 +1057,13 @@ mod tests {
             json!({"type": "message_stop"}),
         ]);
         assert!(events.iter().all(Result::is_ok), "{events:?}");
-        assert_eq!(events.iter().filter(|event| matches!(
-            event, Ok(StreamEvent::Done { .. })
-        )).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+                .count(),
+            1
+        );
         let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
             panic!("expected Done");
         };
@@ -1126,7 +1169,10 @@ mod tests {
                 "cache_read_input_tokens": null,
                 "cache_creation_input_tokens": null
             });
-            usage.as_object_mut().unwrap().insert(field.to_string(), json!(0));
+            usage
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), json!(0));
             let events = collect_wire([
                 json!({"type": "message_start", "message": {"usage": {
                     "input_tokens": 10,
@@ -1178,10 +1224,17 @@ mod tests {
 
     #[test]
     fn malformed_optional_usage_counters_never_publish_done() {
-        for field in ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"] {
+        for field in [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
             for invalid in [json!(-1), json!(1.5), json!("7"), json!([]), json!({})] {
                 let mut usage = json!({"output_tokens": 1});
-                usage.as_object_mut().unwrap().insert(field.to_string(), invalid);
+                usage
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(field.to_string(), invalid);
                 let events = collect_wire([
                     start(),
                     json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": usage}),
@@ -1189,7 +1242,13 @@ mod tests {
                 ]);
                 assert_terminal_error(&events);
                 assert!(
-                    events.last().unwrap().as_ref().unwrap_err().to_string().contains(field),
+                    events
+                        .last()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains(field),
                     "{field}: {events:?}"
                 );
             }
@@ -1240,6 +1299,10 @@ mod tests {
         assert_eq!(error.usage.cache_write, 30);
         assert_eq!(error.usage.output, 7);
         assert_eq!(error.usage.total_tokens, 67);
-        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+        );
     }
 }
