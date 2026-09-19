@@ -1,7 +1,6 @@
 //! LSP initialization, synchronized document versions, requests and diagnostics.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +13,8 @@ use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 
 mod document_sync;
+mod file_uri;
+pub use file_uri::{path_to_uri, try_path_to_uri, uri_to_path};
 
 const WAIT_TICK: Duration = Duration::from_millis(10);
 const WARMUP_RETRY_CADENCE: Duration = Duration::from_millis(250);
@@ -91,44 +92,6 @@ impl From<LspCallError> for Error {
     }
 }
 
-#[must_use]
-pub fn path_to_uri(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let mut out = String::with_capacity(raw.len() + 8);
-    out.push_str("file://");
-    for byte in raw.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push('%');
-                let _ = write!(out, "{byte:02X}");
-            }
-        }
-    }
-    out
-}
-
-#[must_use]
-pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    let mut out = Vec::with_capacity(rest.len());
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    Some(PathBuf::from(String::from_utf8_lossy(&out).into_owned()))
-}
-
 fn content_hash(content: &str) -> u64 {
     super::text::content_hash_for_drift(content)
 }
@@ -181,9 +144,11 @@ impl LspClient {
         initialization_options: Option<&Value>,
         timeout: Duration,
     ) -> Result<Self> {
-        let rpc = JsonRpcClient::spawn(command, args, env, root)?;
-        let root = root.to_path_buf();
-        let root_uri = path_to_uri(&root);
+        // Resolve the workspace before spawning; never send an ambiguous or
+        // relative native path as the server's document root.
+        let root = root.canonicalize()?;
+        let root_uri = try_path_to_uri(&root)?;
+        let rpc = JsonRpcClient::spawn(command, args, env, &root)?;
         let client = Self {
             rpc,
             root,
@@ -344,6 +309,7 @@ impl LspClient {
     }
 
     pub async fn wait_for_diagnostics(&self, uri: &str, wait: Duration) -> bool {
+        let Some(uri) = file_uri::normalize_uri(uri) else { return false };
         let cx = AgentCx::for_current_or_request();
         let start = cx
             .cx()
@@ -353,7 +319,7 @@ impl LspClient {
             self.poll_notifications();
             {
                 let cache = Self::lock(&self.diagnostics);
-                if let Some(diags) = cache.get(uri) {
+                if let Some(diags) = cache.get(&uri) {
                     let settled = !diags.is_empty()
                         || self.quiescent.load(Ordering::SeqCst)
                         || self.connected_at.elapsed() >= WARMUP_EMPTY_RESULT_WINDOW;
@@ -367,7 +333,7 @@ impl LspClient {
                 .timer_driver()
                 .map_or_else(asupersync::time::wall_now, |timer| timer.now());
             if Duration::from_nanos(now.duration_since(start)) >= wait {
-                return Self::lock(&self.diagnostics).contains_key(uri);
+                return Self::lock(&self.diagnostics).contains_key(&uri);
             }
             asupersync::time::sleep(now, WAIT_TICK).await;
         }
@@ -550,6 +516,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn uri_roundtrip_plain() {
         let path = PathBuf::from("/tmp/workspace/src/main.rs");
         let uri = path_to_uri(&path);
@@ -558,6 +525,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn uri_encodes_specials() {
         let path = PathBuf::from("/tmp/my project/fi#1?.rs");
         let uri = path_to_uri(&path);

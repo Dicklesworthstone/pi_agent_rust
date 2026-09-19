@@ -325,4 +325,38 @@ while True:
         assert_eq!(client.open_document_count(), MAX_OPEN_DOCUMENTS);
         client.kill();
     }
+
+    #[test]
+    fn uri_aliases_share_diagnostics_waiting_and_document_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let client = connect(temp.path(), json!({"textDocumentSync":2}), &rt);
+        let path = source(temp.path(), "first");
+        let uri = client.ensure_synced(&path, "plaintext").unwrap();
+        let version = client.document_snapshots()[&path].version;
+        let alias = format!("FILE://LOCALHOST{}", uri.strip_prefix("file://").unwrap())
+            .replace("source.txt", "%73ource%2Etxt");
+        rt.block_on(client.call("test/publish", json!({
+            "uri":alias,"version":version,"diagnostics":[{"message":"alias diagnostic"}]
+        }), Duration::from_secs(5))).unwrap();
+        let diagnostics = client.diagnostics_snapshot();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics.contains_key(&uri));
+        assert!(!diagnostics.contains_key(&alias));
+        assert!(rt.block_on(client.wait_for_diagnostics(&alias, Duration::ZERO)));
+        assert!(!rt.block_on(client.wait_for_diagnostics("file://relative", Duration::ZERO)));
+        client.invalidate(&alias);
+        assert_eq!(client.open_document_count(), 0);
+        assert!(client.diagnostics_snapshot().is_empty());
+        let messages = frames(&client, &rt);
+        let last = messages.last().unwrap();
+        assert_eq!(last["method"], "textDocument/didClose");
+        assert_eq!(last["params"]["textDocument"]["uri"], uri);
+        client.ensure_synced(&path, "plaintext").unwrap();
+        rt.block_on(client.call("test/publish", json!({
+            "uri":alias,"version":version,"diagnostics":[{"message":"stale alias"}]
+        }), Duration::from_secs(5))).unwrap();
+        assert!(client.diagnostics_snapshot().is_empty());
+        client.kill();
+    }
 }

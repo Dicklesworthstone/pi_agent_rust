@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 use serde_json::{Value, json};
 
-use super::{LspClient, OpenDoc, content_hash, path_to_uri};
+use super::{LspClient, OpenDoc, content_hash, try_path_to_uri};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 
@@ -199,7 +199,7 @@ impl LspClient {
         let owner = AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| Error::from(super::LspCallError::Cancelled))?;
         let canonical = path.canonicalize()?;
-        let uri = path_to_uri(&canonical);
+        let uri = try_path_to_uri(&canonical)?;
         let policy = SyncPolicy::parse(&Self::lock(&self.capabilities).raw)?;
         // Keep the read, baseline comparison and wire order serialized. No
         // lock survives an await. Other files may still change externally.
@@ -258,8 +258,9 @@ impl LspClient {
     }
 
     pub fn invalidate(&self, uri: &str) {
+        let Some(uri) = super::file_uri::normalize_uri(uri) else { return };
         let mut docs = Self::lock(&self.open_docs);
-        let _ = self.close_document(&mut docs, uri);
+        let _ = self.close_document(&mut docs, &uri);
     }
 
     pub fn invalidate_all(&self) {
@@ -274,14 +275,15 @@ impl LspClient {
     pub(super) fn accept_diagnostics(&self, params: &Value) {
         let (Some(uri), Some(diagnostics)) = (params.get("uri").and_then(Value::as_str),
             params.get("diagnostics").and_then(Value::as_array)) else { return };
+        let Some(uri) = super::file_uri::normalize_uri(uri) else { return };
         // Same lock order as synchronization: a notification cannot pass the
         // version check, wait for a change, then publish stale diagnostics.
         let docs = Self::lock(&self.open_docs);
         if let Some(version) = params.get("version") {
             let Some(version) = version.as_u64().filter(|value| *value > 0 && *value <= MAX_DOCUMENT_VERSION) else { return };
-            if docs.get(uri).is_none_or(|doc| doc.version != version) { return; }
+            if docs.get(&uri).is_none_or(|doc| doc.version != version) { return; }
         }
-        Self::lock(&self.diagnostics).insert(uri.to_string(), diagnostics.clone());
+        Self::lock(&self.diagnostics).insert(uri, diagnostics.clone());
     }
 }
 
