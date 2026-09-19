@@ -177,24 +177,24 @@
 
 | Command | TS Pi | Rust Pi | Notes |
 |---------|-------|---------|-------|
-| `/settings` | Y | ? | TS settings menu |
+| `/settings` | Y | P | TS settings menu. Classic only; FTUI answers "Unknown command" |
 | `/model` | Y | Y | Model selector |
-| `/scoped-models` | Y | ? | Enable/disable models for cycling |
+| `/scoped-models` | Y | P | Enable/disable models for cycling. Classic only |
 | `/export` | Y | Y | Export session to HTML |
-| `/share` | Y | ? | Share as GitHub gist |
-| `/copy` | Y | ? | Copy last message to clipboard |
-| `/name` | Y | ? | Set session name |
-| `/session` | Y | ? | Session info/stats |
-| `/changelog` | Y | ? | Show changelog |
-| `/hotkeys` | Y | ? | Show keybindings |
-| `/fork` | Y | ? | Fork from previous message |
+| `/share` | Y | Y | Share as GitHub gist; both stacks |
+| `/copy` | Y | P | Copy last message to clipboard. Classic only |
+| `/name` | Y | Y | Set session name; both stacks |
+| `/session` | Y | Y | Session info/stats; both stacks |
+| `/changelog` | Y | P | Show changelog. Classic only; FTUI has no changelog surface |
+| `/hotkeys` | Y | Y | Show keybindings; FTUI gained it in b29a15e2c |
+| `/fork` | Y | P | Fork from previous message. Classic only |
 | `/tree` | Y | Y | Navigate session tree |
-| `/login` | Y | ? | OAuth login |
-| `/logout` | Y | ? | OAuth logout |
-| `/new` | Y | ? | Start new session |
+| `/login` | Y | P | OAuth login. Classic only |
+| `/logout` | Y | P | OAuth logout. Classic only |
+| `/new` | Y | Y | Start new session; both stacks |
 | `/compact` | Y | Y | Manual compaction |
-| `/resume` | Y | ? | Resume different session |
-| `/reload` | Y | ? | Reload extensions/skills/prompts/themes |
+| `/resume` | Y | Y | Resume different session; both stacks |
+| `/reload` | Y | P | Reload extensions/skills/prompts/themes. Classic only |
 | `/help` | Y | Y | Show help |
 | `/clear` | Y | Y | Clear message |
 | `/exit` | Y | Y | Exit application |
@@ -596,20 +596,20 @@
 | Clear | Y | Y | Ctrl+C | |
 | Exit | Y | Y | Ctrl+D | When empty |
 | Suspend | Y | Y | Ctrl+Z | |
-| Cycle thinking | Y | Y | Shift+Tab | |
-| Cycle model forward | Y | Y | Ctrl+P | |
-| Cycle model backward | Y | Y | Shift+Ctrl+P | |
-| Select model | Y | Y | Ctrl+L | |
-| Expand tools | Y | ? | Ctrl+O | Needs verification |
-| Toggle thinking | Y | ? | Ctrl+T | Needs verification |
-| Toggle session named filter | Y | ? | Ctrl+N | Needs verification |
-| External editor | Y | ? | Ctrl+G | Needs verification |
-| Follow up | Y | Y | Alt+Enter | |
-| Dequeue | Y | ? | Alt+Up | Needs verification |
-| Paste image | Y | ? | Ctrl+V | Needs verification |
-| New session | Y | ? | (none) | Needs verification |
-| Tree | Y | ? | (none) | Needs verification |
-| Fork | Y | ? | (none) | Needs verification |
+| Cycle thinking | Y | P | Shift+Tab | Classic only; inert on the default ftui stack |
+| Cycle model forward | Y | P | Ctrl+P | Classic only; inert on ftui |
+| Cycle model backward | Y | P | Shift+Ctrl+P | Classic only; inert on ftui |
+| Select model | Y | Y | Ctrl+L | ftui gained it in d5bcc2eb6 |
+| Expand tools | Y | P | Ctrl+O | Classic only; ftui renders no expandable tool output |
+| Toggle thinking | Y | P | Ctrl+T | Classic only; ftui renders no thinking content to toggle |
+| Toggle session named filter | Y | N | Ctrl+N | Advertised by `/hotkeys`, implemented on neither stack; `session_picker.rs` handles keys by hardcoded `KeyType` |
+| External editor | Y | P | Ctrl+G | Classic only; inert on ftui |
+| Follow up | Y | P | Alt+Enter | Classic only. On ftui the chord reaches the editor and inserts a newline |
+| Dequeue | Y | P | Alt+Up | Classic only; inert on ftui |
+| Paste image | Y | P | Ctrl+V | Classic only; inert on ftui |
+| New session | Y | X | (none) | No default key in pi's catalog on either side; the action is reachable as `/new` |
+| Tree | Y | X | (none) | No default key in pi's catalog; reachable as `/tree` |
+| Fork | Y | X | (none) | No default key in pi's catalog; reachable as `/fork` (classic) |
 
 ### Customization
 
