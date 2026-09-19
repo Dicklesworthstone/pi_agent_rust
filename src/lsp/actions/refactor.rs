@@ -10,7 +10,7 @@ use super::{
     file_hash, inside_root, json, lock, parse_workspace_edit, resolve_tool_path,
     tool_err, verify_source,
 };
-use crate::lsp::client::{DocumentSnapshot, uri_to_path};
+use crate::lsp::client::{DocumentSnapshot, try_path_to_uri, uri_to_path};
 use crate::lsp::edits::WorkspaceEditPlan;
 
 struct RefactorSnapshot {
@@ -93,6 +93,74 @@ fn check_response_size(raw: &Value) -> Result<()> {
         .map_err(|_| tool_err("LSP_EDIT_LIMIT", "workspace edit exceeds 2 MiB"))
 }
 
+/// Append the user-requested move AFTER server import updates. Preserve the
+/// server's document order and annotations, and never combine both edit forms.
+fn append_move(raw: Value, old_uri: &str, new_uri: &str) -> Result<Value> {
+    check_response_size(&raw)?;
+    parse_workspace_edit(&raw)?;
+    let mut object = match raw {
+        Value::Null => serde_json::Map::new(),
+        Value::Object(object) => object,
+        _ => return Err(tool_err("LSP_EDIT_MALFORMED", "workspace edit is not an object")),
+    };
+    let mut ordered = match object.remove("documentChanges") {
+        Some(Value::Array(ordered)) => ordered,
+        None => match object.remove("changes") {
+            Some(Value::Object(changes)) => changes.into_iter().map(|(uri, edits)| {
+                json!({"textDocument":{"uri":uri,"version":null},"edits":edits})
+            }).collect(),
+            None => Vec::new(),
+            _ => return Err(tool_err("LSP_EDIT_MALFORMED", "invalid changes object")),
+        },
+        _ => return Err(tool_err("LSP_EDIT_MALFORMED", "invalid documentChanges array")),
+    };
+    object.remove("changes");
+    ordered.push(json!({"kind":"rename","oldUri":old_uri,"newUri":new_uri,"options":{"overwrite":false}}));
+    object.insert("documentChanges".to_string(), Value::Array(ordered));
+    Ok(Value::Object(object))
+}
+
+/// Static registrations apply to the original file being renamed. Globs use
+/// native paths, not percent-encoded URI text. No filesystem traversal occurs.
+fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Result<bool> {
+    let Some(options) = capabilities.pointer("/workspace/fileOperations")
+        .and_then(|operations| operations.get(operation)) else { return Ok(false) };
+    let invalid = || tool_err("LSP_FILE_OPERATION_OPTIONS", "invalid file operation registration");
+    let filters = options.get("filters").and_then(Value::as_array).ok_or_else(invalid)?;
+    if filters.len() > 128 { return Err(invalid()); }
+    let mut matched = false;
+    for filter in filters {
+        let scheme_matches = match filter.get("scheme") {
+            None => true,
+            Some(Value::String(scheme)) => scheme == "file",
+            _ => return Err(invalid()),
+        };
+        let pattern = filter.get("pattern").ok_or_else(invalid)?;
+        let glob = pattern.get("glob").and_then(Value::as_str)
+            .filter(|glob| glob.len() <= 4096).ok_or_else(invalid)?;
+        let file_matches = match pattern.get("matches") {
+            None => true,
+            Some(Value::String(kind)) if kind == "file" => true,
+            Some(Value::String(kind)) if kind == "folder" => false,
+            _ => return Err(invalid()),
+        };
+        let ignore_case = match pattern.get("options") {
+            None => false,
+            Some(Value::Object(options)) => match options.get("ignoreCase") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                _ => return Err(invalid()),
+            },
+            _ => return Err(invalid()),
+        };
+        let matcher = globset::GlobBuilder::new(glob)
+            .literal_separator(true).backslash_escape(false).case_insensitive(ignore_case)
+            .build().map_err(|_| invalid())?.compile_matcher();
+        matched |= scheme_matches && file_matches && matcher.is_match(path);
+    }
+    Ok(matched)
+}
+
 impl LspTool {
     fn apply_refactor(
         &self,
@@ -116,7 +184,7 @@ impl LspTool {
         result
     }
 
-    pub(in crate::lsp) async fn rename_symbol_checked(&self, input: &LspInput) -> Result<ToolOutput> {
+    pub(in crate::lsp) async fn run_rename(&self, input: &LspInput) -> Result<ToolOutput> {
         let new_name = input.new_name.as_deref().filter(|name| !name.is_empty())
             .ok_or_else(|| tool_err("LSP_USAGE", "lsp rename requires a nonempty newName"))?;
         let file = input.file.as_deref().ok_or_else(|| tool_err("LSP_USAGE", "lsp rename requires file"))?;
@@ -141,6 +209,57 @@ impl LspTool {
             "action":"rename","newName":new_name,"filesChanged":files,
             "fileOps":outcome.file_ops_applied,"atomic":false,"rollbackOnError":true,
             "note":"Scoped regular-file transaction with rollback; not cross-file atomic visibility."
+        });
+        Ok(super::text_output(payload.to_string(), payload))
+    }
+
+    pub(in crate::lsp) async fn run_rename_file(&self, input: &LspInput) -> Result<ToolOutput> {
+        let file = input.file.as_deref().ok_or_else(|| tool_err("LSP_USAGE", "rename_file requires file"))?;
+        let new_file = input.new_file.as_deref().filter(|path| !path.is_empty())
+            .ok_or_else(|| tool_err("LSP_USAGE", "rename_file requires a nonempty newFile"))?;
+        let owner = AgentCx::for_current_or_request();
+        let requested = resolve_tool_path(file, &self.cwd);
+        let metadata = std::fs::symlink_metadata(&requested)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(tool_err("LSP_FILE_UNREADABLE", "rename_file requires a regular file, not a directory or symlink"));
+        }
+        let old_path = requested.canonicalize()?;
+        let hash = file_hash(&old_path)?;
+        let (old_uri, entry) = self.synced(&old_path).await?;
+        let snapshot = RefactorSnapshot::capture(&entry, &old_path, hash)?;
+        // Use a canonical base without creating parents. Scope validation
+        // rejects traversal and symlink components, including dangling targets.
+        let new_path = resolve_tool_path(new_file, &self.cwd.canonicalize()?);
+        inside_root(&new_path, entry.client.root())?;
+        if new_path.try_exists()? {
+            return Err(tool_err("LSP_EDIT_CONFLICT", "rename destination already exists"));
+        }
+        let new_uri = try_path_to_uri(&new_path)?;
+        let capabilities = entry.client.capabilities().raw;
+        // These are capability keys, not protocol method names with 'Files'.
+        let will = registered_for_file(&capabilities, "willRename", &old_path)?;
+        let did = registered_for_file(&capabilities, "didRename", &old_path)?;
+        let params = json!({"files":[{"oldUri":old_uri,"newUri":new_uri}]});
+        let edit = if will {
+            entry.client.call("workspace/willRenameFiles", params.clone(), self.request_timeout(input)).await?
+        } else { Value::Null };
+        let combined = append_move(edit, &old_uri, &new_uri)?;
+        // One transaction computes import updates AND the move before any
+        // target changes. A late destination conflict cannot strand imports.
+        let outcome = self.apply_refactor(&entry, &combined, &snapshot, &owner)?;
+        let warning = if did {
+            entry.client.call_no_wait_notify("workspace/didRenameFiles", params)
+                .err().map(|error| {
+                    entry.client.kill();
+                    format!("Files were moved, but the server notification failed: {}. Do not repeat the move; reload the server.", error.message())
+                })
+        } else { None };
+        let updates: Vec<_> = outcome.files_changed.iter().map(|path| display_path(path, &self.cwd)).collect();
+        let payload = json!({
+            "action":"rename_file","from":display_path(&old_path,&self.cwd),"to":display_path(&new_path,&self.cwd),
+            "applied":true,"importUpdates":updates,"fileOps":outcome.file_ops_applied,
+            "willRenameFiles":will,"notificationRequested":did,"notificationWritten":did && warning.is_none(),
+            "warning":warning,"atomic":false,"rollbackOnError":true
         });
         Ok(super::text_output(payload.to_string(), payload))
     }

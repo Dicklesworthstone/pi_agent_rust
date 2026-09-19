@@ -6,7 +6,7 @@ use crate::tools::Tool as _;
 use std::process::{Command, Stdio};
 
 const SERVER: &str = r#"
-import json, pathlib, sys
+import json, pathlib, sys, urllib.parse, urllib.request
 root = pathlib.Path.cwd()
 mode = sys.argv[1]
 versions = {}
@@ -16,6 +16,8 @@ def send(message):
     sys.stdout.buffer.flush()
 def edits():
     return [{'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 3}}, 'newText': 'renamed'}]
+def native(uri):
+    return pathlib.Path(urllib.request.url2pathname(urllib.parse.urlsplit(uri).path))
 while True:
     headers = {}
     while True:
@@ -34,11 +36,27 @@ while True:
     if method == 'textDocument/didOpen':
         doc = params['textDocument']
         versions[doc['uri']] = doc['version']
+    if method == 'workspace/didRenameFiles':
+        moved = params['files'][0]
+        target = native(moved['newUri'])
+        evidence = {
+            'sourceExists': native(moved['oldUri']).exists(),
+            'targetExists': target.exists(),
+            'targetText': target.read_text(encoding='utf-8') if target.exists() else None,
+            'siblingText': (root / 'sibling.refactor').read_text(encoding='utf-8')
+        }
+        (root / 'notification.json').write_text(json.dumps(evidence), encoding='utf-8')
     if 'id' not in message:
         continue
     result = None
     if method == 'initialize':
         result = {'capabilities': {'textDocumentSync': 1, 'renameProvider': True}}
+        if mode.startswith('move-') and mode != 'move-unregistered':
+            glob = '**/*.other' if mode == 'move-filtered' else '**/*.refactor'
+            registration = {'filters': [{'scheme': 'file', 'pattern': {'glob': glob, 'matches': 'file'}}]}
+            result['capabilities']['workspace'] = {'fileOperations': {
+                'willRename': registration, 'didRename': registration
+            }}
     elif method == 'textDocument/rename':
         source = params['textDocument']['uri']
         sibling = (root / 'sibling.refactor').as_uri()
@@ -57,6 +75,28 @@ while True:
             result = {'documentChanges': [
                 {'textDocument': {'uri': sibling, 'version': None}, 'edits': edits()},
                 {'kind': 'rename', 'oldUri': source, 'newUri': (root / 'moved.refactor').as_uri()}
+            ]}
+    elif method == 'workspace/willRenameFiles':
+        source = params['files'][0]['oldUri']
+        destination = native(params['files'][0]['newUri'])
+        sibling = (root / 'sibling.refactor').as_uri()
+        result = {'changes': {source: edits(), sibling: edits()}}
+        if mode == 'move-appeared':
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text('external destination\n', encoding='utf-8')
+        elif mode == 'move-invalid':
+            result['changes'][sibling][0]['range']['end']['line'] = 999
+        elif mode == 'move-escape':
+            result['changes'][(root.parent / 'outside.refactor').as_uri()] = edits()
+        elif mode == 'move-drift':
+            (root / 'source.refactor').write_text('external source\n', encoding='utf-8')
+        elif mode == 'move-error':
+            send({'jsonrpc': '2.0', 'id': message['id'], 'error': {'code': -32603, 'message': 'import preparation failed'}})
+            continue
+        elif mode == 'move-ordered':
+            result = {'documentChanges': [
+                {'textDocument': {'uri': source, 'version': versions[source]}, 'edits': edits()},
+                {'textDocument': {'uri': sibling, 'version': None}, 'edits': edits()}
             ]}
     send({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
 "#;
@@ -208,4 +248,213 @@ fn cancelled_refactor_does_not_apply_an_already_available_edit() {
 fn oversized_rename_responses_are_rejected_before_copying_the_plan() {
     let raw = json!({"changes":{},"unexpected":"x".repeat(MAX_ACTION_BYTES + 1)});
     assert!(check_response_size(&raw).unwrap_err().to_string().contains("LSP_EDIT_LIMIT"));
+}
+
+fn move_file(tool: &LspTool, runtime: &asupersync::runtime::Runtime, destination: &str) -> Result<ToolOutput> {
+    runtime.block_on(tool.execute("move-case", json!({
+        "action":"rename_file","file":"source.refactor","newFile":destination,"timeout":5
+    }), None))
+}
+
+fn barrier(tool: &LspTool, runtime: &asupersync::runtime::Runtime, file: &str) {
+    runtime.block_on(tool.execute("barrier", json!({
+        "action":"request","file":file,"method":"test/barrier","timeout":5
+    }), None)).unwrap();
+}
+
+fn frames(root: &Path) -> Vec<Value> {
+    contents(root, "requests.jsonl").lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
+#[test]
+fn move_and_import_updates_finish_before_the_server_is_notified() {
+    for mode in ["move-normal", "move-ordered"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let target = "nested/deeper/renamed.refactor";
+        let output = move_file(&tool, &runtime, target).unwrap();
+        assert!(!output.is_error);
+        let details = output.details.unwrap();
+        assert_eq!(details["applied"], true);
+        assert_eq!(details["willRenameFiles"], true);
+        assert_eq!(details["notificationWritten"], true);
+        assert_eq!(details["importUpdates"].as_array().unwrap().len(), 2);
+        assert!(!temp.path().join("source.refactor").exists());
+        assert_eq!(contents(temp.path(), target), "renamed\n");
+        assert_eq!(contents(temp.path(), "sibling.refactor"), "renamed\n");
+        // The peer processes this request only after prior notifications.
+        barrier(&tool, &runtime, target);
+        let evidence: Value = serde_json::from_str(&contents(temp.path(), "notification.json")).unwrap();
+        assert_eq!(evidence, json!({
+            "sourceExists":false,"targetExists":true,
+            "targetText":"renamed\n","siblingText":"renamed\n"
+        }));
+        let frames = frames(temp.path());
+        let before = frames.iter().position(|frame| frame["method"] == "workspace/willRenameFiles").unwrap();
+        let after = frames.iter().position(|frame| frame["method"] == "workspace/didRenameFiles").unwrap();
+        assert!(before < after);
+    }
+}
+
+#[test]
+fn destination_created_while_waiting_leaves_imports_and_source_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "move-appeared") else { return };
+    let error = move_file(&tool, &runtime, "destination.refactor").unwrap_err();
+    assert!(error.to_string().contains("LSP_EDIT_CONFLICT"), "{error}");
+    assert_eq!(contents(temp.path(), "destination.refactor"), "external destination\n");
+    assert_eq!(contents(temp.path(), "source.refactor"), "old\n");
+    assert_eq!(contents(temp.path(), "sibling.refactor"), "old\n");
+    barrier(&tool, &runtime, "source.refactor");
+    assert!(!frames(temp.path()).iter().any(|frame| frame["method"] == "workspace/didRenameFiles"));
+}
+
+#[test]
+fn invalid_import_updates_and_provider_errors_prevent_the_entire_move() {
+    for (mode, code) in [("move-invalid", "LSP_EDIT_CONFLICT"), ("move-error", "import preparation failed")] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let error = move_file(&tool, &runtime, "new/deeper/destination.refactor").unwrap_err();
+        assert!(error.to_string().contains(code), "{error}");
+        assert_eq!(contents(temp.path(), "source.refactor"), "old\n");
+        assert_eq!(contents(temp.path(), "sibling.refactor"), "old\n");
+        assert!(!temp.path().join("new").exists());
+        barrier(&tool, &runtime, "source.refactor");
+        assert!(!temp.path().join("notification.json").exists());
+    }
+}
+
+#[test]
+fn escaping_import_edits_do_not_move_the_source_or_change_other_files() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("outside.refactor"), "old\n").unwrap();
+    let root = temp.path().join("workspace");
+    let Some((tool, runtime)) = fixture(&root, "move-escape") else { return };
+    let error = move_file(&tool, &runtime, "destination.refactor").unwrap_err();
+    assert!(error.to_string().contains("LSP_EDIT_SCOPE"), "{error}");
+    assert_eq!(contents(&root, "source.refactor"), "old\n");
+    assert_eq!(contents(&root, "sibling.refactor"), "old\n");
+    assert_eq!(contents(temp.path(), "outside.refactor"), "old\n");
+    assert!(!root.join("destination.refactor").exists());
+}
+
+#[test]
+fn source_changed_during_import_preparation_is_not_moved_or_overwritten() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "move-drift") else { return };
+    let error = move_file(&tool, &runtime, "destination.refactor").unwrap_err();
+    assert!(error.to_string().contains("LSP_EDIT_CONFLICT"), "{error}");
+    assert_eq!(contents(temp.path(), "source.refactor"), "external source\n");
+    assert_eq!(contents(temp.path(), "sibling.refactor"), "old\n");
+    assert!(!temp.path().join("destination.refactor").exists());
+}
+
+#[test]
+fn out_of_workspace_destination_is_rejected_before_will_rename_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let Some((tool, runtime)) = fixture(&root, "move-normal") else { return };
+    let destination = temp.path().canonicalize().unwrap().join("outside.refactor");
+    let error = move_file(&tool, &runtime, destination.to_str().unwrap()).unwrap_err();
+    assert!(error.to_string().contains("LSP_EDIT_SCOPE"), "{error}");
+    assert_eq!(contents(&root, "source.refactor"), "old\n");
+    assert!(!destination.exists());
+    barrier(&tool, &runtime, "source.refactor");
+    assert!(!frames(&root).iter().any(|frame| frame["method"] == "workspace/willRenameFiles"));
+}
+
+#[test]
+fn unregistered_or_nonmatching_servers_receive_no_file_operation_messages() {
+    for mode in ["move-unregistered", "move-filtered"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((tool, runtime)) = fixture(temp.path(), mode) else { return };
+        let output = move_file(&tool, &runtime, "destination.refactor").unwrap();
+        let details = output.details.unwrap();
+        assert_eq!(details["applied"], true);
+        assert_eq!(details["willRenameFiles"], false);
+        assert_eq!(details["notificationRequested"], false);
+        assert!(details["importUpdates"].as_array().unwrap().is_empty());
+        assert_eq!(contents(temp.path(), "destination.refactor"), "old\n");
+        assert_eq!(contents(temp.path(), "sibling.refactor"), "old\n");
+        assert!(!temp.path().join("source.refactor").exists());
+        barrier(&tool, &runtime, "destination.refactor");
+        assert!(!frames(temp.path()).iter().any(|frame| {
+            frame["method"] == "workspace/willRenameFiles" || frame["method"] == "workspace/didRenameFiles"
+        }));
+    }
+}
+
+#[test]
+fn appending_a_move_preserves_order_versions_and_change_annotations() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let old_uri = try_path_to_uri(&root.join("a.refactor")).unwrap();
+    let new_uri = try_path_to_uri(&root.join("b.refactor")).unwrap();
+    let original = json!({
+        "changes":{"ignored":42},
+        "documentChanges":[{"textDocument":{"uri":old_uri,"version":7},"edits":[]}],
+        "changeAnnotations":{"move":{"label":"Keep this label"}}
+    });
+    let combined = append_move(original.clone(), &old_uri, &new_uri).unwrap();
+    assert_eq!(combined["documentChanges"][0], original["documentChanges"][0]);
+    assert_eq!(combined["changeAnnotations"], original["changeAnnotations"]);
+    assert!(combined.get("changes").is_none());
+    assert_eq!(combined["documentChanges"][1], json!({
+        "kind":"rename","oldUri":old_uri,"newUri":new_uri,"options":{"overwrite":false}
+    }));
+    assert_eq!(parse_workspace_edit(&combined).unwrap().file_ops.len(), 1);
+    for malformed in [json!({"changes":42}), json!({"documentChanges":null}), json!(false)] {
+        assert!(append_move(malformed, &old_uri, &new_uri).is_err());
+    }
+}
+
+#[test]
+fn static_file_operation_filters_match_scheme_kind_case_and_native_paths() {
+    fn capabilities(filter: Value) -> Value {
+        json!({"workspace":{"fileOperations":{"willRename":{"filters":[filter]}}}})
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("My File.REFACTOR");
+    let matching = json!({"scheme":"file","pattern":{
+        "glob":"**/*.refactor","matches":"file","options":{"ignoreCase":true}
+    }});
+    assert!(registered_for_file(&capabilities(matching.clone()), "willRename", &path).unwrap());
+    assert!(!registered_for_file(&capabilities(matching.clone()), "didRename", &path).unwrap());
+    for (field, value) in [("scheme", json!("untitled")), ("matches", json!("folder")), ("ignoreCase", json!(false))] {
+        let mut filter = matching.clone();
+        match field {
+            "scheme" => filter[field] = value,
+            "matches" => filter["pattern"][field] = value,
+            _ => filter["pattern"]["options"][field] = value,
+        }
+        assert!(!registered_for_file(&capabilities(filter), "willRename", &path).unwrap());
+    }
+    for filter in [
+        json!({"scheme":true,"pattern":{"glob":"**/*"}}),
+        json!({"pattern":{"glob":"["}}),
+        json!({"pattern":{"glob":"**/*","matches":true}}),
+        json!({"pattern":{"glob":"**/*","options":{"ignoreCase":"yes"}}}),
+    ] {
+        assert!(registered_for_file(&capabilities(filter), "willRename", &path).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_requested_symlink_is_not_replaced_by_a_move_of_its_referent() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target.refactor");
+    let link = temp.path().join("link.refactor");
+    std::fs::write(&target, "keep referent").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let tool = LspTool::new(temp.path(), None);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let error = runtime.block_on(tool.execute("symlink", json!({
+        "action":"rename_file","file":"link.refactor","newFile":"moved.refactor"
+    }), None)).unwrap_err();
+    assert!(error.to_string().contains("LSP_FILE_UNREADABLE"));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep referent");
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(!temp.path().join("moved.refactor").exists());
 }

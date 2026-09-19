@@ -21,8 +21,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use client::{hover_to_text, parse_locations, path_to_uri, uri_to_path};
-use edits::{apply_workspace_edit, parse_workspace_edit};
+use client::{hover_to_text, parse_locations, uri_to_path};
 use registry::{LspRegistry, ServerEntry};
 use text::{Position, find_occurrences, offset_to_position};
 
@@ -362,96 +361,6 @@ impl LspTool {
         }
     }
 
-    async fn run_rename(&self, input: &LspInput) -> Result<ToolOutput> {
-        self.rename_symbol_checked(input).await
-    }
-
-    async fn run_rename_file(&self, input: &LspInput) -> Result<ToolOutput> {
-        let (Some(file), Some(new_file)) = (input.file.as_deref(), input.new_file.as_deref())
-        else {
-            return Ok(usage_error("lsp rename_file requires `file` and `newFile`"));
-        };
-        let old_path = resolve_tool_path(file, &self.cwd);
-        let new_path = resolve_tool_path(new_file, &self.cwd);
-        if !old_path.exists() {
-            return Err(tool_err(
-                "LSP_FILE_UNREADABLE",
-                format!("rename source does not exist: {}", old_path.display()),
-            ));
-        }
-        if new_path.exists() {
-            return Err(tool_err(
-                "LSP_EDIT_CONFLICT",
-                format!("rename target already exists: {}", new_path.display()),
-            ));
-        }
-        let (old_uri, entry) = self.synced(&old_path).await?;
-        let canonical_new = new_path
-            .parent()
-            .and_then(|parent| parent.canonicalize().ok())
-            .and_then(|parent| new_path.file_name().map(|name| parent.join(name)))
-            .unwrap_or_else(|| new_path.clone());
-        let new_uri = path_to_uri(&canonical_new);
-        let mut edits_applied = Vec::new();
-        if entry.client.capabilities().will_rename_files {
-            let result = entry
-                .client
-                .call(
-                    "workspace/willRenameFiles",
-                    json!({"files":[{"oldUri":old_uri,"newUri":new_uri}]}),
-                    self.request_timeout(input),
-                )
-                .await;
-            match result {
-                Ok(edit) if !edit.is_null() => {
-                    let plan = parse_workspace_edit(&edit)?;
-                    let outcome = apply_workspace_edit(&plan, None)?;
-                    for changed in &outcome.files_changed {
-                        entry.client.invalidate(&path_to_uri(changed));
-                        edits_applied.push(display_path(changed, &self.cwd));
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    return Err(tool_err(
-                        "LSP_SERVER_ERROR",
-                        format!(
-                            "willRenameFiles failed; file NOT moved (fail-closed): {}",
-                            err.message()
-                        ),
-                    ));
-                }
-            }
-        }
-        if let Some(parent) = new_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                tool_err(
-                    "LSP_EDIT_APPLY",
-                    format!("cannot create {}: {err}", parent.display()),
-                )
-            })?;
-        }
-        std::fs::rename(&old_path, &new_path).map_err(|err| {
-            tool_err(
-                "LSP_EDIT_APPLY",
-                format!(
-                    "cannot rename {} -> {}: {err}",
-                    old_path.display(),
-                    new_path.display()
-                ),
-            )
-        })?;
-        let _ = entry.client.call_no_wait_notify(
-            "workspace/didRenameFiles",
-            json!({"files":[{"oldUri":old_uri,"newUri":new_uri}]}),
-        );
-        entry.client.invalidate(&old_uri);
-        entry.client.invalidate(&new_uri);
-        let payload = json!({"action":"rename_file","from":display_path(&old_path,&self.cwd),"to":display_path(&new_path,&self.cwd),
-            "importUpdates":edits_applied,"willRenameFiles":entry.client.capabilities().will_rename_files});
-        Ok(text_output(payload.to_string(), payload))
-    }
-
     fn code_action_range(input: &LspInput, path: &Path) -> Result<Value> {
         if let Some(symbol) = input.symbol.as_deref() {
             let position = Self::resolve_position(path, input.line, symbol)?;
@@ -513,7 +422,7 @@ impl LspTool {
         let entry = self.client_for(&path).await?;
         let caps = entry.client.capabilities();
         let payload = json!({"action":"capabilities","server":entry.spec_name,"serverName":caps.server_name,
-            "willRenameFiles":caps.will_rename_files,"textDocumentSyncKind":caps.sync_kind,"capabilities":caps.raw});
+            "willRenameFiles":caps.raw.pointer("/workspace/fileOperations/willRename").is_some_and(Value::is_object),"textDocumentSyncKind":caps.sync_kind,"capabilities":caps.raw});
         Ok(text_output(payload.to_string(), payload))
     }
 
