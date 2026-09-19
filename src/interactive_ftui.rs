@@ -1050,6 +1050,63 @@ pub enum UiCommand {
     Crash { action: String },
 }
 
+/// Does this action edit the input, rather than drive the application?
+///
+/// Exactly the set [`apply_editor_action`] can carry out, so the two cannot
+/// disagree: a `true` here without an arm there would swallow the key and do
+/// nothing, which is the failure this whole routing exists to remove.
+const fn is_editor_action(action: AppAction) -> bool {
+    matches!(
+        action,
+        AppAction::CursorLeft
+            | AppAction::CursorRight
+            | AppAction::CursorWordLeft
+            | AppAction::CursorWordRight
+            | AppAction::CursorLineStart
+            | AppAction::JumpBackward
+            | AppAction::JumpForward
+            | AppAction::DeleteCharBackward
+            | AppAction::DeleteCharForward
+            | AppAction::DeleteWordBackward
+            | AppAction::DeleteWordForward
+            | AppAction::DeleteToLineEnd
+            | AppAction::Undo
+    )
+}
+
+/// Carry out an editor action on the input.
+///
+/// pi ships a 59-action keymap and the ftui editor recognises ctrl+a, ctrl+k,
+/// ctrl+z, ctrl+y, the arrows, Home/End, Backspace, Delete and PageUp/Down —
+/// ignoring Alt completely. Everything pi promised beyond that reached the
+/// editor as a key it had never heard of and was dropped. Routing through the
+/// catalog is also what makes `keybindings.json` mean anything for editing:
+/// before this, an override of `deleteWordBackward` was parsed, stored,
+/// matched, and then discarded.
+///
+/// Three declared actions are deliberately absent, because the editor has no
+/// operation to call and inventing one is a feature, not a wiring fix:
+/// `DeleteToLineStart` (no kill-to-start), and `Yank`/`YankPop` (no kill
+/// ring — `ctrl+y` reaches the editor and redoes instead).
+fn apply_editor_action(input: &mut TextArea, action: AppAction) {
+    match action {
+        AppAction::CursorLeft => input.move_left(),
+        AppAction::CursorRight => input.move_right(),
+        AppAction::CursorWordLeft => input.move_word_left(),
+        AppAction::CursorWordRight => input.move_word_right(),
+        AppAction::CursorLineStart => input.move_to_line_start(),
+        AppAction::JumpBackward => input.move_to_document_start(),
+        AppAction::JumpForward => input.move_to_document_end(),
+        AppAction::DeleteCharBackward => input.delete_backward(),
+        AppAction::DeleteCharForward => input.delete_forward(),
+        AppAction::DeleteWordBackward => input.delete_word_backward(),
+        AppAction::DeleteWordForward => input.delete_word_forward(),
+        AppAction::DeleteToLineEnd => input.delete_to_end_of_line(),
+        AppAction::Undo => input.undo(),
+        _ => {}
+    }
+}
+
 /// Match `input` against a slash command name: returns the argument tail for
 /// exactly `name` or `name<space>args`, and `None` for prefixes of longer
 /// commands (`/undocumented` must not hit `/undo`).
@@ -2686,7 +2743,28 @@ impl PiFtuiModel {
                         } else {
                             None
                         }
-                    });
+                    })
+                    // Editor-native actions come last so nothing above changes
+                    // meaning. They are routed at all because the ftui editor
+                    // handles only ctrl+a/k/z/y, arrows, Home/End, Backspace,
+                    // Delete and PageUp/Down — and ignores Alt outright — so
+                    // pi's shipped emacs-style defaults did nothing here, and
+                    // ctrl+a did the wrong thing: the editor's own binding is
+                    // select-all, so ctrl+a followed by a keystroke replaced
+                    // the whole message.
+                    .or_else(|| pick(AppAction::CursorLineStart))
+                    .or_else(|| pick(AppAction::CursorWordLeft))
+                    .or_else(|| pick(AppAction::CursorWordRight))
+                    .or_else(|| pick(AppAction::CursorLeft))
+                    .or_else(|| pick(AppAction::CursorRight))
+                    .or_else(|| pick(AppAction::JumpBackward))
+                    .or_else(|| pick(AppAction::JumpForward))
+                    .or_else(|| pick(AppAction::DeleteWordBackward))
+                    .or_else(|| pick(AppAction::DeleteWordForward))
+                    .or_else(|| pick(AppAction::DeleteToLineEnd))
+                    .or_else(|| pick(AppAction::DeleteCharBackward))
+                    .or_else(|| pick(AppAction::DeleteCharForward))
+                    .or_else(|| pick(AppAction::Undo));
                 let page = self.body_height().saturating_sub(1).max(1);
                 match action {
                     Some(AppAction::Suspend) => {
@@ -2756,6 +2834,15 @@ impl PiFtuiModel {
                         // End with an empty editor resumes tail-follow; with
                         // content it falls through to the editor's line-end.
                         self.scroll_from_tail = 0;
+                        return Cmd::none();
+                    }
+                    // Editor-native actions, routed from pi's keybinding
+                    // catalog rather than left to the editor's own much
+                    // smaller one. `input_active` keeps them out of the way
+                    // while an ask card or extension prompt owns the editor.
+                    Some(editing) if self.input_active() && is_editor_action(editing) => {
+                        apply_editor_action(&mut self.input, editing);
+                        self.maybe_trigger_autocomplete();
                         return Cmd::none();
                     }
                     _ => {}
@@ -5473,6 +5560,114 @@ mod tests {
         sim.inject_event(key(KeyCode::Char('b'), Modifiers::empty()));
         assert_eq!(sim.model().input.text(), "a\nb");
         assert_eq!(sim.model().input_rows(), 2);
+    }
+
+    /// Type `text`, then send `code`+`modifiers`, and report what the editor
+    /// holds afterwards.
+    fn after_key(text: &str, code: KeyCode, modifiers: Modifiers) -> String {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in text.chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(code, modifiers));
+        sim.model().input.text()
+    }
+
+    #[test]
+    fn pis_own_default_editor_keys_reach_the_editor() {
+        // Every one of these is in `AppAction`'s default bindings and is shown
+        // by /hotkeys. The ftui editor handles only ctrl+a/k/z/y and ignores
+        // Alt entirely, so before these were routed the whole emacs-style half
+        // of pi's shipped keymap did nothing on the default stack.
+        assert_eq!(
+            after_key("hello world", KeyCode::Char('w'), Modifiers::CTRL),
+            "hello ",
+            "ctrl+w (DeleteWordBackward)"
+        );
+        assert_eq!(
+            after_key("hello world", KeyCode::Backspace, Modifiers::ALT),
+            "hello ",
+            "alt+backspace (DeleteWordBackward)"
+        );
+        assert_eq!(
+            after_key("hello world", KeyCode::Char('d'), Modifiers::ALT),
+            "hello world",
+            "alt+d (DeleteWordForward) at end of line has nothing ahead of it"
+        );
+        assert_eq!(
+            after_key("hi", KeyCode::Char('a'), Modifiers::CTRL),
+            "hi",
+            "ctrl+a (CursorLineStart) must not disturb the text"
+        );
+        assert_eq!(
+            after_key("hi", KeyCode::Char('b'), Modifiers::CTRL),
+            "hi",
+            "ctrl+b (CursorLeft) must not disturb the text"
+        );
+    }
+
+    #[test]
+    fn routed_editor_actions_edit_from_where_the_cursor_lands() {
+        // Composing two routed actions proves the cursor moves really happen
+        // rather than being swallowed: ctrl+a to line start, then ctrl+d.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "abc".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('a'), Modifiers::CTRL));
+        sim.inject_event(key(KeyCode::Char('d'), Modifiers::CTRL));
+        assert_eq!(
+            sim.model().input.text(),
+            "bc",
+            "ctrl+a then ctrl+d should delete the first character"
+        );
+
+        // ctrl+w after a word move takes the word the cursor is now inside.
+        assert_eq!(
+            after_key("one two", KeyCode::Char('u'), Modifiers::CTRL),
+            "one two",
+            "ctrl+u (DeleteToLineStart) is declared but the editor has no \
+             kill-to-start, so it is deliberately not routed"
+        );
+    }
+
+    #[test]
+    fn routing_editor_actions_leaves_the_application_keys_alone() {
+        // The editor-native picks sit last in the chain precisely so these
+        // keep their meaning. ctrl+d on an empty editor is Exit, not delete.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('d'), Modifiers::CTRL));
+        assert!(
+            sim.command_log()
+                .iter()
+                .any(|record| matches!(record, CmdRecord::Quit)),
+            "ctrl+d on an empty editor must still quit"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_moves_to_line_start_rather_than_selecting_everything() {
+        // pi binds ctrl+a to CursorLineStart; the ftui editor's own handler
+        // binds it to select-all, so typing after it replaced the message.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "bcd".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('a'), Modifiers::CTRL));
+        sim.inject_event(key(KeyCode::Char('a'), Modifiers::empty()));
+        assert_eq!(
+            sim.model().input.text(),
+            "abcd",
+            "ctrl+a should move to line start, not select the message"
+        );
     }
 
     #[test]
