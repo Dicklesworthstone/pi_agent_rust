@@ -3847,7 +3847,9 @@ impl Agent {
         let mut tool_call_started = false;
 
         'stream: loop {
-            if checkpoint_cx.checkpoint().is_err() {
+            if checkpoint_cx.checkpoint().is_err()
+                || abort.as_ref().is_some_and(AbortSignal::is_aborted)
+            {
                 let last_partial = if added_partial {
                     match self
                         .messages
@@ -10943,44 +10945,48 @@ mod abort_tests {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
+        let handle = runtime.handle();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+        let provider = Arc::new(HangingProvider);
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let mut agent_session =
+            AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+        let ambient_cx = asupersync::Cx::for_testing();
+        let cancel_cx = ambient_cx.clone();
+
+        let cancel_thread = std::thread::spawn(move || {
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("stream start");
+            cancel_cx.set_cancel_requested(true);
+        });
+
+        let join = handle.spawn(async move {
+            let _current = asupersync::Cx::set_current(Some(ambient_cx));
+            agent_session
+                .run_text_with_abort("hello".to_string(), None, move |event| {
+                    if matches!(
+                        event,
+                        AgentEvent::MessageStart {
+                            message: Message::Assistant(_)
+                        }
+                    ) {
+                        let _ = started_tx.send(());
+                    }
+                })
+                .await
+        });
 
         runtime.block_on(async move {
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-
-            let provider = Arc::new(HangingProvider);
-            let tools = ToolRegistry::new(&[], Path::new("."), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-
-            let ambient_cx = asupersync::Cx::for_testing();
-            let cancel_cx = ambient_cx.clone();
-            let _current = asupersync::Cx::set_current(Some(ambient_cx));
-
-            let cancel_thread = std::thread::spawn(move || {
-                started_rx
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("stream start");
-                cancel_cx.set_cancel_requested(true);
-            });
-
-            let run = agent_session.run_text_with_abort("hello".to_string(), None, move |event| {
-                if matches!(
-                    event,
-                    AgentEvent::MessageStart {
-                        message: Message::Assistant(_)
-                    }
-                ) {
-                    let _ = started_tx.send(());
-                }
-            });
-            futures::pin_mut!(run);
-
             let message = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 std::time::Duration::from_secs(10),
-                run,
+                join,
             )
             .await
             .expect("ambient cancellation should finish before timeout")
