@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{ApplyOutcome, Image, Result, Transaction, WorkspaceEditPlan, conflict};
 use crate::lsp::text::content_hash_for_drift;
@@ -62,6 +62,56 @@ fn prepare_checked(
         }
     }
     Ok(transaction)
+}
+
+/// An immutable, memory-only transaction retained between review and approval.
+/// Staging creates no directories, backups or temporary files. Commit consumes
+/// this value and checks the exact original bytes, permissions and absence;
+/// it never stages a replacement plan against newly read contents.
+pub(in crate::lsp) struct PreparedEdit(Transaction);
+
+impl PreparedEdit {
+    #[allow(clippy::implicit_hasher)]
+    pub(in crate::lsp) fn new(
+        plan: &WorkspaceEditPlan,
+        expected: &HashMap<PathBuf, FileEvidence>,
+    ) -> Result<Self> {
+        prepare_checked(plan, expected).map(Self)
+    }
+
+    pub(in crate::lsp) fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.0.files.keys()
+    }
+
+    pub(in crate::lsp) fn matches_document(&self, path: &Path, text: &str) -> bool {
+        self.0.files.get(path).and_then(|file| file.before.as_ref())
+            .is_some_and(|image| image.bytes.as_ref() == text.as_bytes())
+    }
+
+    /// Includes guard-only and no-op files, which also constrain approval.
+    pub(in crate::lsp) fn summary(&self, cwd: &Path) -> Vec<serde_json::Value> {
+        self.0.files.iter().map(|(path, file)| serde_json::json!({
+            "file":crate::lsp::display_path(path, cwd),
+            "beforeBytes":file.before.as_ref().map(|image| image.bytes.len()),
+            "afterBytes":file.after.as_ref().map(|image| image.bytes.len()),
+            "changed":file.before != file.after
+        })).collect()
+    }
+
+    pub(in crate::lsp) fn verify(&self) -> Result<()> {
+        for (path, file) in &self.0.files {
+            super::verify_image(path, file.before.as_ref())
+                .map_err(|error| super::io_context(path, &error))?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::lsp) fn commit(self, before_commit: impl FnOnce() -> Result<()>) -> Result<ApplyOutcome> {
+        self.verify()?;
+        // Recheck the caller after potentially expensive original-image reads.
+        before_commit()?;
+        self.0.commit()
+    }
 }
 
 /// Apply one rollback-safe batch and return staged content/existence evidence.

@@ -10,7 +10,7 @@ use super::{
     json, lock, parse_workspace_edit, resolve_tool_path, tool_err, verify_source,
 };
 use crate::lsp::client::{DocumentSnapshot, try_path_to_uri, uri_to_path};
-use crate::lsp::edits::WorkspaceEditPlan;
+use crate::lsp::edits::{FileEvidence, PreparedEdit, WorkspaceEditPlan};
 
 mod formatting;
 mod versions;
@@ -228,6 +228,42 @@ fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Re
 }
 
 impl LspTool {
+    fn prepare_refactor(
+        &self,
+        entry: &ServerEntry,
+        raw: &Value,
+        snapshot: &RefactorSnapshot,
+    ) -> Result<PreparedEdit> {
+        check_response_size(raw)?;
+        let plan = parse_workspace_edit(raw)?;
+        let hashes = snapshot.validate(entry, raw, &plan)?;
+        // Admission precedes staging: even a preview must not read arbitrary
+        // server-selected files. This is the same boundary as apply_scoped.
+        let root = entry.client.root();
+        for path in plan.text_edits.keys().chain(hashes.keys()) {
+            inside_root(path, root)?;
+        }
+        for operation in &plan.file_ops {
+            match operation {
+                FileOp::Create { path, .. } | FileOp::Delete { path } => inside_root(path, root)?,
+                FileOp::Rename { old_path, new_path, .. } => {
+                    inside_root(old_path, root)?;
+                    inside_root(new_path, root)?;
+                }
+            }
+        }
+        let expected = hashes.into_iter().map(|(path, hash)| (path, FileEvidence::Text(hash))).collect();
+        PreparedEdit::new(&plan, &expected)
+    }
+
+    pub(in crate::lsp) fn invalidate_refactor(&self, entry: &ServerEntry) {
+        entry.client.invalidate_all();
+        lock(&self.actions.cache).clear();
+        self.hierarchies.clear();
+        self.completions.clear();
+        self.refactors.clear();
+    }
+
     pub(super) fn apply_refactor(
         &self,
         entry: &ServerEntry,
@@ -250,8 +286,7 @@ impl LspTool {
         let result = apply_scoped(entry, raw, Some(&hashes));
         // Also discard stale handles after an incomplete rollback. Do not let
         // cached diagnostics or selected actions claim the old files still exist.
-        entry.client.invalidate_all();
-        lock(&self.actions.cache).clear();
+        self.invalidate_refactor(entry);
         result
     }
 
@@ -289,6 +324,14 @@ impl LspTool {
                 self.request_timeout(input),
             )
             .await?;
+        if input.apply == Some(false) {
+            crate::lsp::refactor_preview::check_owner(&owner)?;
+            let prepared = self.prepare_refactor(&entry, &raw, &snapshot)?;
+            return self.cache_refactor(
+                &entry, prepared, raw,
+                json!({"action":"rename","newName":new_name}), None, &owner,
+            );
+        }
         let outcome = self.apply_refactor(&entry, &raw, &snapshot, &owner)?;
         let files: Vec<_> = outcome
             .files_changed
@@ -355,18 +398,20 @@ impl LspTool {
             Value::Null
         };
         let combined = append_move(edit, &old_uri, &new_uri)?;
+        if input.apply == Some(false) {
+            crate::lsp::refactor_preview::check_owner(&owner)?;
+            let prepared = self.prepare_refactor(&entry, &combined, &snapshot)?;
+            return self.cache_refactor(
+                &entry, prepared, combined,
+                json!({"action":"rename_file","from":display_path(&old_path,&self.cwd),
+                    "to":display_path(&new_path,&self.cwd),"willRenameFiles":will}),
+                did.then_some(params), &owner,
+            );
+        }
         // One transaction computes import updates AND the move before any
         // target changes. A late destination conflict cannot strand imports.
         let outcome = self.apply_refactor(&entry, &combined, &snapshot, &owner)?;
-        let warning = if did {
-            entry.client.call_no_wait_notify("workspace/didRenameFiles", params)
-                .err().map(|error| {
-                    entry.client.kill();
-                    format!("Files were moved, but the server notification failed: {}. Do not repeat the move; reload the server.", error.message())
-                })
-        } else {
-            None
-        };
+        let warning = Self::notify_refactor_move(&entry, did.then_some(params));
         let updates: Vec<_> = outcome
             .files_changed
             .iter()
