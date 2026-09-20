@@ -318,7 +318,7 @@ pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded>
     let format = item
         .get("insertTextFormat")
         .filter(|value| !value.is_null());
-    if format.is_none() || format.is_some_and(|value| value.as_u64() == Some(1)) {
+    if format.is_none_or(|value| value.as_u64() == Some(1)) {
         if values.is_some() {
             return Err(tool_err(
                 "LSP_USAGE",
@@ -331,20 +331,22 @@ pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded>
             missing: Vec::new(),
         });
     }
-    if !format.is_some_and(|value| value.as_u64() == Some(2)) {
+    if format.is_none_or(|value| value.as_u64() != Some(2)) {
         return Err(malformed("invalid completion insertTextFormat"));
     }
     bounded_size(item, MAX_ITEM_BYTES)?;
     let explicit_edit = item.get("textEdit").filter(|value| !value.is_null());
-    let text = if let Some(edit) = explicit_edit {
-        edit.get("newText")
-    } else {
-        item.get("insertText")
-            .filter(|value| !value.is_null())
-            .or_else(|| item.get("label"))
-    }
-    .and_then(Value::as_str)
-    .ok_or_else(|| malformed("snippet insertion text must be a string"))?;
+    let text = explicit_edit
+        .map_or_else(
+            || {
+                item.get("insertText")
+                    .filter(|value| !value.is_null())
+                    .or_else(|| item.get("label"))
+            },
+            |edit| edit.get("newText"),
+        )
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("snippet insertion text must be a string"))?;
     let mut parser = Parser::new(text)?;
     let nodes = parser.sequence(false, 0)?;
     let values = values

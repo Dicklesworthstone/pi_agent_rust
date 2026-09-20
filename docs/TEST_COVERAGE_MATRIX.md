@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 340 current source files.
+- `rg --files src -g '*.rs' | sort` -> 348 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 340.
+- Source-file rows below: 348.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -236,6 +236,13 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/hierarchy/tests.rs` | LSP call hierarchy test suite | Test module; hierarchy tests. |
 | `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
 | `src/lsp/registry.rs` | LSP registry | `tests/lsp.rs`. |
+| `src/lsp/semantic.rs` | LSP semantic inspection, signature help, and inlay hints | Unit; `src/lsp/semantic/tests.rs`, `src/lsp/semantic/tests/hints.rs`. |
+| `src/lsp/semantic/hints.rs` | LSP inlay hints resolution and parameter/type hints | Unit; `src/lsp/semantic/hints/tests.rs`. |
+| `src/lsp/semantic/hints/tests.rs` | LSP inlay hints parser and contract test suite | Test module; inlay hint tests. |
+| `src/lsp/semantic/signatures.rs` | LSP signature help, parameter doc extraction, and overload resolution | Unit; `src/lsp/semantic/signatures/tests.rs`. |
+| `src/lsp/semantic/signatures/tests.rs` | LSP signature help parsing and formatting test suite | Test module; signature help tests. |
+| `src/lsp/semantic/tests.rs` | LSP semantic inspection and signature help integration test suite | Test module; semantic inspection tests. |
+| `src/lsp/semantic/tests/hints.rs` | LSP inlay hint integration and resolve scenario tests | Test module; inlay hint integration tests. |
 | `src/lsp/text.rs` | LSP text mapping | `tests/lsp.rs`. |
 | `src/lsp/workspace_diagnostics.rs` | LSP workspace diagnostics tool | Unit; `src/lsp/workspace_diagnostics/tests.rs`. |
 | `src/lsp/workspace_diagnostics/tests.rs` | LSP workspace diagnostics test suite | Test module; workspace diagnostics tests. |
@@ -249,6 +256,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/mcp/manager/calls.rs` | MCP tool call execution and cancellation | Unit; `tests/mcp.rs`. |
 | `src/mcp/manager/catalog.rs` | MCP tool catalog discovery and pagination | Unit; `tests/mcp_conformance.rs`. |
 | `src/mcp/manager/catalog/context.rs` | MCP resource catalog and context discovery | Unit; in-module tests. |
+| `src/mcp/manager/connection.rs` | MCP server connection setup, lifecycle, and owner tracking | Unit; `tests/mcp.rs`. |
 | `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
 | `src/mcp/trust.rs` | MCP trust | `tests/mcp.rs`. |
 | `src/media_tools.rs` | Opt-in media trio tools `inspect_image` / `generate_image` / `tts` (bd-cv653.2.7) | `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |

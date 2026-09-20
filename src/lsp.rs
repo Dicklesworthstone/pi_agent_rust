@@ -11,9 +11,9 @@ mod completion;
 mod diagnostics_tests;
 pub mod edits;
 mod hierarchy;
-mod semantic;
 pub mod jsonrpc;
 pub mod registry;
+mod semantic;
 pub mod text;
 mod workspace_diagnostics;
 
@@ -590,7 +590,7 @@ struct LspInput {
 }
 
 #[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
+#[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for LspTool {
     fn name(&self) -> &str {
         "lsp"
@@ -600,8 +600,9 @@ impl Tool for LspTool {
     }
     fn description(&self) -> &str {
         concat!(
-        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Numeric snippet placeholders accept literal snippetValues; repeat the values when applying. Commands, snippet variables and transforms are unsupported. Completion range is an explicit replacement fallback for servers omitting textEdit. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
-        , " signature_help inspects callable overloads and the active parameter at file + exact position. inlay_hints inspects inferred types and argument labels over file + optional exact range; resolve:true obtains lazy tooltips and label locations. Both actions are read-only and never accept hint edits or run commands.")
+            "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Numeric snippet placeholders accept literal snippetValues; repeat the values when applying. Commands, snippet variables and transforms are unsupported. Completion range is an explicit replacement fallback for servers omitting textEdit. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16.",
+            " signature_help inspects callable overloads and the active parameter at file + exact position. inlay_hints inspects inferred types and argument labels over file + optional exact range; resolve:true obtains lazy tooltips and label locations. Both actions are read-only and never accept hint edits or run commands."
+        )
     }
     fn parameters(&self) -> Value {
         json!({
@@ -646,6 +647,7 @@ impl Tool for LspTool {
             .union(ToolEffects::write())
             .union(ToolEffects::process())
     }
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -658,7 +660,10 @@ impl Tool for LspTool {
             return Err(tool_err("LSP_USAGE", "line must be 1-indexed"));
         }
         if input.resolve.is_some() && input.action != "inlay_hints" {
-            return Err(tool_err("LSP_USAGE", "resolve is supported only by inlay_hints"));
+            return Err(tool_err(
+                "LSP_USAGE",
+                "resolve is supported only by inlay_hints",
+            ));
         }
         if input.action != "completion"
             && (input.completion_id.is_some() || input.snippet_values.is_some())

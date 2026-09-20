@@ -150,10 +150,12 @@ impl std::fmt::Debug for CachedToken {
 /// serde diagnostics can otherwise quote an unexpected credential value.
 fn parse_session_token_response(text: &str, now: i64) -> Result<CopilotTokenResponse> {
     if text.len() > MAX_TOKEN_RESPONSE_BYTES {
-        return Err(Error::auth("Copilot token response exceeded the size limit"));
+        return Err(Error::auth(
+            "Copilot token response exceeded the size limit",
+        ));
     }
-    let response: CopilotTokenResponse = serde_json::from_str(text)
-        .map_err(|_| Error::auth("Invalid Copilot token response"))?;
+    let response: CopilotTokenResponse =
+        serde_json::from_str(text).map_err(|_| Error::auth("Invalid Copilot token response"))?;
     // Do not trim or otherwise rewrite an opaque credential. Reject values
     // that cannot safely form a single HTTP Authorization header instead.
     if response.token.is_empty() || !response.token.bytes().all(|byte| byte.is_ascii_graphic()) {
@@ -834,7 +836,13 @@ mod tests {
         *provider.cached_token.lock().expect("cache") = Some(cached_session("new-token"));
         provider.invalidate_session_token("old-token");
         assert_eq!(
-            provider.cached_token.lock().expect("cache").as_ref().expect("retained").token,
+            provider
+                .cached_token
+                .lock()
+                .expect("cache")
+                .as_ref()
+                .expect("retained")
+                .token,
             "new-token"
         );
         provider.invalidate_session_token("new-token");
@@ -849,21 +857,32 @@ mod tests {
             api_key: Some("github-secret".to_string()),
             max_tokens: Some(123),
             headers: [
-                ("authorization".to_string(), "Bearer github-secret".to_string()),
+                (
+                    "authorization".to_string(),
+                    "Bearer github-secret".to_string(),
+                ),
                 ("AUTHORIZATION".to_string(), "stale-session".to_string()),
                 ("X-Request-Id".to_string(), "request-1".to_string()),
-            ].into_iter().collect(),
+            ]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
-        let options = CopilotProvider::session_options(&cached_session("session-secret"), &original);
-        let auth: Vec<_> = options.headers.iter()
+        let options =
+            CopilotProvider::session_options(&cached_session("session-secret"), &original);
+        let auth: Vec<_> = options
+            .headers
+            .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
             .collect();
         assert_eq!(auth.len(), 1);
         assert_eq!(auth[0].1, "Bearer session-secret");
         assert_eq!(options.api_key.as_deref(), Some("session-secret"));
         assert_eq!(options.max_tokens, Some(123));
-        assert_eq!(options.headers.get("X-Request-Id").map(String::as_str), Some("request-1"));
+        assert_eq!(
+            options.headers.get("X-Request-Id").map(String::as_str),
+            Some("request-1")
+        );
         assert_eq!(original.api_key.as_deref(), Some("github-secret"));
         assert_eq!(original.headers.len(), 3);
     }
@@ -877,7 +896,12 @@ mod tests {
     fn recovery_fixture(
         test_name: &str,
         responses: &[(u16, &str)],
-    ) -> (CopilotProvider, StreamOptions, Arc<AtomicUsize>, tempfile::TempDir) {
+    ) -> (
+        CopilotProvider,
+        StreamOptions,
+        Arc<AtomicUsize>,
+        tempfile::TempDir,
+    ) {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut interactions = Vec::new();
         for (index, &(status, body)) in responses.iter().enumerate() {
@@ -893,11 +917,14 @@ mod tests {
                     response: RecordedResponse {
                         status: 200,
                         headers: vec![],
-                        body_chunks: vec![serde_json::json!({
-                            "token": "fresh-session",
-                            "expires_at": chrono::Utc::now().timestamp() + 3600,
-                            "endpoints": {"api": "https://copilot-proxy.example.com/v1"}
-                        }).to_string()],
+                        body_chunks: vec![
+                            serde_json::json!({
+                                "token": "fresh-session",
+                                "expires_at": chrono::Utc::now().timestamp() + 3600,
+                                "endpoints": {"api": "https://copilot-proxy.example.com/v1"}
+                            })
+                            .to_string(),
+                        ],
                         body_chunks_base64: None,
                     },
                 });
@@ -927,9 +954,12 @@ mod tests {
         std::fs::write(
             temp.path().join(format!("{test_name}.json")),
             serde_json::to_string_pretty(&cassette).expect("serialize"),
-        ).expect("write cassette");
+        )
+        .expect("write cassette");
         let client = Client::new().with_vcr(VcrRecorder::new_with(
-            test_name, VcrMode::Playback, temp.path(),
+            test_name,
+            VcrMode::Playback,
+            temp.path(),
         ));
         let provider = CopilotProvider::new("gpt-4o", "github-secret")
             .with_github_api_base(GITHUB_API_BASE)
@@ -938,10 +968,12 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&attempts);
         let options = StreamOptions {
-            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(move |_| {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async { Some(recovery_request_body()) })
-            })),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Some(recovery_request_body()) })
+                },
+            )),
             ..Default::default()
         };
         (provider, options, attempts, temp)
@@ -949,7 +981,9 @@ mod tests {
 
     #[test]
     fn rejected_cached_session_refreshes_once_and_streams() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let (provider, options, attempts, _temp) = recovery_fixture(
                 "copilot_recover_401",
@@ -971,10 +1005,13 @@ mod tests {
 
     #[test]
     fn repeated_rejection_is_bounded_and_evicts_rejected_refresh() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let (provider, options, attempts, _temp) = recovery_fixture(
-                "copilot_repeated_401", &[(401, "expired"), (401, "still rejected")],
+                "copilot_repeated_401",
+                &[(401, "expired"), (401, "still rejected")],
             );
             let result = provider.stream(&Context::default(), &options).await;
             let error = result.err().expect("second rejection must be returned");
@@ -986,24 +1023,35 @@ mod tests {
 
     #[test]
     fn non_auth_proxy_errors_are_not_replayed() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             for status in [400, 403, 429, 500, 503] {
                 let (provider, options, attempts, _temp) = recovery_fixture(
                     &format!("copilot_no_replay_{status}"),
                     &[(status, "upstream body mentions HTTP 401")],
                 );
-                let error = provider.stream(&Context::default(), &options).await.err().expect("error");
+                let error = provider
+                    .stream(&Context::default(), &options)
+                    .await
+                    .err()
+                    .expect("error");
                 assert!(!provider.session_token_rejected(&error));
                 assert_eq!(attempts.load(Ordering::SeqCst), 1);
-                assert_eq!(provider.ensure_session_token().await.expect("cached").token, "old-session");
+                assert_eq!(
+                    provider.ensure_session_token().await.expect("cached").token,
+                    "old-session"
+                );
             }
         });
     }
 
     #[test]
     fn established_stream_errors_never_trigger_reauthentication() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let (provider, options, attempts, _temp) = recovery_fixture(
                 "copilot_no_stream_replay",
@@ -1023,13 +1071,23 @@ mod tests {
     #[test]
     fn session_response_requires_header_safe_unexpired_credentials() {
         let now = 1_700_000_000;
-        for token in ["", " ", " secret", "secret ", "secret\tvalue", "secret\r\nInjected: yes", "secret\u{7f}", "sëcret"] {
+        for token in [
+            "",
+            " ",
+            " secret",
+            "secret ",
+            "secret\tvalue",
+            "secret\r\nInjected: yes",
+            "secret\u{7f}",
+            "sëcret",
+        ] {
             let body = serde_json::json!({"token": token, "expires_at": now + 3600}).to_string();
             let error = parse_session_token_response(&body, now).expect_err("unsafe credential");
             assert!(error.to_string().contains("unusable session token"));
         }
         for expires_at in [now - 1, now, i64::MIN] {
-            let body = serde_json::json!({"token": "secret-marker", "expires_at": expires_at}).to_string();
+            let body =
+                serde_json::json!({"token": "secret-marker", "expires_at": expires_at}).to_string();
             let error = parse_session_token_response(&body, now).expect_err("expired credential");
             assert!(error.to_string().contains("expired session token"));
             assert!(!error.to_string().contains("secret-marker"));
@@ -1039,7 +1097,8 @@ mod tests {
         let body = serde_json::json!({
             "token": "tid=test;exp=1700000001;sku=copilot;sig=a+b/c=",
             "expires_at": now + 1
-        }).to_string();
+        })
+        .to_string();
         let parsed = parse_session_token_response(&body, now).expect("valid opaque token");
         assert_eq!(parsed.expires_at, now + 1);
     }
@@ -1079,16 +1138,24 @@ mod tests {
 
     #[test]
     fn invalid_exchange_credentials_never_populate_the_cache() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let now = chrono::Utc::now().timestamp();
             for (index, (token, expires_at)) in [
                 ("", now + 3600),
                 ("secret\r\nInjected: yes", now + 3600),
                 ("expired-secret", now - 1),
-            ].into_iter().enumerate() {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let (client, _temp) = vcr_token_exchange_client(
-                    &format!("copilot_invalid_token_{index}"), token, expires_at, "",
+                    &format!("copilot_invalid_token_{index}"),
+                    token,
+                    expires_at,
+                    "",
                 );
                 let provider = CopilotProvider::new("gpt-4o", "github-secret")
                     .with_github_api_base(GITHUB_API_BASE)
@@ -1101,18 +1168,24 @@ mod tests {
 
     #[test]
     fn oversized_exchange_response_is_rejected_before_caching() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let body = serde_json::json!({
                 "token": "secret-marker",
                 "expires_at": chrono::Utc::now().timestamp() + 3600,
                 "padding": "x".repeat(MAX_TOKEN_RESPONSE_BYTES)
-            }).to_string();
+            })
+            .to_string();
             let (client, _temp) = vcr_raw_token_client("copilot_oversized_token", 200, body);
             let provider = CopilotProvider::new("gpt-4o", "github-secret")
                 .with_github_api_base(GITHUB_API_BASE)
                 .with_client(client);
-            let error = provider.ensure_session_token().await.expect_err("oversized response");
+            let error = provider
+                .ensure_session_token()
+                .await
+                .expect_err("oversized response");
             assert!(error.to_string().contains("size limit"));
             assert!(!error.to_string().contains("secret-marker"));
             assert!(provider.cached_token.lock().expect("cache").is_none());
@@ -1121,7 +1194,9 @@ mod tests {
 
     #[test]
     fn failed_exchange_responses_do_not_disclose_response_bodies() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             for status in [401, 403, 429, 500] {
                 let (client, _temp) = vcr_raw_token_client(
@@ -1132,7 +1207,10 @@ mod tests {
                 let provider = CopilotProvider::new("gpt-4o", "github-secret")
                     .with_github_api_base(GITHUB_API_BASE)
                     .with_client(client);
-                let error = provider.ensure_session_token().await.expect_err("exchange rejected");
+                let error = provider
+                    .ensure_session_token()
+                    .await
+                    .expect_err("exchange rejected");
                 let message = error.to_string();
                 assert!(message.contains(&format!("HTTP {status}")));
                 assert!(!message.contains("github-secret"));
@@ -1144,15 +1222,19 @@ mod tests {
 
     #[test]
     fn failed_reauthentication_never_reuses_the_rejected_session() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             // No GET interaction is available: refresh fails in playback,
             // rather than falling through to a live authentication call.
-            let (provider, options, attempts, _temp) = recovery_fixture(
-                "copilot_failed_refresh", &[(401, "expired")],
-            );
-            let error = provider.stream(&Context::default(), &options)
-                .await.err().expect("refresh failure");
+            let (provider, options, attempts, _temp) =
+                recovery_fixture("copilot_failed_refresh", &[(401, "expired")]);
+            let error = provider
+                .stream(&Context::default(), &options)
+                .await
+                .err()
+                .expect("refresh failure");
             assert!(error.to_string().contains("Copilot token exchange failed"));
             assert!(!error.to_string().contains("github-secret"));
             assert_eq!(attempts.load(Ordering::SeqCst), 1);

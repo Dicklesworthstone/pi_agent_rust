@@ -156,9 +156,7 @@ impl McpManager {
             Some(
                 catalog::operation_with_owner(&owner, acquisition, timeout)
                     .await?
-                    .map_err(|_| {
-                        tool_err("MCP_CANCELLED", "cancelled while connecting server")
-                    })?,
+                    .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while connecting server"))?,
             )
         } else {
             None
@@ -208,8 +206,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Poll;
 
-    use async_trait::async_trait;
     use asupersync::{Budget, Cx};
+    use async_trait::async_trait;
     use serde_json::{Value, json};
 
     use super::super::{ConfiguredServer, McpDiscovery, Provenance, TrustStore};
@@ -403,14 +401,21 @@ mod tests {
                 assert!(futures::poll!(call.as_mut()).is_pending());
                 owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel setup"));
                 let error = call.await.expect_err("cancelled cold call");
-                assert!(error.to_string().contains("MCP_CANCELLED"), "{stage:?}: {error}");
+                assert!(
+                    error.to_string().contains("MCP_CANCELLED"),
+                    "{stage:?}: {error}"
+                );
                 assert!(!parent.is_cancel_requested());
                 assert_eq!(Cx::current().unwrap().budget(), parent.budget());
             }));
             assert!(state.closed.load(Ordering::Acquire));
             assert!(McpManager::lock(&entry.transport).is_none());
             assert_eq!(McpManager::lock(&entry.restarts).count, 1);
-            assert!(!McpManager::lock(&state.methods).iter().any(|m| m == "tools/call"));
+            assert!(
+                !McpManager::lock(&state.methods)
+                    .iter()
+                    .any(|m| m == "tools/call")
+            );
             assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
         }
     }
@@ -428,7 +433,10 @@ mod tests {
                 )))
                 .expect_err("bounded setup");
             assert!(error.to_string().contains("MCP_TIMEOUT"), "{error}");
-            assert!(state.entered.load(Ordering::Acquire), "fixture reached {stage:?}");
+            assert!(
+                state.entered.load(Ordering::Acquire),
+                "fixture reached {stage:?}"
+            );
             assert!(state.closed.load(Ordering::Acquire));
             assert!(McpManager::lock(&entry.transport).is_none());
             assert_eq!(McpManager::lock(&entry.restarts).count, 1);
@@ -440,7 +448,9 @@ mod tests {
     fn lane_wait_is_bounded_without_poisoning_the_lane_owner() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, state) = fixture(&temp, Stage::Ready, false);
-        let lane = Arc::clone(&entry.connect_lane).try_lock_owned().expect("hold lane");
+        let lane = Arc::clone(&entry.connect_lane)
+            .try_lock_owned()
+            .expect("hold lane");
         let error = runtime()
             .block_on(bounded(manager.ensure_ready_owned(
                 &entry,
@@ -480,22 +490,26 @@ mod tests {
         let cancelling = owner.clone();
         *McpManager::lock(&state.hook) = Some(Arc::new(move |stage| {
             if stage == Stage::Activate {
-                cancelling.cancel_with(
-                    asupersync::types::CancelKind::User,
-                    Some("activation race"),
-                );
+                cancelling
+                    .cancel_with(asupersync::types::CancelKind::User, Some("activation race"));
             }
         }));
         let error = runtime
             .block_on(bounded(owner.with_current(manager.call_tool(
-                "setup", "echo", json!({}),
+                "setup",
+                "echo",
+                json!({}),
             ))))
             .expect_err("cancelled activation");
         assert!(error.to_string().contains("MCP_CANCELLED"));
         assert!(state.closed.load(Ordering::Acquire));
         assert!(McpManager::lock(&entry.transport).is_none());
         assert_eq!(McpManager::lock(&entry.restarts).count, 1);
-        assert!(!McpManager::lock(&state.methods).iter().any(|m| m == "tools/call"));
+        assert!(
+            !McpManager::lock(&state.methods)
+                .iter()
+                .any(|m| m == "tools/call")
+        );
     }
 
     #[test]
@@ -544,7 +558,11 @@ mod tests {
         assert_eq!(
             *McpManager::lock(&state.methods),
             [
-                "initialize", "notifications/initialized", "activate", "tools/call", "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "activate",
+                "tools/call",
+                "tools/call",
             ]
         );
         assert!(!state.closed.load(Ordering::Acquire));
@@ -638,7 +656,10 @@ mod tests {
         let budget = Budget::new().with_poll_quota(4321);
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(budget));
         *McpManager::lock(&manager.inner.transport_factory) = Some(Arc::new(move || {
-            assert_eq!(Cx::current().expect("blocking worker owner").budget(), budget);
+            assert_eq!(
+                Cx::current().expect("blocking worker owner").budget(),
+                budget
+            );
             Box::new(SetupTransport(Arc::clone(&state))) as Box<dyn McpTransport>
         }));
         runtime

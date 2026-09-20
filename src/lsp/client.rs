@@ -142,6 +142,7 @@ pub struct LspClient {
 }
 
 impl LspClient {
+    #[allow(clippy::too_many_lines)]
     pub async fn connect(
         command: &str,
         args: &[String],

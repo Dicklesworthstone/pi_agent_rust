@@ -1,3 +1,5 @@
+#![allow(clippy::literal_string_with_formatting_args, clippy::format_collect)]
+
 use super::*;
 
 fn item(text: &str) -> Value {

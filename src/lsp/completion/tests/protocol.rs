@@ -1,5 +1,7 @@
 //! Real public-tool calls, child stdio, and source-file side effects.
 
+#![allow(clippy::literal_string_with_formatting_args)]
+
 use super::*;
 use crate::config::Config;
 use crate::tools::Tool as _;
