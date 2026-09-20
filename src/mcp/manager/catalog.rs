@@ -208,7 +208,7 @@ fn request_cancelled() -> crate::error::Error {
 }
 
 fn request_timed_out() -> crate::error::Error {
-    tool_err("MCP_TIMEOUT", "MCP request exceeded its manager deadline")
+    tool_err("MCP_TIMEOUT", "MCP operation exceeded its manager deadline")
 }
 
 async fn wait_for_owner_cancellation(owner: crate::agent_cx::AgentCx) {
@@ -229,6 +229,42 @@ pub(super) async fn request_with_owner(
     params: Value,
     timeout: Duration,
 ) -> Result<Value> {
+    // Construct the transport request only after admission and under its
+    // captured owner, just like polling and cancellation cleanup below.
+    operation_with_owner(
+        owner,
+        async { transport.request(method, params, timeout).await },
+        timeout,
+    )
+    .await?
+}
+
+/// Drop pending work under its owner even when the caller abandons the entire
+/// enclosing future from a different task or thread.
+struct OwnedOperation<'a, F> {
+    owner: &'a crate::agent_cx::AgentCx,
+    future: Option<std::pin::Pin<Box<F>>>,
+}
+
+impl<F> Drop for OwnedOperation<'_, F> {
+    fn drop(&mut self) {
+        let _guard = self.owner.cx().clone().set_current_restricted();
+        drop(self.future.take());
+    }
+}
+
+/// One cancellation/deadline boundary for requests and connection setup.
+/// The nested result distinguishes a returned operation error (which may
+/// already have been accounted for) from owner cancellation or expiry.
+pub(super) async fn operation_with_owner<F: Future>(
+    owner: &crate::agent_cx::AgentCx,
+    future: F,
+    timeout: Duration,
+) -> Result<F::Output> {
+    let mut operation = OwnedOperation {
+        owner,
+        future: Some(Box::pin(future)),
+    };
     check_request_owner(owner)?;
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -242,7 +278,6 @@ pub(super) async fn request_with_owner(
         .map_or_else(asupersync::time::wall_now, |timer| timer.now());
     let mut timer = Box::pin(asupersync::time::sleep(now, timeout));
     let mut cancellation = Box::pin(wait_for_owner_cancellation(owner.clone()));
-    let mut request = transport.request(method, params, timeout);
     let result = poll_fn(|task| {
         let _guard = owner.cx().clone().set_current_restricted();
         if let Err(error) = check_request_owner(owner) {
@@ -254,7 +289,12 @@ pub(super) async fn request_with_owner(
         if Instant::now() >= deadline || timer.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(request_timed_out()));
         }
-        let result = request.as_mut().poll(task);
+        let result = operation
+            .future
+            .as_mut()
+            .expect("active operation")
+            .as_mut()
+            .poll(task);
         if result.is_ready() {
             if let Err(error) = check_request_owner(owner) {
                 return Poll::Ready(Err(error));
@@ -263,11 +303,11 @@ pub(super) async fn request_with_owner(
                 return Poll::Ready(Err(request_timed_out()));
             }
         }
-        result
+        result.map(Ok)
     })
     .await;
     let _guard = owner.cx().clone().set_current_restricted();
-    drop(request);
+    drop(operation);
     drop(cancellation);
     drop(timer);
     result

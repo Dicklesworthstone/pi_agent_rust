@@ -567,6 +567,7 @@ fn build_glob_override(cwd: &Path, glob: &str) -> Result<ignore::overrides::Over
 struct LspInput {
     action: String,
     position: Option<Position>,
+    resolve: Option<bool>,
     completion_id: Option<String>,
     snippet_values: Option<std::collections::BTreeMap<String, String>>,
     file: Option<String>,
@@ -600,13 +601,14 @@ impl Tool for LspTool {
     fn description(&self) -> &str {
         concat!(
         "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Numeric snippet placeholders accept literal snippetValues; repeat the values when applying. Commands, snippet variables and transforms are unsupported. Completion range is an explicit replacement fallback for servers omitting textEdit. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
-        , " signature_help inspects callable overloads and the active parameter at file + exact position; it is read-only.")
+        , " signature_help inspects callable overloads and the active parameter at file + exact position. inlay_hints inspects inferred types and argument labels over file + optional exact range; resolve:true obtains lazy tooltips and label locations. Both actions are read-only and never accept hint edits or run commands.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help"]},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help","inlay_hints"]},
+                "resolve":{"type":"boolean","description":"inlay_hints only: resolve retained hints for lazy tooltips and label locations under the same request budget. Requires server resolve support. Omit or false for inline results; never applies edits or executes hint commands."},
                 "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for completion or signature_help; requires file. Put signature_help's cursor inside the call to inspect overloads and active parameter. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                 "completionId":{"type":"string","description":"Opaque completion from the latest listing. Select without apply to resolve and preview, or apply:true to insert it with its auto-import edits. Do not combine with other selectors. Expires on source changes, server replacement, reload or another completion listing."},
                 "snippetValues":{"type":"object","maxProperties":64,"additionalProperties":{"type":"string","maxLength":16384},"description":"Selected snippet completion only: literal replacements keyed by canonical numeric placeholder index (0..65535), e.g. {\"1\":\"argument\"}. Values are not evaluated or reparsed. Defaults and first choices apply otherwise; unbound positive tabstops require a value. Repeat the map with apply:true; preview substitutions are not cached."},
@@ -619,7 +621,7 @@ impl Tool for LspTool {
                 "newName":{"type":"string","description":"New symbol name for rename"},
                 "newFile":{"type":"string","description":"Destination path for rename_file"},
                 "apply":{"type":"boolean","description":"Apply a selected code action/completion, or write formatting changes instead of previewing"},
-                "range":{"type":"object","description":"Optional code_actions or format selection, with exact zero-based lines and UTF-16 character offsets. For completion, this is a single-line replacement fallback containing position, used only when the server omits textEdit. For code_actions, cannot be combined with symbol or line. Refactors may also edit outside the selection.","required":["start","end"],"properties":{
+                "range":{"type":"object","description":"Optional code_actions, format or inlay_hints selection, with exact zero-based lines and UTF-16 character offsets. Hints default to the whole file. For completion, this is a single-line replacement fallback containing position, used only when the server omits textEdit. For code_actions, cannot be combined with symbol or line. Refactors may also edit outside the selection.","required":["start","end"],"properties":{
                     "start":{"type":"object","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                     "end":{"type":"object","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}}
                 }},
@@ -634,7 +636,7 @@ impl Tool for LspTool {
                 "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default). workspace_diagnostics instead budgets the whole scan (default 30 seconds, capped at 120); synchronous filesystem operations are not preemptible."},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
                 "payload":{"description":"Raw JSON params for request"},
-                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion defaults to 50, capped at 128. workspace_diagnostics checks at most this many files (default 100, capped at 256)."},
+                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion and inlay_hints default to 50, capped at 128. signature_help defaults to 16, capped at 128, retaining the active overload. workspace_diagnostics checks at most this many files (default 100, capped at 256)."},
                 "after":{"type":"string","maxLength":4096,"description":"workspace_diagnostics only: resume strictly after the workspace-relative path returned as nextAfter. Use the same glob. This is a stateless path cursor, not a snapshot; complete is false for continuation pages. Inspect pageComplete, hasMore and all per-file failures."}
             }
         })
@@ -654,6 +656,9 @@ impl Tool for LspTool {
             .map_err(|err| tool_err("LSP_USAGE", format!("invalid input: {err}")))?;
         if input.line == Some(0) {
             return Err(tool_err("LSP_USAGE", "line must be 1-indexed"));
+        }
+        if input.resolve.is_some() && input.action != "inlay_hints" {
+            return Err(tool_err("LSP_USAGE", "resolve is supported only by inlay_hints"));
         }
         if input.action != "completion"
             && (input.completion_id.is_some() || input.snippet_values.is_some())
@@ -688,6 +693,7 @@ impl Tool for LspTool {
         match input.action.as_str() {
             "completion" => self.run_completion(&input).await,
             "signature_help" => self.run_signature_help(&input).await,
+            "inlay_hints" => self.run_inlay_hints(&input).await,
             "diagnostics" => self.run_diagnostics(&input).await,
             "workspace_diagnostics" => {
                 let pattern = input.file.as_deref().ok_or_else(|| {
@@ -751,7 +757,7 @@ impl Tool for LspTool {
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help|inlay_hints"
             ))),
         }
     }

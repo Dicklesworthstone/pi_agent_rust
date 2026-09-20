@@ -16,6 +16,7 @@ use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 
 mod signatures;
+mod hints;
 
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;

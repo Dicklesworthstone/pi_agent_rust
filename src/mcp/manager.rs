@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 
 mod calls;
 mod catalog;
+mod connection;
 
 #[cfg(test)]
 type TestTransportFactory = dyn Fn() -> Box<dyn McpTransport> + Send + Sync;
@@ -922,18 +923,12 @@ impl McpManager {
         Ok(())
     }
 
-    async fn ensure_ready(&self, entry: &Arc<ServerEntry>) -> Result<()> {
-        let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let _connect_guard =
-            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
-                .await
-                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while connecting server"))?;
-
-        self.ensure_ready_in_lane(entry).await
-    }
-
     #[allow(clippy::too_many_lines)]
-    async fn ensure_ready_in_lane(&self, entry: &Arc<ServerEntry>) -> Result<()> {
+    async fn ensure_ready_in_lane_inner(
+        &self,
+        entry: &Arc<ServerEntry>,
+        attempt: &mut connection::ConnectionAttempt<'_>,
+    ) -> Result<()> {
         self.check_running()?;
         if let Err(err) = self.check_trust(entry) {
             let transport = { Self::lock(&entry.transport).take() };
@@ -967,6 +962,11 @@ impl McpManager {
         // can all take time. Re-read the shared store at the last feasible seam
         // before transport construction or process creation.
         self.check_trust(entry)?;
+        connection::check_transport_owner(
+            &crate::agent_cx::AgentCx::for_current_or_request(),
+            &entry.config,
+        )?;
+        attempt.begin();
         let transport: Arc<dyn McpTransport> = match self.spawn_transport(entry).await {
             Ok(transport) => Arc::from(transport),
             Err(err) => {
@@ -975,6 +975,7 @@ impl McpManager {
             }
         };
         let mut private_transport = PrivateHandshakeTransport::new(Arc::clone(&transport));
+        attempt.observe(Arc::clone(&transport));
         if let Err(err) = self.check_running() {
             transport.close().await;
             return Err(err);
@@ -1110,6 +1111,8 @@ impl McpManager {
 
     async fn spawn_transport(&self, entry: &Arc<ServerEntry>) -> Result<Box<dyn McpTransport>> {
         let config = entry.config.clone();
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        connection::check_transport_owner(&owner, &config)?;
         let cwd = entry.effective_cwd(&self.inner.cwd);
         let trust_path = self.inner.trust_path.clone();
         #[cfg(test)]
@@ -1122,7 +1125,11 @@ impl McpManager {
         // them off the async worker so the startup deadline can still be
         // polled. The production runtime supplies a bounded blocking pool.
         let result = asupersync::runtime::spawn_blocking(move || {
+            // The pool thread's ambient authority is not the request owner's.
+            // Keep both secret resolution and process construction attenuated.
+            let _owner_guard = owner.cx().clone().set_current_restricted();
             let ensure_active = || {
+                connection::check_transport_owner(&owner, &config)?;
                 if abandoned_worker.load(Ordering::Acquire) {
                     Err(tool_err(
                         "MCP_STARTUP_CANCELLED",
