@@ -344,7 +344,7 @@ impl LspTool {
             .await?;
         if input.apply == Some(false) {
             crate::lsp::refactor_preview::check_owner(&owner)?;
-            let prepared = Self::prepare_refactor(&entry, &raw, &snapshot)?;
+            let prepared = self.prepare_refactor(&entry, &raw, &snapshot)?;
             return self.cache_refactor(
                 &entry,
                 prepared,
@@ -422,7 +422,7 @@ impl LspTool {
         let combined = append_move(edit, &old_uri, &new_uri)?;
         if input.apply == Some(false) {
             crate::lsp::refactor_preview::check_owner(&owner)?;
-            let prepared = Self::prepare_refactor(&entry, &combined, &snapshot)?;
+            let prepared = self.prepare_refactor(&entry, &combined, &snapshot)?;
             return self.cache_refactor(
                 &entry,
                 prepared,
