@@ -607,16 +607,17 @@ impl Tool for LspTool {
         concat!(
             "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Numeric snippet placeholders accept literal snippetValues; repeat the values when applying. Commands, snippet variables and transforms are unsupported. Completion range is an explicit replacement fallback for servers omitting textEdit. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then select actionId or a fresh title/index query to resolve and preview an edit-only action; approve the returned refactorId with apply:true. Direct apply:true with actionId or query retains edit-then-command execution; command-backed actions cannot be statically previewed. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16.",
             " signature_help inspects callable overloads and the active parameter at file + exact position. inlay_hints inspects inferred types and argument labels over file + optional exact range; resolve:true obtains lazy tooltips and label locations. Both actions are read-only and never accept hint edits or run commands.",
-            " rename and rename_file with apply:false stage a reviewable workspace edit without writes. Then use the same action with refactorId and apply:true to commit that exact plan without another server request. Omitting apply on a fresh rename preserves immediate application."
+            " rename and rename_file with apply:false stage a reviewable workspace edit without writes. Then use the same action with refactorId and apply:true to commit that exact plan without another server request. Omitting apply on a fresh rename preserves immediate application.",
+            " prepare_rename inspects the server-confirmed symbol range and placeholder without computing edits. It and rename accept file + exact position instead of symbol/line. Fresh rename automatically prepares when supported; a refusal stops before computing edits. Preparation is not an approval handle."
         )
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help","inlay_hints"]},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help","inlay_hints","prepare_rename"]},
                 "resolve":{"type":"boolean","description":"inlay_hints only: resolve retained hints for lazy tooltips and label locations under the same request budget. Requires server resolve support. Omit or false for inline results; never applies edits or executes hint commands."},
-                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for completion or signature_help; requires file. Put signature_help's cursor inside the call to inspect overloads and active parameter. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
+                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for completion, signature_help, prepare_rename or rename; requires file. For rename targeting, use instead of symbol/line. Put signature_help's cursor inside the call. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                 "completionId":{"type":"string","description":"Opaque completion from the latest listing. Select without apply to resolve and preview, or apply:true to insert it with its auto-import edits. Do not combine with other selectors. Expires on source changes, server replacement, reload or another completion listing."},
                 "snippetValues":{"type":"object","maxProperties":64,"additionalProperties":{"type":"string","maxLength":16384},"description":"Selected snippet completion only: literal replacements keyed by canonical numeric placeholder index (0..65535), e.g. {\"1\":\"argument\"}. Values are not evaluated or reparsed. Defaults and first choices apply otherwise; unbound positive tabstops require a value. Repeat the map with apply:true; preview substitutions are not cached."},
                 "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics globs inspect cached reports. workspace_diagnostics uses a positive workspace-relative glob to actively check matching nonignored regular files; it may start language servers."},
@@ -682,11 +683,11 @@ impl Tool for LspTool {
             ));
         }
         if input.position.is_some()
-            && !matches!(input.action.as_str(), "completion" | "signature_help")
+            && !matches!(input.action.as_str(), "completion" | "signature_help" | "prepare_rename" | "rename")
         {
             return Err(tool_err(
                 "LSP_USAGE",
-                "position requires completion or signature_help",
+                "position requires completion, signature_help, prepare_rename or rename",
             ));
         }
         if input.only.is_some() && input.action != "code_actions" {
@@ -769,6 +770,7 @@ impl Tool for LspTool {
                 self.run_hierarchy(&input).await
             }
             "rename" => self.run_rename(&input).await,
+            "prepare_rename" => self.run_prepare_rename(&input).await,
             "rename_file" => self.run_rename_file(&input).await,
             "code_actions" => self.run_code_actions(&input).await,
             "format" => self.run_format(&input).await,
@@ -777,7 +779,7 @@ impl Tool for LspTool {
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help|inlay_hints"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|prepare_rename|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help|inlay_hints"
             ))),
         }
     }

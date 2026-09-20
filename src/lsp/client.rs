@@ -207,7 +207,7 @@ impl LspClient {
                     "callHierarchy":{"dynamicRegistration":false},
                     "typeHierarchy":{"dynamicRegistration":false},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
-                    "rename":{"prepareSupport":false,"honorsChangeAnnotations":false},
+                    "rename":{"prepareSupport":true,"honorsChangeAnnotations":false},
                     "codeAction":{
                         "dynamicRegistration":false,"dataSupport":true,
                         "disabledSupport":true,"isPreferredSupport":true,

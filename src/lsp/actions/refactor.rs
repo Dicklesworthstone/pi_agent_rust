@@ -14,6 +14,7 @@ use crate::lsp::edits::{FileEvidence, PreparedEdit, WorkspaceEditPlan};
 use std::sync::Arc;
 
 mod formatting;
+mod prepare;
 mod versions;
 
 pub(super) struct RefactorSnapshot {
@@ -322,62 +323,59 @@ impl LspTool {
     }
 
     pub(in crate::lsp) async fn run_rename(&self, input: &LspInput) -> Result<ToolOutput> {
+        let request = self.rename_request(input).await?;
         let new_name = input
             .new_name
             .as_deref()
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| tool_err("LSP_USAGE", "lsp rename requires a nonempty newName"))?;
-        let file = input
-            .file
-            .as_deref()
-            .ok_or_else(|| tool_err("LSP_USAGE", "lsp rename requires file"))?;
-        let symbol = input
-            .symbol
-            .as_deref()
-            .ok_or_else(|| tool_err("LSP_USAGE", "lsp rename requires symbol"))?;
-        let owner = AgentCx::for_current_or_request();
-        let path = resolve_tool_path(file, &self.cwd).canonicalize()?;
-        if !path.metadata()?.is_file() {
-            return Err(tool_err(
-                "LSP_FILE_UNREADABLE",
-                "rename source is not a regular file",
-            ));
-        }
-        let hash = file_hash(&path)?;
-        let position = Self::resolve_position(&path, input.line, symbol)?;
-        let (uri, entry) = self.synced(&path).await?;
-        let snapshot = RefactorSnapshot::capture(&entry, &path, hash)?;
-        let raw = entry
+            .ok_or_else(|| tool_err("LSP_USAGE", "rename requires newName"))?;
+        let target = if request.prepare_supported {
+            Some(request.prepare().await?.ok_or_else(|| {
+                tool_err("LSP_RENAME_UNAVAILABLE", "server rejected this rename target; no rename was requested")
+            })?)
+        } else {
+            None
+        };
+        request.verify()?;
+        let raw = request.entry
             .client
             .call(
                 "textDocument/rename",
-                json!({"textDocument":{"uri":uri},"position":position,"newName":new_name}),
-                self.request_timeout(input),
+                json!({"textDocument":{"uri":request.uri},"position":request.position,"newName":new_name}),
+                request.budget.remaining()?,
             )
             .await?;
+        request.verify()?;
+        let prepared = self.prepare_refactor(&request.entry, &raw, &request.snapshot)?;
+        request.verify()?;
+        let mut payload = json!({
+            "action":"rename","newName":new_name,"position":request.position,
+            "prepareRequested":request.prepare_supported,"target":target,
+            "atomic":false,"rollbackOnError":true,
+            "note":"Scoped regular-file transaction with rollback; not cross-file atomic visibility."
+        });
         if input.apply == Some(false) {
-            crate::lsp::refactor_preview::check_owner(&owner)?;
-            let prepared = self.prepare_refactor(&entry, &raw, &snapshot)?;
             return self.cache_refactor(
-                &entry,
+                &request.entry,
                 prepared,
                 raw,
-                json!({"action":"rename","newName":new_name}),
+                payload,
                 None,
-                &owner,
+                &request.budget.owner,
             );
         }
-        let outcome = self.apply_refactor(&entry, &raw, &snapshot, &owner)?;
+        // Recheck the same source, owner and budget after staging, at the
+        // boundary into the existing finish-or-rollback commit discipline.
+        let result = prepared.commit(|| request.verify());
+        self.invalidate_refactor(&request.entry);
+        let outcome = result?;
         let files: Vec<_> = outcome
             .files_changed
             .iter()
             .map(|path| display_path(path, &self.cwd))
             .collect();
-        let payload = json!({
-            "action":"rename","newName":new_name,"filesChanged":files,
-            "fileOps":outcome.file_ops_applied,"atomic":false,"rollbackOnError":true,
-            "note":"Scoped regular-file transaction with rollback; not cross-file atomic visibility."
-        });
+        payload["applied"] = json!(true);
+        payload["filesChanged"] = json!(files);
+        payload["fileOps"] = json!(outcome.file_ops_applied);
         Ok(super::text_output(payload.to_string(), payload))
     }
 
