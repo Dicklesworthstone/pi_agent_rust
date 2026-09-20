@@ -496,6 +496,30 @@ impl McpManager {
         params: Value,
         shape: ContextResult,
     ) -> Result<Value> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        super::check_request_owner(&owner)?;
+        owner
+            .with_current(self.request_context_with_timeout(
+                server,
+                method,
+                params,
+                shape,
+                DEFAULT_MCP_TIMEOUT,
+            ))
+            .await
+    }
+
+    async fn request_context_with_timeout(
+        &self,
+        server: &str,
+        method: &'static str,
+        params: Value,
+        shape: ContextResult,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        // Check before connection setup or any secret/process resolution.
+        super::check_request_owner(&owner)?;
         let entry = self.entry(server)?;
         self.ensure_ready(&entry).await?;
         let transport = Self::lock(&entry.transport).clone().ok_or_else(|| {
@@ -511,32 +535,51 @@ impl McpManager {
             armed: true,
         };
         let started = Instant::now();
-        let result = transport.request(method, params, DEFAULT_MCP_TIMEOUT).await;
-        guard.armed = false;
-        self.check_context_transport(&entry, &transport).await?;
+        let result = super::request_with_owner(&owner, &transport, method, params, timeout).await;
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                if !server_error(&error) {
+                if server_error(&error) {
+                    self.check_context_transport(&entry, &transport).await?;
+                } else {
+                    // Preserve the original cancellation/timeout taxonomy,
+                    // even if dropping the request already closed its socket.
                     Self::fail_transport_generation(&entry, &transport, &error);
                 }
+                guard.armed = false;
                 return Err(error);
             }
         };
+        // Cleanup ownership lasts through validation and final publication,
+        // not just until the transport has produced a value.
+        self.check_context_transport(&entry, &transport).await?;
         if let Err(error) = validate_response(&result, shape) {
             Self::fail_transport_generation(&entry, &transport, &error);
+            guard.armed = false;
             return Err(error);
         }
-        if started.elapsed() >= DEFAULT_MCP_TIMEOUT {
+        if started.elapsed() >= timeout {
             let error = tool_err(
                 "MCP_TIMEOUT",
                 "MCP context response arrived after its deadline",
             );
             Self::fail_transport_generation(&entry, &transport, &error);
+            guard.armed = false;
             return Err(error);
         }
         self.check_context_transport(&entry, &transport).await?;
-        Self::record_operational_success(&entry, &transport);
+        if let Err(error) = super::check_request_owner(&owner) {
+            Self::fail_transport_generation(&entry, &transport, &error);
+            guard.armed = false;
+            return Err(error);
+        }
+        if !Self::record_operational_success(&entry, &transport) {
+            return Err(tool_err(
+                "MCP_TRANSPORT_SUPERSEDED",
+                "connection changed before MCP context publication",
+            ));
+        }
+        guard.armed = false;
         Ok(result)
     }
 }
@@ -551,6 +594,164 @@ mod tests {
 
     use super::super::super::{ConfiguredServer, McpDiscovery, Provenance, TrustStore};
     use super::*;
+
+    struct OwnerBlockedContextTransport {
+        requests: std::sync::atomic::AtomicUsize,
+        closed: AtomicBool,
+    }
+
+    impl OwnerBlockedContextTransport {
+        fn new() -> Self {
+            Self {
+                requests: std::sync::atomic::AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for OwnerBlockedContextTransport {
+        async fn request(
+            &self,
+            method: &str,
+            _params: Value,
+            _timeout: std::time::Duration,
+        ) -> Result<Value> {
+            assert_eq!(method, "resources/list", "no reconnect or replay");
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let budget = asupersync::Cx::current().expect("request owner").budget();
+            std::future::poll_fn(|_| {
+                assert_eq!(
+                    asupersync::Cx::current().expect("owner on every poll").budget(),
+                    budget
+                );
+                std::task::Poll::<Result<Value>>::Pending
+            })
+            .await
+        }
+
+        async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_alive(&self) -> bool {
+            !self.closed.load(Ordering::Acquire)
+        }
+
+        fn abort(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
+
+        async fn close(&self) {
+            self.abort();
+        }
+
+        fn diagnostics_tail(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn owner_cancellation_ends_idle_context_access_without_transport_cooperation() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, _) = fixture(&temp, vec![], true);
+        let transport = Arc::new(OwnerBlockedContextTransport::new());
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        *McpManager::lock(&entry.transport) = Some(erased);
+        let runtime = runtime();
+        let owner = crate::agent_cx::AgentCx::from_cx(runtime.request_cx_with_budget(
+            asupersync::Budget::new().with_poll_quota(1000),
+        ));
+        runtime.block_on(async {
+            let parent = asupersync::Cx::current().expect("parent");
+            let mut task = Context::from_waker(futures::task::noop_waker_ref());
+            let mut request = Box::pin(manager.list_resources("docs", None));
+            {
+                let _guard = owner.cx().clone().set_current_restricted();
+                assert!(request.as_mut().poll(&mut task).is_pending());
+            }
+            assert!(request.as_mut().poll(&mut task).is_pending());
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel context"));
+            let Poll::Ready(Err(error)) = request.as_mut().poll(&mut task) else {
+                panic!("context cancellation must complete without a network response");
+            };
+            assert!(error.to_string().contains("MCP_CANCELLED"));
+            assert!(!parent.is_cancel_requested());
+            assert_eq!(asupersync::Cx::current().unwrap().budget(), parent.budget());
+        });
+        assert_eq!(transport.requests.load(Ordering::SeqCst), 1);
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+    }
+
+    #[test]
+    fn context_manager_deadline_terminates_an_uncooperative_transport() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, _) = fixture(&temp, vec![], true);
+        let transport = Arc::new(OwnerBlockedContextTransport::new());
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        *McpManager::lock(&entry.transport) = Some(erased);
+        let error = runtime()
+            .block_on(manager.request_context_with_timeout(
+                "docs",
+                "resources/list",
+                json!({}),
+                ContextResult::Resources,
+                std::time::Duration::from_millis(20),
+            ))
+            .expect_err("manager timeout");
+        assert!(error.to_string().contains("MCP_TIMEOUT"));
+        assert_eq!(transport.requests.load(Ordering::SeqCst), 1);
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+    }
+
+    #[test]
+    fn pre_cancelled_context_owner_has_no_connection_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![], true);
+        let owner = crate::agent_cx::AgentCx::for_request();
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("before context access"));
+        let error = runtime()
+            .block_on(owner.with_current(manager.list_resources("docs", None)))
+            .expect_err("owner cancelled before dispatch");
+        assert!(error.to_string().contains("MCP_CANCELLED"));
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+    }
+
+    #[test]
+    fn simultaneous_context_reply_and_owner_cancellation_does_not_publish_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![Ok(json!({"resources": [{"name": "private", "uri": "db://private"}]}))],
+            true,
+        );
+        let runtime = runtime();
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        let owner_for_hook = owner.clone();
+        *McpManager::lock(&transport.after_response) = Some(Arc::new(move || {
+            owner_for_hook.cancel_with(asupersync::types::CancelKind::User, Some("reply race"));
+        }));
+        let error = runtime
+            .block_on(owner.with_current(manager.list_resources("docs", None)))
+            .expect_err("cancelled response cannot publish");
+        assert!(error.to_string().contains("MCP_CANCELLED"));
+        assert!(!error.to_string().contains("db://private"));
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+    }
 
     type ResponseHook = dyn Fn() + Send + Sync;
 
