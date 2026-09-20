@@ -218,12 +218,15 @@ fn output_schema_for_call(
             "tool metadata is unavailable; the call was not sent",
         )
     })?;
-    let metadata = tools.iter().find(|metadata| metadata.name == tool).ok_or_else(|| {
-        tool_err(
-            "MCP_UNKNOWN_TOOL",
-            "the requested tool is not in the server's admitted catalog; the call was not sent",
-        )
-    })?;
+    let metadata = tools
+        .iter()
+        .find(|metadata| metadata.name == tool)
+        .ok_or_else(|| {
+            tool_err(
+                "MCP_UNKNOWN_TOOL",
+                "the requested tool is not in the server's admitted catalog; the call was not sent",
+            )
+        })?;
     Ok(metadata.output_schema.clone())
 }
 
@@ -847,8 +850,12 @@ mod tests {
             if expected_valid {
                 assert_eq!(result.expect("original integer contract"), response);
             } else {
-                assert!(result.expect_err("replacement string contract must not be borrowed")
-                    .to_string().contains("MCP_OUTPUT_INVALID"));
+                assert!(
+                    result
+                        .expect_err("replacement string contract must not be borrowed")
+                        .to_string()
+                        .contains("MCP_OUTPUT_INVALID")
+                );
             }
             assert_eq!(McpManager::lock(&transport.requests).len(), 1);
             assert!(!transport.closed.load(Ordering::Acquire));
@@ -1408,7 +1415,7 @@ mod tests {
         assert_eq!(McpManager::lock(&entry.restarts).count, 0);
     }
 
-    fn setup_output_catalog(state: &SetupState, schema: Value) {
+    fn setup_output_catalog(state: &SetupState, schema: &Value) {
         *McpManager::lock(&state.catalog) = json!({"tools":[{
             "name":"execute", "inputSchema":{"type":"object"}, "outputSchema":schema
         }]});
@@ -1420,7 +1427,7 @@ mod tests {
         let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
         McpManager::lock(&entry.transport).take();
         let state = setup_factory(&manager, "none");
-        setup_output_catalog(&state, count_output_schema("integer"));
+        setup_output_catalog(&state, &count_output_schema("integer"));
         *McpManager::lock(&state.reply) = json!({"structuredContent":{"count":"wrong"}});
         let error = runtime()
             .block_on(watchdog(manager.call_tool("exec", "execute", json!({}))))
@@ -1438,7 +1445,7 @@ mod tests {
             let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
             McpManager::lock(&entry.transport).take();
             let state = setup_factory(&manager, "none");
-            setup_output_catalog(&state, count_output_schema("integer"));
+            setup_output_catalog(&state, &count_output_schema("integer"));
             *McpManager::lock(&state.reply) = json!({"structuredContent":{"count":1}});
             let runtime = runtime();
             runtime
@@ -1497,7 +1504,7 @@ mod tests {
         let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
         McpManager::lock(&entry.transport).take();
         let state = setup_factory(&manager, "none");
-        setup_output_catalog(&state, json!({"type":7}));
+        setup_output_catalog(&state, &json!({"type":7}));
         let error = runtime()
             .block_on(watchdog(manager.call_tool("exec", "execute", json!({}))))
             .expect_err("invalid schema prevents dispatch");

@@ -229,7 +229,6 @@ fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Re
 
 impl LspTool {
     fn prepare_refactor(
-        &self,
         entry: &ServerEntry,
         raw: &Value,
         snapshot: &RefactorSnapshot,
@@ -246,13 +245,18 @@ impl LspTool {
         for operation in &plan.file_ops {
             match operation {
                 FileOp::Create { path, .. } | FileOp::Delete { path } => inside_root(path, root)?,
-                FileOp::Rename { old_path, new_path, .. } => {
+                FileOp::Rename {
+                    old_path, new_path, ..
+                } => {
                     inside_root(old_path, root)?;
                     inside_root(new_path, root)?;
                 }
             }
         }
-        let expected = hashes.into_iter().map(|(path, hash)| (path, FileEvidence::Text(hash))).collect();
+        let expected = hashes
+            .into_iter()
+            .map(|(path, hash)| (path, FileEvidence::Text(hash)))
+            .collect();
         PreparedEdit::new(&plan, &expected)
     }
 
@@ -326,10 +330,14 @@ impl LspTool {
             .await?;
         if input.apply == Some(false) {
             crate::lsp::refactor_preview::check_owner(&owner)?;
-            let prepared = self.prepare_refactor(&entry, &raw, &snapshot)?;
+            let prepared = Self::prepare_refactor(&entry, &raw, &snapshot)?;
             return self.cache_refactor(
-                &entry, prepared, raw,
-                json!({"action":"rename","newName":new_name}), None, &owner,
+                &entry,
+                prepared,
+                raw,
+                json!({"action":"rename","newName":new_name}),
+                None,
+                &owner,
             );
         }
         let outcome = self.apply_refactor(&entry, &raw, &snapshot, &owner)?;
@@ -400,12 +408,15 @@ impl LspTool {
         let combined = append_move(edit, &old_uri, &new_uri)?;
         if input.apply == Some(false) {
             crate::lsp::refactor_preview::check_owner(&owner)?;
-            let prepared = self.prepare_refactor(&entry, &combined, &snapshot)?;
+            let prepared = Self::prepare_refactor(&entry, &combined, &snapshot)?;
             return self.cache_refactor(
-                &entry, prepared, combined,
+                &entry,
+                prepared,
+                combined,
                 json!({"action":"rename_file","from":display_path(&old_path,&self.cwd),
                     "to":display_path(&new_path,&self.cwd),"willRenameFiles":will}),
-                did.then_some(params), &owner,
+                did.then_some(params),
+                &owner,
             );
         }
         // One transaction computes import updates AND the move before any

@@ -87,7 +87,9 @@ pub struct McpOutputSchema(Arc<CompiledOutputSchema>);
 impl fmt::Debug for McpOutputSchema {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Metadata debugging must not dump an untrusted schema or its examples.
-        formatter.debug_struct("McpOutputSchema").finish_non_exhaustive()
+        formatter
+            .debug_struct("McpOutputSchema")
+            .finish_non_exhaustive()
     }
 }
 
@@ -166,13 +168,19 @@ impl McpOutputSchema {
         let structured = result
             .get("structuredContent")
             .filter(|value| value.is_object())
-            .ok_or_else(|| output_error("successful tool result requires object structuredContent"))?;
+            .ok_or_else(|| {
+                output_error("successful tool result requires object structuredContent")
+            })?;
         let mut nodes = MAX_RESULT_NODES;
         if !within_shape_budget(structured, MAX_RESULT_DEPTH, &mut nodes) {
-            return Err(output_error("structuredContent exceeds the depth or node limit"));
+            return Err(output_error(
+                "structuredContent exceeds the depth or node limit",
+            ));
         }
         if !self.0.validator.is_valid(structured) {
-            return Err(output_error("structuredContent does not match outputSchema"));
+            return Err(output_error(
+                "structuredContent does not match outputSchema",
+            ));
         }
         Ok(())
     }
@@ -181,7 +189,9 @@ impl McpOutputSchema {
 fn output_error(reason: &str) -> super::Error {
     tool_err(
         "MCP_OUTPUT_INVALID",
-        format!("{reason}; the call was not replayed and remote side effects may already have occurred"),
+        format!(
+            "{reason}; the call was not replayed and remote side effects may already have occurred"
+        ),
     )
 }
 
@@ -208,10 +218,21 @@ mod tests {
             "name":"count", "inputSchema":{"type":"object"}, "outputSchema":schema
         }]}))
         .expect("catalog");
-        let compiled = metas[0].output_schema.as_ref().expect("advertised output schema");
+        let compiled = metas[0]
+            .output_schema
+            .as_ref()
+            .expect("advertised output schema");
         assert_eq!(compiled.schema(), &schema);
-        assert!(compiled.validate_result(&json!({"structuredContent":{"count":1}})).is_ok());
-        assert!(compiled.validate_result(&json!({"structuredContent":{}})).is_err());
+        assert!(
+            compiled
+                .validate_result(&json!({"structuredContent":{"count":1}}))
+                .is_ok()
+        );
+        assert!(
+            compiled
+                .validate_result(&json!({"structuredContent":{}}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -225,7 +246,13 @@ mod tests {
 
     #[test]
     fn discovery_rejects_malformed_output_schema_instead_of_dropping_it() {
-        for schema in [Value::Null, json!(false), json!([]), json!("object"), json!({"type":7})] {
+        for schema in [
+            Value::Null,
+            json!(false),
+            json!([]),
+            json!("object"),
+            json!({"type":7}),
+        ] {
             let error = super::super::parse_tool_list(&json!({"tools":[{
                 "name":"bad", "inputSchema":{}, "outputSchema":schema
             }]}))
@@ -251,8 +278,16 @@ mod tests {
             "required":["count"]
         }))
         .expect("local refs require no I/O");
-        assert!(schema.validate_result(&json!({"structuredContent":{"count":3}})).is_ok());
-        assert!(schema.validate_result(&json!({"structuredContent":{"count":-1}})).is_err());
+        assert!(
+            schema
+                .validate_result(&json!({"structuredContent":{"count":3}}))
+                .is_ok()
+        );
+        assert!(
+            schema
+                .validate_result(&json!({"structuredContent":{"count":-1}}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -289,14 +324,22 @@ mod tests {
     #[test]
     fn schema_node_and_depth_budgets_are_checked_before_compilation() {
         let wide = json!({"examples":vec![Value::Null; MAX_SCHEMA_NODES]});
-        assert!(McpOutputSchema::compile(&wide).expect_err("wide schema")
-            .to_string().contains("node limit"));
+        assert!(
+            McpOutputSchema::compile(&wide)
+                .expect_err("wide schema")
+                .to_string()
+                .contains("node limit")
+        );
         let mut deep = json!({});
         for _ in 0..MAX_SCHEMA_DEPTH {
             deep = json!({"properties":{"nested":deep}});
         }
-        assert!(McpOutputSchema::compile(&deep).expect_err("deep schema")
-            .to_string().contains("depth"));
+        assert!(
+            McpOutputSchema::compile(&deep)
+                .expect_err("deep schema")
+                .to_string()
+                .contains("depth")
+        );
     }
 
     #[test]
@@ -323,7 +366,9 @@ mod tests {
             json!({"structuredContent":{"count":1,"extra":true}}),
             json!({"structuredContent":{}}),
         ] {
-            let error = contract().validate_result(&result).expect_err("invalid output");
+            let error = contract()
+                .validate_result(&result)
+                .expect_err("invalid output");
             assert!(error.to_string().contains("MCP_OUTPUT_INVALID"));
             assert!(error.to_string().contains("not replayed"));
         }
@@ -335,14 +380,17 @@ mod tests {
             json!({"isError":true, "content":[{"type":"text","text":"rate limited"}]}),
             json!({"isError":true, "structuredContent":{"error":"unavailable"}}),
         ] {
-            contract().validate_result(&result).expect("preserve server execution error");
+            contract()
+                .validate_result(&result)
+                .expect("preserve server execution error");
         }
     }
 
     #[test]
     fn malformed_error_flags_cannot_bypass_validation() {
         for flag in [json!("true"), json!(1), Value::Null, json!({}), json!([])] {
-            let error = contract().validate_result(&json!({"isError":flag}))
+            let error = contract()
+                .validate_result(&json!({"isError":flag}))
                 .expect_err("isError must really be a boolean");
             assert!(error.to_string().contains("MCP_OUTPUT_INVALID"));
         }
@@ -352,14 +400,24 @@ mod tests {
     fn structured_result_admission_is_bounded() {
         let schema = McpOutputSchema::compile(&json!({})).expect("permissive schema");
         let wide = json!({"structuredContent":{"items":vec![Value::Null; MAX_RESULT_NODES]}});
-        assert!(schema.validate_result(&wide).expect_err("too many result nodes")
-            .to_string().contains("node limit"));
+        assert!(
+            schema
+                .validate_result(&wide)
+                .expect_err("too many result nodes")
+                .to_string()
+                .contains("node limit")
+        );
         let mut deep = json!({});
         for _ in 0..MAX_RESULT_DEPTH {
             deep = json!({"nested":deep});
         }
-        assert!(schema.validate_result(&json!({"structuredContent":deep}))
-            .expect_err("too deep").to_string().contains("depth"));
+        assert!(
+            schema
+                .validate_result(&json!({"structuredContent":deep}))
+                .expect_err("too deep")
+                .to_string()
+                .contains("depth")
+        );
     }
 
     #[test]

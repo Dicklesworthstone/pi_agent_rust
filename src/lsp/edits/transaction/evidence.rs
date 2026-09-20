@@ -84,18 +84,27 @@ impl PreparedEdit {
     }
 
     pub(in crate::lsp) fn matches_document(&self, path: &Path, text: &str) -> bool {
-        self.0.files.get(path).and_then(|file| file.before.as_ref())
+        self.0
+            .files
+            .get(path)
+            .and_then(|file| file.before.as_ref())
             .is_some_and(|image| image.bytes.as_ref() == text.as_bytes())
     }
 
     /// Includes guard-only and no-op files, which also constrain approval.
     pub(in crate::lsp) fn summary(&self, cwd: &Path) -> Vec<serde_json::Value> {
-        self.0.files.iter().map(|(path, file)| serde_json::json!({
-            "file":crate::lsp::display_path(path, cwd),
-            "beforeBytes":file.before.as_ref().map(|image| image.bytes.len()),
-            "afterBytes":file.after.as_ref().map(|image| image.bytes.len()),
-            "changed":file.before != file.after
-        })).collect()
+        self.0
+            .files
+            .iter()
+            .map(|(path, file)| {
+                serde_json::json!({
+                    "file":crate::lsp::display_path(path, cwd),
+                    "beforeBytes":file.before.as_ref().map(|image| image.bytes.len()),
+                    "afterBytes":file.after.as_ref().map(|image| image.bytes.len()),
+                    "changed":file.before != file.after
+                })
+            })
+            .collect()
     }
 
     pub(in crate::lsp) fn verify(&self) -> Result<()> {
@@ -106,7 +115,10 @@ impl PreparedEdit {
         Ok(())
     }
 
-    pub(in crate::lsp) fn commit(self, before_commit: impl FnOnce() -> Result<()>) -> Result<ApplyOutcome> {
+    pub(in crate::lsp) fn commit(
+        self,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<ApplyOutcome> {
         self.verify()?;
         // Recheck the caller after potentially expensive original-image reads.
         before_commit()?;

@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 348 current source files.
+- `rg --files src -g '*.rs' | sort` -> 352 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 348.
+- Source-file rows below: 352.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -235,6 +235,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/hierarchy.rs` | LSP call hierarchy navigation | Unit; `src/lsp/hierarchy/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/hierarchy/tests.rs` | LSP call hierarchy test suite | Test module; hierarchy tests. |
 | `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
+| `src/lsp/refactor_preview.rs` | LSP refactor preview and approval staging | Unit; `src/lsp/refactor_preview/tests.rs`, `src/lsp/refactor_preview/tests/protocol.rs`. |
+| `src/lsp/refactor_preview/tests.rs` | LSP refactor preview test suite | Test module; refactor preview tests. |
+| `src/lsp/refactor_preview/tests/protocol.rs` | LSP refactor preview protocol test cases | Test support module; refactor protocol scenarios. |
 | `src/lsp/registry.rs` | LSP registry | `tests/lsp.rs`. |
 | `src/lsp/semantic.rs` | LSP semantic inspection, signature help, and inlay hints | Unit; `src/lsp/semantic/tests.rs`, `src/lsp/semantic/tests/hints.rs`. |
 | `src/lsp/semantic/hints.rs` | LSP inlay hints resolution and parameter/type hints | Unit; `src/lsp/semantic/hints/tests.rs`. |
@@ -257,6 +260,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/mcp/manager/catalog.rs` | MCP tool catalog discovery and pagination | Unit; `tests/mcp_conformance.rs`. |
 | `src/mcp/manager/catalog/context.rs` | MCP resource catalog and context discovery | Unit; in-module tests. |
 | `src/mcp/manager/connection.rs` | MCP server connection setup, lifecycle, and owner tracking | Unit; `tests/mcp.rs`. |
+| `src/mcp/manager/output_schema.rs` | MCP tool call structured-output contract validation | Unit; `src/mcp/manager/calls.rs`, `tests/mcp.rs`. |
 | `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
 | `src/mcp/trust.rs` | MCP trust | `tests/mcp.rs`. |
 | `src/media_tools.rs` | Opt-in media trio tools `inspect_image` / `generate_image` / `tts` (bd-cv653.2.7) | `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |

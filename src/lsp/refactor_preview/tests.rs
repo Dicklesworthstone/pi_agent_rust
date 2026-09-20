@@ -6,7 +6,9 @@ use crate::lsp::text::content_hash_for_drift;
 use std::collections::HashMap;
 use std::path::Path;
 
-fn uri(path: &Path) -> String { try_path_to_uri(path).unwrap() }
+fn uri(path: &Path) -> String {
+    try_path_to_uri(path).unwrap()
+}
 
 fn replacement(path: &Path, text: &str) -> Value {
     json!({"textDocument":{"uri":uri(path),"version":null},"edits":[{
@@ -49,7 +51,9 @@ fn unopened_sibling_drift_rejects_the_whole_prepared_batch() {
     let sibling = root.join("sibling.rs");
     std::fs::write(&source, "old\n").unwrap();
     std::fs::write(&sibling, "old\n").unwrap();
-    let prepared = prepare(&json!({"documentChanges":[replacement(&source,"new"),replacement(&sibling,"new")]}));
+    let prepared = prepare(
+        &json!({"documentChanges":[replacement(&source,"new"),replacement(&sibling,"new")]}),
+    );
     std::fs::write(&sibling, "external\n").unwrap();
     let error = prepared.commit(|| Ok(())).unwrap_err();
     assert!(error.to_string().contains("LSP_EDIT_CONFLICT"), "{error}");
@@ -80,14 +84,20 @@ fn guard_only_source_participates_in_approval_and_summary() {
     let target = root.join("target.rs");
     std::fs::write(&source, "source\n").unwrap();
     std::fs::write(&target, "old\n").unwrap();
-    let expected = HashMap::from([(source.clone(), FileEvidence::Text(content_hash_for_drift("source\n")))]);
+    let expected = HashMap::from([(
+        source.clone(),
+        FileEvidence::Text(content_hash_for_drift("source\n")),
+    )]);
     let raw = json!({"documentChanges":[replacement(&target,"new")]});
     let prepared = PreparedEdit::new(&parse_workspace_edit(&raw).unwrap(), &expected).unwrap();
     let summary = prepared.summary(&root);
-    assert_eq!(summary[0], json!({"file":"source.rs","beforeBytes":7,"afterBytes":7,"changed":false}));
+    assert_eq!(
+        summary[0],
+        json!({"file":"source.rs","beforeBytes":7,"afterBytes":7,"changed":false})
+    );
     assert_eq!(summary[1]["changed"], true);
-    assert!(prepared.matches_document(&source,"source\n"));
-    assert!(!prepared.matches_document(&source,"different\n"));
+    assert!(prepared.matches_document(&source, "source\n"));
+    assert!(!prepared.matches_document(&source, "different\n"));
     std::fs::write(&source, "changed\n").unwrap();
     assert!(prepared.commit(|| Ok(())).is_err());
     assert_eq!(std::fs::read_to_string(target).unwrap(), "old\n");
@@ -99,7 +109,9 @@ fn approval_guard_runs_after_staging_and_blocks_all_writes() {
     let source = temp.path().canonicalize().unwrap().join("source.rs");
     std::fs::write(&source, "old\n").unwrap();
     let prepared = prepare(&json!({"documentChanges":[replacement(&source,"new")]}));
-    let error = prepared.commit(|| Err(tool_err("LSP_CANCELLED", "cancelled at approval"))).unwrap_err();
+    let error = prepared
+        .commit(|| Err(tool_err("LSP_CANCELLED", "cancelled at approval")))
+        .unwrap_err();
     assert!(error.to_string().contains("LSP_CANCELLED"));
     assert_eq!(std::fs::read_to_string(source).unwrap(), "old\n");
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
@@ -126,7 +138,9 @@ fn prepared_binary_resource_moves_preserve_exact_bytes() {
     let destination = root.join("new.bin");
     let bytes = [0, 255, 128, 10];
     std::fs::write(&source, bytes).unwrap();
-    let prepared = prepare(&json!({"documentChanges":[{"kind":"rename","oldUri":uri(&source),"newUri":uri(&destination)}]}));
+    let prepared = prepare(
+        &json!({"documentChanges":[{"kind":"rename","oldUri":uri(&source),"newUri":uri(&destination)}]}),
+    );
     assert!(!prepared.matches_document(&source, ""));
     prepared.commit(|| Ok(())).unwrap();
     assert_eq!(std::fs::read(destination).unwrap(), bytes);
@@ -164,7 +178,10 @@ fn prepared_approval_checks_permissions_and_parent_routes() {
     std::fs::rename(&directory, &moved).unwrap();
     symlink(&moved, &directory).unwrap();
     assert!(prepared.commit(|| Ok(())).is_err());
-    assert_eq!(std::fs::read_to_string(moved.join("source.rs")).unwrap(), "old\n");
+    assert_eq!(
+        std::fs::read_to_string(moved.join("source.rs")).unwrap(),
+        "old\n"
+    );
 }
 
 #[test]
@@ -172,10 +189,15 @@ fn prepared_transactions_keep_existing_file_and_count_limits() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let source = root.join("large.rs");
-    std::fs::File::create(&source).unwrap().set_len(16 * 1024 * 1024 + 1).unwrap();
+    std::fs::File::create(&source)
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
     let raw = json!({"documentChanges":[{"kind":"delete","uri":uri(&source)}]});
     assert!(PreparedEdit::new(&parse_workspace_edit(&raw).unwrap(), &HashMap::new()).is_err());
-    let changes: Vec<_> = (0..1025).map(|i| json!({"kind":"create","uri":uri(&root.join(format!("file-{i}.rs")))})).collect();
+    let changes: Vec<_> = (0..1025)
+        .map(|i| json!({"kind":"create","uri":uri(&root.join(format!("file-{i}.rs")))}))
+        .collect();
     let plan = parse_workspace_edit(&json!({"documentChanges":changes})).unwrap();
     let error = PreparedEdit::new(&plan, &HashMap::new()).err().unwrap();
     assert!(error.to_string().contains("LSP_EDIT_LIMIT"), "{error}");
@@ -185,27 +207,46 @@ fn prepared_transactions_keep_existing_file_and_count_limits() {
 #[test]
 fn selected_refactor_rejects_all_overriding_selectors() {
     for (key, value) in [
-        ("file",json!("other.rs")), ("newName",json!("other")), ("newFile",json!("other.rs")),
-        ("symbol",json!("other")), ("line",json!(1)), ("query",json!("other")),
-        ("limit",json!(1)), ("only",json!(["refactor"])), ("after",json!("a.rs")),
-        ("actionId",json!("other")), ("completionId",json!("other")), ("snippetValues",json!({})),
-        ("hierarchyId",json!("other")), ("resolve",json!(false)), ("formatOptions",json!({})),
-        ("method",json!("workspace/executeCommand")), ("payload",json!({})),
-        ("position",json!({"line":0,"character":0})),
-        ("range",json!({"start":{"line":0,"character":0},"end":{"line":0,"character":1}})),
+        ("file", json!("other.rs")),
+        ("newName", json!("other")),
+        ("newFile", json!("other.rs")),
+        ("symbol", json!("other")),
+        ("line", json!(1)),
+        ("query", json!("other")),
+        ("limit", json!(1)),
+        ("only", json!(["refactor"])),
+        ("after", json!("a.rs")),
+        ("actionId", json!("other")),
+        ("completionId", json!("other")),
+        ("snippetValues", json!({})),
+        ("hierarchyId", json!("other")),
+        ("resolve", json!(false)),
+        ("formatOptions", json!({})),
+        ("method", json!("workspace/executeCommand")),
+        ("payload", json!({})),
+        ("position", json!({"line":0,"character":0})),
+        (
+            "range",
+            json!({"start":{"line":0,"character":0},"end":{"line":0,"character":1}}),
+        ),
     ] {
         let mut raw = json!({"action":"rename","refactorId":"test"});
         raw[key] = value;
         let input: LspInput = serde_json::from_value(raw).unwrap();
         assert!(validate_selection(&input).is_err(), "{key}");
     }
-    for raw in [json!({"action":"format","refactorId":"test"}),
+    for raw in [
+        json!({"action":"format","refactorId":"test"}),
         json!({"action":"rename","refactorId":""}),
-        json!({"action":"rename","refactorId":"x".repeat(129)})] {
+        json!({"action":"rename","refactorId":"x".repeat(129)}),
+    ] {
         assert!(validate_selection(&serde_json::from_value(raw).unwrap()).is_err());
     }
-    for action in ["rename","rename_file"] {
-        let input: LspInput = serde_json::from_value(json!({"action":action,"refactorId":"test","apply":true,"timeout":10})).unwrap();
+    for action in ["rename", "rename_file"] {
+        let input: LspInput = serde_json::from_value(
+            json!({"action":action,"refactorId":"test","apply":true,"timeout":10}),
+        )
+        .unwrap();
         validate_selection(&input).unwrap();
     }
 }
