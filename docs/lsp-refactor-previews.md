@@ -53,6 +53,27 @@ its inline edits. List again and explicitly use `apply:true` on the selected
 action to use the existing command workflow. Such direct execution is not
 covered by a reviewed `refactorId` and can have additional command effects.
 
+### Quick fixes from pull-only diagnostics
+
+When `diagnosticProvider` is advertised, a fresh code-action listing or query
+first obtains `textDocument/diagnostic` for the synchronized source. It passes
+the accepted diagnostics, including opaque diagnostic `data`, into the action
+request's context. This makes quick fixes available without a separate manual
+diagnostics call, even when the server never publishes push notifications.
+An explicit empty report is accepted immediately; failed, malformed, or stale
+reports stop the workflow rather than becoming an empty diagnostic context.
+The existing pull-result cache can reuse unchanged reports for the same source
+revision and requests a new full report after resynchronization.
+Starting a fresh listing retires previous action handles, including when the
+new diagnostic request fails; an old quick fix cannot survive a failed refresh.
+
+Listings expose `diagnosticsSource` (`pull` or `cache`) and `diagnosticCount`.
+Push-only servers retain their cached-context behavior; an empty cache does not
+prove that a report was received. Pulling does not grant server-edit permission.
+Each protocol request retains the existing per-request timeout/cancellation
+discipline. Inspection or approval by `refactorId` does not pull diagnostics,
+recompute the code action, or resolve it a second time.
+
 ## Symbol rename
 
 Request the rename with `apply:false`:

@@ -621,17 +621,44 @@ impl LspTool {
                     "code_actions requires file or a cached actionId",
                 )
             })?;
+            // Retire old action handles before requesting a new diagnostic
+            // baseline. A failed refresh must not leave old quick fixes usable.
+            lock(&self.actions.cache).clear();
             let path = resolve_tool_path(file, &self.cwd).canonicalize()?;
             let hash = file_hash(&path)?;
             let range = Self::code_action_range(input, &path)?;
             let (uri, entry) = self.synced(&path).await?;
             let snapshot = Arc::new(refactor::RefactorSnapshot::capture(&entry, &path, hash)?);
-            let diagnostics = entry
+            let pulls_diagnostics = entry
                 .client
-                .diagnostics_snapshot()
-                .get(&uri)
-                .cloned()
-                .unwrap_or_default();
+                .capabilities()
+                .raw
+                .get("diagnosticProvider")
+                .is_some_and(Value::is_object);
+            let diagnostics = if pulls_diagnostics {
+                // Pull-only servers never populate the push cache by opening
+                // a document. Obtain a real report before asking for quick fixes.
+                // An explicit empty report is valid; a failed pull is not one.
+                entry
+                    .client
+                    .refresh_document_diagnostics(&uri, self.request_timeout(input))
+                    .await?;
+                snapshot.verify_request_source(&entry)?;
+                // Read the freshly accepted report without a second pull or
+                // the warmup heuristic used by interactive diagnostic waits.
+                entry
+                    .client
+                    .document_diagnostics(&uri, std::time::Duration::ZERO)
+                    .await?
+            } else {
+                entry
+                    .client
+                    .diagnostics_snapshot()
+                    .get(&uri)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let diagnostic_count = diagnostics.len();
             let mut context = json!({"diagnostics":diagnostics,"triggerKind":1});
             if let Some(only) = &input.only {
                 context["only"] = json!(only);
@@ -701,6 +728,8 @@ impl LspTool {
                 let payload = json!({
                     "action":"code_actions","file":display_path(&path,&self.cwd),
                     "range":range,"only":input.only,"filteredOut":received-actions.len(),
+                    "diagnosticsSource":if pulls_diagnostics { "pull" } else { "cache" },
+                    "diagnosticCount":diagnostic_count,
                     "count":summaries.len(),"actions":summaries
                 });
                 return Ok(text_output(payload.to_string(), payload));

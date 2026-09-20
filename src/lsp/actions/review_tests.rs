@@ -279,3 +279,151 @@ fn action_review_dropping_pending_resolution_cancels_and_releases_tool_lane() {
     assert!(lock(&tool.actions.active).is_none());
     assert_eq!(review_read(temp.path(), "source.lspfixture"), "old\n");
 }
+
+#[test]
+fn action_review_pull_only_quickfix_fetches_diagnostic_context_before_listing() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "review-pull") else { return };
+    let runtime = runtime();
+    let listing = review_listing(&tool, &runtime);
+    assert_eq!(listing["diagnosticsSource"], "pull");
+    assert_eq!(listing["diagnosticCount"], 1);
+    assert_eq!(listing["actions"][0]["kind"], "quickfix");
+    let calls = requests(temp.path());
+    let pull = calls.iter().position(|call| call["method"] == "textDocument/diagnostic").unwrap();
+    let action = calls.iter().position(|call| call["method"] == "textDocument/codeAction").unwrap();
+    assert!(pull < action);
+    assert_eq!(calls[action]["params"]["context"]["diagnostics"][0]["data"]["opaque"][0], "λ");
+    let preview = run(&tool, &runtime, json!({"action":"code_actions","actionId":listing["actions"][0]["actionId"]})).unwrap().details.unwrap();
+    review_approve(&tool, &runtime, &preview["refactorId"]).unwrap();
+    assert_eq!(review_read(temp.path(), "source.lspfixture"), "fixed\n");
+    assert_eq!(methods(temp.path()).iter().filter(|m| *m == "textDocument/diagnostic").count(), 1);
+}
+
+#[test]
+fn action_review_fresh_quickfix_query_also_pulls_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "review-pull") else { return };
+    let runtime = runtime();
+    let preview = run(&tool, &runtime, json!({"action":"code_actions","file":"source.lspfixture",
+        "query":"1","only":["quickfix"],"apply":false})).unwrap().details.unwrap();
+    assert_eq!(preview["kind"], "quickfix");
+    review_approve(&tool, &runtime, &preview["refactorId"]).unwrap();
+    assert_eq!(review_read(temp.path(), "sibling.lspfixture"), "fixed\n");
+}
+
+#[test]
+fn action_review_explicit_empty_and_unchanged_diagnostic_reports_remain_valid() {
+    for mode in ["review-pull", "review-pull-empty"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(tool) = fixture(temp.path(), mode) else { return };
+        let runtime = runtime();
+        for _ in 0..2 {
+            let listing = review_listing(&tool, &runtime);
+            assert_eq!(listing["diagnosticCount"], usize::from(mode == "review-pull"));
+        }
+        let calls = requests(temp.path());
+        let pulls: Vec<_> = calls.iter().filter(|call| call["method"] == "textDocument/diagnostic").collect();
+        assert_eq!(pulls.len(), 2);
+        assert!(pulls[0]["params"].get("previousResultId").is_none());
+        assert_eq!(pulls[1]["params"]["previousResultId"], "review-report");
+    }
+}
+
+#[test]
+fn action_review_resynchronized_source_does_not_reuse_retired_diagnostic_result_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "review-pull") else { return };
+    let runtime = runtime();
+    review_listing(&tool, &runtime);
+    std::fs::write(temp.path().join("source.lspfixture"), "new\n").unwrap();
+    review_listing(&tool, &runtime);
+    let calls = requests(temp.path());
+    let pulls: Vec<_> = calls.iter().filter(|call| call["method"] == "textDocument/diagnostic").collect();
+    assert_eq!(pulls.len(), 2);
+    assert!(pulls.iter().all(|call| call["params"].get("previousResultId").is_none()));
+    let actions: Vec<_> = calls.iter().filter(|call| call["method"] == "textDocument/codeAction").collect();
+    assert_ne!(actions[0]["params"]["context"]["diagnostics"][0]["data"], actions[1]["params"]["context"]["diagnostics"][0]["data"]);
+}
+
+#[test]
+fn action_review_failed_malformed_or_drifted_pull_does_not_dispatch_code_action() {
+    for (mode, expected) in [("review-pull-error", "diagnostic computation failed"),
+        ("review-pull-malformed", "LSP_DIAGNOSTIC_REPORT"), ("review-pull-drift", "LSP_EDIT_CONFLICT")] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(tool) = fixture(temp.path(), mode) else { return };
+        let error = run(&tool, &runtime(), json!({"action":"code_actions","file":"source.lspfixture","query":"1","apply":true,"timeout":5})).unwrap_err();
+        assert!(error.to_string().contains(expected), "{mode}: {error}");
+        assert!(!methods(temp.path()).iter().any(|m| m == "textDocument/codeAction" || m == "workspace/executeCommand"));
+        assert_eq!(review_read(temp.path(), "sibling.lspfixture"), "old\n");
+    }
+}
+
+#[test]
+fn action_review_pull_diagnostics_cannot_open_a_command_callback_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "review-pull-probe") else { return };
+    let runtime = runtime();
+    let listing = review_listing(&tool, &runtime);
+    assert_eq!(listing["diagnosticCount"], 1);
+    let result: Value = serde_json::from_str(&review_read(temp.path(), "pull-probe.json")).unwrap();
+    assert_eq!(result["applied"], false);
+    assert_eq!(review_read(temp.path(), "sibling.lspfixture"), "old\n");
+    assert!(lock(&tool.actions.active).is_none());
+}
+
+#[test]
+fn action_review_cancelled_diagnostic_pull_never_reaches_action_computation() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "review-pull-stall") else { return };
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut pending = Box::pin(tool.execute("pull-drop", json!({"action":"code_actions","file":"source.lspfixture","query":"1","apply":true,"timeout":20}), None));
+        let owner = AgentCx::for_current_or_request();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !temp.path().join("pull-started").exists() {
+            assert!(std::time::Instant::now() < deadline, "diagnostic pull never started");
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            owner.time().sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(pending);
+    });
+    run(&tool, &runtime, json!({"action":"request","file":"source.lspfixture","method":"test/versions","timeout":5})).unwrap();
+    let calls = methods(temp.path());
+    assert!(calls.iter().any(|m| m == "$/cancelRequest"));
+    assert!(!calls.iter().any(|m| m == "textDocument/codeAction"));
+    assert_eq!(review_read(temp.path(), "source.lspfixture"), "old\n");
+}
+
+#[test]
+fn action_review_push_only_servers_keep_cached_context_without_pulling() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "review-lazy") else { return };
+    let listing = review_listing(&tool, &runtime());
+    assert_eq!(listing["diagnosticsSource"], "cache");
+    assert_eq!(listing["diagnosticCount"], 0);
+    assert!(!methods(temp.path()).iter().any(|m| m == "textDocument/diagnostic"));
+}
+
+#[test]
+fn action_review_failed_refresh_never_reuses_cached_diagnostics_or_action_handles() {
+    for mode in ["review-pull-error-after", "review-pull-malformed-after"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(tool) = fixture(temp.path(), mode) else { return };
+        let runtime = runtime();
+        let first = review_listing(&tool, &runtime);
+        let id = &first["actions"][0]["actionId"];
+        let error = run(&tool, &runtime, json!({"action":"code_actions",
+            "file":"source.lspfixture","query":"1","apply":true,"timeout":5})).unwrap_err();
+        assert!(error.to_string().contains(if mode == "review-pull-error-after" {
+            "diagnostic computation failed"
+        } else { "LSP_DIAGNOSTIC_REPORT" }), "{error}");
+        let expired = run(&tool, &runtime, json!({"action":"code_actions","actionId":id,"apply":true})).unwrap_err();
+        assert!(expired.to_string().contains("LSP_ACTION_EXPIRED"), "{expired}");
+        let calls = methods(temp.path());
+        assert_eq!(calls.iter().filter(|m| *m == "textDocument/codeAction").count(), 1);
+        assert!(!calls.iter().any(|m| m == "codeAction/resolve" || m == "workspace/executeCommand"));
+        assert_eq!(review_read(temp.path(), "source.lspfixture"), "old\n");
+        assert_eq!(review_read(temp.path(), "sibling.lspfixture"), "old\n");
+    }
+}

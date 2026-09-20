@@ -9,6 +9,9 @@ SOURCE = None
 VERSIONS = []
 DOCUMENT_VERSIONS = {}
 SEQUENCE = 0
+PULL_COUNT = 0
+PULL_VERSION = None
+PULL_ITEMS = []
 EXTRACTED = "prefix\nextracted()\nsuffix\nfn extracted() { left + right }\n"
 
 
@@ -175,7 +178,7 @@ def resolve_selection(params):
 
 
 def main():
-    global SOURCE
+    global SOURCE, PULL_COUNT, PULL_VERSION, PULL_ITEMS
     while True:
         request = read()
         if request is None:
@@ -185,9 +188,43 @@ def main():
         observe(request)
         if method == "initialize":
             assert params["capabilities"]["textDocument"]["codeAction"]["dataSupport"]
-            reply(request, {"capabilities": {"textDocumentSync": 1,
-                  "codeActionProvider": {"resolveProvider": True},
-                  "executeCommandProvider": {"commands": ["test.finish"]}}})
+            capabilities = {"textDocumentSync": 1,
+                            "codeActionProvider": {"resolveProvider": True},
+                            "executeCommandProvider": {"commands": ["test.finish"]}}
+            if MODE.startswith("review-pull"):
+                capabilities["diagnosticProvider"] = {"identifier": "review-diagnostics",
+                    "interFileDependencies": False, "workspaceDiagnostics": False}
+            reply(request, {"capabilities": capabilities})
+        elif method == "textDocument/diagnostic" and MODE.startswith("review-pull"):
+            PULL_COUNT += 1
+            assert params["identifier"] == "review-diagnostics"
+            uri = params["textDocument"]["uri"]
+            version = DOCUMENT_VERSIONS[uri]
+            if MODE == "review-pull-stall":
+                Path("pull-started").write_text("started", encoding="ascii")
+                continue
+            if MODE == "review-pull-error" or (MODE == "review-pull-error-after" and PULL_COUNT > 1):
+                send({"id": request["id"], "error": {"code": -32603, "message": "diagnostic computation failed"}})
+                continue
+            if MODE == "review-pull-malformed" or (MODE == "review-pull-malformed-after" and PULL_COUNT > 1):
+                reply(request, {"kind": "full", "items": None})
+                continue
+            if MODE == "review-pull-probe":
+                probe = server_edit(Path("sibling.lspfixture").resolve().as_uri())
+                Path("pull-probe.json").write_text(json.dumps(probe), encoding="utf-8")
+            if PULL_VERSION == version:
+                assert params.get("previousResultId") == "review-report"
+                reply(request, {"kind": "unchanged", "resultId": "review-report"})
+                continue
+            assert "previousResultId" not in params
+            PULL_VERSION = version
+            PULL_ITEMS = [] if MODE == "review-pull-empty" else [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                "severity": 1, "code": "needs-fix", "message": "Fix this identifier",
+                "data": {"opaque": ["λ", version], "uri": uri}}]
+            if MODE == "review-pull-drift":
+                Path("source.lspfixture").write_text("external\n", encoding="utf-8")
+            reply(request, {"kind": "full", "items": PULL_ITEMS, "resultId": "review-report"})
         elif method in ("textDocument/didOpen", "textDocument/didChange"):
             continue
         elif method == "textDocument/codeAction":
@@ -296,6 +333,9 @@ def review_edit(data):
 
 
 def review_actions(params):
+    if MODE.startswith("review-pull"):
+        assert PULL_COUNT > 0, "quick-fix request preceded diagnostics"
+        assert params["context"]["diagnostics"] == PULL_ITEMS, "diagnostic data was dropped or changed"
     if MODE == "review-extract":
         return selection_actions(params)
     uri = params["textDocument"]["uri"]
@@ -303,6 +343,9 @@ def review_actions(params):
     data = {"uri": uri, "version": DOCUMENT_VERSIONS[uri],
             "siblingVersion": DOCUMENT_VERSIONS.get(sibling), "opaque": {"keep": [1, "two"]}}
     action = {"title": "Review source and imports", "kind": "refactor.rewrite", "data": data}
+    if MODE.startswith("review-pull"):
+        action["kind"] = "quickfix"
+        action["title"] = "Fix reported diagnostic"
     if MODE in ("review-inline", "review-resource", "review-command-inline"):
         action["edit"] = review_edit(data)
     if MODE == "review-command-inline":
