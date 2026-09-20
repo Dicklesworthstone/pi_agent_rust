@@ -43,6 +43,9 @@ const GITHUB_API_VERSION: &str = "2025-04-01";
 /// Safety margin: refresh the session token this many seconds before expiry.
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 60;
 
+/// Token responses are small control-plane messages, not model output.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+
 fn copilot_editor_version() -> String {
     std::env::var("PI_COPILOT_EDITOR_VERSION")
         .ok()
@@ -98,7 +101,7 @@ fn ensure_chat_completions_path(base: &str) -> String {
 // ── Token exchange types ─────────────────────────────────────────
 
 /// Response from the Copilot token exchange endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct CopilotTokenResponse {
     /// The short-lived session token.
     token: String,
@@ -107,6 +110,15 @@ struct CopilotTokenResponse {
     /// Endpoints returned by the API.
     #[serde(default)]
     endpoints: CopilotEndpoints,
+}
+
+impl std::fmt::Debug for CopilotTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopilotTokenResponse")
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Endpoint URLs returned alongside the session token.
@@ -118,11 +130,39 @@ struct CopilotEndpoints {
 }
 
 /// Cached session token with expiry.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CachedToken {
     token: String,
     expires_at: i64,
     api_endpoint: String,
+}
+
+impl std::fmt::Debug for CachedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedToken")
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Treat all response content as secret-bearing, including parser errors:
+/// serde diagnostics can otherwise quote an unexpected credential value.
+fn parse_session_token_response(text: &str, now: i64) -> Result<CopilotTokenResponse> {
+    if text.len() > MAX_TOKEN_RESPONSE_BYTES {
+        return Err(Error::auth("Copilot token response exceeded the size limit"));
+    }
+    let response: CopilotTokenResponse = serde_json::from_str(text)
+        .map_err(|_| Error::auth("Invalid Copilot token response"))?;
+    // Do not trim or otherwise rewrite an opaque credential. Reject values
+    // that cannot safely form a single HTTP Authorization header instead.
+    if response.token.is_empty() || !response.token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(Error::auth("Copilot returned an unusable session token"));
+    }
+    if response.expires_at <= now {
+        return Err(Error::auth("Copilot returned an expired session token"));
+    }
+    Ok(response)
 }
 
 // ── Provider ─────────────────────────────────────────────────────
@@ -238,25 +278,26 @@ impl CopilotProvider {
             .header("User-Agent", copilot_user_agent())
             .header("X-Github-Api-Version", github_api_version());
 
-        let response = Box::pin(request.send())
-            .await
-            .map_err(|e| Error::auth(format!("Copilot token exchange failed: {e}")))?;
+        let response = Box::pin(request.send()).await.map_err(|_| {
+            // Transport diagnostics can contain a request URL or headers.
+            Error::auth("Copilot token exchange failed before a response was received")
+        })?;
 
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read body>".to_string());
-
         if !(200..300).contains(&status) {
+            // Never copy an authentication response into user-visible
+            // errors. Do not drain a potentially unbounded error body.
             return Err(Error::auth(format!(
                 "Copilot token exchange failed (HTTP {status}). \
-                 Verify your GitHub token has Copilot access. Response: {text}"
+                 Verify your GitHub token has Copilot access."
             )));
         }
 
-        let token_response: CopilotTokenResponse = serde_json::from_str(&text)
-            .map_err(|e| Error::auth(format!("Invalid Copilot token response: {e}")))?;
+        let text = response
+            .text_limited(MAX_TOKEN_RESPONSE_BYTES)
+            .await
+            .map_err(|_| Error::auth("Failed to read Copilot token response"))?;
+        let token_response = parse_session_token_response(&text, chrono::Utc::now().timestamp())?;
 
         // Determine the chat-completions endpoint. A configured override
         // (catalog `base_url`) wins over the endpoint the token-exchange
@@ -276,7 +317,7 @@ impl CopilotProvider {
             api_endpoint,
         };
 
-        // Store in cache.
+        // Store only a fully read, parsed, and validated credential.
         {
             let mut guard = self
                 .cached_token
@@ -537,22 +578,12 @@ mod tests {
         assert_eq!(cloned.expires_at, 99999);
     }
 
-    /// Build a VCR client that returns a successful token exchange response.
-    fn vcr_token_exchange_client(
+    fn vcr_raw_token_client(
         test_name: &str,
-        token: &str,
-        expires_at: i64,
-        api_endpoint: &str,
+        status: u16,
+        response_body: String,
     ) -> (Client, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("tempdir");
-        let response_body = serde_json::json!({
-            "token": token,
-            "expires_at": expires_at,
-            "endpoints": {
-                "api": api_endpoint
-            }
-        })
-        .to_string();
         let cassette = Cassette {
             version: "1.0".to_string(),
             test_name: test_name.to_string(),
@@ -566,7 +597,7 @@ mod tests {
                     body_text: None,
                 },
                 response: RecordedResponse {
-                    status: 200,
+                    status,
                     headers: vec![],
                     body_chunks: vec![response_body],
                     body_chunks_base64: None,
@@ -579,6 +610,24 @@ mod tests {
         let recorder = VcrRecorder::new_with(test_name, VcrMode::Playback, temp.path());
         let client = Client::new().with_vcr(recorder);
         (client, temp)
+    }
+
+    /// Build a VCR client that returns a successful token exchange response.
+    fn vcr_token_exchange_client(
+        test_name: &str,
+        token: &str,
+        expires_at: i64,
+        api_endpoint: &str,
+    ) -> (Client, tempfile::TempDir) {
+        let response_body = serde_json::json!({
+            "token": token,
+            "expires_at": expires_at,
+            "endpoints": {
+                "api": api_endpoint
+            }
+        })
+        .to_string();
+        vcr_raw_token_client(test_name, 200, response_body)
     }
 
     #[test]
@@ -968,6 +1017,146 @@ mod tests {
             assert!(!completed, "a broken stream must not masquerade as completion");
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
             assert_eq!(provider.ensure_session_token().await.expect("cached").token, "old-session");
+        });
+    }
+
+    #[test]
+    fn session_response_requires_header_safe_unexpired_credentials() {
+        let now = 1_700_000_000;
+        for token in ["", " ", " secret", "secret ", "secret\tvalue", "secret\r\nInjected: yes", "secret\u{7f}", "sëcret"] {
+            let body = serde_json::json!({"token": token, "expires_at": now + 3600}).to_string();
+            let error = parse_session_token_response(&body, now).expect_err("unsafe credential");
+            assert!(error.to_string().contains("unusable session token"));
+        }
+        for expires_at in [now - 1, now, i64::MIN] {
+            let body = serde_json::json!({"token": "secret-marker", "expires_at": expires_at}).to_string();
+            let error = parse_session_token_response(&body, now).expect_err("expired credential");
+            assert!(error.to_string().contains("expired session token"));
+            assert!(!error.to_string().contains("secret-marker"));
+        }
+        // Opaque Copilot tokens may contain separators. A live token inside
+        // the refresh margin can serve this request; it is not yet expired.
+        let body = serde_json::json!({
+            "token": "tid=test;exp=1700000001;sku=copilot;sig=a+b/c=",
+            "expires_at": now + 1
+        }).to_string();
+        let parsed = parse_session_token_response(&body, now).expect("valid opaque token");
+        assert_eq!(parsed.expires_at, now + 1);
+    }
+
+    #[test]
+    fn malformed_session_responses_do_not_echo_secret_values() {
+        let now = 1_700_000_000;
+        for body in [
+            r#"{"token":"secret-marker","expires_at":"secret-marker"}"#,
+            r#"{"token":["secret-marker"],"expires_at":1700003600}"#,
+            r#"{"token":"secret-marker","expires_at":1700003600,"endpoints":{"api":42}}"#,
+            "secret-marker is not JSON",
+        ] {
+            let error = parse_session_token_response(body, now).expect_err("malformed response");
+            assert!(error.to_string().contains("Invalid Copilot token response"));
+            assert!(!error.to_string().contains("secret-marker"));
+        }
+    }
+
+    #[test]
+    fn secret_bearing_debug_values_are_redacted() {
+        let response = parse_session_token_response(
+            r#"{"token":"secret-marker","expires_at":1700003600,"endpoints":{"api":"https://example.com/?key=url-secret"}}"#,
+            1_700_000_000,
+        ).expect("response");
+        let cached = CachedToken {
+            token: response.token.clone(),
+            expires_at: response.expires_at,
+            api_endpoint: response.endpoints.api.clone(),
+        };
+        for debug in [format!("{response:?}"), format!("{cached:?}")] {
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains("secret-marker"));
+            assert!(!debug.contains("url-secret"));
+        }
+    }
+
+    #[test]
+    fn invalid_exchange_credentials_never_populate_the_cache() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        rt.block_on(async {
+            let now = chrono::Utc::now().timestamp();
+            for (index, (token, expires_at)) in [
+                ("", now + 3600),
+                ("secret\r\nInjected: yes", now + 3600),
+                ("expired-secret", now - 1),
+            ].into_iter().enumerate() {
+                let (client, _temp) = vcr_token_exchange_client(
+                    &format!("copilot_invalid_token_{index}"), token, expires_at, "",
+                );
+                let provider = CopilotProvider::new("gpt-4o", "github-secret")
+                    .with_github_api_base(GITHUB_API_BASE)
+                    .with_client(client);
+                assert!(provider.ensure_session_token().await.is_err());
+                assert!(provider.cached_token.lock().expect("cache").is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn oversized_exchange_response_is_rejected_before_caching() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        rt.block_on(async {
+            let body = serde_json::json!({
+                "token": "secret-marker",
+                "expires_at": chrono::Utc::now().timestamp() + 3600,
+                "padding": "x".repeat(MAX_TOKEN_RESPONSE_BYTES)
+            }).to_string();
+            let (client, _temp) = vcr_raw_token_client("copilot_oversized_token", 200, body);
+            let provider = CopilotProvider::new("gpt-4o", "github-secret")
+                .with_github_api_base(GITHUB_API_BASE)
+                .with_client(client);
+            let error = provider.ensure_session_token().await.expect_err("oversized response");
+            assert!(error.to_string().contains("size limit"));
+            assert!(!error.to_string().contains("secret-marker"));
+            assert!(provider.cached_token.lock().expect("cache").is_none());
+        });
+    }
+
+    #[test]
+    fn failed_exchange_responses_do_not_disclose_response_bodies() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        rt.block_on(async {
+            for status in [401, 403, 429, 500] {
+                let (client, _temp) = vcr_raw_token_client(
+                    &format!("copilot_secret_error_{status}"),
+                    status,
+                    "github-secret session-secret".repeat(MAX_TOKEN_RESPONSE_BYTES / 16),
+                );
+                let provider = CopilotProvider::new("gpt-4o", "github-secret")
+                    .with_github_api_base(GITHUB_API_BASE)
+                    .with_client(client);
+                let error = provider.ensure_session_token().await.expect_err("exchange rejected");
+                let message = error.to_string();
+                assert!(message.contains(&format!("HTTP {status}")));
+                assert!(!message.contains("github-secret"));
+                assert!(!message.contains("session-secret"));
+                assert!(provider.cached_token.lock().expect("cache").is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn failed_reauthentication_never_reuses_the_rejected_session() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        rt.block_on(async {
+            // No GET interaction is available: refresh fails in playback,
+            // rather than falling through to a live authentication call.
+            let (provider, options, attempts, _temp) = recovery_fixture(
+                "copilot_failed_refresh", &[(401, "expired")],
+            );
+            let error = provider.stream(&Context::default(), &options)
+                .await.err().expect("refresh failure");
+            assert!(error.to_string().contains("Copilot token exchange failed"));
+            assert!(!error.to_string().contains("github-secret"));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(provider.cached_token.lock().expect("cache").is_none());
         });
     }
 }
