@@ -3,6 +3,8 @@
 //! A schema is untrusted server data, not authority to fetch another URL or
 //! open a local file. Compiled validators are shared with each in-flight call
 //! so a catalog refresh cannot change the contract of an already-sent request.
+//! Input admission uses the same bounded, local-only schema compiler before
+//! tools/call is sent; a rejected input never becomes uncertain delivery.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -20,6 +22,9 @@ const MAX_SCHEMA_NODES: usize = 16 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_RESULT_NODES: usize = 64 * 1024;
 const MAX_RESULT_DEPTH: usize = 64;
+const MAX_ARGUMENT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ARGUMENT_NODES: usize = 64 * 1024;
+const MAX_ARGUMENT_DEPTH: usize = 64;
 const MAX_REGEX_BYTES: usize = 1024 * 1024;
 const MAX_REGEX_DFA_BYTES: usize = 256 * 1024;
 const MAX_REGEX_BACKTRACKS: usize = 10_000;
@@ -72,6 +77,45 @@ fn within_shape_budget(value: &Value, depth: usize, nodes: &mut usize) -> bool {
             .all(|value| within_shape_budget(value, depth - 1, nodes)),
         _ => true,
     }
+}
+
+/// Reject invalid argument envelopes before connection setup can resolve
+/// credentials, start a process, or send a request. JSON-encoded size is capped
+/// at 2 MiB, in addition to independent depth and node limits. Nothing is
+/// truncated, coerced, or copied into an error message.
+pub(super) fn admit_arguments(arguments: &Value) -> Result<()> {
+    if !arguments.is_object() {
+        return Err(input_error("tool arguments must be an object"));
+    }
+    let mut nodes = MAX_ARGUMENT_NODES;
+    if !within_shape_budget(arguments, MAX_ARGUMENT_DEPTH, &mut nodes) {
+        return Err(input_error("tool arguments exceed the depth or node limit"));
+    }
+    serde_json::to_writer(&mut ByteBudget(MAX_ARGUMENT_BYTES), arguments)
+        .map_err(|_| input_error("tool arguments exceed the 2 MiB byte limit"))?;
+    Ok(())
+}
+
+/// Validate against the input schema captured from the same catalog snapshot
+/// as the output contract. Compilation happens outside publication locks and
+/// reuses output admission's schema/regex limits and deny-all retriever.
+/// Validation does not install defaults or coerce model-authored arguments.
+pub(super) fn validate_arguments(schema: &Value, arguments: &Value) -> Result<()> {
+    admit_arguments(arguments)?;
+    let compiled = McpOutputSchema::compile(schema).map_err(|_| {
+        tool_err(
+            "MCP_INPUT_SCHEMA_INVALID",
+            "the advertised inputSchema is invalid, unsupported, oversized, or references an unavailable schema; the call was not sent",
+        )
+    })?;
+    if !compiled.0.validator.is_valid(arguments) {
+        return Err(input_error("tool arguments do not match inputSchema"));
+    }
+    Ok(())
+}
+
+fn input_error(reason: &str) -> super::Error {
+    tool_err("MCP_INPUT_INVALID", format!("{reason}; the call was not sent"))
 }
 
 struct CompiledOutputSchema {
@@ -209,6 +253,104 @@ mod tests {
             "additionalProperties": false
         }))
         .expect("valid schema")
+    }
+
+    #[test]
+    fn input_validation_preserves_nested_local_reference_constraints() {
+        let schema = json!({
+            "$schema":"https://json-schema.org/draft/2020-12/schema",
+            "$defs":{"count":{"type":"integer", "minimum":0}},
+            "type":"object",
+            "properties":{"items":{"type":"array", "items":{"$ref":"#/$defs/count"}}},
+            "required":["items"],
+            "additionalProperties":false
+        });
+        let arguments = json!({"items":[0,2]});
+        let before = arguments.clone();
+        validate_arguments(&schema, &arguments).expect("valid nested input");
+        assert_eq!(arguments, before);
+        for arguments in [
+            json!({}),
+            json!({"items":[-1]}),
+            json!({"items":["private-argument"]}),
+            json!({"items":[], "extra":true}),
+        ] {
+            let error = validate_arguments(&schema, &arguments).expect_err("invalid input");
+            let message = error.to_string();
+            assert!(message.contains("MCP_INPUT_INVALID"));
+            assert!(message.contains("call was not sent"));
+            assert!(!message.contains("private-argument"));
+            assert!(!super::super::is_indeterminate_call_delivery(&error));
+        }
+    }
+
+    #[test]
+    fn malformed_or_unavailable_input_schemas_fail_closed_without_private_details() {
+        for schema in [
+            Value::Null,
+            json!(false),
+            json!({"type":7}),
+            json!({"$ref":"#/$defs/missing"}),
+            json!({"$ref":"https://example.invalid/private-schema-secret"}),
+            json!({"$ref":"file:///private-schema-secret"}),
+        ] {
+            let error = validate_arguments(&schema, &json!({})).expect_err("invalid schema");
+            let message = error.to_string();
+            assert!(message.contains("MCP_INPUT_SCHEMA_INVALID"));
+            assert!(message.contains("call was not sent"));
+            assert!(!message.contains("private-schema-secret"));
+            assert!(!super::super::is_indeterminate_call_delivery(&error));
+        }
+    }
+
+    #[test]
+    fn argument_admission_rejects_non_objects_before_schema_compilation() {
+        let schema = json!({"$ref":"https://example.invalid/private-schema-secret"});
+        for arguments in [Value::Null, json!(1), json!("{}"), json!([]), json!(true)] {
+            let message = validate_arguments(&schema, &arguments)
+                .expect_err("arguments must be an object")
+                .to_string();
+            assert!(message.contains("MCP_INPUT_INVALID"));
+            assert!(!message.contains("MCP_INPUT_SCHEMA_INVALID"));
+        }
+    }
+
+    #[test]
+    fn argument_byte_budget_accepts_the_exact_limit_and_rejects_one_more() {
+        let overhead = serde_json::to_vec(&json!({"value":""})).unwrap().len();
+        let exact = json!({"value":"x".repeat(MAX_ARGUMENT_BYTES - overhead)});
+        admit_arguments(&exact).expect("exact byte limit");
+        let oversized = json!({"value":"x".repeat(MAX_ARGUMENT_BYTES - overhead + 1)});
+        assert!(
+            admit_arguments(&oversized)
+                .expect_err("one byte over the limit")
+                .to_string()
+                .contains("byte limit")
+        );
+        // Count encoded bytes, not character count or unescaped string length.
+        let escaped = json!({"value":"\n".repeat(MAX_ARGUMENT_BYTES / 2)});
+        assert!(admit_arguments(&escaped).is_err());
+    }
+
+    #[test]
+    fn input_depth_and_node_limits_apply_even_to_a_permissive_schema() {
+        let wide = json!({"items":vec![Value::Null; MAX_ARGUMENT_NODES]});
+        assert!(
+            validate_arguments(&json!({}), &wide)
+                .expect_err("too many input nodes")
+                .to_string()
+                .contains("node limit")
+        );
+        let mut deep = json!({});
+        for _ in 0..MAX_ARGUMENT_DEPTH {
+            deep = json!({"nested":deep});
+        }
+        assert!(
+            validate_arguments(&json!({}), &deep)
+                .expect_err("input too deep")
+                .to_string()
+                .contains("depth")
+        );
     }
 
     #[test]

@@ -190,15 +190,29 @@ fn is_cancelled(error: &Error) -> bool {
         if tool == "mcp" && message.starts_with("[MCP_CANCELLED] "))
 }
 
+/// Both sides of a call come from one generation's catalog snapshot. Keeping
+/// the input schema here prevents a refresh from changing it independently of
+/// the output contract. Debugging must not dump private schema examples.
+struct ToolCallContract {
+    input_schema: Value,
+    output_schema: Option<super::McpOutputSchema>,
+}
+
+impl std::fmt::Debug for ToolCallContract {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ToolCallContract").finish_non_exhaustive()
+    }
+}
+
 /// Snapshot one advertised contract under the transport->cache publication
 /// lock order. Missing metadata is NOT an absent output schema: discovery must
 /// finish first, or the call must fail before dispatch.
 #[allow(clippy::significant_drop_tightening)]
-fn output_schema_for_call(
+fn contract_for_call(
     entry: &Arc<ServerEntry>,
     transport: &Arc<dyn McpTransport>,
     tool: &str,
-) -> Result<Option<super::McpOutputSchema>> {
+) -> Result<ToolCallContract> {
     let current = McpManager::lock(&entry.transport);
     if !current
         .as_ref()
@@ -208,7 +222,7 @@ fn output_schema_for_call(
         transport.abort();
         return Err(tool_err(
             "MCP_TRANSPORT_SUPERSEDED",
-            "connection changed before output-contract capture; the call was not sent",
+            "connection changed before contract capture; the call was not sent",
         ));
     }
     let cache = McpManager::lock(&entry.tools_cache);
@@ -227,7 +241,10 @@ fn output_schema_for_call(
                 "the requested tool is not in the server's admitted catalog; the call was not sent",
             )
         })?;
-    Ok(metadata.output_schema.clone())
+    Ok(ToolCallContract {
+        input_schema: metadata.input_schema.clone(),
+        output_schema: metadata.output_schema.clone(),
+    })
 }
 
 impl McpManager {
@@ -287,13 +304,13 @@ impl McpManager {
         entry: &Arc<ServerEntry>,
         tool: &str,
         timeout: Duration,
-    ) -> Result<(Arc<dyn McpTransport>, Option<super::McpOutputSchema>)> {
+    ) -> Result<(Arc<dyn McpTransport>, ToolCallContract)> {
         catalog::check_request_owner(owner)?;
         self.check_running()?;
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| phase_timeout("tool preparation"))?;
-        let (mut publication, lane, transport, output_schema) = run_phase(
+        let (mut publication, lane, transport, contract) = run_phase(
             owner,
             async {
                 let lane = asupersync::sync::OwnedMutexGuard::lock(
@@ -324,10 +341,10 @@ impl McpManager {
                 if !catalog_is_fresh {
                     self.list_and_cache_tools_in_lane(entry).await?;
                 }
-                let output_schema = output_schema_for_call(entry, &transport, tool)?;
+                let contract = contract_for_call(entry, &transport, tool)?;
                 // Retain lane ownership until run_phase has accepted the
                 // result; rejected completion drops publication before lane.
-                Ok((publication, lane, transport, output_schema))
+                Ok((publication, lane, transport, contract))
             },
             deadline,
             "tool preparation",
@@ -336,7 +353,7 @@ impl McpManager {
         publication.armed = false;
         drop(publication);
         drop(lane);
-        Ok((transport, output_schema))
+        Ok((transport, contract))
     }
 
     /// Call one tool on one trusted server, retaining the calling owner's
@@ -344,9 +361,12 @@ impl McpManager {
     ///
     /// An uncertain call is never replayed. Transport failures may reconnect
     /// for subsequent calls; user cancellation does not start recovery work.
+    /// Arguments must be an object within the input admission limits and match
+    /// the captured inputSchema. Rejection never sends tools/call, retires a
+    /// healthy connection, or consumes its restart budget.
     ///
     /// # Errors
-    /// Returns capability, trust, cancellation, catalog, output-contract,
+    /// Returns capability, trust, cancellation, catalog, input/output-contract,
     /// transport, or server errors. An abandoned/superseded call may already
     /// have had remote side effects; output-contract errors are not replayed.
     pub async fn call_tool(&self, server: &str, tool: &str, arguments: Value) -> Result<Value> {
@@ -354,12 +374,17 @@ impl McpManager {
         // Reject an attenuated/cancelled caller before setup can resolve
         // secrets, run a command, or open a connection.
         catalog::check_request_owner(&owner)?;
+        super::output_schema::admit_arguments(&arguments)?;
         owner
             .with_current(async {
                 let entry = self.entry(server)?;
-                let (transport, output_schema) = self
+                let (transport, contract) = self
                     .prepare_tool_call(&owner, &entry, tool, DEFAULT_MCP_TIMEOUT)
                     .await?;
+                // Setup has committed and released its publication guard. An
+                // invalid model input must not tear down a healthy cold-start
+                // connection. No locks or delivery guard surround validation.
+                super::output_schema::validate_arguments(&contract.input_schema, &arguments)?;
                 match self
                     .execute_tool_call(
                         &entry,
@@ -367,7 +392,7 @@ impl McpManager {
                         tool,
                         &arguments,
                         DEFAULT_MCP_TIMEOUT,
-                        output_schema,
+                        contract.output_schema,
                     )
                     .await
                 {
@@ -708,6 +733,160 @@ mod tests {
             "required":["count"],
             "additionalProperties":false
         })
+    }
+
+    fn install_input_contract(entry: &Arc<ServerEntry>, schema: Value) {
+        let tools = super::super::parse_tool_list(&json!({"tools":[{
+            "name":"execute", "inputSchema":schema
+        }]}))
+        .expect("input catalog");
+        *McpManager::lock(&entry.tools_cache) = Some((Instant::now(), tools));
+    }
+
+    #[test]
+    fn invalid_inputs_never_dispatch_or_spend_restart_budget_and_can_be_corrected() {
+        for arguments in [
+            json!({}),
+            json!({"count":"private-wrong-type"}),
+            json!({"count":1, "extra":true}),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let response = json!({"content":[]});
+            let (manager, entry, transport) = fixture(&temp, Ok(response.clone()));
+            install_input_contract(&entry, count_output_schema("integer"));
+            McpManager::lock(&entry.restarts).count = 2;
+            let runtime = runtime();
+            let error = runtime
+                .block_on(manager.call_tool("exec", "execute", arguments))
+                .expect_err("invalid input is a local rejection");
+            let message = error.to_string();
+            assert!(message.contains("MCP_INPUT_INVALID"), "{message}");
+            assert!(message.contains("call was not sent"));
+            assert!(!message.contains("private-wrong-type"));
+            assert!(!is_indeterminate_call_delivery(&error));
+            assert!(McpManager::lock(&transport.requests).is_empty());
+            assert!(!transport.closed.load(Ordering::Acquire));
+            assert_eq!(McpManager::lock(&entry.restarts).count, 2);
+            assert_eq!(manager.mounted_tool_metas().len(), 1);
+            let arguments = json!({"count":1});
+            assert_eq!(
+                runtime
+                    .block_on(manager.call_tool("exec", "execute", arguments.clone()))
+                    .expect("corrected input uses the same connection"),
+                response
+            );
+            assert_eq!(
+                *McpManager::lock(&transport.requests),
+                vec![("tools/call".to_string(), json!({"name":"execute", "arguments":arguments}))]
+            );
+            assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        }
+    }
+
+    #[test]
+    fn invalid_input_schema_never_becomes_an_unvalidated_remote_call() {
+        for schema in [
+            json!({"type":7}),
+            json!({"$ref":"#/$defs/missing"}),
+            json!({"$ref":"https://example.invalid/private-schema-secret"}),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, transport) = fixture(&temp, Ok(json!({"content":[]})));
+            // Exercise the call boundary even for metadata admitted by an
+            // older catalog parser; it must never downgrade validation.
+            McpManager::lock(&entry.tools_cache).as_mut().unwrap().1[0].input_schema = schema;
+            let error = runtime()
+                .block_on(manager.call_tool("exec", "execute", json!({})))
+                .expect_err("unusable schema prevents dispatch");
+            assert!(error.to_string().contains("MCP_INPUT_SCHEMA_INVALID"));
+            assert!(!error.to_string().contains("private-schema-secret"));
+            assert!(!is_indeterminate_call_delivery(&error));
+            assert!(McpManager::lock(&transport.requests).is_empty());
+            assert!(!transport.closed.load(Ordering::Acquire));
+            assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        }
+    }
+
+    #[test]
+    fn invalid_argument_envelopes_are_rejected_before_cold_connection_setup() {
+        for arguments in [
+            Value::Null,
+            json!([]),
+            json!("{}"),
+            json!({"payload":"x".repeat(2 * 1024 * 1024)}),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+            McpManager::lock(&entry.transport).take();
+            let state = setup_factory(&manager, "initialize");
+            let error = runtime()
+                .block_on(watchdog(manager.call_tool("exec", "execute", arguments)))
+                .expect_err("invalid envelope must not start setup");
+            assert!(error.to_string().contains("MCP_INPUT_INVALID"));
+            assert!(!state.reached.load(Ordering::Acquire));
+            assert_eq!(state.list_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(state.tool_calls.load(Ordering::SeqCst), 0);
+            assert!(McpManager::lock(&entry.transport).is_none());
+            assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        }
+    }
+
+    #[test]
+    fn cold_input_rejection_keeps_the_new_connection_for_a_corrected_call() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+        McpManager::lock(&entry.transport).take();
+        let state = setup_factory(&manager, "none");
+        *McpManager::lock(&state.catalog) = json!({"tools":[{
+            "name":"execute", "inputSchema":count_output_schema("integer")
+        }]});
+        let runtime = runtime();
+        let error = runtime
+            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":"wrong"}))))
+            .expect_err("cold calls validate input too");
+        assert!(error.to_string().contains("MCP_INPUT_INVALID"));
+        assert_eq!(state.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 0);
+        assert!(!state.aborted.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_some());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        runtime
+            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":1}))))
+            .expect("corrected input reuses the admitted catalog and connection");
+        assert_eq!(state.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 1);
+        assert!(!state.aborted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn catalog_refresh_changes_the_input_contract_for_subsequent_calls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+        McpManager::lock(&entry.transport).take();
+        let state = setup_factory(&manager, "none");
+        *McpManager::lock(&state.catalog) = json!({"tools":[{
+            "name":"execute", "inputSchema":count_output_schema("integer")
+        }]});
+        let runtime = runtime();
+        runtime
+            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":1}))))
+            .expect("initial integer input");
+        *McpManager::lock(&state.catalog) = json!({"tools":[{
+            "name":"execute", "inputSchema":count_output_schema("string")
+        }]});
+        McpManager::lock(&entry.tools_cache).take();
+        let error = runtime
+            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":1}))))
+            .expect_err("stale input contract must not be reused");
+        assert!(error.to_string().contains("MCP_INPUT_INVALID"));
+        assert_eq!(state.list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 1);
+        runtime
+            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":"one"}))))
+            .expect("new input contract accepts the corrected input");
+        assert_eq!(state.list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 2);
+        assert!(!state.aborted.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1491,7 +1670,7 @@ mod tests {
         let (_manager, entry, transport) = fixture(&temp, Ok(json!({"content":[]})));
         let erased: Arc<dyn McpTransport> = transport.clone();
         McpManager::lock(&entry.tools_cache).take();
-        let error = output_schema_for_call(&entry, &erased, "execute")
+        let error = contract_for_call(&entry, &erased, "execute")
             .expect_err("metadata absence is not an optional output schema");
         assert!(error.to_string().contains("MCP_CATALOG_UNAVAILABLE"));
         assert!(McpManager::lock(&transport.requests).is_empty());
