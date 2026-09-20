@@ -335,19 +335,19 @@
 | Variable | TS Pi | Rust Pi | Notes |
 |----------|-------|---------|-------|
 | `ANTHROPIC_API_KEY` | Y | Y | |
-| `ANTHROPIC_OAUTH_TOKEN` | Y | ? | Needs verification in Rust |
+| `ANTHROPIC_OAUTH_TOKEN` | Y | N | Not read by pi's auth. `anthropic` resolves `ANTHROPIC_API_KEY` or a stored OAuth credential from `/login`; the name appears only in the JS bridge map in extensions_js.rs |
 | `OPENAI_API_KEY` | Y | Y | |
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Y | Y | TS uses GEMINI_, Rust uses GOOGLE_ |
 | `AZURE_OPENAI_API_KEY` | Y | Y | |
-| `AZURE_OPENAI_BASE_URL` | Y | ? | Needs verification |
-| `AZURE_OPENAI_RESOURCE_NAME` | Y | ? | Needs verification |
-| `AZURE_OPENAI_API_VERSION` | Y | ? | Needs verification |
-| `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` | Y | ? | Needs verification |
+| `AZURE_OPENAI_BASE_URL` | Y | N | No base-URL override; pi builds the endpoint from resource + deployment |
+| `AZURE_OPENAI_RESOURCE_NAME` | Y | N | Name near-miss: pi reads `AZURE_OPENAI_RESOURCE` (providers/mod.rs), so the TS spelling is ignored |
+| `AZURE_OPENAI_API_VERSION` | Y | Y | Read in providers/mod.rs; `PI_AZURE_API_VERSION` also works |
+| `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` | Y | N | pi reads a single `AZURE_OPENAI_DEPLOYMENT`; no per-model deployment map |
 | `AWS_ACCESS_KEY_ID` | Y | Y | Bedrock |
 | `AWS_SECRET_ACCESS_KEY` | Y | Y | Bedrock |
-| `AWS_BEARER_TOKEN_BEDROCK` | Y | ? | Needs verification |
-| `AWS_REGION` | Y | ? | Needs verification |
-| `AWS_PROFILE` | Y | ? | Needs verification |
+| `AWS_BEARER_TOKEN_BEDROCK` | Y | Y | Bedrock; in the provider's AWS credential chain |
+| `AWS_REGION` | Y | Y | Resolved in auth.rs |
+| `AWS_PROFILE` | Y | Y | Resolved in auth.rs |
 | `GROQ_API_KEY` | Y | Y | |
 | `CEREBRAS_API_KEY` | Y | Y | |
 | `XAI_API_KEY` | Y | Y | |
@@ -358,7 +358,7 @@
 | `PERPLEXITY_API_KEY` | Y | Y | |
 | `COHERE_API_KEY` | N | Y | Rust-only provider |
 | `AI_GATEWAY_API_KEY` | Y | Y | Vercel AI Gateway; `provider_metadata` auth key |
-| `ZAI_API_KEY` | Y | ? | ZAI provider. Rust resolves `zai` auth from `ZHIPU_API_KEY`; `ZAI_API_KEY` appears only in the JS bridge map (`extensions_js.rs`). Needs a call on whether the alias should be accepted |
+| `ZAI_API_KEY` | Y | N | The `zai` provider exists but resolves auth from `ZHIPU_API_KEY`; this spelling appears only in the JS bridge map (`extensions_js.rs`). Accepting it as an alias is a one-line call nobody has made |
 | `MINIMAX_API_KEY` | Y | Y | MiniMax provider; `provider_metadata` auth key |
 | `KIMI_API_KEY` | Y | Y | Kimi provider; `provider_metadata` auth key (alongside `MOONSHOT_API_KEY`) |
 | `MOONSHOT_API_KEY` | N | Y | Rust-only |
@@ -418,10 +418,10 @@
 | GitLab Duo | N | Y | Rust-only |
 | GitHub Copilot | Y | Y | |
 | Ollama | N | Y | Rust-only (local) |
-| Vercel AI Gateway | Y | ? | Needs verification |
-| ZAI | Y | ? | Needs verification |
-| MiniMax | Y | ? | Needs verification |
-| Kimi | Y | ? | Needs verification |
+| Vercel AI Gateway | Y | Y | `vercel` in provider_metadata; auth via `AI_GATEWAY_API_KEY` |
+| ZAI | Y | Y | `zai` and `zai-coding-plan`; auth via `ZHIPU_API_KEY` |
+| MiniMax | Y | Y | `minimax`, `minimax-cn`, and both coding-plan variants |
+| Kimi | Y | Y | `kimi-for-coding` and `kimi-coding`; auth via `KIMI_API_KEY` |
 | Moonshot | N | Y | Rust-only |
 | DashScope/Qwen | N | Y | Rust-only |
 | Fireworks | N | Y | Rust-only |
