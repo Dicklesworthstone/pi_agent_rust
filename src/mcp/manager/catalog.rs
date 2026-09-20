@@ -821,6 +821,7 @@ mod tests {
                     name: "replacement".to_string(),
                     description: String::new(),
                     input_schema: json!({}),
+                    output_schema: None,
                 }],
             ));
             *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -916,6 +917,7 @@ mod tests {
                     name: "replacement".to_string(),
                     description: String::new(),
                     input_schema: json!({}),
+                    output_schema: None,
                 }],
             ));
             *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };

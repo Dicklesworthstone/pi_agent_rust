@@ -190,6 +190,43 @@ fn is_cancelled(error: &Error) -> bool {
         if tool == "mcp" && message.starts_with("[MCP_CANCELLED] "))
 }
 
+/// Snapshot one advertised contract under the transport->cache publication
+/// lock order. Missing metadata is NOT an absent output schema: discovery must
+/// finish first, or the call must fail before dispatch.
+#[allow(clippy::significant_drop_tightening)]
+fn output_schema_for_call(
+    entry: &Arc<ServerEntry>,
+    transport: &Arc<dyn McpTransport>,
+    tool: &str,
+) -> Result<Option<super::McpOutputSchema>> {
+    let current = McpManager::lock(&entry.transport);
+    if !current
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, transport))
+    {
+        drop(current);
+        transport.abort();
+        return Err(tool_err(
+            "MCP_TRANSPORT_SUPERSEDED",
+            "connection changed before output-contract capture; the call was not sent",
+        ));
+    }
+    let cache = McpManager::lock(&entry.tools_cache);
+    let (_, tools) = cache.as_ref().ok_or_else(|| {
+        tool_err(
+            "MCP_CATALOG_UNAVAILABLE",
+            "tool metadata is unavailable; the call was not sent",
+        )
+    })?;
+    let metadata = tools.iter().find(|metadata| metadata.name == tool).ok_or_else(|| {
+        tool_err(
+            "MCP_UNKNOWN_TOOL",
+            "the requested tool is not in the server's admitted catalog; the call was not sent",
+        )
+    })?;
+    Ok(metadata.output_schema.clone())
+}
+
 impl McpManager {
     /// Bound on-demand setup, including waiting for another connection
     /// attempt. Existing private-handshake and blocking-construction guards
@@ -237,6 +274,68 @@ impl McpManager {
         Ok(())
     }
 
+    /// Capture a connection and its admitted tool contract before releasing
+    /// the setup lane. Cold calls and expired/cleared catalogs must discover
+    /// metadata, not silently bypass validation. Execution itself stays outside
+    /// the lane, so independent tool calls remain concurrent.
+    async fn prepare_tool_call(
+        &self,
+        owner: &AgentCx,
+        entry: &Arc<ServerEntry>,
+        tool: &str,
+        timeout: Duration,
+    ) -> Result<(Arc<dyn McpTransport>, Option<super::McpOutputSchema>)> {
+        catalog::check_request_owner(owner)?;
+        self.check_running()?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| phase_timeout("tool preparation"))?;
+        let (mut publication, lane, transport, output_schema) = run_phase(
+            owner,
+            async {
+                let lane = asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&entry.connect_lane),
+                    owner.cx(),
+                )
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while preparing tool call"))?;
+                let publication = SetupPublicationGuard {
+                    entry: Arc::clone(entry),
+                    original: Self::lock(&entry.transport).clone(),
+                    armed: true,
+                };
+                self.ensure_ready_in_lane(entry).await?;
+                let transport = Self::lock(&entry.transport).clone().ok_or_else(|| {
+                    tool_err(
+                        "MCP_TRANSPORT_UNAVAILABLE",
+                        "the connection disappeared before tools/call was dispatched",
+                    )
+                })?;
+                let catalog_is_fresh = publication
+                    .original
+                    .as_ref()
+                    .is_some_and(|original| Arc::ptr_eq(original, &transport))
+                    && Self::lock(&entry.tools_cache)
+                        .as_ref()
+                        .is_some_and(|(at, _)| at.elapsed() <= super::TOOL_CACHE_TTL);
+                if !catalog_is_fresh {
+                    self.list_and_cache_tools_in_lane(entry).await?;
+                }
+                let output_schema = output_schema_for_call(entry, &transport, tool)?;
+                // Retain lane ownership until run_phase has accepted the
+                // result; rejected completion drops publication before lane.
+                Ok((publication, lane, transport, output_schema))
+            },
+            deadline,
+            "tool preparation",
+        )
+        .await?;
+        publication.armed = false;
+        drop(publication);
+        drop(lane);
+        Ok((transport, output_schema))
+    }
+
     /// Call one tool on one trusted server, retaining the calling owner's
     /// authority and cancellation through connection setup and execution.
     ///
@@ -244,8 +343,9 @@ impl McpManager {
     /// for subsequent calls; user cancellation does not start recovery work.
     ///
     /// # Errors
-    /// Returns capability, trust, cancellation, transport, or server errors.
-    /// An abandoned/superseded call may already have had remote side effects.
+    /// Returns capability, trust, cancellation, catalog, output-contract,
+    /// transport, or server errors. An abandoned/superseded call may already
+    /// have had remote side effects; output-contract errors are not replayed.
     pub async fn call_tool(&self, server: &str, tool: &str, arguments: Value) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
         // Reject an attenuated/cancelled caller before setup can resolve
@@ -254,16 +354,18 @@ impl McpManager {
         owner
             .with_current(async {
                 let entry = self.entry(server)?;
-                self.connect_for_request(&owner, &entry, DEFAULT_MCP_TIMEOUT)
+                let (transport, output_schema) = self
+                    .prepare_tool_call(&owner, &entry, tool, DEFAULT_MCP_TIMEOUT)
                     .await?;
-                let transport = Self::lock(&entry.transport).clone().ok_or_else(|| {
-                    tool_err(
-                        "MCP_TRANSPORT_UNAVAILABLE",
-                        "the connection disappeared before tools/call was dispatched",
-                    )
-                })?;
                 match self
-                    .call_on_transport(&entry, &transport, tool, &arguments)
+                    .execute_tool_call(
+                        &entry,
+                        &transport,
+                        tool,
+                        &arguments,
+                        DEFAULT_MCP_TIMEOUT,
+                        output_schema,
+                    )
                     .await
                 {
                     Ok(value) => Ok(value),
@@ -299,6 +401,9 @@ impl McpManager {
             .await
     }
 
+    // Lifecycle fixtures can exercise a transport directly without discovery.
+    // Production callers always enter through prepare_tool_call above.
+    #[cfg(test)]
     pub(super) async fn call_on_transport(
         &self,
         entry: &Arc<ServerEntry>,
@@ -310,6 +415,7 @@ impl McpManager {
             .await
     }
 
+    #[cfg(test)]
     async fn call_on_transport_with_timeout(
         &self,
         entry: &Arc<ServerEntry>,
@@ -317,6 +423,20 @@ impl McpManager {
         tool: &str,
         arguments: &Value,
         timeout: Duration,
+    ) -> Result<Value> {
+        self.execute_tool_call(entry, transport, tool, arguments, timeout, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_tool_call(
+        &self,
+        entry: &Arc<ServerEntry>,
+        transport: &Arc<dyn McpTransport>,
+        tool: &str,
+        arguments: &Value,
+        timeout: Duration,
+        output_schema: Option<super::McpOutputSchema>,
     ) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
         catalog::check_request_owner(&owner)?;
@@ -341,6 +461,8 @@ impl McpManager {
             return Err(error);
         }
 
+        // The contract was captured in the setup lane. Never re-read the
+        // mutable catalog here or after dispatch: a refresh may have cleared it.
         let mut guard = ToolCallGuard {
             entry: Arc::clone(entry),
             transport: Arc::clone(transport),
@@ -398,6 +520,23 @@ impl McpManager {
                 return Err(error);
             }
         };
+        // A schema mismatch is a definite response, not transport loss. Keep
+        // validation's error until the generation has been checked and the
+        // delivery guard disarmed; `?` before that point would retire a healthy
+        // connection and incorrectly classify the completed call as abandoned.
+        let output_validation = output_schema
+            .as_ref()
+            .map_or(Ok(()), |schema| schema.validate_result(&value));
+        if let Err(error) = catalog::check_request_owner(&owner) {
+            guard.retire(&error);
+            return Err(error);
+        }
+        self.check_running()?;
+        if let Err(error) = self.check_trust(entry) {
+            Self::close_revoked_transport(entry, transport).await;
+            guard.armed = false;
+            return Err(error);
+        }
         // This generation-checked operation is the success linearization
         // point. Ignoring its bool would let an old response escape during a
         // concurrent reconnect and reset the replacement's failure budget.
@@ -405,6 +544,7 @@ impl McpManager {
             return Err(superseded_call());
         }
         guard.armed = false;
+        output_validation?;
         Ok(value)
     }
 }
@@ -510,6 +650,7 @@ mod tests {
                 name: name.to_string(),
                 description: String::new(),
                 input_schema: json!({"type": "object"}),
+                output_schema: None,
             }],
         ));
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -545,6 +686,202 @@ mod tests {
         let transport = Arc::new(CallTransport::new(reply));
         install(&entry, &transport, "execute");
         (manager, entry, transport)
+    }
+
+    // Install through the discovery parser, not an independently constructed
+    // validator, so these tests cover catalog-to-execution contract routing.
+    fn install_output_contract(entry: &Arc<ServerEntry>, schema: Value) {
+        let mut tool = json!({"name":"execute", "inputSchema":{"type":"object"}});
+        tool["outputSchema"] = schema;
+        let tools = super::super::parse_tool_list(&json!({"tools":[tool]}))
+            .expect("admitted output schema");
+        *McpManager::lock(&entry.tools_cache) = Some((Instant::now(), tools));
+    }
+
+    fn count_output_schema(kind: &str) -> Value {
+        json!({
+            "type":"object",
+            "properties":{"count":{"type":kind}},
+            "required":["count"],
+            "additionalProperties":false
+        })
+    }
+
+    #[test]
+    fn advertised_output_schema_is_enforced_on_the_public_call_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let response = json!({
+            "content":[{"type":"text", "text":"one item"}],
+            "structuredContent":{"count":1},
+            "_meta":{"private":"client-only"}
+        });
+        let (manager, entry, transport) = fixture(&temp, Ok(response.clone()));
+        install_output_contract(&entry, count_output_schema("integer"));
+        let result = runtime()
+            .block_on(manager.call_tool("exec", "execute", json!({})))
+            .expect("valid structured output");
+        assert_eq!(result, response);
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert_eq!(manager.mounted_tool_metas().len(), 1);
+    }
+
+    #[test]
+    fn invalid_structured_output_is_not_replayed_or_treated_as_transport_loss() {
+        for response in [
+            json!({"content":[{"type":"text", "text":"{\"count\":1}"}]}),
+            json!({"content":[], "structuredContent":{"count":"private-wrong-type"}}),
+            json!({"content":[], "structuredContent":null}),
+            json!({"content":[], "structuredContent":[]}),
+            json!({"isError":"true", "content":[]}),
+            json!({"isError":false, "content":[], "structuredContent":{}}),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, transport) = fixture(&temp, Ok(response));
+            install_output_contract(&entry, count_output_schema("integer"));
+            let error = runtime()
+                .block_on(manager.call_tool("exec", "execute", json!({})))
+                .expect_err("invalid output is not a successful tool call");
+            let message = error.to_string();
+            assert!(message.contains("MCP_OUTPUT_INVALID"), "{message}");
+            assert!(message.contains("not replayed"));
+            assert!(!message.contains("private-wrong-type"));
+            assert!(!is_indeterminate_call_delivery(&error));
+            assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+            assert!(!transport.closed.load(Ordering::Acquire));
+            assert!(McpManager::lock(&entry.transport).is_some());
+            assert_eq!(manager.mounted_tool_metas().len(), 1);
+            assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        }
+    }
+
+    #[test]
+    fn output_contract_failure_does_not_poison_the_next_explicit_call() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            Ok(json!({"content":[], "structuredContent":{"count":"wrong"}})),
+        );
+        install_output_contract(&entry, count_output_schema("integer"));
+        let runtime = runtime();
+        let error = runtime
+            .block_on(manager.call_tool("exec", "execute", json!({})))
+            .expect_err("first response violates contract");
+        assert!(error.to_string().contains("MCP_OUTPUT_INVALID"));
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        let response = json!({"content":[], "structuredContent":{"count":2}});
+        *McpManager::lock(&transport.reply) = Some(Ok(response.clone()));
+        assert_eq!(
+            runtime
+                .block_on(manager.call_tool("exec", "execute", json!({})))
+                .expect("subsequent explicit call uses healthy connection"),
+            response
+        );
+        assert_eq!(McpManager::lock(&transport.requests).len(), 2);
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn tool_execution_errors_bypass_the_success_output_contract() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let response = json!({
+            "isError":true,
+            "content":[{"type":"text", "text":"rate limited"}]
+        });
+        let (manager, entry, transport) = fixture(&temp, Ok(response.clone()));
+        install_output_contract(&entry, count_output_schema("integer"));
+        assert_eq!(
+            runtime()
+                .block_on(manager.call_tool("exec", "execute", json!({})))
+                .expect("keep server's execution error"),
+            response
+        );
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn output_contract_does_not_replace_a_definite_jsonrpc_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            Err(tool_err("MCP_SERVER_ERROR", "server rejected the request")),
+        );
+        install_output_contract(&entry, count_output_schema("integer"));
+        let error = runtime()
+            .block_on(manager.call_tool("exec", "execute", json!({})))
+            .expect_err("definite server error");
+        assert!(error.to_string().contains("MCP_SERVER_ERROR"));
+        assert!(!error.to_string().contains("MCP_OUTPUT_INVALID"));
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn unstructured_tool_calls_keep_their_existing_response_behavior() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let response = json!({"content":[{"type":"text", "text":"plain output"}]});
+        let (manager, _entry, transport) = fixture(&temp, Ok(response.clone()));
+        assert_eq!(
+            runtime()
+                .block_on(manager.call_tool("exec", "execute", json!({})))
+                .expect("no output schema was advertised"),
+            response
+        );
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+    }
+
+    #[test]
+    fn catalog_refresh_cannot_change_an_in_flight_output_contract() {
+        for (count, expected_valid) in [(json!(7), true), (json!("seven"), false)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let response = json!({"content":[], "structuredContent":{"count":count}});
+            let (manager, entry, transport) = fixture(&temp, Ok(response.clone()));
+            install_output_contract(&entry, count_output_schema("integer"));
+            let weak = Arc::downgrade(&entry);
+            *McpManager::lock(&transport.hook) = Some(Arc::new(move || {
+                let entry = weak.upgrade().expect("live entry");
+                install_output_contract(&entry, count_output_schema("string"));
+            }));
+            let result = runtime().block_on(manager.call_tool("exec", "execute", json!({})));
+            if expected_valid {
+                assert_eq!(result.expect("original integer contract"), response);
+            } else {
+                assert!(result.expect_err("replacement string contract must not be borrowed")
+                    .to_string().contains("MCP_OUTPUT_INVALID"));
+            }
+            assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+            assert!(!transport.closed.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn valid_structured_output_from_an_obsolete_generation_cannot_escape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, old) = fixture(
+            &temp,
+            Ok(json!({"content":[], "structuredContent":{"count":1}})),
+        );
+        install_output_contract(&entry, count_output_schema("integer"));
+        let replacement = Arc::new(CallTransport::new(Ok(json!({"content":[]}))));
+        let replacement_for_hook = Arc::clone(&replacement);
+        let weak = Arc::downgrade(&entry);
+        *McpManager::lock(&old.hook) = Some(Arc::new(move || {
+            let entry = weak.upgrade().expect("live entry");
+            install(&entry, &replacement_for_hook, "execute");
+            install_output_contract(&entry, count_output_schema("string"));
+            McpManager::lock(&entry.restarts).count = 2;
+        }));
+        let error = runtime()
+            .block_on(manager.call_tool("exec", "execute", json!({})))
+            .expect_err("obsolete generation response must not escape");
+        assert!(error.to_string().contains("MCP_DELIVERY_INDETERMINATE"));
+        assert!(!error.to_string().contains("MCP_OUTPUT_INVALID"));
+        assert_eq!(McpManager::lock(&old.requests).len(), 1);
+        assert!(old.closed.load(Ordering::Acquire));
+        assert!(!replacement.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&replacement.requests).is_empty());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 2);
     }
 
     #[test]
@@ -795,6 +1132,9 @@ mod tests {
         reached: AtomicBool,
         aborted: AtomicBool,
         tool_calls: AtomicUsize,
+        list_calls: AtomicUsize,
+        catalog: Mutex<Value>,
+        reply: Mutex<Value>,
     }
 
     struct SetupTransport(Arc<SetupState>);
@@ -824,9 +1164,12 @@ mod tests {
                 }
                 "tools/call" => {
                     self.0.tool_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(json!({"content": []}))
+                    Ok(McpManager::lock(&self.0.reply).clone())
                 }
-                "tools/list" => Ok(json!({"tools": []})),
+                "tools/list" => {
+                    self.0.list_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(McpManager::lock(&self.0.catalog).clone())
+                }
                 _ => panic!("unexpected setup method"),
             }
         }
@@ -866,6 +1209,11 @@ mod tests {
             reached: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
             tool_calls: AtomicUsize::new(0),
+            list_calls: AtomicUsize::new(0),
+            catalog: Mutex::new(json!({"tools":[{
+                "name":"execute", "inputSchema":{"type":"object"}
+            }]})),
+            reply: Mutex::new(json!({"content":[]})),
         });
         let state_for_factory = Arc::clone(&state);
         *McpManager::lock(&manager.inner.transport_factory) = Some(Arc::new(move || {
@@ -1058,5 +1406,105 @@ mod tests {
         assert!(!state.aborted.load(Ordering::Acquire));
         assert!(McpManager::lock(&entry.transport).is_some());
         assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+    }
+
+    fn setup_output_catalog(state: &SetupState, schema: Value) {
+        *McpManager::lock(&state.catalog) = json!({"tools":[{
+            "name":"execute", "inputSchema":{"type":"object"}, "outputSchema":schema
+        }]});
+    }
+
+    #[test]
+    fn cold_tool_call_discovers_and_enforces_output_contract_before_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+        McpManager::lock(&entry.transport).take();
+        let state = setup_factory(&manager, "none");
+        setup_output_catalog(&state, count_output_schema("integer"));
+        *McpManager::lock(&state.reply) = json!({"structuredContent":{"count":"wrong"}});
+        let error = runtime()
+            .block_on(watchdog(manager.call_tool("exec", "execute", json!({}))))
+            .expect_err("cold calls must not bypass the advertised output contract");
+        assert!(error.to_string().contains("MCP_OUTPUT_INVALID"));
+        assert_eq!(state.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 1);
+        assert!(!state.aborted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn missing_or_expired_catalog_is_refreshed_before_later_tool_calls() {
+        for expire in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+            McpManager::lock(&entry.transport).take();
+            let state = setup_factory(&manager, "none");
+            setup_output_catalog(&state, count_output_schema("integer"));
+            *McpManager::lock(&state.reply) = json!({"structuredContent":{"count":1}});
+            let runtime = runtime();
+            runtime
+                .block_on(watchdog(manager.call_tool("exec", "execute", json!({}))))
+                .expect("first call establishes the catalog");
+            if expire {
+                McpManager::lock(&entry.tools_cache)
+                    .as_mut()
+                    .expect("cached catalog")
+                    .0 = Instant::now()
+                    .checked_sub(super::super::TOOL_CACHE_TTL + Duration::from_secs(1))
+                    .expect("representable expired instant");
+            } else {
+                McpManager::lock(&entry.tools_cache).take();
+            }
+            *McpManager::lock(&state.reply) = json!({"structuredContent":{"count":"wrong"}});
+            let error = runtime
+                .block_on(watchdog(manager.call_tool("exec", "execute", json!({}))))
+                .expect_err("missing metadata must never become a missing contract");
+            assert!(error.to_string().contains("MCP_OUTPUT_INVALID"));
+            assert_eq!(state.list_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(state.tool_calls.load(Ordering::SeqCst), 2);
+            assert!(!state.aborted.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn undiscovered_tool_names_cannot_skip_output_contract_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, Ok(json!({"content":[]})));
+        let error = runtime()
+            .block_on(manager.call_tool("exec", "not-advertised", json!({})))
+            .expect_err("unadvertised tools must not bypass admission");
+        assert!(error.to_string().contains("MCP_UNKNOWN_TOOL"));
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+    }
+
+    #[test]
+    fn cleared_catalog_capture_fails_before_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_manager, entry, transport) = fixture(&temp, Ok(json!({"content":[]})));
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        McpManager::lock(&entry.tools_cache).take();
+        let error = output_schema_for_call(&entry, &erased, "execute")
+            .expect_err("metadata absence is not an optional output schema");
+        assert!(error.to_string().contains("MCP_CATALOG_UNAVAILABLE"));
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn malformed_output_catalog_blocks_a_cold_call_before_remote_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+        McpManager::lock(&entry.transport).take();
+        let state = setup_factory(&manager, "none");
+        setup_output_catalog(&state, json!({"type":7}));
+        let error = runtime()
+            .block_on(watchdog(manager.call_tool("exec", "execute", json!({}))))
+            .expect_err("invalid schema prevents dispatch");
+        assert!(error.to_string().contains("MCP_PROTOCOL"));
+        assert_eq!(state.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 0);
+        assert!(state.aborted.load(Ordering::Acquire));
+        assert!(manager.mounted_tool_metas().is_empty());
     }
 }

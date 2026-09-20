@@ -18,6 +18,9 @@ use crate::error::{Error, Result};
 mod calls;
 mod catalog;
 mod connection;
+mod output_schema;
+
+pub use output_schema::McpOutputSchema;
 
 #[cfg(test)]
 type TestTransportFactory = dyn Fn() -> Box<dyn McpTransport> + Send + Sync;
@@ -166,10 +169,17 @@ fn parse_tool_list(result: &Value) -> Result<Vec<McpToolMeta>> {
                     format!("tools/list entry {index} must have an object inputSchema"),
                 )
             })?;
+        // Admit every advertised contract before any page becomes mountable.
+        // `null` is malformed metadata, not an absent output contract.
+        let output_schema = tool
+            .get("outputSchema")
+            .map(McpOutputSchema::compile)
+            .transpose()?;
         parsed.push(McpToolMeta {
             name: name.to_string(),
             description: description.to_string(),
             input_schema,
+            output_schema,
         });
     }
     Ok(parsed)
@@ -184,6 +194,9 @@ pub struct McpToolMeta {
     pub description: String,
     /// JSON Schema for the tool input.
     pub input_schema: Value,
+    /// Optional, compiled contract for successful structured tool results.
+    /// Clones share a validator so in-flight calls retain their own contract.
+    pub output_schema: Option<McpOutputSchema>,
 }
 
 /// Runtime health for the `/mcp` view.
@@ -2151,6 +2164,7 @@ mod tests {
                     name: format!("{name}-tool"),
                     description: String::new(),
                     input_schema: serde_json::json!({}),
+                    output_schema: None,
                 }],
             ));
             *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -2345,6 +2359,7 @@ mod tests {
                 name: "stale".to_string(),
                 description: String::new(),
                 input_schema: serde_json::json!({}),
+                output_schema: None,
             }],
         ));
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -2678,6 +2693,7 @@ mod tests {
                         name: "replacement-tool".to_string(),
                         description: String::new(),
                         input_schema: serde_json::json!({}),
+                        output_schema: None,
                     }],
                 ));
                 *McpManager::lock(&contender_entry.health) = ServerHealth::Ready { tools: 1 };
@@ -2893,6 +2909,7 @@ mod tests {
                 name: "replacement-tool".to_string(),
                 description: String::new(),
                 input_schema: serde_json::json!({}),
+                output_schema: None,
             }],
         ));
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -3146,6 +3163,7 @@ mod tests {
                 name: "replacement-tool".to_string(),
                 description: String::new(),
                 input_schema: serde_json::json!({}),
+                output_schema: None,
             }],
         ));
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
