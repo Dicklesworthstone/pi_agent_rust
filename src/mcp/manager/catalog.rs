@@ -314,6 +314,36 @@ pub(super) async fn operation_with_owner<F: Future>(
 }
 
 impl McpManager {
+    /// Discover the server's current tool catalog, including tools added or
+    /// changed since startup. Publish only a complete, validated catalog.
+    ///
+    /// Unlike `/mcp test`, discovery does not reset the restart budget or
+    /// acknowledge trust. Admission, connection setup and all cursor pages
+    /// share one owner and one outer deadline; no tool is executed here.
+    ///
+    /// # Errors
+    /// Returns trust, capability, cancellation, timeout, restart-budget or
+    /// protocol errors. A failed traversal never returns a partial catalog.
+    pub async fn refresh_tools(&self, server: &str) -> Result<Vec<McpToolMeta>> {
+        self.refresh_tools_with_timeout(server, DEFAULT_MCP_TIMEOUT)
+            .await
+    }
+
+    async fn refresh_tools_with_timeout(
+        &self,
+        server: &str,
+        timeout: Duration,
+    ) -> Result<Vec<McpToolMeta>> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        check_request_owner(&owner)?;
+        self.check_running()?;
+        let entry = self.entry(server)?;
+        // connect_and_list retains the connection lane through publication.
+        // The outer owner boundary also covers waiting for that lane and
+        // private initialization, not just individual tools/list requests.
+        operation_with_owner(&owner, self.connect_and_list(&entry), timeout).await?
+    }
+
     pub(super) async fn collect_tool_catalog(
         &self,
         entry: &Arc<ServerEntry>,
@@ -1147,5 +1177,196 @@ mod tests {
             .expect_err("late success is not success");
         assert!(error.to_string().contains("MCP_TIMEOUT"));
         assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+    }
+
+    fn refresh_log(case: &str, requests: usize, code: &str) {
+        eprintln!(
+            "{}",
+            json!({
+                "schema":"pi.mcp.live_catalog.test.v1", "case":case,
+                "requests":requests, "outcome":code, "rawSecretBytesEmitted":0
+            })
+        );
+    }
+
+    #[test]
+    fn public_refresh_replaces_a_fresh_startup_catalog_and_retains_contracts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let schema = json!({"type":"object", "required":["count"]});
+        let mut added = tool("added-after-startup");
+        added["outputSchema"] = schema.clone();
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                json!({"tools":[tool("changed")], "nextCursor":"next"}),
+                json!({"tools":[added]}),
+            ],
+            None,
+        );
+        *McpManager::lock(&entry.tools_cache) = Some((
+            Instant::now(),
+            parse_tool_list(&json!({"tools":[tool("removed")]})).unwrap(),
+        ));
+        McpManager::lock(&entry.restarts).count = 2;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let tools = runtime
+            .block_on(manager.refresh_tools("catalog"))
+            .expect("fresh complete catalog");
+        refresh_log("fresh-catalog-replacement", McpManager::lock(&transport.requests).len(), "ok");
+        assert_eq!(tools.iter().map(|meta| meta.name.as_str()).collect::<Vec<_>>(), vec!["changed", "added-after-startup"]);
+        assert_eq!(tools[1].output_schema.as_ref().unwrap().schema(), &schema);
+        assert_eq!(manager.mounted_tool_metas()[0].1.len(), 2);
+        assert_eq!(McpManager::lock(&entry.restarts).count, 2, "discovery must not reset crash history");
+        assert_eq!(McpManager::lock(&transport.requests).len(), 2);
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn public_refresh_accepts_removal_of_every_previously_advertised_tool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![json!({"tools":[]})], None);
+        *McpManager::lock(&entry.tools_cache) = Some((
+            Instant::now(),
+            parse_tool_list(&json!({"tools":[tool("removed")]})).unwrap(),
+        ));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let tools = runtime.block_on(manager.refresh_tools("catalog")).expect("empty catalog");
+        refresh_log("empty-replacement", McpManager::lock(&transport.requests).len(), "ok");
+        assert!(tools.is_empty());
+        assert!(McpManager::lock(&entry.tools_cache).as_ref().unwrap().1.is_empty());
+        assert!(matches!(*McpManager::lock(&entry.health), ServerHealth::Ready { tools: 0 }));
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn public_refresh_rejects_partial_catalogs_instead_of_returning_cached_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                json!({"tools":[tool("first")], "nextCursor":"next"}),
+                json!({"tools":[{"name":"invalid", "inputSchema":{}}], "nextCursor":7}),
+            ],
+            None,
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime.block_on(manager.refresh_tools("catalog")).expect_err("whole catalog required");
+        refresh_log("partial-catalog", McpManager::lock(&transport.requests).len(), "MCP_PROTOCOL");
+        assert!(error.to_string().contains("MCP_PROTOCOL"));
+        assert!(McpManager::lock(&entry.tools_cache).is_none());
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert_eq!(McpManager::lock(&transport.requests).len(), 2);
+    }
+
+    #[test]
+    fn public_refresh_does_not_reset_an_exhausted_server() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![], None);
+        McpManager::lock(&entry.transport).take();
+        McpManager::lock(&entry.restarts).count = super::super::MAX_RESTARTS;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime.block_on(manager.refresh_tools("catalog")).expect_err("explicit recovery required");
+        refresh_log("restart-budget", McpManager::lock(&transport.requests).len(), "MCP_RESTART_EXHAUSTED");
+        assert!(error.to_string().contains("MCP_RESTART_EXHAUSTED"));
+        assert_eq!(McpManager::lock(&entry.restarts).count, super::super::MAX_RESTARTS);
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(McpManager::lock(&entry.transport).is_none());
+    }
+
+    #[test]
+    fn public_refresh_pre_cancelled_or_restricted_owners_cannot_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![], None);
+        let cancelled = crate::agent_cx::AgentCx::for_request();
+        cancelled.cancel_with(asupersync::types::CancelKind::User, Some("before refresh"));
+        let restricted = {
+            let _guard = asupersync::Cx::for_request()
+                .restrict::<asupersync::cx::cap::None>()
+                .set_current_restricted();
+            crate::agent_cx::AgentCx::for_current_or_request()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for (owner, code) in [(cancelled, "MCP_CANCELLED"), (restricted, "MCP_CAPABILITY_DENIED")] {
+            let error = runtime
+                .block_on(owner.with_current(manager.refresh_tools("catalog")))
+                .expect_err("refresh owner rejected");
+            refresh_log("owner-admission", McpManager::lock(&transport.requests).len(), code);
+            assert!(error.to_string().contains(code), "{error}");
+        }
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+    }
+
+    #[test]
+    fn public_refresh_deadline_includes_waiting_for_the_connection_lane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![], None);
+        let lane = Arc::clone(&entry.connect_lane).try_lock_owned().expect("hold lane");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(manager.refresh_tools_with_timeout("catalog", Duration::from_millis(10)))
+            .expect_err("lane admission spends the deadline");
+        refresh_log("admission-deadline", McpManager::lock(&transport.requests).len(), "MCP_TIMEOUT");
+        assert!(error.to_string().contains("MCP_TIMEOUT"));
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        drop(lane);
+        assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+    }
+
+    #[test]
+    fn public_refresh_deadline_retires_a_pending_page_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![json!({"tools":[tool("late")]})], None);
+        *McpManager::lock(&transport.pause_at) = Some(1);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(manager.refresh_tools_with_timeout("catalog", Duration::from_millis(10)))
+            .expect_err("outer refresh deadline");
+        refresh_log("pending-page-deadline", McpManager::lock(&transport.requests).len(), "MCP_TIMEOUT");
+        assert!(error.to_string().contains("MCP_TIMEOUT"));
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert!(McpManager::lock(&entry.tools_cache).is_none());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+    }
+
+    #[test]
+    fn public_refresh_abandonment_cleans_up_without_replaying_discovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, vec![json!({"tools":[]})], None);
+        *McpManager::lock(&transport.pause_at) = Some(1);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut refresh = Box::pin(manager.refresh_tools("catalog"));
+            assert!(futures::poll!(refresh.as_mut()).is_pending());
+            drop(refresh);
+        });
+        refresh_log("abandoned-refresh", McpManager::lock(&transport.requests).len(), "cancelled");
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert!(transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+        assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
     }
 }
