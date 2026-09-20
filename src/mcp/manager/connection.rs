@@ -269,7 +269,14 @@ mod tests {
                         "serverInfo": {"name": "setup-fixture", "version": "1"}
                     }))
                 }
-                "tools/list" => Ok(json!({"tools": []})),
+                "tools/list" => Ok(json!({
+                    "tools": [{
+                        "name": "echo",
+                        "inputSchema": {
+                            "type": "object"
+                        }
+                    }]
+                })),
                 "tools/call" => Ok(json!({"content": [{"type": "text", "text": "done"}]})),
                 _ => Err(tool_err("MCP_PROTOCOL", "unexpected fixture request")),
             }
@@ -410,7 +417,7 @@ mod tests {
             }));
             assert!(state.closed.load(Ordering::Acquire));
             assert!(McpManager::lock(&entry.transport).is_none());
-            assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+            assert_eq!(McpManager::lock(&entry.restarts).count, 0);
             assert!(
                 !McpManager::lock(&state.methods)
                     .iter()
@@ -561,6 +568,7 @@ mod tests {
                 "initialize",
                 "notifications/initialized",
                 "activate",
+                "tools/list",
                 "tools/call",
                 "tools/call",
             ]
