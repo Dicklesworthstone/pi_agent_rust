@@ -2170,10 +2170,25 @@ build_from_source() {
       return 1
     fi
     src_dir="$TMP/src"
-    git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$src_dir" >&2
+    if ! git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$src_dir" >&2; then
+      err "Failed to clone source for ${VERSION}; no binary was installed"
+      return 1
+    fi
   fi
 
-  (cd "$src_dir" && cargo build --release --locked --bin pi >&2)
+  # Pin the output directory on the command line, which takes precedence over
+  # both CARGO_TARGET_DIR and build.target-dir in Cargo configuration. The
+  # artifact lookup below must use the very same directory (GH-235).
+  local build_args=(build --release --locked --bin pi --target-dir "$src_dir/target")
+  if [ "$OFFLINE" -eq 1 ]; then
+    build_args+=(--offline)
+  fi
+  # A caller can use this function in a conditional, disabling Bash errexit
+  # throughout its body. Never mistake a previous executable for a failed build.
+  if ! (cd "$src_dir" && cargo "${build_args[@]}" >&2); then
+    err "Source build failed; no binary was installed"
+    return 1
+  fi
 
   local built_bin="$src_dir/target/release/pi${EXE_EXT}"
   if [ ! -x "$built_bin" ]; then
