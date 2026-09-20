@@ -6,6 +6,7 @@
 
 mod actions;
 pub mod client;
+mod completion;
 #[cfg(test)]
 mod diagnostics_tests;
 pub mod edits;
@@ -92,6 +93,7 @@ pub struct LspTool {
     registry: LspRegistry,
     actions: Arc<actions::ActionState>,
     hierarchies: hierarchy::HierarchyCache,
+    completions: completion::CompletionCache,
     operations: Arc<asupersync::sync::Mutex<()>>,
 }
 
@@ -103,6 +105,7 @@ impl LspTool {
             registry: LspRegistry::new(cwd, config),
             actions: Arc::new(actions::ActionState::default()),
             hierarchies: hierarchy::HierarchyCache::default(),
+            completions: completion::CompletionCache::default(),
             operations: Arc::new(asupersync::sync::Mutex::new(())),
         }
     }
@@ -445,6 +448,7 @@ impl LspTool {
             .map(|f| resolve_tool_path(f, &self.cwd));
         let killed = self.registry.kill_matching(path.as_deref()).await;
         self.hierarchies.clear();
+        self.completions.clear();
         let payload =
             json!({"action":"reload","killed":killed,"note":"servers respawn lazily on next use"});
         Ok(text_output(payload.to_string(), payload))
@@ -561,6 +565,8 @@ fn build_glob_override(cwd: &Path, glob: &str) -> Result<ignore::overrides::Over
 #[serde(rename_all = "camelCase")]
 struct LspInput {
     action: String,
+    position: Option<Position>,
+    completion_id: Option<String>,
     file: Option<String>,
     line: Option<u32>,
     symbol: Option<String>,
@@ -590,23 +596,25 @@ impl Tool for LspTool {
         "lsp"
     }
     fn description(&self) -> &str {
-        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request and workspace_diagnostics. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
+        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Completion range is an explicit replacement fallback for servers omitting textEdit; snippets and command-backed items cannot be applied. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics"]},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion"]},
+                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for completion; requires file. A range may additionally specify the caller's replacement span when the server omits textEdit.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
+                "completionId":{"type":"string","description":"Opaque completion from the latest listing. Select without apply to resolve and preview, or apply:true to insert it with its auto-import edits. Do not combine with other selectors. Expires on source changes, server replacement, reload or another completion listing."},
                 "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics globs inspect cached reports. workspace_diagnostics uses a positive workspace-relative glob to actively check matching nonignored regular files; it may start language servers."},
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
-                "query":{"type":"string","description":"Workspace-symbol query, or fresh code-action title/index selection"},
+                "query":{"type":"string","description":"Workspace-symbol query, fresh code-action title/index selection, or case-sensitive completion filterText/label prefix (at most 128 bytes)"},
                 "actionId":{"type":"string","description":"Opaque ID from a prior code_actions listing; requires apply:true. Already identifies the selection; cannot be combined with query, range, only, symbol or line"},
                 "hierarchyId":{"type":"string","description":"Opaque hierarchy item from a previous result; use instead of file/line/symbol to traverse one more level. Call and type handles are not interchangeable. Handles expire with their source or server."},
                 "newName":{"type":"string","description":"New symbol name for rename"},
                 "newFile":{"type":"string","description":"Destination path for rename_file"},
-                "apply":{"type":"boolean","description":"Apply the selected code action, or write formatting changes instead of previewing"},
-                "range":{"type":"object","description":"Optional code_actions or format selection, with exact zero-based lines and UTF-16 character offsets. For code_actions, cannot be combined with symbol or line. Omit all selectors for the whole document. Refactors may also edit outside the selection.","required":["start","end"],"properties":{
+                "apply":{"type":"boolean","description":"Apply a selected code action/completion, or write formatting changes instead of previewing"},
+                "range":{"type":"object","description":"Optional code_actions or format selection, with exact zero-based lines and UTF-16 character offsets. For completion, this is a single-line replacement fallback containing position, used only when the server omits textEdit. For code_actions, cannot be combined with symbol or line. Refactors may also edit outside the selection.","required":["start","end"],"properties":{
                     "start":{"type":"object","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                     "end":{"type":"object","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}}
                 }},
@@ -621,7 +629,7 @@ impl Tool for LspTool {
                 "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default). workspace_diagnostics instead budgets the whole scan (default 30 seconds, capped at 120); synchronous filesystem operations are not preemptible."},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
                 "payload":{"description":"Raw JSON params for request"},
-                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. workspace_diagnostics checks at most this many files (default 100, capped at 256)."},
+                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion defaults to 50, capped at 128. workspace_diagnostics checks at most this many files (default 100, capped at 256)."},
                 "after":{"type":"string","maxLength":4096,"description":"workspace_diagnostics only: resume strictly after the workspace-relative path returned as nextAfter. Use the same glob. This is a stateless path cursor, not a snapshot; complete is false for continuation pages. Inspect pageComplete, hasMore and all per-file failures."}
             }
         })
@@ -642,6 +650,11 @@ impl Tool for LspTool {
         if input.line == Some(0) {
             return Err(tool_err("LSP_USAGE", "line must be 1-indexed"));
         }
+        if input.action != "completion"
+            && (input.position.is_some() || input.completion_id.is_some())
+        {
+            return Err(tool_err("LSP_USAGE", "position and completionId are supported by completion"));
+        }
         if input.only.is_some() && input.action != "code_actions" {
             return Err(tool_err("LSP_USAGE", "only is supported by code_actions"));
         }
@@ -657,6 +670,7 @@ impl Tool for LspTool {
                 .await
                 .map_err(|_| tool_err("LSP_CANCELLED", "LSP workflow cancelled while queued"))?;
         match input.action.as_str() {
+            "completion" => self.run_completion(&input).await,
             "diagnostics" => self.run_diagnostics(&input).await,
             "workspace_diagnostics" => {
                 let pattern = input.file.as_deref().ok_or_else(|| {
@@ -720,7 +734,7 @@ impl Tool for LspTool {
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion"
             ))),
         }
     }
