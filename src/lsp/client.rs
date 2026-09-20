@@ -179,6 +179,16 @@ impl LspClient {
                     "publishDiagnostics":{"relatedInformation":true,"versionSupport":true},
                     "diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false},
                     "hover":{"contentFormat":["markdown","plaintext"]},
+                    "completion":{
+                        "dynamicRegistration":false,"contextSupport":true,"insertTextMode":1,
+                        "completionItem":{
+                            "snippetSupport":false,"insertReplaceSupport":true,
+                            "documentationFormat":["markdown","plaintext"],
+                            "insertTextModeSupport":{"valueSet":[1]},
+                            "resolveSupport":{"properties":["detail","documentation","additionalTextEdits"]}
+                        },
+                        "completionList":{"itemDefaults":["editRange","insertTextFormat","insertTextMode","data"]}
+                    },
                     "definition":{"linkSupport":false},"typeDefinition":{"linkSupport":false},
                     "implementation":{"linkSupport":false},"references":{},
                     "callHierarchy":{"dynamicRegistration":false},

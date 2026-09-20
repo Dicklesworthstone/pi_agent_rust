@@ -9,6 +9,138 @@ use super::{
     Value, catalog, is_indeterminate_call_delivery, tool_err,
 };
 use crate::agent_cx::AgentCx;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Instant;
+
+/// Setup and recovery include more than JSON-RPC requests: lock admission,
+/// secret resolution, initialization notifications and receive activation can
+/// all suspend. Keep their entire future (including Drop) under one owner.
+struct OwnedPhase<'a, F> {
+    owner: &'a AgentCx,
+    future: Option<Pin<Box<F>>>,
+}
+
+impl<F: Future> Future for OwnedPhase<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let _guard = this.owner.cx().clone().set_current_restricted();
+        this.future.as_mut().expect("active phase").as_mut().poll(task)
+    }
+}
+
+impl<F> Drop for OwnedPhase<'_, F> {
+    fn drop(&mut self) {
+        let _guard = self.owner.cx().clone().set_current_restricted();
+        drop(self.future.take());
+    }
+}
+
+fn phase_timeout(phase: &str) -> Error {
+    tool_err(
+        "MCP_TIMEOUT",
+        format!("MCP {phase} exceeded its manager deadline"),
+    )
+}
+
+async fn phase_cancellation(owner: &AgentCx) {
+    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+    let _ = receiver.recv(owner.cx()).await;
+    drop(sender);
+}
+
+/// The absolute deadline is shared across lock admission and all setup
+/// stages. No stage can buy itself another thirty seconds. This is an async
+/// bound, not preemption of blocking OS calls; construction's existing
+/// abandonment guard rejects and aborts any late blocking-pool result.
+async fn run_phase<T>(
+    owner: &AgentCx,
+    operation: impl Future<Output = Result<T>>,
+    deadline: Instant,
+    phase: &str,
+) -> Result<T> {
+    OwnedPhase {
+        owner,
+        future: Some(Box::pin(async {
+            catalog::check_request_owner(owner)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(phase_timeout(phase));
+            }
+            let now = owner
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let mut timer = std::pin::pin!(asupersync::time::sleep(now, remaining));
+            let mut cancellation = std::pin::pin!(phase_cancellation(owner));
+            let mut operation = std::pin::pin!(operation);
+            poll_fn(|task| {
+                if let Err(error) = catalog::check_request_owner(owner) {
+                    return Poll::Ready(Err(error));
+                }
+                if cancellation.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(tool_err("MCP_CANCELLED", "MCP phase cancelled")));
+                }
+                if Instant::now() >= deadline || timer.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(phase_timeout(phase)));
+                }
+                let result = operation.as_mut().poll(task);
+                if result.is_ready() {
+                    if let Err(error) = catalog::check_request_owner(owner) {
+                        return Poll::Ready(Err(error));
+                    }
+                    if Instant::now() >= deadline {
+                        return Poll::Ready(Err(phase_timeout(phase)));
+                    }
+                }
+                result
+            })
+            .await
+        })),
+    }
+    .await
+}
+
+/// The caller retains the connection lane while this guard is armed. A
+/// cancelled setup may finish publishing in the same poll as cancellation;
+/// retire that new publication, never a healthy connection merely borrowed
+/// by the attempt. Other setup attempts cannot publish until the lane drops.
+struct SetupPublicationGuard {
+    entry: Arc<ServerEntry>,
+    original: Option<Arc<dyn McpTransport>>,
+    armed: bool,
+}
+
+impl Drop for SetupPublicationGuard {
+    // Publication and its derived state must be cleared under the same lock.
+    #[allow(clippy::significant_drop_tightening)]
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let retired = {
+            let mut current = McpManager::lock(&self.entry.transport);
+            let borrowed = match (current.as_ref(), self.original.as_ref()) {
+                (Some(current), Some(original)) => Arc::ptr_eq(current, original),
+                _ => false,
+            };
+            if borrowed || current.is_none() {
+                None
+            } else {
+                let retired = current.take();
+                McpManager::lock(&self.entry.tools_cache).take();
+                *McpManager::lock(&self.entry.health) = super::ServerHealth::NotStarted;
+                retired
+            }
+        };
+        if let Some(transport) = retired {
+            transport.abort();
+        }
+    }
+}
 
 struct ToolCallGuard {
     entry: Arc<ServerEntry>,
@@ -55,6 +187,52 @@ fn is_cancelled(error: &Error) -> bool {
 }
 
 impl McpManager {
+    /// Bound on-demand setup, including waiting for another connection
+    /// attempt. Existing private-handshake and blocking-construction guards
+    /// own unpublished work; this guard owns only a new publication.
+    pub(super) async fn connect_for_request(
+        &self,
+        owner: &AgentCx,
+        entry: &Arc<ServerEntry>,
+        timeout: Duration,
+    ) -> Result<()> {
+        catalog::check_request_owner(owner)?;
+        self.check_running()?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| phase_timeout("connection setup"))?;
+        let (mut publication, lane) = run_phase(
+            owner,
+            async {
+                let lane = asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&entry.connect_lane),
+                    owner.cx(),
+                )
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while connecting server"))?;
+                let publication = SetupPublicationGuard {
+                    entry: Arc::clone(entry),
+                    original: Self::lock(&entry.transport).clone(),
+                    armed: true,
+                };
+                self.ensure_ready_in_lane(entry).await?;
+                // Keep cleanup armed across run_phase's final cancellation
+                // and deadline checks. Tuple fields drop in this order:
+                // publication first, lane second, even on rejected success.
+                Ok((publication, lane))
+            },
+            deadline,
+            "connection setup",
+        )
+        .await?;
+        publication.armed = false;
+        // The publication guard must finish BEFORE another connector can
+        // take the lane, including when this whole future is abandoned.
+        drop(publication);
+        drop(lane);
+        Ok(())
+    }
+
     /// Call one tool on one trusted server, retaining the calling owner's
     /// authority and cancellation through connection setup and execution.
     ///
@@ -72,7 +250,8 @@ impl McpManager {
         owner
             .with_current(async {
                 let entry = self.entry(server)?;
-                self.ensure_ready(&entry).await?;
+                self.connect_for_request(&owner, &entry, DEFAULT_MCP_TIMEOUT)
+                    .await?;
                 let transport = Self::lock(&entry.transport).clone().ok_or_else(|| {
                     tool_err(
                         "MCP_TRANSPORT_UNAVAILABLE",
@@ -85,9 +264,23 @@ impl McpManager {
                 {
                     Ok(value) => Ok(value),
                     Err(error) if is_indeterminate_call_delivery(&error) => {
-                        let recovery = self
-                            .recover_after_indeterminate_call(&entry, &transport, &error)
-                            .await;
+                        let deadline = Instant::now()
+                            .checked_add(DEFAULT_MCP_TIMEOUT)
+                            .unwrap_or_else(Instant::now);
+                        let recovery = run_phase(
+                            &owner,
+                            async {
+                                Ok(self
+                                    .recover_after_indeterminate_call(&entry, &transport, &error)
+                                    .await)
+                            },
+                            deadline,
+                            "connection recovery",
+                        )
+                        .await
+                        .unwrap_or_else(|recovery| {
+                            format!("recovery stopped without replaying the call: {recovery}")
+                        });
                         Err(tool_err(
                             "MCP_DELIVERY_INDETERMINATE",
                             format!(
@@ -583,5 +776,253 @@ mod tests {
                 json!({"name": "execute", "arguments": arguments})
             )]
         );
+    }
+
+    struct SetupState {
+        stall: &'static str,
+        reached: AtomicBool,
+        aborted: AtomicBool,
+        tool_calls: AtomicUsize,
+    }
+
+    struct SetupTransport(Arc<SetupState>);
+
+    impl SetupTransport {
+        async fn stage(&self, stage: &str) {
+            if self.0.stall == stage {
+                self.0.reached.store(true, Ordering::Release);
+                // No cancellation registration, deadline, or cooperative
+                // transport wake-up: setup itself must supply all three.
+                futures::future::pending::<()>().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for SetupTransport {
+        async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
+            match method {
+                "initialize" => {
+                    self.stage("initialize").await;
+                    if self.0.stall == "close" {
+                        Err(tool_err("MCP_SERVER_ERROR", "initialization refused"))
+                    } else {
+                        Ok(json!({}))
+                    }
+                }
+                "tools/call" => {
+                    self.0.tool_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"content": []}))
+                }
+                "tools/list" => Ok(json!({"tools": []})),
+                _ => panic!("unexpected setup method"),
+            }
+        }
+
+        async fn notify(&self, method: &str, _params: Value) -> Result<()> {
+            assert_eq!(method, "notifications/initialized");
+            self.stage("initialized").await;
+            Ok(())
+        }
+
+        async fn activate(self: Arc<Self>) -> Result<()> {
+            self.stage("activate").await;
+            Ok(())
+        }
+
+        fn is_alive(&self) -> bool {
+            !self.0.aborted.load(Ordering::Acquire)
+        }
+
+        fn abort(&self) {
+            self.0.aborted.store(true, Ordering::Release);
+        }
+
+        async fn close(&self) {
+            self.stage("close").await;
+            self.abort();
+        }
+
+        fn diagnostics_tail(&self) -> String {
+            String::new()
+        }
+    }
+
+    fn setup_factory(manager: &McpManager, stall: &'static str) -> Arc<SetupState> {
+        let state = Arc::new(SetupState {
+            stall,
+            reached: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+            tool_calls: AtomicUsize::new(0),
+        });
+        let state_for_factory = Arc::clone(&state);
+        *McpManager::lock(&manager.inner.transport_factory) = Some(Arc::new(move || {
+            Box::new(SetupTransport(Arc::clone(&state_for_factory))) as Box<dyn McpTransport>
+        }));
+        state
+    }
+
+    /// A broken deadline must fail a test rather than strand its process.
+    async fn watchdog<T>(future: impl Future<Output = T>) -> T {
+        let watch = async {
+            let owner = AgentCx::for_current_or_request();
+            owner.time().sleep(Duration::from_secs(2)).await;
+        };
+        match futures::future::select(Box::pin(future), Box::pin(watch)).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(((), pending)) => {
+                drop(pending);
+                panic!("MCP lifecycle test exceeded its independent watchdog");
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_connection_waiter_does_not_retire_the_lane_holders_transport() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, Ok(json!({"content": []})));
+        let lane = Arc::clone(&entry.connect_lane).try_lock_owned().expect("hold lane");
+        let runtime = runtime();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+        runtime.block_on(async {
+            let mut call = Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel lane waiter"));
+            let Poll::Ready(Err(error)) = futures::poll!(call.as_mut()) else {
+                panic!("cancelled admission must finish before the holder releases its lane");
+            };
+            assert!(error.to_string().contains("MCP_CANCELLED"));
+            assert!(!transport.closed.load(Ordering::Acquire));
+            assert!(McpManager::lock(&transport.requests).is_empty());
+            assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        });
+        drop(lane);
+        assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+        assert_eq!(manager.mounted_tool_metas().len(), 1);
+    }
+
+    #[test]
+    fn connection_admission_spends_the_setup_deadline_without_mutating_the_holder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, Ok(json!({"content": []})));
+        let lane = Arc::clone(&entry.connect_lane).try_lock_owned().expect("hold lane");
+        let runtime = runtime();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+        let error = runtime.block_on(watchdog(manager.connect_for_request(
+            &owner, &entry, Duration::from_millis(20),
+        ))).expect_err("admission deadline");
+        assert!(error.to_string().contains("MCP_TIMEOUT"));
+        assert!(error.to_string().contains("connection setup"));
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        drop(lane);
+        assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+    }
+
+    #[test]
+    fn cancellation_retires_private_setup_at_every_async_handshake_stage() {
+        for stage in ["initialize", "initialized", "activate", "close"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, _) = fixture(&temp, Ok(json!({"content": []})));
+            McpManager::lock(&entry.transport).take();
+            let state = setup_factory(&manager, stage);
+            let runtime = runtime();
+            let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+            runtime.block_on(async {
+                let parent = Cx::current().expect("parent");
+                let mut call = Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
+                watchdog(poll_fn(|task| {
+                    assert!(call.as_mut().poll(task).is_pending(), "stage {stage}");
+                    if state.reached.load(Ordering::Acquire) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })).await;
+                owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel setup"));
+                let Poll::Ready(Err(error)) = futures::poll!(call.as_mut()) else {
+                    panic!("{stage} did not observe owner cancellation");
+                };
+                assert!(error.to_string().contains("MCP_CANCELLED"), "{error}");
+                assert!(!parent.is_cancel_requested());
+                assert_eq!(Cx::current().unwrap().budget(), parent.budget());
+            });
+            assert!(state.aborted.load(Ordering::Acquire), "stage {stage}");
+            assert_eq!(state.tool_calls.load(Ordering::SeqCst), 0);
+            assert!(McpManager::lock(&entry.transport).is_none());
+            assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+        }
+    }
+
+    #[test]
+    fn deadlines_bound_private_initialization_notification_activation_and_close() {
+        for stage in ["initialize", "initialized", "activate", "close"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, _) = fixture(&temp, Ok(json!({"content": []})));
+            McpManager::lock(&entry.transport).take();
+            let state = setup_factory(&manager, stage);
+            let runtime = runtime();
+            let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+            let error = runtime.block_on(watchdog(manager.connect_for_request(
+                &owner, &entry, Duration::from_millis(100),
+            ))).expect_err("whole setup deadline");
+            assert!(error.to_string().contains("MCP_TIMEOUT"), "{stage}: {error}");
+            assert!(state.reached.load(Ordering::Acquire), "stage {stage}");
+            assert!(state.aborted.load(Ordering::Acquire), "stage {stage}");
+            assert_eq!(state.tool_calls.load(Ordering::SeqCst), 0);
+            assert!(McpManager::lock(&entry.transport).is_none());
+            assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+        }
+    }
+
+    #[test]
+    fn recovery_cancellation_preserves_uncertain_delivery_and_never_replays_the_tool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, old) = fixture(
+            &temp, Err(tool_err("MCP_TRANSPORT_IO", "lost tool reply")),
+        );
+        let state = setup_factory(&manager, "activate");
+        let runtime = runtime();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+        runtime.block_on(async {
+            let mut call = Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
+            watchdog(poll_fn(|task| {
+                assert!(call.as_mut().poll(task).is_pending());
+                if state.reached.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })).await;
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel recovery"));
+            let Poll::Ready(Err(error)) = futures::poll!(call.as_mut()) else {
+                panic!("recovery must not suppress owner cancellation");
+            };
+            assert!(error.to_string().contains("MCP_DELIVERY_INDETERMINATE"));
+            assert!(error.to_string().contains("MCP_CANCELLED"));
+        });
+        assert_eq!(McpManager::lock(&old.requests).len(), 1);
+        assert!(old.closed.load(Ordering::Acquire));
+        assert!(state.aborted.load(Ordering::Acquire));
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 0);
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert!(Arc::clone(&entry.connect_lane).try_lock_owned().is_ok());
+    }
+
+    #[test]
+    fn timely_setup_publishes_once_and_dispatches_the_tool_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, _) = fixture(&temp, Ok(json!({"content": []})));
+        McpManager::lock(&entry.transport).take();
+        let state = setup_factory(&manager, "none");
+        let returned = runtime()
+            .block_on(watchdog(manager.call_tool("exec", "execute", json!({}))))
+            .expect("successful setup and execution");
+        assert_eq!(returned, json!({"content": []}));
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 1);
+        assert!(!state.aborted.load(Ordering::Acquire));
+        assert!(McpManager::lock(&entry.transport).is_some());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
     }
 }
