@@ -40,10 +40,21 @@ impl<'de> Deserialize<'de> for GeminiPart {
         let Some(object) = value.as_object() else {
             return Ok(Self::Unknown(value));
         };
-        let payloads = ["text", "inline_data", "inlineData", "functionCall", "functionResponse"];
-        let present = payloads.iter().filter(|key| object.contains_key(**key)).count();
+        let payloads = [
+            "text",
+            "inline_data",
+            "inlineData",
+            "functionCall",
+            "functionResponse",
+        ];
+        let present = payloads
+            .iter()
+            .filter(|key| object.contains_key(**key))
+            .count();
         if present > 1 {
-            return Err(D::Error::custom("Gemini part contains multiple payload kinds"));
+            return Err(D::Error::custom(
+                "Gemini part contains multiple payload kinds",
+            ));
         }
         let thought = match object.get("thought") {
             None | Some(Value::Bool(false)) => false,
@@ -51,7 +62,8 @@ impl<'de> Deserialize<'de> for GeminiPart {
             Some(_) => return Err(D::Error::custom("Gemini thought flag must be boolean")),
         };
         let signature_only = present == 0
-            && (object.contains_key("thoughtSignature") || object.contains_key("thought_signature"));
+            && (object.contains_key("thoughtSignature")
+                || object.contains_key("thought_signature"));
         if object.contains_key("text") || signature_only {
             if thought {
                 let fields: ThoughtFields = serde_json::from_value(value)
@@ -65,7 +77,10 @@ impl<'de> Deserialize<'de> for GeminiPart {
             let fields: TextFields = serde_json::from_value(value)
                 .map_err(|_| D::Error::custom("invalid Gemini text part"))?;
             return Ok(match fields.thought_signature {
-                Some(thought_signature) => Self::SignedText { text: fields.text, thought_signature },
+                Some(thought_signature) => Self::SignedText {
+                    text: fields.text,
+                    thought_signature,
+                },
                 None => Self::Text { text: fields.text },
             });
         }
@@ -73,7 +88,9 @@ impl<'de> Deserialize<'de> for GeminiPart {
             let fields: CallFields = serde_json::from_value(value)
                 .map_err(|_| D::Error::custom("invalid Gemini function call"))?;
             if !fields.function_call.args.is_object() {
-                return Err(D::Error::custom("Gemini function arguments must be an object"));
+                return Err(D::Error::custom(
+                    "Gemini function arguments must be an object",
+                ));
             }
             return Ok(Self::FunctionCall {
                 function_call: fields.function_call,
@@ -96,6 +113,7 @@ impl<'de> Deserialize<'de> for GeminiPart {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub(super) fn response_parse_error(error: serde_json::Error) -> crate::error::Error {
     // Neither thought text nor opaque signatures belong in parse diagnostics.
     crate::error::Error::api(format!(

@@ -70,13 +70,16 @@ fn context() -> Context<'static> {
 }
 
 fn frames(route: Route, events: &[Value]) -> String {
-    events.iter().map(|event| {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for event in events {
         let value = match route {
-            Route::Cli => json!({"response":event}),
+            Route::Cli => json!({"response": event}),
             Route::Developer | Route::Vertex => event.clone(),
         };
-        format!("data: {value}\n\n")
-    }).collect()
+        let _ = write!(out, "data: {value}\n\n");
+    }
+    out
 }
 
 fn success() -> Vec<Value> {
@@ -96,11 +99,24 @@ fn capture(
     let options = route.credentials(options);
     let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
     let events = runtime.block_on(async {
-        provider.stream(context, &options).await.expect("start stream").collect().await
+        provider
+            .stream(context, &options)
+            .await
+            .expect("start stream")
+            .collect()
+            .await
     });
-    let request = requests.recv_timeout(Duration::from_secs(5)).expect("captured request");
-    assert!(request.headers.contains_key("authorization") || request.headers.contains_key("x-goog-api-key"));
-    (serde_json::from_str(&request.body).expect("request JSON"), events)
+    let request = requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured request");
+    assert!(
+        request.headers.contains_key("authorization")
+            || request.headers.contains_key("x-goog-api-key")
+    );
+    (
+        serde_json::from_str(&request.body).expect("request JSON"),
+        events,
+    )
 }
 
 fn done(events: &[Result<StreamEvent>]) -> &AssistantMessage {
@@ -115,18 +131,42 @@ fn done(events: &[Result<StreamEvent>]) -> &AssistantMessage {
 fn explicit_controls_reach_the_wire_on_all_three_google_transports() {
     for route in Route::ALL {
         for (model, level, expected) in [
-            ("gemini-2.5-flash", ThinkingLevel::High,
-                json!({"thinkingBudget":4096,"includeThoughts":true})),
-            ("gemini-3-flash-preview", ThinkingLevel::High,
-                json!({"thinkingLevel":"high","includeThoughts":true})),
-            ("gemini-3-pro-preview", ThinkingLevel::Off,
-                json!({"thinkingLevel":"low","includeThoughts":false})),
+            (
+                "gemini-2.5-flash",
+                ThinkingLevel::High,
+                json!({"thinkingBudget":4096,"includeThoughts":true}),
+            ),
+            (
+                "gemini-3-flash-preview",
+                ThinkingLevel::High,
+                json!({"thinkingLevel":"high","includeThoughts":true}),
+            ),
+            (
+                "gemini-3-pro-preview",
+                ThinkingLevel::Off,
+                json!({"thinkingLevel":"low","includeThoughts":false}),
+            ),
         ] {
-            let (body, events) = capture(route, model, &context(), StreamOptions {
-                max_tokens: Some(8192), thinking_level: Some(level), ..Default::default()
-            }, &success());
-            assert_eq!(route.inner(&body)["generationConfig"]["thinkingConfig"], expected, "{route:?}/{model}");
-            assert_eq!(route.inner(&body)["generationConfig"]["maxOutputTokens"], 8192);
+            let (body, events) = capture(
+                route,
+                model,
+                &context(),
+                StreamOptions {
+                    max_tokens: Some(8192),
+                    thinking_level: Some(level),
+                    ..Default::default()
+                },
+                &success(),
+            );
+            assert_eq!(
+                route.inner(&body)["generationConfig"]["thinkingConfig"],
+                expected,
+                "{route:?}/{model}"
+            );
+            assert_eq!(
+                route.inner(&body)["generationConfig"]["maxOutputTokens"],
+                8192
+            );
             assert_eq!(done(&events).model, model);
             if matches!(route, Route::Cli) {
                 assert_eq!(body["project"], "projects/p/locations/global");
@@ -143,11 +183,22 @@ fn unspecified_and_unrecognized_models_keep_the_original_generation_config() {
         for (model, level) in [
             ("gemini-3-flash-preview", None),
             ("custom-model", Some(ThinkingLevel::High)),
-            ("gemini-2.5-flash-native-audio-preview", Some(ThinkingLevel::High)),
+            (
+                "gemini-2.5-flash-native-audio-preview",
+                Some(ThinkingLevel::High),
+            ),
         ] {
-            let (body, events) = capture(route, model, &context(), StreamOptions {
-                thinking_level: level, max_tokens: Some(1024), ..Default::default()
-            }, &success());
+            let (body, events) = capture(
+                route,
+                model,
+                &context(),
+                StreamOptions {
+                    thinking_level: level,
+                    max_tokens: Some(1024),
+                    ..Default::default()
+                },
+                &success(),
+            );
             let config = &route.inner(&body)["generationConfig"];
             assert!(config.get("thinkingConfig").is_none(), "{route:?}/{model}");
             assert_eq!(config["maxOutputTokens"], 1024);
@@ -166,8 +217,14 @@ fn rewrite_hooks_observe_prepared_controls_and_their_replacement_is_not_overwrit
             before_provider_request: Some(BeforeProviderRequestHook::new(move |event| {
                 let called = Arc::clone(&called);
                 Box::pin(async move {
-                    assert_eq!(event.payload["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
-                    assert!(event.payload.get("project").is_none(), "CLI wrapper is host-owned");
+                    assert_eq!(
+                        event.payload["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                        "high"
+                    );
+                    assert!(
+                        event.payload.get("project").is_none(),
+                        "CLI wrapper is host-owned"
+                    );
                     called.store(true, Ordering::SeqCst);
                     let mut body = event.payload;
                     body["generationConfig"]["thinkingConfig"]["thinkingLevel"] = json!("low");
@@ -176,9 +233,18 @@ fn rewrite_hooks_observe_prepared_controls_and_their_replacement_is_not_overwrit
             })),
             ..Default::default()
         };
-        let (body, events) = capture(route, "gemini-3-flash-preview", &context(), options, &success());
+        let (body, events) = capture(
+            route,
+            "gemini-3-flash-preview",
+            &context(),
+            options,
+            &success(),
+        );
         assert!(observed.load(Ordering::SeqCst));
-        assert_eq!(route.inner(&body)["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
+        assert_eq!(
+            route.inner(&body)["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
         assert_eq!(done(&events).stop_reason, StopReason::Stop);
     }
 }
@@ -193,8 +259,17 @@ fn invalid_rewrites_fall_back_to_prepared_not_unconfigured_requests() {
             })),
             ..Default::default()
         };
-        let (body, events) = capture(route, "gemini-3-flash-preview", &context(), options, &success());
-        assert_eq!(route.inner(&body)["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+        let (body, events) = capture(
+            route,
+            "gemini-3-flash-preview",
+            &context(),
+            options,
+            &success(),
+        );
+        assert_eq!(
+            route.inner(&body)["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
         assert_eq!(done(&events).stop_reason, StopReason::Stop);
     }
 }
@@ -216,37 +291,62 @@ fn impossible_thinking_budgets_fail_before_hooks_or_connections() {
         let provider = route.provider("gemini-2.5-pro", "not a valid endpoint");
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let error = runtime.block_on(async {
-            provider.stream(&context(), &options).await.err().expect("invalid budget")
+            provider
+                .stream(&context(), &options)
+                .await
+                .err()
+                .expect("invalid budget")
         });
-        assert!(error.to_string().contains("max_tokens"), "{route:?}: {error}");
+        assert!(
+            error.to_string().contains("max_tokens"),
+            "{route:?}: {error}"
+        );
         assert!(!observed.load(Ordering::SeqCst));
     }
 }
 
 #[test]
 fn streamed_thoughts_and_answers_have_distinct_ordered_lifecycles() {
-    let body = frames(Route::Developer, &[
-        json!({"candidates":[{"content":{"parts":[{"text":"think ","thought":true}]}}]}),
-        json!({"candidates":[{"content":{"parts":[{"text":"more","thought":true},{"text":"answer"}]},"finishReason":"STOP"}]}),
-    ]);
+    let body = frames(
+        Route::Developer,
+        &[
+            json!({"candidates":[{"content":{"parts":[{"text":"think ","thought":true}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"text":"more","thought":true},{"text":"answer"}]},"finishReason":"STOP"}]}),
+        ],
+    );
     let events = collect_stream_items_from_body(&body);
     let message = done(&events);
     assert_eq!(message.content.len(), 2);
     assert!(matches!(&message.content[0], ContentBlock::Thinking(t) if t.thinking == "think more"));
     assert!(matches!(&message.content[1], ContentBlock::Text(t) if t.text == "answer"));
-    let sequence: Vec<_> = events.iter().map(|event| match event.as_ref().unwrap() {
-        StreamEvent::Start { .. } => "start",
-        StreamEvent::ThinkingStart { .. } => "thinking_start",
-        StreamEvent::ThinkingDelta { .. } => "thinking_delta",
-        StreamEvent::ThinkingEnd { .. } => "thinking_end",
-        StreamEvent::TextStart { .. } => "text_start",
-        StreamEvent::TextDelta { .. } => "text_delta",
-        StreamEvent::TextEnd { .. } => "text_end",
-        StreamEvent::Done { .. } => "done",
-        _ => "unexpected",
-    }).collect();
-    assert_eq!(sequence, vec!["start", "thinking_start", "thinking_delta", "thinking_delta",
-        "thinking_end", "text_start", "text_delta", "text_end", "done"]);
+    let sequence: Vec<_> = events
+        .iter()
+        .map(|event| match event.as_ref().unwrap() {
+            StreamEvent::Start { .. } => "start",
+            StreamEvent::ThinkingStart { .. } => "thinking_start",
+            StreamEvent::ThinkingDelta { .. } => "thinking_delta",
+            StreamEvent::ThinkingEnd { .. } => "thinking_end",
+            StreamEvent::TextStart { .. } => "text_start",
+            StreamEvent::TextDelta { .. } => "text_delta",
+            StreamEvent::TextEnd { .. } => "text_end",
+            StreamEvent::Done { .. } => "done",
+            _ => "unexpected",
+        })
+        .collect();
+    assert_eq!(
+        sequence,
+        vec![
+            "start",
+            "thinking_start",
+            "thinking_delta",
+            "thinking_delta",
+            "thinking_end",
+            "text_start",
+            "text_delta",
+            "text_end",
+            "done"
+        ]
+    );
 }
 
 #[test]
@@ -260,12 +360,18 @@ fn signed_state_round_trips_through_session_encoding_and_actual_followup_request
     ]);
     for route in Route::ALL {
         let initial = context();
-        let (_, events) = capture(route, "gemini-3-flash-preview", &initial, StreamOptions::default(), &[
-            json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]})
-        ]);
+        let (_, events) = capture(
+            route,
+            "gemini-3-flash-preview",
+            &initial,
+            StreamOptions::default(),
+            &[json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]})],
+        );
         let message = done(&events);
         assert_eq!(message.stop_reason, StopReason::ToolUse);
-        assert!(matches!(&events[0], Ok(StreamEvent::Start { partial }) if partial.content.is_empty()));
+        assert!(
+            matches!(&events[0], Ok(StreamEvent::Start { partial }) if partial.content.is_empty())
+        );
         let stored = serde_json::to_vec(&Message::assistant(message.clone())).unwrap();
         let replay: Message = serde_json::from_slice(&stored).unwrap();
         let mut messages = initial.messages.to_vec();
@@ -273,16 +379,32 @@ fn signed_state_round_trips_through_session_encoding_and_actual_followup_request
         for block in &message.content {
             if let ContentBlock::ToolCall(call) = block {
                 messages.push(Message::tool_result(crate::model::ToolResultMessage {
-                    tool_call_id: call.id.clone(), tool_name: call.name.clone(),
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
                     content: vec![ContentBlock::Text(TextContent::new("file contents"))],
-                    details: None, is_error: false, timestamp: 1,
+                    details: None,
+                    is_error: false,
+                    timestamp: 1,
                 }));
             }
         }
         let followup = Context::owned(None, messages, initial.tools.to_vec());
-        let (body, events) = capture(route, "gemini-3-flash-preview", &followup, StreamOptions::default(), &success());
-        assert_eq!(route.inner(&body)["contents"][1]["parts"], parts, "{route:?}");
-        assert_eq!(route.inner(&body)["contents"][2]["parts"][0]["functionResponse"]["name"], "read");
+        let (body, events) = capture(
+            route,
+            "gemini-3-flash-preview",
+            &followup,
+            StreamOptions::default(),
+            &success(),
+        );
+        assert_eq!(
+            route.inner(&body)["contents"][1]["parts"],
+            parts,
+            "{route:?}"
+        );
+        assert_eq!(
+            route.inner(&body)["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "read"
+        );
         assert_eq!(done(&events).stop_reason, StopReason::Stop);
     }
 }
@@ -298,9 +420,23 @@ fn cumulative_thinking_and_cache_counters_survive_omitted_fields_and_repeated_sn
             "usageMetadata":{"thoughtsTokenCount":12,"totalTokenCount":115}}),
     ];
     for route in Route::ALL {
-        let (_, output) = capture(route, "gemini-2.5-flash", &context(), StreamOptions::default(), &events);
+        let (_, output) = capture(
+            route,
+            "gemini-2.5-flash",
+            &context(),
+            StreamOptions::default(),
+            &events,
+        );
         let usage = &done(&output).usage;
-        assert_eq!((usage.input, usage.output, usage.cache_read, usage.total_tokens), (60, 15, 40, 115));
+        assert_eq!(
+            (
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.total_tokens
+            ),
+            (60, 15, 40, 115)
+        );
     }
 }
 
@@ -314,11 +450,17 @@ fn malformed_reasoning_never_falls_through_to_ordinary_text_or_exposes_payloads(
         json!({"text":"private-thought","thoughtSignature":"private-signature","thought_signature":"other"}),
         json!({"text":"private-thought","functionCall":{"name":"read","args":{}}}),
     ] {
-        let body = frames(Route::Developer, &[
-            json!({"candidates":[{"content":{"parts":[part]},"finishReason":"STOP"}]})
-        ]);
+        let body = frames(
+            Route::Developer,
+            &[json!({"candidates":[{"content":{"parts":[part]},"finishReason":"STOP"}]})],
+        );
         let events = collect_stream_items_from_body(&body);
-        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::TextDelta { .. } | StreamEvent::Done { .. } | StreamEvent::ToolCallStart { .. }))));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::TextDelta { .. }
+                | StreamEvent::Done { .. }
+                | StreamEvent::ToolCallStart { .. })
+        )));
         let error = events.last().unwrap().as_ref().unwrap_err().to_string();
         assert!(error.contains("JSON parse error"));
         assert!(!error.contains("private-"));
@@ -335,7 +477,10 @@ fn false_thought_flags_and_signature_aliases_decode_without_losing_native_state(
             let output = serde_json::to_value(decoded).unwrap();
             assert_eq!(output["text"], "body");
             assert_eq!(output["thoughtSignature"], "c2ln");
-            assert_eq!(output.get("thought").and_then(Value::as_bool), thought.then_some(true));
+            assert_eq!(
+                output.get("thought").and_then(Value::as_bool),
+                thought.then_some(true)
+            );
             assert!(output.get("thought_signature").is_none());
         }
     }
@@ -343,36 +488,58 @@ fn false_thought_flags_and_signature_aliases_decode_without_losing_native_state(
 
 #[test]
 fn signature_only_tail_parts_survive_and_every_content_block_closes_once() {
-    let body = frames(Route::Developer, &[
-        json!({"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}]}),
-        json!({"candidates":[{"content":{"parts":[{"thoughtSignature":"dGFpbA=="}]}}]}),
-        json!({"candidates":[{"finishReason":"STOP"}]}),
-    ]);
+    let body = frames(
+        Route::Developer,
+        &[
+            json!({"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}]}),
+            json!({"candidates":[{"content":{"parts":[{"thoughtSignature":"dGFpbA=="}]}}]}),
+            json!({"candidates":[{"finishReason":"STOP"}]}),
+        ],
+    );
     let events = collect_stream_items_from_body(&body);
     let message = done(&events);
     assert_eq!(message.content.len(), 2);
     assert!(matches!(&message.content[1], ContentBlock::Text(t)
         if t.text.is_empty() && t.text_signature.as_deref() == Some("dGFpbA==")));
-    let ends: Vec<_> = events.iter().filter_map(|event| match event {
-        Ok(StreamEvent::TextEnd { content_index, .. }) => Some(*content_index),
-        _ => None,
-    }).collect();
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(StreamEvent::TextEnd { content_index, .. }) => Some(*content_index),
+            _ => None,
+        })
+        .collect();
     assert_eq!(ends, vec![0, 1]);
 }
 
 #[test]
 fn corrupted_or_timed_out_streams_never_become_success_after_a_finish_marker() {
     for cloud in [false, true] {
-        for kind in [std::io::ErrorKind::WriteZero, std::io::ErrorKind::WouldBlock,
-            std::io::ErrorKind::TimedOut, std::io::ErrorKind::ConnectionReset] {
+        for kind in [
+            std::io::ErrorKind::WriteZero,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
             let route = if cloud { Route::Cli } else { Route::Developer };
             let bytes = frames(route, &success()).into_bytes();
-            let source = stream::iter(vec![Ok(bytes), Err(std::io::Error::new(kind, "fixture failure")),
-                Ok(frames(route, &success()).into_bytes())]);
-            let state = StreamState::new(SseStream::new(source), "gemini-test".into(), "google-generative-ai".into(), "google".into());
+            let source = stream::iter(vec![
+                Ok(bytes),
+                Err(std::io::Error::new(kind, "fixture failure")),
+                Ok(frames(route, &success()).into_bytes()),
+            ]);
+            let state = StreamState::new(
+                SseStream::new(source),
+                "gemini-test".into(),
+                "google-generative-ai".into(),
+                "google".into(),
+            );
             let events: Vec<_> = futures::executor::block_on(state.into_stream(cloud).collect());
             assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
-            assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+            );
             assert!(events.last().unwrap().is_err());
         }
     }
@@ -380,36 +547,69 @@ fn corrupted_or_timed_out_streams_never_become_success_after_a_finish_marker() {
 
 #[test]
 fn truncated_reasoning_is_a_partial_stream_not_a_completed_answer() {
-    let body = frames(Route::Developer, &[
-        json!({"candidates":[{"content":{"parts":[{"text":"unfinished","thought":true}]}}]})
-    ]);
+    let body = frames(
+        Route::Developer,
+        &[json!({"candidates":[{"content":{"parts":[{"text":"unfinished","thought":true}]}}]})],
+    );
     let events = collect_stream_items_from_body(&body);
     assert!(events.iter().any(|event| matches!(event, Ok(StreamEvent::ThinkingDelta { delta, .. }) if delta == "unfinished")));
-    assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
-    assert!(events.last().unwrap().as_ref().unwrap_err().to_string().contains("unexpected EOF"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+    );
+    assert!(
+        events
+            .last()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected EOF")
+    );
 }
 
 #[test]
 fn a_blocked_prompt_cannot_dispatch_an_adjoining_tool_candidate() {
-    let body = frames(Route::Developer, &[
-        json!({"promptFeedback":{"blockReason":"SAFETY"},
-            "candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{}}}]},"finishReason":"STOP"}]})
-    ]);
+    let body = frames(
+        Route::Developer,
+        &[json!({"promptFeedback":{"blockReason":"SAFETY"},
+            "candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{}}}]},"finishReason":"STOP"}]})],
+    );
     let events = collect_stream_items_from_body(&body);
     assert_eq!(done(&events).stop_reason, StopReason::Error);
-    assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::ToolCallStart { .. }))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Ok(StreamEvent::ToolCallStart { .. })))
+    );
 }
 
 #[test]
 fn foreign_and_claude_vertex_signatures_are_not_relabelled_as_gemini_state() {
-    for (api, model) in [("anthropic-messages", "claude-sonnet-4-6"),
-        ("openai-responses", "gpt-test"), ("google-vertex", "claude-sonnet-4-6")] {
+    for (api, model) in [
+        ("anthropic-messages", "claude-sonnet-4-6"),
+        ("openai-responses", "gpt-test"),
+        ("google-vertex", "claude-sonnet-4-6"),
+    ] {
         let message = Message::assistant(AssistantMessage {
-            api: api.into(), model: model.into(),
+            api: api.into(),
+            model: model.into(),
             content: vec![
-                ContentBlock::Thinking(ThinkingContent { thinking:"private foreign thought".into(), thinking_signature:Some("foreign-thought-signature".into()) }),
-                ContentBlock::Text(TextContent { text:"visible answer".into(), text_signature:Some("foreign-text-signature".into()) }),
-                ContentBlock::ToolCall(ToolCall { id:"call-1".into(), name:"read".into(), arguments:json!({}), thought_signature:Some("foreign-call-signature".into()) }),
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "private foreign thought".into(),
+                    thinking_signature: Some("foreign-thought-signature".into()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "visible answer".into(),
+                    text_signature: Some("foreign-text-signature".into()),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: json!({}),
+                    thought_signature: Some("foreign-call-signature".into()),
+                }),
             ],
             ..AssistantMessage::default()
         });
@@ -428,29 +628,63 @@ fn unicode_and_signed_part_boundaries_are_invariant_at_every_transport_split() {
         {"text":"回答","thoughtSignature":"YW5zd2Vy"},
         {"text":"","thoughtSignature":"ZW1wdHk="}
     ]);
-    let body = frames(Route::Developer, &[
-        json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]})
-    ]).into_bytes();
+    let body = frames(
+        Route::Developer,
+        &[json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]})],
+    )
+    .into_bytes();
     for split in 0..=body.len() {
         let source = stream::iter(vec![Ok(body[..split].to_vec()), Ok(body[split..].to_vec())]);
-        let state = StreamState::new(SseStream::new(source), "gemini-test".into(), "google-generative-ai".into(), "google".into());
+        let state = StreamState::new(
+            SseStream::new(source),
+            "gemini-test".into(),
+            "google-generative-ai".into(),
+            "google".into(),
+        );
         let events: Vec<_> = futures::executor::block_on(state.into_stream(false).collect());
         let message = done(&events);
-        let wire = serde_json::to_value(convert_message_to_gemini(&Message::assistant(message.clone()))).unwrap();
+        let wire = serde_json::to_value(convert_message_to_gemini(&Message::assistant(
+            message.clone(),
+        )))
+        .unwrap();
         assert_eq!(wire[0]["parts"], parts, "byte split {split}");
-        assert_eq!(events.iter().filter(|event| matches!(event, Ok(StreamEvent::ThinkingEnd { .. } | StreamEvent::TextEnd { .. }))).count(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Ok(StreamEvent::ThinkingEnd { .. } | StreamEvent::TextEnd { .. })
+                ))
+                .count(),
+            3
+        );
     }
 }
 
 #[test]
 fn zero_argument_calls_are_not_dropped_and_non_object_arguments_fail() {
-    let body = frames(Route::Developer, &[
-        json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"status"}}]},"finishReason":"STOP"}]})
-    ]);
+    let body = frames(
+        Route::Developer,
+        &[
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"status"}}]},"finishReason":"STOP"}]}),
+        ],
+    );
     let events = collect_stream_items_from_body(&body);
     let message = done(&events);
-    assert!(matches!(&message.content[0], ContentBlock::ToolCall(call) if call.arguments == json!({})));
-    for args in [Value::Null, json!([]), json!("private-arguments"), json!(42)] {
-        assert!(serde_json::from_value::<GeminiPart>(json!({"functionCall":{"name":"status","args":args}})).is_err());
+    assert!(
+        matches!(&message.content[0], ContentBlock::ToolCall(call) if call.arguments == json!({}))
+    );
+    for args in [
+        Value::Null,
+        json!([]),
+        json!("private-arguments"),
+        json!(42),
+    ] {
+        assert!(
+            serde_json::from_value::<GeminiPart>(
+                json!({"functionCall":{"name":"status","args":args}})
+            )
+            .is_err()
+        );
     }
 }

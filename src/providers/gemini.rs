@@ -6,8 +6,7 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, Usage,
-    UserContent,
+    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -411,8 +410,8 @@ impl Provider for GeminiProvider {
             let provider = self.name().to_string();
             let cloud_cli_mode = self.google_cli_mode;
 
-            let stream = StreamState::new(event_source, model, api, provider)
-                .into_stream(cloud_cli_mode);
+            let stream =
+                StreamState::new(event_source, model, api, provider).into_stream(cloud_cli_mode);
 
             return Ok(Box::pin(stream));
         }
@@ -505,8 +504,8 @@ impl Provider for GeminiProvider {
         let provider = self.name().to_string();
         let cloud_cli_mode = self.google_cli_mode;
 
-        let stream = StreamState::new(event_source, model, api, provider)
-            .into_stream(cloud_cli_mode);
+        let stream =
+            StreamState::new(event_source, model, api, provider).into_stream(cloud_cli_mode);
 
         Ok(Box::pin(stream))
     }
@@ -649,8 +648,8 @@ where
     }
 
     pub(super) fn process_event(&mut self, data: &str) -> Result<()> {
-        let response: GeminiStreamResponse = serde_json::from_str(data)
-            .map_err(wire::response_parse_error)?;
+        let response: GeminiStreamResponse =
+            serde_json::from_str(data).map_err(wire::response_parse_error)?;
         self.process_response(response)
     }
 
@@ -677,8 +676,10 @@ where
         {
             self.saw_terminal = true;
             self.partial.stop_reason = StopReason::Error;
-            self.partial.error_message =
-                Some(format!("{} blocked the prompt: {reason}", self.service_label()));
+            self.partial.error_message = Some(format!(
+                "{} blocked the prompt: {reason}",
+                self.service_label()
+            ));
             self.content_state
                 .close(&self.partial, &mut self.pending_events);
             // A refused prompt must not dispatch content/tool calls even if
@@ -697,8 +698,8 @@ where
     }
 
     fn process_cloud_code_event(&mut self, data: &str) -> Result<()> {
-        let wrapped: CloudCodeAssistResponseChunk = serde_json::from_str(data)
-            .map_err(wire::response_parse_error)?;
+        let wrapped: CloudCodeAssistResponseChunk =
+            serde_json::from_str(data).map_err(wire::response_parse_error)?;
         let Some(response) = wrapped.response else {
             return Ok(());
         };
@@ -739,7 +740,10 @@ where
                             None,
                         );
                     }
-                    GeminiPart::SignedText { text, thought_signature } => {
+                    GeminiPart::SignedText {
+                        text,
+                        thought_signature,
+                    } => {
                         self.content_state.append(
                             &mut self.partial,
                             &mut self.pending_events,
@@ -749,7 +753,11 @@ where
                             Some(thought_signature),
                         );
                     }
-                    GeminiPart::Thought { text, thought_signature, .. } => {
+                    GeminiPart::Thought {
+                        text,
+                        thought_signature,
+                        ..
+                    } => {
                         self.content_state.append(
                             &mut self.partial,
                             &mut self.pending_events,
@@ -1037,6 +1045,7 @@ pub(crate) struct GeminiUsageMetadata {
 // Conversion Functions
 // ============================================================================
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
     match message {
         Message::User(user) => vec![GeminiContent {
@@ -1056,13 +1065,17 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
             for block in &assistant.content {
                 match block {
                     ContentBlock::Text(t) => {
-                        if let Some(signature) = t.text_signature.as_ref().filter(|_| google_history) {
+                        if let Some(signature) =
+                            t.text_signature.as_ref().filter(|_| google_history)
+                        {
                             parts.push(GeminiPart::SignedText {
                                 text: t.text.clone(),
                                 thought_signature: signature.clone(),
                             });
                         } else {
-                            parts.push(GeminiPart::Text { text: t.text.clone() });
+                            parts.push(GeminiPart::Text {
+                                text: t.text.clone(),
+                            });
                         }
                     }
                     ContentBlock::Thinking(t) if google_history => {
@@ -1078,7 +1091,10 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                                 name: tc.name.clone(),
                                 args: tc.arguments.clone(),
                             },
-                            thought_signature: tc.thought_signature.clone().filter(|_| google_history),
+                            thought_signature: tc
+                                .thought_signature
+                                .clone()
+                                .filter(|_| google_history),
                         });
                     }
                     ContentBlock::Thinking(_)
