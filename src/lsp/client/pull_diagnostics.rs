@@ -244,6 +244,7 @@ impl LspClient {
                             || err.to_string().contains("server cancelled") => {}
                     Err(err) => return Err(err),
                 }
+                self.poll_notifications();
                 let diags = Self::lock(&self.diagnostics)
                     .get(&uri)
                     .cloned()

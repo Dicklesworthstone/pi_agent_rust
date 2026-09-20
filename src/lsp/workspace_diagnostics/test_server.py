@@ -98,7 +98,7 @@ while True:
             (root / "a.scan").write_text("external change\n", encoding="utf-8")
         result = {"kind": "full", "resultId": uri + ":" + str(documents[uri]["version"]),
                   "items": items(uri)}
-    send({"jsonrpc": "2.0", "id": message["id"], "result": result})
     if method == "textDocument/diagnostic":
         send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
               "params": {"quiescent": True}})
+    send({"jsonrpc": "2.0", "id": message["id"], "result": result})
