@@ -3102,7 +3102,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             );
             AuthStorage::empty_at(auth_path)
         }
-        Err(err) => return Err(err.into()),
+        Err(err) => return Err(err),
     };
     // gh #218: refresh per provider; only a failure for the provider this
     // session actually selects is an error (checked after selection below).

@@ -622,7 +622,9 @@ mod tests {
             let budget = asupersync::Cx::current().expect("request owner").budget();
             std::future::poll_fn(|_| {
                 assert_eq!(
-                    asupersync::Cx::current().expect("owner on every poll").budget(),
+                    asupersync::Cx::current()
+                        .expect("owner on every poll")
+                        .budget(),
                     budget
                 );
                 std::task::Poll::<Result<Value>>::Pending
@@ -662,9 +664,9 @@ mod tests {
         let erased: Arc<dyn McpTransport> = transport.clone();
         *McpManager::lock(&entry.transport) = Some(erased);
         let runtime = runtime();
-        let owner = crate::agent_cx::AgentCx::from_cx(runtime.request_cx_with_budget(
-            asupersync::Budget::new().with_poll_quota(1000),
-        ));
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new().with_poll_quota(1000)),
+        );
         runtime.block_on(async {
             let parent = asupersync::Cx::current().expect("parent");
             let mut task = Context::from_waker(futures::task::noop_waker_ref());
@@ -716,7 +718,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(&temp, vec![], true);
         let owner = crate::agent_cx::AgentCx::for_request();
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("before context access"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("before context access"),
+        );
         let error = runtime()
             .block_on(owner.with_current(manager.list_resources("docs", None)))
             .expect_err("owner cancelled before dispatch");
@@ -731,7 +736,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(
             &temp,
-            vec![Ok(json!({"resources": [{"name": "private", "uri": "db://private"}]}))],
+            vec![Ok(
+                json!({"resources": [{"name": "private", "uri": "db://private"}]}),
+            )],
             true,
         );
         let runtime = runtime();

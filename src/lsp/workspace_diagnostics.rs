@@ -111,12 +111,9 @@ fn discover(
             break;
         }
         found.visited += 1;
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                found.errors += 1;
-                continue;
-            }
+        let Ok(entry) = entry else {
+            found.errors += 1;
+            continue;
         };
         if entry.error().is_some() {
             found.errors += 1;
@@ -266,27 +263,27 @@ impl LspTool {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn run_workspace_diagnostics(
         &self,
         input: &LspInput,
         pattern: &str,
     ) -> Result<ToolOutput> {
         let glob = matcher(pattern)?;
-        if let Some(after) = input.after.as_deref() {
-            if after.is_empty()
+        if let Some(after) = input.after.as_deref()
+            && (after.is_empty()
                 || after.len() > MAX_PATH_BYTES
                 || after.contains('\0')
                 || Path::new(after).is_absolute()
                 || Path::new(after)
                     .components()
                     .any(|part| !matches!(part, Component::Normal(_)))
-                || after.split('/').any(|part| matches!(part, "" | "." | ".."))
-            {
-                return Err(tool_err(
-                    "LSP_USAGE",
-                    "after must be a bounded workspace-relative cursor path",
-                ));
-            }
+                || after.split('/').any(|part| matches!(part, "" | "." | "..")))
+        {
+            return Err(tool_err(
+                "LSP_USAGE",
+                "after must be a bounded workspace-relative cursor path",
+            ));
         }
         if input.limit == Some(0) {
             return Err(tool_err(
@@ -349,7 +346,7 @@ impl LspTool {
                             .cx()
                             .timer_driver()
                             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                        match asupersync::time::timeout(
+                        asupersync::time::timeout(
                             now,
                             remaining,
                             self.check_workspace_document(
@@ -360,13 +357,12 @@ impl LspTool {
                             ),
                         )
                         .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err(tool_err(
+                        .unwrap_or_else(|_| {
+                            Err(tool_err(
                                 "LSP_TIMEOUT",
                                 "workspace diagnostic budget expired",
-                            )),
-                        }
+                            ))
+                        })
                     }
                     Err(error) => Err(error),
                 }

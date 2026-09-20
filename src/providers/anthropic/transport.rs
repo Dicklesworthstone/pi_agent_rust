@@ -1628,18 +1628,14 @@ mod tests {
     fn terminal_authorization_survives_every_transport_split() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         for reason in ["refusal", "tool_use"] {
-            let bytes = [
+            let bytes = wire_bytes([
                 start(),
                 tool_start(0, "call-a", &json!({})),
                 tool_delta(0, "{\"path\":\"héllo.txt\"}"),
                 stop(0),
                 final_delta(reason),
                 json!({"type": "message_stop"}),
-            ]
-            .into_iter()
-            .map(|event| format!("data: {event}\n\n"))
-            .collect::<String>()
-            .into_bytes();
+            ]);
             for split in 0..=bytes.len() {
                 let chunks = [Ok(bytes[..split].to_vec()), Ok(bytes[split..].to_vec())];
                 let events: Vec<_> = runtime.block_on(
@@ -1719,11 +1715,12 @@ mod tests {
     }
 
     fn wire_bytes(events: impl IntoIterator<Item = Value>) -> Vec<u8> {
-        events
-            .into_iter()
-            .map(|event| format!("data: {event}\n\n"))
-            .collect::<String>()
-            .into_bytes()
+        use std::fmt::Write;
+        let mut out = String::new();
+        for event in events {
+            let _ = write!(out, "data: {event}\n\n");
+        }
+        out.into_bytes()
     }
 
     fn assert_retired(output: &mut EventStream, dropped: &AtomicBool) {

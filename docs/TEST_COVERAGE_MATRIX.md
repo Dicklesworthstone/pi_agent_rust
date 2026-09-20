@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 327 current source files.
+- `rg --files src -g '*.rs' | sort` -> 333 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 327.
+- Source-file rows below: 333.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -230,6 +230,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
 | `src/lsp/registry.rs` | LSP registry | `tests/lsp.rs`. |
 | `src/lsp/text.rs` | LSP text mapping | `tests/lsp.rs`. |
+| `src/lsp/workspace_diagnostics.rs` | LSP workspace diagnostics tool | Unit; `src/lsp/workspace_diagnostics/tests.rs`. |
+| `src/lsp/workspace_diagnostics/tests.rs` | LSP workspace diagnostics test suite | Test module; workspace diagnostics tests. |
 | `src/magic_keywords.rs` | Magic keywords | `tests/magic_keywords.rs`. |
 | `src/main.rs` | CLI entry | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/markdown_rich.rs` | Markdown, math, mermaid, and visual rendering (OMP-ADOPT / bd-cv653.9.7) | Unit (9 tests); `tests/markdown_rich.rs`, `tests/chrome_tui_integration.rs`. |
@@ -237,6 +239,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/mcp/config.rs` | MCP config | `tests/mcp.rs`. |
 | `src/mcp/content.rs` | MCP content block shaper and serialization | Unit; `tests/mcp_conformance.rs`. |
 | `src/mcp/manager.rs` | MCP manager | `tests/mcp.rs`. |
+| `src/mcp/manager/calls.rs` | MCP tool call execution and cancellation | Unit; `tests/mcp.rs`. |
 | `src/mcp/manager/catalog.rs` | MCP tool catalog discovery and pagination | Unit; `tests/mcp_conformance.rs`. |
 | `src/mcp/manager/catalog/context.rs` | MCP resource catalog and context discovery | Unit; in-module tests. |
 | `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
@@ -286,7 +289,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
 | `src/providers/gemini/files.rs` | Credential-scoped Gemini Files API staging for large inline media | Unit (in-module, loopback HTTP fixtures); two concurrency cases are timing-flaky, see bd-eg6ng. |
 | `src/providers/gemini/reasoning.rs` | Gemini reasoning and thinking trace handling | Unit; `tests/provider_streaming/gemini.rs`. |
+| `src/providers/gemini/tests/integration_reasoning.rs` | Gemini streaming reasoning integration tests | Test module; streaming reasoning tests. |
 | `src/providers/gemini/thinking.rs` | Gemini thinking-budget mapping | Unit (in-module). |
+| `src/providers/gemini/wire.rs` | Gemini wire types and serialization | Unit; in-module tests. |
 | `src/providers/gitlab.rs` | GitLab Duo provider | Unit; `tests/provider_streaming/gitlab.rs`, provider error/path suites. |
 | `src/providers/mod.rs` | Provider factory | Unit; `tests/provider_factory.rs`, `tests/provider_native_verify.rs`; branch export baseline marks this family partly branch-SIGSEGV fallback. |
 | `src/providers/model_fetch.rs` | Live provider-model discovery and cache | Unit tests in this module; static-registry integration through `tests/model_registry.rs`. |
@@ -320,6 +325,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_index.rs` | Session index | Unit; `tests/session_index_tests.rs`, `tests/reproduce_index_gap.rs`. |
 | `src/session_metrics.rs` | Session metrics | Unit; `tests/provider_session_coverage.rs` and session evidence suites. |
 | `src/session_picker.rs` | Session picker UI | Unit; `tests/session_picker.rs`. |
+| `src/session_picker/browse.rs` | Session picker browse state and navigation | Unit; `tests/session_picker.rs`. |
 | `src/session_sqlite.rs` | SQLite session backend | Unit; `tests/session_sqlite.rs`, `tests/fault_injection_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/session_sqlite/attachments.rs` | SQLite session attachment and media blob storage | Unit; `tests/session_sqlite.rs`. |
 | `src/session_sqlite/entry_io.rs` | SQLite session entry serialization, paging, and batch insertion | Unit; `tests/session_sqlite.rs`. |

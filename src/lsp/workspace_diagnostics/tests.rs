@@ -124,12 +124,17 @@ fn oversized_and_non_utf8_documents_fail_bounded_read_admission() {
 #[test]
 fn discovery_does_not_obtain_io_authority_from_an_unprivileged_owner() {
     let temp = tempfile::tempdir().unwrap();
+    let restricted = asupersync::Cx::for_request().restrict::<asupersync::cx::cap::None>();
+    let owner = {
+        let _guard = restricted.set_current_restricted();
+        AgentCx::for_current_or_request()
+    };
     let error = discover(
         temp.path(),
         &matcher("**/*.scan").unwrap(),
         1,
         None,
-        &AgentCx::for_testing(),
+        &owner,
         Instant::now(),
         Duration::from_secs(1),
     )

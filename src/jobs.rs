@@ -1410,9 +1410,13 @@ impl BackgroundChild {
 
     fn kill_and_wait(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
-        crate::tools::kill_process_group_tree(Some(child.id()));
+        let pid = child.id();
+        crate::tools::terminate_reaped_child_discipline(pid);
+        crate::tools::kill_process_group_tree(Some(pid));
         let _ = child.kill();
-        child.wait().ok().and_then(|status| status.code())
+        let code = child.wait().ok().and_then(|status| status.code());
+        crate::tools::terminate_reaped_child_discipline(pid);
+        code
     }
 
     fn disarm(&mut self) {

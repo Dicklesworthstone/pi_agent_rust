@@ -1391,7 +1391,7 @@ impl McpManager {
                     Self::record_failure(entry, &error);
                     (true, owned)
                 }
-                None if current.is_none() => {
+                Some(_) | None if current.is_none() => {
                     Self::record_failure(entry, &error);
                     (true, None)
                 }

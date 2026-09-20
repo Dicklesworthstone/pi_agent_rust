@@ -66,6 +66,8 @@ while True:
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
               "params": {"uri": doc["uri"], "version": doc["version"],
                          "diagnostics": items(doc["uri"])}})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+              "params": {"quiescent": True}})
     if "id" not in message:
         continue
     result = None
@@ -97,3 +99,6 @@ while True:
         result = {"kind": "full", "resultId": uri + ":" + str(documents[uri]["version"]),
                   "items": items(uri)}
     send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+    if method == "textDocument/diagnostic":
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+              "params": {"quiescent": True}})
