@@ -34,7 +34,7 @@ pub(super) fn check_owner(owner: &AgentCx) -> Result<()> {
 
 pub(super) fn validate_selection(input: &LspInput) -> Result<()> {
     let Some(id) = &input.refactor_id else { return Ok(()) };
-    if !matches!(input.action.as_str(), "rename" | "rename_file") || id.is_empty() || id.len() > 128
+    if !matches!(input.action.as_str(), "rename" | "rename_file" | "code_actions") || id.is_empty() || id.len() > 128
         || input.file.is_some() || input.new_name.is_some() || input.new_file.is_some()
         || input.position.is_some() || input.symbol.is_some() || input.line.is_some()
         || input.range.is_some() || input.query.is_some() || input.limit.is_some()
@@ -43,7 +43,7 @@ pub(super) fn validate_selection(input: &LspInput) -> Result<()> {
         || input.hierarchy_id.is_some() || input.resolve.is_some() || input.format_options.is_some()
         || input.method.is_some() || input.payload.is_some()
     {
-        return Err(tool_err("LSP_USAGE", "refactorId requires its original rename action and accepts only apply and timeout; the plan cannot be overridden"));
+        return Err(tool_err("LSP_USAGE", "refactorId requires its original action and accepts only apply and timeout; the plan cannot be overridden"));
     }
     Ok(())
 }
@@ -168,7 +168,7 @@ impl LspTool {
                 .filter(|preview| Some(preview.id.as_str()) == input.refactor_id.as_deref())
                 .ok_or_else(stale)?;
             if preview.metadata["action"].as_str() != Some(input.action.as_str()) {
-                return Err(tool_err("LSP_USAGE", "refactorId belongs to a different rename action"));
+                return Err(tool_err("LSP_USAGE", "refactorId belongs to a different action"));
             }
             // Consume before validation or any write. Failed/stale applications
             // cannot be replayed, including failures with incomplete rollback.
