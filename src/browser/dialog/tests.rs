@@ -32,7 +32,17 @@ fn accept(listener: &TcpListener) -> TcpStream {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match listener.accept() {
-            Ok((socket, _)) => return socket,
+            Ok((socket, _)) => {
+                // macOS and the BSDs return an accepted socket that inherited
+                // the listener's O_NONBLOCK; Linux does not, and POSIX leaves
+                // it unspecified. Everything below reads with a blocking
+                // `read_exact`, so without clearing it the first frame read
+                // fails with EAGAIN, this peer thread panics, and the client
+                // under test reports "CDP connection closed before the command
+                // completed" instead of whatever it was being asked to prove.
+                socket.set_nonblocking(false).unwrap();
+                return socket;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
                     Instant::now() < deadline,
