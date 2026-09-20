@@ -520,6 +520,23 @@ mod tests {
         json!({"name":name,"description":"fixture","inputSchema":{"type":"object"}})
     }
 
+    /// Deadline for a test that asserts the transport RECORDED its request
+    /// before the deadline fired.
+    ///
+    /// `PagedTransport` pushes onto `requests` and only then parks forever, so
+    /// such a test needs its future polled at least once inside the budget.
+    /// At 10ms that is not guaranteed: on a loaded host a full-suite run failed
+    /// `manager_deadline_terminates_a_transport_that_ignores_its_timeout` with
+    /// `requests.len()` 0 against 1 — the task never ran — while the same test
+    /// passed five times out of five alone. The park is unconditional
+    /// (`Poll::Pending` forever), so a larger budget cannot stop the deadline
+    /// firing; it only stops the scheduler from beating the transport to it.
+    ///
+    /// This is margin, not determinism. A test that WANTS the deadline to land
+    /// before any request (`serialized_lane_admission_spends_the_deadline`)
+    /// keeps its own short one.
+    const RECORDED_REQUEST_DEADLINE: Duration = Duration::from_millis(250);
+
     fn fixture(
         temp: &tempfile::TempDir,
         pages: Vec<Value>,
@@ -1055,7 +1072,7 @@ mod tests {
             .block_on(manager.collect_tool_catalog_with_timeout(
                 &entry,
                 &erased,
-                Duration::from_millis(10),
+                RECORDED_REQUEST_DEADLINE,
             ))
             .expect_err("manager enforces deadline");
         assert!(error.to_string().contains("MCP_TIMEOUT"));
@@ -1395,7 +1412,7 @@ mod tests {
             .build()
             .expect("runtime");
         let error = runtime
-            .block_on(manager.refresh_tools_with_timeout("catalog", Duration::from_millis(10)))
+            .block_on(manager.refresh_tools_with_timeout("catalog", RECORDED_REQUEST_DEADLINE))
             .expect_err("outer refresh deadline");
         refresh_log(
             "pending-page-deadline",
