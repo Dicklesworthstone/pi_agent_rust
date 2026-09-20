@@ -2171,6 +2171,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             "setWidget" | "set_widget" => self.apply_extension_widget_effect(request),
             "setTitle" | "set_title" => self.apply_extension_title_effect(request),
             "set_editor_text" => self.apply_extension_editor_text_effect(request),
+            // An op this stack does not know is dropped without a word, so
+            // `extensions_js.rs` declaring a `pi.ui(...)` call proves nothing
+            // on its own — the bridge is happy either way. Anything added
+            // there needs an arm here (or, for ops that answer the caller, in
+            // `handle_extension_ui_request`) before it does anything.
             _ => {}
         }
     }
