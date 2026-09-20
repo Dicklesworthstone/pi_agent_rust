@@ -207,6 +207,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/actions/refactor/versions.rs` | LSP request-time document version tracking across resource operations | Unit; `src/lsp/actions/refactor/versions/tests.rs`. |
 | `src/lsp/actions/refactor/versions/tests.rs` | LSP document version tracking test suite | Test module; version tracking tests. |
 | `src/lsp/actions/refactor/versions/tests/protocol.rs` | LSP document version tracking protocol test cases | Test support module; exercises version tracking. |
+| `src/lsp/actions/review_tests.rs` | LSP code action review and approval test suite | Test module; code action review tests. |
 | `src/lsp/actions/selection_tests.rs` | LSP code action selection test suite | Test module; action selection tests. |
 | `src/lsp/client.rs` | LSP client | `tests/lsp.rs`. |
 | `src/lsp/client/document_sync.rs` | LSP client live document synchronization | Unit; `src/lsp/client/document_sync/tests.rs`. |

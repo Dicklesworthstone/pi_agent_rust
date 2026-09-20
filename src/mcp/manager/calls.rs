@@ -200,7 +200,9 @@ struct ToolCallContract {
 
 impl std::fmt::Debug for ToolCallContract {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ToolCallContract").finish_non_exhaustive()
+        formatter
+            .debug_struct("ToolCallContract")
+            .finish_non_exhaustive()
     }
 }
 
@@ -735,7 +737,7 @@ mod tests {
         })
     }
 
-    fn install_input_contract(entry: &Arc<ServerEntry>, schema: Value) {
+    fn install_input_contract(entry: &Arc<ServerEntry>, schema: &Value) {
         let tools = super::super::parse_tool_list(&json!({"tools":[{
             "name":"execute", "inputSchema":schema
         }]}))
@@ -753,7 +755,7 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let response = json!({"content":[]});
             let (manager, entry, transport) = fixture(&temp, Ok(response.clone()));
-            install_input_contract(&entry, count_output_schema("integer"));
+            install_input_contract(&entry, &count_output_schema("integer"));
             McpManager::lock(&entry.restarts).count = 2;
             let runtime = runtime();
             let error = runtime
@@ -777,7 +779,10 @@ mod tests {
             );
             assert_eq!(
                 *McpManager::lock(&transport.requests),
-                vec![("tools/call".to_string(), json!({"name":"execute", "arguments":arguments}))]
+                vec![(
+                    "tools/call".to_string(),
+                    json!({"name":"execute", "arguments":arguments})
+                )]
             );
             assert_eq!(McpManager::lock(&entry.restarts).count, 0);
         }
@@ -842,7 +847,11 @@ mod tests {
         }]});
         let runtime = runtime();
         let error = runtime
-            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":"wrong"}))))
+            .block_on(watchdog(manager.call_tool(
+                "exec",
+                "execute",
+                json!({"count":"wrong"}),
+            )))
             .expect_err("cold calls validate input too");
         assert!(error.to_string().contains("MCP_INPUT_INVALID"));
         assert_eq!(state.list_calls.load(Ordering::SeqCst), 1);
@@ -851,7 +860,11 @@ mod tests {
         assert!(McpManager::lock(&entry.transport).is_some());
         assert_eq!(McpManager::lock(&entry.restarts).count, 0);
         runtime
-            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":1}))))
+            .block_on(watchdog(manager.call_tool(
+                "exec",
+                "execute",
+                json!({"count":1}),
+            )))
             .expect("corrected input reuses the admitted catalog and connection");
         assert_eq!(state.list_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.tool_calls.load(Ordering::SeqCst), 1);
@@ -869,20 +882,32 @@ mod tests {
         }]});
         let runtime = runtime();
         runtime
-            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":1}))))
+            .block_on(watchdog(manager.call_tool(
+                "exec",
+                "execute",
+                json!({"count":1}),
+            )))
             .expect("initial integer input");
         *McpManager::lock(&state.catalog) = json!({"tools":[{
             "name":"execute", "inputSchema":count_output_schema("string")
         }]});
         McpManager::lock(&entry.tools_cache).take();
         let error = runtime
-            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":1}))))
+            .block_on(watchdog(manager.call_tool(
+                "exec",
+                "execute",
+                json!({"count":1}),
+            )))
             .expect_err("stale input contract must not be reused");
         assert!(error.to_string().contains("MCP_INPUT_INVALID"));
         assert_eq!(state.list_calls.load(Ordering::SeqCst), 2);
         assert_eq!(state.tool_calls.load(Ordering::SeqCst), 1);
         runtime
-            .block_on(watchdog(manager.call_tool("exec", "execute", json!({"count":"one"}))))
+            .block_on(watchdog(manager.call_tool(
+                "exec",
+                "execute",
+                json!({"count":"one"}),
+            )))
             .expect("new input contract accepts the corrected input");
         assert_eq!(state.list_calls.load(Ordering::SeqCst), 2);
         assert_eq!(state.tool_calls.load(Ordering::SeqCst), 2);

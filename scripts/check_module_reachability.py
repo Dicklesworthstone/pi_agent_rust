@@ -48,6 +48,12 @@ ALLOWLIST: dict[str, str] = {
         "and CI tooling; the shipped agent has no reason to classify its own "
         "test flakes."
     ),
+    "session_control": (
+        "Live turn-scoped steering, follow-up, and abort control for in-process "
+        "SDK sessions (bd-06j9). Documented in docs/sdk-session-control.md as "
+        "an SDK-facing extension on AgentSessionHandle; internal CLI/RPC paths "
+        "do not drive it."
+    ),
     "swarm_flight_recorder": (
         "Deterministic E2E evidence harness for multi-agent runs, documented in "
         "docs/swarm-flight-recorder.md as driven via "

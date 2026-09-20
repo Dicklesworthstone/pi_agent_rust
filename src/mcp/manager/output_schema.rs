@@ -115,7 +115,10 @@ pub(super) fn validate_arguments(schema: &Value, arguments: &Value) -> Result<()
 }
 
 fn input_error(reason: &str) -> super::Error {
-    tool_err("MCP_INPUT_INVALID", format!("{reason}; the call was not sent"))
+    tool_err(
+        "MCP_INPUT_INVALID",
+        format!("{reason}; the call was not sent"),
+    )
 }
 
 struct CompiledOutputSchema {
