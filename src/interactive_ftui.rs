@@ -2102,6 +2102,8 @@ impl PiFtuiModel {
                     let text =
                         sanitize(format_extension_ui_prompt(&request).trim_end()).into_owned();
                     self.push_entry(EntryRole::System, text);
+                } else if self.answer_extension_ui_query(&request) {
+                    return Cmd::none();
                 } else if self.active_ext.is_none() && self.active_ask.is_none() {
                     self.activate_ext_request(request);
                 } else {
@@ -2714,6 +2716,73 @@ impl PiFtuiModel {
             }
             // `setWidget` has no surface on this stack yet, and anything else
             // is unknown; both keep the printed fallback.
+            _ => false,
+        }
+    }
+
+    /// Answer an extension UI request that asks for data, reporting whether it
+    /// was answered.
+    ///
+    /// These expect a response, so before this they fell through to
+    /// `activate_ext_request` and became a prompt card: the user was shown a
+    /// question they never asked for, and the extension received whatever the
+    /// user typed instead of the value it asked for. That is worse than the
+    /// printed fallback the effects got, which is why it is handled here.
+    ///
+    /// The theme answers describe what THIS stack supports, which is `dark`
+    /// and `light` — the two its `/theme` picker offers. The classic stack
+    /// additionally scans resource-provided themes. Reporting two is the
+    /// truthful answer for this stack rather than a degraded one; the
+    /// divergence is in theme support, not in the query.
+    fn answer_extension_ui_query(&mut self, request: &ExtensionUiRequest) -> bool {
+        let answer = |value: serde_json::Value| ExtensionUiResponse {
+            id: request.id.clone(),
+            value: Some(value),
+            cancelled: false,
+        };
+        let requested_name = || {
+            request
+                .payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        };
+
+        match request.method.as_str() {
+            "getEditorText" | "get_editor_text" => {
+                self.send_ext_reply(answer(serde_json::Value::String(self.input.text())));
+                true
+            }
+            "getAllThemes" | "get_all_themes" => {
+                let themes = ["dark", "light"]
+                    .into_iter()
+                    .map(
+                        |name| serde_json::json!({ "name": name, "path": serde_json::Value::Null }),
+                    )
+                    .collect();
+                self.send_ext_reply(answer(serde_json::Value::Array(themes)));
+                true
+            }
+            "getTheme" | "get_theme" => {
+                let value = match requested_name().as_str() {
+                    "dark" => serde_json::to_value(crate::theme::Theme::dark()).ok(),
+                    "light" => serde_json::to_value(crate::theme::Theme::light()).ok(),
+                    _ => None,
+                };
+                self.send_ext_reply(answer(value.unwrap_or(serde_json::Value::Null)));
+                true
+            }
+            "setTheme" | "set_theme" => {
+                let name = requested_name();
+                let applied = matches!(name.as_str(), "dark" | "light");
+                if applied {
+                    self.apply_picker_choice(PickerKind::Theme, &name);
+                }
+                self.send_ext_reply(answer(serde_json::Value::Bool(applied)));
+                true
+            }
             _ => false,
         }
     }
@@ -6645,6 +6714,79 @@ mod tests {
         );
         assert_eq!(sim.model().input.text(), "drafted by an extension");
         assert_eq!(sim.model().transcript.len(), before);
+    }
+
+    /// Drive a request that expects a response and return what the extension
+    /// received, plus whether a prompt card was raised.
+    fn ask_ui_query(
+        method: &str,
+        payload: serde_json::Value,
+    ) -> (Option<serde_json::Value>, bool, usize) {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "q", method, payload,
+        ))));
+        let reply = ext_rx.try_recv().ok().and_then(|r| r.value);
+        (
+            reply,
+            sim.model().active_ext.is_some(),
+            sim.model().transcript.len() - before,
+        )
+    }
+
+    #[test]
+    fn get_editor_text_answers_the_extension_instead_of_prompting_the_user() {
+        // Before this, a query expecting a response fell through to a prompt
+        // card: the user saw a question nobody asked, and the extension got
+        // whatever they typed rather than the editor's contents.
+        let (reply, card, _) = ask_ui_query("getEditorText", serde_json::json!({}));
+        assert_eq!(reply, Some(serde_json::Value::String(String::new())));
+        assert!(!card, "a query must not raise a prompt card");
+    }
+
+    #[test]
+    fn theme_queries_report_what_this_stack_actually_supports() {
+        let (all, card, _) = ask_ui_query("getAllThemes", serde_json::json!({}));
+        assert!(!card);
+        let names: Vec<String> = all
+            .expect("themes")
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(names, vec!["dark".to_string(), "light".to_string()]);
+
+        let (one, _, _) = ask_ui_query("getTheme", serde_json::json!({"name": "light"}));
+        assert!(one.is_some_and(|value| !value.is_null()), "light resolves");
+
+        let (missing, _, _) = ask_ui_query("getTheme", serde_json::json!({"name": "nope"}));
+        assert_eq!(
+            missing,
+            Some(serde_json::Value::Null),
+            "an unknown theme is null"
+        );
+    }
+
+    #[test]
+    fn set_theme_applies_and_reports_whether_it_took() {
+        let (applied, card, entries) =
+            ask_ui_query("setTheme", serde_json::json!({"name": "light"}));
+        assert_eq!(applied, Some(serde_json::Value::Bool(true)));
+        assert!(!card);
+        assert_eq!(entries, 1, "applying a theme announces it");
+
+        let (refused, _, _) = ask_ui_query("setTheme", serde_json::json!({"name": "nope"}));
+        assert_eq!(
+            refused,
+            Some(serde_json::Value::Bool(false)),
+            "an unsupported theme reports false rather than pretending"
+        );
     }
 
     #[test]

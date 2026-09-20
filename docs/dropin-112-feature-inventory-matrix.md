@@ -657,19 +657,19 @@
 | `ui.input()` | Y | Y | Input dialog |
 | `ui.notify()` | Y | Y | Notification |
 | `ui.setStatus()` | Y | Y | Status bar |
-| `ui.setWorkingMessage()` | Y | P | Bridges to `setStatus`, applied on classic. On ftui it is printed as a transcript line, not applied |
+| `ui.setWorkingMessage()` | Y | Y | Bridges to `setStatus`; applied on both stacks |
 | `ui.setWidget()` | Y | Y | Custom widget |
-| `ui.setFooter()` | Y | P | Bridges to `setStatus`/`setTitle`; classic applies, ftui prints |
-| `ui.setHeader()` | Y | P | Bridges to `setTitle`/`setStatus`; classic applies, ftui prints |
+| `ui.setFooter()` | Y | Y | Bridges to `setStatus`/`setTitle`; applied on both stacks |
+| `ui.setHeader()` | Y | Y | Bridges to `setTitle`/`setStatus`; applied on both stacks |
 | `ui.setTitle()` | Y | Y | Window title |
 | `ui.custom()` | Y | Y | Custom component; `custom` op in extension_dispatcher.rs |
-| `ui.setEditorText()` | Y | P | `set_editor_text`, applied in interactive/agent.rs; ftui prints it instead |
-| `ui.getEditorText()` | Y | P | Answered in interactive/agent.rs; ftui has no handler for it |
+| `ui.setEditorText()` | Y | Y | `set_editor_text`; applied on both stacks |
+| `ui.getEditorText()` | Y | Y | Answered on both stacks |
 | `ui.editor()` | Y | Y | Full editor dialog; `input`/`editor` op in rpc.rs |
 | `ui.theme` | Y | Y | Current theme |
-| `ui.getAllThemes()` | Y | P | Answered in interactive/agent.rs; ftui has no handler for it |
-| `ui.getTheme()` | Y | P | Answered in interactive/agent.rs; ftui has no handler for it |
-| `ui.setTheme()` | Y | P | Applied in interactive/agent.rs; ftui has no handler for it |
+| `ui.getAllThemes()` | Y | P | Answered on both stacks, but ftui reports only `dark`/`light`; classic also scans resource themes |
+| `ui.getTheme()` | Y | P | Answered on both stacks; ftui resolves only `dark`/`light` |
+| `ui.setTheme()` | Y | P | Applied on both stacks; ftui accepts only `dark`/`light` and reports false otherwise |
 
 ### Hostcalls
 
