@@ -330,7 +330,10 @@ impl LspTool {
             .ok_or_else(|| tool_err("LSP_USAGE", "rename requires newName"))?;
         let target = if request.prepare_supported {
             Some(request.prepare().await?.ok_or_else(|| {
-                tool_err("LSP_RENAME_UNAVAILABLE", "server rejected this rename target; no rename was requested")
+                tool_err(
+                    "LSP_RENAME_UNAVAILABLE",
+                    "server rejected this rename target; no rename was requested",
+                )
             })?)
         } else {
             None

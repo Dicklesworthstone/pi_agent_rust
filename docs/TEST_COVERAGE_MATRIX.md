@@ -203,6 +203,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/actions/refactor.rs` | LSP symbol rename and refactor operations | Unit; `src/lsp/actions/refactor/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/actions/refactor/formatting.rs` | LSP document and range formatting | Unit; `src/lsp/actions/refactor/formatting/tests.rs`. |
 | `src/lsp/actions/refactor/formatting/tests.rs` | LSP document formatting test suite | Test module; document formatting tests. |
+| `src/lsp/actions/refactor/prepare.rs` | LSP rename preparation and target confirmation | Unit; `src/lsp/actions/refactor/prepare/tests.rs`, `tests/lsp.rs`. |
+| `src/lsp/actions/refactor/prepare/tests.rs` | LSP rename preparation test suite | Test module; prepare rename tests. |
+| `src/lsp/actions/refactor/prepare/tests/protocol.rs` | LSP rename preparation protocol test cases | Test support module; exercises prepare rename protocol. |
 | `src/lsp/actions/refactor/tests.rs` | LSP symbol refactor test suite | Test module; refactor tests. |
 | `src/lsp/actions/refactor/versions.rs` | LSP request-time document version tracking across resource operations | Unit; `src/lsp/actions/refactor/versions/tests.rs`. |
 | `src/lsp/actions/refactor/versions/tests.rs` | LSP document version tracking test suite | Test module; version tracking tests. |

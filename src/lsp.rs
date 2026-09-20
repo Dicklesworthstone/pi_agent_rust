@@ -683,7 +683,10 @@ impl Tool for LspTool {
             ));
         }
         if input.position.is_some()
-            && !matches!(input.action.as_str(), "completion" | "signature_help" | "prepare_rename" | "rename")
+            && !matches!(
+                input.action.as_str(),
+                "completion" | "signature_help" | "prepare_rename" | "rename"
+            )
         {
             return Err(tool_err(
                 "LSP_USAGE",
