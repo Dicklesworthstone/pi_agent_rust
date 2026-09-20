@@ -174,6 +174,48 @@ fn response_parses_status_headers_and_body_content_length() {
 }
 
 #[test]
+fn second_request_reuses_the_kept_connection() {
+    let harness = TestHarness::new("http_client_second_request_reuses_the_kept_connection");
+
+    // One accepted connection carries both requests; a client that reconnected would
+    // block on the second accept and time out.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let addr = listener.local_addr().expect("server addr");
+    let (requests_seen, requests) = mpsc::channel();
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        for _ in 0..2 {
+            let request = read_http_request(&mut stream);
+            requests_seen
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .expect("record request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .expect("write response");
+        }
+    });
+
+    let bodies = common::run_async(async move {
+        let mut bodies = Vec::new();
+        for path in ["/first", "/second"] {
+            let url = format!("http://127.0.0.1:{}{path}", addr.port());
+            let response = Client::new().get(&url).send().await.expect("send");
+            bodies.push(response.text().await.expect("text"));
+        }
+        bodies
+    });
+
+    join.join().expect("server thread");
+    assert_eq!(bodies, ["ok", "ok"]);
+    let seen: Vec<String> = requests.try_iter().collect();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].starts_with("GET /first "));
+    assert!(seen[1].starts_with("GET /second "));
+    write_logs_artifact(&harness);
+}
+
+#[test]
 fn response_streams_chunked_body() {
     let harness = TestHarness::new("http_client_response_streams_chunked_body");
 

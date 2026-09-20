@@ -232,6 +232,62 @@ pub struct Client {
 static TLS_CONNECTOR: std::sync::OnceLock<std::result::Result<TlsConnector, String>> =
     std::sync::OnceLock::new();
 
+/// An idle keep-alive connection, kept for the next request to the same origin.
+///
+/// A new TCP + TLS connection costs a round trip each (about half a second to a
+/// remote provider); a kept one costs nothing. The pool is process-wide, like the
+/// TLS connector, because `Client::new()` is called per provider and per request.
+struct IdleConnection {
+    origin: String,
+    transport: Transport,
+    since: std::time::Instant,
+}
+
+static IDLE_CONNECTIONS: std::sync::Mutex<Vec<IdleConnection>> = std::sync::Mutex::new(Vec::new());
+
+/// How many idle connections are kept in all.
+const MAX_IDLE_CONNECTIONS: usize = 16;
+
+/// Servers drop idle keep-alive connections themselves, most within a minute or two.
+/// An older one is not offered; a stale one that slipped through fails on its first
+/// write or read and the request is retried once on a fresh connection.
+const MAX_IDLE_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a kept connection is good for: the origin, and the proxy it goes through.
+fn connection_origin(parsed: &ParsedUrl, proxy: Option<&ProxyEndpoint>) -> String {
+    let scheme = match parsed.scheme {
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+    };
+    let via = proxy.map_or(String::new(), |proxy| {
+        format!(" via {}:{}", proxy.host, proxy.port)
+    });
+    format!("{scheme}://{}:{}{via}", parsed.host, parsed.port)
+}
+
+fn take_idle_connection(origin: &str) -> Option<Transport> {
+    let mut idle = IDLE_CONNECTIONS.lock().ok()?;
+    idle.retain(|connection| connection.since.elapsed() < MAX_IDLE_AGE);
+    let position = idle
+        .iter()
+        .position(|connection| connection.origin == origin)?;
+    Some(idle.remove(position).transport)
+}
+
+fn keep_idle_connection(origin: String, transport: Transport) {
+    let Ok(mut idle) = IDLE_CONNECTIONS.lock() else {
+        return;
+    };
+    if idle.len() >= MAX_IDLE_CONNECTIONS {
+        idle.remove(0);
+    }
+    idle.push(IdleConnection {
+        origin,
+        transport,
+        since: std::time::Instant::now(),
+    });
+}
+
 /// Explicit opt-in env var for the OS trust store instead of the bundled
 /// webpki roots (gh #186).
 pub const USE_SYSTEM_CERTS_ENV: &str = "PI_HTTP_USE_SYSTEM_CERTS";
@@ -611,25 +667,28 @@ async fn send_parts(
         &parsed.host,
         parsed.port,
     );
-    let mut transport = connect_transport(&parsed, client, proxy).await?;
-
+    let origin = connection_origin(&parsed, proxy);
     let request_bytes =
         build_request_bytes(method, &parsed, &client.user_agent, headers, body, proxy);
-    write_all_with_retry(&mut transport, &request_bytes).await?;
-    if !body.is_empty() {
-        write_all_with_retry(&mut transport, body).await?;
-    }
-    transport.flush().await?;
 
-    let (status, response_headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
+    let (transport, head) =
+        if let Some(done) = exchange_on_kept(&origin, &request_bytes, body).await {
+            done
+        } else {
+            let mut fresh = connect_transport(&parsed, client, proxy).await?;
+            let head = exchange(&mut fresh, &request_bytes, body).await?;
+            (fresh, head)
+        };
+    let (status, response_headers, leftover, keep_alive) = head;
     let body_kind = body_kind_from_response(status, &response_headers)?;
 
-    let state = BodyStreamState::new(transport, body_kind, leftover);
+    let keep_for = keep_alive.then_some(origin);
+    let state = BodyStreamState::new(transport, body_kind, leftover, keep_for);
     let stream = stream::try_unfold(state, |mut state| async move {
         match Box::pin(state.next_bytes()).await {
             Ok(Some(chunk)) => Ok(Some((chunk, state))),
             Ok(None) => {
-                state.shutdown_transport_best_effort().await;
+                state.keep_or_shutdown_transport().await;
                 Ok(None)
             }
             Err(err) => {
@@ -641,6 +700,37 @@ async fn send_parts(
     .boxed();
 
     Ok((status, response_headers, stream))
+}
+
+/// A response head: the status, the headers, the body bytes read past the head, and
+/// whether the connection may carry another request.
+type ResponseHead = (u16, Vec<(String, String)>, Vec<u8>, bool);
+
+/// The request on a kept connection to `origin`, when there is one. A kept connection
+/// the server had closed meanwhile fails here with nothing of the request having
+/// reached it, so the caller sends it again on a fresh connection.
+async fn exchange_on_kept(
+    origin: &str,
+    request_bytes: &[u8],
+    body: &[u8],
+) -> Option<(Transport, ResponseHead)> {
+    let mut kept = take_idle_connection(origin)?;
+    let head = exchange(&mut kept, request_bytes, body).await.ok()?;
+    Some((kept, head))
+}
+
+/// Write the request and read the response head.
+async fn exchange(
+    transport: &mut Transport,
+    request_bytes: &[u8],
+    body: &[u8],
+) -> Result<ResponseHead> {
+    write_all_with_retry(transport, request_bytes).await?;
+    if !body.is_empty() {
+        write_all_with_retry(transport, body).await?;
+    }
+    transport.flush().await?;
+    Box::pin(read_response_head(transport)).await
 }
 
 fn build_recorded_request(
@@ -1069,7 +1159,8 @@ async fn proxy_connect_tunnel(
     let mut transport = Transport::Tcp(tcp);
     write_all_with_retry(&mut transport, request.as_bytes()).await?;
     transport.flush().await?;
-    let (status, _headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
+    let (status, _headers, leftover, _keep_alive) =
+        Box::pin(read_response_head(&mut transport)).await?;
 
     if !(200..300).contains(&status) {
         return Err(Error::api(format!(
@@ -1089,7 +1180,7 @@ async fn proxy_connect_tunnel(
     }
     match transport {
         Transport::Tcp(tcp) => Ok(tcp),
-        Transport::Tls(_) => Err(Error::api(
+        Transport::Tls(_) | Transport::Closed => Err(Error::api(
             "internal error: CONNECT handshake transport changed type",
         )),
     }
@@ -1192,9 +1283,19 @@ fn host_header_value(parsed: &ParsedUrl) -> String {
     }
 }
 
-async fn read_response_head(
-    transport: &mut Transport,
-) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+/// Whether the response's connection may carry another request: HTTP/1.1, and no
+/// `Connection: close` (RFC 9112 §9.3).
+fn connection_reusable(head: &[u8], headers: &[(String, String)]) -> bool {
+    let http_1_1 = head.starts_with(b"HTTP/1.1");
+    let closes = header_value(headers, "connection").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("close"))
+    });
+    http_1_1 && !closes
+}
+
+async fn read_response_head(transport: &mut Transport) -> Result<ResponseHead> {
     let mut buf = Vec::with_capacity(8192);
     let mut scratch = [0u8; READ_CHUNK_BYTES];
     let mut search_start = 0;
@@ -1210,7 +1311,8 @@ async fn read_response_head(
             let head = &buf[..absolute_pos];
             let leftover = buf[absolute_pos..].to_vec();
             let (status, headers) = parse_response_head(head)?;
-            return Ok((status, headers, leftover));
+            let keep_alive = connection_reusable(head, &headers);
+            return Ok((status, headers, leftover, keep_alive));
         }
 
         let n = read_some(transport, &mut scratch).await?;
@@ -1409,10 +1511,18 @@ struct BodyStreamState {
     chunked_state: ChunkedState,
     remaining: usize,
     transport_closed: bool,
+    /// The origin to keep the connection for once the body has ended cleanly; None when
+    /// the response said the connection is done.
+    keep_for: Option<String>,
 }
 
 impl BodyStreamState {
-    const fn new(transport: Transport, kind: BodyKind, leftover: Vec<u8>) -> Self {
+    const fn new(
+        transport: Transport,
+        kind: BodyKind,
+        leftover: Vec<u8>,
+        keep_for: Option<String>,
+    ) -> Self {
         let remaining = match kind {
             BodyKind::ContentLength(n) => n,
             _ => 0,
@@ -1424,6 +1534,28 @@ impl BodyStreamState {
             chunked_state: ChunkedState::SizeLine,
             remaining,
             transport_closed: false,
+            keep_for,
+        }
+    }
+
+    /// The body has ended: the connection goes back to the pool when the response allowed
+    /// it and the body's end was marked (a body read to EOF has no connection left to
+    /// keep). Otherwise it is shut down.
+    async fn keep_or_shutdown_transport(&mut self) {
+        let ended_cleanly = match self.kind {
+            BodyKind::Empty => true,
+            BodyKind::ContentLength(_) => self.remaining == 0,
+            BodyKind::Chunked => matches!(self.chunked_state, ChunkedState::Done),
+            BodyKind::Eof => false,
+        };
+        let keep_for = self.keep_for.take();
+        match keep_for {
+            Some(origin) if ended_cleanly && self.buf.is_empty() && !self.transport_closed => {
+                self.transport_closed = true;
+                let transport = std::mem::replace(&mut self.transport, Transport::Closed);
+                keep_idle_connection(origin, transport);
+            }
+            _ => self.shutdown_transport_best_effort().await,
         }
     }
 
@@ -1643,6 +1775,15 @@ async fn read_some<R: AsyncRead + Unpin>(reader: &mut R, dst: &mut [u8]) -> std:
 enum Transport {
     Tcp(TcpStream),
     Tls(Box<asupersync::tls::TlsStream<TcpStream>>),
+    /// What a body state holds after its connection went back to the pool.
+    Closed,
+}
+
+fn closed_transport_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "connection was returned to the pool",
+    )
 }
 
 impl Unpin for Transport {}
@@ -1656,6 +1797,7 @@ impl AsyncRead for Transport {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
             Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
+            Self::Closed => Poll::Ready(Err(closed_transport_error())),
         }
     }
 }
@@ -1669,6 +1811,7 @@ impl AsyncWrite for Transport {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             Self::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
+            Self::Closed => Poll::Ready(Err(closed_transport_error())),
         }
     }
 
@@ -1676,6 +1819,7 @@ impl AsyncWrite for Transport {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             Self::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
+            Self::Closed => Poll::Ready(Ok(())),
         }
     }
 
@@ -1683,6 +1827,7 @@ impl AsyncWrite for Transport {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
             Self::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+            Self::Closed => Poll::Ready(Ok(())),
         }
     }
 }
