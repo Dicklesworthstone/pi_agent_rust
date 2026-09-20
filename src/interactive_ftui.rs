@@ -1204,6 +1204,10 @@ pub struct PiFtuiModel {
     /// otherwise. Shared naming with the bubbletea stack via
     /// `KeyBinding::from_ftui_key`.
     keybindings: KeyBindings,
+    /// Status text an extension set via `ui.setStatus` / `ui.setWorkingMessage`.
+    /// Shown on the idle status line, ahead of the todo summary; cleared by an
+    /// empty status.
+    ext_status: Option<String>,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
     /// Extension UI prompt currently collecting a reply (bd-1eoh4); extras
@@ -1421,6 +1425,7 @@ impl PiFtuiModel {
             pending_quit: false,
             available_sessions: Vec::new(),
             keybindings: KeyBindings::default(),
+            ext_status: None,
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
@@ -2088,6 +2093,12 @@ impl PiFtuiModel {
             }
             PiMsg::ExtensionUiRequest(request) => {
                 if !request.expects_response() {
+                    // Effects this stack can carry out are applied; the rest
+                    // still fall through to a transcript line, which is the
+                    // only thing that used to happen to any of them.
+                    if self.apply_extension_ui_effect(&request) {
+                        return Cmd::none();
+                    }
                     let text =
                         sanitize(format_extension_ui_prompt(&request).trim_end()).into_owned();
                     self.push_entry(EntryRole::System, text);
@@ -2661,6 +2672,60 @@ impl PiFtuiModel {
     /// The active busy operation's status label, if any.
     fn busy_label(&self) -> Option<&str> {
         self.busy.as_ref().map(|op| op.label.as_str())
+    }
+
+    /// Carry out an extension UI effect, reporting whether it was handled.
+    ///
+    /// `false` leaves the caller to fall back to printing the request, which
+    /// is what happened to every one of these before: this stack had no
+    /// equivalent of the classic `apply_extension_ui_effect`, so
+    /// `ui.setWorkingMessage(...)` put a line in the transcript instead of a
+    /// status and `ui.setEditorText(...)` never reached the editor.
+    ///
+    /// Payload keys match the classic handlers exactly — the JS bridge sends
+    /// one shape and both stacks must read it the same way.
+    fn apply_extension_ui_effect(&mut self, request: &ExtensionUiRequest) -> bool {
+        let text_field = |keys: &[&str]| -> Option<String> {
+            keys.iter()
+                .find_map(|key| request.payload.get(*key).and_then(|v| v.as_str()))
+                .map(|value| sanitize(value).into_owned())
+        };
+
+        match request.method.as_str() {
+            "setStatus" | "set_status" => {
+                let status = text_field(&["statusText", "status_text", "text"]).unwrap_or_default();
+                // An empty status clears, matching the classic handler's
+                // treatment of an absent one.
+                self.ext_status = (!status.is_empty()).then_some(status);
+                true
+            }
+            "setTitle" | "set_title" => {
+                if let Some(title) = text_field(&["title", "text"]) {
+                    Self::write_terminal_title(&title);
+                }
+                true
+            }
+            "set_editor_text" => {
+                if let Some(text) = text_field(&["text"]) {
+                    self.input.set_text(&text);
+                    self.maybe_trigger_autocomplete();
+                }
+                true
+            }
+            // `setWidget` has no surface on this stack yet, and anything else
+            // is unknown; both keep the printed fallback.
+            _ => false,
+        }
+    }
+
+    /// Write the OSC title sequence, as `PiMsg::TerminalTitle` does.
+    fn write_terminal_title(title: &str) {
+        use std::io::Write as _;
+
+        let sequence = crate::delight::format_terminal_title(title);
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(sequence.as_bytes());
+        let _ = out.flush();
     }
 
     /// Convert a freshly armed busy operation into the tick command that
@@ -3456,6 +3521,8 @@ impl PiFtuiModel {
         } else if let Some(busy) = self.busy_label() {
             let spin = DOTS[self.spinner.current_frame % DOTS.len()];
             format!("{spin} {busy}")
+        } else if let Some(status) = &self.ext_status {
+            status.clone()
         } else {
             self.todo_summary
                 .as_ref()
@@ -6525,35 +6592,78 @@ mod tests {
             .with_extension_id(Some(String::from("demo-ext")))
     }
 
-    #[test]
-    fn extension_ui_effects_are_printed_rather_than_applied_here() {
-        // The classic stack routes these through `apply_extension_ui_effect`,
-        // which sets the status line, the title, a widget or the editor text.
-        // This stack has no such dispatcher: anything that does not expect a
-        // response is formatted and pushed as a System entry, so an extension
-        // calling `ui.setWorkingMessage(...)` gets a line in the transcript
-        // instead of a status. Pinned so the divergence is visible rather than
-        // discovered, and so that implementing the effects breaks this test on
-        // purpose.
-        for method in ["setStatus", "setTitle", "setWidget", "set_editor_text"] {
-            let (_tx, model) = new_model();
-            let mut sim = ProgramSimulator::new(model);
-            sim.init();
-            let before = sim.model().transcript.len();
-            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
-                "probe",
-                method,
-                serde_json::json!({"text": "hello", "statusText": "hello"}),
-            ))));
+    fn send_ui_effect(
+        sim: &mut ProgramSimulator<PiFtuiModel>,
+        method: &str,
+        payload: serde_json::Value,
+    ) {
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "effect", method, payload,
+        ))));
+    }
 
-            let added = &sim.model().transcript[before..];
-            assert_eq!(added.len(), 1, "{method} should add one entry");
-            assert_eq!(added[0].role, EntryRole::System, "{method} role");
-            assert!(
-                sim.model().input.text().is_empty(),
-                "{method} must not have reached the editor"
-            );
-        }
+    #[test]
+    fn set_status_reaches_the_status_line_instead_of_the_transcript() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        send_ui_effect(
+            &mut sim,
+            "setStatus",
+            serde_json::json!({"statusKey": "working", "statusText": "indexing"}),
+        );
+        assert_eq!(
+            sim.model().ext_status.as_deref(),
+            Some("indexing"),
+            "ui.setWorkingMessage should set the status"
+        );
+        assert_eq!(
+            sim.model().transcript.len(),
+            before,
+            "an applied effect should not also print a line"
+        );
+
+        // An empty status clears it, as the classic handler treats an absent
+        // one.
+        send_ui_effect(&mut sim, "setStatus", serde_json::json!({"statusText": ""}));
+        assert_eq!(sim.model().ext_status, None);
+    }
+
+    #[test]
+    fn set_editor_text_reaches_the_editor() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        send_ui_effect(
+            &mut sim,
+            "set_editor_text",
+            serde_json::json!({"text": "drafted by an extension"}),
+        );
+        assert_eq!(sim.model().input.text(), "drafted by an extension");
+        assert_eq!(sim.model().transcript.len(), before);
+    }
+
+    #[test]
+    fn an_effect_this_stack_cannot_carry_out_still_prints() {
+        // `setWidget` has no surface here, so the old printed fallback is
+        // still the honest outcome — better than swallowing it.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "k", "lines": ["a"]}),
+        );
+        let added = &sim.model().transcript[before..];
+        assert_eq!(added.len(), 1, "setWidget should still surface somehow");
+        assert_eq!(added[0].role, EntryRole::System);
     }
 
     #[test]
