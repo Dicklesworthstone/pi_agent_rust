@@ -567,6 +567,7 @@ struct LspInput {
     action: String,
     position: Option<Position>,
     completion_id: Option<String>,
+    snippet_values: Option<std::collections::BTreeMap<String, String>>,
     file: Option<String>,
     line: Option<u32>,
     symbol: Option<String>,
@@ -596,7 +597,7 @@ impl Tool for LspTool {
         "lsp"
     }
     fn description(&self) -> &str {
-        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Completion range is an explicit replacement fallback for servers omitting textEdit; snippets and command-backed items cannot be applied. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
+        "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Numeric snippet placeholders accept literal snippetValues; repeat the values when applying. Commands, snippet variables and transforms are unsupported. Completion range is an explicit replacement fallback for servers omitting textEdit. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then apply:true plus actionId, or use a fresh title/index query. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. Lazy actions are resolved and edits precede commands. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -605,6 +606,7 @@ impl Tool for LspTool {
                 "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion"]},
                 "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for completion; requires file. A range may additionally specify the caller's replacement span when the server omits textEdit.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                 "completionId":{"type":"string","description":"Opaque completion from the latest listing. Select without apply to resolve and preview, or apply:true to insert it with its auto-import edits. Do not combine with other selectors. Expires on source changes, server replacement, reload or another completion listing."},
+                "snippetValues":{"type":"object","maxProperties":64,"additionalProperties":{"type":"string","maxLength":16384},"description":"Selected snippet completion only: literal replacements keyed by canonical numeric placeholder index (0..65535), e.g. {\"1\":\"argument\"}. Values are not evaluated or reparsed. Defaults and first choices apply otherwise; unbound positive tabstops require a value. Repeat the map with apply:true; preview substitutions are not cached."},
                 "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics globs inspect cached reports. workspace_diagnostics uses a positive workspace-relative glob to actively check matching nonignored regular files; it may start language servers."},
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
@@ -651,9 +653,9 @@ impl Tool for LspTool {
             return Err(tool_err("LSP_USAGE", "line must be 1-indexed"));
         }
         if input.action != "completion"
-            && (input.position.is_some() || input.completion_id.is_some())
+            && (input.position.is_some() || input.completion_id.is_some() || input.snippet_values.is_some())
         {
-            return Err(tool_err("LSP_USAGE", "position and completionId are supported by completion"));
+            return Err(tool_err("LSP_USAGE", "position, completionId and snippetValues are supported by completion"));
         }
         if input.only.is_some() && input.action != "code_actions" {
             return Err(tool_err("LSP_USAGE", "only is supported by code_actions"));

@@ -40,9 +40,27 @@ def result():
         item = {"label": "Type", "insertText": "Type"}
     elif mode == "replace":
         item["textEdit"] = {"insert": span(12, 14), "replace": span(12, 16), "newText": "Type"}
-    elif mode == "snippet":
+    elif mode.startswith("snippet"):
         item["insertTextFormat"] = 2
-        item["textEdit"]["newText"] = "Type(${1:argument})"
+        snippets = {
+            "snippet": "Type(${1:argument})$0",
+            "snippet_lazy": "Type(${1:argument}, $1)$0",
+            "snippet_mirror": "Type(${1:argument}, $1)$0",
+            "snippet_required": "Type($1, $2)$0",
+            "snippet_choice": "Type(${1|red,green|})$0",
+            "snippet_nested": "Type(${1:outer(${2:inner})})$0",
+            "snippet_variable": "Type($CLIPBOARD)$0",
+            "snippet_transform": "Type(${1/(.*)/$1/})$0",
+            "snippet_malformed": "Type(${1:unfinished",
+            "snippet_conflict": "Type(${1:one}, ${1:two})",
+            "snippet_defaults": "Type(${1:default})$0",
+        }
+        item["textEdit"]["newText"] = snippets[mode]
+        if mode == "snippet_defaults":
+            return {"isIncomplete": False,
+                    "itemDefaults": {"editRange": span(12,14), "insertTextFormat": 2, "data": opaque},
+                    "items": [{"label": "Type", "textEditText": snippets[mode]}]}
+        return [item]
     elif mode == "command":
         item["command"] = {"title": "Run", "command": "unsafe.run", "arguments": ["opaque"]}
     elif mode == "indent":
@@ -81,7 +99,7 @@ while True:
         if mode == "hang_initialize":
             continue
         capabilities = message["params"]["capabilities"]["textDocument"]["completion"]
-        assert capabilities["completionItem"]["snippetSupport"] is False
+        assert capabilities["completionItem"]["snippetSupport"] is True
         assert capabilities["completionItem"]["insertReplaceSupport"] is True
         assert "additionalTextEdits" in capabilities["completionItem"]["resolveSupport"]["properties"]
         assert "editRange" in capabilities["completionList"]["itemDefaults"]
@@ -89,7 +107,10 @@ while True:
         if mode == "encoding":
             server["positionEncoding"] = "utf-8"
         if mode != "unsupported":
-            server["completionProvider"] = {"resolveProvider": mode not in ("array", "plain", "replace", "snippet", "command", "indent")}
+            resolve = mode not in ("array", "plain", "replace", "command", "indent")
+            if mode.startswith("snippet"):
+                resolve = mode in ("snippet_lazy", "snippet_defaults")
+            server["completionProvider"] = {"resolveProvider": resolve}
         response["result"] = {"capabilities": server}
     elif method == "textDocument/completion":
         assert message["params"]["position"] == position(14)
@@ -113,6 +134,8 @@ while True:
         item["additionalTextEdits"] = [{"range": {"start": {"line": 0, "character": 0},
                                                     "end": {"line": 0, "character": 0}},
                                          "newText": "use example::Type;\n"}]
+        if mode == "snippet_lazy":
+            item["additionalTextEdits"][0]["newText"] += "// literal $0 ${1:keep}\n"
         if mode == "overlap":
             item["additionalTextEdits"][0]["range"] = span(12,14)
         elif mode == "mutate":

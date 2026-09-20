@@ -1,8 +1,9 @@
 //! Native semantic completion: list, resolve/preview, explicitly apply.
 //!
 //! Handles retain one bounded listing, its immutable synchronized source and
-//! its exact server connection. No snippet interpreter or command permission
-//! is implied. Insertion and auto-import edits share the existing transaction.
+//! its exact server connection. Numeric snippets accept explicit literal
+//! substitutions; no command permission is implied. Insertion and auto-import
+//! edits share the existing transaction.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -22,6 +23,7 @@ use crate::error::{Error, Result};
 use crate::tools::ToolOutput;
 
 mod item;
+mod snippet;
 
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -214,6 +216,12 @@ fn clipped(value: Option<&Value>, limit: usize) -> Value {
 }
 
 fn validate_input(input: &LspInput) -> Result<()> {
+    if let Some(values) = &input.snippet_values {
+        snippet::validate_values(values)?;
+        if input.completion_id.is_none() {
+            return Err(tool_err("LSP_USAGE", "snippetValues require a selected completionId"));
+        }
+    }
     if input.symbol.is_some() || input.line.is_some() || input.action_id.is_some()
         || input.hierarchy_id.is_some() || input.method.is_some() || input.payload.is_some()
         || input.new_name.is_some() || input.new_file.is_some() || input.format_options.is_some()
@@ -240,7 +248,7 @@ impl LspTool {
         let budget = Budget::new(self.request_timeout(input));
         budget.remaining()?;
         if let Some(id) = input.completion_id.as_deref() {
-            return self.select_completion(id, input.apply == Some(true), &budget).await;
+            return self.select_completion(id, input.apply == Some(true), input.snippet_values.as_ref(), &budget).await;
         }
         self.list_completions(input, &budget).await
     }
@@ -307,11 +315,14 @@ impl LspTool {
                 break;
             }
             let id = format!("completion-{serial}-{}", index + 1);
-            let reason = item::edits(&item, &source.text, position, input.range).err().map(|error| error.to_string());
+            let reason = snippet::prepare(&item, None).and_then(|expanded| {
+                item::edits(&expanded.item, &source.text, position, input.range)?;
+                expanded.require_values()
+            }).err().map(|error| error.to_string());
             summaries.push(json!({
                 "completionId":id,"label":item["label"],"kind":item.get("kind"),
                 "detail":clipped(item.get("detail"), 512),"needsResolve":resolve,
-                "blockedReason":reason
+                "blockedReason":reason,"snippet":item.get("insertTextFormat").and_then(Value::as_u64)==Some(2)
             }));
             // Leave room for envelope metadata. Never turn structured output
             // into a truncated string or return an ID that wasn't retained.
@@ -328,14 +339,14 @@ impl LspTool {
             "action":"completion","file":display_path(&source.path, &self.cwd),"position":position,
             "server":entry.spec_name,"count":count,"matched":matched,"isIncomplete":incomplete,
             "truncated":count < matched,"items":summaries,
-            "note":"Select completionId to resolve and preview; add apply:true to insert with auto-imports. Plain text only; command-backed items cannot be applied."
+            "note":"Select completionId to resolve and preview; supply snippetValues for numeric placeholders and repeat them with apply:true. Commands, variables and transforms are not executed."
         });
         bounded_size(&payload, MAX_PAYLOAD_BYTES)?;
         lock(&self.completions.0).items = retained;
         Ok(text_output(payload.to_string(), payload))
     }
 
-    async fn select_completion(&self, id: &str, apply: bool, budget: &Budget) -> Result<ToolOutput> {
+    async fn select_completion(&self, id: &str, apply: bool, values: Option<&snippet::Values>, budget: &Budget) -> Result<ToolOutput> {
         budget.remaining()?;
         let mut selected = { lock(&self.completions.0).items.get(id).cloned().ok_or_else(stale)? };
         let entry = selected.source.verify()?;
@@ -352,8 +363,12 @@ impl LspTool {
         budget.remaining()?;
         selected.source.verify()?;
         let source = &selected.source;
-        let edits = match item::edits(&selected.item, &source.text, source.position, source.fallback) {
-            Ok(edits) => edits,
+        let planned = snippet::prepare(&selected.item, values).and_then(|expanded| {
+            let edits = item::edits(&expanded.item, &source.text, source.position, source.fallback)?;
+            Ok((expanded, edits))
+        });
+        let (expanded, edits) = match planned {
+            Ok(planned) => planned,
             Err(error) if !apply => {
                 let payload = json!({"action":"completion","completionId":id,"applied":false,
                     "canApply":false,"reason":error.to_string(),"label":selected.item["label"]});
@@ -361,6 +376,7 @@ impl LspTool {
             }
             Err(error) => return Err(error),
         };
+        if apply { expanded.require_values()?; }
         let mut changes = serde_json::Map::new();
         changes.insert(source.uri.clone(), json!(edits));
         let plan = parse_workspace_edit(&json!({"changes":changes}))?;
@@ -369,9 +385,11 @@ impl LspTool {
         });
         if !apply {
             let payload = json!({"action":"completion","completionId":id,"applied":false,
-                "canApply":true,"label":selected.item["label"],"file":display_path(&source.path, &self.cwd),
+                "canApply":expanded.missing.is_empty(),"label":selected.item["label"],"file":display_path(&source.path, &self.cwd),
                 "detail":clipped(selected.item.get("detail"), 4096),"documentation":clipped(documentation, 8192),
-                "edits":edits,"editMode":"replace","additionalEdits":edits.len().saturating_sub(1)});
+                "edits":edits,"editMode":"replace","additionalEdits":edits.len().saturating_sub(1),
+                "snippetPlaceholders":expanded.fields,"missingPlaceholders":expanded.missing,
+                "note":"Preview substitutions are not cached; repeat snippetValues when applying. Missing positive tabstops require explicit values, including an empty string to intentionally omit one."});
             bounded_size(&payload, MAX_PAYLOAD_BYTES)?;
             return Ok(text_output(payload.to_string(), payload));
         }

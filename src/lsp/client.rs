@@ -182,7 +182,7 @@ impl LspClient {
                     "completion":{
                         "dynamicRegistration":false,"contextSupport":true,"insertTextMode":1,
                         "completionItem":{
-                            "snippetSupport":false,"insertReplaceSupport":true,
+                            "snippetSupport":true,"insertReplaceSupport":true,
                             "documentationFormat":["markdown","plaintext"],
                             "insertTextModeSupport":{"valueSet":[1]},
                             "resolveSupport":{"properties":["detail","documentation","additionalTextEdits"]}

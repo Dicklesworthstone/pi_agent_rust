@@ -93,8 +93,8 @@ selected-item resolution; staging checks the remaining budget before commit.
 Synchronous filesystem operations cannot be preempted while blocked.
 
 No completion operation grants `workspace/applyEdit` callback permission or
-executes `workspace/executeCommand`. Snippets, indentation-adjusting insertion
-and command-backed items are visible but **cannot be applied**. They are not
+executes `workspace/executeCommand`. Indentation-adjusting insertion and
+command-backed items are visible but **cannot be applied**. They are not
 silently flattened, partially inserted, or executed. The existing explicit
 code-action command workflow remains separate.
 
@@ -104,6 +104,63 @@ also retires handles, including when the shared transaction reports incomplete
 rollback. The transaction's recovery error remains visible. This is not a
 crash-recovery mechanism or a filesystem sandbox against hostile concurrent
 path replacement.
+
+## Parameterized snippet completions
+
+Pi advertises snippet completion support and implements a bounded numeric
+subset of the [LSP snippet syntax](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#snippet_syntax).
+Tabstops (`$1`, `${1}`), defaults (`${1:argument}`), choices
+(`${1|red,green|}`), nested defaults and repeated placeholders are supported.
+Ordinary text, Unicode, multiline insertions and context-appropriate escapes
+are preserved. This is a one-shot expansion, not an interactive tabstop editor
+or a complete TextMate interpreter.
+
+The listing identifies snippet candidates with `snippet:true`. Select a
+`completionId` to inspect the expanded edits and `snippetPlaceholders`. Omitted
+values use the supplied default or first choice. A positive bare tabstop with
+no default appears in `missingPlaceholders` and makes `canApply:false`; it is
+not silently erased during application. Bare `$0` denotes the final cursor
+marker and contributes no text. A default or explicit value for index zero
+contributes that text, but Pi does not move a UI cursor after applying.
+
+Supply `snippetValues` to bind numeric placeholders to literal source text:
+
+```json
+{"action":"completion","completionId":"<returned ID>","snippetValues":{"1":"request","2":"options"}}
+```
+
+For example, `call(${1:argument}, $1)$0` with `{"1":"request"}` previews
+`call(request, request)`. Nested placeholders resolve before their parent's
+default is inserted. Replacing an outer placeholder suppresses its nested
+fields unless those fields are also referenced elsewhere. Supplying a value
+for a suppressed or unknown index is an error rather than ignored input.
+Forward references use their later definition; conflicting definitions and
+cycles encountered during expansion are rejected.
+
+Repeat the same substitutions with explicit application:
+
+```json
+{"action":"completion","completionId":"<returned ID>","snippetValues":{"1":"request","2":"options"},"apply":true}
+```
+
+Preview substitutions are **not cached**. Omitting them on another request
+returns to the server defaults and required-field rules; the cached server
+item remains unchanged. An explicit empty string intentionally fills a bare
+tabstop with no text. Choice values may be edited freely, not only selected
+from the offered list. Substitution keys are canonical decimal indices from
+0 through 65535 and are only accepted on a selected snippet completion.
+
+Only the primary insertion is interpreted as snippet text. Auto-import
+`additionalTextEdits` remain plain text even when they contain dollar signs or
+placeholder-looking expressions, and still commit with the primary edit in
+one checked transaction. Caller substitutions are never parsed again: shell
+syntax, dollar signs and backslashes in a value are inserted literally.
+
+Variables (including environment-, filename- and clipboard-derived values),
+regular-expression transforms and other unsupported syntax are rejected
+before any file changes. Pi does not guess their expansion or obtain ambient
+data. The entire snippet is parsed even when an outer placeholder has an
+explicit override; that override cannot hide unsupported syntax.
 
 ## Limits and validation
 
@@ -115,8 +172,15 @@ additional edits allowed per item. Structured output is bounded at 200 KiB;
 handles expire after five minutes. Large documentation strings are visibly
 clipped in the inspection output.
 
+Snippet input and expanded insertion text are bounded at 64 KiB, with at most
+64 distinct placeholder indices, 32 options per choice, 2048 syntax nodes and
+32 nesting/expansion levels. Substitutions are at most 16 KiB each and 64 KiB
+combined. Expansion has a separate work budget and a 2 MiB memoized-text cap.
+All limits fail before applying an edit; response-size limits still apply to
+preview edits and placeholder metadata.
+
 Regression tests are in `src/lsp/completion/tests.rs`, `completion/item/tests.rs`
-and `completion/tests/protocol.rs`. The latter drives the real tool over framed
+`completion/snippet/tests.rs` and `completion/tests/protocol.rs`. The latter drives the real tool over framed
 child stdio and real temporary source files. `PI_LSP_REQUIRE_PROTOCOL` makes a
 missing Python peer an error rather than a skip. Run the repository's DSR
 quality entry point; standalone Python-peer checks are not Rust test evidence.
