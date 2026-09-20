@@ -4,11 +4,10 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use bubbletea::{Cmd, KeyMsg, KeyType, Message, Program, quit};
+use bubbletea::{Cmd, KeyMsg, KeyType, Message, Program, WindowSizeMsg, quit};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -16,6 +15,9 @@ use crate::session::{Session, encode_cwd};
 use crate::session_index::session_file_stats;
 use crate::session_index::{SessionIndex, SessionMeta, build_meta_from_file, is_session_file_path};
 use crate::theme::{Theme, TuiStyles};
+
+mod browse;
+use browse::BrowserState;
 
 /// Format a timestamp for display.
 pub fn format_time(timestamp: &str) -> String {
@@ -41,6 +43,7 @@ pub fn truncate_session_id(session_id: &str, max_chars: usize) -> &str {
 /// The session picker TUI model.
 #[derive(bubbletea::Model)]
 pub struct SessionPicker {
+    browser: BrowserState,
     sessions: Vec<SessionMeta>,
     selected: usize,
     chosen: Option<usize>,
@@ -59,6 +62,7 @@ impl SessionPicker {
         let theme = Theme::dark();
         let styles = theme.tui_styles();
         Self {
+            browser: BrowserState::new(sessions.len()),
             sessions,
             selected: 0,
             chosen: None,
@@ -74,6 +78,7 @@ impl SessionPicker {
     pub fn with_theme(sessions: Vec<SessionMeta>, theme: &Theme) -> Self {
         let styles = theme.tui_styles();
         Self {
+            browser: BrowserState::new(sessions.len()),
             sessions,
             selected: 0,
             chosen: None,
@@ -93,6 +98,7 @@ impl SessionPicker {
     ) -> Self {
         let styles = theme.tui_styles();
         Self {
+            browser: BrowserState::new(sessions.len()),
             sessions,
             selected: 0,
             chosen: None,
@@ -123,46 +129,18 @@ impl SessionPicker {
 
     #[allow(clippy::needless_pass_by_value)] // Required by Model trait
     pub fn update(&mut self, msg: Message) -> Option<Cmd> {
+        if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
+            self.resize_browser(size.width, size.height);
+            return None;
+        }
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
             if self.confirm_delete.is_some() {
+                if key.paste {
+                    return None;
+                }
                 return self.handle_delete_prompt(key);
             }
-            match key.key_type {
-                KeyType::Up if self.selected > 0 => {
-                    self.selected -= 1;
-                }
-                KeyType::Down if self.selected < self.sessions.len().saturating_sub(1) => {
-                    self.selected += 1;
-                }
-                KeyType::Runes if key.runes == ['k'] && self.selected > 0 => {
-                    self.selected -= 1;
-                }
-                KeyType::Runes
-                    if key.runes == ['j']
-                        && self.selected < self.sessions.len().saturating_sub(1) =>
-                {
-                    self.selected += 1;
-                }
-                KeyType::Enter => {
-                    if !self.sessions.is_empty() {
-                        self.chosen = Some(self.selected);
-                    }
-                    return Some(quit());
-                }
-                KeyType::Esc | KeyType::CtrlC => {
-                    self.cancelled = true;
-                    return Some(quit());
-                }
-                KeyType::Runes if key.runes == ['q'] => {
-                    self.cancelled = true;
-                    return Some(quit());
-                }
-                KeyType::CtrlD if !self.sessions.is_empty() => {
-                    self.confirm_delete = Some(self.selected);
-                    self.status_message = Some("Delete session? Press y/n to confirm.".to_string());
-                }
-                _ => {}
-            }
+            return self.handle_browse_key(key);
         }
         None
     }
@@ -186,7 +164,7 @@ impl SessionPicker {
                 self.confirm_delete = None;
                 self.status_message = None;
             }
-            KeyType::Esc | KeyType::CtrlC => {
+            _ if self.browser_cancel_key(key) => {
                 self.confirm_delete = None;
                 self.status_message = None;
             }
@@ -206,88 +184,12 @@ impl SessionPicker {
             let _ = index.delete_session_path(&path);
         }
         self.sessions.remove(index);
-        if self.selected >= self.sessions.len() {
-            self.selected = self.sessions.len().saturating_sub(1);
-        }
+        self.refresh_browser_after_delete();
         Ok(())
     }
 
     pub fn view(&self) -> String {
-        let mut output = String::new();
-
-        // Header
-        let _ = writeln!(
-            output,
-            "\n  {}\n",
-            self.styles.title.render("Select a session to resume")
-        );
-
-        if self.sessions.is_empty() {
-            let _ = writeln!(
-                output,
-                "  {}",
-                self.styles
-                    .muted
-                    .render("No sessions found for this project.")
-            );
-        } else {
-            // Column headers
-            let _ = writeln!(
-                output,
-                "  {:<20}  {:<30}  {:<8}  {}",
-                self.styles.muted_bold.render("Time"),
-                self.styles.muted_bold.render("Name"),
-                self.styles.muted_bold.render("Messages"),
-                self.styles.muted_bold.render("Session ID")
-            );
-            output.push_str("  ");
-            output.push_str(&"-".repeat(78));
-            output.push('\n');
-
-            // Session rows
-            for (i, session) in self.sessions.iter().enumerate() {
-                let is_selected = i == self.selected;
-
-                let prefix = if is_selected { ">" } else { " " };
-                let time = format_time(&session.timestamp);
-                let name = session
-                    .name
-                    .as_deref()
-                    .unwrap_or("-")
-                    .chars()
-                    .take(28)
-                    .collect::<String>();
-                let messages = session.message_count.to_string();
-                let id = truncate_session_id(&session.id, 8);
-
-                let _ = writeln!(
-                    output,
-                    "{prefix} {}",
-                    if is_selected {
-                        self.styles
-                            .selection
-                            .render(&format!(" {time:<20}  {name:<30}  {messages:<8}  {id}"))
-                    } else {
-                        format!(" {time:<20}  {name:<30}  {messages:<8}  {id}")
-                    }
-                );
-            }
-        }
-
-        // Help text
-        output.push('\n');
-        let _ = writeln!(
-            output,
-            "  {}",
-            self.styles
-                .muted
-                .render("↑/↓/j/k: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel")
-        );
-        if let Some(message) = &self.status_message {
-            let _ = writeln!(output, "  {}", self.styles.warning_bold.render(message));
-        }
-
-        output
+        self.render_browser()
     }
 }
 
@@ -318,7 +220,12 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
 
     let config = Config::load().unwrap_or_default();
     let theme = Theme::resolve(&config, &cwd);
-    let picker = SessionPicker::with_theme_and_root(sessions, &theme, base_dir.clone());
+    let keys = crate::keybindings::KeyBindings::load_from_user_config();
+    for warning in &keys.warnings {
+        tracing::warn!(?warning, "Session picker keybinding configuration warning");
+    }
+    let picker = SessionPicker::with_theme_and_root(sessions, &theme, base_dir.clone())
+        .with_keybindings(keys.bindings);
 
     // Run the TUI
     let result = Program::new(picker).with_alt_screen().run();
@@ -417,8 +324,13 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
     }
 
     sessions = by_id.into_values().chain(anonymous).collect();
-    sessions.sort_by_key(|m| Reverse(m.last_modified_ms));
-    sessions.truncate(50);
+    // Pagination belongs in the UI, not the data source. Older sessions must
+    // remain resumable/searchable, with deterministic ordering for mtime ties.
+    sessions.sort_by(|a, b| {
+        Reverse(a.last_modified_ms)
+            .cmp(&Reverse(b.last_modified_ms))
+            .then_with(|| a.path.cmp(&b.path))
+    });
     sessions
 }
 
@@ -2044,7 +1956,7 @@ esac
                 invocation_marker.display()
             ),
         )
-        .expect("write trash script");
+        .expect("write script");
         let mut script_permissions = fs::metadata(&trash_script)
             .expect("trash script metadata")
             .permissions();
