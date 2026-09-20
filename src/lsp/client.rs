@@ -179,6 +179,14 @@ impl LspClient {
                     "publishDiagnostics":{"relatedInformation":true,"versionSupport":true},
                     "diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false},
                     "hover":{"contentFormat":["markdown","plaintext"]},
+                    "signatureHelp":{
+                        "dynamicRegistration":false,"contextSupport":true,
+                        "signatureInformation":{
+                            "documentationFormat":["markdown","plaintext"],
+                            "parameterInformation":{"labelOffsetSupport":true},
+                            "activeParameterSupport":true
+                        }
+                    },
                     "completion":{
                         "dynamicRegistration":false,"contextSupport":true,"insertTextMode":1,
                         "completionItem":{
