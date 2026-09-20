@@ -1082,7 +1082,10 @@ mod stream_number_tests {
             "contentIndex": 0.0
         });
         normalize_js_stream_numbers(&mut value);
-        assert_eq!(value["nested"][0]["timestamp"].as_i64(), Some(1_789_918_884_239));
+        assert_eq!(
+            value["nested"][0]["timestamp"].as_i64(),
+            Some(1_789_918_884_239)
+        );
         assert_eq!(value["nested"][0]["cost"], json!(0.125));
         assert_eq!(value["contentIndex"].as_u64(), Some(0));
         let normalized = value.clone();
@@ -1101,10 +1104,16 @@ mod stream_number_tests {
         };
         assert_eq!(reason, StopReason::Error);
         assert_eq!(error.timestamp, 1_789_918_884_239);
-        assert_eq!(error.error_message.as_deref(), Some("intentional repro error"));
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("intentional repro error")
+        );
         assert_eq!(error.usage.input, 2_147_483_648);
         assert_eq!(error.usage.total_tokens, 2_147_483_649);
-        assert_eq!(serde_json::to_value(&error.usage.cost).unwrap()["input"], json!(0.125));
+        assert_eq!(
+            serde_json::to_value(&error.usage.cost).unwrap()["input"],
+            json!(0.125)
+        );
     }
 
     #[test]
@@ -1114,18 +1123,33 @@ mod stream_number_tests {
         message["errorMessage"] = Value::Null;
         message["content"] = json!([{"type": "text", "text": "hello"}]);
         for (mut value, message_key) in [
-            (json!({"type": "start", "partial": message.clone()}), "partial"),
-            (json!({
-                "type": "text_delta", "contentIndex": 0.0,
-                "delta": "hello", "partial": message.clone()
-            }), "partial"),
-            (json!({"type": "done", "reason": "stop", "message": message}), "message"),
+            (
+                json!({"type": "start", "partial": message.clone()}),
+                "partial",
+            ),
+            (
+                json!({
+                    "type": "text_delta", "contentIndex": 0.0,
+                    "delta": "hello", "partial": message.clone()
+                }),
+                "partial",
+            ),
+            (
+                json!({"type": "done", "reason": "stop", "message": message}),
+                "message",
+            ),
         ] {
             normalize_js_stream_numbers(&mut value);
             let event: AssistantMessageEvent = serde_json::from_value(value).expect("valid event");
             let encoded = serde_json::to_value(event).unwrap();
-            assert_eq!(encoded[message_key]["timestamp"].as_i64(), Some(1_789_918_884_239));
-            assert_eq!(encoded[message_key]["usage"]["input"].as_u64(), Some(2_147_483_648));
+            assert_eq!(
+                encoded[message_key]["timestamp"].as_i64(),
+                Some(1_789_918_884_239)
+            );
+            assert_eq!(
+                encoded[message_key]["usage"]["input"].as_u64(),
+                Some(2_147_483_648)
+            );
             assert_eq!(encoded[message_key]["usage"]["cost"]["input"], json!(0.125));
             if encoded["type"] == "text_delta" {
                 assert_eq!(encoded["contentIndex"].as_u64(), Some(0));
@@ -1148,7 +1172,10 @@ mod stream_number_tests {
             *message.pointer_mut(pointer).unwrap() = invalid;
             let mut value = json!({"type": "error", "reason": "error", "error": message});
             normalize_js_stream_numbers(&mut value);
-            assert!(serde_json::from_value::<AssistantMessageEvent>(value).is_err(), "{pointer}");
+            assert!(
+                serde_json::from_value::<AssistantMessageEvent>(value).is_err(),
+                "{pointer}"
+            );
         }
     }
 }
