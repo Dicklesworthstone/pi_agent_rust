@@ -2884,7 +2884,7 @@ pub async fn run(
                         continue;
                     }
 
-                    let levels = available_thinking_levels(&entry);
+                    let levels = entry.available_thinking_levels();
                     let current = guard
                         .agent
                         .stream_options()
@@ -12905,29 +12905,10 @@ fn extract_user_text(content: &crate::model::UserContent) -> Option<String> {
     }
 }
 
-/// Returns the available thinking levels for a model.
-/// For reasoning models, returns the full range; for non-reasoning, returns only Off.
-fn available_thinking_levels(entry: &ModelEntry) -> Vec<crate::model::ThinkingLevel> {
-    use crate::model::ThinkingLevel;
-    if entry.model.reasoning {
-        let mut levels = vec![
-            ThinkingLevel::Off,
-            ThinkingLevel::Minimal,
-            ThinkingLevel::Low,
-            ThinkingLevel::Medium,
-            ThinkingLevel::High,
-        ];
-        if entry.supports_xhigh() {
-            levels.push(ThinkingLevel::XHigh);
-        }
-        if entry.supports_max() {
-            levels.push(ThinkingLevel::Max);
-        }
-        levels
-    } else {
-        vec![ThinkingLevel::Off]
-    }
-}
+// The thinking-level list lives on `ModelEntry::available_thinking_levels`
+// (models.rs). This file used to carry a byte-for-byte copy of it; the tests
+// below now exercise the shared one, so the RPC and the two TUI stacks cannot
+// drift apart about which levels a model offers.
 
 /// Cycles through scoped models (if any) and returns the next model.
 /// Returns (ModelEntry, ThinkingLevel, is_from_scoped_models).
@@ -18987,14 +18968,14 @@ export default function init(pi) {
     #[test]
     fn available_thinking_levels_non_reasoning() {
         let entry = dummy_entry("gpt-4o-mini", false);
-        let levels = available_thinking_levels(&entry);
+        let levels = entry.available_thinking_levels();
         assert_eq!(levels, vec![ThinkingLevel::Off]);
     }
 
     #[test]
     fn available_thinking_levels_reasoning_no_xhigh() {
         let entry = dummy_entry("claude-opus-4-6", true);
-        let levels = available_thinking_levels(&entry);
+        let levels = entry.available_thinking_levels();
         assert_eq!(
             levels,
             vec![
@@ -19010,7 +18991,7 @@ export default function init(pi) {
     #[test]
     fn available_thinking_levels_reasoning_with_xhigh() {
         let entry = dummy_entry("gpt-5.2", true);
-        let levels = available_thinking_levels(&entry);
+        let levels = entry.available_thinking_levels();
         assert_eq!(
             levels,
             vec![
