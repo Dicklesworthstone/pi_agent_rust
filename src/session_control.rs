@@ -22,9 +22,9 @@ use crate::error::{Error, Result};
 use crate::model::{AssistantMessage, Message, UserContent, UserMessage};
 use crate::sdk::AgentSessionHandle;
 
-mod attachments;
 #[cfg(test)]
 mod agent_tests;
+mod attachments;
 
 const MAX_PENDING_INPUTS: usize = 100;
 const MAX_INPUT_BYTES: usize = 256 * 1024;
@@ -94,7 +94,9 @@ struct Run {
 type ActiveRun = Arc<Mutex<Weak<Run>>>;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn control_error(code: &str, message: &str) -> Error {
@@ -130,6 +132,7 @@ impl Run {
         };
         data.pending_bytes -= input.bytes;
         data.handed_to_agent = data.handed_to_agent.saturating_add(1);
+        drop(data);
         // One item per fetch avoids pre-draining a follow-up backlog into the
         // agent. Preserve exactly the authored text for keyword scanning.
         vec![QueuedAgentMessage::authored(
@@ -231,6 +234,7 @@ impl SessionControlHandle {
         let index = data.pending.iter().position(|input| input.id == id)?;
         let input = data.pending.remove(index)?;
         data.pending_bytes -= input.bytes;
+        drop(data);
         Some(input)
     }
 
@@ -301,8 +305,9 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for ControlledTurn<F> 
     }
 }
 
-/// In-process SDK driver with live input and cancellation. The two additive
-/// fetchers are installed once, not once per prompt. Idle session management
+/// In-process SDK driver with live input and cancellation.
+///
+/// The two additive fetchers are installed once, not once per prompt. Idle session management
 /// stays available through `session_mut`; Rust prevents access during a turn.
 pub struct ControllableSession {
     session: AgentSessionHandle,
@@ -327,7 +332,7 @@ impl AgentSessionHandle {
 }
 
 impl ControllableSession {
-    pub fn session_mut(&mut self) -> &mut AgentSessionHandle {
+    pub const fn session_mut(&mut self) -> &mut AgentSessionHandle {
         &mut self.session
     }
 
@@ -341,6 +346,7 @@ impl ControllableSession {
         }
         let (run, signal) = Run::new();
         *active = Arc::downgrade(&run);
+        drop(active);
         Ok((
             TurnGuard {
                 active: Arc::clone(&self.active),
@@ -419,7 +425,13 @@ mod tests {
     pub(super) fn live() -> (SessionControlHandle, TurnGuard, AbortSignal) {
         let (run, signal) = Run::new();
         let active = Arc::new(Mutex::new(Arc::downgrade(&run)));
-        (SessionControlHandle { run: Arc::clone(&run) }, TurnGuard { active, run }, signal)
+        (
+            SessionControlHandle {
+                run: Arc::clone(&run),
+            },
+            TurnGuard { active, run },
+            signal,
+        )
     }
 
     #[test]
@@ -429,9 +441,18 @@ mod tests {
         control.steer("  change course\n日本語  ").unwrap();
         control.steer("then inspect").unwrap();
         let first = control.run.fetch(InputKind::Steering);
-        assert_eq!(first[0].keyword_scan_source(), Some("  change course\n日本語  "));
-        assert_eq!(control.run.fetch(InputKind::Steering)[0].text_for_display(), Some("then inspect"));
-        assert_eq!(control.run.fetch(InputKind::FollowUp)[0].text_for_display(), Some("next"));
+        assert_eq!(
+            first[0].keyword_scan_source(),
+            Some("  change course\n日本語  ")
+        );
+        assert_eq!(
+            control.run.fetch(InputKind::Steering)[0].text_for_display(),
+            Some("then inspect")
+        );
+        assert_eq!(
+            control.run.fetch(InputKind::FollowUp)[0].text_for_display(),
+            Some("next")
+        );
         assert_eq!(control.snapshot().handed_to_agent, 3);
         assert_eq!(control.snapshot().pending_bytes, 0);
     }
@@ -442,7 +463,13 @@ mod tests {
         for index in 0..MAX_PENDING_INPUTS {
             control.steer(&index.to_string()).unwrap();
         }
-        assert!(control.follow_up("overflow").unwrap_err().to_string().contains("SESSION_CONTROL_FULL"));
+        assert!(
+            control
+                .follow_up("overflow")
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_FULL")
+        );
         let pending = control.take_pending();
         assert_eq!(pending.len(), MAX_PENDING_INPUTS);
         assert_eq!(pending[0].text, "0");
@@ -493,7 +520,10 @@ mod tests {
             let _guard = guard;
             std::future::pending::<Result<AssistantMessage>>().await
         };
-        let turn = ControlledTurn { future: Box::pin(future), control: control.clone() };
+        let turn = ControlledTurn {
+            future: Box::pin(future),
+            control: control.clone(),
+        };
         drop(turn);
         assert!(control.snapshot().finished);
         assert!(control.steer("late").is_err());

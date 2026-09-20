@@ -1,3 +1,5 @@
+#![allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
+
 //! End-to-end control tests through the real OpenAI adapter, HTTP/SSE parser,
 //! agent loop, read tool, and SDK session wrapper. The local peer supplies wire
 //! fixtures only; it does not replace any of those production implementations.
@@ -37,17 +39,29 @@ struct Peer {
 }
 
 fn read_request(stream: &TcpStream) -> Value {
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut length = None;
     let mut header_bytes = 0;
     loop {
         let mut line = String::new();
-        assert!(reader.read_line(&mut line).unwrap() > 0, "request ended in headers");
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "request ended in headers"
+        );
         header_bytes += line.len();
-        assert!(header_bytes <= 64 * 1024, "oversized fixture request headers");
-        if line == "\r\n" { break; }
+        assert!(
+            header_bytes <= 64 * 1024,
+            "oversized fixture request headers"
+        );
+        if line == "\r\n" {
+            break;
+        }
         if let Some((key, value)) = line.split_once(':') {
             if key.eq_ignore_ascii_case("content-length") {
                 length = Some(value.trim().parse::<usize>().unwrap());
@@ -62,17 +76,23 @@ fn read_request(stream: &TcpStream) -> Value {
 }
 
 fn event(delta: Value, finish: Value) -> String {
-    format!("data: {}\n\n", json!({
-        "id":"control-fixture", "object":"chat.completion.chunk",
-        "created":0, "model":"control-fixture",
-        "choices":[{"index":0, "delta":delta, "finish_reason":finish}]
-    }))
+    format!(
+        "data: {}\n\n",
+        json!({
+            "id":"control-fixture", "object":"chat.completion.chunk",
+            "created":0, "model":"control-fixture",
+            "choices":[{"index":0, "delta":delta, "finish_reason":finish}]
+        })
+    )
 }
 
 fn respond(stream: &mut TcpStream, reply: Reply, stop: &AtomicBool) {
     if matches!(reply, Reply::Hanging) {
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
-        let chunk = event(json!({"role":"assistant", "content":"partial"}), Value::Null);
+        let chunk = event(
+            json!({"role":"assistant", "content":"partial"}),
+            Value::Null,
+        );
         write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len()).unwrap();
         stream.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -90,17 +110,31 @@ fn respond(stream: &mut TcpStream, reply: Reply, stop: &AtomicBool) {
             json!({"error":{"message":"local fixture failure"}}).to_string(),
         ),
         Reply::Tool => {
-            let start = event(json!({"role":"assistant", "tool_calls":[{
-                "index":0, "id":"read-once", "type":"function",
-                "function":{"name":"read", "arguments":"{\"path\":\"note.txt\"}"}
-            }]}), Value::Null);
+            let start = event(
+                json!({"role":"assistant", "tool_calls":[{
+                    "index":0, "id":"read-once", "type":"function",
+                    "function":{"name":"read", "arguments":"{\"path\":\"note.txt\"}"}
+                }]}),
+                Value::Null,
+            );
             let end = event(json!({}), json!("tool_calls"));
-            ("200 OK", "text/event-stream", format!("{start}{end}data: [DONE]\n\n"))
+            (
+                "200 OK",
+                "text/event-stream",
+                format!("{start}{end}data: [DONE]\n\n"),
+            )
         }
         Reply::Text => {
-            let start = event(json!({"role":"assistant", "content":"complete"}), Value::Null);
+            let start = event(
+                json!({"role":"assistant", "content":"complete"}),
+                Value::Null,
+            );
             let end = event(json!({}), json!("stop"));
-            ("200 OK", "text/event-stream", format!("{start}{end}data: [DONE]\n\n"))
+            (
+                "200 OK",
+                "text/event-stream",
+                format!("{start}{end}data: [DONE]\n\n"),
+            )
         }
         Reply::Hanging => unreachable!(),
     };
@@ -121,7 +155,9 @@ impl Peer {
             for reply in replies {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
-                    if stopping.load(Ordering::SeqCst) { return; }
+                    if stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
                     assert!(Instant::now() < deadline, "fixture request deadline");
                     match listener.accept() {
                         Ok((mut stream, _)) => {
@@ -137,21 +173,30 @@ impl Peer {
                 }
             }
         });
-        Self { url, requests, stop, worker: Some(worker) }
+        Self {
+            url,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
     }
 
     fn session(&self, cwd: &std::path::Path) -> ControllableSession {
         let provider = Arc::new(OpenAIProvider::new("control-fixture").with_base_url(&self.url));
-        let agent = Agent::new(provider, ToolRegistry::new(&["read"], cwd, None), AgentConfig {
-            max_tool_iterations: 4,
-            model_accepts_images: true,
-            stream_options: StreamOptions {
-                api_key: Some("local-fixture-key".to_string()),
-                max_tokens: Some(128),
-                ..StreamOptions::default()
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&["read"], cwd, None),
+            AgentConfig {
+                max_tool_iterations: 4,
+                model_accepts_images: true,
+                stream_options: StreamOptions {
+                    api_key: Some("local-fixture-key".to_string()),
+                    max_tokens: Some(128),
+                    ..StreamOptions::default()
+                },
+                ..AgentConfig::default()
             },
-            ..AgentConfig::default()
-        });
+        );
         let session = AgentSession::new(
             agent,
             Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
@@ -168,13 +213,18 @@ impl Drop for Peer {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(worker) = self.worker.take() {
             let result = worker.join();
-            if !std::thread::panicking() { result.expect("wire fixture thread"); }
+            if !std::thread::panicking() {
+                result.expect("wire fixture thread");
+            }
         }
     }
 }
 
 fn request_has(request: &Value, text: &str) -> bool {
-    request["messages"].as_array().unwrap().iter()
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
         .any(|message| message["content"].to_string().contains(text))
 }
 
@@ -188,16 +238,20 @@ fn mid_tool_thread_can_steer_and_follow_up_without_replaying_the_tool() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&events);
     runtime.block_on(async {
-        let turn = session.prompt_with_control("read note.txt".to_string(), move |control, event| {
-            if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                let control = control.clone();
-                std::thread::spawn(move || {
-                    control.steer("focus on constraints").unwrap();
-                    control.follow_up("then explain tradeoffs").unwrap();
-                }).join().unwrap();
-            }
-            lock(&captured).push(event);
-        }).unwrap();
+        let turn = session
+            .prompt_with_control("read note.txt".to_string(), move |control, event| {
+                if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                    let control = control.clone();
+                    std::thread::spawn(move || {
+                        control.steer("focus on constraints").unwrap();
+                        control.follow_up("then explain tradeoffs").unwrap();
+                    })
+                    .join()
+                    .unwrap();
+                }
+                lock(&captured).push(event);
+            })
+            .unwrap();
         let control = turn.control();
         assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
         assert!(control.snapshot().finished);
@@ -210,15 +264,33 @@ fn mid_tool_thread_can_steer_and_follow_up_without_replaying_the_tool() {
     assert!(request_has(&requests[1], "focus on constraints"));
     assert!(!request_has(&requests[1], "then explain tradeoffs"));
     assert!(request_has(&requests[2], "then explain tradeoffs"));
-    assert_eq!(lock(&events).iter().filter(|event| matches!(event, AgentEvent::ToolExecutionStart { .. })).count(), 1);
+    assert_eq!(
+        lock(&events)
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolExecutionStart { .. }))
+            .count(),
+        1
+    );
     drop(requests);
     let store = session.session_mut().session_store();
     runtime.block_on(async {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let state = store.lock(cx.cx()).await.unwrap();
         let messages = state.to_messages_for_current_path();
-        assert_eq!(messages.iter().filter(|message| matches!(message, Message::User(_))).count(), 3);
-        assert_eq!(messages.iter().filter(|message| matches!(message, Message::ToolResult(_))).count(), 1);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::User(_)))
+                .count(),
+            3
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::ToolResult(_)))
+                .count(),
+            1
+        );
     });
 }
 
@@ -229,12 +301,19 @@ fn control_abort_interrupts_a_live_unfinished_provider_stream() {
     let peer = Peer::new(vec![Reply::Hanging]);
     let mut session = peer.session(temp.path());
     runtime.block_on(async {
-        let turn = session.prompt_with_control("stream".to_string(), |control, event| {
-            if matches!(event, AgentEvent::MessageStart { message: Message::Assistant(_) }) {
-                control.follow_up("recover after abort").unwrap();
-                assert!(control.abort());
-            }
-        }).unwrap();
+        let turn = session
+            .prompt_with_control("stream".to_string(), |control, event| {
+                if matches!(
+                    event,
+                    AgentEvent::MessageStart {
+                        message: Message::Assistant(_)
+                    }
+                ) {
+                    control.follow_up("recover after abort").unwrap();
+                    assert!(control.abort());
+                }
+            })
+            .unwrap();
         let control = turn.control();
         assert_eq!(turn.await.unwrap().stop_reason, StopReason::Aborted);
         assert!(control.snapshot().finished);
@@ -272,7 +351,9 @@ fn unpolled_public_turn_can_be_dropped_then_replaced_without_a_request() {
     let temp = tempfile::tempdir().unwrap();
     let peer = Peer::new(vec![Reply::Text]);
     let mut session = peer.session(temp.path());
-    let unused = session.prompt("must not be sent".to_string(), |_| {}).unwrap();
+    let unused = session
+        .prompt("must not be sent".to_string(), |_| {})
+        .unwrap();
     let old = unused.control();
     old.steer("recover me").unwrap();
     drop(unused);
@@ -294,7 +375,10 @@ fn controlled_continuation_does_not_append_the_original_prompt_twice() {
     let peer = Peer::new(vec![Reply::Error, Reply::Text]);
     let mut session = peer.session(temp.path());
     runtime.block_on(async {
-        let first = session.prompt("original prompt".to_string(), |_| {}).unwrap().await;
+        let first = session
+            .prompt("original prompt".to_string(), |_| {})
+            .unwrap()
+            .await;
         assert!(first.is_err() || first.unwrap().stop_reason == StopReason::Error);
         let resumed = session.continue_turn(|_| {}).unwrap();
         let control = resumed.control();
@@ -303,8 +387,16 @@ fn controlled_continuation_does_not_append_the_original_prompt_twice() {
     });
     let requests = lock(&peer.requests);
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1]["messages"].as_array().unwrap().iter()
-        .filter(|message| message["role"] == "user" && message["content"].to_string().contains("original prompt")).count(), 1);
+    assert_eq!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user"
+                && message["content"].to_string().contains("original prompt"))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -352,11 +444,19 @@ fn queued_native_image_reaches_the_real_provider_without_flattening() {
     });
     let requests = lock(&peer.requests);
     assert_eq!(requests.len(), 2);
-    let parts = requests[1]["messages"].as_array().unwrap().iter()
+    let parts = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
         .filter_map(|message| message["content"].as_array())
         .find(|parts| parts.iter().any(|part| part["type"] == "image_url"))
         .expect("native image in provider request");
     assert_eq!(parts[0]["text"], "inspect image");
-    assert!(parts[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert!(
+        parts[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
     assert_eq!(parts[2]["text"], "trailing context");
 }

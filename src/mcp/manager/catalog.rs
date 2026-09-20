@@ -1214,11 +1214,25 @@ mod tests {
         let tools = runtime
             .block_on(manager.refresh_tools("catalog"))
             .expect("fresh complete catalog");
-        refresh_log("fresh-catalog-replacement", McpManager::lock(&transport.requests).len(), "ok");
-        assert_eq!(tools.iter().map(|meta| meta.name.as_str()).collect::<Vec<_>>(), vec!["changed", "added-after-startup"]);
+        refresh_log(
+            "fresh-catalog-replacement",
+            McpManager::lock(&transport.requests).len(),
+            "ok",
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .map(|meta| meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["changed", "added-after-startup"]
+        );
         assert_eq!(tools[1].output_schema.as_ref().unwrap().schema(), &schema);
         assert_eq!(manager.mounted_tool_metas()[0].1.len(), 2);
-        assert_eq!(McpManager::lock(&entry.restarts).count, 2, "discovery must not reset crash history");
+        assert_eq!(
+            McpManager::lock(&entry.restarts).count,
+            2,
+            "discovery must not reset crash history"
+        );
         assert_eq!(McpManager::lock(&transport.requests).len(), 2);
         assert!(!transport.closed.load(Ordering::Acquire));
     }
@@ -1234,11 +1248,26 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
-        let tools = runtime.block_on(manager.refresh_tools("catalog")).expect("empty catalog");
-        refresh_log("empty-replacement", McpManager::lock(&transport.requests).len(), "ok");
+        let tools = runtime
+            .block_on(manager.refresh_tools("catalog"))
+            .expect("empty catalog");
+        refresh_log(
+            "empty-replacement",
+            McpManager::lock(&transport.requests).len(),
+            "ok",
+        );
         assert!(tools.is_empty());
-        assert!(McpManager::lock(&entry.tools_cache).as_ref().unwrap().1.is_empty());
-        assert!(matches!(*McpManager::lock(&entry.health), ServerHealth::Ready { tools: 0 }));
+        assert!(
+            McpManager::lock(&entry.tools_cache)
+                .as_ref()
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert!(matches!(
+            *McpManager::lock(&entry.health),
+            ServerHealth::Ready { tools: 0 }
+        ));
         assert!(!transport.closed.load(Ordering::Acquire));
     }
 
@@ -1256,8 +1285,14 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
-        let error = runtime.block_on(manager.refresh_tools("catalog")).expect_err("whole catalog required");
-        refresh_log("partial-catalog", McpManager::lock(&transport.requests).len(), "MCP_PROTOCOL");
+        let error = runtime
+            .block_on(manager.refresh_tools("catalog"))
+            .expect_err("whole catalog required");
+        refresh_log(
+            "partial-catalog",
+            McpManager::lock(&transport.requests).len(),
+            "MCP_PROTOCOL",
+        );
         assert!(error.to_string().contains("MCP_PROTOCOL"));
         assert!(McpManager::lock(&entry.tools_cache).is_none());
         assert!(transport.closed.load(Ordering::Acquire));
@@ -1273,10 +1308,19 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
-        let error = runtime.block_on(manager.refresh_tools("catalog")).expect_err("explicit recovery required");
-        refresh_log("restart-budget", McpManager::lock(&transport.requests).len(), "MCP_RESTART_EXHAUSTED");
+        let error = runtime
+            .block_on(manager.refresh_tools("catalog"))
+            .expect_err("explicit recovery required");
+        refresh_log(
+            "restart-budget",
+            McpManager::lock(&transport.requests).len(),
+            "MCP_RESTART_EXHAUSTED",
+        );
         assert!(error.to_string().contains("MCP_RESTART_EXHAUSTED"));
-        assert_eq!(McpManager::lock(&entry.restarts).count, super::super::MAX_RESTARTS);
+        assert_eq!(
+            McpManager::lock(&entry.restarts).count,
+            super::super::MAX_RESTARTS
+        );
         assert!(McpManager::lock(&transport.requests).is_empty());
         assert!(McpManager::lock(&entry.transport).is_none());
     }
@@ -1296,11 +1340,18 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
-        for (owner, code) in [(cancelled, "MCP_CANCELLED"), (restricted, "MCP_CAPABILITY_DENIED")] {
+        for (owner, code) in [
+            (cancelled, "MCP_CANCELLED"),
+            (restricted, "MCP_CAPABILITY_DENIED"),
+        ] {
             let error = runtime
                 .block_on(owner.with_current(manager.refresh_tools("catalog")))
                 .expect_err("refresh owner rejected");
-            refresh_log("owner-admission", McpManager::lock(&transport.requests).len(), code);
+            refresh_log(
+                "owner-admission",
+                McpManager::lock(&transport.requests).len(),
+                code,
+            );
             assert!(error.to_string().contains(code), "{error}");
         }
         assert!(McpManager::lock(&transport.requests).is_empty());
@@ -1312,14 +1363,20 @@ mod tests {
     fn public_refresh_deadline_includes_waiting_for_the_connection_lane() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(&temp, vec![], None);
-        let lane = Arc::clone(&entry.connect_lane).try_lock_owned().expect("hold lane");
+        let lane = Arc::clone(&entry.connect_lane)
+            .try_lock_owned()
+            .expect("hold lane");
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
         let error = runtime
             .block_on(manager.refresh_tools_with_timeout("catalog", Duration::from_millis(10)))
             .expect_err("lane admission spends the deadline");
-        refresh_log("admission-deadline", McpManager::lock(&transport.requests).len(), "MCP_TIMEOUT");
+        refresh_log(
+            "admission-deadline",
+            McpManager::lock(&transport.requests).len(),
+            "MCP_TIMEOUT",
+        );
         assert!(error.to_string().contains("MCP_TIMEOUT"));
         assert!(McpManager::lock(&transport.requests).is_empty());
         assert!(!transport.closed.load(Ordering::Acquire));
@@ -1331,7 +1388,8 @@ mod tests {
     #[test]
     fn public_refresh_deadline_retires_a_pending_page_once() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, transport) = fixture(&temp, vec![json!({"tools":[tool("late")]})], None);
+        let (manager, entry, transport) =
+            fixture(&temp, vec![json!({"tools":[tool("late")]})], None);
         *McpManager::lock(&transport.pause_at) = Some(1);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -1339,7 +1397,11 @@ mod tests {
         let error = runtime
             .block_on(manager.refresh_tools_with_timeout("catalog", Duration::from_millis(10)))
             .expect_err("outer refresh deadline");
-        refresh_log("pending-page-deadline", McpManager::lock(&transport.requests).len(), "MCP_TIMEOUT");
+        refresh_log(
+            "pending-page-deadline",
+            McpManager::lock(&transport.requests).len(),
+            "MCP_TIMEOUT",
+        );
         assert!(error.to_string().contains("MCP_TIMEOUT"));
         assert!(transport.closed.load(Ordering::Acquire));
         assert!(McpManager::lock(&entry.transport).is_none());
@@ -1362,7 +1424,11 @@ mod tests {
             assert!(futures::poll!(refresh.as_mut()).is_pending());
             drop(refresh);
         });
-        refresh_log("abandoned-refresh", McpManager::lock(&transport.requests).len(), "cancelled");
+        refresh_log(
+            "abandoned-refresh",
+            McpManager::lock(&transport.requests).len(),
+            "cancelled",
+        );
         assert_eq!(McpManager::lock(&transport.requests).len(), 1);
         assert!(transport.closed.load(Ordering::Acquire));
         assert!(McpManager::lock(&entry.transport).is_none());
