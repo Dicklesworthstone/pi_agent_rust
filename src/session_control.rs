@@ -22,9 +22,13 @@ use crate::error::{Error, Result};
 use crate::model::{AssistantMessage, Message, UserContent, UserMessage};
 use crate::sdk::AgentSessionHandle;
 
+mod attachments;
+#[cfg(test)]
+mod agent_tests;
+
 const MAX_PENDING_INPUTS: usize = 100;
 const MAX_INPUT_BYTES: usize = 256 * 1024;
-const MAX_PENDING_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 /// The existing agent loop decides the exact safe delivery boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,9 +39,10 @@ pub enum InputKind {
     FollowUp,
 }
 
-/// An identity local to one control handle's turn, not a durable receipt.
+/// An opaque input identity, not a durable receipt. Identities do not repeat
+/// between turns, so a stale retraction cannot select a new turn's input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InputId(u64);
+pub struct InputId(uuid::Uuid);
 
 /// An input which has not been handed to the agent and is safe to reclaim.
 /// Debug output deliberately excludes its potentially private text.
@@ -45,7 +50,11 @@ pub struct InputId(u64);
 pub struct PendingInput {
     pub id: InputId,
     pub kind: InputKind,
+    /// Original user-authored prose, before template/attachment expansion.
     pub text: String,
+    /// Exact provider-visible text/image/media payload, never flattened.
+    pub content: UserContent,
+    bytes: usize,
 }
 
 impl fmt::Debug for PendingInput {
@@ -53,7 +62,7 @@ impl fmt::Debug for PendingInput {
         f.debug_struct("PendingInput")
             .field("id", &self.id)
             .field("kind", &self.kind)
-            .field("bytes", &self.text.len())
+            .field("bytes", &self.bytes)
             .finish_non_exhaustive()
     }
 }
@@ -72,7 +81,6 @@ pub struct ControlSnapshot {
 struct RunData {
     accepting_input: bool,
     finished: bool,
-    next_id: u64,
     pending: VecDeque<PendingInput>,
     pending_bytes: usize,
     handed_to_agent: u64,
@@ -100,7 +108,6 @@ impl Run {
             data: Mutex::new(RunData {
                 accepting_input: true,
                 finished: false,
-                next_id: 0,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 handed_to_agent: 0,
@@ -121,13 +128,13 @@ impl Run {
         let Some(input) = data.pending.remove(index) else {
             return Vec::new();
         };
-        data.pending_bytes -= input.text.len();
+        data.pending_bytes -= input.bytes;
         data.handed_to_agent = data.handed_to_agent.saturating_add(1);
         // One item per fetch avoids pre-draining a follow-up backlog into the
         // agent. Preserve exactly the authored text for keyword scanning.
         vec![QueuedAgentMessage::authored(
             Message::User(UserMessage {
-                content: UserContent::Text(input.text.clone()),
+                content: input.content,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             }),
             input.text,
@@ -182,39 +189,13 @@ impl SessionControlHandle {
     }
 
     fn enqueue(&self, kind: InputKind, text: &str) -> Result<InputId> {
-        if text.trim().is_empty() || text.len() > MAX_INPUT_BYTES {
+        if text.len() > MAX_INPUT_BYTES || text.trim().is_empty() {
             return Err(control_error(
                 "SESSION_CONTROL_INPUT",
                 "input must be nonblank and at most 256 KiB",
             ));
         }
-        let mut data = lock(&self.run.data);
-        if !data.accepting_input {
-            return Err(control_error(
-                "SESSION_CONTROL_CLOSED",
-                "this turn no longer accepts input",
-            ));
-        }
-        if data.pending.len() >= MAX_PENDING_INPUTS
-            || text.len() > MAX_PENDING_BYTES.saturating_sub(data.pending_bytes)
-        {
-            return Err(control_error(
-                "SESSION_CONTROL_FULL",
-                "pending input limit reached; no existing input was discarded",
-            ));
-        }
-        let next_id = data.next_id.checked_add(1).ok_or_else(|| {
-            control_error("SESSION_CONTROL_FULL", "input identity space exhausted")
-        })?;
-        let id = InputId(data.next_id);
-        data.next_id = next_id;
-        data.pending_bytes += text.len();
-        data.pending.push_back(PendingInput {
-            id,
-            kind,
-            text: text.to_string(),
-        });
-        Ok(id)
+        self.enqueue_content(kind, &UserContent::Text(text.to_string()), text)
     }
 
     /// Request cancellation of this turn only and stop dequeuing new input.
@@ -241,6 +222,16 @@ impl SessionControlHandle {
         let mut data = lock(&self.run.data);
         data.pending_bytes = 0;
         data.pending.drain(..).collect()
+    }
+
+    /// Retract exactly one unclaimed input. `None` means it was already
+    /// handed off, reclaimed, or never admitted by this turn's handle.
+    pub fn retract(&self, id: InputId) -> Option<PendingInput> {
+        let mut data = lock(&self.run.data);
+        let index = data.pending.iter().position(|input| input.id == id)?;
+        let input = data.pending.remove(index)?;
+        data.pending_bytes -= input.bytes;
+        Some(input)
     }
 
     #[must_use]
@@ -366,16 +357,32 @@ impl ControllableSession {
         input: String,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
+        self.prompt_with_control(input, move |_, event| on_event(event))
+    }
+
+    /// Like `prompt`, but each event callback also receives this turn's
+    /// control lane. Hosts can react to streaming/tool events without a
+    /// shared mutable session, a command-loop deadlock, or a setup race.
+    pub fn prompt_with_control(
+        &mut self,
+        input: String,
+        on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
+    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
         let (guard, signal) = self.begin()?;
         let control = SessionControlHandle {
             run: Arc::clone(&guard.run),
         };
+        let callback_control = control.clone();
         let session = &mut self.session;
         let future = async move {
             // Capture the guard in the future so cancellation before its first
             // poll is just as safe as dropping it during a provider request.
             let _guard = guard;
-            session.prompt_with_abort(input, signal, on_event).await
+            session
+                .prompt_with_abort(input, signal, move |event| {
+                    on_event(&callback_control, event);
+                })
+                .await
         };
         Ok(ControlledTurn {
             future: Box::pin(future),
@@ -409,14 +416,10 @@ impl ControllableSession {
 mod tests {
     use super::*;
 
-    fn live() -> (SessionControlHandle, TurnGuard, AbortSignal) {
+    pub(super) fn live() -> (SessionControlHandle, TurnGuard, AbortSignal) {
         let (run, signal) = Run::new();
         let active = Arc::new(Mutex::new(Arc::downgrade(&run)));
-        (
-            SessionControlHandle { run: Arc::clone(&run) },
-            TurnGuard { active, run },
-            signal,
-        )
+        (SessionControlHandle { run: Arc::clone(&run) }, TurnGuard { active, run }, signal)
     }
 
     #[test]
@@ -427,14 +430,8 @@ mod tests {
         control.steer("then inspect").unwrap();
         let first = control.run.fetch(InputKind::Steering);
         assert_eq!(first[0].keyword_scan_source(), Some("  change course\n日本語  "));
-        assert_eq!(
-            control.run.fetch(InputKind::Steering)[0].text_for_display(),
-            Some("then inspect")
-        );
-        assert_eq!(
-            control.run.fetch(InputKind::FollowUp)[0].text_for_display(),
-            Some("next")
-        );
+        assert_eq!(control.run.fetch(InputKind::Steering)[0].text_for_display(), Some("then inspect"));
+        assert_eq!(control.run.fetch(InputKind::FollowUp)[0].text_for_display(), Some("next"));
         assert_eq!(control.snapshot().handed_to_agent, 3);
         assert_eq!(control.snapshot().pending_bytes, 0);
     }
@@ -445,8 +442,7 @@ mod tests {
         for index in 0..MAX_PENDING_INPUTS {
             control.steer(&index.to_string()).unwrap();
         }
-        let error = control.follow_up("overflow").unwrap_err();
-        assert!(error.to_string().contains("SESSION_CONTROL_FULL"));
+        assert!(control.follow_up("overflow").unwrap_err().to_string().contains("SESSION_CONTROL_FULL"));
         let pending = control.take_pending();
         assert_eq!(pending.len(), MAX_PENDING_INPUTS);
         assert_eq!(pending[0].text, "0");
@@ -457,10 +453,9 @@ mod tests {
     fn byte_limits_are_shared_by_both_lanes_and_refunded() {
         let (control, _guard, _) = live();
         let text = "x".repeat(MAX_INPUT_BYTES);
-        for _ in 0..4 {
-            control.follow_up(&text).unwrap();
-        }
-        assert!(control.steer("x").is_err());
+        while control.follow_up(&text).is_ok() {}
+        assert!(control.snapshot().pending_bytes <= MAX_PENDING_BYTES);
+        assert!(control.steer(&text).is_err());
         control.run.fetch(InputKind::FollowUp);
         assert!(control.steer(&text).is_ok());
         assert!(control.steer(&"x".repeat(MAX_INPUT_BYTES + 1)).is_err());
@@ -498,10 +493,7 @@ mod tests {
             let _guard = guard;
             std::future::pending::<Result<AssistantMessage>>().await
         };
-        let turn = ControlledTurn {
-            future: Box::pin(future),
-            control: control.clone(),
-        };
+        let turn = ControlledTurn { future: Box::pin(future), control: control.clone() };
         drop(turn);
         assert!(control.snapshot().finished);
         assert!(control.steer("late").is_err());
