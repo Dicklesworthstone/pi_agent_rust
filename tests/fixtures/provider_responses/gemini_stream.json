@@ -196,10 +196,10 @@
         { "kind": "start" },
         { "kind": "text_start", "content_index": 0 },
         { "kind": "text_delta", "content_index": 0, "delta": "Let me check that file." },
-        { "kind": "other" },
-        { "kind": "other" },
-        { "kind": "other" },
         { "kind": "text_end", "content_index": 0, "content": "Let me check that file." },
+        { "kind": "other" },
+        { "kind": "other" },
+        { "kind": "other" },
         { "kind": "done", "reason": "tool_use" }
       ]
     },

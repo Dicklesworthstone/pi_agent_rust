@@ -12,21 +12,20 @@
 
 use crate::error::{Error, Result};
 use crate::http::client::Client;
-use crate::model::{
-    AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ToolCall, Usage,
-};
+use crate::model::StreamEvent;
+#[cfg(test)]
+use crate::model::{ContentBlock, StopReason, TextContent};
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions};
 use crate::providers::gemini::{
-    self, GeminiCandidate, GeminiContent, GeminiFunctionCall, GeminiFunctionCallingConfig,
-    GeminiGenerationConfig, GeminiPart, GeminiRequest, GeminiStreamResponse, GeminiTool,
-    GeminiToolConfig,
+    self, GeminiContent, GeminiFunctionCallingConfig, GeminiGenerationConfig, GeminiPart,
+    GeminiRequest, GeminiTool, GeminiToolConfig, StreamState,
 };
 use crate::sse::SseStream;
 use async_trait::async_trait;
+#[cfg(test)]
 use futures::StreamExt;
-use futures::stream::{self, Stream};
-use std::collections::VecDeque;
+use futures::stream::Stream;
 use std::pin::Pin;
 
 #[cfg(test)]
@@ -181,7 +180,8 @@ impl VertexProvider {
         )
     }
 
-    /// Build the Gemini-format request body (for Google-native models).
+    /// Build the base Gemini request. Live requests apply model-specific
+    /// thinking controls before the request-rewrite hook.
     #[allow(clippy::unused_self)]
     pub fn build_gemini_request(
         &self,
@@ -283,8 +283,9 @@ impl Provider for VertexProvider {
             return Box::pin(provider.stream_vertex(context, options, &authorization)).await;
         }
 
-        // Google-native models retain their Gemini request and stream parser.
+        // Apply the same native thinking contract as Developer API and CLI.
         let request_body = self.build_gemini_request(context, options);
+        let request_body = gemini::reasoning::prepare_request(&self.model, options, &request_body)?;
         let mut request = self.client.post(&url).header("Accept", "text/event-stream");
         if let Some(headers) = self
             .compat
@@ -332,310 +333,15 @@ impl Provider for VertexProvider {
             ));
         }
 
-        // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(response.bytes_stream());
-
-        // Create stream state — same response format as Gemini.
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
-
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                if state.finished {
-                    return None;
-                }
-                loop {
-                    // Drain pending events before polling for more SSE data.
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            state.transient_error_count = 0;
-                            if msg.event == "ping" {
-                                continue;
-                            }
-
-                            if let Err(e) = state.process_event(&msg.data) {
-                                state.finished = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
-                            // Skip them and keep reading the stream, but cap
-                            // consecutive occurrences to avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.finished = true;
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        None => {
-                            let outcome = state.finish_at_eof();
-                            return Some((outcome, state));
-                        }
-                    }
-                }
-            },
+        // Google-native Vertex shares the exact decoder, content lifecycle,
+        // usage state and terminal-error handling with the other Google routes.
+        let state = StreamState::new(
+            SseStream::new(response.bytes_stream()),
+            self.model.clone(),
+            self.api().to_string(),
+            self.name().to_string(),
         );
-
-        Ok(Box::pin(stream))
-    }
-}
-
-// ============================================================================
-// Stream State (reuses Gemini response format)
-// ============================================================================
-
-struct StreamState<S>
-where
-    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
-{
-    event_source: SseStream<S>,
-    partial: AssistantMessage,
-    pending_events: VecDeque<StreamEvent>,
-    started: bool,
-    finished: bool,
-    /// Consecutive WriteZero errors seen without a successful event in between.
-    transient_error_count: usize,
-    /// Whether a chunk carried a terminal marker (`finishReason` on the
-    /// candidate, or a `promptFeedback.blockReason`). The final chunk always
-    /// carries one; a transport close without it is a truncated stream.
-    saw_terminal: bool,
-}
-
-impl<S> StreamState<S>
-where
-    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
-{
-    fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
-        Self {
-            event_source,
-            partial: AssistantMessage {
-                content: Vec::new(),
-                api,
-                provider,
-                model,
-                usage: Usage::default(),
-                stop_reason: StopReason::Stop,
-                stop_details: None,
-                error_message: None,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            },
-            pending_events: VecDeque::new(),
-            started: false,
-            finished: false,
-            transient_error_count: 0,
-            saw_terminal: false,
-        }
-    }
-
-    /// Terminal outcome once the transport closes: `Done` after a terminal
-    /// marker, otherwise a retryable error so a cut-off response is never
-    /// committed as a clean `Stop` (mirrors `gemini::StreamState`).
-    fn finish_at_eof(&mut self) -> Result<StreamEvent> {
-        self.finished = true;
-        if !self.saw_terminal {
-            return Err(Error::api(
-                "Vertex AI stream ended before finishReason (unexpected EOF)",
-            ));
-        }
-        if self.partial.stop_reason == StopReason::Stop
-            && self
-                .partial
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
-        {
-            self.partial.stop_reason = StopReason::ToolUse;
-        }
-        let reason = self.partial.stop_reason;
-        let message = std::mem::take(&mut self.partial);
-        Ok(StreamEvent::Done { reason, message })
-    }
-
-    fn process_event(&mut self, data: &str) -> Result<()> {
-        let response: GeminiStreamResponse = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
-
-        // Handle usage metadata.
-        if let Some(metadata) = response.usage_metadata {
-            self.partial.usage.input = metadata.prompt_token_count.unwrap_or(0);
-            self.partial.usage.output = metadata.candidates_token_count.unwrap_or(0);
-            self.partial.usage.total_tokens = metadata.total_token_count.unwrap_or(0);
-        }
-
-        // A blocked prompt: `promptFeedback.blockReason`, no candidates, no
-        // finishReason. Terminal, and an error rather than an empty success.
-        if let Some(reason) = response
-            .prompt_feedback
-            .as_ref()
-            .and_then(|feedback| feedback.block_reason.as_deref())
-        {
-            self.saw_terminal = true;
-            self.partial.stop_reason = StopReason::Error;
-            self.partial.error_message = Some(format!("Vertex AI blocked the prompt: {reason}"));
-        }
-
-        // Process candidates.
-        if let Some(candidates) = response.candidates
-            && let Some(candidate) = candidates.into_iter().next()
-        {
-            self.process_candidate(candidate)?;
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::unnecessary_wraps)]
-    fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
-        self.saw_terminal |= candidate.finish_reason.is_some();
-        // Handle finish reason.
-        if let Some(ref reason) = candidate.finish_reason {
-            self.partial.stop_reason = match reason.as_str() {
-                "MAX_TOKENS" => StopReason::Length,
-                "SAFETY" | "RECITATION" | "OTHER" => StopReason::Error,
-                "FUNCTION_CALL" => StopReason::ToolUse,
-                _ => StopReason::Stop,
-            };
-        }
-
-        // Process content parts — queue all events into pending_events.
-        if let Some(content) = candidate.content {
-            for part in content.parts {
-                match part {
-                    GeminiPart::Text { text } => {
-                        let last_is_text =
-                            matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-                        if !last_is_text {
-                            let content_index = self.partial.content.len();
-                            self.partial
-                                .content
-                                .push(ContentBlock::Text(TextContent::new("")));
-
-                            self.ensure_started();
-
-                            self.pending_events
-                                .push_back(StreamEvent::TextStart { content_index });
-                        }
-                        let content_index = self.partial.content.len() - 1;
-
-                        if let Some(ContentBlock::Text(t)) =
-                            self.partial.content.get_mut(content_index)
-                        {
-                            t.text.push_str(&text);
-                        }
-
-                        self.ensure_started();
-
-                        self.pending_events.push_back(StreamEvent::TextDelta {
-                            content_index,
-                            delta: text,
-                        });
-                    }
-                    GeminiPart::FunctionCall {
-                        function_call,
-                        thought_signature,
-                    } => {
-                        let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-
-                        let args_str = serde_json::to_string(&function_call.args)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        let GeminiFunctionCall { name, args } = function_call;
-
-                        let tool_call = ToolCall {
-                            id,
-                            name,
-                            arguments: args,
-                            thought_signature,
-                        };
-
-                        self.partial
-                            .content
-                            .push(ContentBlock::ToolCall(tool_call.clone()));
-                        let content_index = self.partial.content.len() - 1;
-
-                        if self.partial.stop_reason == StopReason::Stop {
-                            self.partial.stop_reason = StopReason::ToolUse;
-                        }
-
-                        self.ensure_started();
-
-                        self.pending_events.push_back(StreamEvent::ToolCallStart {
-                            content_index,
-                            id: tool_call.id.clone(),
-                            name: tool_call.name.clone(),
-                        });
-                        self.pending_events.push_back(StreamEvent::ToolCallDelta {
-                            content_index,
-                            delta: args_str,
-                        });
-                        self.pending_events.push_back(StreamEvent::ToolCallEnd {
-                            content_index,
-                            tool_call,
-                        });
-                    }
-                    GeminiPart::InlineData { .. }
-                    | GeminiPart::FunctionResponse { .. }
-                    | GeminiPart::Unknown(_) => {
-                        // Input-only parts are skipped.
-                        // Unknown parts are also skipped so new Gemini API part
-                        // variants don't break streaming.
-                    }
-                }
-            }
-        }
-
-        // Emit TextEnd/ThinkingEnd for all open text/thinking blocks when a finish reason
-        // is present.
-        if candidate.finish_reason.is_some() {
-            for (content_index, block) in self.partial.content.iter().enumerate() {
-                if let ContentBlock::Text(t) = block {
-                    self.pending_events.push_back(StreamEvent::TextEnd {
-                        content_index,
-                        content: t.text.clone(),
-                    });
-                } else if let ContentBlock::Thinking(t) = block {
-                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
-                        content_index,
-                        content: t.thinking.clone(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn ensure_started(&mut self) {
-        if !self.started {
-            self.started = true;
-            self.pending_events.push_back(StreamEvent::Start {
-                partial: self.partial.clone(),
-            });
-        }
+        Ok(Box::pin(state.into_stream(false)))
     }
 }
 

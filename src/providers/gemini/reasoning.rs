@@ -131,13 +131,21 @@ pub(crate) fn prepare_request(
 /// Keep first-party reasoning metadata out of cross-provider replays. A text
 /// signature from Responses, for example, is not a Gemini thought signature.
 pub(crate) fn is_google_message(message: &AssistantMessage) -> bool {
+    if message.api == "google-vertex" {
+        // Vertex's Claude adapter reports google-vertex too. Its Anthropic
+        // signatures must not be reinterpreted as Gemini thought signatures.
+        return message.model.rsplit('/').next().is_some_and(|model| {
+            model.to_ascii_lowercase().starts_with("gemini-")
+        });
+    }
     matches!(message.api.as_str(),
         "google-generative-ai" | "google-generative" | "google-gemini-cli" |
-        "google-vertex" | "google")
+        "google")
 }
 
-/// Used by the thought variant in the untagged wire enum. A part with
-/// thought:false must fall through to ordinary (possibly signed) text.
+/// Validate the explicit thought envelope. The wire decoder chooses this
+/// envelope before deserializing, so invalid thoughts cannot fall through
+/// to ordinary answer text.
 pub(crate) fn deserialize_true<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<bool, D::Error> {
@@ -421,6 +429,23 @@ mod tests {
         }
         for api in ["google-generative-ai", "google-gemini-cli", "google-vertex"] {
             message.api = api.to_string();
+            message.model = "gemini-2.5-pro".to_string();
+            assert!(is_google_message(&message));
+        }
+    }
+
+    #[test]
+    fn vertex_api_name_alone_does_not_authorize_gemini_signature_replay() {
+        let mut message = AssistantMessage {
+            api: "google-vertex".to_string(),
+            ..AssistantMessage::default()
+        };
+        for model in ["claude-sonnet-4-6", "publishers/anthropic/models/claude-opus-4-6", ""] {
+            message.model = model.to_string();
+            assert!(!is_google_message(&message));
+        }
+        for model in ["gemini-2.5-pro", "publishers/google/models/gemini-3-flash-preview"] {
+            message.model = model.to_string();
             assert!(is_google_message(&message));
         }
     }

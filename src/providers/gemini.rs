@@ -6,7 +6,7 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall, Usage,
+    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, Usage,
     UserContent,
 };
 use crate::models::CompatConfig;
@@ -20,6 +20,8 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 
 mod files;
+pub(super) mod reasoning;
+mod wire;
 
 // ============================================================================
 // Constants
@@ -163,7 +165,8 @@ impl GeminiProvider {
         }
     }
 
-    /// Build the request body for the Gemini API.
+    /// Build the base request body. The live request additionally applies
+    /// model-specific thinking controls before the request-rewrite hook.
     #[allow(clippy::unused_self)]
     pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> GeminiRequest {
         let contents = Self::build_contents(context);
@@ -220,7 +223,7 @@ impl GeminiProvider {
 struct CloudCodeAssistRequest {
     project: String,
     model: String,
-    request: GeminiRequest,
+    request: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_type: Option<String>,
     user_agent: String,
@@ -230,7 +233,7 @@ struct CloudCodeAssistRequest {
 fn build_google_cli_request(
     model_id: &str,
     project_id: &str,
-    request: GeminiRequest,
+    request: serde_json::Value,
     is_antigravity: bool,
 ) -> std::result::Result<CloudCodeAssistRequest, &'static str> {
     let safe_project = project_id.trim();
@@ -301,6 +304,7 @@ impl Provider for GeminiProvider {
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let request_body = self.build_request(context, options);
+        let request_body = reasoning::prepare_request(&self.model, options, &request_body)?;
         let url = self.streaming_url();
 
         // Build request (Content-Type set by .json() below)
@@ -379,22 +383,14 @@ impl Provider for GeminiProvider {
                 |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
             )
             .await;
-            let cli_request =
-                build_google_cli_request(&self.model, &project_id, request_body, is_antigravity)
-                    .map_err(|message| Error::provider(self.name(), message.to_string()))?;
-            let request = match rewritten_inner {
-                Some(inner) => {
-                    let mut wrapper = serde_json::to_value(&cli_request).map_err(|err| {
-                        Error::provider(
-                            self.name(),
-                            format!("Failed to serialize Gemini CLI request: {err}"),
-                        )
-                    })?;
-                    wrapper["request"] = inner;
-                    request.json(&wrapper)?
-                }
-                None => request.json(&cli_request)?,
-            };
+            let cli_request = build_google_cli_request(
+                &self.model,
+                &project_id,
+                rewritten_inner.unwrap_or(request_body),
+                is_antigravity,
+            )
+            .map_err(|message| Error::provider(self.name(), message.to_string()))?;
+            let request = request.json(&cli_request)?;
             let response = Box::pin(request.send()).await?;
             let status = response.status();
             if !(200..300).contains(&status) {
@@ -415,73 +411,8 @@ impl Provider for GeminiProvider {
             let provider = self.name().to_string();
             let cloud_cli_mode = self.google_cli_mode;
 
-            let stream = stream::unfold(
-                StreamState::new(event_source, model, api, provider),
-                move |mut state| async move {
-                    if state.finished {
-                        return None;
-                    }
-                    loop {
-                        // Drain pending events before polling for more SSE data
-                        if let Some(event) = state.pending_events.pop_front() {
-                            return Some((Ok(event), state));
-                        }
-
-                        match state.event_source.next().await {
-                            Some(Ok(msg)) => {
-                                state.transient_error_count = 0;
-                                if msg.event == "ping" {
-                                    continue;
-                                }
-
-                                let processing = if cloud_cli_mode {
-                                    state.process_cloud_code_event(&msg.data)
-                                } else {
-                                    state.process_event(&msg.data)
-                                };
-                                if let Err(e) = processing {
-                                    state.finished = true;
-                                    return Some((Err(e), state));
-                                }
-                            }
-                            Some(Err(e)) => {
-                                // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
-                                // Skip them and keep reading the stream, but cap
-                                // consecutive occurrences to avoid infinite loops.
-                                const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                                if e.kind() == std::io::ErrorKind::WriteZero
-                                    || e.kind() == std::io::ErrorKind::WouldBlock
-                                    || e.kind() == std::io::ErrorKind::TimedOut
-                                {
-                                    state.transient_error_count += 1;
-                                    if state.transient_error_count
-                                        <= MAX_CONSECUTIVE_TRANSIENT_ERRORS
-                                    {
-                                        tracing::warn!(
-                                            kind = ?e.kind(),
-                                            count = state.transient_error_count,
-                                            "Transient error in SSE stream, continuing"
-                                        );
-                                        continue;
-                                    }
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                         consecutive attempts, treating as fatal"
-                                    );
-                                }
-                                state.finished = true;
-                                let err = Error::sse(&e);
-                                return Some((Err(err), state));
-                            }
-                            None => {
-                                let outcome = state.finish_at_eof();
-                                return Some((outcome, state));
-                            }
-                        }
-                    }
-                },
-            );
+            let stream = StreamState::new(event_source, model, api, provider)
+                .into_stream(cloud_cli_mode);
 
             return Ok(Box::pin(stream));
         }
@@ -540,12 +471,8 @@ impl Provider for GeminiProvider {
             |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
         )
         .await;
-        let mut body = match rewritten_body {
-            Some(body) => body,
-            None => serde_json::to_value(&request_body)?,
-        };
-        // Release the typed payload before decoding large base64 attachments.
-        drop(request_body);
+        // Moving the fallback also drops its media copy when a rewrite won.
+        let mut body = rewritten_body.unwrap_or(request_body);
         // Stage the final payload after extension rewrites. Session originals
         // stay inline and portable; remote file URIs are transport-only state.
         // Cloud Code Assist returned above; Vertex uses its separate provider.
@@ -578,63 +505,8 @@ impl Provider for GeminiProvider {
         let provider = self.name().to_string();
         let cloud_cli_mode = self.google_cli_mode;
 
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            move |mut state| async move {
-                if state.finished {
-                    return None;
-                }
-                loop {
-                    // Drain pending events before polling for more SSE data
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            state.transient_error_count = 0;
-                            if msg.event == "ping" {
-                                continue;
-                            }
-
-                            let processing = if cloud_cli_mode {
-                                state.process_cloud_code_event(&msg.data)
-                            } else {
-                                state.process_event(&msg.data)
-                            };
-                            if let Err(e) = processing {
-                                state.finished = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_WRITE_ZERO {
-                                    tracing::warn!(
-                                        count = state.transient_error_count,
-                                        "Transient WriteZero error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    "WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.finished = true;
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        None => {
-                            let outcome = state.finish_at_eof();
-                            return Some((outcome, state));
-                        }
-                    }
-                }
-            },
-        );
+        let stream = StreamState::new(event_source, model, api, provider)
+            .into_stream(cloud_cli_mode);
 
         Ok(Box::pin(stream))
     }
@@ -644,29 +516,37 @@ impl Provider for GeminiProvider {
 // Stream State
 // ============================================================================
 
-struct StreamState<S>
+/// Shared by Developer API, Cloud Code Assist and Google-native Vertex.
+/// Keeping one parser also keeps signature boundaries and usage accounting
+/// identical across the three transports.
+pub(super) struct StreamState<S>
 where
     S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
 {
-    event_source: SseStream<S>,
+    pub(super) event_source: SseStream<S>,
     partial: AssistantMessage,
-    pending_events: VecDeque<StreamEvent>,
+    pub(super) pending_events: VecDeque<StreamEvent>,
     started: bool,
-    finished: bool,
-    /// Consecutive WriteZero errors seen without a successful event in between.
-    transient_error_count: usize,
+    pub(super) finished: bool,
     /// Whether a chunk carried a terminal marker (`finishReason` on the
     /// candidate, or a `promptFeedback.blockReason`). Gemini's final chunk
     /// always carries one; a transport close without it is a truncated
     /// stream, not a complete answer.
     saw_terminal: bool,
+    content_state: reasoning::ContentState,
+    usage_state: reasoning::UsageState,
 }
 
 impl<S> StreamState<S>
 where
     S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
 {
-    fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
+    pub(super) fn new(
+        event_source: SseStream<S>,
+        model: String,
+        api: String,
+        provider: String,
+    ) -> Self {
         Self {
             event_source,
             partial: AssistantMessage {
@@ -683,21 +563,66 @@ where
             pending_events: VecDeque::new(),
             started: false,
             finished: false,
-            transient_error_count: 0,
             saw_terminal: false,
+            content_state: reasoning::ContentState::default(),
+            usage_state: reasoning::UsageState::default(),
         }
+    }
+
+    pub(super) fn into_stream(
+        self,
+        cloud_cli_mode: bool,
+    ) -> impl Stream<Item = Result<StreamEvent>> {
+        stream::unfold(self, move |mut state| async move {
+            loop {
+                if let Some(event) = state.pending_events.pop_front() {
+                    return Some((Ok(event), state));
+                }
+                if state.finished {
+                    return None;
+                }
+                match state.event_source.next().await {
+                    Some(Ok(msg)) => {
+                        if msg.event == "ping" {
+                            continue;
+                        }
+                        let result = if cloud_cli_mode {
+                            state.process_cloud_code_event(&msg.data)
+                        } else {
+                            state.process_event(&msg.data)
+                        };
+                        if let Err(error) = result {
+                            state.finished = true;
+                            return Some((Err(error), state));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        // SseStream errors are terminal. Swallowing a timeout
+                        // here would turn its next EOF into a clean success
+                        // when a finish marker had already been observed.
+                        state.finished = true;
+                        return Some((Err(Error::sse(&error)), state));
+                    }
+                    None => {
+                        let outcome = state.finish_at_eof();
+                        return Some((outcome, state));
+                    }
+                }
+            }
+        })
     }
 
     /// Terminal outcome once the transport closes. A close without a
     /// terminal marker means the response was cut off mid-stream (proxy
     /// reset, idle timeout, dropped connection): surface a retryable error
     /// instead of committing the partial text as a clean `Stop`.
-    fn finish_at_eof(&mut self) -> Result<StreamEvent> {
+    pub(super) fn finish_at_eof(&mut self) -> Result<StreamEvent> {
         self.finished = true;
         if !self.saw_terminal {
-            return Err(Error::api(
-                "Gemini stream ended before finishReason (unexpected EOF)",
-            ));
+            return Err(Error::api(format!(
+                "{} stream ended before finishReason (unexpected EOF)",
+                self.service_label()
+            )));
         }
         // Gemini commonly sends STOP in a separate final chunk after the
         // function calls. It completes the model step, not the agent's turn.
@@ -715,18 +640,31 @@ where
         Ok(StreamEvent::Done { reason, message })
     }
 
-    fn process_event(&mut self, data: &str) -> Result<()> {
+    fn service_label(&self) -> &'static str {
+        if self.partial.api == "google-vertex" {
+            "Vertex AI"
+        } else {
+            "Gemini"
+        }
+    }
+
+    pub(super) fn process_event(&mut self, data: &str) -> Result<()> {
         let response: GeminiStreamResponse = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+            .map_err(wire::response_parse_error)?;
         self.process_response(response)
     }
 
     fn process_response(&mut self, response: GeminiStreamResponse) -> Result<()> {
-        // Handle usage metadata
+        // Usage chunks are cumulative and can omit individual counters.
         if let Some(metadata) = response.usage_metadata {
-            self.partial.usage.input = metadata.prompt_token_count.unwrap_or(0);
-            self.partial.usage.output = metadata.candidates_token_count.unwrap_or(0);
-            self.partial.usage.total_tokens = metadata.total_token_count.unwrap_or(0);
+            self.usage_state.update(
+                &mut self.partial.usage,
+                metadata.prompt_token_count,
+                metadata.candidates_token_count,
+                metadata.thoughts_token_count,
+                metadata.cached_content_token_count,
+                metadata.total_token_count,
+            );
         }
 
         // A blocked prompt arrives as `promptFeedback.blockReason` with no
@@ -739,7 +677,13 @@ where
         {
             self.saw_terminal = true;
             self.partial.stop_reason = StopReason::Error;
-            self.partial.error_message = Some(format!("Gemini blocked the prompt: {reason}"));
+            self.partial.error_message =
+                Some(format!("{} blocked the prompt: {reason}", self.service_label()));
+            self.content_state
+                .close(&self.partial, &mut self.pending_events);
+            // A refused prompt must not dispatch content/tool calls even if
+            // a malformed response also supplies candidates.
+            return Ok(());
         }
 
         // Process candidates
@@ -754,7 +698,7 @@ where
 
     fn process_cloud_code_event(&mut self, data: &str) -> Result<()> {
         let wrapped: CloudCodeAssistResponseChunk = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+            .map_err(wire::response_parse_error)?;
         let Some(response) = wrapped.response else {
             return Ok(());
         };
@@ -786,42 +730,42 @@ where
             for part in content.parts {
                 match part {
                     GeminiPart::Text { text } => {
-                        // Accumulate text into partial
-                        let last_is_text =
-                            matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-
-                        // Ensure Start is emitted before any TextStart/TextDelta events
-                        // so downstream consumers see the correct event order:
-                        // Start → TextStart → TextDelta
-                        self.ensure_started();
-
-                        let content_index = if last_is_text {
-                            self.partial.content.len() - 1
-                        } else {
-                            let idx = self.partial.content.len();
-                            self.partial
-                                .content
-                                .push(ContentBlock::Text(TextContent::new("")));
-                            self.pending_events
-                                .push_back(StreamEvent::TextStart { content_index: idx });
-                            idx
-                        };
-
-                        if let Some(ContentBlock::Text(t)) =
-                            self.partial.content.get_mut(content_index)
-                        {
-                            t.text.push_str(&text);
-                        }
-
-                        self.pending_events.push_back(StreamEvent::TextDelta {
-                            content_index,
-                            delta: text,
-                        });
+                        self.content_state.append(
+                            &mut self.partial,
+                            &mut self.pending_events,
+                            &mut self.started,
+                            text,
+                            false,
+                            None,
+                        );
+                    }
+                    GeminiPart::SignedText { text, thought_signature } => {
+                        self.content_state.append(
+                            &mut self.partial,
+                            &mut self.pending_events,
+                            &mut self.started,
+                            text,
+                            false,
+                            Some(thought_signature),
+                        );
+                    }
+                    GeminiPart::Thought { text, thought_signature, .. } => {
+                        self.content_state.append(
+                            &mut self.partial,
+                            &mut self.pending_events,
+                            &mut self.started,
+                            text,
+                            true,
+                            thought_signature,
+                        );
                     }
                     GeminiPart::FunctionCall {
                         function_call,
                         thought_signature,
                     } => {
+                        self.content_state
+                            .close(&self.partial, &mut self.pending_events);
+                        self.ensure_started();
                         // Generate a unique ID for this tool call
                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
 
@@ -847,8 +791,6 @@ where
                         if self.partial.stop_reason == StopReason::Stop {
                             self.partial.stop_reason = StopReason::ToolUse;
                         }
-
-                        self.ensure_started();
 
                         // Emit full ToolCallStart → ToolCallDelta → ToolCallEnd sequence
                         self.pending_events.push_back(StreamEvent::ToolCallStart {
@@ -876,22 +818,11 @@ where
             }
         }
 
-        // Emit TextEnd/ThinkingEnd for all open text/thinking blocks (not just the last
-        // one, since text/thinking may precede tool calls).
-        if has_finish_reason {
-            for (content_index, block) in self.partial.content.iter().enumerate() {
-                if let ContentBlock::Text(t) = block {
-                    self.pending_events.push_back(StreamEvent::TextEnd {
-                        content_index,
-                        content: t.text.clone(),
-                    });
-                } else if let ContentBlock::Thinking(t) = block {
-                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
-                        content_index,
-                        content: t.thinking.clone(),
-                    });
-                }
-            }
+        // Seal each block exactly once, including a late signature-bearing
+        // empty text part after the terminal candidate but before EOF.
+        if self.saw_terminal {
+            self.content_state
+                .close(&self.partial, &mut self.pending_events);
         }
 
         Ok(())
@@ -933,9 +864,20 @@ pub(crate) struct GeminiContent {
     pub(crate) parts: Vec<GeminiPart>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum GeminiPart {
+    Thought {
+        text: String,
+        thought: bool,
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    SignedText {
+        text: String,
+        #[serde(rename = "thoughtSignature")]
+        thought_signature: String,
+    },
     Text {
         text: String,
     },
@@ -975,7 +917,12 @@ pub(crate) struct GeminiBlob {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct GeminiFunctionCall {
     pub(crate) name: String,
+    #[serde(default = "empty_function_arguments")]
     pub(crate) args: serde_json::Value,
+}
+
+fn empty_function_arguments() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1079,6 +1026,10 @@ pub(crate) struct GeminiUsageMetadata {
     #[serde(default)]
     pub(crate) candidates_token_count: Option<u64>,
     #[serde(default)]
+    pub(crate) thoughts_token_count: Option<u64>,
+    #[serde(default)]
+    pub(crate) cached_content_token_count: Option<u64>,
+    #[serde(default)]
     pub(crate) total_token_count: Option<u64>,
 }
 
@@ -1100,12 +1051,25 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
         }],
         Message::Assistant(assistant) => {
             let mut parts = Vec::new();
+            let google_history = reasoning::is_google_message(assistant);
 
             for block in &assistant.content {
                 match block {
                     ContentBlock::Text(t) => {
-                        parts.push(GeminiPart::Text {
-                            text: t.text.clone(),
+                        if let Some(signature) = t.text_signature.as_ref().filter(|_| google_history) {
+                            parts.push(GeminiPart::SignedText {
+                                text: t.text.clone(),
+                                thought_signature: signature.clone(),
+                            });
+                        } else {
+                            parts.push(GeminiPart::Text { text: t.text.clone() });
+                        }
+                    }
+                    ContentBlock::Thinking(t) if google_history => {
+                        parts.push(GeminiPart::Thought {
+                            text: t.thinking.clone(),
+                            thought: true,
+                            thought_signature: t.thinking_signature.clone(),
                         });
                     }
                     ContentBlock::ToolCall(tc) => {
@@ -1114,16 +1078,16 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                                 name: tc.name.clone(),
                                 args: tc.arguments.clone(),
                             },
-                            thought_signature: tc.thought_signature.clone(),
+                            thought_signature: tc.thought_signature.clone().filter(|_| google_history),
                         });
                     }
                     ContentBlock::Thinking(_)
                     | ContentBlock::Image(_)
                     | ContentBlock::Media(_)
                     | ContentBlock::RedactedThinking(_) => {
-                        // Anthropic-shaped thinking blocks (including redacted
-                        // markers) and image/media blocks have no Gemini
-                        // equivalent on the model side.
+                        // Foreign-provider reasoning/signatures are not Google
+                        // state. Redacted markers and model-side media are not
+                        // replayed as reasoning text.
                     }
                 }
             }
@@ -1254,7 +1218,10 @@ pub(crate) fn convert_tool_to_gemini(tool: &ToolDef) -> GeminiFunctionDeclaratio
 
 #[cfg(test)]
 mod tests {
+    mod integration_reasoning;
+
     use super::*;
+    use crate::model::TextContent;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
