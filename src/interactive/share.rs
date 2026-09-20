@@ -127,6 +127,7 @@ impl ShareProcess {
         // bounded even when a child daemonizes. `try_wait` already reaped the
         // root, so only the process group/job can still contain live processes.
         if let Some(child) = self.child.as_ref() {
+            crate::tools::terminate_reaped_child_discipline(child.id());
             crate::tools::kill_process_group_tree(Some(child.id()));
         }
         let _ = self.child.take();

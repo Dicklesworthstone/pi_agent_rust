@@ -197,7 +197,11 @@ impl StreamLifecycle {
                 // Null/omitted reasons are valid metadata updates, but cannot
                 // authorize Done until an explicit reason has actually arrived.
                 if let Some(reason) = wire["delta"]["stop_reason"].as_str() {
-                    if self.stop_reason.as_deref().is_some_and(|seen| seen != reason) {
+                    if self
+                        .stop_reason
+                        .as_deref()
+                        .is_some_and(|seen| seen != reason)
+                    {
                         return Err(protocol_error("conflicting final stop reasons"));
                     }
                     self.stop_reason.get_or_insert_with(|| reason.to_string());
@@ -375,7 +379,11 @@ fn protocol_error(message: &str) -> Error {
 /// Text-only refusal, truncation and pause outcomes retain their public meaning.
 /// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
 fn authorize_terminal(event: StreamEvent) -> StreamEvent {
-    let StreamEvent::Done { reason, mut message } = event else {
+    let StreamEvent::Done {
+        reason,
+        mut message,
+    } = event
+    else {
         return event;
     };
     let has_calls = message
@@ -389,15 +397,15 @@ fn authorize_terminal(event: StreamEvent) -> StreamEvent {
         StopReason::Stop if has_calls => {
             Some("Anthropic ended without tool_use authorization; local tool calls withheld")
         }
-        StopReason::Length if has_calls => {
-            Some("Anthropic response was truncated before tool_use authorization; local tool calls withheld")
-        }
+        StopReason::Length if has_calls => Some(
+            "Anthropic response was truncated before tool_use authorization; local tool calls withheld",
+        ),
         StopReason::Refusal if has_calls => {
             Some("Anthropic refused the response; local tool calls withheld")
         }
-        StopReason::PauseTurn if has_calls => {
-            Some("Anthropic pause_turn cannot authorize client tool calls; local tool calls withheld")
-        }
+        StopReason::PauseTurn if has_calls => Some(
+            "Anthropic pause_turn cannot authorize client tool calls; local tool calls withheld",
+        ),
         _ => None,
     };
     if let Some(failure) = failure {
@@ -1403,9 +1411,16 @@ mod tests {
 
     fn terminal_failure(events: &[Result<StreamEvent>]) -> &AssistantMessage {
         assert!(events.iter().all(Result::is_ok), "{events:?}");
-        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+        );
         assert_eq!(
-            events.iter().filter(|event| matches!(event, Ok(StreamEvent::Error { .. }))).count(),
+            events
+                .iter()
+                .filter(|event| matches!(event, Ok(StreamEvent::Error { .. })))
+                .count(),
             1
         );
         let Some(Ok(StreamEvent::Error { reason, error })) = events.last() else {
@@ -1423,25 +1438,43 @@ mod tests {
             ("google-vertex", "google-vertex"),
         ] {
             for reason in [
-                "end_turn", "stop_sequence", "max_tokens",
-                "model_context_window_exceeded", "refusal", "pause_turn",
+                "end_turn",
+                "stop_sequence",
+                "max_tokens",
+                "model_context_window_exceeded",
+                "refusal",
+                "pause_turn",
             ] {
-                let events = collect_wire_for_api([
-                    start(),
-                    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
-                    json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "retained"}}),
-                    stop(0),
-                    tool_start(1, "call-a", &json!({"path": "must-not-run.txt"})),
-                    stop(1),
-                    final_delta(reason),
-                    json!({"type": "message_stop"}),
-                ], api, provider);
+                let events = collect_wire_for_api(
+                    [
+                        start(),
+                        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+                        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "retained"}}),
+                        stop(0),
+                        tool_start(1, "call-a", &json!({"path": "must-not-run.txt"})),
+                        stop(1),
+                        final_delta(reason),
+                        json!({"type": "message_stop"}),
+                    ],
+                    api,
+                    provider,
+                );
                 // ToolCallEnd is still a content event, not permission to run.
-                assert_eq!(events.iter().filter(|event| matches!(
-                    event, Ok(StreamEvent::ToolCallEnd { .. })
-                )).count(), 1);
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+                        .count(),
+                    1
+                );
                 let error = terminal_failure(&events);
-                assert!(error.error_message.as_deref().unwrap().contains("local tool calls withheld"));
+                assert!(
+                    error
+                        .error_message
+                        .as_deref()
+                        .unwrap()
+                        .contains("local tool calls withheld")
+                );
                 assert_eq!(error.api, api);
                 assert_eq!(error.provider, provider);
                 assert_eq!(error.model, "claude-test");
@@ -1480,10 +1513,16 @@ mod tests {
                 start(),
                 json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
                 json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "retained"}}),
-                stop(0), final_delta(reason), json!({"type": "message_stop"}),
+                stop(0),
+                final_delta(reason),
+                json!({"type": "message_stop"}),
             ]);
             assert!(events.iter().all(Result::is_ok), "{reason}: {events:?}");
-            assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Error { .. }))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Ok(StreamEvent::Error { .. })))
+            );
             let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
                 panic!("expected a coherent Done");
             };
@@ -1492,7 +1531,10 @@ mod tests {
             assert!(message.error_message.is_none());
             assert_eq!(message.usage.total_tokens, 67);
             if expected == StopReason::Refusal {
-                assert_eq!(message.stop_details.as_ref().unwrap().category.as_deref(), Some("fixture"));
+                assert_eq!(
+                    message.stop_details.as_ref().unwrap().category.as_deref(),
+                    Some("fixture")
+                );
             }
         }
     }
@@ -1510,7 +1552,13 @@ mod tests {
             input.extend([final_delta("tool_use"), json!({"type": "message_stop"})]);
             let events = collect_wire(input);
             let error = terminal_failure(&events);
-            assert!(error.error_message.as_deref().unwrap().contains("no client tool calls"));
+            assert!(
+                error
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("no client tool calls")
+            );
             assert_eq!(error.usage.total_tokens, 67);
         }
     }
@@ -1518,8 +1566,13 @@ mod tests {
     #[test]
     fn conflicting_stop_reasons_never_reauthorize_a_streamed_call() {
         let reasons = [
-            "tool_use", "end_turn", "stop_sequence", "max_tokens",
-            "model_context_window_exceeded", "refusal", "pause_turn",
+            "tool_use",
+            "end_turn",
+            "stop_sequence",
+            "max_tokens",
+            "model_context_window_exceeded",
+            "refusal",
+            "pause_turn",
         ];
         for first in reasons {
             for second in reasons {
@@ -1527,12 +1580,24 @@ mod tests {
                     continue;
                 }
                 let events = collect_wire([
-                    start(), tool_start(0, "call-a", &json!({})), stop(0),
-                    final_delta(first), final_delta(second), json!({"type": "message_stop"}),
+                    start(),
+                    tool_start(0, "call-a", &json!({})),
+                    stop(0),
+                    final_delta(first),
+                    final_delta(second),
+                    json!({"type": "message_stop"}),
                 ]);
                 assert_terminal_error(&events);
-                assert!(events.last().unwrap().as_ref().unwrap_err().to_string()
-                    .contains("conflicting final stop reasons"), "{first} -> {second}");
+                assert!(
+                    events
+                        .last()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("conflicting final stop reasons"),
+                    "{first} -> {second}"
+                );
             }
         }
     }
@@ -1540,7 +1605,9 @@ mod tests {
     #[test]
     fn repeated_or_null_metadata_cannot_erase_valid_tool_authorization() {
         let events = collect_wire([
-            start(), tool_start(0, "call-a", &json!({})), stop(0),
+            start(),
+            tool_start(0, "call-a", &json!({})),
+            stop(0),
             final_delta("tool_use"),
             json!({"type": "message_delta", "delta": {"stop_reason": null}, "usage": {"output_tokens": 8}}),
             final_delta("tool_use"),
@@ -1562,21 +1629,42 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         for reason in ["refusal", "tool_use"] {
             let bytes = [
-                start(), tool_start(0, "call-a", &json!({})),
-                tool_delta(0, "{\"path\":\"héllo.txt\"}"), stop(0),
-                final_delta(reason), json!({"type": "message_stop"}),
-            ].into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>().into_bytes();
+                start(),
+                tool_start(0, "call-a", &json!({})),
+                tool_delta(0, "{\"path\":\"héllo.txt\"}"),
+                stop(0),
+                final_delta(reason),
+                json!({"type": "message_stop"}),
+            ]
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+            .into_bytes();
             for split in 0..=bytes.len() {
                 let chunks = [Ok(bytes[..split].to_vec()), Ok(bytes[split..].to_vec())];
-                let events: Vec<_> = runtime.block_on(wire_stream(
-                    stream::iter(chunks), "claude-test".into(),
-                    "anthropic-messages".into(), "anthropic".into(),
-                ).collect());
+                let events: Vec<_> = runtime.block_on(
+                    wire_stream(
+                        stream::iter(chunks),
+                        "claude-test".into(),
+                        "anthropic-messages".into(),
+                        "anthropic".into(),
+                    )
+                    .collect(),
+                );
                 if reason == "refusal" {
                     terminal_failure(&events);
                 } else {
-                    assert!(events.iter().all(Result::is_ok), "split {split}: {events:?}");
-                    assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { reason: StopReason::ToolUse, .. }))));
+                    assert!(
+                        events.iter().all(Result::is_ok),
+                        "split {split}: {events:?}"
+                    );
+                    assert!(matches!(
+                        events.last(),
+                        Some(Ok(StreamEvent::Done {
+                            reason: StopReason::ToolUse,
+                            ..
+                        }))
+                    ));
                 }
             }
         }
@@ -1620,46 +1708,81 @@ mod tests {
             dropped: Arc::clone(&dropped),
         };
         (
-            wire_stream(source, "claude-test".into(), "anthropic-messages".into(), "anthropic".into()),
+            wire_stream(
+                source,
+                "claude-test".into(),
+                "anthropic-messages".into(),
+                "anthropic".into(),
+            ),
             dropped,
         )
     }
 
     fn wire_bytes(events: impl IntoIterator<Item = Value>) -> Vec<u8> {
-        events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>().into_bytes()
+        events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+            .into_bytes()
     }
 
     fn assert_retired(output: &mut EventStream, dropped: &AtomicBool) {
         // This assertion MUST precede another poll: a consumer may retain the
         // terminal stream indefinitely without ever asking it for EOF.
-        assert!(dropped.load(Ordering::SeqCst), "source retained after terminal event");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "source retained after terminal event"
+        );
         for _ in 0..3 {
-            assert!(output.next().now_or_never().expect("fused stream must be ready").is_none());
+            assert!(
+                output
+                    .next()
+                    .now_or_never()
+                    .expect("fused stream must be ready")
+                    .is_none()
+            );
         }
     }
 
     #[test]
     fn successful_terminal_releases_source_without_an_extra_poll() {
-        let bytes = wire_bytes([start(), final_delta("end_turn"), json!({"type": "message_stop"})]);
+        let bytes = wire_bytes([
+            start(),
+            final_delta("end_turn"),
+            json!({"type": "message_stop"}),
+        ]);
         let (mut output, dropped) = observed_wire([Ok(bytes)], true);
-        assert!(matches!(output.next().now_or_never().unwrap(), Some(Ok(StreamEvent::Start { .. }))));
+        assert!(matches!(
+            output.next().now_or_never().unwrap(),
+            Some(Ok(StreamEvent::Start { .. }))
+        ));
         assert!(!dropped.load(Ordering::SeqCst));
-        assert!(matches!(output.next().now_or_never().unwrap(), Some(Ok(StreamEvent::Done { .. }))));
+        assert!(matches!(
+            output.next().now_or_never().unwrap(),
+            Some(Ok(StreamEvent::Done { .. }))
+        ));
         assert_retired(&mut output, &dropped);
     }
 
     #[test]
     fn rejected_tool_terminal_releases_source_before_error_is_observed() {
         let bytes = wire_bytes([
-            start(), tool_start(0, "call-a", &json!({})), stop(0),
-            final_delta("refusal"), json!({"type": "message_stop"}),
+            start(),
+            tool_start(0, "call-a", &json!({})),
+            stop(0),
+            final_delta("refusal"),
+            json!({"type": "message_stop"}),
             // A queued tail cannot keep the source alive or reauthorize calls.
-            final_delta("tool_use"), json!({"type": "message_stop"}),
+            final_delta("tool_use"),
+            json!({"type": "message_stop"}),
         ]);
         let (mut output, dropped) = observed_wire([Ok(bytes)], true);
         for _ in 0..3 {
             let event = output.next().now_or_never().unwrap().unwrap().unwrap();
-            assert!(!matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. }));
+            assert!(!matches!(
+                event,
+                StreamEvent::Done { .. } | StreamEvent::Error { .. }
+            ));
         }
         let event = output.next().now_or_never().unwrap().unwrap().unwrap();
         let StreamEvent::Error { reason, error } = event else {
@@ -1678,7 +1801,8 @@ mod tests {
             wire_bytes([start(), start()]),
             wire_bytes([start(), final_delta("refusal"), final_delta("tool_use")]),
             wire_bytes([
-                start(), tool_start(0, "call-a", &json!({})),
+                start(),
+                tool_start(0, "call-a", &json!({})),
                 json!({"type": "content_block_delta", "index": 0, "delta": {
                     "type": "input_json_delta", "partial_json": null
                 }}),
@@ -1687,7 +1811,11 @@ mod tests {
             let (mut output, dropped) = observed_wire([Ok(bytes)], true);
             let mut terminal_seen = false;
             for _ in 0..8 {
-                let event = output.next().now_or_never().expect("error must not wait for EOF").unwrap();
+                let event = output
+                    .next()
+                    .now_or_never()
+                    .expect("error must not wait for EOF")
+                    .unwrap();
                 if event.is_err() {
                     terminal_seen = true;
                     break;
@@ -1705,7 +1833,10 @@ mod tests {
             start(),
         ]);
         let (mut output, dropped) = observed_wire([Ok(bytes)], true);
-        assert!(matches!(output.next().now_or_never().unwrap(), Some(Ok(StreamEvent::Error { .. }))));
+        assert!(matches!(
+            output.next().now_or_never().unwrap(),
+            Some(Ok(StreamEvent::Error { .. }))
+        ));
         assert_retired(&mut output, &dropped);
     }
 
@@ -1716,15 +1847,23 @@ mod tests {
             std::io::ErrorKind::ConnectionReset,
             std::io::ErrorKind::Interrupted,
         ] {
-            let (mut output, dropped) = observed_wire([Err(std::io::Error::new(kind, "fixture"))], true);
+            let (mut output, dropped) =
+                observed_wire([Err(std::io::Error::new(kind, "fixture"))], true);
             assert!(output.next().now_or_never().unwrap().unwrap().is_err());
             assert_retired(&mut output, &dropped);
         }
         for started in [false, true] {
-            let chunks = if started { vec![Ok(wire_bytes([start()]))] } else { Vec::new() };
+            let chunks = if started {
+                vec![Ok(wire_bytes([start()]))]
+            } else {
+                Vec::new()
+            };
             let (mut output, dropped) = observed_wire(chunks, false);
             if started {
-                assert!(matches!(output.next().now_or_never().unwrap(), Some(Ok(StreamEvent::Start { .. }))));
+                assert!(matches!(
+                    output.next().now_or_never().unwrap(),
+                    Some(Ok(StreamEvent::Start { .. }))
+                ));
             }
             assert!(output.next().now_or_never().unwrap().unwrap().is_err());
             assert_retired(&mut output, &dropped);
@@ -1758,12 +1897,17 @@ mod tests {
             let frame = match kind {
                 "header" => b"event: ping\ndata: {}\n\n".to_vec(),
                 "body" => wire_bytes([json!({"type": "ping"})]),
-                "metadata" => wire_bytes([json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 1}})]),
+                "metadata" => wire_bytes([
+                    json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 1}}),
+                ]),
                 _ => panic!("unexpected fixture kind"),
             };
             bytes.extend(frame);
         }
-        bytes.extend(wire_bytes([final_delta("end_turn"), json!({"type": "message_stop"})]));
+        bytes.extend(wire_bytes([
+            final_delta("end_turn"),
+            json!({"type": "message_stop"}),
+        ]));
         bytes
     }
 
@@ -1774,14 +1918,25 @@ mod tests {
             let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
             let waker = Waker::from(Arc::clone(&flag));
             let mut task = TaskContext::from_waker(&waker);
-            assert!(matches!(output.as_mut().poll_next(&mut task), Poll::Ready(Some(Ok(StreamEvent::Start { .. })))));
-            assert!(output.as_mut().poll_next(&mut task).is_pending(), "{kind} must yield before completing the burst");
-            assert!(flag.0.load(Ordering::SeqCst), "{kind} must schedule another poll");
+            assert!(matches!(
+                output.as_mut().poll_next(&mut task),
+                Poll::Ready(Some(Ok(StreamEvent::Start { .. })))
+            ));
+            assert!(
+                output.as_mut().poll_next(&mut task).is_pending(),
+                "{kind} must yield before completing the burst"
+            );
+            assert!(
+                flag.0.load(Ordering::SeqCst),
+                "{kind} must schedule another poll"
+            );
             assert!(!dropped.load(Ordering::SeqCst));
             // A finite burst must still finish, with no timer or network EOF.
             let mut done = false;
             for _ in 0..4 {
-                if let Poll::Ready(Some(Ok(StreamEvent::Done { message, .. }))) = output.as_mut().poll_next(&mut task) {
+                if let Poll::Ready(Some(Ok(StreamEvent::Done { message, .. }))) =
+                    output.as_mut().poll_next(&mut task)
+                {
                     assert_eq!(message.usage.total_tokens, 67);
                     done = true;
                     break;
@@ -1797,7 +1952,10 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let (mut output, dropped) = observed_wire([Ok(silent_burst("metadata"))], true);
         runtime.block_on(async {
-            assert!(matches!(output.next().await, Some(Ok(StreamEvent::Start { .. }))));
+            assert!(matches!(
+                output.next().await,
+                Some(Ok(StreamEvent::Start { .. }))
+            ));
             let (abort, signal) = crate::agent::AbortHandle::new();
             // Poll the response first. Without cooperative yielding it returns
             // Done before the abort branch ever gets a chance to run.

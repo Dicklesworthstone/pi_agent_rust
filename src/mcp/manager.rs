@@ -3184,7 +3184,7 @@ mod tests {
     fn stale_malformed_tools_list_cannot_poison_replacement() {
         assert_stale_tools_list_preserves_replacement(
             serde_json::json!({"tools": [{"name": "broken"}]}),
-            "MCP_PROTOCOL",
+            "MCP_TRANSPORT_SUPERSEDED",
         );
     }
 

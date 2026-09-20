@@ -128,7 +128,7 @@ impl State {
         self.acknowledged.is_some()
     }
 
-    pub(super) fn record_sent(&mut self, id: u64, accepted: bool) {
+    pub(super) const fn record_sent(&mut self, id: u64, accepted: bool) {
         self.pending = Some((id, accepted));
     }
 

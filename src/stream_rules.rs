@@ -148,6 +148,7 @@ fn screened_excerpt(text: &str) -> String {
 }
 
 /// Evaluate the entire incoming delta plus bounded same-channel history.
+///
 /// Lookback limits cross-delta history, not the portion of a delta inspected.
 /// Matches that need more historical bytes than the lookback are not promised;
 /// regex end anchors still observe the current, not a future, stream prefix.

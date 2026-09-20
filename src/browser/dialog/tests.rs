@@ -1,6 +1,8 @@
 //! The real browser tool against a bounded HTTP/WebSocket protocol peer.
 //! These fixtures do not substitute for a live Chromium or DSR run.
 
+#![allow(clippy::needless_pass_by_value)]
+
 use super::*;
 use crate::browser::BrowserTool;
 use crate::tools::Tool;

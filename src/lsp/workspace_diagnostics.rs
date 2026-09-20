@@ -25,9 +25,14 @@ const MAX_PATH_BYTES: usize = 4096;
 const RESULT_RESERVE: usize = 64 * 1024;
 
 fn checkpoint(owner: &AgentCx) -> Result<()> {
-    owner.checkpoint().map_err(|_| tool_err("LSP_CANCELLED", "workspace diagnostics cancelled"))?;
+    owner
+        .checkpoint()
+        .map_err(|_| tool_err("LSP_CANCELLED", "workspace diagnostics cancelled"))?;
     if !owner.capabilities().io {
-        return Err(tool_err("LSP_IO_PERMISSION", "workspace diagnostics requires filesystem I/O"));
+        return Err(tool_err(
+            "LSP_IO_PERMISSION",
+            "workspace diagnostics requires filesystem I/O",
+        ));
     }
     Ok(())
 }
@@ -36,12 +41,18 @@ fn matcher(pattern: &str) -> Result<globset::GlobMatcher> {
     // Forward slashes give the same glob semantics on Unix and Windows.
     // Reject traversal, negation and native drive prefixes instead of treating
     // them as an empty workspace scan. Exact absolute file requests stay valid.
-    if pattern.is_empty() || pattern.len() > MAX_PATH_BYTES
-        || pattern.starts_with('/') || pattern.starts_with('!')
-        || pattern.contains(['\\', ':']) || pattern.chars().any(char::is_control)
+    if pattern.is_empty()
+        || pattern.len() > MAX_PATH_BYTES
+        || pattern.starts_with('/')
+        || pattern.starts_with('!')
+        || pattern.contains(['\\', ':'])
+        || pattern.chars().any(char::is_control)
         || pattern.split('/').any(|part| part == "..")
     {
-        return Err(tool_err("LSP_USAGE", "diagnostic globs must be positive workspace-relative paths without traversal"));
+        return Err(tool_err(
+            "LSP_USAGE",
+            "diagnostic globs must be positive workspace-relative paths without traversal",
+        ));
     }
     globset::GlobBuilder::new(pattern.strip_prefix("./").unwrap_or(pattern))
         .literal_separator(true)
@@ -91,7 +102,9 @@ fn discover(
             found.stop = Some("walk_limit");
             break;
         }
-        let Some(entry) = walker.next() else { break; };
+        let Some(entry) = walker.next() else {
+            break;
+        };
         checkpoint(owner)?;
         if started.elapsed() >= timeout {
             found.stop = Some("timeout");
@@ -100,18 +113,27 @@ fn discover(
         found.visited += 1;
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => { found.errors += 1; continue; }
+            Err(_) => {
+                found.errors += 1;
+                continue;
+            }
         };
-        if entry.error().is_some() { found.errors += 1; }
+        if entry.error().is_some() {
+            found.errors += 1;
+        }
         if entry.file_type().is_some_and(|kind| kind.is_dir()) && entry.depth() >= MAX_DEPTH {
             found.stop.get_or_insert("depth_limit");
         }
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) { continue; }
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
         let Ok(relative) = entry.path().strip_prefix(root) else {
             found.errors += 1;
             continue;
         };
-        if !glob.is_match(relative) { continue; }
+        if !glob.is_match(relative) {
+            continue;
+        }
         let Some(relative) = relative.to_str() else {
             found.errors += 1;
             continue;
@@ -122,19 +144,28 @@ fn discover(
         }
         let relative = relative.replace(std::path::MAIN_SEPARATOR, "/");
         found.matched += 1;
-        if after.is_some_and(|after| relative.as_str() <= after) { continue; }
+        if after.is_some_and(|after| relative.as_str() <= after) {
+            continue;
+        }
         found.eligible += 1;
         found.files.insert(relative);
         // Keep a bounded, deterministic first page even with unordered walks.
-        if found.files.len() > limit { found.files.pop_last(); }
+        if found.files.len() > limit {
+            found.files.pop_last();
+        }
     }
-    if found.eligible > limit { found.stop.get_or_insert("file_limit"); }
+    if found.eligible > limit {
+        found.stop.get_or_insert("file_limit");
+    }
     Ok(found)
 }
 
 fn scoped_file(root: &Path, relative: &str) -> Result<(PathBuf, u64)> {
     let path = root.join(relative);
-    if Path::new(relative).components().any(|part| !matches!(part, Component::Normal(_))) {
+    if Path::new(relative)
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+    {
         return Err(tool_err("LSP_FILE_SCOPE", "invalid discovered path"));
     }
     // Recheck the route immediately before reading. A directory or file that
@@ -142,10 +173,16 @@ fn scoped_file(root: &Path, relative: &str) -> Result<(PathBuf, u64)> {
     let canonical = path.canonicalize()?;
     let metadata = std::fs::symlink_metadata(&path)?;
     if canonical != path || !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(tool_err("LSP_FILE_SCOPE", "diagnostic source is no longer a scoped regular file"));
+        return Err(tool_err(
+            "LSP_FILE_SCOPE",
+            "diagnostic source is no longer a scoped regular file",
+        ));
     }
     if metadata.len() > MAX_FILE_BYTES {
-        return Err(tool_err("LSP_FILE_LIMIT", "diagnostic source exceeds 8 MiB"));
+        return Err(tool_err(
+            "LSP_FILE_LIMIT",
+            "diagnostic source exceeds 8 MiB",
+        ));
     }
     Ok((canonical, metadata.len()))
 }
@@ -153,9 +190,14 @@ fn scoped_file(root: &Path, relative: &str) -> Result<(PathBuf, u64)> {
 fn read_source(root: &Path, relative: &str) -> Result<String> {
     let (path, _) = scoped_file(root, relative)?;
     let mut text = String::new();
-    std::fs::File::open(path)?.take(MAX_FILE_BYTES + 1).read_to_string(&mut text)?;
+    std::fs::File::open(path)?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
     if text.len() as u64 > MAX_FILE_BYTES {
-        return Err(tool_err("LSP_FILE_LIMIT", "diagnostic source grew beyond 8 MiB"));
+        return Err(tool_err(
+            "LSP_FILE_LIMIT",
+            "diagnostic source grew beyond 8 MiB",
+        ));
     }
     Ok(text)
 }
@@ -171,11 +213,15 @@ fn short_error(error: &crate::error::Error) -> String {
 struct ByteBudget(usize);
 impl Write for ByteBudget {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.checked_sub(bytes.len())
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
             .ok_or_else(|| std::io::Error::other("diagnostic output limit"))?;
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn size_within(value: &Value, limit: usize) -> Option<usize> {
@@ -185,43 +231,90 @@ fn size_within(value: &Value, limit: usize) -> Option<usize> {
 }
 
 impl LspTool {
-    async fn check_workspace_document(&self, root: &Path, relative: &str, before: u64, wait: Duration) -> Result<(Value, u64)> {
+    async fn check_workspace_document(
+        &self,
+        root: &Path,
+        relative: &str,
+        before: u64,
+        wait: Duration,
+    ) -> Result<(Value, u64)> {
         let (path, _) = scoped_file(root, relative)?;
         let (uri, entry) = self.synced(&path).await?;
-        let source = entry.client.synchronized_text(&uri)
-            .ok_or_else(|| tool_err("LSP_DIAGNOSTIC_STALE", "diagnostic source was not synchronized"))?;
+        let source = entry.client.synchronized_text(&uri).ok_or_else(|| {
+            tool_err(
+                "LSP_DIAGNOSTIC_STALE",
+                "diagnostic source was not synchronized",
+            )
+        })?;
         if super::text::content_hash_for_drift(&source) != before {
-            return Err(tool_err("LSP_DIAGNOSTIC_STALE", "source changed during synchronization"));
+            return Err(tool_err(
+                "LSP_DIAGNOSTIC_STALE",
+                "source changed during synchronization",
+            ));
         }
         let diagnostics = entry.client.document_diagnostics(&uri, wait).await?;
         if disk_hash(root, relative)? != before {
-            return Err(tool_err("LSP_DIAGNOSTIC_STALE", "source changed while obtaining diagnostics"));
+            return Err(tool_err(
+                "LSP_DIAGNOSTIC_STALE",
+                "source changed while obtaining diagnostics",
+            ));
         }
-        Ok((json!({"file":relative,"server":entry.spec_name,"status":"checked",
-            "count":diagnostics.len(),"diagnostics":diagnostics}), before))
+        Ok((
+            json!({"file":relative,"server":entry.spec_name,"status":"checked",
+            "count":diagnostics.len(),"diagnostics":diagnostics}),
+            before,
+        ))
     }
 
-    pub(super) async fn run_workspace_diagnostics(&self, input: &LspInput, pattern: &str) -> Result<ToolOutput> {
+    pub(super) async fn run_workspace_diagnostics(
+        &self,
+        input: &LspInput,
+        pattern: &str,
+    ) -> Result<ToolOutput> {
         let glob = matcher(pattern)?;
         if let Some(after) = input.after.as_deref() {
-            if after.is_empty() || after.len() > MAX_PATH_BYTES || after.contains('\0')
+            if after.is_empty()
+                || after.len() > MAX_PATH_BYTES
+                || after.contains('\0')
                 || Path::new(after).is_absolute()
-                || Path::new(after).components().any(|part| !matches!(part, Component::Normal(_)))
+                || Path::new(after)
+                    .components()
+                    .any(|part| !matches!(part, Component::Normal(_)))
                 || after.split('/').any(|part| matches!(part, "" | "." | ".."))
             {
-                return Err(tool_err("LSP_USAGE", "after must be a bounded workspace-relative cursor path"));
+                return Err(tool_err(
+                    "LSP_USAGE",
+                    "after must be a bounded workspace-relative cursor path",
+                ));
             }
         }
         if input.limit == Some(0) {
-            return Err(tool_err("LSP_USAGE", "diagnostic file limit must be positive"));
+            return Err(tool_err(
+                "LSP_USAGE",
+                "diagnostic file limit must be positive",
+            ));
         }
         let limit = input.limit.unwrap_or(100).min(MAX_FILES);
-        let timeout = Duration::from_secs(input.timeout.filter(|seconds| *seconds > 0).unwrap_or(30).min(120));
+        let timeout = Duration::from_secs(
+            input
+                .timeout
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(30)
+                .min(120),
+        );
         let started = Instant::now();
         let owner = AgentCx::for_current_or_request();
         checkpoint(&owner)?;
         let root = self.cwd.canonicalize()?;
-        let found = discover(&root, &glob, limit, input.after.as_deref(), &owner, started, timeout)?;
+        let found = discover(
+            &root,
+            &glob,
+            limit,
+            input.after.as_deref(),
+            &owner,
+            started,
+            timeout,
+        )?;
         let mut stop = found.stop;
         let mut entries = Vec::new();
         let mut guards = Vec::new();
@@ -231,10 +324,16 @@ impl LspTool {
         for relative in &found.files {
             checkpoint(&owner)?;
             let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() { stop = Some("timeout"); break; }
+            if remaining.is_zero() {
+                stop = Some("timeout");
+                break;
+            }
             let mut guard = None;
             let result = if self.registry.spec_for_file(&root.join(relative)).is_none() {
-                Err(tool_err("LSP_NO_SERVER", "no configured language server for this file"))
+                Err(tool_err(
+                    "LSP_NO_SERVER",
+                    "no configured language server for this file",
+                ))
             } else {
                 match read_source(&root, relative) {
                     Ok(source) => {
@@ -246,14 +345,27 @@ impl LspTool {
                         source_bytes += bytes;
                         let hash = super::text::content_hash_for_drift(&source);
                         drop(source);
-                        let now = owner.cx().timer_driver()
+                        let now = owner
+                            .cx()
+                            .timer_driver()
                             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                        match asupersync::time::timeout(now, remaining,
-                            self.check_workspace_document(&root, relative, hash, remaining.min(Duration::from_secs(5))))
-                            .await
+                        match asupersync::time::timeout(
+                            now,
+                            remaining,
+                            self.check_workspace_document(
+                                &root,
+                                relative,
+                                hash,
+                                remaining.min(Duration::from_secs(5)),
+                            ),
+                        )
+                        .await
                         {
                             Ok(result) => result,
-                            Err(_) => Err(tool_err("LSP_TIMEOUT", "workspace diagnostic budget expired")),
+                            Err(_) => Err(tool_err(
+                                "LSP_TIMEOUT",
+                                "workspace diagnostic budget expired",
+                            )),
                         }
                     }
                     Err(error) => Err(error),
@@ -261,7 +373,10 @@ impl LspTool {
             };
             checkpoint(&owner)?;
             let mut row = match result {
-                Ok((row, hash)) => { guard = Some(hash); row }
+                Ok((row, hash)) => {
+                    guard = Some(hash);
+                    row
+                }
                 Err(error) => json!({"file":relative,"status":"error","error":short_error(&error)}),
             };
             if size_within(&row, remaining_bytes).is_none() {
@@ -275,10 +390,14 @@ impl LspTool {
                 break;
             };
             remaining_bytes = remaining_bytes.saturating_sub(bytes + 1);
-            if let Some(hash) = guard { guards.push((entries.len(), relative, hash)); }
+            if let Some(hash) = guard {
+                guards.push((entries.len(), relative, hash));
+            }
             entries.push(row);
         }
-        if started.elapsed() >= timeout { stop = Some("timeout"); }
+        if started.elapsed() >= timeout {
+            stop = Some("timeout");
+        }
         // Another file's analysis can change an earlier source. Do not label
         // those earlier diagnostics current merely because their call succeeded.
         for (index, relative, expected) in guards {
@@ -288,19 +407,29 @@ impl LspTool {
                     "error":"LSP_DIAGNOSTIC_STALE"});
             }
         }
-        let checked = entries.iter().filter(|row| row["status"] == "checked").count();
-        let errors = entries.iter().filter(|row| row["status"] == "error").count();
+        let checked = entries
+            .iter()
+            .filter(|row| row["status"] == "checked")
+            .count();
+        let errors = entries
+            .iter()
+            .filter(|row| row["status"] == "error")
+            .count();
         // A cursor is sound only after complete discovery: otherwise unvisited
         // paths may sort before the last emitted name and be skipped forever.
-        let discovery_complete = found.errors == 0
-            && matches!(found.stop, None | Some("file_limit"));
+        let discovery_complete =
+            found.errors == 0 && matches!(found.stop, None | Some("file_limit"));
         let has_more = discovery_complete.then_some(found.eligible > entries.len());
         let next_after = if has_more == Some(true) {
             entries.last().and_then(|entry| entry["file"].as_str())
-        } else { None };
-        let page_complete = discovery_complete && !output_truncated
+        } else {
+            None
+        };
+        let page_complete = discovery_complete
+            && !output_truncated
             && matches!(stop, None | Some("file_limit"))
-            && entries.len() == found.files.len() && checked == entries.len();
+            && entries.len() == found.files.len()
+            && checked == entries.len();
         let complete = input.after.is_none() && page_complete && has_more == Some(false);
         let payload = json!({"action":"workspace_diagnostics","glob":pattern,"cachedOnly":false,
             "complete":complete,"stopReason":stop,"outputTruncated":output_truncated,
@@ -313,7 +442,10 @@ impl LspTool {
             "note":"Document reports for nonignored regular files under cwd, not an atomic project snapshot. Continuation pages never claim whole-workspace completeness; files added before a cursor need a fresh scan. Unversioned server pushes cannot prove server-side freshness. Missing or failed reports are not clean files."});
         // A final size guard includes metadata and replacements, not only rows.
         if size_within(&payload, MAX_PAYLOAD_BYTES).is_none() {
-            return Err(tool_err("LSP_DIAGNOSTIC_LIMIT", "workspace diagnostic output exceeds its byte limit"));
+            return Err(tool_err(
+                "LSP_DIAGNOSTIC_LIMIT",
+                "workspace diagnostic output exceeds its byte limit",
+            ));
         }
         let mut output = text_output(payload.to_string(), payload);
         output.is_error = errors > 0 || found.errors > 0;

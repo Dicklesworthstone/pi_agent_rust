@@ -102,6 +102,7 @@ impl CommandLease {
             .ok_or_else(|| tool_err("LSP_EDIT_REVOKED", "selected action lease ended"))?;
         let outcome = grant.edits.apply(entry, edit, || Ok(()))?;
         grant.report.record(outcome);
+        drop(active);
         Ok(())
     }
 
@@ -113,6 +114,7 @@ impl CommandLease {
             .ok_or_else(|| tool_err("LSP_EDIT_REVOKED", "selected action lease ended"))?;
         grant.edits.activate(entry, timeout)?;
         grant.accepting = true;
+        drop(active);
         self.state.admission.store(self.id, Ordering::Release);
         Ok(())
     }

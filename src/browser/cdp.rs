@@ -124,7 +124,6 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     dialog::validate_action(args)?;
     dialog::Expected::from_args(args, allowlist)?;
     match action {
-        "handle_dialog" => {}
         "start" | "status" | "stop" => {
             if args.as_object().is_some_and(|object| {
                 object
@@ -146,7 +145,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
         "evaluate" => {
             required(args, "script")?;
         }
-        "close" | "list_tabs" | "snapshot" | "ax_tree" => {}
+        "handle_dialog" | "close" | "list_tabs" | "snapshot" | "ax_tree" => {}
         "click" | "wait_for" => {
             required(args, "selector")?;
         }

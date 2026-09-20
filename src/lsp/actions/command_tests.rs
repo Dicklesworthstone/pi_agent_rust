@@ -225,7 +225,11 @@ fn server_callbacks_cannot_gain_io_authority_missing_from_the_selected_owner() {
     let source = temp.path().join("source.lspfixture").canonicalize().unwrap();
     let (_, entry) = runtime.block_on(tool.synced(&source)).unwrap();
     let snapshot = refactor::RefactorSnapshot::capture(&entry, &source, file_hash(&source).unwrap()).unwrap();
-    let owner = AgentCx::for_testing();
+    let restricted = asupersync::Cx::for_request().restrict::<asupersync::cx::cap::None>();
+    let owner = {
+        let _guard = restricted.set_current_restricted();
+        AgentCx::for_current_or_request()
+    };
     assert!(!owner.capabilities().io);
     let mut edits = snapshot.command_edits(owner);
     let error = edits.apply(&entry, &callback_edit(temp.path())["edit"], || Ok(())).unwrap_err();

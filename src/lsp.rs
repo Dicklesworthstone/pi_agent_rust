@@ -646,7 +646,10 @@ impl Tool for LspTool {
             return Err(tool_err("LSP_USAGE", "only is supported by code_actions"));
         }
         if input.after.is_some() && input.action != "workspace_diagnostics" {
-            return Err(tool_err("LSP_USAGE", "after requires workspace_diagnostics"));
+            return Err(tool_err(
+                "LSP_USAGE",
+                "after requires workspace_diagnostics",
+            ));
         }
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         let _operation =
@@ -657,7 +660,10 @@ impl Tool for LspTool {
             "diagnostics" => self.run_diagnostics(&input).await,
             "workspace_diagnostics" => {
                 let pattern = input.file.as_deref().ok_or_else(|| {
-                    tool_err("LSP_USAGE", "workspace_diagnostics requires file (a workspace-relative glob)")
+                    tool_err(
+                        "LSP_USAGE",
+                        "workspace_diagnostics requires file (a workspace-relative glob)",
+                    )
                 })?;
                 self.run_workspace_diagnostics(&input, pattern).await
             }

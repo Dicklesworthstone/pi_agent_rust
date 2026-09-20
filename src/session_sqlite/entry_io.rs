@@ -321,7 +321,7 @@ pub(super) struct InsertBatch<'a> {
 }
 
 impl<'a> InsertBatch<'a> {
-    pub(super) fn new(conn: &'a SqliteConnection) -> Self {
+    pub(super) const fn new(conn: &'a SqliteConnection) -> Self {
         Self {
             conn,
             params: Vec::new(),

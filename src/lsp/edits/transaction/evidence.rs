@@ -27,12 +27,13 @@ impl FileEvidence {
         let Some(image) = image else {
             return Self::Absent;
         };
-        if let Ok(text) = std::str::from_utf8(&image.bytes) {
-            Self::Text(content_hash_for_drift(text))
-        } else {
-            let mut hash = DefaultHasher::new();
-            image.bytes.hash(&mut hash);
-            Self::Binary(hash.finish())
+        match std::str::from_utf8(&image.bytes) {
+            Ok(text) => Self::Text(content_hash_for_drift(text)),
+            Err(_) => {
+                let mut hash = DefaultHasher::new();
+                image.bytes.hash(&mut hash);
+                Self::Binary(hash.finish())
+            }
         }
     }
 }

@@ -3087,8 +3087,23 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         config_override.as_deref(),
         options.workspace_trusted,
     )?;
-
-    let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
+    let auth_path = Config::auth_path();
+    let auth_result = AuthStorage::load_async(auth_path.clone()).await;
+    let mut auth = match auth_result {
+        Ok(auth) => auth,
+        Err(err)
+            if options
+                .api_key
+                .as_deref()
+                .is_some_and(|k| !k.trim().is_empty()) =>
+        {
+            tracing::warn!(
+                "stored credentials are unavailable ({err}); continuing with explicit api_key only"
+            );
+            AuthStorage::empty_at(auth_path)
+        }
+        Err(err) => return Err(err.into()),
+    };
     // gh #218: refresh per provider; only a failure for the provider this
     // session actually selects is an error (checked after selection below).
     let oauth_refresh = auth.refresh_expired_oauth_tokens_report().await;
