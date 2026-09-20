@@ -8,14 +8,10 @@ fn run_async<F: std::future::Future>(future: F) -> F::Output {
         .with_reactor(reactor)
         .build()
         .expect("runtime")
-        // Boxed: `create_agent_session`'s future does not fit a libtest
-        // thread's default stack, and overflowing it aborts the process rather
-        // than failing a test — which took the whole `cargo test --lib` run
-        // down with it, not just this file. Measured: all seven tests here
-        // pass unchanged under RUST_MIN_STACK=8388608, so the future is large
-        // rather than unbounded, and the heap is the right place for it. Same
-        // remedy the crate already applies at 29 other sites for
-        // `clippy::large_futures`; rpc.rs alone boxes 23 futures this way.
+        // Boxed for the same reason as `sdk::tests::run_async`, which see:
+        // `create_agent_session`'s future does not fit a libtest thread's
+        // 2 MiB default stack, and overflowing it aborts the process rather
+        // than failing one test.
         .block_on(Box::pin(future))
 }
 

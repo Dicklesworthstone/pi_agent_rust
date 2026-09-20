@@ -26,23 +26,30 @@ PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
 # Minimum stack for every thread a cargo-launched process spawns, which for
 # `cargo test` means each libtest test thread.
 #
-# Without it the lib test binary ABORTS rather than failing: every `sdk::tests`
-# case that builds a session overflows the 2 MiB default in a debug build, and a
-# stack overflow kills the process, so `cargo test --lib` exits on SIGABRT with
-# no pass/fail tally for any of its ~8500 tests. That is the same failure mode
-# bd-79qxb found in `sdk_unit` and `sdk_integration`; its fix
+# This used to be the only thing standing between `cargo test --lib` and an
+# abort: every `sdk::tests` case that builds a session overflows the 2 MiB
+# default in a debug build, and a stack overflow kills the process, so the run
+# ended with no pass/fail tally for any of its ~9900 tests. That is the same
+# failure mode bd-79qxb found in `sdk_unit` and `sdk_integration`; its fix
 # (`thread_stack_size` on the shared runtime builder, tests/common/mod.rs) could
 # not reach these, because they drive a `current_thread` runtime that polls on
 # the libtest thread itself, and several of their futures hold an
 # `asupersync::sync::MutexGuard` across an await so cannot be moved to a
-# reserved thread either. `RUST_MIN_STACK` is the only knob that reaches a
-# libtest thread.
+# reserved thread either.
+#
+# The lib suite no longer depends on it. `sdk::tests::run_async` and
+# `sdk::extension_bootstrap_tests::run_async` box their futures, and the whole
+# lib test binary now runs to a full tally on an unmodified 2 MiB stack. That
+# distinction matters because `[env]` reaches only processes cargo launches: a
+# built test binary invoked directly, as one does to skip a relink, gets none
+# of it, and used to abort with no output but an exit code.
 #
 # 16 MiB matches the project's other long-frame reservations,
 # `SQLITE_THREAD_STACK_BYTES` (src/session_sqlite.rs) and `DRIVER_STACK_BYTES`
-# (src/interactive_ftui.rs). The reservation is virtual and committed lazily, so
-# threads that never need it pay nothing. `force = false` leaves an operator
-# free to raise it further from the environment.
+# (src/interactive_ftui.rs). It stays as headroom for the other test binaries
+# and for any future deep frame. The reservation is virtual and committed
+# lazily, so threads that never need it pay nothing. `force = false` leaves an
+# operator free to raise it further from the environment.
 #
 # This reaches only processes cargo launches; a shipped `pi` binary is
 # unaffected.
