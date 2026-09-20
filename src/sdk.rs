@@ -2586,6 +2586,45 @@ impl AgentSessionHandle {
         self.session.set_thinking_level(level).await
     }
 
+    /// Step the thinking level one place through the levels the running model
+    /// actually offers, wrapping past the last one back to the first.
+    ///
+    /// Returns the level now in force, or `None` when there is nothing to
+    /// cycle through: a non-reasoning model offers only `Off`, and a model the
+    /// registry cannot resolve offers nothing at all. `None` is not an error —
+    /// the caller reports it as "this model does not support thinking", the
+    /// same as the charmed stack and the `cycle_thinking_level` RPC.
+    ///
+    /// The level list comes from [`ModelEntry::available_thinking_levels`],
+    /// which is the single definition of that policy, and the write goes
+    /// through [`Self::set_thinking_level`], so clamping, history dedupe and
+    /// persistence behave exactly as they do for an explicit `/thinking`.
+    pub async fn cycle_thinking_level(&mut self) -> Result<Option<crate::model::ThinkingLevel>> {
+        let Some(entry) = self.session.current_model_entry() else {
+            return Ok(None);
+        };
+        let levels = entry.available_thinking_levels();
+        if levels.len() <= 1 {
+            return Ok(None);
+        }
+        let current = self.thinking_level().unwrap_or_default();
+        // An unknown current level starts the cycle at the beginning rather
+        // than failing: a level clamped away by a model switch must not strand
+        // the key.
+        let index = levels
+            .iter()
+            .position(|level| *level == current)
+            .unwrap_or(0);
+        // `cycle` supplies the wrap, so this reads the same as indexing at
+        // `(index + 1) % len` without an index that has to be proven in range.
+        // The list is non-empty here, so `nth` always yields.
+        let Some(next) = levels.iter().copied().cycle().nth(index + 1) else {
+            return Ok(None);
+        };
+        self.set_thinking_level(next).await?;
+        Ok(Some(next))
+    }
+
     /// Update the persisted session display name.
     ///
     /// Records a `SessionInfo` entry with the new name on the leaf path and
@@ -4557,6 +4596,87 @@ mod tests {
                 .count()
         });
         assert_eq!(thinking_changes, 1);
+    }
+
+    #[test]
+    fn cycle_thinking_level_walks_the_models_own_levels_and_wraps() {
+        let tmp = tempdir().expect("tempdir");
+        let options = SessionOptions {
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-sonnet-4-6".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(tmp.path().to_path_buf()),
+            no_session: true,
+            ..SessionOptions::default()
+        };
+        let mut handle = run_async(create_agent_session(options)).expect("create session");
+        let levels = handle
+            .session()
+            .current_model_entry()
+            .expect("registry resolves the fixture model")
+            .available_thinking_levels();
+        assert!(
+            levels.len() > 1,
+            "fixture must be a reasoning model, got {levels:?}"
+        );
+
+        let start = handle.thinking_level().unwrap_or_default();
+        let start_index = levels
+            .iter()
+            .position(|level| *level == start)
+            .expect("starting level is one the model offers");
+
+        // The levels a full lap should visit, in order, starting one past the
+        // current one and wrapping back around to it.
+        let lap = levels
+            .iter()
+            .copied()
+            .cycle()
+            .skip(start_index + 1)
+            .take(levels.len())
+            .collect::<Vec<_>>();
+        assert_eq!(lap.len(), levels.len());
+
+        // Every step lands on the next level in the model's own list, the last
+        // wraps to the first, and the runtime agrees each time.
+        for (step, expected) in lap.into_iter().enumerate() {
+            let reported = run_async(handle.cycle_thinking_level()).expect("cycle");
+            assert_eq!(reported, Some(expected), "step {step}");
+            assert_eq!(handle.thinking_level(), Some(expected), "step {step}");
+        }
+        assert_eq!(
+            handle.thinking_level(),
+            Some(start),
+            "a full lap must return to where it started"
+        );
+    }
+
+    #[test]
+    fn cycle_thinking_level_reports_nothing_to_cycle_rather_than_moving() {
+        // gpt-4o does not reason, so `Off` is the only level it offers. The
+        // caller has to be able to tell that apart from a successful cycle —
+        // the UI prints "does not support thinking" on `None` — so this must
+        // not silently no-op and report a level.
+        let tmp = tempdir().expect("tempdir");
+        let options = SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(tmp.path().to_path_buf()),
+            no_session: true,
+            ..SessionOptions::default()
+        };
+        let mut handle = run_async(create_agent_session(options)).expect("create session");
+
+        assert_eq!(
+            run_async(handle.cycle_thinking_level()).expect("cycle"),
+            None
+        );
+        assert_eq!(
+            handle.session().agent.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Off),
+            "a model with nothing to cycle must be left where it was"
+        );
     }
 
     #[test]

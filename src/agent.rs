@@ -12726,6 +12726,20 @@ impl AgentSession {
         Ok(())
     }
 
+    /// The catalog entry for the model this session is currently running.
+    ///
+    /// `None` when no registry was installed or the running model is not in
+    /// it — an extension-registered or ad-hoc model, say. Callers that need a
+    /// model's declared capabilities (thinking levels, context window) should
+    /// resolve through here rather than re-deriving them, so a session that
+    /// cannot be resolved degrades the same way everywhere.
+    pub fn current_model_entry(&self) -> Option<ModelEntry> {
+        let provider = self.agent.provider();
+        self.model_registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider.name(), provider.model_id()))
+    }
+
     pub(crate) fn clamp_thinking_level_for_model(
         &self,
         provider_id: &str,

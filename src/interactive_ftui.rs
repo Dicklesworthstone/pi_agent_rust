@@ -1039,6 +1039,11 @@ pub enum UiCommand {
     /// The UI validates the level against `ThinkingLevel::from_str` before
     /// sending; invalid levels never reach the driver.
     SetThinking(Option<crate::model::ThinkingLevel>),
+    /// Step the thinking level to the next one this model offers
+    /// (`AppAction::CycleThinkingLevel`, shift+tab by default). The driver
+    /// owns the decision because only it can see the model's catalog entry;
+    /// the UI has no model state to cycle through.
+    CycleThinking,
     /// Set the session display name (`/name <name>`).
     SetName(String),
     /// Grant access to an additional workspace root
@@ -2916,6 +2921,12 @@ impl PiFtuiModel {
                     // /hotkeys and did nothing here until they were routed.
                     .or_else(|| pick(AppAction::SelectModel))
                     .or_else(|| pick(AppAction::Help))
+                    // shift+tab. Only the driver can see the model's catalog
+                    // entry, so the cycle itself lives there; this is the
+                    // routing that was missing. The completion popup claims
+                    // tab before this, above, which is why it stays correct
+                    // while the popup is open.
+                    .or_else(|| pick(AppAction::CycleThinkingLevel))
                     // Editor-native actions come last so nothing above changes
                     // meaning. They are routed at all because the ftui editor
                     // handles only ctrl+a/k/z/y, arrows, Home/End, Backspace,
@@ -3016,6 +3027,10 @@ impl PiFtuiModel {
                     }
                     Some(AppAction::Help) => {
                         self.route_slash_command_tail("/help");
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CycleThinkingLevel) => {
+                        self.send_command(UiCommand::CycleThinking);
                         return Cmd::none();
                     }
                     // Editor-native actions, routed from pi's keybinding
@@ -4728,6 +4743,23 @@ async fn run_set_thinking_command(
     let _ = agent_tx.send(msg);
 }
 
+/// Handle `AppAction::CycleThinkingLevel` (shift+tab): step to the next
+/// thinking level this model offers.
+///
+/// The wording matches the charmed stack's `cycle_thinking_level` so the two
+/// stacks say the same thing about the same model.
+async fn run_cycle_thinking_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let msg = match handle.cycle_thinking_level().await {
+        Ok(Some(level)) => PiMsg::System(format!("Thinking level: {level}")),
+        Ok(None) => PiMsg::System(String::from("Current model does not support thinking")),
+        Err(err) => PiMsg::AgentError(format!("thinking: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+}
+
 /// Handle `/name <name>`: set the session display name.
 async fn run_set_name_command(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -5296,6 +5328,9 @@ pub fn run(
                         Ok(UiCommand::SetThinking(level)) => {
                             run_set_thinking_command(&mut handle, level, &agent_tx).await;
                         }
+                        Ok(UiCommand::CycleThinking) => {
+                            run_cycle_thinking_command(&mut handle, &agent_tx).await;
+                        }
                         Ok(UiCommand::SetName(name)) => {
                             run_set_name_command(&mut handle, &name, &agent_tx).await;
                         }
@@ -5849,6 +5884,53 @@ mod tests {
             added[0].text.contains("/model"),
             "f1 should print the help entry, got {:?}",
             added[0].text
+        );
+    }
+
+    #[test]
+    fn shift_tab_routes_the_thinking_cycle_to_the_driver() {
+        // `/hotkeys` advertises shift+tab for CycleThinkingLevel and it did
+        // nothing here: the catalog knew the action, no chain picked it, and
+        // the key reached the editor, which ignores Tab with a modifier.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        sim.inject_event(key(KeyCode::Tab, Modifiers::SHIFT));
+        assert_eq!(
+            submit_rx.try_recv().expect("shift+tab routed"),
+            UiCommand::CycleThinking
+        );
+        // The driver owns the level, so the key must not invent transcript
+        // text of its own; the reply it sends back is what the user sees.
+        assert!(
+            sim.model().transcript.is_empty(),
+            "shift+tab should report through the driver, not locally: {:?}",
+            sim.model().transcript
+        );
+    }
+
+    #[test]
+    fn shift_tab_belongs_to_the_completion_popup_while_it_is_open() {
+        // The popup claims navigation keys before the catalog chain runs, so
+        // cycling the thinking level must not steal them mid-completion.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/he");
+        assert!(
+            sim.model().completion_visible(),
+            "expected the completion popup for a slash prefix"
+        );
+
+        sim.inject_event(key(KeyCode::Tab, Modifiers::SHIFT));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "the popup must consume shift+tab before the thinking cycle"
         );
     }
 
