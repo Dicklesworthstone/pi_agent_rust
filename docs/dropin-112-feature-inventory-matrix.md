@@ -163,13 +163,13 @@
 |-------|-------|---------|-------|
 | DEFAULT_MAX_LINES | 2000 | 2000 | Match |
 | DEFAULT_MAX_BYTES | 1,000,000 | 1,000,000 | Match |
-| GREP_MAX_LINE_LENGTH | ? | 500 | Needs TS verification |
-| DEFAULT_GREP_LIMIT | ? | 100 | Needs TS verification |
-| DEFAULT_FIND_LIMIT | ? | 1000 | Needs TS verification |
-| DEFAULT_LS_LIMIT | ? | 500 | Needs TS verification |
-| DEFAULT_BASH_TIMEOUT_SECS | ? | 120 | Needs TS verification |
-| IMAGE_MAX_BYTES | ? | 4.5MB | Needs TS verification |
-| READ_TOOL_MAX_BYTES | ? | 100MB | Needs TS verification |
+| GREP_MAX_LINE_LENGTH | 500 | 500 | Match; `GREP_MAX_LINE_LENGTH = 500` in the bundled TS pi |
+| DEFAULT_GREP_LIMIT | ? | 100 | No same-named constant in the bundled TS pi, and no numeric default in its grep tool schema — the cap may be Rust-only |
+| DEFAULT_FIND_LIMIT | ? | 1000 | No same-named constant in the bundled TS pi |
+| DEFAULT_LS_LIMIT | ? | 500 | No same-named constant in the bundled TS pi |
+| DEFAULT_BASH_TIMEOUT_SECS | ? | 120 | No same-named constant in the bundled TS pi |
+| IMAGE_MAX_BYTES | 4.5MB | 4.5MB | Match; `4.5 * 1024 * 1024` in the bundled TS pi |
+| READ_TOOL_MAX_BYTES | ? | 100MB | No same-named constant in the bundled TS pi |
 
 ---
 
@@ -657,19 +657,19 @@
 | `ui.input()` | Y | Y | Input dialog |
 | `ui.notify()` | Y | Y | Notification |
 | `ui.setStatus()` | Y | Y | Status bar |
-| `ui.setWorkingMessage()` | Y | ? | Working message |
+| `ui.setWorkingMessage()` | Y | Y | Working message; bridges to the `setStatus` op |
 | `ui.setWidget()` | Y | Y | Custom widget |
-| `ui.setFooter()` | Y | ? | Custom footer |
-| `ui.setHeader()` | Y | ? | Custom header |
+| `ui.setFooter()` | Y | Y | Custom footer; bridges to `setStatus`/`setTitle` |
+| `ui.setHeader()` | Y | Y | Custom header; bridges to `setTitle`/`setStatus` |
 | `ui.setTitle()` | Y | Y | Window title |
-| `ui.custom()` | Y | ? | Custom component |
-| `ui.setEditorText()` | Y | ? | Set editor text |
-| `ui.getEditorText()` | Y | ? | Get editor text |
-| `ui.editor()` | Y | ? | Full editor dialog |
+| `ui.custom()` | Y | Y | Custom component; `custom` op in extension_dispatcher.rs |
+| `ui.setEditorText()` | Y | Y | `set_editor_text`, applied in interactive/agent.rs |
+| `ui.getEditorText()` | Y | Y | `getEditorText`, answered in interactive/agent.rs |
+| `ui.editor()` | Y | Y | Full editor dialog; `input`/`editor` op in rpc.rs |
 | `ui.theme` | Y | Y | Current theme |
-| `ui.getAllThemes()` | Y | ? | Theme list |
-| `ui.getTheme()` | Y | ? | Get theme by name |
-| `ui.setTheme()` | Y | ? | Set active theme |
+| `ui.getAllThemes()` | Y | Y | Theme list; answered in interactive/agent.rs |
+| `ui.getTheme()` | Y | Y | Get theme by name; answered in interactive/agent.rs |
+| `ui.setTheme()` | Y | Y | Set active theme; applied in interactive/agent.rs |
 
 ### Hostcalls
 
@@ -699,17 +699,17 @@
 | Component | TS Pi | Rust Pi | Notes |
 |-----------|-------|---------|-------|
 | Model selector | Y | Y | |
-| Scoped models selector | Y | ? | Needs verification |
+| Scoped models selector | Y | P | `handle_slash_scoped_models`; classic only, like `/scoped-models` |
 | Thinking selector | Y | Y | |
 | Session selector/picker | Y | Y | |
 | Tree selector | Y | Y | |
-| Settings selector | Y | ? | Needs verification |
-| Login dialog | Y | ? | OAuth flow |
-| Config selector | Y | ? | Package resource config |
+| Settings selector | Y | P | `SlashCommand::Settings`; classic only |
+| Login dialog | Y | P | OAuth flow; `handle_slash_login`, classic only |
+| Config selector | Y | Y | Package resource config; `ConfigUiApp` in main.rs, independent of the interactive stack |
 | Tool execution display | Y | Y | |
 | Bash execution display | Y | Y | |
 | Skill invocation display | Y | Y | |
-| Extension editor | Y | ? | Custom UI |
+| Extension editor | Y | Y | Custom UI; `ExtensionUiRequest` is handled on both stacks |
 | Autocomplete | Y | Y | @file and /commands |
 
 ---
