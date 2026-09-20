@@ -192,6 +192,9 @@ def main():
             continue
         elif method == "textDocument/codeAction":
             SOURCE = params["textDocument"]["uri"]
+            if MODE.startswith("review-"):
+                reply(request, review_actions(params))
+                continue
             if MODE.startswith("command-"):
                 reply(request, [command_action(SOURCE)])
                 continue
@@ -206,6 +209,18 @@ def main():
                 action["disabled"] = {"reason": "not applicable"}
             reply(request, [action])
         elif method == "codeAction/resolve":
+            if MODE.startswith("review-"):
+                if MODE == "review-stall":
+                    Path("resolve-started").write_text("started", encoding="ascii")
+                    continue
+                if MODE == "review-probe":
+                    result = server_edit(Path("sibling.lspfixture").resolve().as_uri())
+                    Path("review-probe.json").write_text(json.dumps(result), encoding="utf-8")
+                if MODE == "review-error":
+                    send({"id": request["id"], "error": {"code": -32603, "message": "refactor resolution failed"}})
+                    continue
+                reply(request, resolve_review(params))
+                continue
             if MODE.startswith("selection"):
                 reply(request, resolve_selection(params))
                 continue
@@ -251,6 +266,67 @@ def main():
             return
         elif "id" in request:
             send({"id": request["id"], "error": {"code": -32601, "message": "unknown fixture method"}})
+
+
+def review_edit(data):
+    uri = data["uri"]
+    sibling = Path("sibling.lspfixture").resolve().as_uri()
+    if MODE == "review-stale":
+        return versioned_edit(uri, data["version"] + 1)
+    if MODE == "review-known-sibling":
+        return {"documentChanges": versioned_edit(uri, data["version"], "fixed")["documentChanges"]
+                + versioned_edit(sibling, data["siblingVersion"], "fixed")["documentChanges"]}
+    if MODE == "review-resource":
+        destination = Path("generated/moved.lspfixture").resolve().as_uri()
+        return {"documentChanges": versioned_edit(uri, data["version"], "fixed")["documentChanges"]
+                + [{"kind": "rename", "oldUri": sibling, "newUri": destination}]}
+    if MODE == "review-scope":
+        return edit((Path.cwd().parent / "outside.lspfixture").as_uri())
+    if MODE == "review-oversized":
+        return edit(uri, "x" * (205 * 1024))
+    if MODE == "review-malformed":
+        return {"documentChanges": [{"kind": "unknown"}]}
+    if MODE == "review-noop":
+        return {}
+    if MODE == "review-guard":
+        return edit(sibling)
+    changes = edit(uri)["changes"]
+    changes.update(edit(sibling)["changes"])
+    return {"changes": changes}
+
+
+def review_actions(params):
+    if MODE == "review-extract":
+        return selection_actions(params)
+    uri = params["textDocument"]["uri"]
+    sibling = Path("sibling.lspfixture").resolve().as_uri()
+    data = {"uri": uri, "version": DOCUMENT_VERSIONS[uri],
+            "siblingVersion": DOCUMENT_VERSIONS.get(sibling), "opaque": {"keep": [1, "two"]}}
+    action = {"title": "Review source and imports", "kind": "refactor.rewrite", "data": data}
+    if MODE in ("review-inline", "review-resource", "review-command-inline"):
+        action["edit"] = review_edit(data)
+    if MODE == "review-command-inline":
+        action["command"] = {"command": "test.finish", "title": "Finish"}
+    if MODE == "review-command-only":
+        return [{"title": "Command only", "command": "test.finish"}]
+    if MODE == "review-disabled":
+        action["disabled"] = {"reason": "not available"}
+    return [action]
+
+
+def resolve_review(params):
+    if MODE == "review-extract":
+        resolved = resolve_selection(params)
+        del resolved["command"]
+        return resolved
+    resolved = dict(params, edit=review_edit(params["data"]))
+    if MODE == "review-command-lazy":
+        resolved["command"] = {"command": "test.finish", "title": "Finish"}
+    if MODE == "review-changed":
+        resolved["data"] = {"changed": True}
+    if MODE == "review-drift":
+        Path("source.lspfixture").write_text("external\n", encoding="utf-8")
+    return resolved
 
 
 if __name__ == "__main__":

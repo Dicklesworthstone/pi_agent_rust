@@ -505,6 +505,20 @@ fn validate_resolution(original: &Value, resolved: Value) -> Result<Value> {
 }
 
 fn validate_action_request(input: &LspInput) -> Result<()> {
+    if input.query.as_ref().is_some_and(|query| query.len() > 1024)
+        || input.new_name.is_some()
+        || input.new_file.is_some()
+        || input.format_options.is_some()
+        || input.hierarchy_id.is_some()
+        || input.method.is_some()
+        || input.payload.is_some()
+        || input.limit.is_some()
+    {
+        return Err(tool_err(
+            "LSP_USAGE",
+            "code_actions requires a bounded actionId or nonempty title/index query, without unrelated selectors",
+        ));
+    }
     if let Some(id) = &input.action_id
         && (id.is_empty()
             || id.len() > 128
@@ -725,6 +739,7 @@ impl LspTool {
                     self.request_timeout(input),
                 )
                 .await?;
+            refactor::check_response_size(&resolved)?;
             validate_resolution(&selected, resolved)?
         } else {
             selected
@@ -739,9 +754,7 @@ impl LspTool {
             ));
         }
         snapshot.verify_request_source(&entry)?;
-        owner
-            .checkpoint()
-            .map_err(|_| tool_err("LSP_CANCELLED", "code action cancelled before applying"))?;
+        super::refactor_preview::check_owner(&owner)?;
         lock(&self.actions.cache).clear();
         if input.apply != Some(true) {
             // A command may request more edits or cause other effects only
@@ -880,4 +893,5 @@ mod tests {
     include!("actions/protocol_tests.rs");
     include!("actions/selection_tests.rs");
     include!("actions/command_tests.rs");
+    include!("actions/review_tests.rs");
 }
