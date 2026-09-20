@@ -41,7 +41,13 @@ fn fixture(root: &Path, mode: &str) -> Option<LspTool> {
         }),
         ..Default::default()
     };
-    Some(LspTool::new(root, Some(&config)))
+    // Canonical, as `hierarchy::tests` and `actions::tests` already build it:
+    // the tool canonicalizes each resolved file path (actions.rs:606) but not
+    // its own cwd, so a root that still reads `/var/...` while the file reads
+    // `/private/var/...` makes `display_path` fail to strip the prefix and
+    // report absolute paths. A real cwd comes from `getcwd`, which is already
+    // resolved; only a handed-in TempDir path is not.
+    Some(LspTool::new(&root.canonicalize().unwrap(), Some(&config)))
 }
 
 fn run(tool: &LspTool, runtime: &asupersync::runtime::Runtime, args: Value) -> Result<ToolOutput> {
