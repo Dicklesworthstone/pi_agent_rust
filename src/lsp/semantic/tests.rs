@@ -128,7 +128,16 @@ fn provider_errors_malformed_reports_and_limits_never_become_empty_success() {
         ("malformed", "LSP_SEMANTIC_MALFORMED"),
         ("oversized", "LSP_SEMANTIC_LIMIT"),
         ("unsupported", "LSP_UNSUPPORTED"),
-        ("encoding", "LSP_UNSUPPORTED"),
+        // The `encoding` fixture advertises positionEncoding utf-8, and that
+        // is refused at client initialization by `SyncPolicy::parse`
+        // (client/document_sync.rs:49), which is explicit that an
+        // incompatible choice "must fail before any document is sent". So it
+        // is `LSP_SYNC_UNSUPPORTED` that reaches the caller, and semantic.rs's
+        // own positionEncoding guard never runs. Note `LSP_UNSUPPORTED` is not
+        // a substring of `LSP_SYNC_UNSUPPORTED`, so asserting the semantic
+        // code here could not pass; the sync check landed in 80ae61a03, before
+        // this test in 25b503d13.
+        ("encoding", "LSP_SYNC_UNSUPPORTED"),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let Some(tool) = fixture(temp.path(), mode) else {
