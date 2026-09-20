@@ -1119,6 +1119,24 @@ mod tests {
     }
 
     #[test]
+    fn oversized_token_text_is_rejected_without_parsing_or_echoing_it() {
+        let now = 1_700_000_000;
+        // Well-formed and otherwise acceptable: without the size guard this
+        // body parses into a usable token, so reaching `expect_err` is the
+        // guard doing the work and nothing else.
+        let body = serde_json::json!({
+            "token": "secret-marker",
+            "expires_at": now + 3600,
+            "padding": "x".repeat(MAX_TOKEN_RESPONSE_BYTES)
+        })
+        .to_string();
+        assert!(body.len() > MAX_TOKEN_RESPONSE_BYTES);
+        let error = parse_session_token_response(&body, now).expect_err("oversized response");
+        assert!(error.to_string().contains("size limit"));
+        assert!(!error.to_string().contains("secret-marker"));
+    }
+
+    #[test]
     fn secret_bearing_debug_values_are_redacted() {
         let response = parse_session_token_response(
             r#"{"token":"secret-marker","expires_at":1700003600,"endpoints":{"api":"https://example.com/?key=url-secret"}}"#,
@@ -1186,7 +1204,21 @@ mod tests {
                 .ensure_session_token()
                 .await
                 .expect_err("oversized response");
-            assert!(error.to_string().contains("size limit"));
+            // The read is bounded before the parser ever sees a byte, so an
+            // oversized body is refused by `text_limited`, not by the size
+            // guard in `parse_session_token_response`. This assertion used to
+            // name the guard's message, which is why it has failed since the
+            // day it was written. What the test is actually for holds either
+            // way and is asserted below: refused before caching, and the body
+            // never copied into the error.
+            // `oversized_token_text_is_rejected_without_parsing_or_echoing_it`
+            // covers the guard itself.
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to read Copilot token response"),
+                "unexpected error: {error}"
+            );
             assert!(!error.to_string().contains("secret-marker"));
             assert!(provider.cached_token.lock().expect("cache").is_none());
         });
