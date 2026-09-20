@@ -42,6 +42,8 @@ while True:
             response['result'] = {'kind':'full','resultId':'fixture','items':items}
     else: response['result'] = None
     send(response)
+    if method == 'initialize' and mode in ('push_empty', 'pull_empty'):
+        send({'jsonrpc':'2.0','method':'experimental/serverStatus','params':{'quiescent':True}})
 ";
 
 fn tool(root: &Path, mode: &str) -> Option<LspTool> {
@@ -68,14 +70,36 @@ fn tool(root: &Path, mode: &str) -> Option<LspTool> {
     Some(LspTool::new(root, Some(&config)))
 }
 
+/// Run the tool with a budget that only has to outlast a healthy server.
+///
+/// The budget is in seconds and covers the Python server's spawn as well as
+/// the request. At 1 there was no margin left for the spawn on a loaded host:
+/// a full-suite run failed with "[LSP_TIMEOUT] request timed out after 7 ms" —
+/// startup had consumed 993 ms of the second — while the same test passed
+/// every time when run alone. 5 matches actions/refactor/tests.rs.
+///
+/// Use [`run_until_budget_expires`] instead for a case that is *supposed* to
+/// run the clock out, so raising this bound does not silently make it slower.
 fn run(tool: &LspTool, file: &str) -> Result<ToolOutput> {
+    run_with_timeout(tool, file, 5)
+}
+
+/// Run the tool where exhausting the budget IS the expected outcome — a server
+/// that never reports has nothing else to end the wait, since an empty result
+/// stays unsettled for `WARMUP_EMPTY_RESULT_WINDOW` (180s) unless the server
+/// declares quiescence. Keep this short: it is paid in full on every run.
+fn run_until_budget_expires(tool: &LspTool, file: &str) -> Result<ToolOutput> {
+    run_with_timeout(tool, file, 1)
+}
+
+fn run_with_timeout(tool: &LspTool, file: &str, timeout: u64) -> Result<ToolOutput> {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .unwrap();
     runtime.block_on(tool.execute(
         "diagnostics-test",
         json!({
-            "action":"diagnostics","file":file,"timeout":1
+            "action":"diagnostics","file":file,"timeout":timeout
         }),
         None,
     ))
@@ -118,7 +142,11 @@ fn model_facing_diagnostics_requires_an_actual_push_report() {
     let Some(tool) = tool(temp.path(), "silent") else {
         return;
     };
-    let error = run(&tool, "source.pidiag").expect_err("missing report is not clean");
+    // The `silent` server never reports and never declares quiescence, so the
+    // wait can only end by running out of budget. That is the behaviour under
+    // test, so it takes the short one.
+    let error =
+        run_until_budget_expires(&tool, "source.pidiag").expect_err("missing report is not clean");
     assert!(
         error.to_string().contains("LSP_DIAGNOSTICS_PENDING"),
         "{error}"
