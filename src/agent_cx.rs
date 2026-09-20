@@ -95,7 +95,7 @@ impl AgentCx {
     /// The thread-local guard must end before returning `Pending`: holding it
     /// across an await would leak authority into other tasks on the same worker
     /// and could restore the wrong thread's context after task migration.
-    async fn with_current<F: Future>(&self, future: F) -> F::Output {
+    pub(crate) async fn with_current<F: Future>(&self, future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
         poll_fn(|task_cx| {
             let _guard = self.cx.clone().set_current_restricted();

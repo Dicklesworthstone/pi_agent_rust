@@ -15,6 +15,7 @@ use super::transport::{DEFAULT_MCP_TIMEOUT, MCP_PROTOCOL_VERSION, McpTransport};
 use super::trust::{TrustDecision, TrustStore, TrustWriteGuard};
 use crate::error::{Error, Result};
 
+mod calls;
 mod catalog;
 
 #[cfg(test)]
@@ -228,7 +229,7 @@ struct ServerEntry {
     restarts: Mutex<RestartState>,
     /// bd-hyik7: extension-supplied working-directory override for this
     /// server; relative spec values anchor to the manager cwd at
-    /// registration so the bound identity stays deterministic.
+    /// registration so the bound identity and spawn environment stay deterministic.
     cwd_override: Option<PathBuf>,
 }
 
@@ -1184,75 +1185,6 @@ impl McpManager {
         .await;
         attempt.disarm();
         result
-    }
-
-    /// Call one tool on one server.
-    ///
-    /// Trust-gated. When the transport dies mid-call, the server is reconnected
-    /// for later calls, but the failed call is not replayed: the server may
-    /// have performed a side effect before its response was lost.
-    ///
-    /// # Errors
-    ///
-    /// Trust-gated; transport and server errors carry taxonomy codes.
-    pub async fn call_tool(&self, server: &str, tool: &str, arguments: Value) -> Result<Value> {
-        let entry = self.entry(server)?;
-        self.ensure_ready(&entry).await?;
-        let transport = Self::lock(&entry.transport).clone().ok_or_else(|| {
-            tool_err(
-                "MCP_TRANSPORT_UNAVAILABLE",
-                "the connection disappeared before tools/call was dispatched",
-            )
-        })?;
-        match self
-            .call_on_transport(&entry, &transport, tool, &arguments)
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(err) if is_indeterminate_call_delivery(&err) => {
-                let recovery = self
-                    .recover_after_indeterminate_call(&entry, &transport, &err)
-                    .await;
-                Err(tool_err(
-                    "MCP_DELIVERY_INDETERMINATE",
-                    format!(
-                        "server {:?} lost its transport during tools/call; the request may have completed and was not retried; {recovery}",
-                        entry.config.name
-                    ),
-                ))
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn call_on_transport(
-        &self,
-        entry: &Arc<ServerEntry>,
-        transport: &Arc<dyn McpTransport>,
-        tool: &str,
-        arguments: &Value,
-    ) -> Result<Value> {
-        // The connection lane intentionally does not span a potentially long
-        // tool call. Re-authorize at the request boundary so a trust decision
-        // changed by another manager cannot be bypassed by an already-live
-        // transport.
-        self.check_running()?;
-        self.check_trust(entry)?;
-        let result = transport
-            .request(
-                "tools/call",
-                serde_json::json!({ "name": tool, "arguments": arguments }),
-                DEFAULT_MCP_TIMEOUT,
-            )
-            .await;
-        self.check_running()?;
-        let result = result?;
-        if let Err(err) = self.check_trust(entry) {
-            Self::close_revoked_transport(entry, transport).await;
-            return Err(err);
-        }
-        Self::record_operational_success(entry, transport);
-        Ok(result)
     }
 
     async fn recover_after_indeterminate_call(
@@ -2600,9 +2532,10 @@ mod tests {
             count: 2,
             next_retry_at: Some(Instant::now() + Duration::from_secs(10)),
         };
-        runtime
+        let stale_error = runtime
             .block_on(manager.call_on_transport(&entry, &stale, "echo", &serde_json::json!({})))
-            .expect("stale transport response is still a completed call");
+            .expect_err("a superseded transport must not dispatch a tool call");
+        assert!(stale_error.to_string().contains("MCP_TRANSPORT_SUPERSEDED"));
         assert_eq!(
             McpManager::lock(&entry.restarts).count,
             2,

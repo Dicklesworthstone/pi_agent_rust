@@ -190,7 +190,7 @@ fn check_catalog_generation(
     Ok(())
 }
 
-fn check_request_owner(owner: &crate::agent_cx::AgentCx) -> Result<()> {
+pub(super) fn check_request_owner(owner: &crate::agent_cx::AgentCx) -> Result<()> {
     if !owner.capabilities().io || !owner.capabilities().time {
         return Err(tool_err(
             "MCP_CAPABILITY_DENIED",
@@ -222,7 +222,7 @@ async fn wait_for_owner_cancellation(owner: crate::agent_cx::AgentCx) {
 /// Enforce the manager's lifetime even when a transport never wakes, ignores
 /// its timeout, or is polled later by a task with different ambient authority.
 /// Cancellation and expiry win over a response arriving in the same poll.
-async fn request_with_owner(
+pub(super) async fn request_with_owner(
     owner: &crate::agent_cx::AgentCx,
     transport: &Arc<dyn McpTransport>,
     method: &str,
