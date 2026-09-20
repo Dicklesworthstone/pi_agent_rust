@@ -658,10 +658,18 @@ impl Tool for LspTool {
         if input.action != "completion"
             && (input.completion_id.is_some() || input.snippet_values.is_some())
         {
-            return Err(tool_err("LSP_USAGE", "completionId and snippetValues require completion"));
+            return Err(tool_err(
+                "LSP_USAGE",
+                "completionId and snippetValues require completion",
+            ));
         }
-        if input.position.is_some() && !matches!(input.action.as_str(), "completion" | "signature_help") {
-            return Err(tool_err("LSP_USAGE", "position requires completion or signature_help"));
+        if input.position.is_some()
+            && !matches!(input.action.as_str(), "completion" | "signature_help")
+        {
+            return Err(tool_err(
+                "LSP_USAGE",
+                "position requires completion or signature_help",
+            ));
         }
         if input.only.is_some() && input.action != "code_actions" {
             return Err(tool_err("LSP_USAGE", "only is supported by code_actions"));

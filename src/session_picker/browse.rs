@@ -273,6 +273,7 @@ impl SessionPicker {
         None
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn render_browser(&self) -> String {
         let browser = &self.browser;
         let width = browser.width;

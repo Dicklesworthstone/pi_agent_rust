@@ -28,7 +28,11 @@ impl<F: Future> Future for OwnedPhase<'_, F> {
     fn poll(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let _guard = this.owner.cx().clone().set_current_restricted();
-        this.future.as_mut().expect("active phase").as_mut().poll(task)
+        this.future
+            .as_mut()
+            .expect("active phase")
+            .as_mut()
+            .poll(task)
     }
 }
 
@@ -412,8 +416,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
 
-    use async_trait::async_trait;
     use asupersync::{Budget, Cx};
+    use async_trait::async_trait;
     use serde_json::json;
 
     use super::super::{
@@ -446,7 +450,10 @@ mod tests {
     #[async_trait]
     impl McpTransport for CallTransport {
         async fn request(&self, method: &str, params: Value, _timeout: Duration) -> Result<Value> {
-            assert_eq!(method, "tools/call", "no hidden replay or reconnect request");
+            assert_eq!(
+                method, "tools/call",
+                "no hidden replay or reconnect request"
+            );
             McpManager::lock(&self.requests).push((method.to_string(), params));
             let hook = McpManager::lock(&self.hook).clone();
             if let Some(hook) = hook {
@@ -635,9 +642,8 @@ mod tests {
         let (manager, entry, transport) = fixture(&temp, Ok(json!({"content": []})));
         transport.pending.store(true, Ordering::Release);
         let runtime = runtime();
-        let owner = AgentCx::from_cx(
-            runtime.request_cx_with_budget(Budget::new().with_poll_quota(1000)),
-        );
+        let owner =
+            AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new().with_poll_quota(1000)));
         runtime.block_on(async {
             let parent = Cx::current().expect("parent");
             let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
@@ -650,7 +656,10 @@ mod tests {
             }
             assert!(call.as_mut().poll(&mut task).is_pending());
             let before = counter.0.load(Ordering::SeqCst);
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel tools/call"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel tools/call"),
+            );
             assert!(counter.0.load(Ordering::SeqCst) > before);
             let Poll::Ready(Err(error)) = call.as_mut().poll(&mut task) else {
                 panic!("cancelled call must finish without a transport reply");
@@ -739,7 +748,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(
             &temp,
-            Err(tool_err("MCP_SERVER_ERROR", "server error -32602: invalid arguments")),
+            Err(tool_err(
+                "MCP_SERVER_ERROR",
+                "server error -32602: invalid arguments",
+            )),
         );
         McpManager::lock(&entry.restarts).count = 2;
         let error = runtime()
@@ -881,13 +893,19 @@ mod tests {
     fn cancelled_connection_waiter_does_not_retire_the_lane_holders_transport() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(&temp, Ok(json!({"content": []})));
-        let lane = Arc::clone(&entry.connect_lane).try_lock_owned().expect("hold lane");
+        let lane = Arc::clone(&entry.connect_lane)
+            .try_lock_owned()
+            .expect("hold lane");
         let runtime = runtime();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
         runtime.block_on(async {
-            let mut call = Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
+            let mut call =
+                Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
             assert!(futures::poll!(call.as_mut()).is_pending());
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel lane waiter"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel lane waiter"),
+            );
             let Poll::Ready(Err(error)) = futures::poll!(call.as_mut()) else {
                 panic!("cancelled admission must finish before the holder releases its lane");
             };
@@ -905,12 +923,18 @@ mod tests {
     fn connection_admission_spends_the_setup_deadline_without_mutating_the_holder() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(&temp, Ok(json!({"content": []})));
-        let lane = Arc::clone(&entry.connect_lane).try_lock_owned().expect("hold lane");
+        let lane = Arc::clone(&entry.connect_lane)
+            .try_lock_owned()
+            .expect("hold lane");
         let runtime = runtime();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
-        let error = runtime.block_on(watchdog(manager.connect_for_request(
-            &owner, &entry, Duration::from_millis(20),
-        ))).expect_err("admission deadline");
+        let error = runtime
+            .block_on(watchdog(manager.connect_for_request(
+                &owner,
+                &entry,
+                Duration::from_millis(20),
+            )))
+            .expect_err("admission deadline");
         assert!(error.to_string().contains("MCP_TIMEOUT"));
         assert!(error.to_string().contains("connection setup"));
         assert!(!transport.closed.load(Ordering::Acquire));
@@ -931,7 +955,8 @@ mod tests {
             let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
             runtime.block_on(async {
                 let parent = Cx::current().expect("parent");
-                let mut call = Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
+                let mut call =
+                    Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
                 watchdog(poll_fn(|task| {
                     assert!(call.as_mut().poll(task).is_pending(), "stage {stage}");
                     if state.reached.load(Ordering::Acquire) {
@@ -939,7 +964,8 @@ mod tests {
                     } else {
                         Poll::Pending
                     }
-                })).await;
+                }))
+                .await;
                 owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel setup"));
                 let Poll::Ready(Err(error)) = futures::poll!(call.as_mut()) else {
                     panic!("{stage} did not observe owner cancellation");
@@ -964,10 +990,17 @@ mod tests {
             let state = setup_factory(&manager, stage);
             let runtime = runtime();
             let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
-            let error = runtime.block_on(watchdog(manager.connect_for_request(
-                &owner, &entry, Duration::from_millis(100),
-            ))).expect_err("whole setup deadline");
-            assert!(error.to_string().contains("MCP_TIMEOUT"), "{stage}: {error}");
+            let error = runtime
+                .block_on(watchdog(manager.connect_for_request(
+                    &owner,
+                    &entry,
+                    Duration::from_millis(100),
+                )))
+                .expect_err("whole setup deadline");
+            assert!(
+                error.to_string().contains("MCP_TIMEOUT"),
+                "{stage}: {error}"
+            );
             assert!(state.reached.load(Ordering::Acquire), "stage {stage}");
             assert!(state.aborted.load(Ordering::Acquire), "stage {stage}");
             assert_eq!(state.tool_calls.load(Ordering::SeqCst), 0);
@@ -979,14 +1012,14 @@ mod tests {
     #[test]
     fn recovery_cancellation_preserves_uncertain_delivery_and_never_replays_the_tool() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (manager, entry, old) = fixture(
-            &temp, Err(tool_err("MCP_TRANSPORT_IO", "lost tool reply")),
-        );
+        let (manager, entry, old) =
+            fixture(&temp, Err(tool_err("MCP_TRANSPORT_IO", "lost tool reply")));
         let state = setup_factory(&manager, "activate");
         let runtime = runtime();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
         runtime.block_on(async {
-            let mut call = Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
+            let mut call =
+                Box::pin(owner.with_current(manager.call_tool("exec", "execute", json!({}))));
             watchdog(poll_fn(|task| {
                 assert!(call.as_mut().poll(task).is_pending());
                 if state.reached.load(Ordering::Acquire) {
@@ -994,7 +1027,8 @@ mod tests {
                 } else {
                     Poll::Pending
                 }
-            })).await;
+            }))
+            .await;
             owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel recovery"));
             let Poll::Ready(Err(error)) = futures::poll!(call.as_mut()) else {
                 panic!("recovery must not suppress owner cancellation");
