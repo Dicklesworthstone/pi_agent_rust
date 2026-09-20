@@ -77,12 +77,18 @@ impl BrowserState {
                     session.cwd.to_lowercase(),
                     session.path.to_lowercase(),
                 ];
-                terms.iter().all(|term| fields.iter().any(|field| field.contains(*term)))
+                terms
+                    .iter()
+                    .all(|term| fields.iter().any(|field| field.contains(*term)))
             })
             .map(|(index, _)| index)
             .collect();
         *selected = anchor
-            .and_then(|index| self.visible.iter().position(|candidate| *candidate == index))
+            .and_then(|index| {
+                self.visible
+                    .iter()
+                    .position(|candidate| *candidate == index)
+            })
             .unwrap_or(0);
         self.keep_visible(selected);
     }
@@ -90,7 +96,10 @@ impl BrowserState {
     fn action(&self, key: &KeyMsg) -> Option<AppAction> {
         let binding = KeyBinding::from_bubbletea_key(key)?;
         let matches = self.bindings.matching_actions(&binding);
-        PICKER_ACTIONS.iter().copied().find(|action| matches.contains(action))
+        PICKER_ACTIONS
+            .iter()
+            .copied()
+            .find(|action| matches.contains(action))
     }
 
     fn keys(&self, action: AppAction) -> String {
@@ -98,7 +107,10 @@ impl BrowserState {
         if keys.is_empty() {
             "unbound".to_string()
         } else {
-            keys.iter().map(ToString::to_string).collect::<Vec<_>>().join("/")
+            keys.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("/")
         }
     }
 
@@ -135,7 +147,8 @@ impl SessionPicker {
 
     pub(super) fn refresh_browser_after_delete(&mut self) {
         let position = self.selected;
-        self.browser.rebuild(&self.sessions, &mut self.selected, None);
+        self.browser
+            .rebuild(&self.sessions, &mut self.selected, None);
         self.selected = position;
         self.browser.keep_visible(&mut self.selected);
     }
@@ -156,7 +169,8 @@ impl SessionPicker {
             }
             self.browser.query.push(ch);
         }
-        self.browser.rebuild(&self.sessions, &mut self.selected, anchor);
+        self.browser
+            .rebuild(&self.sessions, &mut self.selected, anchor);
     }
 
     fn handle_search_key(&mut self, key: &KeyMsg) -> Option<Cmd> {
@@ -173,25 +187,32 @@ impl SessionPicker {
             Some(AppAction::SelectCancel) => {
                 if let Some((query, anchor)) = self.browser.search_before.take() {
                     self.browser.query = query;
-                    self.browser.rebuild(&self.sessions, &mut self.selected, anchor);
+                    self.browser
+                        .rebuild(&self.sessions, &mut self.selected, anchor);
                 }
             }
             Some(AppAction::SelectConfirm) => {
                 self.browser.search_before = None;
             }
-            Some(action @ (AppAction::SelectUp | AppAction::SelectDown
-                | AppAction::SelectPageUp | AppAction::SelectPageDown)) => {
+            Some(
+                action @ (AppAction::SelectUp
+                | AppAction::SelectDown
+                | AppAction::SelectPageUp
+                | AppAction::SelectPageDown),
+            ) => {
                 self.move_selection(action);
             }
             _ if key.key_type == KeyType::Backspace || key.key_type == KeyType::CtrlH => {
                 let anchor = self.browser.original_index(self.selected);
                 self.browser.query.pop();
-                self.browser.rebuild(&self.sessions, &mut self.selected, anchor);
+                self.browser
+                    .rebuild(&self.sessions, &mut self.selected, anchor);
             }
             _ if key.key_type == KeyType::CtrlU => {
                 let anchor = self.browser.original_index(self.selected);
                 self.browser.query.clear();
-                self.browser.rebuild(&self.sessions, &mut self.selected, anchor);
+                self.browser
+                    .rebuild(&self.sessions, &mut self.selected, anchor);
             }
             _ => {}
         }
@@ -217,7 +238,10 @@ impl SessionPicker {
         if key.paste {
             return None;
         }
-        let action = self.browser.action(key).or_else(|| self.browser.default_alias(key));
+        let action = self
+            .browser
+            .action(key)
+            .or_else(|| self.browser.default_alias(key));
         match action {
             Some(AppAction::SelectConfirm) => {
                 self.chosen = self.browser.original_index(self.selected);
@@ -264,57 +288,130 @@ impl SessionPicker {
         };
         if browser.height < 9 {
             if let Some(message) = &self.status_message {
-                lines.push(self.styles.warning_bold.render(&display_line(message, width)));
+                lines.push(
+                    self.styles
+                        .warning_bold
+                        .render(&display_line(message, width)),
+                );
             }
-            let current = browser.original_index(self.selected).and_then(|i| self.sessions.get(i));
+            let current = browser
+                .original_index(self.selected)
+                .and_then(|i| self.sessions.get(i));
             lines.push(display_line(
-                &current.map_or_else(|| "No matching sessions".to_string(), row_text), width,
+                &current.map_or_else(|| "No matching sessions".to_string(), row_text),
+                width,
             ));
             lines.push(display_line(&format!("Search: {}", browser.query), width));
-            return lines.into_iter().take(browser.height).collect::<Vec<_>>().join("\n");
+            return lines
+                .into_iter()
+                .take(browser.height)
+                .collect::<Vec<_>>()
+                .join("\n");
         }
-        lines.push(self.styles.title.render(&display_line("Select a session to resume", width)));
-        let start = if browser.visible.is_empty() { 0 } else { browser.top + 1 };
-        let end = browser.top.saturating_add(browser.page_size()).min(browser.visible.len());
-        lines.push(display_line(&format!(
-            "{} matches / {} sessions · rows {start}-{end}", browser.visible.len(), self.sessions.len(),
-        ), width));
-        lines.push(display_line(&format!(
-            "Search{}: {}", if browser.search_before.is_some() { " (editing)" } else { "" }, browser.query,
-        ), width));
+        lines.push(
+            self.styles
+                .title
+                .render(&display_line("Select a session to resume", width)),
+        );
+        let start = if browser.visible.is_empty() {
+            0
+        } else {
+            browser.top + 1
+        };
+        let end = browser
+            .top
+            .saturating_add(browser.page_size())
+            .min(browser.visible.len());
+        lines.push(display_line(
+            &format!(
+                "{} matches / {} sessions · rows {start}-{end}",
+                browser.visible.len(),
+                self.sessions.len(),
+            ),
+            width,
+        ));
+        lines.push(display_line(
+            &format!(
+                "Search{}: {}",
+                if browser.search_before.is_some() {
+                    " (editing)"
+                } else {
+                    ""
+                },
+                browser.query,
+            ),
+            width,
+        ));
         lines.push(self.styles.muted_bold.render(&display_line(
-            "  Time                  Name                          Messages  Session ID", width,
+            "  Time                  Name                          Messages  Session ID",
+            width,
         )));
         if browser.visible.is_empty() {
-            lines.push(display_line(if self.sessions.is_empty() {
-                "No sessions found for this project."
-            } else {
-                "No matching sessions. Press / to edit the search."
-            }, width));
+            lines.push(display_line(
+                if self.sessions.is_empty() {
+                    "No sessions found for this project."
+                } else {
+                    "No matching sessions. Press / to edit the search."
+                },
+                width,
+            ));
         }
-        for position in browser.top..end {
-            let Some(session) = self.sessions.get(browser.visible[position]) else { continue; };
+        for (offset, &idx) in browser.visible[browser.top..end].iter().enumerate() {
+            let position = browser.top + offset;
+            let Some(session) = self.sessions.get(idx) else {
+                continue;
+            };
             let selected = position == self.selected;
-            let row = display_line(&format!("{} {}", if selected { ">" } else { " " }, row_text(session)), width);
-            lines.push(if selected { self.styles.selection.render(&row) } else { row });
+            let inner = display_line(&row_text(session), width.saturating_sub(2));
+            let row = if selected {
+                format!("> {}", self.styles.selection.render(&inner))
+            } else {
+                format!("  {inner}")
+            };
+            lines.push(row);
         }
         let help = if browser.search_before.is_some() {
-            format!("{}: apply search  {}: undo search  Ctrl+U: clear", browser.keys(AppAction::SelectConfirm), browser.keys(AppAction::SelectCancel))
+            format!(
+                "{}: apply search  {}: undo search  Ctrl+U: clear",
+                browser.keys(AppAction::SelectConfirm),
+                browser.keys(AppAction::SelectCancel)
+            )
         } else {
-            format!("/: search  {}: select  {}: delete  {}: cancel", browser.keys(AppAction::SelectConfirm), browser.keys(AppAction::DeleteSession), browser.keys(AppAction::SelectCancel))
+            format!(
+                "/: search  {}: select  {}: delete  {}: cancel",
+                browser.keys(AppAction::SelectConfirm),
+                browser.keys(AppAction::DeleteSession),
+                browser.keys(AppAction::SelectCancel)
+            )
         };
         lines.push(self.styles.muted.render(&display_line(&help, width)));
-        lines.push(self.styles.muted.render(&display_line(&format!(
-            "{} / {}: move  {} / {}: page", browser.keys(AppAction::SelectUp), browser.keys(AppAction::SelectDown),
-            browser.keys(AppAction::SelectPageUp), browser.keys(AppAction::SelectPageDown),
-        ), width)));
-        let path = browser.original_index(self.selected).and_then(|i| self.sessions.get(i))
+        lines.push(self.styles.muted.render(&display_line(
+            &format!(
+                "{} / {}: move  {} / {}: page",
+                browser.keys(AppAction::SelectUp),
+                browser.keys(AppAction::SelectDown),
+                browser.keys(AppAction::SelectPageUp),
+                browser.keys(AppAction::SelectPageDown),
+            ),
+            width,
+        )));
+        let path = browser
+            .original_index(self.selected)
+            .and_then(|i| self.sessions.get(i))
             .map_or("", |meta| meta.path.as_str());
         lines.push(self.styles.muted.render(&display_line(path, width)));
         if let Some(message) = &self.status_message {
-            lines.push(self.styles.warning_bold.render(&display_line(message, width)));
+            lines.push(
+                self.styles
+                    .warning_bold
+                    .render(&display_line(message, width)),
+            );
         }
-        lines.into_iter().take(browser.height).collect::<Vec<_>>().join("\n")
+        lines
+            .into_iter()
+            .take(browser.height)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -327,10 +424,15 @@ fn safe_char(ch: char) -> bool {
 fn display_line(value: &str, columns: usize) -> String {
     let mut output = String::new();
     let mut used = 0;
-    for ch in value.chars().take(columns.saturating_mul(8).saturating_add(32)) {
+    for ch in value
+        .chars()
+        .take(columns.saturating_mul(8).saturating_add(32))
+    {
         let ch = if safe_char(ch) { ch } else { ' ' };
         let width = ch.width().unwrap_or(0);
-        if used + width > columns { break; }
+        if used + width > columns {
+            break;
+        }
         used += width;
         output.push(ch);
     }
@@ -351,16 +453,27 @@ mod tests {
     use std::path::Path;
 
     fn sessions(count: usize) -> Vec<SessionMeta> {
-        (0..count).map(|i| SessionMeta {
-            path: format!("/sessions/{i:04}.jsonl"), id: format!("session-{i:04}"),
-            cwd: "/project".to_string(), timestamp: "2026-09-01T00:00:00Z".to_string(),
-            message_count: u64::try_from(i).unwrap(), last_modified_ms: i64::try_from(i).unwrap(), size_bytes: 10,
-            name: Some(format!("Work {i:04}")),
-        }).collect()
+        (0..count)
+            .map(|i| SessionMeta {
+                path: format!("/sessions/{i:04}.jsonl"),
+                id: format!("session-{i:04}"),
+                cwd: "/project".to_string(),
+                timestamp: "2026-09-01T00:00:00Z".to_string(),
+                message_count: u64::try_from(i).unwrap(),
+                last_modified_ms: i64::try_from(i).unwrap(),
+                size_bytes: 10,
+                name: Some(format!("Work {i:04}")),
+            })
+            .collect()
     }
 
     fn press(picker: &mut SessionPicker, key_type: KeyType, runes: &str) -> Option<Cmd> {
-        picker.update(Message::new(KeyMsg { key_type, runes: runes.chars().collect(), alt: false, paste: false }))
+        picker.update(Message::new(KeyMsg {
+            key_type,
+            runes: runes.chars().collect(),
+            alt: false,
+            paste: false,
+        }))
     }
 
     fn search(picker: &mut SessionPicker, query: &str) {
@@ -373,15 +486,22 @@ mod tests {
     #[test]
     fn full_history_is_paged_without_dropping_old_records() {
         let mut picker = SessionPicker::new(sessions(1000));
-        picker.update(Message::new(WindowSizeMsg { width: 96, height: 18 }));
+        picker.update(Message::new(WindowSizeMsg {
+            width: 96,
+            height: 18,
+        }));
         assert!(picker.view().lines().count() <= 18);
         assert!(!picker.view().contains("Work 0999"));
-        for _ in 0..110 { press(&mut picker, KeyType::PgDown, ""); }
+        for _ in 0..110 {
+            press(&mut picker, KeyType::PgDown, "");
+        }
         assert_eq!(picker.selected, 999);
         assert!(picker.view().contains("Work 0999"));
         press(&mut picker, KeyType::Enter, "");
         assert_eq!(picker.selected_path(), Some("/sessions/0999.jsonl"));
-        for _ in 0..110 { press(&mut picker, KeyType::PgUp, ""); }
+        for _ in 0..110 {
+            press(&mut picker, KeyType::PgUp, "");
+        }
         assert_eq!(picker.selected, 0);
     }
 
@@ -439,8 +559,17 @@ mod tests {
         press(&mut picker, KeyType::Runes, "/");
         press(&mut picker, KeyType::Up, "");
         assert_eq!(picker.confirm_delete, Some(4));
-        picker.update(Message::new(KeyMsg { key_type: KeyType::Runes, runes: vec!['y'], alt: false, paste: true }));
-        assert_eq!(picker.confirm_delete, Some(4), "paste must not confirm deletion");
+        picker.update(Message::new(KeyMsg {
+            key_type: KeyType::Runes,
+            runes: vec!['y'],
+            alt: false,
+            paste: true,
+        }));
+        assert_eq!(
+            picker.confirm_delete,
+            Some(4),
+            "paste must not confirm deletion"
+        );
         press(&mut picker, KeyType::Esc, "");
         assert!(picker.confirm_delete.is_none());
         assert_eq!(picker.browser.visible, vec![4]);
@@ -453,8 +582,12 @@ mod tests {
         press(&mut picker, KeyType::Runes, "日本");
         press(&mut picker, KeyType::Backspace, "");
         assert_eq!(picker.browser.query, "日");
-        picker.update(Message::new(KeyMsg { key_type: KeyType::Runes,
-            runes: "q\ny\u{1b}\u{202e}".chars().collect(), alt: false, paste: true }));
+        picker.update(Message::new(KeyMsg {
+            key_type: KeyType::Runes,
+            runes: "q\ny\u{1b}\u{202e}".chars().collect(),
+            alt: false,
+            paste: true,
+        }));
         assert_eq!(picker.browser.query, "日q y");
         assert!(picker.browser.search_before.is_some());
         assert!(!picker.cancelled);
@@ -468,8 +601,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys.json");
         std::fs::write(&path, r#"{"selectDown":["ctrl+j"],"selectUp":[],"selectConfirm":["ctrl+g"],"deleteSession":[]}"#).unwrap();
-        let mut picker = SessionPicker::new(sessions(5)).with_keybindings(KeyBindings::load(&path).unwrap());
-        for (kind, runes) in [(KeyType::Down, ""), (KeyType::Runes, "j"), (KeyType::CtrlD, "")] {
+        let mut picker =
+            SessionPicker::new(sessions(5)).with_keybindings(KeyBindings::load(&path).unwrap());
+        for (kind, runes) in [
+            (KeyType::Down, ""),
+            (KeyType::Runes, "j"),
+            (KeyType::CtrlD, ""),
+        ] {
             press(&mut picker, kind, runes);
         }
         assert_eq!(picker.selected, 0);
@@ -508,10 +646,16 @@ mod tests {
             let mut header = crate::session::SessionHeader::new();
             header.id = format!("history-{i}");
             header.cwd = cwd.display().to_string();
-            std::fs::write(project.join(format!("{i}.jsonl")), serde_json::to_vec(&header).unwrap()).unwrap();
+            std::fs::write(
+                project.join(format!("{i}.jsonl")),
+                serde_json::to_vec(&header).unwrap(),
+            )
+            .unwrap();
         }
         let rows = super::super::list_sessions_for_project(cwd, Some(tmp.path()));
         assert_eq!(rows.len(), 55);
-        for i in 0..55 { assert!(rows.iter().any(|row| row.id == format!("history-{i}"))); }
+        for i in 0..55 {
+            assert!(rows.iter().any(|row| row.id == format!("history-{i}")));
+        }
     }
 }
