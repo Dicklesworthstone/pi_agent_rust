@@ -44,9 +44,7 @@ fn limit() -> Error {
 /// Limits: 16 KiB template and expanded URI, 128 variables, 64 KiB combined
 /// variable names/values, and 1,024 variable occurrences across expressions.
 pub fn expand_resource_uri(template: &str, variables: &Map<String, Value>) -> Result<String> {
-    if template.is_empty()
-        || template.len() > MAX_TEMPLATE_BYTES
-        || variables.len() > MAX_VARIABLES
+    if template.is_empty() || template.len() > MAX_TEMPLATE_BYTES || variables.len() > MAX_VARIABLES
     {
         return Err(limit());
     }
@@ -58,7 +56,11 @@ pub fn expand_resource_uri(template: &str, variables: &Map<String, Value>) -> Re
         let value_bytes = match value {
             Value::String(text) => text.len(),
             Value::Null => 0,
-            _ => return Err(invalid("template variables must be strings or explicit nulls")),
+            _ => {
+                return Err(invalid(
+                    "template variables must be strings or explicit nulls",
+                ));
+            }
         };
         bytes = bytes
             .checked_add(name.len())
@@ -76,12 +78,7 @@ pub fn expand_resource_uri(template: &str, variables: &Map<String, Value>) -> Re
         let close = remaining
             .find('}')
             .ok_or_else(|| invalid("unclosed template expression"))?;
-        expand_expression(
-            &remaining[..close],
-            variables,
-            &mut output,
-            &mut expansions,
-        )?;
+        expand_expression(&remaining[..close], variables, &mut output, &mut expansions)?;
         remaining = &remaining[close + 1..];
     }
     output.literal(remaining)?;
@@ -93,7 +90,9 @@ pub fn expand_resource_uri(template: &str, variables: &Map<String, Value>) -> Re
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"+.-".contains(&byte))
     {
-        return Err(invalid("expanded resource URI must have an absolute URI scheme"));
+        return Err(invalid(
+            "expanded resource URI must have an absolute URI scheme",
+        ));
     }
     Ok(uri)
 }
@@ -190,9 +189,7 @@ fn expand_expression(
             // Values were validated before parsing. Null is deliberate omission.
             continue;
         };
-        let value = prefix.map_or(value.as_str(), |length| {
-            &value[..prefix_end(value, length)]
-        });
+        let value = prefix.map_or(value.as_str(), |length| &value[..prefix_end(value, length)]);
         output.push(if emitted {
             operator.separator
         } else {
@@ -222,7 +219,9 @@ fn variable_spec(specification: &str) -> Result<(&str, Option<usize>)> {
             || prefix.starts_with('0')
             || !prefix.bytes().all(|byte| byte.is_ascii_digit())
         {
-            return Err(invalid("prefix lengths must be integers from 1 through 9999"));
+            return Err(invalid(
+                "prefix lengths must be integers from 1 through 9999",
+            ));
         }
         (
             name,
@@ -291,12 +290,10 @@ fn prefix_end(value: &str, length: usize) -> usize {
             };
             let mut scalar = [first; 4];
             let complete = (1..width).all(|index| {
-                if let Some(byte) = pct_octet(bytes, offset + index * 3) {
+                pct_octet(bytes, offset + index * 3).is_some_and(|byte| {
                     scalar[index] = byte;
                     true
-                } else {
-                    false
-                }
+                })
             });
             offset += if complete && std::str::from_utf8(&scalar[..width]).is_ok() {
                 width * 3
@@ -342,7 +339,7 @@ impl Output {
             }
             if unreserved(byte) || (allow_reserved && reserved(byte)) {
                 // This branch accepts ASCII only, so these are UTF-8 boundaries.
-                self.push(&text[offset..offset + 1])?;
+                self.push(&text[offset..=offset])?;
             } else {
                 if MAX_URI_BYTES.saturating_sub(self.0.len()) < 3 {
                     return Err(limit());
@@ -374,7 +371,8 @@ impl Output {
                 0x21 | 0x23..=0x24 | 0x26 | 0x28..=0x3B | 0x3D | 0x3F..=0x5B
                 | 0x5D | 0x5F | 0x61..=0x7A | 0x7E
                 | 0xA0..=0xD7FF | 0xE000..=0xFDCF | 0xFDF0..=0xFFEF
-            ) || (code >= 0x10000 && (code & 0xFFFF) <= 0xFFFD
+            ) || (code >= 0x10000
+                && (code & 0xFFFF) <= 0xFFFD
                 && !(0xE0000..=0xE0FFF).contains(&code));
             if !allowed {
                 return Err(invalid("template contains an invalid literal character"));
@@ -387,11 +385,15 @@ impl Output {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::literal_string_with_formatting_args)]
     use super::*;
     use serde_json::json;
 
     fn vars(value: Value) -> Map<String, Value> {
-        value.as_object().expect("test variable object").clone()
+        match value {
+            Value::Object(map) => map,
+            _ => panic!("test variable object"),
+        }
     }
 
     #[test]
@@ -403,52 +405,88 @@ mod tests {
         // RFC 6570 examples, prefixed with an opaque MCP scheme so they are
         // usable resource URIs rather than relative references.
         for (template, expected) in [
-            ("{var}", "value"), ("{hello}", "Hello%20World%21"),
-            ("{+hello}", "Hello%20World!"), ("{+path}/here", "/foo/bar/here"),
-            ("{#path}", "#/foo/bar"), ("{x,hello,y}", "1024,Hello%20World%21,768"),
-            ("X{.x,y}", "X.1024.768"), ("{/var,x}/here", "/value/1024/here"),
+            ("{var}", "value"),
+            ("{hello}", "Hello%20World%21"),
+            ("{+hello}", "Hello%20World!"),
+            ("{+path}/here", "/foo/bar/here"),
+            ("{#path}", "#/foo/bar"),
+            ("{x,hello,y}", "1024,Hello%20World%21,768"),
+            ("X{.x,y}", "X.1024.768"),
+            ("{/var,x}/here", "/value/1024/here"),
             ("{;x,y,empty}", ";x=1024;y=768;empty"),
             ("{?x,y,empty}", "?x=1024&y=768&empty="),
-            ("?fixed=yes{&x}", "?fixed=yes&x=1024"), ("{var:3}", "val"),
-            ("{var:30}", "value"), ("{var*}", "value"),
-            ("{/var,undef}", "/value"), ("{/var,empty}", "/value/"),
-            ("{#empty}", "#"), ("{?undef}", ""),
+            ("?fixed=yes{&x}", "?fixed=yes&x=1024"),
+            ("{var:3}", "val"),
+            ("{var:30}", "value"),
+            ("{var*}", "value"),
+            ("{/var,undef}", "/value"),
+            ("{/var,empty}", "/value/"),
+            ("{#empty}", "#"),
+            ("{?undef}", ""),
         ] {
-            assert_eq!(expand_resource_uri(&format!("mcp:{template}"), &variables).unwrap(), format!("mcp:{expected}"));
+            assert_eq!(
+                expand_resource_uri(&format!("mcp:{template}"), &variables).unwrap(),
+                format!("mcp:{expected}")
+            );
         }
     }
 
     #[test]
     fn components_cannot_inject_query_fields_paths_or_fragments() {
         let variables = vars(json!({"id":"a/b?admin=true#fragment", "q":"a&b=c + d"}));
-        assert_eq!(expand_resource_uri("docs://files/{id}{?q}", &variables).unwrap(),
-            "docs://files/a%2Fb%3Fadmin%3Dtrue%23fragment?q=a%26b%3Dc%20%2B%20d");
-        assert_eq!(expand_resource_uri("docs:{+id}", &variables).unwrap(), "docs:a/b?admin=true#fragment");
+        assert_eq!(
+            expand_resource_uri("docs://files/{id}{?q}", &variables).unwrap(),
+            "docs://files/a%2Fb%3Fadmin%3Dtrue%23fragment?q=a%26b%3Dc%20%2B%20d"
+        );
+        assert_eq!(
+            expand_resource_uri("docs:{+id}", &variables).unwrap(),
+            "docs:a/b?admin=true#fragment"
+        );
     }
 
     #[test]
     fn unicode_and_percent_encoded_prefixes_do_not_split_characters() {
         for value in ["🌍日本", "%F0%9F%8C%8Dtail"] {
             let variables = vars(json!({"word":value}));
-            assert_eq!(expand_resource_uri("docs:{+word:1}", &variables).unwrap(), "docs:%F0%9F%8C%8D");
+            assert_eq!(
+                expand_resource_uri("docs:{+word:1}", &variables).unwrap(),
+                "docs:%F0%9F%8C%8D"
+            );
         }
         let variables = vars(json!({"word":"%E6%97%A5tail"}));
-        assert_eq!(expand_resource_uri("docs:{word:1}", &variables).unwrap(), "docs:%25E6%2597%25A5");
-        assert_eq!(expand_resource_uri("docs:日本/%2f", &Map::new()).unwrap(), "docs:%E6%97%A5%E6%9C%AC/%2f");
+        assert_eq!(
+            expand_resource_uri("docs:{word:1}", &variables).unwrap(),
+            "docs:%25E6%2597%25A5"
+        );
+        assert_eq!(
+            expand_resource_uri("docs:日本/%2f", &Map::new()).unwrap(),
+            "docs:%E6%97%A5%E6%9C%AC/%2f"
+        );
     }
 
     #[test]
     fn reserved_expansion_preserves_only_valid_percent_triplets() {
         let variables = vars(json!({"v":"%2f%GG%"}));
-        assert_eq!(expand_resource_uri("docs:{+v}", &variables).unwrap(), "docs:%2f%25GG%25");
-        assert_eq!(expand_resource_uri("docs:{v}", &variables).unwrap(), "docs:%252f%25GG%25");
+        assert_eq!(
+            expand_resource_uri("docs:{+v}", &variables).unwrap(),
+            "docs:%2f%25GG%25"
+        );
+        assert_eq!(
+            expand_resource_uri("docs:{v}", &variables).unwrap(),
+            "docs:%252f%25GG%25"
+        );
     }
 
     #[test]
     fn variable_names_are_exact_and_missing_values_are_not_silent_omissions() {
         let variables = vars(json!({"x.y":"one", "%78":"two", "x":"three", "skip":null}));
-        assert_eq!(expand_resource_uri("docs:{?x.y,%78,x,skip}", &variables).unwrap(), "docs:?x.y=one&%78=two&x=three");
-        let error = expand_resource_uri("docs:{X}", &variables).unwrap_err().to_string();
+        assert_eq!(
+            expand_resource_uri("docs:{?x.y,%78,x,skip}", &variables).unwrap(),
+            "docs:?x.y=one&%78=two&x=three"
+        );
+        let error = expand_resource_uri("docs:{X}", &variables)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("missing"));
         assert!(error.contains("read was not sent"));
     }
@@ -456,17 +494,38 @@ mod tests {
     #[test]
     fn malformed_templates_and_nonstring_values_fail_closed_without_echo() {
         for template in [
-            "docs:{", "docs:}", "docs:{}", "docs:{?}", "docs:{v,}", "docs:{{v}}",
-            "docs:{v:0}", "docs:{v:01}", "docs:{v:10000}", "docs:{v:2*}",
-            "docs:{v**}", "docs:{=v}", "docs:{v..x}", "docs:{%GG}", "docs:bad%",
-            "docs:bad space", "docs:bad\\path", "docs:\nprivate-sentinel", "relative/{v}",
+            "docs:{",
+            "docs:}",
+            "docs:{}",
+            "docs:{?}",
+            "docs:{v,}",
+            "docs:{{v}}",
+            "docs:{v:0}",
+            "docs:{v:01}",
+            "docs:{v:10000}",
+            "docs:{v:2*}",
+            "docs:{v**}",
+            "docs:{=v}",
+            "docs:{v..x}",
+            "docs:{%GG}",
+            "docs:bad%",
+            "docs:bad space",
+            "docs:bad\\path",
+            "docs:\nprivate-sentinel",
+            "relative/{v}",
         ] {
             let error = expand_resource_uri(template, &vars(json!({"v":"private-sentinel"})))
-                .expect_err(template).to_string();
+                .expect_err(template)
+                .to_string();
             assert!(error.contains("MCP_TEMPLATE_INVALID"));
             assert!(!error.contains("private-sentinel"));
         }
-        for value in [json!(1), json!(true), json!(["one"]), json!({"key":"value"})] {
+        for value in [
+            json!(1),
+            json!(true),
+            json!(["one"]),
+            json!({"key":"value"}),
+        ] {
             assert!(expand_resource_uri("docs:{v}", &vars(json!({"v":value}))).is_err());
         }
     }
@@ -481,7 +540,13 @@ mod tests {
         let variables = vars(json!({"v":"x".repeat(MAX_URI_BYTES / 2)}));
         assert!(expand_resource_uri("docs:{v}{v}", &variables).is_err());
         let variables = vars(json!({"v":null}));
-        assert!(expand_resource_uri(&format!("docs:{}", "{v}".repeat(MAX_EXPANSIONS + 1)), &variables).is_err());
+        assert!(
+            expand_resource_uri(
+                &format!("docs:{}", "{v}".repeat(MAX_EXPANSIONS + 1)),
+                &variables
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -489,7 +554,8 @@ mod tests {
         let variables = vars(json!({"unused":"x".repeat(MAX_VARIABLE_BYTES)}));
         assert!(expand_resource_uri("docs:static", &variables).is_err());
         let variables: Map<String, Value> = (0..=MAX_VARIABLES)
-            .map(|index| (format!("v{index}"), Value::Null)).collect();
+            .map(|index| (format!("v{index}"), Value::Null))
+            .collect();
         assert!(expand_resource_uri("docs:static", &variables).is_err());
     }
 }

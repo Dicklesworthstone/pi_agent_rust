@@ -654,12 +654,17 @@ mod tests {
             "action":"read_resource_template", "uri_template":"docs://items/{id}{?q}",
             "variables":{"id":"a/b", "q":null}
         });
-        let McpContextAction::ReadResourceTemplate { uri_template, variables } =
-            serde_json::from_value(action.clone()).expect("template action")
+        let McpContextAction::ReadResourceTemplate {
+            uri_template,
+            variables,
+        } = serde_json::from_value(action.clone()).expect("template action")
         else {
             panic!("must dispatch through template expansion");
         };
-        assert_eq!(expand_resource_uri(&uri_template, &variables).unwrap(), "docs://items/a%2Fb");
+        assert_eq!(
+            expand_resource_uri(&uri_template, &variables).unwrap(),
+            "docs://items/a%2Fb"
+        );
         for field in ["uri_template", "variables"] {
             let mut missing = action.clone();
             missing.as_object_mut().unwrap().remove(field);

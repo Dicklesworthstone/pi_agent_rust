@@ -265,6 +265,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/mcp/manager/output_schema.rs` | MCP tool call structured-output contract validation | Unit; `src/mcp/manager/calls.rs`, `tests/mcp.rs`. |
 | `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
 | `src/mcp/trust.rs` | MCP trust | `tests/mcp.rs`. |
+| `src/mcp/uri_template.rs` | RFC 6570 URI template expansion and variable validation | Unit; `src/mcp.rs`, `tests/mcp.rs`. |
 | `src/media_tools.rs` | Opt-in media trio tools `inspect_image` / `generate_image` / `tts` (bd-cv653.2.7) | `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
 | `src/media_tools/artifact.rs` | Media tools artifact publishing and staging | Unit; `tests/media_tools.rs`. |
 | `src/media_tools/generation.rs` | Image generation tool backend | Unit; `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
