@@ -116,12 +116,18 @@ struct Fixture {
 impl Fixture {
     fn new(root: &Path, mode: &str) -> Option<Self> {
         let python = ["python3", "python"].into_iter().find(|program| {
-            Command::new(program).arg("--version").stdout(Stdio::null()).stderr(Stdio::null())
-                .status().is_ok_and(|status| status.success())
+            Command::new(program)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
         });
         let Some(python) = python else {
-            assert!(std::env::var_os("PI_LSP_REQUIRE_PROTOCOL").is_none(),
-                "Python is required for the selected code-action review tests");
+            assert!(
+                std::env::var_os("PI_LSP_REQUIRE_PROTOCOL").is_none(),
+                "Python is required for the selected code-action review tests"
+            );
             eprintln!("SKIP code-action review peer: Python unavailable");
             return None;
         };
@@ -135,24 +141,35 @@ impl Fixture {
         let config: Config = serde_json::from_value(json!({"lsp":{"servers":{"review-peer":{
             "command":python,"args":["-I","-u",script.to_str().unwrap(),mode],
             "extensions":[".review"],"languages":["plaintext"],"rootMarkers":[".review-root"]
-        }}}})).unwrap();
+        }}}}))
+        .unwrap();
         let tool = LspTool::new(&root, Some(&config));
         let runtime = asupersync::runtime::RuntimeBuilder::new()
-            .worker_threads(1).enable_parking(false).build().unwrap();
-        Some(Self { root, tool, runtime })
+            .worker_threads(1)
+            .enable_parking(false)
+            .build()
+            .unwrap();
+        Some(Self {
+            root,
+            tool,
+            runtime,
+        })
     }
 
     fn run(&self, input: Value) -> Result<Value> {
-        self.runtime.block_on(self.tool.execute("review-action", input, None)).map(|output| {
-            assert!(!output.is_error);
-            output.details.unwrap()
-        })
+        self.runtime
+            .block_on(self.tool.execute("review-action", input, None))
+            .map(|output| {
+                assert!(!output.is_error);
+                output.details.unwrap()
+            })
     }
 
     fn list(&self) -> Value {
         self.run(json!({"action":"code_actions","file":"source.review",
             "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":12}},
-            "only":["refactor.extract"],"timeout":3})).unwrap()
+            "only":["refactor.extract"],"timeout":3}))
+            .unwrap()
     }
 
     fn preview(&self) -> Value {
@@ -170,25 +187,33 @@ impl Fixture {
     }
 
     fn barrier(&self) -> Value {
-        self.run(json!({"action":"request","file":"source.review","method":"test/barrier","timeout":3})).unwrap()["payload"]["result"].clone()
+        self.run(
+            json!({"action":"request","file":"source.review","method":"test/barrier","timeout":3}),
+        )
+        .unwrap()["payload"]["result"]
+            .clone()
     }
 }
 
 #[test]
 fn review_selection_accepts_cached_and_fresh_choices_without_apply() {
-    for raw in [json!({"action":"code_actions","actionId":"chosen"}),
+    for raw in [
+        json!({"action":"code_actions","actionId":"chosen"}),
         json!({"action":"code_actions","actionId":"chosen","apply":false}),
         json!({"action":"code_actions","file":"source.review","query":"Extract"}),
         json!({"action":"code_actions","file":"source.review","query":"1","apply":false}),
-        json!({"action":"code_actions","actionId":"chosen","apply":true})] {
+        json!({"action":"code_actions","actionId":"chosen","apply":true}),
+    ] {
         let input: LspInput = serde_json::from_value(raw).unwrap();
         validate_action_request(&input).unwrap();
     }
-    for raw in [json!({"action":"code_actions","actionId":""}),
+    for raw in [
+        json!({"action":"code_actions","actionId":""}),
         json!({"action":"code_actions","actionId":"x".repeat(129)}),
         json!({"action":"code_actions","actionId":"chosen","query":"1"}),
         json!({"action":"code_actions","query":"  "}),
-        json!({"action":"code_actions","apply":true})] {
+        json!({"action":"code_actions","apply":true}),
+    ] {
         let input: LspInput = serde_json::from_value(raw).unwrap();
         assert!(validate_action_request(&input).is_err());
     }
@@ -198,16 +223,26 @@ fn review_selection_accepts_cached_and_fresh_choices_without_apply() {
 fn extract_review_and_approval_do_not_repeat_listing_or_resolution() {
     for mode in ["lazy", "inline"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some(f) = Fixture::new(temp.path(), mode) else { return };
+        let Some(f) = Fixture::new(temp.path(), mode) else {
+            return;
+        };
         let preview = f.preview();
         assert_eq!(preview["preview"], true);
         assert_eq!(preview["applied"], false);
         assert_eq!(preview["title"], "Extract selected expression");
         assert_eq!(preview["kind"], "refactor.extract.function");
-        assert_eq!(preview["workspaceEdit"]["documentChanges"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            preview["workspaceEdit"]["documentChanges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(f.text("source.review"), BEFORE);
         assert_eq!(f.text("sibling.review"), "use old;\n");
-        let inspected = f.run(json!({"action":"code_actions","refactorId":preview["refactorId"]})).unwrap();
+        let inspected = f
+            .run(json!({"action":"code_actions","refactorId":preview["refactorId"]}))
+            .unwrap();
         assert_eq!(inspected["workspaceEdit"], preview["workspaceEdit"]);
         let applied = f.approve(&preview).unwrap();
         assert_eq!(applied["applied"], true);
@@ -221,7 +256,10 @@ fn extract_review_and_approval_do_not_repeat_listing_or_resolution() {
         assert_eq!(stats["resolves"], u64::from(mode == "lazy"));
         assert_eq!(stats["commands"], 0);
         if mode == "lazy" {
-            assert_eq!(stats["resolvePayload"]["data"]["opaque"], json!({"nested":[1,"kept"]}));
+            assert_eq!(
+                stats["resolvePayload"]["data"]["opaque"],
+                json!({"nested":[1,"kept"]})
+            );
         }
     }
 }
@@ -229,9 +267,13 @@ fn extract_review_and_approval_do_not_repeat_listing_or_resolution() {
 #[test]
 fn fresh_filtered_query_previews_only_the_selected_action() {
     let temp = tempfile::tempdir().unwrap();
-    let Some(f) = Fixture::new(temp.path(), "lazy") else { return };
-    let preview = f.run(json!({"action":"code_actions","file":"source.review",
-        "only":["refactor.extract"],"query":"1","apply":false,"timeout":3})).unwrap();
+    let Some(f) = Fixture::new(temp.path(), "lazy") else {
+        return;
+    };
+    let preview = f
+        .run(json!({"action":"code_actions","file":"source.review",
+        "only":["refactor.extract"],"query":"1","apply":false,"timeout":3}))
+        .unwrap();
     assert_eq!(preview["title"], "Extract selected expression");
     assert_eq!(f.text("source.review"), BEFORE);
     f.approve(&preview).unwrap();
@@ -243,10 +285,17 @@ fn fresh_filtered_query_previews_only_the_selected_action() {
 fn command_backed_actions_are_never_presented_as_complete_frozen_edits() {
     for mode in ["command", "lazy-command"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some(f) = Fixture::new(temp.path(), mode) else { return };
+        let Some(f) = Fixture::new(temp.path(), mode) else {
+            return;
+        };
         let listing = f.list();
-        let error = f.run(json!({"action":"code_actions","actionId":listing["actions"][0]["actionId"]})).unwrap_err();
-        assert!(error.to_string().contains("LSP_ACTION_NOT_PREVIEWABLE"), "{error}");
+        let error = f
+            .run(json!({"action":"code_actions","actionId":listing["actions"][0]["actionId"]}))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("LSP_ACTION_NOT_PREVIEWABLE"),
+            "{error}"
+        );
         assert_eq!(f.text("source.review"), BEFORE);
         assert_eq!(f.text("sibling.review"), "use old;\n");
         assert!(lock(&f.tool.actions.active).is_none());
@@ -265,13 +314,17 @@ fn command_backed_actions_are_never_presented_as_complete_frozen_edits() {
 fn unchanged_bytes_cannot_reuse_a_closed_source_before_preview_resolution() {
     for mode in ["lazy", "nosync"] {
         let temp = tempfile::tempdir().unwrap();
-        let Some(f) = Fixture::new(temp.path(), mode) else { return };
+        let Some(f) = Fixture::new(temp.path(), mode) else {
+            return;
+        };
         let listing = f.list();
         let path = f.root.join("source.review");
         let (uri, entry) = f.runtime.block_on(f.tool.synced(&path)).unwrap();
         entry.client.invalidate(&uri);
         entry.client.ensure_synced(&path, "plaintext").unwrap();
-        let error = f.run(json!({"action":"code_actions","actionId":listing["actions"][0]["actionId"]})).unwrap_err();
+        let error = f
+            .run(json!({"action":"code_actions","actionId":listing["actions"][0]["actionId"]}))
+            .unwrap_err();
         assert!(error.to_string().contains("LSP_EDIT_CONFLICT"), "{error}");
         assert_eq!(f.text("source.review"), BEFORE);
         assert_eq!(f.barrier()["resolves"], 0);
@@ -282,14 +335,27 @@ fn unchanged_bytes_cannot_reuse_a_closed_source_before_preview_resolution() {
 fn reviewed_extract_rejects_unopened_sibling_and_guard_only_source_drift() {
     for (mode, changed) in [("lazy", "sibling.review"), ("guard", "source.review")] {
         let temp = tempfile::tempdir().unwrap();
-        let Some(f) = Fixture::new(temp.path(), mode) else { return };
+        let Some(f) = Fixture::new(temp.path(), mode) else {
+            return;
+        };
         let preview = f.preview();
         std::fs::write(f.root.join(changed), "external\n").unwrap();
         let error = f.approve(&preview).unwrap_err();
         assert!(error.to_string().contains("LSP_EDIT_CONFLICT"), "{error}");
         assert_eq!(f.text(changed), "external\n");
-        let other = if changed == "source.review" { "sibling.review" } else { "source.review" };
-        assert_eq!(f.text(other), if other == "source.review" { BEFORE } else { "use old;\n" });
+        let other = if changed == "source.review" {
+            "sibling.review"
+        } else {
+            "source.review"
+        };
+        assert_eq!(
+            f.text(other),
+            if other == "source.review" {
+                BEFORE
+            } else {
+                "use old;\n"
+            }
+        );
         assert!(f.approve(&preview).is_err());
         assert_eq!(f.barrier()["resolves"], 1);
     }
@@ -298,7 +364,9 @@ fn reviewed_extract_rejects_unopened_sibling_and_guard_only_source_drift() {
 #[test]
 fn preview_resolution_does_not_authorize_unsolicited_edits() {
     let temp = tempfile::tempdir().unwrap();
-    let Some(f) = Fixture::new(temp.path(), "probe") else { return };
+    let Some(f) = Fixture::new(temp.path(), "probe") else {
+        return;
+    };
     let preview = f.preview();
     assert_eq!(f.barrier()["probe"]["applied"], false);
     assert_eq!(f.text("source.review"), BEFORE);
@@ -311,11 +379,15 @@ fn preview_resolution_does_not_authorize_unsolicited_edits() {
 #[test]
 fn wrong_action_and_overriding_review_selectors_preserve_the_valid_plan() {
     let temp = tempfile::tempdir().unwrap();
-    let Some(f) = Fixture::new(temp.path(), "lazy") else { return };
+    let Some(f) = Fixture::new(temp.path(), "lazy") else {
+        return;
+    };
     let preview = f.preview();
-    for raw in [json!({"action":"rename","refactorId":preview["refactorId"],"apply":true}),
+    for raw in [
+        json!({"action":"rename","refactorId":preview["refactorId"],"apply":true}),
         json!({"action":"code_actions","refactorId":preview["refactorId"],"query":"Other","apply":true}),
-        json!({"action":"code_actions","refactorId":preview["refactorId"],"actionId":"other","apply":true})] {
+        json!({"action":"code_actions","refactorId":preview["refactorId"],"actionId":"other","apply":true}),
+    ] {
         assert!(f.run(raw).unwrap_err().to_string().contains("LSP_USAGE"));
     }
     f.approve(&preview).unwrap();

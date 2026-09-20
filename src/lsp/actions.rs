@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 mod command_edits;
-mod refactor;
 #[cfg(test)]
 mod preview_tests;
+mod refactor;
 
 const MAX_ACTIONS: usize = 128;
 const MAX_ACTION_BYTES: usize = 2 * 1024 * 1024;
@@ -519,7 +519,11 @@ fn validate_action_request(input: &LspInput) -> Result<()> {
             "actionId must be nonempty and bounded and cannot be combined with query, range, only, symbol or line",
         ));
     }
-    if input.query.as_deref().is_some_and(|query| query.trim().is_empty()) {
+    if input
+        .query
+        .as_deref()
+        .is_some_and(|query| query.trim().is_empty())
+    {
         return Err(tool_err("LSP_USAGE", "code action query must not be empty"));
     }
     if input.action_id.is_none()
@@ -750,7 +754,10 @@ impl LspTool {
                 ));
             }
             let edit = edit.ok_or_else(|| {
-                tool_err("LSP_ACTION_NO_EDIT", "selected code action has no workspace edit")
+                tool_err(
+                    "LSP_ACTION_NO_EDIT",
+                    "selected code action has no workspace edit",
+                )
             })?;
             let prepared = self.prepare_refactor(&entry, edit, &snapshot)?;
             return self.cache_refactor(

@@ -39,9 +39,16 @@ impl RefactorSnapshot {
         let documents = entry.client.document_snapshots();
         // Retain the synchronized incarnation even for servers without wire
         // versions. Identical bytes after close/reopen are not the old request.
-        let source_text = entry.client.synchronized_text(&try_path_to_uri(source)?)
+        let source_text = entry
+            .client
+            .synchronized_text(&try_path_to_uri(source)?)
             .filter(|text| crate::lsp::text::content_hash_for_drift(text) == hash)
-            .ok_or_else(|| tool_err("LSP_EDIT_CONFLICT", "source synchronization changed before refactoring"))?;
+            .ok_or_else(|| {
+                tool_err(
+                    "LSP_EDIT_CONFLICT",
+                    "source synchronization changed before refactoring",
+                )
+            })?;
         if documents
             .get(source)
             .is_some_and(|document| document.hash != hash)
@@ -73,10 +80,15 @@ impl RefactorSnapshot {
         plan: &WorkspaceEditPlan,
     ) -> Result<HashMap<PathBuf, u64>> {
         verify_source(&self.source, self.source_hash)?;
-        if !entry.client.synchronized_text(&try_path_to_uri(&self.source)?)
+        if !entry
+            .client
+            .synchronized_text(&try_path_to_uri(&self.source)?)
             .is_some_and(|text| Arc::ptr_eq(&self.source_text, &text))
         {
-            return Err(tool_err("LSP_EDIT_CONFLICT", "source document was closed or resynchronized during refactoring"));
+            return Err(tool_err(
+                "LSP_EDIT_CONFLICT",
+                "source document was closed or resynchronized during refactoring",
+            ));
         }
         let current = entry.client.document_snapshots();
         validate_versions(raw, &self.documents, &current)?;
@@ -241,6 +253,7 @@ fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Re
 }
 
 impl LspTool {
+    #[allow(clippy::unused_self)]
     pub(super) fn prepare_refactor(
         &self,
         entry: &ServerEntry,

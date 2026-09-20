@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 352 current source files.
+- `rg --files src -g '*.rs' | sort` -> 356 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 352.
+- Source-file rows below: 356.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -198,6 +198,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/actions.rs` | LSP code action and refactoring execution | Unit; `tests/lsp.rs`. |
 | `src/lsp/actions/command_edits.rs` | LSP execute command workspace edit collector | `tests/lsp.rs`, `src/lsp/actions/command_tests.rs`. |
 | `src/lsp/actions/command_tests.rs` | LSP execute command test suite | Test module; execute command tests. |
+| `src/lsp/actions/preview_tests.rs` | LSP code action preview and approval test suite | Test module; code action preview tests. |
 | `src/lsp/actions/protocol_tests.rs` | LSP code action protocol test cases | Test support module; exercises code actions. |
 | `src/lsp/actions/refactor.rs` | LSP symbol rename and refactor operations | Unit; `src/lsp/actions/refactor/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/actions/refactor/formatting.rs` | LSP document and range formatting | Unit; `src/lsp/actions/refactor/formatting/tests.rs`. |
@@ -338,6 +339,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/self_update.rs` | Self-update | `tests/self_update.rs`. |
 | `src/semantic_workspace_graph.rs` | Semantic workspace graph and context bundles | Unit; `tests/semantic_workspace_graph_contract.rs`, `tests/semantic_workspace_graph_builder.rs`, and agent integration tests. |
 | `src/session.rs` | Session JSONL/tree | Unit; `tests/session_conformance.rs`, `tests/e2e_session_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/session_control.rs` | Session control, live steering, follow-up, and input retraction | Unit; `src/session_control/agent_tests.rs`. |
+| `src/session_control/agent_tests.rs` | Session control agent integration test suite | Test module; session control agent tests. |
+| `src/session_control/attachments.rs` | Session control media attachment admission and authorship tracking | Unit; in-module tests. |
 | `src/session_import.rs` | Session import | `tests/session_import.rs`. |
 | `src/session_import/conversion.rs` | Session import format conversion and mapping | Unit; `tests/session_import.rs`. |
 | `src/session_import/transcript.rs` | Session import transcript parser | Unit; `tests/session_import.rs`. |
