@@ -152,12 +152,23 @@ fn unix_non_utf8_names_do_not_alias_replacement_characters() {
     let name = std::ffi::OsString::from_vec(b"invalid-\xff.rs".to_vec());
     let raw = temp.path().join(name);
     let replacement = temp.path().join("invalid-�.rs");
-    std::fs::write(&raw, "raw filename").unwrap();
-    std::fs::write(&replacement, "different filename").unwrap();
+    // The aliasing guarded here is a property of the encoder, so assert it
+    // without a filesystem; neither path has to exist for these to hold.
     let uri = try_path_to_uri(&raw).unwrap();
     assert!(uri.contains("%FF"));
-    assert_eq!(uri_to_path(&uri), Some(raw));
+    assert_eq!(uri_to_path(&uri), Some(raw.clone()));
     assert_ne!(uri, try_path_to_uri(&replacement).unwrap());
+
+    // Reading back through the round-tripped path does need a filesystem that
+    // will hold a name which is not UTF-8, and APFS and HFS+ will not: they
+    // refuse it with EILSEQ, which failed this test on macOS instead of
+    // skipping the one half that cannot run there. Creating the
+    // replacement-character name first keeps the skip honest — if that write
+    // fails the directory is at fault, and the unwrap says so.
+    std::fs::write(&replacement, "different filename").unwrap();
+    if std::fs::write(&raw, "raw filename").is_err() {
+        return;
+    }
     assert_eq!(
         std::fs::read(uri_to_path(&uri).unwrap()).unwrap(),
         b"raw filename"

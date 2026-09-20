@@ -292,6 +292,7 @@ pub mod self_update;
 pub mod semantic_workspace_graph;
 #[doc(hidden)]
 pub mod session;
+pub mod session_control;
 #[doc(hidden)]
 pub mod session_import;
 #[doc(hidden)]

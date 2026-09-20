@@ -49,7 +49,7 @@ pub(super) fn validate_selection(input: &LspInput) -> Result<()> {
     let Some(id) = &input.refactor_id else {
         return Ok(());
     };
-    if !matches!(input.action.as_str(), "rename" | "rename_file")
+    if !matches!(input.action.as_str(), "rename" | "rename_file" | "code_actions")
         || id.is_empty()
         || id.len() > 128
         || input.file.is_some()
@@ -74,7 +74,7 @@ pub(super) fn validate_selection(input: &LspInput) -> Result<()> {
     {
         return Err(tool_err(
             "LSP_USAGE",
-            "refactorId requires its original rename action and accepts only apply and timeout; the plan cannot be overridden",
+            "refactorId requires its original action and accepts only apply and timeout; the plan cannot be overridden",
         ));
     }
     Ok(())
@@ -222,10 +222,7 @@ impl LspTool {
                 .filter(|preview| Some(preview.id.as_str()) == input.refactor_id.as_deref())
                 .ok_or_else(stale)?;
             if preview.metadata["action"].as_str() != Some(input.action.as_str()) {
-                return Err(tool_err(
-                    "LSP_USAGE",
-                    "refactorId belongs to a different rename action",
-                ));
+                return Err(tool_err("LSP_USAGE", "refactorId belongs to a different action"));
             }
             // Consume before validation or any write. Failed/stale applications
             // cannot be replayed, including failures with incomplete rollback.

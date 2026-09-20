@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 mod command_edits;
 mod refactor;
+#[cfg(test)]
+mod preview_tests;
 
 const MAX_ACTIONS: usize = 128;
 const MAX_ACTION_BYTES: usize = 2 * 1024 * 1024;
@@ -503,8 +505,9 @@ fn validate_resolution(original: &Value, resolved: Value) -> Result<Value> {
 }
 
 fn validate_action_request(input: &LspInput) -> Result<()> {
-    if input.action_id.is_some()
-        && (!input.apply.unwrap_or(false)
+    if let Some(id) = &input.action_id
+        && (id.is_empty()
+            || id.len() > 128
             || input.query.is_some()
             || input.range.is_some()
             || input.only.is_some()
@@ -513,8 +516,11 @@ fn validate_action_request(input: &LspInput) -> Result<()> {
     {
         return Err(tool_err(
             "LSP_USAGE",
-            "actionId requires apply:true and cannot be combined with query, range, only, symbol or line",
+            "actionId must be nonempty and bounded and cannot be combined with query, range, only, symbol or line",
         ));
+    }
+    if input.query.as_deref().is_some_and(|query| query.trim().is_empty()) {
+        return Err(tool_err("LSP_USAGE", "code action query must not be empty"));
     }
     if input.action_id.is_none()
         && input.apply.unwrap_or(false)
@@ -567,6 +573,11 @@ impl LspTool {
     pub(super) async fn run_code_actions(&self, input: &LspInput) -> Result<ToolOutput> {
         // Validate before consuming a handle or starting a language server.
         validate_action_request(input)?;
+        let owner = AgentCx::for_current_or_request();
+        super::refactor_preview::check_owner(&owner)?;
+        // Any admitted fresh listing/selection replaces an earlier reviewed
+        // plan. Invalid selectors and restricted callers leave it untouched.
+        self.refactors.clear();
         let (entry, snapshot, selected) = if let Some(id) = input.action_id.as_deref() {
             let cached = self.actions.take(id)?;
             let entry = cached
@@ -642,7 +653,7 @@ impl LspTool {
             if let Some(only) = &input.only {
                 actions.retain(|action| matches_action_kind(action, only));
             }
-            if !input.apply.unwrap_or(false) {
+            if !input.apply.unwrap_or(false) && input.query.is_none() {
                 let mut summaries = Vec::new();
                 // Old handles are intentionally replaced by the new listing.
                 lock(&self.actions.cache).clear();
@@ -724,11 +735,37 @@ impl LspTool {
             ));
         }
         snapshot.verify_request_source(&entry)?;
-        let owner = AgentCx::for_current_or_request();
         owner
             .checkpoint()
             .map_err(|_| tool_err("LSP_CANCELLED", "code action cancelled before applying"))?;
         lock(&self.actions.cache).clear();
+        if input.apply != Some(true) {
+            // A command may request more edits or cause other effects only
+            // once executed. Never approve its inline subset as the complete
+            // action, and never grant a command lease just to obtain a preview.
+            if command.is_some() {
+                return Err(tool_err(
+                    "LSP_ACTION_NOT_PREVIEWABLE",
+                    "command-backed code actions cannot be frozen into a complete preview; list again and explicitly apply the selected action to execute it",
+                ));
+            }
+            let edit = edit.ok_or_else(|| {
+                tool_err("LSP_ACTION_NO_EDIT", "selected code action has no workspace edit")
+            })?;
+            let prepared = self.prepare_refactor(&entry, edit, &snapshot)?;
+            return self.cache_refactor(
+                &entry,
+                prepared,
+                edit.clone(),
+                json!({
+                    "action":"code_actions","title":selected["title"],"kind":selected.get("kind"),
+                    "executedCommand":null,"serverEditRequests":0,"serverEditFailures":[],
+                    "partial":false,"rollbackIncomplete":false,"error":null
+                }),
+                None,
+                &owner,
+            );
+        }
         let mut report = Report::default();
         let mut failure = None;
         let mut command_started = false;

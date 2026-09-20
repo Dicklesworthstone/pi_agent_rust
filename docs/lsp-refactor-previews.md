@@ -1,9 +1,57 @@
 # Review and approve workspace refactors
 
-Symbol and file renames can be inspected before any target files change.
+Symbol renames, file moves, and edit-only code actions can be inspected before
+any target files change.
 A preview retains one immutable, already-staged transaction. Approval commits
 those staged final images; it does not ask the language server for another
-rename or recalculate edits against newer file contents.
+rename, re-resolve a code action, or recalculate edits against newer contents.
+
+## Extract, inline, and fix imports with review
+
+List code actions for an exact UTF-16 range and a kind such as
+`refactor.extract`, `refactor.inline`, or `source.organizeImports`:
+
+```json
+{"action":"code_actions","file":"src/lib.rs","range":{"start":{"line":8,"character":4},"end":{"line":10,"character":12}},"only":["refactor.extract"]}
+```
+
+Select the returned `actionId` without `apply:true` to resolve and stage its
+complete workspace edit. This consumes the selected action handle and returns
+a `refactorId`; no target files change:
+
+```json
+{"action":"code_actions","actionId":"<listed action ID>"}
+```
+
+Inspect or approve that exact plan using **only** the new handle:
+
+```json
+{"action":"code_actions","refactorId":"<preview ID>"}
+```
+
+```json
+{"action":"code_actions","refactorId":"<preview ID>","apply":true}
+```
+
+A fresh `query` also selects one action for preview when `apply` is omitted or
+false. Queries match a unique title or a one-based index **after** the `only`
+filter. Without `query` or `actionId`, a non-applying request is still a list.
+Explicit `apply:true` with `actionId` or a fresh query preserves direct
+application. A blank query is an error, not an implicit selection.
+
+The source's synchronized incarnation is retained from the original listing,
+including servers without wire document versions. Closing and reopening the
+same bytes cannot revive an old action before resolution. At preview staging,
+the transaction also captures unopened affected files. Approval never sends
+another `textDocument/codeAction` or `codeAction/resolve` request.
+
+**Command-backed actions are not complete static plans.** Preview rejects
+both command-only and edit-plus-command actions with
+`LSP_ACTION_NOT_PREVIEWABLE`, including commands added during lazy resolution.
+It does not execute the command to discover effects or silently approve just
+its inline edits. List again and explicitly use `apply:true` on the selected
+action to use the existing command workflow. Such direct execution is not
+covered by a reviewed `refactorId` and can have additional command effects.
 
 ## Symbol rename
 
@@ -74,7 +122,8 @@ absence of integration is not mistaken for updated imports.
 ## Identity, freshness, and authority
 
 One plan is retained per `LspTool` instance. IDs are opaque and cannot be used
-on another instance. A fresh rename replaces the previous plan. Reload,
+on another instance. A fresh rename or an admitted code-action listing or
+selection replaces the previous plan. Reload,
 refactor application, server death, and expiry invalidate old plans. Plans are
 usable for five minutes after creation; inspection does not extend that time.
 Expiry is checked on use, not by a background eviction task.
@@ -95,7 +144,7 @@ server's analysis is globally up to date.
 Each inspection or approval requires the current caller's filesystem I/O
 authority and cancellation checks. An earlier request's authority does not
 grant a later caller permission. Invalid overriding selectors, foreign IDs,
-and a mismatched rename action do not consume the matching valid plan.
+and a mismatched action do not consume the matching valid plan.
 Once a matching, admitted selection begins validation, failures retire it;
 applications consume it before any write. Reusing an applied or retired ID
 returns `LSP_REFACTOR_STALE` without another server request. Correct the

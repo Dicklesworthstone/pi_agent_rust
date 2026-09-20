@@ -3492,12 +3492,20 @@ mod tests {
     ///
     /// Note that this polls on the CALLING thread, which is the libtest thread,
     /// so the frames land on whatever stack libtest gave it. These session
-    /// builds need far more than the 2 MiB default in a debug build — see
-    /// `RUST_MIN_STACK` in `.cargo/config.toml`. The builder-level
-    /// `thread_stack_size` that rescued `sdk_unit` and `sdk_integration`
-    /// (bd-79qxb) cannot help here, and neither can moving the work to a
-    /// reserved thread: several of these futures hold an
-    /// `asupersync::sync::MutexGuard` across an await and so are not `Send`.
+    /// builds do not fit the 2 MiB default in a debug build, and a stack
+    /// overflow ABORTS the process rather than failing one test, so the whole
+    /// binary reports nothing — not a tally with one failure in it.
+    ///
+    /// Boxing the future is enough on its own: every one of the 66 `sdk::`
+    /// tests passes on an unmodified libtest thread with it, and overflows
+    /// without it. The builder-level `thread_stack_size` that rescued
+    /// `sdk_unit` and `sdk_integration` (bd-79qxb) cannot help here, and
+    /// neither can moving the work to a reserved thread: several of these
+    /// futures hold an `asupersync::sync::MutexGuard` across an await and so
+    /// are not `Send`. `RUST_MIN_STACK` in `.cargo/config.toml` also covers
+    /// this, but only for a process cargo launches; boxing additionally covers
+    /// running the built test binary directly, which cargo's `[env]` never
+    /// reaches.
     fn run_async<F>(future: F) -> F::Output
     where
         F: std::future::Future,
@@ -3507,7 +3515,7 @@ mod tests {
             .with_reactor(reactor)
             .build()
             .expect("build runtime");
-        runtime.block_on(future)
+        runtime.block_on(Box::pin(future))
     }
 
     fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -8,7 +8,11 @@ fn run_async<F: std::future::Future>(future: F) -> F::Output {
         .with_reactor(reactor)
         .build()
         .expect("runtime")
-        .block_on(future)
+        // Boxed for the same reason as `sdk::tests::run_async`, which see:
+        // `create_agent_session`'s future does not fit a libtest thread's
+        // 2 MiB default stack, and overflowing it aborts the process rather
+        // than failing one test.
+        .block_on(Box::pin(future))
 }
 
 fn extension(dir: &Path, provider: &str) -> PathBuf {
