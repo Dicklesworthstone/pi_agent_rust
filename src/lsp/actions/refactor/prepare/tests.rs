@@ -153,3 +153,5 @@ fn request_budget_and_cancellation_do_not_reset_between_phases() {
     budget.owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel rename"));
     assert!(budget.remaining().unwrap_err().to_string().contains("LSP_CANCELLED"));
 }
+
+mod protocol;
