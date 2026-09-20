@@ -7,7 +7,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 338 current source files.
+- `rg --files src -g '*.rs' | sort` -> 340 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 338.
+- Source-file rows below: 340.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -220,6 +220,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/completion.rs` | LSP native completion engine and handle manager | Unit; `src/lsp/completion/tests.rs`, `src/lsp/completion/tests/protocol.rs`. |
 | `src/lsp/completion/item.rs` | LSP completion item normalization, resolution, and text edits | Unit; `src/lsp/completion/item/tests.rs`. |
 | `src/lsp/completion/item/tests.rs` | LSP completion item test suite | Test module; completion item tests. |
+| `src/lsp/completion/snippet.rs` | LSP completion snippet placeholder parsing and expansion | Unit; `src/lsp/completion/snippet/tests.rs`. |
+| `src/lsp/completion/snippet/tests.rs` | LSP completion snippet test suite | Test module; snippet tests. |
 | `src/lsp/completion/tests.rs` | LSP completion handle and integration test suite | Test module; completion tests. |
 | `src/lsp/completion/tests/protocol.rs` | LSP completion protocol scenario tests | Test module; protocol scenarios. |
 | `src/lsp/diagnostics_tests.rs` | LSP model-facing diagnostics test suite | Test module; diagnostics tool tests. |

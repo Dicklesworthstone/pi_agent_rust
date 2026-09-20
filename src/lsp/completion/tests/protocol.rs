@@ -419,123 +419,237 @@ fn a_completion_cannot_write_with_an_owner_that_lacks_io_authority() {
 }
 
 fn with_values(id: &str, apply: bool, values: Value) -> Value {
-    let mut input=select(id,apply);
-    input["snippetValues"]=values;
+    let mut input = select(id, apply);
+    input["snippetValues"] = values;
     input
 }
 
 #[test]
 fn snippet_defaults_preview_and_explicit_values_apply_without_mutating_the_candidate() {
-    let temp=tempfile::tempdir().unwrap();
-    let Some(tool)=fixture(temp.path(),"snippet") else { return };
-    let rt=runtime(); let id=list(&tool,&rt);
-    let preview=run(&tool,&rt,select(&id,false)).unwrap().details.unwrap();
-    assert_eq!(preview["canApply"],true);
-    assert_eq!(preview["edits"][0]["newText"],"Type(argument)");
-    let chosen=run(&tool,&rt,with_values(&id,false,json!({"1":"input"}))).unwrap().details.unwrap();
-    assert_eq!(chosen["edits"][0]["newText"],"Type(input)");
-    assert_eq!(source(temp.path()),SOURCE);
-    let again=run(&tool,&rt,select(&id,false)).unwrap().details.unwrap();
-    assert_eq!(again["edits"][0]["newText"],"Type(argument)");
-    run(&tool,&rt,with_values(&id,true,json!({"1":"different"}))).unwrap();
-    assert_eq!(source(temp.path()),"// header\nfn main() { Type(different) }\n");
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "snippet") else {
+        return;
+    };
+    let rt = runtime();
+    let id = list(&tool, &rt);
+    let preview = run(&tool, &rt, select(&id, false))
+        .unwrap()
+        .details
+        .unwrap();
+    assert_eq!(preview["canApply"], true);
+    assert_eq!(preview["edits"][0]["newText"], "Type(argument)");
+    let chosen = run(&tool, &rt, with_values(&id, false, json!({"1":"input"})))
+        .unwrap()
+        .details
+        .unwrap();
+    assert_eq!(chosen["edits"][0]["newText"], "Type(input)");
+    assert_eq!(source(temp.path()), SOURCE);
+    let again = run(&tool, &rt, select(&id, false))
+        .unwrap()
+        .details
+        .unwrap();
+    assert_eq!(again["edits"][0]["newText"], "Type(argument)");
+    run(&tool, &rt, with_values(&id, true, json!({"1":"different"}))).unwrap();
+    assert_eq!(
+        source(temp.path()),
+        "// header\nfn main() { Type(different) }\n"
+    );
 }
 
 #[test]
 fn snippet_required_fields_cannot_be_erased_accidentally_or_inherited_from_preview() {
-    let temp=tempfile::tempdir().unwrap();
-    let Some(tool)=fixture(temp.path(),"snippet_required") else { return };
-    let rt=runtime(); let id=list(&tool,&rt);
-    let preview=run(&tool,&rt,select(&id,false)).unwrap().details.unwrap();
-    assert_eq!(preview["canApply"],false);
-    assert_eq!(preview["missingPlaceholders"],json!([1,2]));
-    let supplied=json!({"1":"first","2":"second"});
-    assert_eq!(run(&tool,&rt,with_values(&id,false,supplied.clone())).unwrap().details.unwrap()["canApply"],true);
-    assert!(run(&tool,&rt,select(&id,true)).unwrap_err().to_string().contains("VALUES_REQUIRED"));
-    assert_eq!(source(temp.path()),SOURCE);
-    run(&tool,&rt,with_values(&id,true,supplied)).unwrap();
-    assert_eq!(source(temp.path()),"// header\nfn main() { Type(first, second) }\n");
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "snippet_required") else {
+        return;
+    };
+    let rt = runtime();
+    let id = list(&tool, &rt);
+    let preview = run(&tool, &rt, select(&id, false))
+        .unwrap()
+        .details
+        .unwrap();
+    assert_eq!(preview["canApply"], false);
+    assert_eq!(preview["missingPlaceholders"], json!([1, 2]));
+    let supplied = json!({"1":"first","2":"second"});
+    assert_eq!(
+        run(&tool, &rt, with_values(&id, false, supplied.clone()))
+            .unwrap()
+            .details
+            .unwrap()["canApply"],
+        true
+    );
+    assert!(
+        run(&tool, &rt, select(&id, true))
+            .unwrap_err()
+            .to_string()
+            .contains("VALUES_REQUIRED")
+    );
+    assert_eq!(source(temp.path()), SOURCE);
+    run(&tool, &rt, with_values(&id, true, supplied)).unwrap();
+    assert_eq!(
+        source(temp.path()),
+        "// header\nfn main() { Type(first, second) }\n"
+    );
 }
 
 #[test]
 fn snippet_mirrors_insert_literal_unicode_values_without_evaluation() {
-    let temp=tempfile::tempdir().unwrap();
-    let Some(tool)=fixture(temp.path(),"snippet_mirror") else { return };
-    let rt=runtime(); let id=list(&tool,&rt);
-    let value="${2:literal} \\ 😀 $(not_a_command)";
-    let output=run(&tool,&rt,with_values(&id,true,json!({"1":value}))).unwrap().details.unwrap();
-    assert_eq!(output["commandExecuted"],false);
-    assert_eq!(source(temp.path()),format!("// header\nfn main() {{ Type({value}, {value}) }}\n"));
-    assert!(!events(temp.path()).iter().any(|event|event["method"]=="workspace/executeCommand"));
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "snippet_mirror") else {
+        return;
+    };
+    let rt = runtime();
+    let id = list(&tool, &rt);
+    let value = "${2:literal} \\ 😀 $(not_a_command)";
+    let output = run(&tool, &rt, with_values(&id, true, json!({"1":value})))
+        .unwrap()
+        .details
+        .unwrap();
+    assert_eq!(output["commandExecuted"], false);
+    assert_eq!(
+        source(temp.path()),
+        format!("// header\nfn main() {{ Type({value}, {value}) }}\n")
+    );
+    assert!(
+        !events(temp.path())
+            .iter()
+            .any(|event| event["method"] == "workspace/executeCommand")
+    );
 }
 
 #[test]
 fn lazy_snippet_auto_imports_remain_plain_and_share_the_existing_transaction() {
-    let temp=tempfile::tempdir().unwrap();
-    let Some(tool)=fixture(temp.path(),"snippet_lazy") else { return };
-    let rt=runtime(); let id=list(&tool,&rt);
-    let input=json!({"1":"input"});
-    let preview=run(&tool,&rt,with_values(&id,false,input.clone())).unwrap().details.unwrap();
-    assert_eq!(preview["additionalEdits"],1);
-    assert_eq!(preview["edits"][0]["newText"],"Type(input, input)");
-    assert_eq!(preview["edits"][1]["newText"],"use example::Type;\n// literal $0 ${1:keep}\n");
-    run(&tool,&rt,with_values(&id,true,input)).unwrap();
-    assert_eq!(source(temp.path()),"use example::Type;\n// literal $0 ${1:keep}\n// header\nfn main() { Type(input, input) }\n");
-    assert_eq!(events(temp.path()).iter().filter(|event|event["method"]=="completionItem/resolve").count(),1);
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "snippet_lazy") else {
+        return;
+    };
+    let rt = runtime();
+    let id = list(&tool, &rt);
+    let input = json!({"1":"input"});
+    let preview = run(&tool, &rt, with_values(&id, false, input.clone()))
+        .unwrap()
+        .details
+        .unwrap();
+    assert_eq!(preview["additionalEdits"], 1);
+    assert_eq!(preview["edits"][0]["newText"], "Type(input, input)");
+    assert_eq!(
+        preview["edits"][1]["newText"],
+        "use example::Type;\n// literal $0 ${1:keep}\n"
+    );
+    run(&tool, &rt, with_values(&id, true, input)).unwrap();
+    assert_eq!(
+        source(temp.path()),
+        "use example::Type;\n// literal $0 ${1:keep}\n// header\nfn main() { Type(input, input) }\n"
+    );
+    assert_eq!(
+        events(temp.path())
+            .iter()
+            .filter(|event| event["method"] == "completionItem/resolve")
+            .count(),
+        1
+    );
 }
 
 #[test]
 fn snippet_choices_nested_defaults_and_list_defaults_survive_public_dispatch() {
-    for (mode,values,expected) in [
-        ("snippet_choice",json!({"1":"green"}),"// header\nfn main() { Type(green) }\n"),
-        ("snippet_nested",json!({"2":"chosen"}),"// header\nfn main() { Type(outer(chosen)) }\n"),
-        ("snippet_defaults",json!({"1":"chosen"}),"use example::Type;\n// header\nfn main() { Type(chosen) }\n"),
+    for (mode, values, expected) in [
+        (
+            "snippet_choice",
+            json!({"1":"green"}),
+            "// header\nfn main() { Type(green) }\n",
+        ),
+        (
+            "snippet_nested",
+            json!({"2":"chosen"}),
+            "// header\nfn main() { Type(outer(chosen)) }\n",
+        ),
+        (
+            "snippet_defaults",
+            json!({"1":"chosen"}),
+            "use example::Type;\n// header\nfn main() { Type(chosen) }\n",
+        ),
     ] {
-        let temp=tempfile::tempdir().unwrap();
-        let Some(tool)=fixture(temp.path(),mode) else { return };
-        let rt=runtime(); let id=list(&tool,&rt);
-        run(&tool,&rt,with_values(&id,true,values)).unwrap();
-        assert_eq!(source(temp.path()),expected,"{mode}");
+        let temp = tempfile::tempdir().unwrap();
+        let Some(tool) = fixture(temp.path(), mode) else {
+            return;
+        };
+        let rt = runtime();
+        let id = list(&tool, &rt);
+        run(&tool, &rt, with_values(&id, true, values)).unwrap();
+        assert_eq!(source(temp.path()), expected, "{mode}");
     }
 }
 
 #[test]
 fn unsupported_or_malformed_snippets_never_apply_partial_insertions() {
-    for mode in ["snippet_variable","snippet_transform","snippet_malformed","snippet_conflict"] {
-        let temp=tempfile::tempdir().unwrap();
-        let Some(tool)=fixture(temp.path(),mode) else { return };
-        let rt=runtime(); let id=list(&tool,&rt);
-        assert_eq!(run(&tool,&rt,select(&id,false)).unwrap().details.unwrap()["canApply"],false);
-        assert!(run(&tool,&rt,with_values(&id,true,json!({"1":"override"}))).is_err());
-        assert_eq!(source(temp.path()),SOURCE,"{mode}");
+    for mode in [
+        "snippet_variable",
+        "snippet_transform",
+        "snippet_malformed",
+        "snippet_conflict",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(tool) = fixture(temp.path(), mode) else {
+            return;
+        };
+        let rt = runtime();
+        let id = list(&tool, &rt);
+        assert_eq!(
+            run(&tool, &rt, select(&id, false))
+                .unwrap()
+                .details
+                .unwrap()["canApply"],
+            false
+        );
+        assert!(run(&tool, &rt, with_values(&id, true, json!({"1":"override"}))).is_err());
+        assert_eq!(source(temp.path()), SOURCE, "{mode}");
     }
 }
 
 #[test]
 fn snippet_value_usage_errors_do_not_consume_valid_handles() {
-    let temp=tempfile::tempdir().unwrap();
-    let Some(tool)=fixture(temp.path(),"snippet") else { return };
-    let rt=runtime();
-    let mut listing=request(); listing["snippetValues"]=json!({"1":"bad"});
-    assert!(run(&tool,&rt,listing).is_err());
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "snippet") else {
+        return;
+    };
+    let rt = runtime();
+    let mut listing = request();
+    listing["snippetValues"] = json!({"1":"bad"});
+    assert!(run(&tool, &rt, listing).is_err());
     assert!(tool.registry.status().is_empty());
-    assert!(run(&tool,&rt,json!({"action":"status","snippetValues":{}})).is_err());
-    let id=list(&tool,&rt);
-    for values in [json!({"01":"bad"}),json!({"2":"unknown"}),json!({"1":42}),json!({"1":"x".repeat(16385)})] {
-        assert!(run(&tool,&rt,with_values(&id,true,values)).is_err());
-        assert_eq!(source(temp.path()),SOURCE);
+    assert!(run(&tool, &rt, json!({"action":"status","snippetValues":{}})).is_err());
+    let id = list(&tool, &rt);
+    for values in [
+        json!({"01":"bad"}),
+        json!({"2":"unknown"}),
+        json!({"1":42}),
+        json!({"1":"x".repeat(16385)}),
+    ] {
+        assert!(run(&tool, &rt, with_values(&id, true, values)).is_err());
+        assert_eq!(source(temp.path()), SOURCE);
     }
-    run(&tool,&rt,with_values(&id,true,json!({"1":"valid"}))).unwrap();
-    assert_eq!(source(temp.path()),"// header\nfn main() { Type(valid) }\n");
+    run(&tool, &rt, with_values(&id, true, json!({"1":"valid"}))).unwrap();
+    assert_eq!(
+        source(temp.path()),
+        "// header\nfn main() { Type(valid) }\n"
+    );
 }
 
 #[test]
 fn source_drift_after_snippet_preview_prevents_both_insertion_and_auto_imports() {
-    let temp=tempfile::tempdir().unwrap();
-    let Some(tool)=fixture(temp.path(),"snippet_lazy") else { return };
-    let rt=runtime(); let id=list(&tool,&rt);
-    run(&tool,&rt,with_values(&id,false,json!({"1":"value"}))).unwrap();
-    std::fs::write(temp.path().join("source.picomp"),"external\n").unwrap();
-    assert!(run(&tool,&rt,with_values(&id,true,json!({"1":"value"}))).unwrap_err().to_string().contains("STALE"));
-    assert_eq!(source(temp.path()),"external\n");
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "snippet_lazy") else {
+        return;
+    };
+    let rt = runtime();
+    let id = list(&tool, &rt);
+    run(&tool, &rt, with_values(&id, false, json!({"1":"value"}))).unwrap();
+    std::fs::write(temp.path().join("source.picomp"), "external\n").unwrap();
+    assert!(
+        run(&tool, &rt, with_values(&id, true, json!({"1":"value"})))
+            .unwrap_err()
+            .to_string()
+            .contains("STALE")
+    );
+    assert_eq!(source(temp.path()), "external\n");
 }

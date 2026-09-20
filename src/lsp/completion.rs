@@ -566,8 +566,12 @@ impl LspTool {
         selected.source.verify()?;
         let source = &selected.source;
         let planned = snippet::prepare(&selected.item, values).and_then(|expanded| {
-            let edits =
-                item::edits(&expanded.item, &source.text, source.position, source.fallback)?;
+            let edits = item::edits(
+                &expanded.item,
+                &source.text,
+                source.position,
+                source.fallback,
+            )?;
             Ok((expanded, edits))
         });
         let (expanded, edits) = match planned {
@@ -579,7 +583,9 @@ impl LspTool {
             }
             Err(error) => return Err(error),
         };
-        if apply { expanded.require_values()?; }
+        if apply {
+            expanded.require_values()?;
+        }
         let mut changes = serde_json::Map::new();
         changes.insert(source.uri.clone(), json!(edits));
         let plan = parse_workspace_edit(&json!({"changes":changes}))?;
