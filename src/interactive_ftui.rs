@@ -6526,6 +6526,37 @@ mod tests {
     }
 
     #[test]
+    fn extension_ui_effects_are_printed_rather_than_applied_here() {
+        // The classic stack routes these through `apply_extension_ui_effect`,
+        // which sets the status line, the title, a widget or the editor text.
+        // This stack has no such dispatcher: anything that does not expect a
+        // response is formatted and pushed as a System entry, so an extension
+        // calling `ui.setWorkingMessage(...)` gets a line in the transcript
+        // instead of a status. Pinned so the divergence is visible rather than
+        // discovered, and so that implementing the effects breaks this test on
+        // purpose.
+        for method in ["setStatus", "setTitle", "setWidget", "set_editor_text"] {
+            let (_tx, model) = new_model();
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            let before = sim.model().transcript.len();
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                "probe",
+                method,
+                serde_json::json!({"text": "hello", "statusText": "hello"}),
+            ))));
+
+            let added = &sim.model().transcript[before..];
+            assert_eq!(added.len(), 1, "{method} should add one entry");
+            assert_eq!(added[0].role, EntryRole::System, "{method} role");
+            assert!(
+                sim.model().input.text().is_empty(),
+                "{method} must not have reached the editor"
+            );
+        }
+    }
+
+    #[test]
     fn extension_reply_disconnect_cancels_pending_and_rejects_new_prompts() {
         let (agent_tx, agent_rx) = mpsc::channel();
         let handler = FtuiExtensionUiHandler::new(agent_tx);

@@ -657,19 +657,19 @@
 | `ui.input()` | Y | Y | Input dialog |
 | `ui.notify()` | Y | Y | Notification |
 | `ui.setStatus()` | Y | Y | Status bar |
-| `ui.setWorkingMessage()` | Y | Y | Working message; bridges to the `setStatus` op |
+| `ui.setWorkingMessage()` | Y | P | Bridges to `setStatus`, applied on classic. On ftui it is printed as a transcript line, not applied |
 | `ui.setWidget()` | Y | Y | Custom widget |
-| `ui.setFooter()` | Y | Y | Custom footer; bridges to `setStatus`/`setTitle` |
-| `ui.setHeader()` | Y | Y | Custom header; bridges to `setTitle`/`setStatus` |
+| `ui.setFooter()` | Y | P | Bridges to `setStatus`/`setTitle`; classic applies, ftui prints |
+| `ui.setHeader()` | Y | P | Bridges to `setTitle`/`setStatus`; classic applies, ftui prints |
 | `ui.setTitle()` | Y | Y | Window title |
 | `ui.custom()` | Y | Y | Custom component; `custom` op in extension_dispatcher.rs |
-| `ui.setEditorText()` | Y | Y | `set_editor_text`, applied in interactive/agent.rs |
-| `ui.getEditorText()` | Y | Y | `getEditorText`, answered in interactive/agent.rs |
+| `ui.setEditorText()` | Y | P | `set_editor_text`, applied in interactive/agent.rs; ftui prints it instead |
+| `ui.getEditorText()` | Y | P | Answered in interactive/agent.rs; ftui has no handler for it |
 | `ui.editor()` | Y | Y | Full editor dialog; `input`/`editor` op in rpc.rs |
 | `ui.theme` | Y | Y | Current theme |
-| `ui.getAllThemes()` | Y | Y | Theme list; answered in interactive/agent.rs |
-| `ui.getTheme()` | Y | Y | Get theme by name; answered in interactive/agent.rs |
-| `ui.setTheme()` | Y | Y | Set active theme; applied in interactive/agent.rs |
+| `ui.getAllThemes()` | Y | P | Answered in interactive/agent.rs; ftui has no handler for it |
+| `ui.getTheme()` | Y | P | Answered in interactive/agent.rs; ftui has no handler for it |
+| `ui.setTheme()` | Y | P | Applied in interactive/agent.rs; ftui has no handler for it |
 
 ### Hostcalls
 
