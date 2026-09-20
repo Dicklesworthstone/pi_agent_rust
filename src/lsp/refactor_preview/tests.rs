@@ -219,3 +219,5 @@ fn oversized_previews_fail_instead_of_truncating_approval_evidence() {
     let result = output(payload.clone()).unwrap();
     assert_eq!(result.details, Some(payload));
 }
+
+mod protocol;
