@@ -179,6 +179,10 @@ impl LspClient {
                     "publishDiagnostics":{"relatedInformation":true,"versionSupport":true},
                     "diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false},
                     "hover":{"contentFormat":["markdown","plaintext"]},
+                    "inlayHint":{
+                        "dynamicRegistration":false,
+                        "resolveSupport":{"properties":["tooltip","label.tooltip","label.location"]}
+                    },
                     "signatureHelp":{
                         "dynamicRegistration":false,"contextSupport":true,
                         "signatureInformation":{

@@ -200,3 +200,5 @@ fn dropping_a_pending_signature_request_cancels_it_and_releases_the_tool_lane() 
         assert!(!output.is_error);
     });
 }
+
+mod hints;
