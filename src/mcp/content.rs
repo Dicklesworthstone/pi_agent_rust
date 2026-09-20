@@ -5,6 +5,9 @@
 //! structured results and embedded documents to the model instead of hiding
 //! them in `ToolOutput::details`. Resource URIs are opaque labels here: this
 //! module never opens a path, fetches a URL, or executes server content.
+//! Explicit audience annotations are honored before rendering or decoding.
+//! Blocks not addressed to the assistant remain in client details. These are
+//! routing hints, not a grant of authority or trust in the server's content.
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -203,6 +206,27 @@ impl Shaper {
         Ok(())
     }
 
+    /// None means the original block is retained only in client details;
+    /// Some records whether the normal model-content conversion succeeded.
+    /// Check routing before inspecting labels or decoding binary payloads.
+    fn model_block(
+        &mut self,
+        index: usize,
+        block: &Value,
+        client_only: &mut Vec<Value>,
+    ) -> Option<bool> {
+        let reason = match assistant_audience(block) {
+            Ok(true) => return Some(self.block(index, block)),
+            Ok(false) => "not_for_assistant",
+            Err(reason) => {
+                self.warning(Some(index), "MCP_AUDIENCE_INVALID", reason, true);
+                "invalid_annotations"
+            }
+        };
+        client_only.push(json!({"index":index, "reason":reason, "block":block}));
+        None
+    }
+
     fn block(&mut self, index: usize, block: &Value) -> bool {
         let kind = block.get("type").and_then(Value::as_str);
         let result = match kind {
@@ -235,6 +259,50 @@ impl Shaper {
         }
         true
     }
+}
+
+/// Missing audience annotations preserve the existing model-visible default.
+/// An explicit audience is an allow-list: an empty list includes nobody, and
+/// malformed roles do not silently become permission to expose the block.
+fn assistant_audience(block: &Value) -> Result<bool, &'static str> {
+    let Some(annotations) = block.get("annotations") else {
+        return Ok(true);
+    };
+    let annotations = annotations
+        .as_object()
+        .ok_or("content annotations must be an object")?;
+    let Some(audience) = annotations.get("audience") else {
+        return Ok(true);
+    };
+    let roles = audience
+        .as_array()
+        .ok_or("audience must be an array of user or assistant roles")?;
+    roles.iter().try_fold(false, |visible, role| match role.as_str() {
+        Some("assistant") => Ok(true),
+        Some("user") => Ok(visible),
+        _ => Err("audience entries must be user or assistant roles"),
+    })
+}
+
+/// Only a model-visible text block can stand in for structuredContent. In
+/// particular, user-only JSON text must not suppress separately advertised
+/// structured facts that have not yet reached the model.
+fn structured_is_model_visible(result: &Value, structured: &Value, block_limit: usize) -> bool {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks.iter().take(block_limit).any(|block| {
+                assistant_audience(block).unwrap_or(false)
+                    && block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                        .as_ref()
+                        == Some(structured)
+            })
+        })
 }
 
 fn quoted_label(label: &str) -> String {
@@ -314,6 +382,7 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
     };
     let mut details = json!({"mcp": true, "nonTextBlocks": 0});
     let mut non_text = Vec::new();
+    let mut client_only = Vec::new();
     if result.is_object() {
         if result.get("isError").is_some_and(|flag| !flag.is_boolean()) {
             shaper.warning(
@@ -332,7 +401,9 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
                         .count()
                 );
                 for (index, block) in blocks.iter().take(limits.blocks).enumerate() {
-                    let represented = shaper.block(index, block);
+                    let Some(represented) = shaper.model_block(index, block, &mut client_only) else {
+                        continue;
+                    };
                     if block.get("type").and_then(Value::as_str) != Some("text") {
                         non_text.push(if represented {
                             non_text_metadata(block)
@@ -359,22 +430,7 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
             // Servers commonly supply the exact same JSON in a text block
             // for older clients. Avoid duplicating it, but a human summary
             // such as "Done" must not hide structured facts from the model.
-            let already_visible =
-                result
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|blocks| {
-                        blocks.iter().take(limits.blocks).any(|block| {
-                            block.get("type").and_then(Value::as_str) == Some("text")
-                                && block
-                                    .get("text")
-                                    .and_then(Value::as_str)
-                                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                                    .as_ref()
-                                    == Some(structured)
-                        })
-                    });
-            if !already_visible {
+            if !structured_is_model_visible(result, structured, limits.blocks) {
                 shaper.text("MCP structured result:");
                 shaper.text(&json_text(structured));
             }
@@ -391,7 +447,15 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
         );
     }
     if shaper.content.is_empty() {
-        shaper.text("[MCP tool returned no content]");
+        shaper.text(if client_only.is_empty() {
+            "[MCP tool returned no content]"
+        } else {
+            "[MCP tool returned only content not addressed to the assistant; retained in client details]"
+        });
+    }
+    if !client_only.is_empty() {
+        details["audienceFilteredBlocks"] = json!(client_only.len());
+        details["audienceFilteredContent"] = Value::Array(client_only);
     }
     if !non_text.is_empty() {
         details["nonText"] = Value::Array(non_text);
@@ -433,6 +497,153 @@ mod tests {
             binary_bytes: bytes,
             audio_bytes: bytes,
         }
+    }
+
+    #[test]
+    fn user_only_text_is_retained_in_details_not_model_content() {
+        let hidden = json!({
+            "type":"text", "text":"private-user-text",
+            "annotations":{"audience":["user"]}, "_meta":{"token":"private-user-meta"}
+        });
+        let input = json!({"content":[
+            {"type":"text", "text":"before"},
+            hidden,
+            {"type":"text", "text":"after"}
+        ]});
+        let before = input.clone();
+        let output = tool_output(&input);
+        assert!(!output.is_error);
+        assert_eq!(text(&output), "before\nafter");
+        assert!(!text(&output).contains("private-user"));
+        let details = output.details.expect("details");
+        assert_eq!(details["audienceFilteredBlocks"], 1);
+        assert_eq!(details["audienceFilteredContent"][0]["index"], 1);
+        assert_eq!(details["audienceFilteredContent"][0]["reason"], "not_for_assistant");
+        assert_eq!(details["audienceFilteredContent"][0]["block"], hidden);
+        assert_eq!(input, before, "routing must not mutate the original result");
+    }
+
+    #[test]
+    fn user_only_binary_and_resource_blocks_are_not_decoded_or_rendered() {
+        let mut blocks = vec![
+            json!({"type":"image", "mimeType":"image/png", "data":"private-user-image"}),
+            json!({"type":"audio", "mimeType":"audio/wav", "data":"private-user-audio"}),
+            json!({"type":"resource", "resource":{
+                "uri":"file:///private-user-resource", "text":"private-user-document"
+            }}),
+            json!({"type":"resource_link", "uri":"file:///private-user-link", "name":"private-user-name"}),
+        ];
+        for block in &mut blocks {
+            block["annotations"] = json!({"audience":["user"]});
+        }
+        let output = tool_output_with_limits(&json!({"content":blocks}), limits(0));
+        assert!(!output.is_error, "unaddressed payloads must not enter binary admission");
+        assert!(!text(&output).contains("private-user"));
+        assert!(text(&output).contains("retained in client details"));
+        assert!(output.content.iter().all(|block| matches!(block, ContentBlock::Text(_))));
+        let details = output.details.expect("details");
+        assert_eq!(details["decodedBinaryBytes"], 0);
+        assert_eq!(details["audienceFilteredBlocks"], 4);
+        assert!(details.get("nonText").is_none(), "do not duplicate omitted binary payloads");
+        assert!(details.get("contentWarnings").is_none());
+        for (index, block) in blocks.iter().enumerate() {
+            assert_eq!(details["audienceFilteredContent"][index]["block"], *block);
+        }
+    }
+
+    #[test]
+    fn assistant_and_shared_audiences_preserve_native_content_and_order() {
+        let image = encoded(b"shared image");
+        let output = tool_output(&json!({"content":[
+            {"type":"text", "text":"default", "annotations":{"priority":0.5}},
+            {"type":"text", "text":"assistant", "annotations":{"audience":["assistant"]}},
+            {"type":"image", "mimeType":"image/png", "data":image,
+                "annotations":{"audience":["user","assistant"]}},
+            {"type":"text", "text":"after", "annotations":{"audience":["assistant","user"]}}
+        ]}));
+        assert!(!output.is_error);
+        assert_eq!(output.content.len(), 3);
+        assert!(matches!(&output.content[0], ContentBlock::Text(t) if t.text == "default\nassistant"));
+        assert!(matches!(&output.content[1], ContentBlock::Image(i) if i.data == image));
+        assert!(matches!(&output.content[2], ContentBlock::Text(t) if t.text == "after"));
+        assert!(output.details.expect("details").get("audienceFilteredContent").is_none());
+    }
+
+    #[test]
+    fn invalid_audience_annotations_fail_closed_without_echoing_payloads() {
+        for annotations in [
+            Value::Null,
+            json!(true),
+            json!([]),
+            json!("private-annotation"),
+            json!({"audience":"assistant"}),
+            json!({"audience":null}),
+            json!({"audience":[1]}),
+            json!({"audience":["assistant","private-unknown-role"]}),
+        ] {
+            let block = json!({"type":"text", "text":"private-payload", "annotations":annotations});
+            let output = tool_output(&json!({"content":[block]}));
+            assert!(output.is_error);
+            let visible = text(&output);
+            assert!(visible.contains("MCP_AUDIENCE_INVALID"));
+            assert!(!visible.contains("private-"));
+            let details = output.details.expect("details");
+            assert_eq!(details["audienceFilteredContent"][0]["reason"], "invalid_annotations");
+            assert_eq!(details["audienceFilteredContent"][0]["block"], block);
+        }
+    }
+
+    #[test]
+    fn an_empty_audience_has_no_model_visible_content() {
+        let output = tool_output(&json!({"content":[{
+            "type":"text", "text":"unaddressed-private-content", "annotations":{"audience":[]}
+        }]}));
+        assert!(!output.is_error);
+        assert!(!text(&output).contains("unaddressed-private-content"));
+        assert!(text(&output).contains("not addressed to the assistant"));
+        assert_eq!(output.details.expect("details")["audienceFilteredBlocks"], 1);
+    }
+
+    #[test]
+    fn filtered_json_text_does_not_hide_separately_advertised_structured_content() {
+        let structured = json!({"answer":42});
+        for audience in [json!(["user"]), json!([]), json!("invalid")] {
+            let output = tool_output(&json!({
+                "content":[{"type":"text", "text":structured.to_string(),
+                    "annotations":{"audience":audience}}],
+                "structuredContent":structured
+            }));
+            assert!(text(&output).contains("MCP structured result"));
+            assert!(text(&output).contains("\"answer\": 42"));
+        }
+    }
+
+    #[test]
+    fn audience_filtering_does_not_extend_the_content_block_budget() {
+        let output = tool_output_with_limits(
+            &json!({"content":[
+                {"type":"text", "text":"private-first", "annotations":{"audience":["user"]}},
+                {"type":"text", "text":"late-visible-content"}
+            ]}),
+            Limits { blocks: 1, binary_bytes: 0, audio_bytes: 0 },
+        );
+        assert!(output.is_error);
+        assert!(text(&output).contains("MCP_CONTENT_LIMIT"));
+        assert!(!text(&output).contains("private-first"));
+        assert!(!text(&output).contains("late-visible-content"));
+        let details = output.details.expect("details");
+        assert_eq!(details["audienceFilteredBlocks"], 1);
+        assert_eq!(details["omittedContentBlocks"], 1);
+    }
+
+    #[test]
+    fn filtering_preserves_remote_execution_error_status() {
+        let output = tool_output(&json!({"isError":true, "content":[{
+            "type":"text", "text":"private-error-detail", "annotations":{"audience":["user"]}
+        }]}));
+        assert!(output.is_error);
+        assert!(!text(&output).contains("private-error-detail"));
+        assert_eq!(output.details.expect("details")["audienceFilteredBlocks"], 1);
     }
 
     #[test]
