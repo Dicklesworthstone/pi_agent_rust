@@ -277,11 +277,13 @@ fn assistant_audience(block: &Value) -> Result<bool, &'static str> {
     let roles = audience
         .as_array()
         .ok_or("audience must be an array of user or assistant roles")?;
-    roles.iter().try_fold(false, |visible, role| match role.as_str() {
-        Some("assistant") => Ok(true),
-        Some("user") => Ok(visible),
-        _ => Err("audience entries must be user or assistant roles"),
-    })
+    roles
+        .iter()
+        .try_fold(false, |visible, role| match role.as_str() {
+            Some("assistant") => Ok(true),
+            Some("user") => Ok(visible),
+            _ => Err("audience entries must be user or assistant roles"),
+        })
 }
 
 /// Only a model-visible text block can stand in for structuredContent. In
@@ -401,7 +403,8 @@ fn tool_output_with_limits(result: &Value, limits: Limits) -> ToolOutput {
                         .count()
                 );
                 for (index, block) in blocks.iter().take(limits.blocks).enumerate() {
-                    let Some(represented) = shaper.model_block(index, block, &mut client_only) else {
+                    let Some(represented) = shaper.model_block(index, block, &mut client_only)
+                    else {
                         continue;
                     };
                     if block.get("type").and_then(Value::as_str) != Some("text") {
@@ -518,7 +521,10 @@ mod tests {
         let details = output.details.expect("details");
         assert_eq!(details["audienceFilteredBlocks"], 1);
         assert_eq!(details["audienceFilteredContent"][0]["index"], 1);
-        assert_eq!(details["audienceFilteredContent"][0]["reason"], "not_for_assistant");
+        assert_eq!(
+            details["audienceFilteredContent"][0]["reason"],
+            "not_for_assistant"
+        );
         assert_eq!(details["audienceFilteredContent"][0]["block"], hidden);
         assert_eq!(input, before, "routing must not mutate the original result");
     }
@@ -537,14 +543,25 @@ mod tests {
             block["annotations"] = json!({"audience":["user"]});
         }
         let output = tool_output_with_limits(&json!({"content":blocks}), limits(0));
-        assert!(!output.is_error, "unaddressed payloads must not enter binary admission");
+        assert!(
+            !output.is_error,
+            "unaddressed payloads must not enter binary admission"
+        );
         assert!(!text(&output).contains("private-user"));
         assert!(text(&output).contains("retained in client details"));
-        assert!(output.content.iter().all(|block| matches!(block, ContentBlock::Text(_))));
+        assert!(
+            output
+                .content
+                .iter()
+                .all(|block| matches!(block, ContentBlock::Text(_)))
+        );
         let details = output.details.expect("details");
         assert_eq!(details["decodedBinaryBytes"], 0);
         assert_eq!(details["audienceFilteredBlocks"], 4);
-        assert!(details.get("nonText").is_none(), "do not duplicate omitted binary payloads");
+        assert!(
+            details.get("nonText").is_none(),
+            "do not duplicate omitted binary payloads"
+        );
         assert!(details.get("contentWarnings").is_none());
         for (index, block) in blocks.iter().enumerate() {
             assert_eq!(details["audienceFilteredContent"][index]["block"], *block);
@@ -563,10 +580,18 @@ mod tests {
         ]}));
         assert!(!output.is_error);
         assert_eq!(output.content.len(), 3);
-        assert!(matches!(&output.content[0], ContentBlock::Text(t) if t.text == "default\nassistant"));
+        assert!(
+            matches!(&output.content[0], ContentBlock::Text(t) if t.text == "default\nassistant")
+        );
         assert!(matches!(&output.content[1], ContentBlock::Image(i) if i.data == image));
         assert!(matches!(&output.content[2], ContentBlock::Text(t) if t.text == "after"));
-        assert!(output.details.expect("details").get("audienceFilteredContent").is_none());
+        assert!(
+            output
+                .details
+                .expect("details")
+                .get("audienceFilteredContent")
+                .is_none()
+        );
     }
 
     #[test]
@@ -588,7 +613,10 @@ mod tests {
             assert!(visible.contains("MCP_AUDIENCE_INVALID"));
             assert!(!visible.contains("private-"));
             let details = output.details.expect("details");
-            assert_eq!(details["audienceFilteredContent"][0]["reason"], "invalid_annotations");
+            assert_eq!(
+                details["audienceFilteredContent"][0]["reason"],
+                "invalid_annotations"
+            );
             assert_eq!(details["audienceFilteredContent"][0]["block"], block);
         }
     }
@@ -601,7 +629,10 @@ mod tests {
         assert!(!output.is_error);
         assert!(!text(&output).contains("unaddressed-private-content"));
         assert!(text(&output).contains("not addressed to the assistant"));
-        assert_eq!(output.details.expect("details")["audienceFilteredBlocks"], 1);
+        assert_eq!(
+            output.details.expect("details")["audienceFilteredBlocks"],
+            1
+        );
     }
 
     #[test]
@@ -625,7 +656,11 @@ mod tests {
                 {"type":"text", "text":"private-first", "annotations":{"audience":["user"]}},
                 {"type":"text", "text":"late-visible-content"}
             ]}),
-            Limits { blocks: 1, binary_bytes: 0, audio_bytes: 0 },
+            Limits {
+                blocks: 1,
+                binary_bytes: 0,
+                audio_bytes: 0,
+            },
         );
         assert!(output.is_error);
         assert!(text(&output).contains("MCP_CONTENT_LIMIT"));
@@ -643,7 +678,10 @@ mod tests {
         }]}));
         assert!(output.is_error);
         assert!(!text(&output).contains("private-error-detail"));
-        assert_eq!(output.details.expect("details")["audienceFilteredBlocks"], 1);
+        assert_eq!(
+            output.details.expect("details")["audienceFilteredBlocks"],
+            1
+        );
     }
 
     #[test]
