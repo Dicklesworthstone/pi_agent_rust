@@ -256,6 +256,7 @@ files = [
     "extensions_message_session",
     "extensions_policy_negative",
     "extensions_process_shim",
+    "extensions_provider_numeric",
     "extensions_provider_oauth",
     "extensions_provider_streaming",
     "extensions_registration",

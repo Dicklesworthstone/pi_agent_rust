@@ -374,6 +374,10 @@
           "justification": "Process shim runtime behavior and compatibility checks for extensions."
         },
         {
+          "path": "tests/extensions_provider_numeric.rs",
+          "justification": "Extension provider numeric decoding and QuickJS number tagging coverage."
+        },
+        {
           "path": "tests/extensions_provider_oauth.rs",
           "justification": "Extension provider OAuth flow integration and failure-path coverage."
         },
