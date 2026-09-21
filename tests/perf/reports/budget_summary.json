@@ -447,12 +447,12 @@
       "remediation": "re-run the benchmark with a correlation id and strict mode, then regenerate the budget report"
     }
   ],
-  "generated_at": "2026-09-21T01:22:38.000Z",
+  "generated_at": "2026-09-21T04:00:37.000Z",
   "no_data": 19,
   "pass": 0,
   "run_id": null,
   "schema": "pi.perf.budget_summary.v2",
-  "source_commit": "bc49dddcc0f5498397f96dd632e32bdb1dcd141b",
+  "source_commit": "bf83241a6b0ec892aea73456501023480a8b514c",
   "strict_mode": false,
   "total_budgets": 19
 }
