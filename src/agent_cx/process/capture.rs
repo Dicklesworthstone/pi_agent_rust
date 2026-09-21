@@ -132,7 +132,7 @@ mod tests {
     use std::io::Cursor;
     use std::process::{Command, Stdio};
 
-    fn command(owner: AgentCx, script: &str) -> AgentCommand {
+    fn command(owner: &AgentCx, script: &str) -> AgentCommand {
         let mut command = owner.process().command("/bin/sh");
         command
             .args(["-c", script])
@@ -147,7 +147,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            command(AgentCx::for_current_or_request(), script)
+            command(&AgentCx::for_current_or_request(), script)
                 .spawn()?
                 .wait_with_output_limited(limit, Duration::from_secs(10))
                 .await
@@ -203,7 +203,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let mut child = command(AgentCx::for_current_or_request(), "printf saved; exit 4")
+            let mut child = command(&AgentCx::for_current_or_request(), "printf saved; exit 4")
                 .spawn()
                 .unwrap();
             assert_eq!(child.wait().await.unwrap().code(), Some(4));
@@ -223,7 +223,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let output = command(
-                AgentCx::for_current_or_request(),
+                &AgentCx::for_current_or_request(),
                 "head -c 131072 /dev/zero >&2; printf ok",
             )
             .stderr(Stdio::null())
@@ -243,7 +243,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let child = command(AgentCx::for_current_or_request(), "exec sleep 30")
+            let child = command(&AgentCx::for_current_or_request(), "exec sleep 30")
                 .spawn()
                 .unwrap();
             let pid = child.id();
@@ -263,7 +263,7 @@ mod tests {
             .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
         runtime.block_on(async {
-            let child = command(owner.clone(), "exec sleep 30").spawn().unwrap();
+            let child = command(&owner, "exec sleep 30").spawn().unwrap();
             let pid = child.id();
             let mut capture = Box::pin(child.wait_with_output_limited(1024, Duration::from_secs(30)));
             assert!(futures::poll!(&mut capture).is_pending());
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn dropping_an_unpolled_capture_still_reaps_its_owned_child() {
-        let child = command(AgentCx::for_request(), "exec sleep 30")
+        let child = command(&AgentCx::for_request(), "exec sleep 30")
             .spawn()
             .unwrap();
         let pid = child.id();
@@ -290,7 +290,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let child = command(AgentCx::for_current_or_request(), "exec sleep 30")
+            let child = command(&AgentCx::for_current_or_request(), "exec sleep 30")
                 .spawn()
                 .unwrap();
             let pid = child.id();
@@ -308,7 +308,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let child = command(
-                AgentCx::for_current_or_request(),
+                &AgentCx::for_current_or_request(),
                 "printf overflow; exec sleep 30",
             )
             .spawn()

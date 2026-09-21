@@ -41,7 +41,7 @@ fn rejects_malformed_items_and_ranges_even_when_omitted_by_output_limit() {
     for bad in [Value::Null, json!({}), json!({"start":{"line":1,"character":0},"end":{"line":0,"character":0}}),
         json!({"start":{"line":0,"character":-1},"end":{"line":0,"character":0}}),
         json!({"start":{"line":0,"character":0.5},"end":{"line":0,"character":1}}),
-        json!({"start":{"line":2147483648_u64,"character":0},"end":{"line":2147483648_u64,"character":0}})] {
+        json!({"start":{"line":2_147_483_648_u64,"character":0},"end":{"line":2_147_483_648_u64,"character":0}})] {
         let mut value = symbol();
         value["location"]["range"] = bad;
         assert!(items(&json!([symbol(), value])).is_err());

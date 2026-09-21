@@ -163,10 +163,12 @@ impl Deref for AgentCommand {
     }
 }
 
-/// Owns a subprocess until reaped. Extracted pipe handles are ordinary OS
-/// handles; they do not transfer or disable this child's cleanup ownership.
-/// Unclaimed stdout and stderr remain available after reaping or killing the
-/// process. Waiting only closes stdin; it must not discard unread output.
+/// Owns a subprocess until reaped.
+///
+/// Extracted pipe handles are ordinary OS handles; they do not transfer or
+/// disable this child's cleanup ownership. Unclaimed stdout and stderr remain
+/// available after reaping or killing the process. Waiting only closes stdin;
+/// it must not discard unread output.
 pub struct AgentChild {
     owner: AgentCx,
     child: Option<Child>,
@@ -201,11 +203,11 @@ impl AgentChild {
         self.child.as_mut().and_then(|child| child.stdin.take())
     }
 
-    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+    pub const fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.stdout.take()
     }
 
-    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
+    pub const fn take_stderr(&mut self) -> Option<ChildStderr> {
         self.stderr.take()
     }
 

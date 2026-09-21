@@ -1,6 +1,6 @@
 //! End-to-end numeric decoding regressions for extension providers (gh #238).
 //!
-//! Unlike the JSON-only normalization tests, these exercise QuickJS number
+//! Unlike the JSON-only normalization tests, these exercise `QuickJS` number
 //! tagging, the runtime coordinator, and the typed provider stream adapter.
 
 #![recursion_limit = "1024"]
