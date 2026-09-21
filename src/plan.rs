@@ -14,6 +14,9 @@
 use crate::tools::ToolEffects;
 use std::sync::{Arc, RwLock};
 
+mod session;
+pub use session::{PlanChange, PlanPersistence, SessionPlanReview};
+
 /// Maximum UTF-8 bytes retained for one submitted plan. The tool checks this
 /// before copying model input; direct state callers use the same bound.
 pub const MAX_PLAN_BYTES: usize = 256 * 1024;
@@ -244,6 +247,9 @@ impl std::fmt::Debug for PlanReview {
 struct PlanStateInner {
     mode: PlanMode,
     plan: Option<Arc<str>>,
+    /// The SDK-owned prompt pin survives raw gate transitions so SDK exit can
+    /// still remove it. Session reset retires it with the previous agent.
+    session_pin: Option<session::PlanPin>,
     /// The model the session ran before plan mode took over (restored on
     /// approval when the plan role was active).
     previous_model: Option<(String, String)>,
@@ -403,6 +409,7 @@ impl PlanState {
         };
         inner.plan = None;
         inner.previous_model = None;
+        inner.session_pin = None;
     }
 
     /// The submitted plan text, if any.

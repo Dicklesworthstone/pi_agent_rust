@@ -17,7 +17,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 ### Current Drift Check
 
 - Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
-- Source-file rows below: 356.
+- Source-file rows below: 358.
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -110,7 +110,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/error.rs` | Error types | Unit; `tests/error_types.rs`, `tests/error_handling.rs`. |
 | `src/error_hints.rs` | Error remediation hints | Unit; `tests/error_handling.rs`. |
 | `src/eval.rs` | Eval harness | `tests/eval.rs`. |
-| `src/eval/js_kernel.rs` | Eval JS kernel | `tests/eval.rs`; in-source kernel tests. |
+| `src/eval/js_kernel.rs` | Eval JS kernel | Unit; `tests/eval.rs`; in-source kernel tests. |
 | `src/extension_conformance_matrix.rs` | Extension matrix | Unit; `tests/ext_conformance_matrix.rs`. |
 | `src/extension_dispatcher.rs` | Extension dispatcher | Unit; `tests/event_dispatch_latency.rs`, `tests/extensions_event_wiring.rs`, `tests/extensions_event_cancellation.rs`; timing ignored test owner `bd-8t27h.11`. |
 | `src/extension_events.rs` | Extension events | Unit; `tests/extensions_event_wiring.rs`, `tests/extensions_event_cancellation.rs`, `tests/extensions_repair_events.rs`. |
@@ -229,7 +229,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/completion/item.rs` | LSP completion item normalization, resolution, and text edits | Unit; `src/lsp/completion/item/tests.rs`. |
 | `src/lsp/completion/item/tests.rs` | LSP completion item test suite | Test module; completion item tests. |
 | `src/lsp/completion/snippet.rs` | LSP completion snippet placeholder parsing and expansion | Unit; `src/lsp/completion/snippet/tests.rs`. |
-| `src/lsp/completion/snippet/tests.rs` | LSP completion snippet test suite | Test module; snippet tests. |
+| `src/lsp/completion/snippet/tests.rs` | LSP snippet test suite | Test module; snippet tests. |
 | `src/lsp/completion/tests.rs` | LSP completion handle and integration test suite | Test module; completion tests. |
 | `src/lsp/completion/tests/protocol.rs` | LSP completion protocol scenario tests | Test module; protocol scenarios. |
 | `src/lsp/diagnostics_tests.rs` | LSP model-facing diagnostics test suite | Test module; diagnostics tool tests. |
@@ -303,6 +303,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/permissions.rs` | Capability permissions | Unit; `tests/capability_policy_model.rs`, `tests/capability_policy_scoped.rs`, `tests/capability_denial_matrix.rs`. |
 | `src/pi_wasm.rs` | PiWasm runtime | Unit; `tests/lab_runtime_extensions.rs`; unsupported imports fail closed, with bounded Emscripten compatibility stubs covered by source tests. |
 | `src/plan.rs` | Plan mode | `tests/e2e_plan_mode.rs`. |
+| `src/plan/session.rs` | SDK plan review, prompt ownership and journaled lifecycle | Unit; `src/plan/session/tests.rs` exercises real SDK handles and provider/tool loops. Added, not executed: DSR unavailable. |
+| `src/plan/session/tests.rs` | SDK plan lifecycle contract and wire tests | Test module; 26 tests for submission identity, policy separation, prompt cleanup, persistence and actual tool dispatch. Added, not executed: DSR unavailable. |
 | `src/platform.rs` | Platform helpers | Unit. |
 | `src/pmu_telemetry.rs` | PMU-guided stall-cycle elimination and microarchitectural regression budgets | `tests/pmu_telemetry.rs`. |
 | `src/profiler.rs` | Sampling profiler front-end (`--profile` / `PI_PROFILE=1`, bd-cv653.7.12.1) | Unit (3 tests); no dedicated integration test (manual `pi --profile`). |
