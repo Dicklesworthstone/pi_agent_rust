@@ -123,12 +123,17 @@ if [[ -x "$DSR" ]]; then
   DSR_DRY_RC=$?
   set -e
   PLANNED_LINES=$(echo "$DSR_DRY" | grep -c "Planned, NOT executed" || true)
-  if [[ "${PLANNED_LINES:-0}" -ge 6 ]]; then
+  # The recipe grew a seventh check (check_fixture_read_patience.py); at a
+  # floor of 6 this contract would have stayed green while one was removed.
+  # The finding id keeps its original spelling on purpose:
+  # tests/dsr_recipe_preflight_test.rs greps for it verbatim.
+  EXPECTED_CHECKS=7
+  if [[ "${PLANNED_LINES:-0}" -ge "$EXPECTED_CHECKS" ]]; then
     record pass "DSR_DRY_RUN_PLANS_6_CHECKS" \
-      "dsr plans $PLANNED_LINES checks"
+      "dsr plans $PLANNED_LINES checks (expected >=$EXPECTED_CHECKS)"
   else
     record fail "DSR_DRY_RUN_PLANS_6_CHECKS" \
-      "dsr plans $PLANNED_LINES checks, expected >=6 (dsr --dry-run rc=$DSR_DRY_RC)"
+      "dsr plans $PLANNED_LINES checks, expected >=$EXPECTED_CHECKS (dsr --dry-run rc=$DSR_DRY_RC)"
   fi
 fi
 

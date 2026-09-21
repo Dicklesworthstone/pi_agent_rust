@@ -350,6 +350,12 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
         # Explicit historical contract: the citation itself declares the
         # obligation a retained snapshot, not a current release claim.
         ("historical", re.compile(r'\*\(from ([^,);]+); historical snapshot\)\*')),
+        # Explicit no-claim contract: the block cites the artifact in order to
+        # disclose that it authorizes nothing. Without this form the only way
+        # to report a blocked budget summary was to stop citing it -- and the
+        # claim bindings key off citations, so dropping the citation is what
+        # let the numbers drift unnoticed in the first place.
+        ("no_claim", re.compile(r'\*\(from ([^,);]+); no performance claim\)\*')),
         # Bare path-only form: *(from path)*. The captured token must look
         # like a repository-relative artifact path (contains "/" and no
         # whitespace) so prose citations such as "the Git-pinned verdict
@@ -363,7 +369,7 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
         for citation_kind, citation_pattern in citation_patterns:
             for match in citation_pattern.finditer(stripped_line):
                 artifact_path = match.group(1).strip()
-                if citation_kind in {"bare", "historical"}:
+                if citation_kind in {"bare", "historical", "no_claim"}:
                     if " " in artifact_path or "/" not in artifact_path:
                         continue
                     citation_value = ""
@@ -447,6 +453,9 @@ def parse_quantitative_performance_claims(
         for obligation in parse_citation_obligations(readme_text)
         if obligation.artifact_path.strip().replace("\\", "/")
         == CANONICAL_PERFORMANCE_SUMMARY_PATH
+        # A "; no performance claim" citation must not license a performance
+        # number on its own line; that is the whole point of the label.
+        and obligation.citation_kind != "no_claim"
     }
 
     claims: list[QuantitativePerformanceClaim] = []
@@ -1669,6 +1678,24 @@ def check_artifact_content(
             )
         return tuple(errors)
 
+    if citation_kind == "no_claim":
+        # The block asserts no performance result; it discloses the artifact's
+        # readiness state. The contract is the mirror image of the normal one:
+        # the artifact must genuinely NOT authorize claims, so the label
+        # cannot be used to wave a real claim past the strict contract.
+        if artifact_path == "tests/perf/reports/budget_summary.json":
+            claim = payload.get("claim_readiness")
+            authorized = (
+                isinstance(claim, dict)
+                and claim.get("performance_claims_authorized") is True
+            )
+            if authorized:
+                errors.append(
+                    "citation is labelled '; no performance claim' but the budget "
+                    "summary authorizes performance claims; cite it normally instead"
+                )
+        return tuple(errors)
+
     if citation_kind in {"bare", "historical"}:
         # Path-only and explicit-historical citations carry no inline
         # provenance value to match. Existence, decodability, and JSON
@@ -1811,6 +1838,29 @@ def _resolve_dotted_field(payload: Any, dotted: str) -> Any:
     return current
 
 
+_NUMERIC_VALUE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _value_appears(expected: str, text: str) -> bool:
+    """Whether `expected` is stated in `text`, not merely embedded in it.
+
+    Plain substring matching is unsafe for the small integers these bindings
+    mostly carry. Observed: with `pass` and `fail` both 0 in
+    tests/perf/reports/budget_summary.json, the binding reported "0 mismatched"
+    because "0" occurs inside `20260823`, `2026-08-28` and `bd-sog97.20` in the
+    citing block -- while that block claimed 16 PASS and 3 FAIL. A guard that
+    accepts a digit borrowed from a date is not binding anything.
+
+    So a numeric value must not abut a digit on either side, nor sit on either
+    side of a decimal point that belongs to a longer number. Non-numeric values
+    (run ids, statuses) keep substring semantics, where they are unambiguous.
+    """
+    if not _NUMERIC_VALUE.match(expected):
+        return expected in text
+    pattern = r"(?<!\d)(?<!\d\.)" + re.escape(expected) + r"(?!\d)(?!\.\d)"
+    return re.search(pattern, text) is not None
+
+
 def check_claim_bindings(
     obligations: list[ClaimObligation],
     bindings: list[dict[str, Any]],
@@ -1872,12 +1922,109 @@ def check_claim_bindings(
             )
             continue
         expected = str(resolved)
-        if any(expected in block_text(o.line_number) for o in cited):
+        if any(_value_appears(expected, block_text(o.line_number)) for o in cited):
             continue
         errors.append(
-            f"BINDING MISMATCH: no README block citing {artifact} contains the "
+            f"BINDING MISMATCH: no README block citing {artifact} states the "
             f"current value {expected!r} of '{field}'"
         )
+    return errors
+
+
+EVIDENCE_STATE_HEADING_RE = re.compile(
+    r"^##\s+Current Evidence State\b", re.IGNORECASE
+)
+_EVIDENCE_ROW_RE = re.compile(r"^\|\s*`([A-Za-z0-9_]+)`\s*\|\s*([^|]*)\|")
+_EVIDENCE_STATUS_RE = re.compile(r"\b(PASS|FAIL|NO_DATA)\b", re.IGNORECASE)
+# A labelled aggregate anywhere in the section: "`0` PASS", "19 declared
+# budgets". Claim bindings alone cannot police these, because a bound value
+# only has to appear in *some* block citing the artifact -- so a second,
+# lying block is covered for by an honest one elsewhere in the README.
+_EVIDENCE_COUNT_RE = re.compile(
+    r"`?(\d+)`?\s+(PASS|FAIL|NO_DATA|declared)\b", re.IGNORECASE
+)
+_EVIDENCE_COUNT_FIELDS = {
+    "pass": "pass",
+    "fail": "fail",
+    "no_data": "no_data",
+    "declared": "total_budgets",
+}
+
+
+def check_evidence_state_table(
+    readme_text: str, summary: dict[str, Any] | None
+) -> list[str]:
+    """Verify the README's evidence table agrees with the budget summary.
+
+    The claim-binding manifest can only bind header aggregates, and the
+    quantitative-claim regexes miss underscore-form budget names entirely
+    (`binary[ -]size` does not match `binary_size_release`). Between those two
+    gaps the table sat for a month advertising four PASS measurements --
+    binary size, idle memory, complex cold-load, event dispatch -- against an
+    artifact whose rows were all NO_DATA, under an "(auto-generated)" heading
+    with no generator behind it. This binds each row that names a declared
+    budget to that budget's status in the artifact, which is the claim a
+    reader actually takes away from the table.
+
+    Rows naming something other than a declared budget (`ext_must_pass`,
+    `evidence_bundle`) are bound to other artifacts and are left alone.
+    """
+    if summary is None:
+        return []
+    statuses = {
+        row.get("budget_name"): row.get("status")
+        for row in summary.get("budget_results", [])
+        if isinstance(row, dict) and isinstance(row.get("budget_name"), str)
+    }
+    if not statuses:
+        return []
+
+    lines = readme_text.splitlines()
+    errors: list[str] = []
+    in_section = False
+    for index, line in enumerate(lines, start=1):
+        if line.startswith("## "):
+            in_section = bool(EVIDENCE_STATE_HEADING_RE.match(line))
+            continue
+        # Labelled aggregates are checked document-wide, not just inside the
+        # section: the phrasing only ever occurs in budget-summary prose, and
+        # the second such block lives a thousand lines away under the testing
+        # policy, where it drifted to "16 PASS and 3 FAIL" unnoticed.
+        for count in _EVIDENCE_COUNT_RE.finditer(line):
+            field = _EVIDENCE_COUNT_FIELDS[count.group(2).lower()]
+            if field not in summary:
+                continue
+            stated = int(count.group(1))
+            if stated != summary[field]:
+                errors.append(
+                    f"EVIDENCE COUNT MISMATCH: line {index}: README states "
+                    f"{count.group(0).strip()} but "
+                    f"{CANONICAL_PERFORMANCE_SUMMARY_PATH} has {field}="
+                    f"{summary[field]}"
+                )
+        if not in_section:
+            continue
+        row = _EVIDENCE_ROW_RE.match(line)
+        if row is None:
+            continue
+        budget_name = row.group(1)
+        expected = statuses.get(budget_name)
+        if expected is None:
+            continue
+        declared = _EVIDENCE_STATUS_RE.search(row.group(2))
+        if declared is None:
+            errors.append(
+                f"EVIDENCE TABLE UNREADABLE: line {index}: row for "
+                f"`{budget_name}` states no PASS/FAIL/NO_DATA status; the "
+                f"artifact says {expected}"
+            )
+            continue
+        if declared.group(1).upper() != str(expected).upper():
+            errors.append(
+                f"EVIDENCE TABLE MISMATCH: line {index}: `{budget_name}` is "
+                f"shown as {declared.group(1).upper()} but "
+                f"{CANONICAL_PERFORMANCE_SUMMARY_PATH} says {expected}"
+            )
     return errors
 
 
@@ -2120,6 +2267,25 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     for error in binding_errors:
         print(error)
 
+    # The "Current Evidence State" table is hand-written; bind its rows to the
+    # artifact so it cannot quietly disagree with the summary it cites.
+    perf_summary: dict[str, Any] | None = None
+    perf_summary_path = repo_root / CANONICAL_PERFORMANCE_SUMMARY_PATH
+    if perf_summary_path.exists():
+        try:
+            loaded = json.loads(perf_summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"INVALID: {CANONICAL_PERFORMANCE_SUMMARY_PATH} is unreadable "
+                f"for the evidence-table check: {exc}"
+            )
+            return 2
+        if isinstance(loaded, dict):
+            perf_summary = loaded
+    evidence_table_errors = check_evidence_state_table(readme_text, perf_summary)
+    for error in evidence_table_errors:
+        print(error)
+
     # Summary
     print(f"\nSUMMARY:")
     print(f"  Total proof obligations: {len(obligations)}")
@@ -2131,6 +2297,15 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     print(f"  Missing artifacts: {missing_count}")
     print(f"  Invalid artifact content checks: {content_error_count}")
     print(f"  Claim bindings enforced: {len(bindings)} ({len(binding_errors)} mismatched)")
+    print(f"  Evidence statements disagreeing with the artifact: {len(evidence_table_errors)}")
+
+    if evidence_table_errors:
+        print(
+            f"\nFAIL: {len(evidence_table_errors)} README evidence statement(s) "
+            f"disagree with {CANONICAL_PERFORMANCE_SUMMARY_PATH}."
+        )
+        print("Restate them from the artifact; never hand-patch the artifact.")
+        return 1
 
     if stale_count > 0:
         print(f"\nFAIL: {stale_count} cited artifact(s) are >14 days stale.")
@@ -2616,6 +2791,131 @@ def _run_self_test_cases() -> int:
         )
         if len(drifted_errors) != 1 or "BINDING MISMATCH" not in drifted_errors[0]:
             print(f"SELF-TEST FAIL: diverged binding must fail: {drifted_errors}")
+            return 2
+
+        # The evidence section and the labelled aggregates elsewhere in the
+        # README must both track the artifact. The "16 PASS and 3 FAIL" case
+        # below is the drift that actually happened, a thousand lines away
+        # from the table, against a summary whose rows were all NO_DATA.
+        evidence_summary = {
+            "pass": 0,
+            "fail": 0,
+            "no_data": 19,
+            "total_budgets": 19,
+            "budget_results": [
+                {"budget_name": "binary_size_release", "status": "NO_DATA"},
+                {"budget_name": "event_dispatch_p99", "status": "NO_DATA"},
+            ],
+        }
+        honest_section = (
+            "## Current Evidence State\n"
+            "\n"
+            "> Of `19` declared budgets, `0` PASS, `0` FAIL and `19` NO_DATA.\n"
+            "\n"
+            "| Budget | Status | Why |\n"
+            "|---|---|---|\n"
+            "| `binary_size_release` | NO_DATA | lineage incomplete |\n"
+            "| `event_dispatch_p99` | NO_DATA | lineage incomplete |\n"
+            "| `ext_must_pass` | fail | bound to another artifact |\n"
+        )
+        evidence_cases = [
+            ("honest section", honest_section, 0),
+            (
+                "row flipped to PASS",
+                honest_section.replace(
+                    "| `binary_size_release` | NO_DATA |",
+                    "| `binary_size_release` | **PASS** (32.8 MB) |",
+                ),
+                1,
+            ),
+            (
+                "row with no status at all",
+                honest_section.replace(
+                    "| `event_dispatch_p99` | NO_DATA |",
+                    "| `event_dispatch_p99` | pending |",
+                ),
+                1,
+            ),
+            (
+                "aggregate drifted",
+                honest_section.replace("`0` PASS", "`4` PASS"),
+                1,
+            ),
+            (
+                "declared count drifted",
+                honest_section.replace("`19` declared", "`21` declared"),
+                1,
+            ),
+            (
+                "labelled aggregate outside the section",
+                honest_section
+                + "\n## Testing Policy\n\nRows show `16` PASS and `3` FAIL.\n",
+                2,
+            ),
+        ]
+        for label, fixture, expected_count in evidence_cases:
+            found = check_evidence_state_table(fixture, evidence_summary)
+            if len(found) != expected_count:
+                print(
+                    f"SELF-TEST FAIL: evidence-state check on {label!r} produced "
+                    f"{len(found)} error(s), expected {expected_count}: {found}"
+                )
+                return 2
+        if check_evidence_state_table(honest_section, None):
+            print("SELF-TEST FAIL: a missing budget summary must not raise errors")
+            return 2
+
+        # The "; no performance claim" form: disclosing a blocked summary must
+        # pass, mislabelling an authorized one must fail, and the label must
+        # not license a performance number on the same line.
+        no_claim_forms = parse_citation_obligations(
+            "- Blocked. *(from tests/perf/reports/budget_summary.json; no performance claim)*\n"
+        )
+        if len(no_claim_forms) != 1 or no_claim_forms[0].citation_kind != "no_claim":
+            print(f"SELF-TEST FAIL: no-claim citation form not parsed: {no_claim_forms}")
+            return 2
+        smuggled = parse_quantitative_performance_claims(
+            "- Startup latency is 12.5 ms. "
+            "*(from tests/perf/reports/budget_summary.json; no performance claim)*\n"
+        )
+        if len(smuggled) != 1 or smuggled[0].has_canonical_inline_citation:
+            print(
+                "SELF-TEST FAIL: a no-claim citation must not license a "
+                f"quantitative claim: {smuggled}"
+            )
+            return 2
+
+        # A digit borrowed from a date, a version or a bead id must not satisfy
+        # a binding. This is the exact shape that let the README's perf block
+        # claim "16 PASS and 3 FAIL" while the artifact carried pass=0, fail=0
+        # and the check reported 0 mismatched.
+        zero_target = generic_root / "tests/perf/reports/zero_target.json"
+        zero_target.write_text(
+            json.dumps({"pass": 0, "fail": 0, "total": 19}), encoding="utf-8"
+        )
+        zero_fixture_text = (
+            "- Budget summary from run `beige-evidence-refresh-20260823`: `19`\n"
+            "  declared budgets, `16` PASS and `3` FAIL as of 2026-08-28\n"
+            "  (bd-sog97.20). *(from tests/perf/reports/zero_target.json)*\n"
+        )
+        zero_bindings = [
+            {"artifact": "tests/perf/reports/zero_target.json", "field": "pass"},
+            {"artifact": "tests/perf/reports/zero_target.json", "field": "fail"},
+            {"artifact": "tests/perf/reports/zero_target.json", "field": "total"},
+        ]
+        zero_errors = check_claim_bindings(
+            parse_citation_obligations(zero_fixture_text),
+            zero_bindings,
+            zero_fixture_text,
+            base_dir=generic_root,
+        )
+        if len(zero_errors) != 2 or not all(
+            "BINDING MISMATCH" in error for error in zero_errors
+        ):
+            print(
+                "SELF-TEST FAIL: digits inside dates/bead ids must not satisfy a "
+                f"binding, and 19 must still bind: {zero_errors}"
+            )
             return 2
 
 

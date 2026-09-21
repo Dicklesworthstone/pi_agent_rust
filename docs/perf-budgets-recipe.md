@@ -16,9 +16,10 @@ invalid per AGENTS.md "DSR-Only" rule and the bead cannot be closed.
 /Users/jemanuel/projects/doodlestein_self_releaser/dsr
 ```
 
-This binary is NOT on `$PATH` by default. The harness must be invoked
-by absolute path or by adding the project to `$PATH`. `which dsr`
-returns non-zero on a fresh shell; that is a recipe-audit failure.
+On the release-operator host this is reachable as `dsr` via a symlink in
+`~/.local/bin`. Do not assume it: `which dsr` returning non-zero on a
+fresh shell is a recipe-audit failure, and the absolute path above always
+works.
 
 ```bash
 DSR=/Users/jemanuel/projects/doodlestein_self_releaser/dsr
@@ -26,32 +27,38 @@ DSR=/Users/jemanuel/projects/doodlestein_self_releaser/dsr
   --work-dir /Users/jemanuel/projects/pi_agent_rust
 ```
 
-## 2. The DSR quality recipe (6 checks, registered in `~/.config/dsr/repos.yaml`)
+## 2. The DSR quality recipe (7 checks, registered in `~/.config/dsr/repos.yaml`)
 
-For `pi_agent_rust`, the recipe is:
+For `pi_agent_rust`, the recipe is, as reported by
+`dsr quality --tool pi_agent_rust --dry-run` on 2026-09-21:
 
 1. `cargo fmt --check`
-2. `rch exec -- env CARGO_TARGET_DIR=/tmp/pi-agent-rust-dsr/check cargo check --locked --all-targets`
-3. `rch exec -- env CARGO_TARGET_DIR=/tmp/pi-agent-rust-dsr/check cargo clippy --locked --all-targets -- -D warnings`
-4. `rch exec -- env CARGO_TARGET_DIR=/tmp/pi-agent-rust-dsr/test cargo test --locked --all-targets`
+2. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check --locked --all-targets`
+3. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy --locked --all-targets -- -D warnings`
+4. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test --locked --all-targets --no-fail-fast`
 5. `bash tests/installer_regression.sh`
 6. `python3 scripts/check_module_reachability.py`
+7. `python3 scripts/check_fixture_read_patience.py`
 
-## 3. Hidden contract: `CARGO_TARGET_DIR=/tmp/pi-agent-rust-dsr/...`
+`scripts/check_readme_evidence_freshness.py` is **not** in this recipe,
+so nothing in the gate notices when README evidence claims drift away
+from `tests/perf/reports/budget_summary.json`. Run it by hand until that
+is fixed (`bd-readme-freshness-into-recipe-5sgos`).
 
-DSR hardcodes the target dir to `/tmp/pi-agent-rust-dsr/{check,test}`.
-**This is the exact anti-pattern AGENTS.md warns about**: `/tmp` on
-macOS is `/private/tmp` on the Data volume, and a 19-budget perf run
-can produce 100GB+ of target-dir churn in a single day.
+## 3. Hidden contract: build scratch on the Data volume
 
-The operator MUST:
+The `CARGO_TARGET_DIR=/tmp/pi-agent-rust-dsr/{check,test}` hardcode this
+section was written about is **gone** from the registered recipe; the
+checks quoted in section 2 are verbatim from
+`~/.config/dsr/repos.yaml` as of 2026-09-21. What remains is `TMPDIR=/tmp`
+on the test check, and rch's own target directories on the worker.
 
-1. Set `CARGO_TARGET_DIR=$RCH_TARGET_BASE/cargo-dsr-pi-agent-rust`
-   (or the external-NVMe equivalent) before invoking DSR, OR
-2. Patch the recipe in `~/.config/dsr/repos.yaml` to remove the
-   `/tmp/pi-agent-rust-dsr` hardcode, OR
-3. Accept the `/tmp` pollution as a known cost and clean it up
-   post-run with `sbh check --need 20G` or equivalent.
+The underlying hazard has not gone away: `/tmp` on macOS is
+`/private/tmp` on the Data volume, and a 19-budget perf run can produce
+100GB+ of churn in a single day. So before a perf run, either point the
+scratch at `$RCH_TARGET_BASE` (or the external-NVMe equivalent), or
+accept the pollution as a known cost and clean up afterwards with
+`sbh check --need 20G` or equivalent.
 
 The preflight script (`scripts/perf/preflight_dsr_recipe.sh`)
 warns on this contract and surfaces a `DSR_TMP_TARGET_DIR_USED`

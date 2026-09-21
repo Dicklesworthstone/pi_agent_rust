@@ -207,8 +207,8 @@ If you want full details, see:
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
 | **Startup** | Native single-binary path (Fresh `v0.3.0` measurement pending; pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
-| **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state-auto-generated), never promoted here until claim readiness is `ready` | Runtime-dependent |
-| **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state-auto-generated) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
+| **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state), never promoted here until claim readiness is `ready` | Runtime-dependent |
+| **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
 | **Tool execution** | Process tree management | Basic subprocess |
 | **Sessions** | JSONL with branching | Varies |
@@ -2176,17 +2176,16 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
-- Current strict budget summary (run `beige-evidence-refresh-20260823`, source
-  `2697f21d`): `19` declared budgets. Its per-budget `budget_results` rows
-  show `16` PASS and `3` FAIL (extension simple cold-load p95 over budget,
-  tool-call latency and throughput inputs missing, fail-closed); claim
-  readiness is `blocked` and performance claims are NOT authorized. The
-  artifact's aggregate header still reports `12` PASS, `5` FAIL, `2`
-  NO_DATA from before the 2026-08-28 idle-memory, binary-size,
-  complex-cold-load, and event-dispatch re-measurements, so the header and
-  the rows disagree until the summary is regenerated (bd-sog97.20).
+- Current budget summary (generated 2026-09-21 from source `9c887d33`; no run
+  id, no correlation id, `strict_mode` false): `19` declared budgets, of which
+  `0` PASS, `0` FAIL and `19` NO_DATA. Header and per-budget `budget_results`
+  rows now agree, and they agree on this: the tree carries no performance
+  measurements at all. Claim readiness is `blocked`,
+  `performance_claims_authorized` is false, and the blocking reason codes are
+  `budget_data_missing`, `ci_budget_data_missing`, `correlation_id_missing`,
+  `data_contract_failure`, `run_id_missing` and `strict_mode_disabled`.
   Counts are value-bound to the artifact:
-  *(from tests/perf/reports/budget_summary.json)*
+  *(from tests/perf/reports/budget_summary.json; no performance claim)*
 - Before spending time on a definitive refresh, run
   `python3 scripts/perf/preflight_budget_inputs.py` to list missing budget
   inputs, expected artifact paths, and RCH-only refresh commands.
@@ -3130,40 +3129,97 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 ---
 
-## Current Evidence State (auto-generated)
+## Current Evidence State
 
-> **STATUS: PARTIAL** — `claim_readiness.status = "blocked"`, `performance_claims_authorized = false` (3 budgets still failing/no-data).
-> Four of the seven previously-failing budgets now have **fresh v0.3.0 measurements** (binary_size, idle_memory, ext_cold_load_complex, event_dispatch). The remaining items are: `ext_cold_load_simple_p95` (over 5ms budget; needs profile-driven optimization), `tool_call_latency_mean` and `tool_call_throughput_min` (need a pijs_workload binary), and the long-standing `ext_must_pass` marckrenn-pi-sub conformance gap.
-> See [`tests/perf/reports/budget_summary.json`](tests/perf/reports/budget_summary.json) for the current budget state and [`docs/perf-budgets-recipe.md`](docs/perf-budgets-recipe.md) for the recipe to regenerate.
+> **STATUS: UNMEASURED.** `claim_readiness.status = "blocked"`,
+> `performance_claims_authorized = false`. The checked-in budget summary was
+> regenerated on 2026-09-21 from source `9c887d33` and contains no
+> measurements whatsoever: of `19` declared budgets, `0` PASS, `0` FAIL and
+> `19` NO_DATA.
+> *(from tests/perf/reports/budget_summary.json; no performance claim)*
 
-| Budget | Status | Notes |
+Earlier revisions of this section reported four passing budgets — binary size,
+idle memory, complex extension cold-load, event dispatch — carried over from a
+v0.3.0 run. Those figures are not in the artifact this section cites, so they
+are not repeated here. Until a strict run lands, treat pi's performance as
+unmeasured rather than as good or bad.
+
+| Budget | Status | Why |
 |---|---|---|
-| `binary_size_release` | **PASS** (32.8 MB) | Fresh v0.3.0 measurement against stripped release binary; under 48 MB budget |
-| `idle_memory_rss` | **PASS** (8.0 MB) | Fresh v0.3.0 measurement against the user-facing release binary; under 50 MB target |
-| `tool_call_latency_mean` | **FAIL** | `pijs_workload` data missing; generator at `scripts/perf/run_pijs_workload.py` |
-| `tool_call_throughput_min` | **FAIL** | same as above |
-| `ext_cold_load_simple_p95` | **FAIL** (11.9ms) | over budget (5.0ms); profile-driven optimization pending |
-| `ext_cold_load_complex_p95` | **PASS** (38.3ms) | Fresh measurement; under 50ms budget |
-| `event_dispatch_p99` | **PASS** (766us) | Fresh measurement; under 5000us budget |
-| `ext_must_pass` | **fail** | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
-| `evidence_bundle` | **partial** (was `insufficient`) | 0 invalid sections now; 18 present, 12 missing (optional) |
+| `startup_version_p95` | NO_DATA | benchmark lineage incomplete |
+| `startup_full_agent_p95` | NO_DATA | benchmark lineage incomplete |
+| `ext_cold_load_simple_p95` | NO_DATA | also fails its data contract: no measurement control captured |
+| `ext_cold_load_complex_p95` | NO_DATA | also fails its data contract: no measurement control captured |
+| `ext_load_60_total` | NO_DATA | benchmark lineage incomplete |
+| `tool_call_latency_mean` | NO_DATA | needs a `pijs_workload` run; generator at `scripts/perf/run_pijs_workload.py` |
+| `tool_call_throughput_min` | NO_DATA | same as above |
+| `event_dispatch_p99` | NO_DATA | benchmark lineage incomplete |
+| `context_graph_build_cold_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_graph_build_warm_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_incremental_update_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_planning_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_bundle_serialization_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_bundle_estimated_bytes_max` | NO_DATA | benchmark lineage incomplete |
+| `policy_eval_p99` | NO_DATA | benchmark lineage incomplete |
+| `idle_memory_rss` | NO_DATA | also fails its data contract: no measurement control captured |
+| `sustained_load_rss_growth` | NO_DATA | benchmark lineage incomplete |
+| `binary_size_release` | NO_DATA | also fails its data contract: no measurement control captured |
+| `protocol_parse_p99` | NO_DATA | benchmark lineage incomplete |
+
+Of the 19, 14 are CI-enforced and none of those has data. Blocking reason
+codes: `budget_data_missing`, `ci_budget_data_missing`,
+`correlation_id_missing`, `data_contract_failure`, `run_id_missing`,
+`strict_mode_disabled`.
+
+Two adjacent gates, bound to their own artifacts rather than to the budget
+summary:
+
+| Gate | Status | Notes |
+|---|---|---|
+| `ext_must_pass` | fail | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
+| `evidence_bundle` | partial | 0 invalid sections; 18 present, 12 missing (all optional) |
+
+Thresholds, categories, methodology and failing data contracts for every
+budget are in [`tests/perf/reports/PERF_BUDGETS.md`](tests/perf/reports/PERF_BUDGETS.md),
+which *is* generated from the summary. The recipe and its hidden contracts are
+in [`docs/perf-budgets-recipe.md`](docs/perf-budgets-recipe.md).
+
+### Keeping this section honest
+
+This table is written by hand. It previously carried an "(auto-generated)"
+label with no generator behind it, which is how it spent a month advertising
+four passing budgets that the artifact did not contain. The label is gone, and
+`scripts/check_readme_evidence_freshness.py` now binds every row above to the
+artifact's status for that budget and fails on any disagreement. Run it after
+any refresh:
 
 ```bash
-# 1. Verify the DSR perf recipe is ready
+# 1. Verify the DSR perf recipe is ready, and see what inputs are missing
+#    before spending a build on them
 bash scripts/perf/preflight_dsr_recipe.sh
+python3 scripts/perf/preflight_budget_inputs.py
 
-# 2. Build the release binary via DSR
-/Users/jemanuel/projects/doodlestein_self_releaser/dsr build pi_agent_rust
+# 2. Build the release binary via DSR (the only authorized build path)
+dsr build pi_agent_rust
 
-# 3. Generate the canonical evidence artifacts
+# 3. Generate the canonical measurement artifacts
 python3 scripts/perf/measure_idle_memory.py
 python3 scripts/perf/measure_binary_size.py --no-build
 python3 scripts/perf/run_ext_cold_load_complex.py
 python3 scripts/perf/run_event_dispatch_scenario.py
 
-# 4. Regenerate the evidence bundle and the markdown
+# 4. Regenerate budget_summary.json and PERF_BUDGETS.md. This is the
+#    generator; scripts/perf/render_perf_budgets_md.py is a stale duplicate
+#    that overwrites the same path with a different, lossier format --
+#    do not run it (bd-o9qzt).
+PI_GENERATE_PERF_BUDGET_REPORT=1 \
+  dsr quality --tool pi_agent_rust   # or the perf-budgets test under RCH
+
+# 5. Rebuild the evidence bundle, restate the table above, and verify
 python3 scripts/perf/rebuild_evidence_bundle.py
-python3 scripts/perf/render_perf_budgets_md.py
+python3 scripts/check_readme_evidence_freshness.py
 ```
 
-When `claim_readiness.status` flips from `blocked` to `ready` (or `ready_with_advisories`), the `Current Evidence State` section above will be re-rendered and the `Why Pi?` table numbers can be re-promoted to current.
+When `claim_readiness.status` flips from `blocked` to `ready` (or
+`ready_with_advisories`), restate the table above from the regenerated
+artifact; only then may the `Why Pi?` table numbers be promoted to current.
