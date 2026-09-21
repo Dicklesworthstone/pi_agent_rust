@@ -86,7 +86,7 @@ fn output_preserves_order_and_duplicates_and_exposes_omitted_count() {
 
 #[test]
 fn malformed_coordinate_and_uri_types_fail_instead_of_empty_success() {
-    for value in [json!(-1),json!(1.5),json!(2147483648_u64),json!("1"),Value::Null] {
+    for value in [json!(-1),json!(1.5),json!(2_147_483_648_u64),json!("1"),Value::Null] {
         let mut item = plain(); item["range"]["start"]["line"] = value;
         assert!(output(&item, 1, false).is_err());
     }
@@ -116,7 +116,7 @@ fn navigation_limits_fail_closed_and_maximum_coordinates_do_not_overflow() {
     item["range"] = json!({"start":{"line":MAX_LSP_UINTEGER,"character":MAX_LSP_UINTEGER},
         "end":{"line":MAX_LSP_UINTEGER,"character":MAX_LSP_UINTEGER}});
     let out = output(&item, 1, false).unwrap();
-    assert_eq!(out["locations"][0]["line"], 2147483648_u64);
+    assert_eq!(out["locations"][0]["line"], 2_147_483_648_u64);
     item["uri"] = json!(format!("generated:{}", "x".repeat(MAX_RESPONSE_BYTES)));
     assert!(output(&item, 1, false).is_err());
 }

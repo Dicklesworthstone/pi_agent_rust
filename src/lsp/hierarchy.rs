@@ -25,6 +25,14 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_ITEMS: usize = 1024;
 const MAX_RETURNED_ITEMS: usize = 128;
+/// Locations returned when the caller names no limit.
+///
+/// This was `lsp::DEFAULT_LOCATION_LIMIT` until 2623052cb moved the navigation
+/// limits into `semantic::navigation` and left this reference behind, breaking
+/// the build. That module inlines the same 100; the value is kept here rather
+/// than reaching across to it, because `MAX_RETURNED_ITEMS` beside it is
+/// already this module's own cap.
+const DEFAULT_RETURNED_ITEMS: usize = 100;
 const MAX_CALL_SITES: usize = 16_384;
 const MAX_SHOWN_CALL_SITES: usize = 64;
 const MAX_CACHE_ITEMS: usize = 256;
@@ -477,7 +485,7 @@ impl LspTool {
         let direction = Direction::from_action(&input.action)?;
         let limit = input
             .limit
-            .unwrap_or(super::DEFAULT_LOCATION_LIMIT)
+            .unwrap_or(DEFAULT_RETURNED_ITEMS)
             .min(MAX_RETURNED_ITEMS);
         if limit == 0
             || input.apply == Some(true)
