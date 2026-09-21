@@ -4053,7 +4053,21 @@ fn load_source_bound_performance_summary_at_with_probe<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
-    if !root.join(".git").exists() {
+    let stale_worker_git = std::fs::canonicalize(root)
+        .ok()
+        .zip(std::fs::canonicalize(repo_root()).ok())
+        .is_some_and(|(a, b)| a == b)
+        && std::env::var("PI_PROVIDER_REPLAY_GIT_COMMIT").is_ok_and(|expected| {
+            let expected = expected.trim();
+            !expected.is_empty()
+                && performance_git_context(root)
+                    .and_then(|ctx| {
+                        perf_git_stdout_at(&ctx, &["rev-parse", "--verify", "HEAD^{commit}"])
+                    })
+                    .is_ok_and(|head| head != expected)
+        });
+
+    if !root.join(".git").exists() || stale_worker_git {
         let full_path = root.join(artifact_path);
         let probed_bytes = std::fs::read(&full_path)
             .map_err(|err| format!("performance summary probe is unreadable: {err}"))?;
