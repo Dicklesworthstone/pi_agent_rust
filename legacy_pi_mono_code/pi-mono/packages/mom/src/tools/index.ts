@@ -9,11 +9,11 @@ import { createWriteTool } from "./write.js";
 export { setUploadFunction } from "./attach.js";
 
 export function createMomTools(executor: Executor): AgentTool<any>[] {
-	return [
-		createReadTool(executor),
-		createBashTool(executor),
-		createEditTool(executor),
-		createWriteTool(executor),
-		attachTool,
-	];
+  return [
+    createReadTool(executor),
+    createBashTool(executor),
+    createEditTool(executor),
+    createWriteTool(executor),
+    attachTool,
+  ];
 }

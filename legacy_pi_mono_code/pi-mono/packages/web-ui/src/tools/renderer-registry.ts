@@ -12,14 +12,14 @@ export const toolRenderers = new Map<string, ToolRenderer>();
  * Register a custom tool renderer
  */
 export function registerToolRenderer(toolName: string, renderer: ToolRenderer): void {
-	toolRenderers.set(toolName, renderer);
+  toolRenderers.set(toolName, renderer);
 }
 
 /**
  * Get a tool renderer by name
  */
 export function getToolRenderer(toolName: string): ToolRenderer | undefined {
-	return toolRenderers.get(toolName);
+  return toolRenderers.get(toolName);
 }
 
 /**
@@ -27,16 +27,16 @@ export function getToolRenderer(toolName: string): ToolRenderer | undefined {
  * Shows icon on left when complete/error, spinner on right when in progress
  */
 export function renderHeader(
-	state: "inprogress" | "complete" | "error",
-	toolIcon: any,
-	text: string | TemplateResult,
+  state: "inprogress" | "complete" | "error",
+  toolIcon: any,
+  text: string | TemplateResult,
 ): TemplateResult {
-	const statusIcon = (iconComponent: any, color: string) =>
-		html`<span class="inline-block ${color}">${icon(iconComponent, "sm")}</span>`;
+  const statusIcon = (iconComponent: any, color: string) =>
+    html`<span class="inline-block ${color}">${icon(iconComponent, "sm")}</span>`;
 
-	switch (state) {
-		case "inprogress":
-			return html`
+  switch (state) {
+    case "inprogress":
+      return html`
 				<div class="flex items-center justify-between gap-2 text-sm text-muted-foreground">
 					<div class="flex items-center gap-2">
 						${statusIcon(toolIcon, "text-foreground")}
@@ -45,21 +45,21 @@ export function renderHeader(
 					${statusIcon(Loader, "text-foreground animate-spin")}
 				</div>
 			`;
-		case "complete":
-			return html`
+    case "complete":
+      return html`
 				<div class="flex items-center gap-2 text-sm text-muted-foreground">
 					${statusIcon(toolIcon, "text-green-600 dark:text-green-500")}
 					${text}
 				</div>
 			`;
-		case "error":
-			return html`
+    case "error":
+      return html`
 				<div class="flex items-center gap-2 text-sm text-muted-foreground">
 					${statusIcon(toolIcon, "text-destructive")}
 					${text}
 				</div>
 			`;
-	}
+  }
 }
 
 /**
@@ -67,54 +67,54 @@ export function renderHeader(
  * Same as renderHeader but with a chevron button that toggles visibility of content
  */
 export function renderCollapsibleHeader(
-	state: "inprogress" | "complete" | "error",
-	toolIcon: any,
-	text: string | TemplateResult,
-	contentRef: Ref<HTMLElement>,
-	chevronRef: Ref<HTMLElement>,
-	defaultExpanded = false,
+  state: "inprogress" | "complete" | "error",
+  toolIcon: any,
+  text: string | TemplateResult,
+  contentRef: Ref<HTMLElement>,
+  chevronRef: Ref<HTMLElement>,
+  defaultExpanded = false,
 ): TemplateResult {
-	const statusIcon = (iconComponent: any, color: string) =>
-		html`<span class="inline-block ${color}">${icon(iconComponent, "sm")}</span>`;
+  const statusIcon = (iconComponent: any, color: string) =>
+    html`<span class="inline-block ${color}">${icon(iconComponent, "sm")}</span>`;
 
-	const toggleContent = (e: Event) => {
-		e.preventDefault();
-		const content = contentRef.value;
-		const chevron = chevronRef.value;
-		if (content && chevron) {
-			const isCollapsed = content.classList.contains("max-h-0");
-			if (isCollapsed) {
-				content.classList.remove("max-h-0");
-				content.classList.add("max-h-[2000px]", "mt-3");
-				// Show ChevronUp, hide ChevronsUpDown
-				const upIcon = chevron.querySelector(".chevron-up");
-				const downIcon = chevron.querySelector(".chevrons-up-down");
-				if (upIcon && downIcon) {
-					upIcon.classList.remove("hidden");
-					downIcon.classList.add("hidden");
-				}
-			} else {
-				content.classList.remove("max-h-[2000px]", "mt-3");
-				content.classList.add("max-h-0");
-				// Show ChevronsUpDown, hide ChevronUp
-				const upIcon = chevron.querySelector(".chevron-up");
-				const downIcon = chevron.querySelector(".chevrons-up-down");
-				if (upIcon && downIcon) {
-					upIcon.classList.add("hidden");
-					downIcon.classList.remove("hidden");
-				}
-			}
-		}
-	};
+  const toggleContent = (e: Event) => {
+    e.preventDefault();
+    const content = contentRef.value;
+    const chevron = chevronRef.value;
+    if (content && chevron) {
+      const isCollapsed = content.classList.contains("max-h-0");
+      if (isCollapsed) {
+        content.classList.remove("max-h-0");
+        content.classList.add("max-h-[2000px]", "mt-3");
+        // Show ChevronUp, hide ChevronsUpDown
+        const upIcon = chevron.querySelector(".chevron-up");
+        const downIcon = chevron.querySelector(".chevrons-up-down");
+        if (upIcon && downIcon) {
+          upIcon.classList.remove("hidden");
+          downIcon.classList.add("hidden");
+        }
+      } else {
+        content.classList.remove("max-h-[2000px]", "mt-3");
+        content.classList.add("max-h-0");
+        // Show ChevronsUpDown, hide ChevronUp
+        const upIcon = chevron.querySelector(".chevron-up");
+        const downIcon = chevron.querySelector(".chevrons-up-down");
+        if (upIcon && downIcon) {
+          upIcon.classList.add("hidden");
+          downIcon.classList.remove("hidden");
+        }
+      }
+    }
+  };
 
-	const toolIconColor =
-		state === "complete"
-			? "text-green-600 dark:text-green-500"
-			: state === "error"
-				? "text-destructive"
-				: "text-foreground";
+  const toolIconColor =
+    state === "complete"
+      ? "text-green-600 dark:text-green-500"
+      : state === "error"
+        ? "text-destructive"
+        : "text-foreground";
 
-	return html`
+  return html`
 		<button @click=${toggleContent} class="flex items-center justify-between gap-2 text-sm text-muted-foreground w-full text-left hover:text-foreground transition-colors cursor-pointer">
 			<div class="flex items-center gap-2">
 				${state === "inprogress" ? statusIcon(Loader, "text-foreground animate-spin") : ""}

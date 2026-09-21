@@ -33,80 +33,80 @@ let photonModule: typeof import("@silvia-odwyer/photon-node") | null = null;
 let loadPromise: Promise<typeof import("@silvia-odwyer/photon-node") | null> | null = null;
 
 function pathOrNull(file: PathOrFileDescriptor): string | null {
-	if (typeof file === "string") {
-		return file;
-	}
-	if (file instanceof URL) {
-		return fileURLToPath(file);
-	}
-	return null;
+  if (typeof file === "string") {
+    return file;
+  }
+  if (file instanceof URL) {
+    return fileURLToPath(file);
+  }
+  return null;
 }
 
 function getFallbackWasmPaths(): string[] {
-	const execDir = path.dirname(process.execPath);
-	return [
-		path.join(execDir, WASM_FILENAME),
-		path.join(execDir, "photon", WASM_FILENAME),
-		path.join(process.cwd(), WASM_FILENAME),
-	];
+  const execDir = path.dirname(process.execPath);
+  return [
+    path.join(execDir, WASM_FILENAME),
+    path.join(execDir, "photon", WASM_FILENAME),
+    path.join(process.cwd(), WASM_FILENAME),
+  ];
 }
 
 function patchPhotonWasmRead(): () => void {
-	const originalReadFileSync: ReadFileSync = fs.readFileSync.bind(fs);
-	const fallbackPaths = getFallbackWasmPaths();
-	const mutableFs = fs as { readFileSync: ReadFileSync };
+  const originalReadFileSync: ReadFileSync = fs.readFileSync.bind(fs);
+  const fallbackPaths = getFallbackWasmPaths();
+  const mutableFs = fs as { readFileSync: ReadFileSync };
 
-	const patchedReadFileSync: ReadFileSync = ((...args: Parameters<ReadFileSync>) => {
-		const [file, options] = args;
-		const resolvedPath = pathOrNull(file);
+  const patchedReadFileSync: ReadFileSync = ((...args: Parameters<ReadFileSync>) => {
+    const [file, options] = args;
+    const resolvedPath = pathOrNull(file);
 
-		if (resolvedPath?.endsWith(WASM_FILENAME)) {
-			try {
-				return originalReadFileSync(...args);
-			} catch (error) {
-				const err = error as NodeJS.ErrnoException;
-				if (err?.code && err.code !== "ENOENT") {
-					throw error;
-				}
+    if (resolvedPath?.endsWith(WASM_FILENAME)) {
+      try {
+        return originalReadFileSync(...args);
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err?.code && err.code !== "ENOENT") {
+          throw error;
+        }
 
-				for (const fallbackPath of fallbackPaths) {
-					if (!fs.existsSync(fallbackPath)) {
-						continue;
-					}
-					if (options === undefined) {
-						return originalReadFileSync(fallbackPath);
-					}
-					return originalReadFileSync(fallbackPath, options);
-				}
+        for (const fallbackPath of fallbackPaths) {
+          if (!fs.existsSync(fallbackPath)) {
+            continue;
+          }
+          if (options === undefined) {
+            return originalReadFileSync(fallbackPath);
+          }
+          return originalReadFileSync(fallbackPath, options);
+        }
 
-				throw error;
-			}
-		}
+        throw error;
+      }
+    }
 
-		return originalReadFileSync(...args);
-	}) as ReadFileSync;
+    return originalReadFileSync(...args);
+  }) as ReadFileSync;
 
-	try {
-		mutableFs.readFileSync = patchedReadFileSync;
-	} catch {
-		Object.defineProperty(fs, "readFileSync", {
-			value: patchedReadFileSync,
-			writable: true,
-			configurable: true,
-		});
-	}
+  try {
+    mutableFs.readFileSync = patchedReadFileSync;
+  } catch {
+    Object.defineProperty(fs, "readFileSync", {
+      value: patchedReadFileSync,
+      writable: true,
+      configurable: true,
+    });
+  }
 
-	return () => {
-		try {
-			mutableFs.readFileSync = originalReadFileSync;
-		} catch {
-			Object.defineProperty(fs, "readFileSync", {
-				value: originalReadFileSync,
-				writable: true,
-				configurable: true,
-			});
-		}
-	};
+  return () => {
+    try {
+      mutableFs.readFileSync = originalReadFileSync;
+    } catch {
+      Object.defineProperty(fs, "readFileSync", {
+        value: originalReadFileSync,
+        writable: true,
+        configurable: true,
+      });
+    }
+  };
 }
 
 /**
@@ -114,26 +114,26 @@ function patchPhotonWasmRead(): () => void {
  * Returns cached module on subsequent calls.
  */
 export async function loadPhoton(): Promise<typeof import("@silvia-odwyer/photon-node") | null> {
-	if (photonModule) {
-		return photonModule;
-	}
+  if (photonModule) {
+    return photonModule;
+  }
 
-	if (loadPromise) {
-		return loadPromise;
-	}
+  if (loadPromise) {
+    return loadPromise;
+  }
 
-	loadPromise = (async () => {
-		const restoreReadFileSync = patchPhotonWasmRead();
-		try {
-			photonModule = await import("@silvia-odwyer/photon-node");
-			return photonModule;
-		} catch {
-			photonModule = null;
-			return photonModule;
-		} finally {
-			restoreReadFileSync();
-		}
-	})();
+  loadPromise = (async () => {
+    const restoreReadFileSync = patchPhotonWasmRead();
+    try {
+      photonModule = await import("@silvia-odwyer/photon-node");
+      return photonModule;
+    } catch {
+      photonModule = null;
+      return photonModule;
+    } finally {
+      restoreReadFileSync();
+    }
+  })();
 
-	return loadPromise;
+  return loadPromise;
 }

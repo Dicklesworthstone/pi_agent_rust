@@ -6,27 +6,27 @@
 export type MessageType = "request-response" | "fire-and-forget";
 
 export interface RuntimeMessageBridgeOptions {
-	context: "sandbox-iframe" | "user-script";
-	sandboxId: string;
+  context: "sandbox-iframe" | "user-script";
+  sandboxId: string;
 }
 
 // biome-ignore lint/complexity/noStaticOnlyClass: fine
 export class RuntimeMessageBridge {
-	/**
-	 * Generate sendRuntimeMessage() function as injectable string.
-	 * Returns the function source code to be injected into target context.
-	 */
-	static generateBridgeCode(options: RuntimeMessageBridgeOptions): string {
-		if (options.context === "sandbox-iframe") {
-			return RuntimeMessageBridge.generateSandboxBridge(options.sandboxId);
-		} else {
-			return RuntimeMessageBridge.generateUserScriptBridge(options.sandboxId);
-		}
-	}
+  /**
+   * Generate sendRuntimeMessage() function as injectable string.
+   * Returns the function source code to be injected into target context.
+   */
+  static generateBridgeCode(options: RuntimeMessageBridgeOptions): string {
+    if (options.context === "sandbox-iframe") {
+      return RuntimeMessageBridge.generateSandboxBridge(options.sandboxId);
+    } else {
+      return RuntimeMessageBridge.generateUserScriptBridge(options.sandboxId);
+    }
+  }
 
-	private static generateSandboxBridge(sandboxId: string): string {
-		// Returns stringified function that uses window.parent.postMessage
-		return `
+  private static generateSandboxBridge(sandboxId: string): string {
+    // Returns stringified function that uses window.parent.postMessage
+    return `
 window.__completionCallbacks = [];
 window.sendRuntimeMessage = async (message) => {
     const messageId = 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
@@ -62,11 +62,11 @@ window.onCompleted = (callback) => {
     window.__completionCallbacks.push(callback);
 };
 `.trim();
-	}
+  }
 
-	private static generateUserScriptBridge(sandboxId: string): string {
-		// Returns stringified function that uses chrome.runtime.sendMessage
-		return `
+  private static generateUserScriptBridge(sandboxId: string): string {
+    // Returns stringified function that uses chrome.runtime.sendMessage
+    return `
 window.__completionCallbacks = [];
 window.sendRuntimeMessage = async (message) => {
     return await chrome.runtime.sendMessage({
@@ -78,5 +78,5 @@ window.onCompleted = (callback) => {
     window.__completionCallbacks.push(callback);
 };
 `.trim();
-	}
+  }
 }

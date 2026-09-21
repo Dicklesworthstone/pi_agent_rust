@@ -2,7 +2,7 @@
 const result = {
   fixture_id: "event-loop-ordering",
   scenario_id: "SCN-event-loop-io-ordering",
-  checks: []
+  checks: [],
 };
 
 // Capture execution order
@@ -22,27 +22,30 @@ Promise.resolve().then(() => order.push("promise-then-2"));
 setTimeout(() => {
   // Check 1: Microtasks and promises run before setTimeout(0)
   const timeoutIdx = order.indexOf("timeout-0ms");
-  const allMicrotasksBefore = ["microtask-1", "microtask-2", "promise-then-1", "promise-then-2"].every(
-    item => order.indexOf(item) < timeoutIdx
-  );
+  const allMicrotasksBefore = [
+    "microtask-1",
+    "microtask-2",
+    "promise-then-1",
+    "promise-then-2",
+  ].every((item) => order.indexOf(item) < timeoutIdx);
   result.checks.push({
     name: "microtasks_before_timers",
     pass: allMicrotasksBefore,
-    detail: `order: ${JSON.stringify(order)}`
+    detail: `order: ${JSON.stringify(order)}`,
   });
 
   // Check 2: Nested promise from microtask runs before timeout
   result.checks.push({
     name: "nested_promise_before_timer",
     pass: order.indexOf("nested-promise") < timeoutIdx,
-    detail: `nested-promise at ${order.indexOf("nested-promise")}, timeout at ${timeoutIdx}`
+    detail: `nested-promise at ${order.indexOf("nested-promise")}, timeout at ${timeoutIdx}`,
   });
 
   // Check 3: Promise.resolve().then() and queueMicrotask interleave correctly
   result.checks.push({
     name: "microtask_promise_interleave",
     pass: order.includes("microtask-1") && order.includes("promise-then-1"),
-    detail: `both microtask and promise executed`
+    detail: `both microtask and promise executed`,
   });
 
   console.log(JSON.stringify(result));

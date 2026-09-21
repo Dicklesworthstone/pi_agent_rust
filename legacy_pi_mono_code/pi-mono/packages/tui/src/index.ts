@@ -2,10 +2,10 @@
 
 // Autocomplete support
 export {
-	type AutocompleteItem,
-	type AutocompleteProvider,
-	CombinedAutocompleteProvider,
-	type SlashCommand,
+  type AutocompleteItem,
+  type AutocompleteProvider,
+  CombinedAutocompleteProvider,
+  type SlashCommand,
 } from "./autocomplete.js";
 // Components
 export { Box } from "./components/box.js";
@@ -16,7 +16,11 @@ export { Input } from "./components/input.js";
 export { Loader } from "./components/loader.js";
 export { type DefaultTextStyle, Markdown, type MarkdownTheme } from "./components/markdown.js";
 export { type SelectItem, SelectList, type SelectListTheme } from "./components/select-list.js";
-export { type SettingItem, SettingsList, type SettingsListTheme } from "./components/settings-list.js";
+export {
+  type SettingItem,
+  SettingsList,
+  type SettingsListTheme,
+} from "./components/settings-list.js";
 export { Spacer } from "./components/spacer.js";
 export { Text } from "./components/text.js";
 export { TruncatedText } from "./components/truncated-text.js";
@@ -26,24 +30,24 @@ export type { EditorComponent } from "./editor-component.js";
 export { type FuzzyMatch, fuzzyFilter, fuzzyMatch } from "./fuzzy.js";
 // Keybindings
 export {
-	DEFAULT_EDITOR_KEYBINDINGS,
-	type EditorAction,
-	type EditorKeybindingsConfig,
-	EditorKeybindingsManager,
-	getEditorKeybindings,
-	setEditorKeybindings,
+  DEFAULT_EDITOR_KEYBINDINGS,
+  type EditorAction,
+  type EditorKeybindingsConfig,
+  EditorKeybindingsManager,
+  getEditorKeybindings,
+  setEditorKeybindings,
 } from "./keybindings.js";
 // Keyboard input handling
 export {
-	isKeyRelease,
-	isKeyRepeat,
-	isKittyProtocolActive,
-	Key,
-	type KeyEventType,
-	type KeyId,
-	matchesKey,
-	parseKey,
-	setKittyProtocolActive,
+  isKeyRelease,
+  isKeyRepeat,
+  isKittyProtocolActive,
+  Key,
+  type KeyEventType,
+  type KeyId,
+  matchesKey,
+  parseKey,
+  setKittyProtocolActive,
 } from "./keys.js";
 // Input buffering for batch splitting
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.js";
@@ -51,42 +55,42 @@ export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "
 export { ProcessTerminal, type Terminal } from "./terminal.js";
 // Terminal image support
 export {
-	allocateImageId,
-	type CellDimensions,
-	calculateImageRows,
-	deleteAllKittyImages,
-	deleteKittyImage,
-	detectCapabilities,
-	encodeITerm2,
-	encodeKitty,
-	getCapabilities,
-	getCellDimensions,
-	getGifDimensions,
-	getImageDimensions,
-	getJpegDimensions,
-	getPngDimensions,
-	getWebpDimensions,
-	type ImageDimensions,
-	type ImageProtocol,
-	type ImageRenderOptions,
-	imageFallback,
-	renderImage,
-	resetCapabilitiesCache,
-	setCellDimensions,
-	type TerminalCapabilities,
+  allocateImageId,
+  type CellDimensions,
+  calculateImageRows,
+  deleteAllKittyImages,
+  deleteKittyImage,
+  detectCapabilities,
+  encodeITerm2,
+  encodeKitty,
+  getCapabilities,
+  getCellDimensions,
+  getGifDimensions,
+  getImageDimensions,
+  getJpegDimensions,
+  getPngDimensions,
+  getWebpDimensions,
+  type ImageDimensions,
+  type ImageProtocol,
+  type ImageRenderOptions,
+  imageFallback,
+  renderImage,
+  resetCapabilitiesCache,
+  setCellDimensions,
+  type TerminalCapabilities,
 } from "./terminal-image.js";
 export {
-	type Component,
-	Container,
-	CURSOR_MARKER,
-	type Focusable,
-	isFocusable,
-	type OverlayAnchor,
-	type OverlayHandle,
-	type OverlayMargin,
-	type OverlayOptions,
-	type SizeValue,
-	TUI,
+  type Component,
+  Container,
+  CURSOR_MARKER,
+  type Focusable,
+  isFocusable,
+  type OverlayAnchor,
+  type OverlayHandle,
+  type OverlayMargin,
+  type OverlayOptions,
+  type SizeValue,
+  TUI,
 } from "./tui.js";
 // Utilities
 export { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "./utils.js";
