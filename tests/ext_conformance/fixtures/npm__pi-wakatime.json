@@ -11,10 +11,7 @@
       "kind": "registration",
       "summary": "Validates event hook registrations for tool_result and turn_start",
       "expect": {
-        "event_hooks_contains": [
-          "tool_result",
-          "turn_start"
-        ]
+        "event_hooks_contains": ["tool_result", "turn_start"]
       }
     },
     {

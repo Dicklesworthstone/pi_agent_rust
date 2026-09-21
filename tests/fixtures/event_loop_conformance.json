@@ -52,7 +52,11 @@
       "start_ms": 0,
       "ops": [
         { "op": "enqueue_inbound_event", "event_id": "evt-1" },
-        { "op": "tick", "microtasks": 2, "expect": { "kind": "inbound_event", "event_id": "evt-1" } }
+        {
+          "op": "tick",
+          "microtasks": 2,
+          "expect": { "kind": "inbound_event", "event_id": "evt-1" }
+        }
       ]
     }
   ]

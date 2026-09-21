@@ -35,11 +35,7 @@
       "expect": {
         "api": "openai-completions",
         "api_key_env": "QWEN_CLI_API_KEY",
-        "models_contains": [
-          "qwen3-coder-plus",
-          "qwen3-coder-flash",
-          "vision-model"
-        ],
+        "models_contains": ["qwen3-coder-plus", "qwen3-coder-flash", "vision-model"],
         "no_error": true
       },
       "outputs": {

@@ -8,26 +8,11 @@
         "method": "POST",
         "url": "https://api.anthropic.com/v1/messages",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "X-API-Key",
-            "[REDACTED]"
-          ],
-          [
-            "anthropic-version",
-            "2023-06-01"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"],
+          ["X-API-Key", "[REDACTED]"],
+          ["anthropic-version", "2023-06-01"],
+          ["Content-Type", "application/json"]
         ],
         "body": {
           "max_tokens": 256,
@@ -56,62 +41,20 @@
       "response": {
         "status": 200,
         "headers": [
-          [
-            "Date",
-            "Thu, 05 Feb 2026 03:41:04 GMT"
-          ],
-          [
-            "Content-Type",
-            "text/event-stream; charset=utf-8"
-          ],
-          [
-            "Transfer-Encoding",
-            "chunked"
-          ],
-          [
-            "Connection",
-            "keep-alive"
-          ],
-          [
-            "Cache-Control",
-            "no-cache"
-          ],
-          [
-            "request-id",
-            "req_011CXpEDwGBm3BDJ4oHtmcNR"
-          ],
-          [
-            "strict-transport-security",
-            "max-age=31536000; includeSubDomains; preload"
-          ],
-          [
-            "anthropic-organization-id",
-            "2c19872b-debd-4294-9e6a-43d74c1afba3"
-          ],
-          [
-            "Server",
-            "cloudflare"
-          ],
-          [
-            "x-envoy-upstream-service-time",
-            "649"
-          ],
-          [
-            "cf-cache-status",
-            "DYNAMIC"
-          ],
-          [
-            "X-Robots-Tag",
-            "none"
-          ],
-          [
-            "Content-Security-Policy",
-            "default-src 'none'; frame-ancestors 'none'"
-          ],
-          [
-            "CF-RAY",
-            "9c8f63d3794f1db9-STL"
-          ]
+          ["Date", "Thu, 05 Feb 2026 03:41:04 GMT"],
+          ["Content-Type", "text/event-stream; charset=utf-8"],
+          ["Transfer-Encoding", "chunked"],
+          ["Connection", "keep-alive"],
+          ["Cache-Control", "no-cache"],
+          ["request-id", "req_011CXpEDwGBm3BDJ4oHtmcNR"],
+          ["strict-transport-security", "max-age=31536000; includeSubDomains; preload"],
+          ["anthropic-organization-id", "2c19872b-debd-4294-9e6a-43d74c1afba3"],
+          ["Server", "cloudflare"],
+          ["x-envoy-upstream-service-time", "649"],
+          ["cf-cache-status", "DYNAMIC"],
+          ["X-Robots-Tag", "none"],
+          ["Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'"],
+          ["CF-RAY", "9c8f63d3794f1db9-STL"]
         ],
         "body_chunks": [
           "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-20250514\",\"id\":\"msg_01MthdmJLQ1FHZ6BAP6jHBAg\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":35,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0},\"output_tokens\":8,\"service_tier\":\"standard\"}}        }\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}            }\n\n",

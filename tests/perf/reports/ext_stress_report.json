@@ -20,53 +20,35 @@
       },
       "reactor": {
         "enabled": true,
-        "max_queue_depths": [
-          0
-        ],
+        "max_queue_depths": [0],
         "migration_events": {
           "by_transition": {},
           "total": 0
         },
-        "queue_depths_final": [
-          0
-        ],
+        "queue_depths_final": [0],
         "queue_samples": [
           {
-            "max_queue_depths": [
-              0
-            ],
-            "queue_depths": [
-              0
-            ],
+            "max_queue_depths": [0],
+            "queue_depths": [0],
             "rejected_enqueues": 0,
             "t_s": 0,
             "total_dispatched": 0,
-            "total_enqueued_by_shard": [
-              0
-            ]
+            "total_enqueued_by_shard": [0]
           },
           {
-            "max_queue_depths": [
-              0
-            ],
-            "queue_depths": [
-              0
-            ],
+            "max_queue_depths": [0],
+            "queue_depths": [0],
             "rejected_enqueues": 0,
             "t_s": 59,
             "total_dispatched": 0,
-            "total_enqueued_by_shard": [
-              0
-            ]
+            "total_enqueued_by_shard": [0]
           }
         ],
         "rejected_enqueues": 0,
         "shard_count": 1,
         "stall_reasons": {},
         "total_dispatched": 0,
-        "total_enqueued_by_shard": [
-          0
-        ]
+        "total_enqueued_by_shard": [0]
       },
       "shards": 1,
       "throughput_eps": 0.5
@@ -91,79 +73,43 @@
       },
       "reactor": {
         "enabled": true,
-        "max_queue_depths": [
-          0,
-          0
-        ],
+        "max_queue_depths": [0, 0],
         "migration_events": {
           "by_transition": {},
           "total": 0
         },
-        "queue_depths_final": [
-          0,
-          0
-        ],
+        "queue_depths_final": [0, 0],
         "queue_samples": [
           {
-            "max_queue_depths": [
-              0,
-              0
-            ],
-            "queue_depths": [
-              0,
-              0
-            ],
+            "max_queue_depths": [0, 0],
+            "queue_depths": [0, 0],
             "rejected_enqueues": 0,
             "t_s": 0,
             "total_dispatched": 0,
-            "total_enqueued_by_shard": [
-              0,
-              0
-            ]
+            "total_enqueued_by_shard": [0, 0]
           },
           {
-            "max_queue_depths": [
-              0,
-              0
-            ],
-            "queue_depths": [
-              0,
-              0
-            ],
+            "max_queue_depths": [0, 0],
+            "queue_depths": [0, 0],
             "rejected_enqueues": 0,
             "t_s": 1,
             "total_dispatched": 0,
-            "total_enqueued_by_shard": [
-              0,
-              0
-            ]
+            "total_enqueued_by_shard": [0, 0]
           },
           {
-            "max_queue_depths": [
-              0,
-              0
-            ],
-            "queue_depths": [
-              0,
-              0
-            ],
+            "max_queue_depths": [0, 0],
+            "queue_depths": [0, 0],
             "rejected_enqueues": 0,
             "t_s": 2,
             "total_dispatched": 0,
-            "total_enqueued_by_shard": [
-              0,
-              0
-            ]
+            "total_enqueued_by_shard": [0, 0]
           }
         ],
         "rejected_enqueues": 0,
         "shard_count": 2,
         "stall_reasons": {},
         "total_dispatched": 0,
-        "total_enqueued_by_shard": [
-          0,
-          0
-        ]
+        "total_enqueued_by_shard": [0, 0]
       },
       "shards": 2,
       "throughput_eps": 25.0
@@ -235,9 +181,7 @@
   "events_path": "tests/perf/reports/ext_stress_events.jsonl",
   "extensions": {
     "count": 1,
-    "names": [
-      "antigravity-image-gen/antigravity-image-gen.ts"
-    ]
+    "names": ["antigravity-image-gen/antigravity-image-gen.ts"]
   },
   "generated_at": "2026-05-08T06:40:04Z",
   "host": {
@@ -267,79 +211,43 @@
   },
   "reactor": {
     "enabled": true,
-    "max_queue_depths": [
-      0,
-      0
-    ],
+    "max_queue_depths": [0, 0],
     "migration_events": {
       "by_transition": {},
       "total": 0
     },
-    "queue_depths_final": [
-      0,
-      0
-    ],
+    "queue_depths_final": [0, 0],
     "queue_samples": [
       {
-        "max_queue_depths": [
-          0,
-          0
-        ],
-        "queue_depths": [
-          0,
-          0
-        ],
+        "max_queue_depths": [0, 0],
+        "queue_depths": [0, 0],
         "rejected_enqueues": 0,
         "t_s": 0,
         "total_dispatched": 0,
-        "total_enqueued_by_shard": [
-          0,
-          0
-        ]
+        "total_enqueued_by_shard": [0, 0]
       },
       {
-        "max_queue_depths": [
-          0,
-          0
-        ],
-        "queue_depths": [
-          0,
-          0
-        ],
+        "max_queue_depths": [0, 0],
+        "queue_depths": [0, 0],
         "rejected_enqueues": 0,
         "t_s": 1,
         "total_dispatched": 0,
-        "total_enqueued_by_shard": [
-          0,
-          0
-        ]
+        "total_enqueued_by_shard": [0, 0]
       },
       {
-        "max_queue_depths": [
-          0,
-          0
-        ],
-        "queue_depths": [
-          0,
-          0
-        ],
+        "max_queue_depths": [0, 0],
+        "queue_depths": [0, 0],
         "rejected_enqueues": 0,
         "t_s": 2,
         "total_dispatched": 0,
-        "total_enqueued_by_shard": [
-          0,
-          0
-        ]
+        "total_enqueued_by_shard": [0, 0]
       }
     ],
     "rejected_enqueues": 0,
     "shard_count": 2,
     "stall_reasons": {},
     "total_dispatched": 0,
-    "total_enqueued_by_shard": [
-      0,
-      0
-    ]
+    "total_enqueued_by_shard": [0, 0]
   },
   "rss": {
     "growth_pct": 0.00032088307020921577,

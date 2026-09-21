@@ -6,9 +6,7 @@
     {
       "name": "learn_captures_reusable_lesson",
       "description": "a reusable lesson is stored as typed project memory without promoting a managed skill",
-      "requirement_ids": [
-        "MEM-LEARN-1"
-      ],
+      "requirement_ids": ["MEM-LEARN-1"],
       "input": {
         "lesson": "Pin the exact source base for every remote proof."
       },
@@ -18,19 +16,13 @@
           "schema": "pi.memory.v1",
           "promoted": null
         },
-        "details_contains": [
-          "Pin the exact source base for every remote proof.",
-          "lesson",
-          "learn"
-        ]
+        "details_contains": ["Pin the exact source base for every remote proof.", "lesson", "learn"]
       }
     },
     {
       "name": "learn_appends_context_to_memory",
       "description": "optional context is retained with the lesson so later recall preserves when and why it applies",
-      "requirement_ids": [
-        "MEM-LEARN-2"
-      ],
+      "requirement_ids": ["MEM-LEARN-2"],
       "input": {
         "lesson": "Serialize heavyweight compilation lanes.",
         "context": "Shared repositories can otherwise saturate remote workers."
@@ -49,9 +41,7 @@
     {
       "name": "learn_rejects_empty_lesson",
       "description": "blank lesson content fails before opening a promotion path",
-      "requirement_ids": [
-        "MEM-LEARN-ERR-1"
-      ],
+      "requirement_ids": ["MEM-LEARN-ERR-1"],
       "input": {
         "lesson": "   "
       },

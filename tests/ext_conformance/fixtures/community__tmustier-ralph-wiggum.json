@@ -12,15 +12,8 @@
       "summary": "Verifies 2 tool(s), ralph command, event hooks registered for tmustier-ralph-wiggum",
       "expect": {
         "tool_count": 2,
-        "commands_contains": [
-          "ralph",
-          "ralph-stop"
-        ],
-        "event_hooks_contains": [
-          "agent_end",
-          "before_agent_start",
-          "session_shutdown"
-        ]
+        "commands_contains": ["ralph", "ralph-stop"],
+        "event_hooks_contains": ["agent_end", "before_agent_start", "session_shutdown"]
       }
     },
     {

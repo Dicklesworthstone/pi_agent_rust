@@ -7,25 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream",
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "application/json"
-          ]
-        ]
+        "headers": [["Content-Type", "application/json"], ["Accept", "application/json"]]
       },
       "response": {
         "status": 401,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"__type\":\"UnrecognizedClientException\",\"message\":\"Simulated error 401\"}"
         ]

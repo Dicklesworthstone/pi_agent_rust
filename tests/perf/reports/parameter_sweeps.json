@@ -12,9 +12,7 @@
   "readiness": {
     "status": "blocked",
     "ready_for_phase5": false,
-    "blocking_reasons": [
-      "phase1_matrix_not_ready_for_phase5"
-    ]
+    "blocking_reasons": ["phase1_matrix_not_ready_for_phase5"]
   },
   "selected_defaults": {
     "flush_cadence_ms": 500,

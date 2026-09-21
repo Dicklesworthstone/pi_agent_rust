@@ -1,25 +1,18 @@
 {
   "action_plan": {
-    "command_safety_classes": [
-      "read_only_probe"
-    ],
+    "command_safety_classes": ["read_only_probe"],
     "decision": "pause_or_surface_blocker",
     "schema": "pi.swarm.action_plan.v1",
     "source_action": "fail_closed",
     "status": "blocked"
   },
-  "actions": [
-    "fail_closed"
-  ],
+  "actions": ["fail_closed"],
   "artifact_dir": "[WORKSPACE]/autopilot-e2e/malformed_source_fail_closed",
   "budget_state": {
     "status": "not_evaluated"
   },
   "command_count": 4,
-  "evidence_paths": [
-    "source_statuses.doctor_swarm",
-    "doctor_json"
-  ],
+  "evidence_paths": ["source_statuses.doctor_swarm", "doctor_json"],
   "input_pack_status": "not_built",
   "plan_status": "blocked",
   "redaction_summary": {
@@ -31,14 +24,10 @@
   "status": "pass",
   "work_admission_gate": {
     "admit_new_implementation": false,
-    "blockers": [
-      "malformed_required_source"
-    ],
+    "blockers": ["malformed_required_source"],
     "decision": "pause_escalate",
     "dry_run_executor": {
-      "blocked_ids": [
-        "BLOCK-malformed_required_source"
-      ],
+      "blocked_ids": ["BLOCK-malformed_required_source"],
       "never_execute_ids": [
         "POLICY-recursive_filesystem_deletion",
         "POLICY-file_deletion",

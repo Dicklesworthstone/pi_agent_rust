@@ -7,9 +7,13 @@
       "name": "computer_mock_lists_displays",
       "description": "Explicit mock mode returns a marked deterministic inventory",
       "requirement_ids": ["COMP-1"],
-      "input": {"action": "list_displays"},
+      "input": { "action": "list_displays" },
       "expected": {
-        "content_contains": ["Found 2 display(s)", "Built-in Retina Display", "External 4K Monitor"],
+        "content_contains": [
+          "Found 2 display(s)",
+          "Built-in Retina Display",
+          "External 4K Monitor"
+        ],
         "details_contains": ["\"width\": 2560", "\"width\": 3840", "\"mock\": true"]
       }
     },
@@ -17,10 +21,10 @@
       "name": "computer_mouse_move_zero_boundary",
       "description": "Explicit zero coordinates remain valid; omission is not accidental input at the origin",
       "requirement_ids": ["COMP-2"],
-      "input": {"action": "mouse_move", "x": 0, "y": 0},
+      "input": { "action": "mouse_move", "x": 0, "y": 0 },
       "expected": {
         "content_contains": ["mouse_move", "mock"],
-        "details_exact": {"action": "mouse_move", "x": 0, "y": 0, "button": "left", "mock": true}
+        "details_exact": { "action": "mouse_move", "x": 0, "y": 0, "button": "left", "mock": true }
       }
     },
     {
@@ -29,7 +33,7 @@
       "requirement_ids": ["COMP-2"],
       "expect_error": true,
       "error_contains": "both x and y",
-      "input": {"action": "mouse_move"},
+      "input": { "action": "mouse_move" },
       "expected": {}
     },
     {
@@ -38,7 +42,7 @@
       "requirement_ids": ["COMP-3"],
       "expect_error": true,
       "error_contains": "unknown",
-      "input": {"action": "invalid_action_xyz"},
+      "input": { "action": "invalid_action_xyz" },
       "expected": {}
     }
   ]

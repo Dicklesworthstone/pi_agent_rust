@@ -8,19 +8,21 @@
       "description": "a non-interactive session deterministically chooses the recommended option",
       "requirement_ids": ["ASK-1"],
       "input": {
-        "questions": [{
-          "id": "target",
-          "question": "Which target?",
-          "options": [{"label": "Safe"}, {"label": "Fast"}],
-          "recommended": 1
-        }]
+        "questions": [
+          {
+            "id": "target",
+            "question": "Which target?",
+            "options": [{ "label": "Safe" }, { "label": "Fast" }],
+            "recommended": 1
+          }
+        ]
       },
       "expected": {
         "content_contains": ["non-interactive session", "Q: Which target?", "A: Fast"],
         "details_exact": {
           "schema": "ask_response.v1",
           "autoAnswered": true,
-          "answers": [{"questionId": "target", "selected": ["Fast"]}]
+          "answers": [{ "questionId": "target", "selected": ["Fast"] }]
         }
       }
     },
@@ -29,17 +31,22 @@
       "description": "the documented maximum of five options remains accepted",
       "requirement_ids": ["ASK-2"],
       "input": {
-        "questions": [{
-          "question": "Pick one?",
-          "options": [
-            {"label": "One"}, {"label": "Two"}, {"label": "Three"},
-            {"label": "Four"}, {"label": "Five"}
-          ]
-        }]
+        "questions": [
+          {
+            "question": "Pick one?",
+            "options": [
+              { "label": "One" },
+              { "label": "Two" },
+              { "label": "Three" },
+              { "label": "Four" },
+              { "label": "Five" }
+            ]
+          }
+        ]
       },
       "expected": {
         "content_contains": ["A: One"],
-        "details_exact": {"schema": "ask_response.v1", "autoAnswered": true}
+        "details_exact": { "schema": "ask_response.v1", "autoAnswered": true }
       }
     },
     {
@@ -49,11 +56,13 @@
       "expect_error": true,
       "error_contains": "out of bounds",
       "input": {
-        "questions": [{
-          "question": "Select target?",
-          "options": [{"label": "A"}, {"label": "B"}],
-          "recommended": 2
-        }]
+        "questions": [
+          {
+            "question": "Select target?",
+            "options": [{ "label": "A" }, { "label": "B" }],
+            "recommended": 2
+          }
+        ]
       },
       "expected": {}
     }

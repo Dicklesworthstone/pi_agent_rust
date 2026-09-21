@@ -11,15 +11,8 @@
       "kind": "registration",
       "summary": "Verifies dcp-debug command, event hooks registered for zenobi-us-pi-dcp",
       "expect": {
-        "commands_contains": [
-          "dcp-debug",
-          "dcp-init",
-          "dcp-logs"
-        ],
-        "event_hooks_contains": [
-          "context",
-          "session_start"
-        ]
+        "commands_contains": ["dcp-debug", "dcp-init", "dcp-logs"],
+        "event_hooks_contains": ["context", "session_start"]
       }
     },
     {

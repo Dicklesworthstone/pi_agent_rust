@@ -7,10 +7,14 @@
       "name": "tts_mock_success",
       "description": "the mock backend writes deterministic WAV bytes without network access",
       "requirement_ids": ["MEDIA-TTS-1"],
-      "input": {"text": "hello fixture", "output_path": "audio/fixture.wav"},
+      "input": { "text": "hello fixture", "output_path": "audio/fixture.wav" },
       "expected": {
-        "content_contains": ["Successfully synthesized speech audio", "Voice: eve", "Characters: 13"],
-        "details_exact": {"voice": "eve", "format": "wav", "size_bytes": 44, "char_count": 13}
+        "content_contains": [
+          "Successfully synthesized speech audio",
+          "Voice: eve",
+          "Characters: 13"
+        ],
+        "details_exact": { "voice": "eve", "format": "wav", "size_bytes": 44, "char_count": 13 }
       }
     },
     {
@@ -19,7 +23,7 @@
       "requirement_ids": ["MEDIA-TTS-2"],
       "expect_error": true,
       "error_contains": "text cannot be empty",
-      "input": {"text": "   "},
+      "input": { "text": "   " },
       "expected": {}
     },
     {

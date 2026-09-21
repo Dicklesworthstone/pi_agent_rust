@@ -11,14 +11,8 @@
       "kind": "registration",
       "summary": "Verifies saferm command, event hooks registered for qualisero-safe-rm",
       "expect": {
-        "commands_contains": [
-          "saferm",
-          "saferm-clearlog",
-          "saferm-log"
-        ],
-        "event_hooks_contains": [
-          "tool_call"
-        ]
+        "commands_contains": ["saferm", "saferm-clearlog", "saferm-log"],
+        "event_hooks_contains": ["tool_call"]
       }
     },
     {

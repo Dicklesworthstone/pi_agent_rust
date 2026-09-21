@@ -8,28 +8,14 @@
         "method": "POST",
         "url": "https://zenmux.ai/api/anthropic/v1/messages",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "X-API-Key",
-            "[REDACTED]"
-          ],
-          [
-            "anthropic-version",
-            "2023-06-01"
-          ]
+          ["Content-Type", "application/json"],
+          ["X-API-Key", "[REDACTED]"],
+          ["anthropic-version", "2023-06-01"]
         ]
       },
       "response": {
         "status": 401,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"error\":{\"message\":\"Simulated error 401\",\"type\":\"authentication_error\"},\"type\":\"error\"}"
         ]

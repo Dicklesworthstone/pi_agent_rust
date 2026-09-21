@@ -44,10 +44,7 @@
       "summary": "Worktree is clean"
     },
     {
-      "evidence": [
-        "abc1234",
-        "origin/main"
-      ],
+      "evidence": ["abc1234", "origin/main"],
       "id": "git_pushed",
       "status": "pass",
       "summary": "HEAD matches upstream"

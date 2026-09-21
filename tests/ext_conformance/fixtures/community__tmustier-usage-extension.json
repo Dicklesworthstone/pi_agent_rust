@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies usage command registered for tmustier-usage-extension",
       "expect": {
-        "commands_contains": [
-          "usage"
-        ]
+        "commands_contains": ["usage"]
       }
     },
     {

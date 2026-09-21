@@ -11,16 +11,8 @@
       "kind": "registration",
       "summary": "Verifies notify-beep command, event hooks registered for qualisero-background-notify",
       "expect": {
-        "commands_contains": [
-          "notify-beep",
-          "notify-focus",
-          "notify-save-global"
-        ],
-        "event_hooks_contains": [
-          "agent_end",
-          "agent_start",
-          "session_start"
-        ]
+        "commands_contains": ["notify-beep", "notify-focus", "notify-save-global"],
+        "event_hooks_contains": ["agent_end", "agent_start", "session_start"]
       }
     },
     {

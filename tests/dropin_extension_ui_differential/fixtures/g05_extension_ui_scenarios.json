@@ -18,7 +18,10 @@
           "type": "prompt",
           "message": "test extension ui with confirm method",
           "ui_method": "confirm",
-          "ui_payload": { "title": "Continue with operation?", "message": "This will perform a test operation." }
+          "ui_payload": {
+            "title": "Continue with operation?",
+            "message": "This will perform a test operation."
+          }
         }
       ],
       "expected_patterns": [
@@ -246,9 +249,7 @@
           "ui_payload": { "title": "This should fail" }
         }
       ],
-      "expected_patterns": [
-        { "type": "response_error" }
-      ]
+      "expected_patterns": [{ "type": "response_error" }]
     },
     {
       "id": "ui-missing-required-field",
@@ -260,9 +261,7 @@
           "value": "response without requestId"
         }
       ],
-      "expected_patterns": [
-        { "type": "response_error" }
-      ]
+      "expected_patterns": [{ "type": "response_error" }]
     }
   ]
 }

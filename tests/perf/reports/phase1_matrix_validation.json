@@ -5,17 +5,8 @@
   "run_id": "20260216T041030Z",
   "correlation_id": "bd-3ar8v.3.8-20260216T041030Z",
   "matrix_requirements": {
-    "required_partition_tags": [
-      "matched-state",
-      "realistic"
-    ],
-    "required_session_message_sizes": [
-      100000,
-      200000,
-      500000,
-      1000000,
-      5000000
-    ],
+    "required_partition_tags": ["matched-state", "realistic"],
+    "required_session_message_sizes": [100000, 200000, 500000, 1000000, 5000000],
     "required_cell_count": 10
   },
   "matrix_cells": [
@@ -361,12 +352,7 @@
     }
   ],
   "stage_summary": {
-    "required_stage_keys": [
-      "open_ms",
-      "append_ms",
-      "save_ms",
-      "index_ms"
-    ],
+    "required_stage_keys": ["open_ms", "append_ms", "save_ms", "index_ms"],
     "operation_stage_coverage": {
       "open_ms": 0,
       "append_ms": 0,
@@ -474,10 +460,7 @@
     "wall_clock_ms": 27283.0,
     "rust_vs_node_ratio": null,
     "rust_vs_bun_ratio": null,
-    "missing_reasons": [
-      "missing_rust_vs_node_ratio",
-      "missing_rust_vs_bun_ratio"
-    ],
+    "missing_reasons": ["missing_rust_vs_node_ratio", "missing_rust_vs_bun_ratio"],
     "ordering_policy": "primary_e2e_before_microbench"
   },
   "regression_guards": {
@@ -544,10 +527,7 @@
     ]
   },
   "lineage": {
-    "run_id_lineage": [
-      "20260216T041030Z",
-      "bd-3ar8v.3.8-20260216T041030Z"
-    ],
+    "run_id_lineage": ["20260216T041030Z", "bd-3ar8v.3.8-20260216T041030Z"],
     "source_manifest_path": "tests/e2e_results/bd-3ar8v.3.8-20260216T041030Z/manifest.json",
     "source_scenario_runner_path": null,
     "source_stratification_path": "tests/e2e_results/bd-3ar8v.3.8-20260216T041030Z/results/extension_benchmark_stratification.json",

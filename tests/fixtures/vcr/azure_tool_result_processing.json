@@ -15,10 +15,7 @@
       },
       "response": {
         "status": 200,
-        "headers": [
-          ["Content-Type", "text/event-stream"],
-          ["Cache-Control", "no-cache"]
-        ],
+        "headers": [["Content-Type", "text/event-stream"], ["Cache-Control", "no-cache"]],
         "body_chunks": [
           "data: {\"id\":\"chatcmpl-azure-004\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
           "data: {\"id\":\"chatcmpl-azure-004\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",

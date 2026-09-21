@@ -7,25 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://test-resource.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2024-12-01-preview",
-        "headers": [
-          [
-            "api-key",
-            "[REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ]
+        "headers": [["api-key", "[REDACTED]"], ["Content-Type", "application/json"]]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "text/event-stream"
-          ]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"\",\"name\":\"add\"},\"id\":\"call_verify_add_0\",\"index\":0,\"type\":\"function\"},{\"function\":{\"arguments\":\"\",\"name\":\"echo\"},\"id\":\"call_verify_echo_1\",\"index\":1,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0}],\"created\":1738875600,\"id\":\"chatcmpl-verify-003\",\"model\":\"gpt-4o-mini\",\"object\":\"chat.completion.chunk\"}\n\n",
           "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"a\\\":2,\\\"b\\\":2}\"},\"index\":0},{\"function\":{\"arguments\":\"{\\\"text\\\":\\\"verification test\\\"}\"},\"index\":1}]},\"finish_reason\":null,\"index\":0}],\"created\":1738875600,\"id\":\"chatcmpl-verify-003\",\"model\":\"gpt-4o-mini\",\"object\":\"chat.completion.chunk\"}\n\n",

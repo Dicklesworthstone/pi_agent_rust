@@ -11,16 +11,8 @@
       "kind": "registration",
       "summary": "Verifies emoji command, event hooks registered for qualisero-session-emoji",
       "expect": {
-        "commands_contains": [
-          "emoji",
-          "emoji-config",
-          "emoji-history"
-        ],
-        "event_hooks_contains": [
-          "agent_start",
-          "session_start",
-          "session_switch"
-        ]
+        "commands_contains": ["emoji", "emoji-config", "emoji-history"],
+        "event_hooks_contains": ["agent_start", "session_start", "session_switch"]
       }
     },
     {

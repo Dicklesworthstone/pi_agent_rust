@@ -15,10 +15,7 @@
       },
       "response": {
         "status": 429,
-        "headers": [
-          ["Content-Type", "application/json"],
-          ["Retry-After", "60"]
-        ],
+        "headers": [["Content-Type", "application/json"], ["Retry-After", "60"]],
         "body_chunks": [
           "{\"error\":{\"message\":\"Rate limit reached for gpt-4o-mini in organization org-test on tokens per min (TPM): Limit 60000, Used 59500, Requested 1000.\",\"type\":\"tokens\",\"param\":null,\"code\":\"rate_limit_exceeded\"}}"
         ]

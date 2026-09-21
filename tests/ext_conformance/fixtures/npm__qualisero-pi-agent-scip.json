@@ -10,10 +10,7 @@
       "summary": "Verifies 6 tool(s), event hooks registered for the npm qualisero SCIP bundle",
       "expect": {
         "tool_count": 6,
-        "event_hooks_contains": [
-          "before_agent_start",
-          "session_start"
-        ]
+        "event_hooks_contains": ["before_agent_start", "session_start"]
       }
     },
     {

@@ -213,14 +213,9 @@
   },
   "promotion_rules": {
     "can_promote": false,
-    "blocker_gates": [
-      "ext_must_pass",
-      "practical_finish_checkpoint"
-    ],
+    "blocker_gates": ["ext_must_pass", "practical_finish_checkpoint"],
     "waiver_gates": [],
-    "conditions": [
-      "Blocking gates still failing: ext_must_pass, practical_finish_checkpoint"
-    ]
+    "conditions": ["Blocking gates still failing: ext_must_pass, practical_finish_checkpoint"]
   },
   "rerun_guidance": {
     "preflight_command": "cargo test --test ci_full_suite_gate -- preflight_fast_fail --nocapture --exact",

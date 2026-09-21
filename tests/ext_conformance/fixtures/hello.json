@@ -37,9 +37,7 @@
       "setup": null,
       "steps": [],
       "expect": {
-        "content_contains": [
-          "Hello, World!"
-        ],
+        "content_contains": ["Hello, World!"],
         "details_exact": {
           "greeted": "World"
         }

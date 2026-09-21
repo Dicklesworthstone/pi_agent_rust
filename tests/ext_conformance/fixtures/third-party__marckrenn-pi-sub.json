@@ -11,16 +11,8 @@
       "kind": "registration",
       "summary": "Verifies sub-bar:import command, event hooks registered for marckrenn-pi-sub",
       "expect": {
-        "commands_contains": [
-          "sub-bar:import",
-          "sub-bar:settings",
-          "sub-core:settings"
-        ],
-        "event_hooks_contains": [
-          "model_select",
-          "session_shutdown",
-          "session_start"
-        ]
+        "commands_contains": ["sub-bar:import", "sub-bar:settings", "sub-core:settings"],
+        "event_hooks_contains": ["model_select", "session_shutdown", "session_start"]
       }
     },
     {

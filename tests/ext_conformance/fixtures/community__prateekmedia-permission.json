@@ -11,14 +11,8 @@
       "kind": "registration",
       "summary": "Verifies permission command, event hooks registered for prateekmedia-permission",
       "expect": {
-        "commands_contains": [
-          "permission",
-          "permission-mode"
-        ],
-        "event_hooks_contains": [
-          "session_start",
-          "tool_call"
-        ]
+        "commands_contains": ["permission", "permission-mode"],
+        "event_hooks_contains": ["session_start", "tool_call"]
       }
     },
     {

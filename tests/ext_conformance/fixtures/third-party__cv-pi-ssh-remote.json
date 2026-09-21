@@ -12,10 +12,7 @@
       "summary": "Verifies 1 tool(s), event hooks registered for cv-pi-ssh-remote",
       "expect": {
         "tool_count": 1,
-        "event_hooks_contains": [
-          "session_shutdown",
-          "session_start"
-        ]
+        "event_hooks_contains": ["session_shutdown", "session_start"]
       }
     },
     {

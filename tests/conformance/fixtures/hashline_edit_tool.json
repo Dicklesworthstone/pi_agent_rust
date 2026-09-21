@@ -6,36 +6,26 @@
     {
       "name": "hashline_prepend_bof",
       "description": "Prepend without anchor inserts at BOF",
-      "setup": [
-        {"type": "create_file", "path": "file.txt", "content": "alpha\nbeta"}
-      ],
+      "setup": [{ "type": "create_file", "path": "file.txt", "content": "alpha\nbeta" }],
       "input": {
         "path": "file.txt",
-        "edits": [
-          {"op": "prepend", "lines": ["intro"]}
-        ]
+        "edits": [{ "op": "prepend", "lines": ["intro"] }]
       },
       "expected": {
         "content_exact": "Successfully applied hashline edits to file.txt.",
         "details_exact": {
           "firstChangedLine": 1
         },
-        "details_contains": [
-          "+1 intro"
-        ]
+        "details_contains": ["+1 intro"]
       }
     },
     {
       "name": "hashline_mismatch_rejected",
       "description": "Mismatched hash anchor is rejected with a clear error",
-      "setup": [
-        {"type": "create_file", "path": "file.txt", "content": "alpha\nbeta"}
-      ],
+      "setup": [{ "type": "create_file", "path": "file.txt", "content": "alpha\nbeta" }],
       "input": {
         "path": "file.txt",
-        "edits": [
-          {"op": "replace", "pos": "1#ZZ", "lines": ["ALPHA"]}
-        ]
+        "edits": [{ "op": "replace", "pos": "1#ZZ", "lines": ["ALPHA"] }]
       },
       "expect_error": true,
       "error_contains": "Hash validation failed",

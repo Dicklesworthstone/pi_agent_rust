@@ -19,9 +19,7 @@
         "close_reason": "Completed with direct evidence: commit abc1234, pushed ref, self-test, and audit artifacts.",
         "closed_at": "2026-01-02T03:00:00+00:00",
         "dependencies": [],
-        "dependents": [
-          "bd-fixture.2"
-        ],
+        "dependents": ["bd-fixture.2"],
         "id": "bd-fixture",
         "issue_type": "task",
         "priority": 2,
@@ -55,9 +53,7 @@
         "close_reason": "Completed with direct evidence: commit abc1234, pushed ref, self-test, and audit artifacts.",
         "closed_at": "2026-01-02T03:00:00+00:00",
         "dependencies": [],
-        "dependents": [
-          "bd-fixture.2"
-        ],
+        "dependents": ["bd-fixture.2"],
         "id": "bd-fixture",
         "issue_type": "task",
         "priority": 2,
@@ -89,9 +85,7 @@
   "overall_status": "complete",
   "requirements": [
     {
-      "evidence_refs": [
-        "bead:bd-fixture:closeout"
-      ],
+      "evidence_refs": ["bead:bd-fixture:closeout"],
       "evidence_status": "covered",
       "id": "REQ-001",
       "issue": null,
@@ -100,9 +94,7 @@
       "text": "Close bead `bd-fixture` with direct evidence in the close reason."
     },
     {
-      "evidence_refs": [
-        "files_changed:scripts/build_completion_audit.py"
-      ],
+      "evidence_refs": ["files_changed:scripts/build_completion_audit.py"],
       "evidence_status": "covered",
       "id": "REQ-002",
       "issue": null,
@@ -111,9 +103,7 @@
       "text": "Update `scripts/build_completion_audit.py`."
     },
     {
-      "evidence_refs": [
-        "command[0]:python3 scripts/build_completion_audit.py --self-test"
-      ],
+      "evidence_refs": ["command[0]:python3 scripts/build_completion_audit.py --self-test"],
       "evidence_status": "covered",
       "id": "REQ-003",
       "issue": null,
@@ -135,11 +125,7 @@
       "text": "Emit JSON plus Markdown audit artifacts."
     },
     {
-      "evidence_refs": [
-        "commit[0]",
-        "push[0]",
-        "commit_push:commit+push"
-      ],
+      "evidence_refs": ["commit[0]", "push[0]", "commit_push:commit+push"],
       "evidence_status": "covered",
       "id": "REQ-005",
       "issue": null,
@@ -148,9 +134,7 @@
       "text": "Commit and push the finished work."
     },
     {
-      "evidence_refs": [
-        "git:worktree_clean"
-      ],
+      "evidence_refs": ["git:worktree_clean"],
       "evidence_status": "covered",
       "id": "REQ-006",
       "issue": null,
@@ -159,9 +143,7 @@
       "text": "Leave the worktree clean."
     },
     {
-      "evidence_refs": [
-        "files_changed:scripts/build_completion_audit.py"
-      ],
+      "evidence_refs": ["files_changed:scripts/build_completion_audit.py"],
       "evidence_status": "covered",
       "id": "REQ-007",
       "issue": null,

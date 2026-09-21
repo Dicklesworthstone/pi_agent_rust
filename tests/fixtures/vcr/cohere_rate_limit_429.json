@@ -8,18 +8,9 @@
         "method": "POST",
         "url": "https://api.cohere.com/v2/chat",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "Authorization",
-            "[REDACTED]"
-          ]
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"],
+          ["Authorization", "[REDACTED]"]
         ],
         "body": {
           "model": "command-r-plus",
@@ -34,19 +25,8 @@
       },
       "response": {
         "status": 429,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Retry-After",
-            "60"
-          ]
-        ],
-        "body_chunks": [
-          "{\"message\":\"rate limit exceeded\"}"
-        ]
+        "headers": [["Content-Type", "application/json"], ["Retry-After", "60"]],
+        "body_chunks": ["{\"message\":\"rate limit exceeded\"}"]
       }
     }
   ]

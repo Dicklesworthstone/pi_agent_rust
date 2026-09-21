@@ -4,27 +4,28 @@
   "surface": "rpc_mode",
   "description": "RPC mode smoke: get_state command returns successful response envelope",
   "cli_args": [
-    "--mode", "rpc",
-    "--provider", "anthropic",
-    "--model", "claude-sonnet-4-5",
-    "--api-key", "test-vcr-key",
+    "--mode",
+    "rpc",
+    "--provider",
+    "anthropic",
+    "--model",
+    "claude-sonnet-4-5",
+    "--api-key",
+    "test-vcr-key",
     "--no-tools",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--thinking", "off"
+    "--thinking",
+    "off"
   ],
   "stdin": "{\"id\":\"cmd-rpc-1\",\"type\":\"get_state\"}\n",
   "env_overrides": {},
   "cassette": null,
   "expected": {
     "exit_code": 0,
-    "stdout_contains": [
-      "\"type\":\"response\"",
-      "\"command\":\"get_state\"",
-      "\"success\":true"
-    ],
+    "stdout_contains": ["\"type\":\"response\"", "\"command\":\"get_state\"", "\"success\":true"],
     "stdout_not_contains": [],
     "stderr_not_contains": ["panic"]
   }

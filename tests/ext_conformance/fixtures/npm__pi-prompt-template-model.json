@@ -11,11 +11,7 @@
       "kind": "registration",
       "summary": "Validates event hook registrations",
       "expect": {
-        "event_hooks_contains": [
-          "agent_end",
-          "before_agent_start",
-          "session_start"
-        ]
+        "event_hooks_contains": ["agent_end", "before_agent_start", "session_start"]
       }
     },
     {

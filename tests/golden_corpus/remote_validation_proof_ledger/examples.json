@@ -32,19 +32,12 @@
             "bead_id": "bd-e5le6.1",
             "command_class": "cargo_check",
             "command": {
-              "argv": [
-                "cargo",
-                "check",
-                "--all-targets"
-              ],
+              "argv": ["cargo", "check", "--all-targets"],
               "rendered": "rch exec -- cargo check --all-targets",
               "cwd": "/data/projects/pi_agent_rust",
               "command_fingerprint": "sha256:remote-clean",
               "feature_flags": [],
-              "env_allowlist": [
-                "CARGO_TARGET_DIR",
-                "TMPDIR"
-              ]
+              "env_allowlist": ["CARGO_TARGET_DIR", "TMPDIR"]
             },
             "runner": {
               "requested_runner": "rch",
@@ -83,15 +76,11 @@
               "tmpdir": "/data/tmp/pi_agent_rust_cargo/fixture/tmp",
               "remote_target_dir": "/data/projects/pi_agent_rust/.rch-target-worker-job",
               "remote_tmpdir": "/data/projects/pi_agent_rust/.rch-tmp",
-              "artifact_paths": [
-                "target/debug/.fingerprint"
-              ]
+              "artifact_paths": ["target/debug/.fingerprint"]
             },
             "artifact_retrieval": {
               "status": "clean",
-              "retrieved_paths": [
-                "target/debug/.fingerprint"
-              ],
+              "retrieved_paths": ["target/debug/.fingerprint"],
               "missing_paths": [],
               "warning_details": [],
               "retrieval_exit_code": 0,
@@ -167,22 +156,12 @@
             "bead_id": "bd-e5le6.1",
             "command_class": "cargo_clippy",
             "command": {
-              "argv": [
-                "cargo",
-                "clippy",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings"
-              ],
+              "argv": ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"],
               "rendered": "rch exec -- cargo clippy --all-targets -- -D warnings",
               "cwd": "/data/projects/pi_agent_rust",
               "command_fingerprint": "sha256:local-fallback-refusal",
               "feature_flags": [],
-              "env_allowlist": [
-                "CARGO_TARGET_DIR",
-                "TMPDIR"
-              ]
+              "env_allowlist": ["CARGO_TARGET_DIR", "TMPDIR"]
             },
             "runner": {
               "requested_runner": "rch",
@@ -260,12 +239,8 @@
                 "claimed_authoritative": false,
                 "authoritative_for_bead": false
               },
-              "degraded_reasons": [
-                "local_fallback_refused"
-              ],
-              "next_actions": [
-                "rerun when RCH is available"
-              ]
+              "degraded_reasons": ["local_fallback_refused"],
+              "next_actions": ["rerun when RCH is available"]
             }
           }
         ],
@@ -313,20 +288,12 @@
             "bead_id": "bd-e5le6.1",
             "command_class": "cargo_test",
             "command": {
-              "argv": [
-                "cargo",
-                "test",
-                "--test",
-                "remote_validation_proof_ledger_contract"
-              ],
+              "argv": ["cargo", "test", "--test", "remote_validation_proof_ledger_contract"],
               "rendered": "rch exec -- cargo test --test remote_validation_proof_ledger_contract",
               "cwd": "/data/projects/pi_agent_rust",
               "command_fingerprint": "sha256:queue-backoff",
               "feature_flags": [],
-              "env_allowlist": [
-                "CARGO_TARGET_DIR",
-                "TMPDIR"
-              ]
+              "env_allowlist": ["CARGO_TARGET_DIR", "TMPDIR"]
             },
             "runner": {
               "requested_runner": "rch",
@@ -404,12 +371,8 @@
                 "claimed_authoritative": false,
                 "authoritative_for_bead": false
               },
-              "degraded_reasons": [
-                "queue_backoff"
-              ],
-              "next_actions": [
-                "wait for queue pressure to drop"
-              ]
+              "degraded_reasons": ["queue_backoff"],
+              "next_actions": ["wait for queue pressure to drop"]
             }
           }
         ],
@@ -457,19 +420,12 @@
             "bead_id": "bd-e5le6.1",
             "command_class": "cargo_check",
             "command": {
-              "argv": [
-                "cargo",
-                "check",
-                "--all-targets"
-              ],
+              "argv": ["cargo", "check", "--all-targets"],
               "rendered": "rch exec -- cargo check --all-targets",
               "cwd": "/data/projects/pi_agent_rust",
               "command_fingerprint": "sha256:retrieval-warning",
               "feature_flags": [],
-              "env_allowlist": [
-                "CARGO_TARGET_DIR",
-                "TMPDIR"
-              ]
+              "env_allowlist": ["CARGO_TARGET_DIR", "TMPDIR"]
             },
             "runner": {
               "requested_runner": "rch",
@@ -508,19 +464,13 @@
               "tmpdir": "/data/tmp/pi_agent_rust_cargo/fixture/tmp",
               "remote_target_dir": "/data/projects/pi_agent_rust/.rch-target-worker-job",
               "remote_tmpdir": "/data/projects/pi_agent_rust/.rch-tmp",
-              "artifact_paths": [
-                "target/debug/.fingerprint"
-              ]
+              "artifact_paths": ["target/debug/.fingerprint"]
             },
             "artifact_retrieval": {
               "status": "warning",
               "retrieved_paths": [],
-              "missing_paths": [
-                "target/debug/.fingerprint"
-              ],
-              "warning_details": [
-                "rsync failed to set times on target directory"
-              ],
+              "missing_paths": ["target/debug/.fingerprint"],
+              "warning_details": ["rsync failed to set times on target directory"],
               "retrieval_exit_code": 23,
               "retrieval_elapsed_ms": 3353
             },
@@ -553,9 +503,7 @@
                 "claimed_authoritative": false,
                 "authoritative_for_bead": false
               },
-              "degraded_reasons": [
-                "artifact_retrieval_warning"
-              ],
+              "degraded_reasons": ["artifact_retrieval_warning"],
               "next_actions": [
                 "record retrieval warning in handoff",
                 "do not cite as clean remote proof"

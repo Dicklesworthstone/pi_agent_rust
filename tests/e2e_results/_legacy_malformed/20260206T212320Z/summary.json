@@ -5,15 +5,17 @@
   "passed_suites": 0,
   "failed_suites": 1,
   "failed_names": ["e2e_rpc"],
-  "suites": [{
-  "suite": "e2e_rpc",
-  "exit_code": 101,
-  "duration_ms": 47863,
-  "passed": 0,
-  "failed": 0,
-  "ignored": 0,
-  "total": 0,
-  "log_file": "/data/projects/pi_agent_rust/tests/e2e_results/20260206T212320Z/e2e_rpc/output.log",
-  "timestamp": "20260206T212320Z"
-}]
+  "suites": [
+    {
+      "suite": "e2e_rpc",
+      "exit_code": 101,
+      "duration_ms": 47863,
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "total": 0,
+      "log_file": "/data/projects/pi_agent_rust/tests/e2e_results/20260206T212320Z/e2e_rpc/output.log",
+      "timestamp": "20260206T212320Z"
+    }
+  ]
 }

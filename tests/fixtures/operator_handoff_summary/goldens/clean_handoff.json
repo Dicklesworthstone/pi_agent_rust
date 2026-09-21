@@ -65,18 +65,13 @@
       "summary": "Worktree is clean"
     },
     {
-      "evidence": [
-        "abc1234",
-        "origin/main"
-      ],
+      "evidence": ["abc1234", "origin/main"],
       "id": "git_pushed",
       "status": "pass",
       "summary": "HEAD matches upstream"
     },
     {
-      "evidence": [
-        "cargo_check_all_targets_rch"
-      ],
+      "evidence": ["cargo_check_all_targets_rch"],
       "id": "validation_gates",
       "status": "pass",
       "summary": "validation status=pass"
@@ -132,9 +127,7 @@
     "raw_sensitive_values_retained": false,
     "redacted_fields": 0
   },
-  "safe_next_actions": [
-    "Claim the next ready bead: bd-next."
-  ],
+  "safe_next_actions": ["Claim the next ready bead: bd-next."],
   "schema": "pi.operator.handoff_summary.v1",
   "source_statuses": {
     "action_plan": "clear",

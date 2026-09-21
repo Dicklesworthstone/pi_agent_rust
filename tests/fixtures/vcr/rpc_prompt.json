@@ -30,9 +30,7 @@
       },
       "response": {
         "status": 200,
-        "headers": [
-          ["content-type", "text/event-stream"]
-        ],
+        "headers": [["content-type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n"
         ]

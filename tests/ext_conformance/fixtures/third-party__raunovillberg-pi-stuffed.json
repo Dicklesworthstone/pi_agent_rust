@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies reddit command registered for raunovillberg-pi-stuffed",
       "expect": {
-        "commands_contains": [
-          "reddit"
-        ]
+        "commands_contains": ["reddit"]
       }
     },
     {

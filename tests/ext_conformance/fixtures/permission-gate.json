@@ -44,9 +44,7 @@
       "steps": [],
       "expect": {
         "block": true,
-        "reason_contains": [
-          "Dangerous command blocked"
-        ],
+        "reason_contains": ["Dangerous command blocked"],
         "no_error": true
       },
       "outputs": {
@@ -142,9 +140,7 @@
       "steps": [],
       "expect": {
         "block": true,
-        "reason_contains": [
-          "Blocked by user"
-        ]
+        "reason_contains": ["Blocked by user"]
       },
       "outputs": {
         "stdout_normalized_jsonl": [

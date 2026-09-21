@@ -96,10 +96,7 @@
           "active_equivalent_groups": [
             {
               "command_fingerprint": "fixture-broad-cargo-check",
-              "slot_ids": [
-                "slot-status-active",
-                "slot-status-reusable"
-              ]
+              "slot_ids": ["slot-status-active", "slot-status-reusable"]
             }
           ],
           "reusable_slots": [

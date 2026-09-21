@@ -8,28 +8,14 @@
         "method": "POST",
         "url": "https://api.anthropic.com/v1/messages",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "X-API-Key",
-            "[REDACTED]"
-          ],
-          [
-            "anthropic-version",
-            "2023-06-01"
-          ]
+          ["Content-Type", "application/json"],
+          ["X-API-Key", "[REDACTED]"],
+          ["anthropic-version", "2023-06-01"]
         ]
       },
       "response": {
         "status": 429,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"error\":{\"message\":\"Simulated error 429\",\"type\":\"authentication_error\"},\"type\":\"error\"}"
         ]

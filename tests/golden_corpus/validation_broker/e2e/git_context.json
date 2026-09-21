@@ -9,13 +9,7 @@
     "behind": 0,
     "status": "ok"
   },
-  "porcelain_lines": [
-    " M tests/validation_broker_cli.rs"
-  ],
-  "recent_commits": [
-    "abc123fixture bd-gusp4.8 validation broker e2e fixture"
-  ],
-  "recent_remote_commits": [
-    "def456fixture origin/main prior validation broker closeout"
-  ]
+  "porcelain_lines": [" M tests/validation_broker_cli.rs"],
+  "recent_commits": ["abc123fixture bd-gusp4.8 validation broker e2e fixture"],
+  "recent_remote_commits": ["def456fixture origin/main prior validation broker closeout"]
 }

@@ -42,9 +42,7 @@
       },
       "steps": [],
       "expect": {
-        "error_contains": [
-          "Missing Google Antigravity OAuth credentials"
-        ],
+        "error_contains": ["Missing Google Antigravity OAuth credentials"],
         "is_error": true
       },
       "outputs": {
@@ -140,16 +138,8 @@
       },
       "steps": [],
       "expect": {
-        "content_types": [
-          "text",
-          "image"
-        ],
-        "details_contains_keys": [
-          "provider",
-          "model",
-          "aspectRatio",
-          "saveMode"
-        ],
+        "content_types": ["text", "image"],
+        "details_contains_keys": ["provider", "model", "aspectRatio", "saveMode"],
         "no_error": true
       },
       "outputs": {

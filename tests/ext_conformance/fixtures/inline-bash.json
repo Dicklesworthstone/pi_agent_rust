@@ -41,10 +41,7 @@
       "setup": {
         "mock_exec": [
           {
-            "args": [
-              "-c",
-              "pwd"
-            ],
+            "args": ["-c", "pwd"],
             "code": 0,
             "command": "bash",
             "stderr": "",
@@ -55,9 +52,7 @@
       "steps": [],
       "expect": {
         "action": "transform",
-        "text_contains": [
-          "/repo"
-        ],
+        "text_contains": ["/repo"],
         "no_error": true
       },
       "outputs": {

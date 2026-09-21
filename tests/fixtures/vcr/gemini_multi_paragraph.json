@@ -7,16 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse",
-        "headers": [
-          ["Content-Type", "application/json"],
-          ["Accept", "text/event-stream"]
-        ]
+        "headers": [["Content-Type", "application/json"], ["Accept", "text/event-stream"]]
       },
       "response": {
         "status": 200,
-        "headers": [
-          ["Content-Type", "text/event-stream"]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Paragraph 1.\"}]}}]}\n\n",
           "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\\n\\nParagraph 2.\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":35,\"candidatesTokenCount\":12,\"totalTokenCount\":47}}\n\n"

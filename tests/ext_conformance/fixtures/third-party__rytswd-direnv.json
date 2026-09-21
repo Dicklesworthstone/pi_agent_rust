@@ -11,10 +11,7 @@
       "kind": "registration",
       "summary": "Verifies event hooks registered for rytswd-direnv",
       "expect": {
-        "event_hooks_contains": [
-          "session_start",
-          "tool_result"
-        ]
+        "event_hooks_contains": ["session_start", "tool_result"]
       }
     },
     {

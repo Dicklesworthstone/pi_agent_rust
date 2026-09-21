@@ -49,9 +49,39 @@
     {
       "name": "tool_call",
       "events": [
-        { "choices": [{ "delta": { "role": "assistant", "tool_calls": [{ "index": 0, "id": "call_001", "type": "function", "function": { "name": "read_file", "arguments": "" } }] } }] },
-        { "choices": [{ "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "{\"path\"" } }] } }] },
-        { "choices": [{ "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": ": \"/tmp/test.txt\"}" } }] } }] },
+        {
+          "choices": [
+            {
+              "delta": {
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "id": "call_001",
+                    "type": "function",
+                    "function": { "name": "read_file", "arguments": "" }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "choices": [
+            {
+              "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "{\"path\"" } }] }
+            }
+          ]
+        },
+        {
+          "choices": [
+            {
+              "delta": {
+                "tool_calls": [{ "index": 0, "function": { "arguments": ": \"/tmp/test.txt\"}" } }]
+              }
+            }
+          ]
+        },
         {
           "choices": [{ "delta": {}, "finish_reason": "tool_calls" }],
           "usage": { "prompt_tokens": 20, "completion_tokens": 15, "total_tokens": 35 }
@@ -93,8 +123,31 @@
       "name": "text_then_tool_call",
       "events": [
         { "choices": [{ "delta": { "content": "Let me check." } }] },
-        { "choices": [{ "delta": { "tool_calls": [{ "index": 0, "id": "call_bash01", "type": "function", "function": { "name": "bash", "arguments": "" } }] } }] },
-        { "choices": [{ "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "{\"command\": \"ls\"}" } }] } }] },
+        {
+          "choices": [
+            {
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "id": "call_bash01",
+                    "type": "function",
+                    "function": { "name": "bash", "arguments": "" }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "choices": [
+            {
+              "delta": {
+                "tool_calls": [{ "index": 0, "function": { "arguments": "{\"command\": \"ls\"}" } }]
+              }
+            }
+          ]
+        },
         {
           "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
         },

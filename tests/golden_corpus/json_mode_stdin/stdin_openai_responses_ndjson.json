@@ -4,16 +4,21 @@
   "surface": "json_mode_stdin",
   "description": "JSON mode with stdin: OpenAI Responses NDJSON stream playback",
   "cli_args": [
-    "--mode", "json",
-    "--provider", "openai",
-    "--model", "gpt-4o-mini",
+    "--mode",
+    "json",
+    "--provider",
+    "openai",
+    "--model",
+    "gpt-4o-mini",
     "--no-tools",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--thinking", "off",
-    "--system-prompt", "JSON stdin test."
+    "--thinking",
+    "off",
+    "--system-prompt",
+    "JSON stdin test."
   ],
   "stdin": "JSON stdin body\n",
   "env_overrides": {
@@ -38,9 +43,7 @@
             "input": [
               {
                 "role": "user",
-                "content": [
-                  { "type": "input_text", "text": "JSON stdin body" }
-                ]
+                "content": [{ "type": "input_text", "text": "JSON stdin body" }]
               }
             ],
             "instructions": "JSON stdin test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>",
@@ -50,9 +53,7 @@
         },
         "response": {
           "status": 200,
-          "headers": [
-            ["Content-Type", "application/x-ndjson"]
-          ],
+          "headers": [["Content-Type", "application/x-ndjson"]],
           "body_chunks": [
             "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_ndjson_stdin_1\",\"content_index\":0,\"delta\":\"stdin \"}\n",
             "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_ndjson_stdin_1\",\"content_index\":0,\"delta\":\"ok\"}\n",

@@ -4,9 +4,7 @@
       "id": "REQ-003",
       "issue": "artifact status passed but path is missing: missing-completion-audit.md",
       "kind": "missing_artifact",
-      "refs": [
-        "artifact[1]:missing-completion-audit.md"
-      ],
+      "refs": ["artifact[1]:missing-completion-audit.md"],
       "remediation": "Create or correct the missing artifact path, then regenerate the audit.",
       "requirement_kind": "artifact_bundle",
       "status": "contradiction"

@@ -6,30 +6,20 @@
     {
       "name": "retain_writes_typed_project_memory",
       "description": "a lesson is stored in the isolated project memory bank with its tags and versioned envelope",
-      "requirement_ids": [
-        "MEM-RETAIN-1"
-      ],
+      "requirement_ids": ["MEM-RETAIN-1"],
       "input": {
         "content": "Remote checks must remain fail-closed.",
         "kind": "lesson",
-        "tags": [
-          "verification",
-          "rch"
-        ]
+        "tags": ["verification", "rch"]
       },
       "expected": {
-        "content_contains": [
-          "Remembered [1] lesson"
-        ],
+        "content_contains": ["Remembered [1] lesson"],
         "details_exact": {
           "schema": "pi.memory.v1",
           "id": 1,
           "kind": "lesson",
           "content": "Remote checks must remain fail-closed.",
-          "tags": [
-            "verification",
-            "rch"
-          ],
+          "tags": ["verification", "rch"],
           "status": "active"
         }
       }
@@ -37,17 +27,13 @@
     {
       "name": "retain_redacts_github_token_before_storage",
       "description": "credential-shaped input is replaced before the memory reaches durable storage",
-      "requirement_ids": [
-        "MEM-RETAIN-2"
-      ],
+      "requirement_ids": ["MEM-RETAIN-2"],
       "input": {
         "content": "Never persist ghp_1234567890abcdefghij in a note.",
         "kind": "fact"
       },
       "expected": {
-        "content_contains": [
-          "secret redacted before storage"
-        ],
+        "content_contains": ["secret redacted before storage"],
         "details_exact": {
           "schema": "pi.memory.v1",
           "id": 1,
@@ -55,17 +41,13 @@
           "content": "Never persist [REDACTED_GITHUB_PAT] in a note.",
           "status": "active"
         },
-        "details_contains": [
-          "[REDACTED_GITHUB_PAT]"
-        ]
+        "details_contains": ["[REDACTED_GITHUB_PAT]"]
       }
     },
     {
       "name": "retain_rejects_unknown_memory_kind",
       "description": "unsupported memory kinds fail before any row is written and enumerate the accepted taxonomy",
-      "requirement_ids": [
-        "MEM-RETAIN-ERR-1"
-      ],
+      "requirement_ids": ["MEM-RETAIN-ERR-1"],
       "input": {
         "content": "This must not be stored.",
         "kind": "credential"

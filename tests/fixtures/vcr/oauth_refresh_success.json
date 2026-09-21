@@ -7,9 +7,7 @@
       "request": {
         "method": "POST",
         "url": "https://console.anthropic.com/v1/oauth/token",
-        "headers": [
-          ["Content-Type", "application/json"]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body": {
           "grant_type": "refresh_token",
           "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
@@ -19,9 +17,7 @@
       },
       "response": {
         "status": 200,
-        "headers": [
-          ["content-type", "application/json"]
-        ],
+        "headers": [["content-type", "application/json"]],
         "body_chunks": [
           "{\"access_token\":\"new-access-success\",\"refresh_token\":\"new-refresh-success\",\"expires_in\":3600}"
         ]

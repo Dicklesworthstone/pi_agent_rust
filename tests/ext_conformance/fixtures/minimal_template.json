@@ -13,9 +13,7 @@
       "summary": "Discovers template",
       "expect": {
         "returns_contains": {
-          "templatePaths": [
-            "templates/test-template"
-          ]
+          "templatePaths": ["templates/test-template"]
         }
       }
     },
@@ -25,9 +23,7 @@
       "summary": "Template pack remains discoverable",
       "expect": {
         "returns_contains": {
-          "templatePaths": [
-            "templates/test-template"
-          ]
+          "templatePaths": ["templates/test-template"]
         }
       }
     }

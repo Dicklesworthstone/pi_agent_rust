@@ -8,18 +8,9 @@
         "method": "POST",
         "url": "https://api.cohere.com/v2/chat",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "Authorization",
-            "[REDACTED]"
-          ]
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"],
+          ["Authorization", "[REDACTED]"]
         ],
         "body": {
           "model": "command-r-plus",
@@ -34,15 +25,8 @@
       },
       "response": {
         "status": 401,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
-        "body_chunks": [
-          "{\"message\":\"invalid api token\"}"
-        ]
+        "headers": [["Content-Type", "application/json"]],
+        "body_chunks": ["{\"message\":\"invalid api token\"}"]
       }
     }
   ]

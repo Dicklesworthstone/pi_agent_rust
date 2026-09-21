@@ -11,11 +11,7 @@
       "kind": "registration",
       "summary": "Validates event hook registrations",
       "expect": {
-        "event_hooks_contains": [
-          "session_start",
-          "session_switch",
-          "tool_result"
-        ]
+        "event_hooks_contains": ["session_start", "session_switch", "tool_result"]
       }
     },
     {

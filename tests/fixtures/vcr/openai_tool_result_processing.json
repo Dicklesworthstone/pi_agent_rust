@@ -15,9 +15,7 @@
       },
       "response": {
         "status": 200,
-        "headers": [
-          ["Content-Type", "text/event-stream"]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"id\":\"chatcmpl-vcr006\",\"object\":\"chat.completion.chunk\",\"created\":1738875600,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
           "data: {\"id\":\"chatcmpl-vcr006\",\"object\":\"chat.completion.chunk\",\"created\":1738875600,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",

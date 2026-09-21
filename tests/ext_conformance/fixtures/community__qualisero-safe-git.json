@@ -11,15 +11,8 @@
       "kind": "registration",
       "summary": "Verifies safegit command, event hooks registered for qualisero-safe-git",
       "expect": {
-        "commands_contains": [
-          "safegit",
-          "safegit-level",
-          "safegit-status"
-        ],
-        "event_hooks_contains": [
-          "session_start",
-          "tool_call"
-        ]
+        "commands_contains": ["safegit", "safegit-level", "safegit-status"],
+        "event_hooks_contains": ["session_start", "tool_call"]
       }
     },
     {

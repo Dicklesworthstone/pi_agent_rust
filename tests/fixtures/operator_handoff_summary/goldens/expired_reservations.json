@@ -44,10 +44,7 @@
       "summary": "Worktree is clean"
     },
     {
-      "evidence": [
-        "abc1234",
-        "origin/main"
-      ],
+      "evidence": ["abc1234", "origin/main"],
       "id": "git_pushed",
       "status": "pass",
       "summary": "HEAD matches upstream"
@@ -71,9 +68,7 @@
       "summary": "agent mail health=green semantic=pass"
     },
     {
-      "evidence": [
-        "src/extensions.rs"
-      ],
+      "evidence": ["src/extensions.rs"],
       "id": "reservations_current",
       "status": "warn",
       "summary": "1 expired reservation(s)"

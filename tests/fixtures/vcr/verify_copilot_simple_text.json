@@ -7,25 +7,11 @@
       "request": {
         "method": "GET",
         "url": "https://api.github.com/copilot_internal/v2/token",
-        "headers": [
-          [
-            "Accept",
-            "application/json"
-          ],
-          [
-            "Authorization",
-            "token [REDACTED]"
-          ]
-        ]
+        "headers": [["Accept", "application/json"], ["Authorization", "token [REDACTED]"]]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"endpoints\":{\"api\":\"https://api.githubcopilot.com\"},\"expires_at\":2147483647,\"token\":\"[REDACTED]\"}"
         ]
@@ -36,28 +22,14 @@
         "method": "POST",
         "url": "https://api.githubcopilot.com/chat/completions",
         "headers": [
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
+          ["Accept", "text/event-stream"],
+          ["Authorization", "Bearer [REDACTED]"],
+          ["Content-Type", "application/json"]
         ]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "text/event-stream"
-          ]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":1738875600,\"id\":\"chatcmpl-verify-001\",\"model\":\"gpt-4o-mini\",\"object\":\"chat.completion.chunk\"}\n\n",
           "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from the verification harness.\"},\"finish_reason\":null,\"index\":0}],\"created\":1738875600,\"id\":\"chatcmpl-verify-001\",\"model\":\"gpt-4o-mini\",\"object\":\"chat.completion.chunk\"}\n\n",

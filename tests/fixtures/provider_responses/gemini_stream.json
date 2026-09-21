@@ -6,9 +6,7 @@
       "name": "text_basic",
       "events": [
         {
-          "candidates": [
-            { "content": { "parts": [{ "text": "Hello " }] } }
-          ],
+          "candidates": [{ "content": { "parts": [{ "text": "Hello " }] } }],
           "usageMetadata": {
             "promptTokenCount": 5,
             "candidatesTokenCount": 1,
@@ -42,14 +40,10 @@
       "name": "text_multi_chunk",
       "events": [
         {
-          "candidates": [
-            { "content": { "parts": [{ "text": "First " }] } }
-          ]
+          "candidates": [{ "content": { "parts": [{ "text": "First " }] } }]
         },
         {
-          "candidates": [
-            { "content": { "parts": [{ "text": "second " }] } }
-          ]
+          "candidates": [{ "content": { "parts": [{ "text": "second " }] } }]
         },
         {
           "candidates": [
@@ -113,9 +107,7 @@
       "name": "max_tokens_finish",
       "events": [
         {
-          "candidates": [
-            { "content": { "parts": [{ "text": "truncated output" }] } }
-          ]
+          "candidates": [{ "content": { "parts": [{ "text": "truncated output" }] } }]
         },
         {
           "candidates": [
@@ -170,9 +162,7 @@
       "name": "text_then_tool_call",
       "events": [
         {
-          "candidates": [
-            { "content": { "parts": [{ "text": "Let me check that file." }] } }
-          ]
+          "candidates": [{ "content": { "parts": [{ "text": "Let me check that file." }] } }]
         },
         {
           "candidates": [
@@ -207,9 +197,7 @@
       "name": "usage_only_event",
       "events": [
         {
-          "candidates": [
-            { "content": { "parts": [{ "text": "hi" }] } }
-          ]
+          "candidates": [{ "content": { "parts": [{ "text": "hi" }] } }]
         },
         {
           "usageMetadata": {

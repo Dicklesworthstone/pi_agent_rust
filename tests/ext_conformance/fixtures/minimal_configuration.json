@@ -12,9 +12,7 @@
       "kind": "registration",
       "summary": "Registers a flag and a shortcut",
       "expect": {
-        "flags_contains": [
-          "verbose"
-        ]
+        "flags_contains": ["verbose"]
       }
     },
     {
@@ -22,9 +20,7 @@
       "kind": "registration",
       "summary": "Shortcut registration is present",
       "expect": {
-        "shortcuts_contains": [
-          "ctrl+shift+v"
-        ],
+        "shortcuts_contains": ["ctrl+shift+v"],
         "flag_count": 1
       }
     }

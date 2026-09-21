@@ -37,16 +37,12 @@
     "confidence": {
       "level": "medium",
       "score": 75,
-      "reasons": [
-        "missing_data_suppressed_claims"
-      ]
+      "reasons": ["missing_data_suppressed_claims"]
     },
     "missing_data": [
       {
         "claim": "resource_budget_claims",
-        "reasons": [
-          "host resource profile missing"
-        ],
+        "reasons": ["host resource profile missing"],
         "suppressed_metrics": [
           "resource_budget.peak_agent_concurrency",
           "resource_budget.peak_tool_concurrency",
@@ -105,16 +101,12 @@
     "confidence": {
       "level": "medium",
       "score": 75,
-      "reasons": [
-        "missing_data_suppressed_claims"
-      ]
+      "reasons": ["missing_data_suppressed_claims"]
     },
     "missing_data": [
       {
         "claim": "resource_budget_claims",
-        "reasons": [
-          "host resource profile missing"
-        ],
+        "reasons": ["host resource profile missing"],
         "suppressed_metrics": [
           "resource_budget.peak_agent_concurrency",
           "resource_budget.peak_tool_concurrency",
@@ -175,16 +167,12 @@
     "confidence": {
       "level": "medium",
       "score": 75,
-      "reasons": [
-        "missing_data_suppressed_claims"
-      ]
+      "reasons": ["missing_data_suppressed_claims"]
     },
     "missing_data": [
       {
         "claim": "resource_budget_claims",
-        "reasons": [
-          "host resource profile missing"
-        ],
+        "reasons": ["host resource profile missing"],
         "suppressed_metrics": [
           "resource_budget.peak_agent_concurrency",
           "resource_budget.peak_tool_concurrency",

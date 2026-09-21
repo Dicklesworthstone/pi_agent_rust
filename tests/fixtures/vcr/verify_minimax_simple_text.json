@@ -8,28 +8,14 @@
         "method": "POST",
         "url": "https://api.minimax.io/anthropic/v1/messages",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "X-API-Key",
-            "[REDACTED]"
-          ],
-          [
-            "anthropic-version",
-            "2023-06-01"
-          ]
+          ["Content-Type", "application/json"],
+          ["X-API-Key", "[REDACTED]"],
+          ["anthropic-version", "2023-06-01"]
         ]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "text/event-stream"
-          ]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"msg_verify_b1_001\",\"model\":\"MiniMax-M2.1\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":20,\"output_tokens\":1}},\"type\":\"message_start\"}\n\n",
           "event: content_block_start\ndata: {\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}\n\n",

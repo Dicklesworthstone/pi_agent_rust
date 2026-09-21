@@ -37,9 +37,7 @@
       "setup": null,
       "steps": [],
       "expect": {
-        "content_contains": [
-          "3600000"
-        ]
+        "content_contains": ["3600000"]
       },
       "outputs": {
         "stdout_normalized_jsonl": [

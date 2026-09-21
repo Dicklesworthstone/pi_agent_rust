@@ -10,87 +10,45 @@
   "rows": [
     {
       "bead": "bd-3ar8v.2.8",
-      "unit_evidence": [
-        "tests/bench_schema.rs"
-      ],
-      "e2e_evidence": [
-        "tests/e2e_results"
-      ],
-      "log_evidence": [
-        "tests/full_suite_gate/full_suite_events.jsonl"
-      ]
+      "unit_evidence": ["tests/bench_schema.rs"],
+      "e2e_evidence": ["tests/e2e_results"],
+      "log_evidence": ["tests/full_suite_gate/full_suite_events.jsonl"]
     },
     {
       "bead": "bd-3ar8v.3.8",
-      "unit_evidence": [
-        "tests/compaction.rs"
-      ],
-      "e2e_evidence": [
-        "tests/e2e_session_persistence.rs"
-      ],
-      "log_evidence": [
-        "tests/full_suite_gate/certification_events.jsonl"
-      ]
+      "unit_evidence": ["tests/compaction.rs"],
+      "e2e_evidence": ["tests/e2e_session_persistence.rs"],
+      "log_evidence": ["tests/full_suite_gate/certification_events.jsonl"]
     },
     {
       "bead": "bd-3ar8v.4.7",
-      "unit_evidence": [
-        "tests/ext_conformance.rs"
-      ],
-      "e2e_evidence": [
-        "tests/e2e_extension_registration.rs"
-      ],
-      "log_evidence": [
-        "tests/ext_conformance/reports/conformance_summary.json"
-      ]
+      "unit_evidence": ["tests/ext_conformance.rs"],
+      "e2e_evidence": ["tests/e2e_extension_registration.rs"],
+      "log_evidence": ["tests/ext_conformance/reports/conformance_summary.json"]
     },
     {
       "bead": "bd-3ar8v.4.8",
-      "unit_evidence": [
-        "tests/ext_proptest.rs"
-      ],
-      "e2e_evidence": [
-        "tests/e2e_extension_registration.rs"
-      ],
-      "log_evidence": [
-        "tests/full_suite_gate/full_suite_events.jsonl"
-      ]
+      "unit_evidence": ["tests/ext_proptest.rs"],
+      "e2e_evidence": ["tests/e2e_extension_registration.rs"],
+      "log_evidence": ["tests/full_suite_gate/full_suite_events.jsonl"]
     },
     {
       "bead": "bd-3ar8v.4.9",
-      "unit_evidence": [
-        "tests/ext_bench_harness.rs"
-      ],
-      "e2e_evidence": [
-        "tests/e2e_extension_registration.rs"
-      ],
-      "log_evidence": [
-        "tests/full_suite_gate/certification_events.jsonl"
-      ]
+      "unit_evidence": ["tests/ext_bench_harness.rs"],
+      "e2e_evidence": ["tests/e2e_extension_registration.rs"],
+      "log_evidence": ["tests/full_suite_gate/certification_events.jsonl"]
     },
     {
       "bead": "bd-3ar8v.4.10",
-      "unit_evidence": [
-        "tests/phase3_security_invariants.rs"
-      ],
-      "e2e_evidence": [
-        "tests/e2e_security_scenario_sec66.rs"
-      ],
-      "log_evidence": [
-        "tests/full_suite_gate/certification_events.jsonl"
-      ]
+      "unit_evidence": ["tests/phase3_security_invariants.rs"],
+      "e2e_evidence": ["tests/e2e_security_scenario_sec66.rs"],
+      "log_evidence": ["tests/full_suite_gate/certification_events.jsonl"]
     },
     {
       "bead": "bd-3ar8v.6.11",
-      "unit_evidence": [
-        "tests/ci_full_suite_gate.rs"
-      ],
-      "e2e_evidence": [
-        "tests/full_suite_gate/certification_verdict.json"
-      ],
-      "log_evidence": [
-        "tests/full_suite_gate/certification_events.jsonl"
-      ]
+      "unit_evidence": ["tests/ci_full_suite_gate.rs"],
+      "e2e_evidence": ["tests/full_suite_gate/certification_verdict.json"],
+      "log_evidence": ["tests/full_suite_gate/certification_events.jsonl"]
     }
   ]
 }

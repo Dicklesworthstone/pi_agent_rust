@@ -7,25 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://ollama.com/v1/chat/completions",
-        "headers": [
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ]
+        "headers": [["Authorization", "Bearer [REDACTED]"], ["Content-Type", "application/json"]]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "text/event-stream"
-          ]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"\",\"name\":\"echo\"},\"id\":\"call_verify_echo\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0}],\"created\":1738875600,\"id\":\"chatcmpl-verify-002\",\"model\":\"llama3.1:70b\",\"object\":\"chat.completion.chunk\"}\n\n",
           "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"text\\\":\\\"verification test\\\"}\"},\"index\":0}]},\"finish_reason\":null,\"index\":0}],\"created\":1738875600,\"id\":\"chatcmpl-verify-002\",\"model\":\"llama3.1:70b\",\"object\":\"chat.completion.chunk\"}\n\n",

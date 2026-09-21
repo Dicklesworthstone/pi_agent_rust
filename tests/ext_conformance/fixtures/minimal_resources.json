@@ -13,12 +13,8 @@
       "summary": "Discovers bundled prompts and skills",
       "expect": {
         "returns_contains": {
-          "promptPaths": [
-            "prompts/test-prompt.md"
-          ],
-          "skillPaths": [
-            "skills/test-skill.md"
-          ]
+          "promptPaths": ["prompts/test-prompt.md"],
+          "skillPaths": ["skills/test-skill.md"]
         }
       }
     },
@@ -28,9 +24,7 @@
       "summary": "Skill path remains discoverable",
       "expect": {
         "returns_contains": {
-          "skillPaths": [
-            "skills/test-skill.md"
-          ]
+          "skillPaths": ["skills/test-skill.md"]
         }
       }
     }

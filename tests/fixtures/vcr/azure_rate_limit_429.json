@@ -15,10 +15,7 @@
       },
       "response": {
         "status": 429,
-        "headers": [
-          ["Content-Type", "application/json"],
-          ["Retry-After", "60"]
-        ],
+        "headers": [["Content-Type", "application/json"], ["Retry-After", "60"]],
         "body_chunks": [
           "{\"error\":{\"code\":\"429\",\"message\":\"Requests to the ChatCompletions_Create Operation under Azure OpenAI API version 2024-12-01-preview have exceeded token rate limit of your current Azure OpenAI S0 pricing tier.\"}}"
         ]

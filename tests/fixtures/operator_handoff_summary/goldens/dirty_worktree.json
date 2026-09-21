@@ -28,14 +28,10 @@
     "ahead": 0,
     "behind": 0,
     "branch": "main",
-    "dirty_files": [
-      "scripts/build_swarm_operator_runpack.py"
-    ],
+    "dirty_files": ["scripts/build_swarm_operator_runpack.py"],
     "head": "abc1234",
     "recent_commits": [],
-    "untracked_files": [
-      "docs/contracts/new-contract.json"
-    ],
+    "untracked_files": ["docs/contracts/new-contract.json"],
     "upstream": "origin/main"
   },
   "guardrails": {
@@ -48,27 +44,19 @@
   },
   "invariants": [
     {
-      "evidence": [
-        "scripts/build_swarm_operator_runpack.py",
-        "docs/contracts/new-contract.json"
-      ],
+      "evidence": ["scripts/build_swarm_operator_runpack.py", "docs/contracts/new-contract.json"],
       "id": "git_worktree_clean",
       "status": "warn",
       "summary": "2 worktree path(s) need attention"
     },
     {
-      "evidence": [
-        "abc1234",
-        "origin/main"
-      ],
+      "evidence": ["abc1234", "origin/main"],
       "id": "git_pushed",
       "status": "pass",
       "summary": "HEAD matches upstream"
     },
     {
-      "evidence": [
-        "py_compile"
-      ],
+      "evidence": ["py_compile"],
       "id": "validation_gates",
       "status": "pass",
       "summary": "validation status=pass"

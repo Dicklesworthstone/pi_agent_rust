@@ -9,7 +9,13 @@
       "kind": "registration",
       "summary": "Verifies overlay QA test commands and event handlers are registered",
       "expect": {
-        "commands_contains": ["overlay-anchors", "overlay-animation", "overlay-edge", "overlay-stack", "overlay-toggle"],
+        "commands_contains": [
+          "overlay-anchors",
+          "overlay-animation",
+          "overlay-edge",
+          "overlay-stack",
+          "overlay-toggle"
+        ],
         "event_hooks_contains": ["close", "data"]
       }
     },

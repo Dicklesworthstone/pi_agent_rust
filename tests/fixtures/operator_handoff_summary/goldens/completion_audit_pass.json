@@ -46,10 +46,7 @@
       "summary": "Worktree is clean"
     },
     {
-      "evidence": [
-        "abc1234",
-        "origin/main"
-      ],
+      "evidence": ["abc1234", "origin/main"],
       "id": "git_pushed",
       "status": "pass",
       "summary": "HEAD matches upstream"
@@ -111,9 +108,7 @@
     "raw_sensitive_values_retained": false,
     "redacted_fields": 0
   },
-  "safe_next_actions": [
-    "Capture fresh triage with bv/br before starting new work."
-  ],
+  "safe_next_actions": ["Capture fresh triage with bv/br before starting new work."],
   "schema": "pi.operator.handoff_summary.v1",
   "source_statuses": {
     "action_plan": "clear",

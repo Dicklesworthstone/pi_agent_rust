@@ -11,15 +11,8 @@
       },
       "response": {
         "status": 401,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
-        "body_chunks": [
-          "{\"message\":\"Simulated error 401\"}"
-        ]
+        "headers": [["Content-Type", "application/json"]],
+        "body_chunks": ["{\"message\":\"Simulated error 401\"}"]
       }
     }
   ]

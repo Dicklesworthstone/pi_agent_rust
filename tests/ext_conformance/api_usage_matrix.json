@@ -190,9 +190,7 @@
       "tier_breakdown": { "T1": 1, "T2": 3, "T3_npm": 4, "T3_gh": 2 },
       "shim_status": "real",
       "criticality": "P2",
-      "apis": [
-        { "name": "createRequire", "call_count": 10, "shim_status": "real" }
-      ]
+      "apis": [{ "name": "createRequire", "call_count": 10, "shim_status": "real" }]
     },
     {
       "module": "node:readline",
@@ -263,9 +261,7 @@
       "tier_breakdown": { "T3_npm": 2, "T3_gh": 1 },
       "shim_status": "real",
       "criticality": "P2",
-      "apis": [
-        { "name": "EventEmitter", "call_count": 15, "shim_status": "real" }
-      ]
+      "apis": [{ "name": "EventEmitter", "call_count": 15, "shim_status": "real" }]
     },
     {
       "module": "node:stream",
@@ -600,10 +596,26 @@
   "domain_packages": {
     "notes": "Internal pi packages and custom domain libraries with virtual module stubs",
     "modules": [
-      { "module": "@mariozechner/pi-coding-agent", "shim_status": "partial", "notes": "Mix of real utilities and stubs" },
-      { "module": "@mariozechner/pi-tui", "shim_status": "partial", "notes": "Real fuzzy matching; stubs for rendering" },
-      { "module": "@mariozechner/pi-ai", "shim_status": "partial", "notes": "Capability-filtered env lookup; unsupported completion/auth/model helpers fail closed" },
-      { "module": "vscode-languageserver-protocol", "shim_status": "partial", "notes": "Real constants; stub connections" },
+      {
+        "module": "@mariozechner/pi-coding-agent",
+        "shim_status": "partial",
+        "notes": "Mix of real utilities and stubs"
+      },
+      {
+        "module": "@mariozechner/pi-tui",
+        "shim_status": "partial",
+        "notes": "Real fuzzy matching; stubs for rendering"
+      },
+      {
+        "module": "@mariozechner/pi-ai",
+        "shim_status": "partial",
+        "notes": "Capability-filtered env lookup; unsupported completion/auth/model helpers fail closed"
+      },
+      {
+        "module": "vscode-languageserver-protocol",
+        "shim_status": "partial",
+        "notes": "Real constants; stub connections"
+      },
       { "module": "@opentelemetry/*", "shim_status": "stub", "notes": "5 modules, all stubs" },
       { "module": "@xterm/*", "shim_status": "stub", "notes": "2 modules, all stubs" },
       { "module": "@aliou/*", "shim_status": "stub", "notes": "2 modules, all stubs" },
@@ -625,10 +637,7 @@
       "error_throw": 2,
       "missing_from_corpus": 2
     },
-    "missing_modules_used_by_corpus": [
-      "express (2 ext)",
-      "ora (2 ext)"
-    ],
+    "missing_modules_used_by_corpus": ["express (2 ext)", "ora (2 ext)"],
     "top_gaps_by_impact": [
       "child_process.fork (72 calls, error throw)",
       "process.getuid/getgid (16 calls, stubbed identity)",

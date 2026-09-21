@@ -11,12 +11,8 @@
       "kind": "registration",
       "summary": "Verifies paste command, event hooks registered for tmustier-raw-paste",
       "expect": {
-        "commands_contains": [
-          "paste"
-        ],
-        "event_hooks_contains": [
-          "session_start"
-        ]
+        "commands_contains": ["paste"],
+        "event_hooks_contains": ["session_start"]
       }
     },
     {

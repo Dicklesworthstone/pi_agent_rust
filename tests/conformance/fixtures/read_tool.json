@@ -7,9 +7,13 @@
       "name": "read_simple_file",
       "description": "Read a simple text file",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "line1\nline2\nline3\nline4\nline5"
+        }
       ],
-      "input": {"path": "test.txt"},
+      "input": { "path": "test.txt" },
       "expected": {
         "content_exact": "    1\u2192line1\n    2\u2192line2\n    3\u2192line3\n    4\u2192line4\n    5\u2192line5",
         "details_none": true
@@ -19,9 +23,13 @@
       "name": "read_with_offset",
       "description": "Read file starting from a specific line",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "line1\nline2\nline3\nline4\nline5"
+        }
       ],
-      "input": {"path": "test.txt", "offset": 3},
+      "input": { "path": "test.txt", "offset": 3 },
       "expected": {
         "content_exact": "    3\u2192line3\n    4\u2192line4\n    5\u2192line5",
         "details_none": true
@@ -31,9 +39,13 @@
       "name": "read_with_limit",
       "description": "Read file with line limit",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "line1\nline2\nline3\nline4\nline5"
+        }
       ],
-      "input": {"path": "test.txt", "limit": 2},
+      "input": { "path": "test.txt", "limit": 2 },
       "expected": {
         "content_exact": "    1\u2192line1\n    2\u2192line2\n\n[3 more lines in file. Use offset=3 to continue.]",
         "details_none": true
@@ -43,9 +55,9 @@
       "name": "read_with_limit_golden",
       "description": "Read limit output matches golden snapshot",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4"}
+        { "type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4" }
       ],
-      "input": {"path": "test.txt", "limit": 2},
+      "input": { "path": "test.txt", "limit": 2 },
       "expected": {
         "content_golden": "read_tool/limit_notice.txt",
         "details_none": true
@@ -55,9 +67,9 @@
       "name": "read_with_limit_golden_crlf",
       "description": "CRLF input normalizes to the same golden limit output",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\r\nline2\r\nline3\r\nline4"}
+        { "type": "create_file", "path": "test.txt", "content": "line1\r\nline2\r\nline3\r\nline4" }
       ],
-      "input": {"path": "test.txt", "limit": 2},
+      "input": { "path": "test.txt", "limit": 2 },
       "expected": {
         "content_golden": "read_tool/limit_notice.txt",
         "details_none": true
@@ -67,9 +79,9 @@
       "name": "read_with_limit_golden_cr",
       "description": "CR-only input normalizes to the same golden limit output",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\rline2\rline3\rline4"}
+        { "type": "create_file", "path": "test.txt", "content": "line1\rline2\rline3\rline4" }
       ],
-      "input": {"path": "test.txt", "limit": 2},
+      "input": { "path": "test.txt", "limit": 2 },
       "expected": {
         "content_golden": "read_tool/limit_notice.txt",
         "details_none": true
@@ -79,9 +91,13 @@
       "name": "read_with_offset_and_limit",
       "description": "Read file with both offset and limit",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "line1\nline2\nline3\nline4\nline5"
+        }
       ],
-      "input": {"path": "test.txt", "offset": 2, "limit": 2},
+      "input": { "path": "test.txt", "offset": 2, "limit": 2 },
       "expected": {
         "content_exact": "    2\u2192line2\n    3\u2192line3\n\n[2 more lines in file. Use offset=4 to continue.]",
         "details_none": true
@@ -91,9 +107,13 @@
       "name": "read_offset_out_of_bounds",
       "description": "Offset beyond EOF should error with an actionable message",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "line1\nline2\nline3\nline4\nline5"
+        }
       ],
-      "input": {"path": "test.txt", "offset": 999},
+      "input": { "path": "test.txt", "offset": 999 },
       "expect_error": true,
       "error_contains": "Offset 999 is beyond end of file",
       "expected": {}
@@ -101,7 +121,7 @@
     {
       "name": "read_outside_cwd",
       "description": "Reading outside the working directory should be rejected",
-      "input": {"path": "../outside.txt"},
+      "input": { "path": "../outside.txt" },
       "expect_error": true,
       "error_contains": "Cannot read outside the working directory",
       "expected": {}
@@ -109,27 +129,23 @@
     {
       "name": "read_nonexistent_file",
       "description": "Reading a nonexistent file should error",
-      "input": {"path": "/nonexistent/path/file.txt"},
+      "input": { "path": "/nonexistent/path/file.txt" },
       "expect_error": true,
       "expected": {}
     },
     {
       "name": "read_directory",
       "description": "Reading a directory should error",
-      "setup": [
-        {"type": "create_dir", "path": "mydir"}
-      ],
-      "input": {"path": "mydir"},
+      "setup": [{ "type": "create_dir", "path": "mydir" }],
+      "input": { "path": "mydir" },
       "expect_error": true,
       "expected": {}
     },
     {
       "name": "read_empty_file",
       "description": "Read an empty file",
-      "setup": [
-        {"type": "create_file", "path": "empty.txt", "content": ""}
-      ],
-      "input": {"path": "empty.txt"},
+      "setup": [{ "type": "create_file", "path": "empty.txt", "content": "" }],
+      "input": { "path": "empty.txt" },
       "expected": {
         "content_exact": "",
         "details_none": true
@@ -139,9 +155,13 @@
       "name": "read_unicode_content",
       "description": "Read file with Unicode content",
       "setup": [
-        {"type": "create_file", "path": "unicode.txt", "content": "Hello \u4e16\u754c\n\u3053\u3093\u306b\u3061\u306f\n\ud83c\udf89 emoji"}
+        {
+          "type": "create_file",
+          "path": "unicode.txt",
+          "content": "Hello \u4e16\u754c\n\u3053\u3093\u306b\u3061\u306f\n\ud83c\udf89 emoji"
+        }
       ],
-      "input": {"path": "unicode.txt"},
+      "input": { "path": "unicode.txt" },
       "expected": {
         "content_exact": "    1\u2192Hello \u4e16\u754c\n    2\u2192\u3053\u3093\u306b\u3061\u306f\n    3\u2192\ud83c\udf89 emoji",
         "details_none": true
@@ -151,9 +171,9 @@
       "name": "read_nested_path",
       "description": "Read file in nested directory",
       "setup": [
-        {"type": "create_file", "path": "a/b/c/deep.txt", "content": "deeply nested content"}
+        { "type": "create_file", "path": "a/b/c/deep.txt", "content": "deeply nested content" }
       ],
-      "input": {"path": "a/b/c/deep.txt"},
+      "input": { "path": "a/b/c/deep.txt" },
       "expected": {
         "content_exact": "    1\u2192deeply nested content",
         "details_none": true
@@ -164,9 +184,12 @@
       "description": "The run_command setup step can prepare fixture files before tool execution",
       "requirement_ids": ["CONF-SETUP-RUN-COMMAND"],
       "setup": [
-        {"type": "run_command", "command": "mkdir generated && echo generated via setup>generated/out.txt"}
+        {
+          "type": "run_command",
+          "command": "mkdir generated && echo generated via setup>generated/out.txt"
+        }
       ],
-      "input": {"path": "generated/out.txt"},
+      "input": { "path": "generated/out.txt" },
       "expected": {
         "content_exact": "    1\u2192generated via setup",
         "details_none": true
@@ -175,10 +198,8 @@
     {
       "name": "read_trailing_newline",
       "description": "Read file with trailing newline",
-      "setup": [
-        {"type": "create_file", "path": "trailing.txt", "content": "line1\nline2\n"}
-      ],
-      "input": {"path": "trailing.txt"},
+      "setup": [{ "type": "create_file", "path": "trailing.txt", "content": "line1\nline2\n" }],
+      "input": { "path": "trailing.txt" },
       "expected": {
         "content_exact": "    1\u2192line1\n    2\u2192line2",
         "details_none": true
@@ -188,9 +209,9 @@
       "name": "read_no_trailing_newline",
       "description": "Read file without trailing newline",
       "setup": [
-        {"type": "create_file", "path": "notrailing.txt", "content": "no trailing newline"}
+        { "type": "create_file", "path": "notrailing.txt", "content": "no trailing newline" }
       ],
-      "input": {"path": "notrailing.txt"},
+      "input": { "path": "notrailing.txt" },
       "expected": {
         "content_exact": "    1\u2192no trailing newline",
         "details_none": true
@@ -199,10 +220,8 @@
     {
       "name": "read_single_line",
       "description": "Read file with single line",
-      "setup": [
-        {"type": "create_file", "path": "single.txt", "content": "only one line"}
-      ],
-      "input": {"path": "single.txt"},
+      "setup": [{ "type": "create_file", "path": "single.txt", "content": "only one line" }],
+      "input": { "path": "single.txt" },
       "expected": {
         "content_exact": "    1\u2192only one line",
         "details_none": true
@@ -211,10 +230,8 @@
     {
       "name": "read_many_empty_lines",
       "description": "Read file with multiple empty lines",
-      "setup": [
-        {"type": "create_file", "path": "blanks.txt", "content": "line1\n\n\n\nline2"}
-      ],
-      "input": {"path": "blanks.txt"},
+      "setup": [{ "type": "create_file", "path": "blanks.txt", "content": "line1\n\n\n\nline2" }],
+      "input": { "path": "blanks.txt" },
       "expected": {
         "content_exact": "    1\u2192line1\n    2\u2192\n    3\u2192\n    4\u2192\n    5\u2192line2",
         "details_none": true
@@ -224,9 +241,9 @@
       "name": "read_crlf_line_endings",
       "description": "Read file with Windows-style line endings",
       "setup": [
-        {"type": "create_file", "path": "windows.txt", "content": "line1\r\nline2\r\nline3"}
+        { "type": "create_file", "path": "windows.txt", "content": "line1\r\nline2\r\nline3" }
       ],
-      "input": {"path": "windows.txt"},
+      "input": { "path": "windows.txt" },
       "expected": {
         "content_contains": ["line1", "line2", "line3"],
         "details_none": true
@@ -236,9 +253,13 @@
       "name": "read_special_characters",
       "description": "Read file with special characters",
       "setup": [
-        {"type": "create_file", "path": "special.txt", "content": "Tab:\there\nQuotes: \"quoted\"\nBackslash: \\path"}
+        {
+          "type": "create_file",
+          "path": "special.txt",
+          "content": "Tab:\there\nQuotes: \"quoted\"\nBackslash: \\path"
+        }
       ],
-      "input": {"path": "special.txt"},
+      "input": { "path": "special.txt" },
       "expected": {
         "content_contains": ["Tab:\there", "Quotes: \"quoted\"", "Backslash: \\path"],
         "details_none": true
@@ -248,9 +269,13 @@
       "name": "read_long_lines",
       "description": "Read file with very long lines",
       "setup": [
-        {"type": "create_file", "path": "long.txt", "content": "short\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nend"}
+        {
+          "type": "create_file",
+          "path": "long.txt",
+          "content": "short\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nend"
+        }
       ],
-      "input": {"path": "long.txt"},
+      "input": { "path": "long.txt" },
       "expected": {
         "content_contains": ["short", "AAAA", "end"],
         "details_none": true
@@ -259,10 +284,8 @@
     {
       "name": "read_zero_offset",
       "description": "Offset 0 should start from the beginning (equivalent to no offset)",
-      "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3"}
-      ],
-      "input": {"path": "test.txt", "offset": 0},
+      "setup": [{ "type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3" }],
+      "input": { "path": "test.txt", "offset": 0 },
       "expected": {
         "content_exact": "    1\u2192line1\n    2\u2192line2\n    3\u2192line3",
         "details_none": true
@@ -271,10 +294,8 @@
     {
       "name": "read_offset_at_last_line",
       "description": "Offset at the exact last line",
-      "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3"}
-      ],
-      "input": {"path": "test.txt", "offset": 3},
+      "setup": [{ "type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3" }],
+      "input": { "path": "test.txt", "offset": 3 },
       "expected": {
         "content_exact": "    3\u2192line3",
         "details_none": true
@@ -283,10 +304,8 @@
     {
       "name": "read_limit_greater_than_lines",
       "description": "Limit larger than available lines should return all lines",
-      "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3"}
-      ],
-      "input": {"path": "test.txt", "limit": 100},
+      "setup": [{ "type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3" }],
+      "input": { "path": "test.txt", "limit": 100 },
       "expected": {
         "content_exact": "    1\u2192line1\n    2\u2192line2\n    3\u2192line3",
         "details_none": true
@@ -295,10 +314,8 @@
     {
       "name": "read_dotfile",
       "description": "Read hidden dotfile",
-      "setup": [
-        {"type": "create_file", "path": ".hidden", "content": "secret content"}
-      ],
-      "input": {"path": ".hidden"},
+      "setup": [{ "type": "create_file", "path": ".hidden", "content": "secret content" }],
+      "input": { "path": ".hidden" },
       "expected": {
         "content_exact": "    1\u2192secret content",
         "details_none": true
@@ -308,9 +325,13 @@
       "name": "read_json_content",
       "description": "Read file with JSON content",
       "setup": [
-        {"type": "create_file", "path": "data.json", "content": "{\"key\": \"value\", \"num\": 42}"}
+        {
+          "type": "create_file",
+          "path": "data.json",
+          "content": "{\"key\": \"value\", \"num\": 42}"
+        }
       ],
-      "input": {"path": "data.json"},
+      "input": { "path": "data.json" },
       "expected": {
         "content_exact": "    1\u2192{\"key\": \"value\", \"num\": 42}",
         "details_none": true
@@ -320,9 +341,13 @@
       "name": "read_markdown_content",
       "description": "Read file with markdown content",
       "setup": [
-        {"type": "create_file", "path": "readme.md", "content": "# Title\n\n- bullet 1\n- bullet 2\n\n```rust\nfn main() {}\n```"}
+        {
+          "type": "create_file",
+          "path": "readme.md",
+          "content": "# Title\n\n- bullet 1\n- bullet 2\n\n```rust\nfn main() {}\n```"
+        }
       ],
-      "input": {"path": "readme.md"},
+      "input": { "path": "readme.md" },
       "expected": {
         "content_contains": ["# Title", "bullet", "fn main"],
         "details_none": true
@@ -331,10 +356,8 @@
     {
       "name": "read_hashline_format",
       "description": "Hashline mode emits N#AB:content tags",
-      "setup": [
-        {"type": "create_file", "path": "hashline.txt", "content": "alpha\nbeta"}
-      ],
-      "input": {"path": "hashline.txt", "hashline": true},
+      "setup": [{ "type": "create_file", "path": "hashline.txt", "content": "alpha\nbeta" }],
+      "input": { "path": "hashline.txt", "hashline": true },
       "expected": {
         "content_regex": "(?s)^\\s*1#[A-Z]{2}:alpha\\n\\s*2#[A-Z]{2}:beta$",
         "details_none": true
@@ -344,9 +367,9 @@
       "name": "read_hashline_offset_preserves_line_numbers",
       "description": "Hashline mode preserves original line numbers when offset is used",
       "setup": [
-        {"type": "create_file", "path": "hashline_offset.txt", "content": "alpha\nbeta\ngamma"}
+        { "type": "create_file", "path": "hashline_offset.txt", "content": "alpha\nbeta\ngamma" }
       ],
-      "input": {"path": "hashline_offset.txt", "offset": 2, "limit": 1, "hashline": true},
+      "input": { "path": "hashline_offset.txt", "offset": 2, "limit": 1, "hashline": true },
       "expected": {
         "content_regex": "(?s)^\\s*2#[A-Z]{2}:beta\\n\\n\\[1 more lines in file\\. Use offset=3 to continue\\.\\]$",
         "details_none": true

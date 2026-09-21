@@ -8,149 +8,280 @@
       "scenario_id": "agent_mail_unavailable",
       "title": "Agent Mail unavailable keeps degraded coordination explicit but does not invent a collision",
       "faults": ["agent_mail_unavailable"],
-      "request": {"slot_id": "slot-mail-red", "command_class": "cargo_check"},
-      "inputs": {"rch": "healthy", "cargo_headroom": "ok", "scratch_headroom": "ok", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "unavailable"},
+      "request": { "slot_id": "slot-mail-red", "command_class": "cargo_check" },
+      "inputs": {
+        "rch": "healthy",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "ok",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "unavailable"
+      },
       "slot_store": [],
       "policy": {},
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "allow",
         "confidence": "medium",
         "reasons": ["validation_admission_allowed"],
         "required_actions": [],
-        "source_statuses": {"agent_mail": "unavailable"}
+        "source_statuses": { "agent_mail": "unavailable" }
       }
     },
     {
       "scenario_id": "rch_queue_saturated_backoff",
       "title": "Saturated RCH queue backs off when broad-gate narrowing is disabled",
       "faults": ["rch_queue_saturated"],
-      "request": {"slot_id": "slot-rch-saturated", "command_class": "cargo_check"},
-      "inputs": {"rch": "saturated", "cargo_headroom": "ok", "scratch_headroom": "ok", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "available"},
+      "request": { "slot_id": "slot-rch-saturated", "command_class": "cargo_check" },
+      "inputs": {
+        "rch": "saturated",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "ok",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "available"
+      },
       "slot_store": [],
-      "policy": {"allow_narrow_scope": false},
+      "policy": { "allow_narrow_scope": false },
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "wait",
         "confidence": "high",
         "reasons": ["hard_rch_backpressure"],
         "required_actions": ["wait_for_rch_capacity"],
-        "policy": {"rch_saturated": true}
+        "policy": { "rch_saturated": true }
       }
     },
     {
       "scenario_id": "rch_fail_open_local_fallback",
       "title": "RCH fail-open local fallback is denied for required remote gates",
       "faults": ["rch_fail_open_local_fallback"],
-      "request": {"slot_id": "slot-rch-local-fallback", "command_class": "cargo_check"},
-      "inputs": {"rch": "local_fallback", "cargo_headroom": "ok", "scratch_headroom": "ok", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "available"},
+      "request": { "slot_id": "slot-rch-local-fallback", "command_class": "cargo_check" },
+      "inputs": {
+        "rch": "local_fallback",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "ok",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "available"
+      },
       "slot_store": [],
       "policy": {},
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "deny_local_fallback",
         "confidence": "medium",
         "reasons": ["rch_required_but_local_fallback_detected"],
         "required_actions": ["restore_remote_rch_or_run_later_do_not_run_locally"],
-        "source_statuses": {"rch": "degraded"},
-        "policy": {"rch_local_fallback": true}
+        "source_statuses": { "rch": "degraded" },
+        "policy": { "rch_local_fallback": true }
       }
     },
     {
       "scenario_id": "stale_pre_commit_ubs",
       "title": "Stale pre-commit UBS slot recovers instead of duplicating or killing owner work",
       "faults": ["stale_pre_commit_ubs"],
-      "request": {"slot_id": "slot-current-ubs", "command_class": "ubs_staged", "runner": "local_allowed"},
-      "inputs": {"rch": "healthy", "cargo_headroom": "ok", "scratch_headroom": "ok", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "available"},
+      "request": {
+        "slot_id": "slot-current-ubs",
+        "command_class": "ubs_staged",
+        "runner": "local_allowed"
+      },
+      "inputs": {
+        "rch": "healthy",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "ok",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "available"
+      },
       "slot_store": [
-        {"slot_id": "slot-stale-ubs", "state": "active", "equivalence": "matching", "expires_at_utc": "2026-05-14T07:30:00Z"}
+        {
+          "slot_id": "slot-stale-ubs",
+          "state": "active",
+          "equivalence": "matching",
+          "expires_at_utc": "2026-05-14T07:30:00Z"
+        }
       ],
       "policy": {},
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "stale_recover",
         "confidence": "high",
         "reasons": ["equivalent_stale_slot_recoverable:slot-stale-ubs"],
         "required_actions": ["record_stale_recovery_without_killing_other_processes"],
-        "policy": {"stale_equivalent_slots": 1}
+        "policy": { "stale_equivalent_slots": 1 }
       }
     },
     {
       "scenario_id": "stuck_cargo_clippy",
       "title": "Expired cargo clippy slot triggers stale recovery with no duplicate broad gate",
       "faults": ["stuck_cargo_clippy"],
-      "request": {"slot_id": "slot-current-clippy", "command_class": "cargo_clippy"},
-      "inputs": {"rch": "healthy", "cargo_headroom": "ok", "scratch_headroom": "ok", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "available"},
+      "request": { "slot_id": "slot-current-clippy", "command_class": "cargo_clippy" },
+      "inputs": {
+        "rch": "healthy",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "ok",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "available"
+      },
       "slot_store": [
-        {"slot_id": "slot-stuck-clippy", "state": "active", "equivalence": "matching", "expires_at_utc": "2026-05-14T07:30:00Z"}
+        {
+          "slot_id": "slot-stuck-clippy",
+          "state": "active",
+          "equivalence": "matching",
+          "expires_at_utc": "2026-05-14T07:30:00Z"
+        }
       ],
       "policy": {},
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "stale_recover",
         "confidence": "high",
         "reasons": ["equivalent_stale_slot_recoverable:slot-stuck-clippy"],
         "required_actions": ["record_stale_recovery_without_killing_other_processes"],
-        "policy": {"stale_equivalent_slots": 1}
+        "policy": { "stale_equivalent_slots": 1 }
       }
     },
     {
       "scenario_id": "insufficient_tmpdir_narrow",
       "title": "Insufficient TMPDIR headroom narrows a broad validation gate",
       "faults": ["insufficient_tmpdir"],
-      "request": {"slot_id": "slot-low-tmpdir", "command_class": "cargo_check"},
-      "inputs": {"rch": "healthy", "cargo_headroom": "ok", "scratch_headroom": "low", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "available"},
+      "request": { "slot_id": "slot-low-tmpdir", "command_class": "cargo_check" },
+      "inputs": {
+        "rch": "healthy",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "low",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "available"
+      },
       "slot_store": [],
       "policy": {},
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "narrow",
         "confidence": "high",
         "reasons": ["broad_gate_has_insufficient_target_or_tmp_headroom"],
         "required_actions": ["narrow_to_package_test_or_non_compile_gate"],
-        "policy": {"low_scratch_headroom": true}
+        "policy": { "low_scratch_headroom": true }
       }
     },
     {
       "scenario_id": "target_dir_collision_reuse_refused",
       "title": "Reusable artifact from a different target dir is refused when reuse is required",
       "faults": ["target_dir_collision", "reusable_provenance_mismatch"],
-      "request": {"slot_id": "slot-current-target", "command_class": "cargo_check"},
-      "inputs": {"rch": "healthy", "cargo_headroom": "ok", "scratch_headroom": "ok", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "available"},
+      "request": { "slot_id": "slot-current-target", "command_class": "cargo_check" },
+      "inputs": {
+        "rch": "healthy",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "ok",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "available"
+      },
       "slot_store": [
-        {"slot_id": "slot-target-collision", "state": "reusable", "equivalence": "target_dir_mismatch", "expires_at_utc": "2026-05-14T09:00:00Z"}
+        {
+          "slot_id": "slot-target-collision",
+          "state": "reusable",
+          "equivalence": "target_dir_mismatch",
+          "expires_at_utc": "2026-05-14T09:00:00Z"
+        }
       ],
-      "policy": {"reuse_required": true},
+      "policy": { "reuse_required": true },
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "degraded_block",
         "confidence": "high",
         "reasons": ["reuse_required_but_no_valid_reusable_slot"],
         "required_actions": ["run_required_gate_or_wait_for_matching_artifact"],
-        "policy": {"reusable_equivalent_slots": 0, "reuse_required": true},
+        "policy": { "reusable_equivalent_slots": 0, "reuse_required": true },
         "rejected_reusable_slots": [
-          {"slot_id": "slot-target-collision", "reasons": ["target_dir_mismatch"]}
+          { "slot_id": "slot-target-collision", "reasons": ["target_dir_mismatch"] }
         ]
       }
     },
@@ -158,37 +289,79 @@
       "scenario_id": "duplicate_broad_gate_wait",
       "title": "Duplicate equivalent broad gate waits for the active slot",
       "faults": ["duplicate_broad_gate_request"],
-      "request": {"slot_id": "slot-current-duplicate", "command_class": "cargo_check"},
-      "inputs": {"rch": "healthy", "cargo_headroom": "ok", "scratch_headroom": "ok", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "available"},
+      "request": { "slot_id": "slot-current-duplicate", "command_class": "cargo_check" },
+      "inputs": {
+        "rch": "healthy",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "ok",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "available"
+      },
       "slot_store": [
-        {"slot_id": "slot-active-duplicate", "state": "active", "equivalence": "matching", "expires_at_utc": "2026-05-14T09:00:00Z"}
+        {
+          "slot_id": "slot-active-duplicate",
+          "state": "active",
+          "equivalence": "matching",
+          "expires_at_utc": "2026-05-14T09:00:00Z"
+        }
       ],
       "policy": {},
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "wait",
         "confidence": "high",
         "reasons": ["equivalent_active_slot_in_flight:slot-active-duplicate"],
         "required_actions": ["wait_for_equivalent_validation_result"],
-        "policy": {"active_equivalent_slots": 1}
+        "policy": { "active_equivalent_slots": 1 }
       }
     },
     {
       "scenario_id": "reusable_equivalent_coalesce",
       "title": "Fresh equivalent reusable slot coalesces with carried artifacts",
       "faults": ["equivalent_reusable_artifact"],
-      "request": {"slot_id": "slot-current-reusable", "command_class": "cargo_check"},
-      "inputs": {"rch": "healthy", "cargo_headroom": "ok", "scratch_headroom": "ok", "doctor": "ok", "git": "clean", "beads": "none", "agent_mail": "available"},
+      "request": { "slot_id": "slot-current-reusable", "command_class": "cargo_check" },
+      "inputs": {
+        "rch": "healthy",
+        "cargo_headroom": "ok",
+        "scratch_headroom": "ok",
+        "doctor": "ok",
+        "git": "clean",
+        "beads": "none",
+        "agent_mail": "available"
+      },
       "slot_store": [
-        {"slot_id": "slot-reusable-equivalent", "state": "reusable", "equivalence": "matching", "expires_at_utc": "2026-05-14T09:00:00Z"}
+        {
+          "slot_id": "slot-reusable-equivalent",
+          "state": "reusable",
+          "equivalence": "matching",
+          "expires_at_utc": "2026-05-14T09:00:00Z"
+        }
       ],
       "policy": {},
       "artifact_manifest": [
-        {"path": "tests/golden_corpus/validation_broker/fault_corpus.json", "artifact_schema": "pi.validation_broker.fault_corpus.v1", "evidence_kind": "corpus_manifest"},
-        {"path": "tests/golden_corpus/validation_broker/fault_events.jsonl", "artifact_schema": "pi.validation_broker.fault_event.v1", "evidence_kind": "event_log"}
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_corpus.json",
+          "artifact_schema": "pi.validation_broker.fault_corpus.v1",
+          "evidence_kind": "corpus_manifest"
+        },
+        {
+          "path": "tests/golden_corpus/validation_broker/fault_events.jsonl",
+          "artifact_schema": "pi.validation_broker.fault_event.v1",
+          "evidence_kind": "event_log"
+        }
       ],
       "expected": {
         "decision": "coalesce",
@@ -197,7 +370,7 @@
         "required_actions": [],
         "reusable_slot": "slot-reusable-equivalent",
         "coalesced_artifacts": 1,
-        "policy": {"reusable_equivalent_slots": 1}
+        "policy": { "reusable_equivalent_slots": 1 }
       }
     }
   ]

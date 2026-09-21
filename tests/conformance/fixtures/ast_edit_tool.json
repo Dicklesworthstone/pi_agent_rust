@@ -6,9 +6,7 @@
     {
       "name": "ast_edit_stage_preview_diff",
       "description": "Stage returns a proposal id, replacement count, and exact per-file diff preview without writing",
-      "requirement_ids": [
-        "AST-5"
-      ],
+      "requirement_ids": ["AST-5"],
       "setup": [
         {
           "type": "create_dir",
@@ -45,10 +43,7 @@
     {
       "name": "ast_edit_metavar_identity_rewrite",
       "description": "Rewrite with a repeated metavariable only rewrites identical-code matches",
-      "requirement_ids": [
-        "AST-2",
-        "AST-5"
-      ],
+      "requirement_ids": ["AST-2", "AST-5"],
       "setup": [
         {
           "type": "create_file",
@@ -71,17 +66,13 @@
           "-    let _ = value == value;",
           "+    let _ = value.eq(&value);"
         ],
-        "content_not_contains": [
-          "left.eq(&right)"
-        ]
+        "content_not_contains": ["left.eq(&right)"]
       }
     },
     {
       "name": "ast_edit_empty_out_deletes_node",
       "description": "Empty out deletes the matched node (preview)",
-      "requirement_ids": [
-        "AST-5"
-      ],
+      "requirement_ids": ["AST-5"],
       "setup": [
         {
           "type": "create_file",
@@ -99,19 +90,13 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "\"replacements\": 1",
-          "-  console.log(\\\"debug\\\");"
-        ]
+        "content_contains": ["\"replacements\": 1", "-  console.log(\\\"debug\\\");"]
       }
     },
     {
       "name": "ast_edit_comment_only_match_stages_nothing",
       "description": "Planted negative for rewrite: unwrap() appearing only in a comment stages no proposal",
-      "requirement_ids": [
-        "AST-1",
-        "AST-5"
-      ],
+      "requirement_ids": ["AST-1", "AST-5"],
       "setup": [
         {
           "type": "create_file",
@@ -129,19 +114,13 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "\"staged\": false",
-          "\"replacements\": 0",
-          "nothing staged"
-        ]
+        "content_contains": ["\"staged\": false", "\"replacements\": 0", "nothing staged"]
       }
     },
     {
       "name": "ast_edit_malformed_pattern_named_error",
       "description": "Non-single-node pattern returns a named AST_PATTERN_PARSE error, never a partial apply",
-      "requirement_ids": [
-        "AST-4"
-      ],
+      "requirement_ids": ["AST-4"],
       "setup": [
         {
           "type": "create_file",
@@ -165,9 +144,7 @@
     {
       "name": "ast_edit_malformed_replacement_named_error",
       "description": "Non-single-node replacement (two statements) returns a named AST_PATTERN_PARSE error",
-      "requirement_ids": [
-        "AST-4"
-      ],
+      "requirement_ids": ["AST-4"],
       "setup": [
         {
           "type": "create_file",
@@ -191,9 +168,7 @@
     {
       "name": "ast_edit_unparseable_pattern_named_error",
       "description": "Syntactically broken pattern returns a named AST_PATTERN_PARSE error",
-      "requirement_ids": [
-        "AST-4"
-      ],
+      "requirement_ids": ["AST-4"],
       "setup": [
         {
           "type": "create_file",
@@ -218,9 +193,7 @@
     {
       "name": "ast_edit_unknown_lang_rejected",
       "description": "Unknown lang override is a validation error",
-      "requirement_ids": [
-        "AST-5"
-      ],
+      "requirement_ids": ["AST-5"],
       "setup": [
         {
           "type": "create_file",
@@ -245,9 +218,7 @@
     {
       "name": "ast_edit_unknown_proposal_resolve",
       "description": "Resolving an unknown proposal id fails with AST_PROPOSAL_UNKNOWN",
-      "requirement_ids": [
-        "AST-6"
-      ],
+      "requirement_ids": ["AST-6"],
       "input": {
         "action": "resolve",
         "proposalId": "ast-does-not-exist",
@@ -260,9 +231,7 @@
     {
       "name": "ast_edit_resolve_requires_reason",
       "description": "Resolve without a one-line reason fails with AST_REASON_REQUIRED",
-      "requirement_ids": [
-        "AST-6"
-      ],
+      "requirement_ids": ["AST-6"],
       "input": {
         "action": "resolve",
         "proposalId": "ast-x"

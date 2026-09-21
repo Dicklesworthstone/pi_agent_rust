@@ -10,9 +10,7 @@
         "command": "echo 'Hello, World!'"
       },
       "expected": {
-        "content_contains": [
-          "Hello, World!"
-        ],
+        "content_contains": ["Hello, World!"],
         "details_none": true
       }
     },
@@ -34,9 +32,7 @@
         "command": "exit 42"
       },
       "expected": {
-        "content_contains": [
-          "exited with code 42"
-        ]
+        "content_contains": ["exited with code 42"]
       }
     },
     {
@@ -46,11 +42,7 @@
         "command": "echo 'line1'; echo 'line2'; echo 'line3'"
       },
       "expected": {
-        "content_contains": [
-          "line1",
-          "line2",
-          "line3"
-        ],
+        "content_contains": ["line1", "line2", "line3"],
         "details_none": true
       }
     },
@@ -61,9 +53,7 @@
         "command": "echo 'error' >&2"
       },
       "expected": {
-        "content_contains": [
-          "error"
-        ],
+        "content_contains": ["error"],
         "details_none": true
       }
     },
@@ -74,10 +64,7 @@
         "command": "echo 'stdout'; echo 'stderr' >&2"
       },
       "expected": {
-        "content_contains": [
-          "stdout",
-          "stderr"
-        ],
+        "content_contains": ["stdout", "stderr"],
         "details_none": true
       }
     },
@@ -88,10 +75,7 @@
         "command": "echo 'hello world' | tr ' ' '\\n'"
       },
       "expected": {
-        "content_contains": [
-          "hello",
-          "world"
-        ],
+        "content_contains": ["hello", "world"],
         "details_none": true
       }
     },
@@ -102,9 +86,7 @@
         "command": "echo $(echo nested)"
       },
       "expected": {
-        "content_contains": [
-          "nested"
-        ],
+        "content_contains": ["nested"],
         "details_none": true
       }
     },
@@ -126,9 +108,7 @@
         "command": "exit 1"
       },
       "expected": {
-        "content_contains": [
-          "exited with code 1"
-        ]
+        "content_contains": ["exited with code 1"]
       }
     },
     {
@@ -138,9 +118,7 @@
         "command": "false"
       },
       "expected": {
-        "content_contains": [
-          "exited with code 1"
-        ]
+        "content_contains": ["exited with code 1"]
       }
     },
     {
@@ -150,9 +128,7 @@
         "command": "exit 255"
       },
       "expected": {
-        "content_contains": [
-          "exited with code 255"
-        ]
+        "content_contains": ["exited with code 255"]
       }
     },
     {
@@ -162,9 +138,7 @@
         "command": "nonexistent_command_xyz123"
       },
       "expected": {
-        "content_contains": [
-          "not found"
-        ]
+        "content_contains": ["not found"]
       }
     },
     {
@@ -174,9 +148,7 @@
         "command": "echo 'hello $HOME world'"
       },
       "expected": {
-        "content_contains": [
-          "hello $HOME world"
-        ],
+        "content_contains": ["hello $HOME world"],
         "details_none": true
       }
     },
@@ -198,11 +170,7 @@
         "command": "echo '\u4e16\u754c \ud83c\udf89 \u3053\u3093\u306b\u3061\u306f'"
       },
       "expected": {
-        "content_contains": [
-          "\u4e16\u754c",
-          "\ud83c\udf89",
-          "\u3053\u3093\u306b\u3061\u306f"
-        ],
+        "content_contains": ["\u4e16\u754c", "\ud83c\udf89", "\u3053\u3093\u306b\u3061\u306f"],
         "details_none": true
       }
     },
@@ -213,9 +181,7 @@
         "command": "echo 'a\\nb'"
       },
       "expected": {
-        "content_contains": [
-          "a\\nb"
-        ],
+        "content_contains": ["a\\nb"],
         "details_none": true
       }
     },
@@ -226,9 +192,7 @@
         "command": "echo -e 'a\\tb'"
       },
       "expected": {
-        "content_contains": [
-          "a\tb"
-        ],
+        "content_contains": ["a\tb"],
         "details_none": true
       }
     },
@@ -239,9 +203,7 @@
         "command": "echo $((2 + 3 * 4))"
       },
       "expected": {
-        "content_contains": [
-          "14"
-        ],
+        "content_contains": ["14"],
         "details_none": true
       }
     },
@@ -252,10 +214,7 @@
         "command": "cat << 'EOF'\nhello\nworld\nEOF"
       },
       "expected": {
-        "content_contains": [
-          "hello",
-          "world"
-        ],
+        "content_contains": ["hello", "world"],
         "details_none": true
       }
     },
@@ -266,9 +225,7 @@
         "command": "true && echo success"
       },
       "expected": {
-        "content_contains": [
-          "success"
-        ],
+        "content_contains": ["success"],
         "details_none": true
       }
     },
@@ -287,9 +244,7 @@
         "command": "false || echo fallback"
       },
       "expected": {
-        "content_contains": [
-          "fallback"
-        ],
+        "content_contains": ["fallback"],
         "details_none": true
       }
     },
@@ -300,9 +255,7 @@
         "command": "false; echo continued"
       },
       "expected": {
-        "content_contains": [
-          "continued"
-        ],
+        "content_contains": ["continued"],
         "details_none": true
       }
     },
@@ -325,10 +278,7 @@
         "command": "ls *.txt"
       },
       "expected": {
-        "content_contains": [
-          "test1.txt",
-          "test2.txt"
-        ],
+        "content_contains": ["test1.txt", "test2.txt"],
         "details_none": true
       }
     },
@@ -339,11 +289,7 @@
         "command": "for i in 1 2 3; do echo $i; done"
       },
       "expected": {
-        "content_contains": [
-          "1",
-          "2",
-          "3"
-        ],
+        "content_contains": ["1", "2", "3"],
         "details_none": true
       }
     },
@@ -354,9 +300,7 @@
         "command": "if true; then echo yes; else echo no; fi"
       },
       "expected": {
-        "content_contains": [
-          "yes"
-        ],
+        "content_contains": ["yes"],
         "details_none": true
       }
     },
@@ -389,9 +333,7 @@
         "command": "echo -e 'line1\\nline2\\nline3' | head -1"
       },
       "expected": {
-        "content_contains": [
-          "line1"
-        ],
+        "content_contains": ["line1"],
         "details_none": true
       }
     },
@@ -402,9 +344,7 @@
         "command": "echo -e 'line1\\nline2\\nline3' | tail -1"
       },
       "expected": {
-        "content_contains": [
-          "line3"
-        ],
+        "content_contains": ["line3"],
         "details_none": true
       }
     },
@@ -426,11 +366,7 @@
         "command": "echo -e 'c\\na\\nb' | sort"
       },
       "expected": {
-        "content_contains": [
-          "a",
-          "b",
-          "c"
-        ],
+        "content_contains": ["a", "b", "c"],
         "details_none": true
       }
     },
@@ -441,10 +377,7 @@
         "command": "echo -e 'a\\na\\nb' | uniq"
       },
       "expected": {
-        "content_contains": [
-          "a",
-          "b"
-        ],
+        "content_contains": ["a", "b"],
         "details_none": true
       }
     }

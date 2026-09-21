@@ -11,11 +11,7 @@
       "kind": "registration",
       "summary": "Validates command and event hook registrations",
       "expect": {
-        "event_hooks_contains": [
-          "session_start",
-          "agent_end",
-          "tool_call"
-        ]
+        "event_hooks_contains": ["session_start", "agent_end", "tool_call"]
       }
     },
     {

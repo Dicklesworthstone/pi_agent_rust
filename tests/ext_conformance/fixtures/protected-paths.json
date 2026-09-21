@@ -45,12 +45,8 @@
       "steps": [],
       "expect": {
         "block": true,
-        "reason_contains": [
-          "protected"
-        ],
-        "ui_notify_contains": [
-          "Blocked write to protected path"
-        ],
+        "reason_contains": ["protected"],
+        "ui_notify_contains": ["Blocked write to protected path"],
         "no_error": true
       },
       "outputs": {

@@ -11,11 +11,7 @@
       "kind": "registration",
       "summary": "Verifies event hooks registered for prateekmedia-checkpoint",
       "expect": {
-        "event_hooks_contains": [
-          "session_start",
-          "session_switch",
-          "turn_start"
-        ]
+        "event_hooks_contains": ["session_start", "session_switch", "turn_start"]
       }
     },
     {

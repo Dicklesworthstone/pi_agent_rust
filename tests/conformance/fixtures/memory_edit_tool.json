@@ -6,9 +6,7 @@
     {
       "name": "memory_edit_updates_seeded_memory",
       "description": "update replaces the seeded row and returns the versioned edit envelope",
-      "requirement_ids": [
-        "MEM-EDIT-1"
-      ],
+      "requirement_ids": ["MEM-EDIT-1"],
       "setup": [
         {
           "type": "retain_memory",
@@ -33,9 +31,7 @@
     {
       "name": "memory_edit_update_requires_content",
       "description": "update returns a tool error when the replacement content is missing",
-      "requirement_ids": [
-        "MEM-EDIT-2"
-      ],
+      "requirement_ids": ["MEM-EDIT-2"],
       "setup": [
         {
           "type": "retain_memory",
@@ -54,20 +50,14 @@
     {
       "name": "memory_edit_names_unknown_id",
       "description": "an absent id returns the stable PI_MEMORY_UNKNOWN_ID taxonomy",
-      "requirement_ids": [
-        "MEM-EDIT-ERR-1"
-      ],
+      "requirement_ids": ["MEM-EDIT-ERR-1"],
       "input": {
         "id": 999,
         "op": "invalidate"
       },
       "expected": {
-        "content_contains": [
-          "PI_MEMORY_UNKNOWN_ID: no memory with id 999"
-        ],
-        "details_contains": [
-          "PI_MEMORY_UNKNOWN_ID: no memory with id 999"
-        ]
+        "content_contains": ["PI_MEMORY_UNKNOWN_ID: no memory with id 999"],
+        "details_contains": ["PI_MEMORY_UNKNOWN_ID: no memory with id 999"]
       }
     }
   ]

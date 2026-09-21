@@ -6,9 +6,7 @@
     {
       "name": "hub_ps_returns_supervisor_registry",
       "description": "ps returns the versioned service registry whether it is empty or populated by another case in the process",
-      "requirement_ids": [
-        "HUB-PS-1"
-      ],
+      "requirement_ids": ["HUB-PS-1"],
       "input": {
         "op": "ps"
       },
@@ -22,28 +20,20 @@
     {
       "name": "hub_start_requires_application",
       "description": "start refuses a named service without an executable before mutating supervisor state",
-      "requirement_ids": [
-        "HUB-START-1"
-      ],
+      "requirement_ids": ["HUB-START-1"],
       "input": {
         "op": "start",
         "name": "fixture-service"
       },
       "expected": {
-        "content_contains": [
-          "hub start requires application"
-        ],
-        "details_contains": [
-          "hub start requires application"
-        ]
+        "content_contains": ["hub start requires application"],
+        "details_contains": ["hub start requires application"]
       }
     },
     {
       "name": "hub_rejects_unknown_operation",
       "description": "unknown operations return the complete accepted operation set as a readable tool error",
-      "requirement_ids": [
-        "HUB-ERR-1"
-      ],
+      "requirement_ids": ["HUB-ERR-1"],
       "input": {
         "op": "attach"
       },
@@ -52,9 +42,7 @@
           "Unknown hub op 'attach'",
           "start, ps, logs, stop, restart, describe, send, jobs, or agent"
         ],
-        "details_contains": [
-          "Unknown hub op 'attach'"
-        ]
+        "details_contains": ["Unknown hub op 'attach'"]
       }
     }
   ]

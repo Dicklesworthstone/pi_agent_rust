@@ -6,9 +6,7 @@
     {
       "name": "github_pr_view_formats_canned_gh_json",
       "description": "the real gh argument path parses canned structured output into the agent-facing pull-request card",
-      "requirement_ids": [
-        "GITHUB-PR-1"
-      ],
+      "requirement_ids": ["GITHUB-PR-1"],
       "setup": [
         {
           "type": "create_file",
@@ -37,9 +35,7 @@
     {
       "name": "github_rejects_invalid_repository_shape",
       "description": "an explicit repository must be owner/name before any gh process starts",
-      "requirement_ids": [
-        "GITHUB-REPO-1"
-      ],
+      "requirement_ids": ["GITHUB-REPO-1"],
       "input": {
         "op": "pr_view",
         "number": 5,
@@ -52,9 +48,7 @@
     {
       "name": "github_names_malformed_gh_json",
       "description": "successful gh execution with malformed JSON fails with the stable GH_PARSE taxonomy",
-      "requirement_ids": [
-        "GITHUB-ERR-1"
-      ],
+      "requirement_ids": ["GITHUB-ERR-1"],
       "setup": [
         {
           "type": "create_file",

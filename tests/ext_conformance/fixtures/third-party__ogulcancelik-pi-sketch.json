@@ -11,13 +11,8 @@
       "kind": "registration",
       "summary": "Verifies sketch command, event hooks registered for ogulcancelik-pi-sketch",
       "expect": {
-        "commands_contains": [
-          "sketch"
-        ],
-        "event_hooks_contains": [
-          "data",
-          "end"
-        ]
+        "commands_contains": ["sketch"],
+        "event_hooks_contains": ["data", "end"]
       }
     },
     {

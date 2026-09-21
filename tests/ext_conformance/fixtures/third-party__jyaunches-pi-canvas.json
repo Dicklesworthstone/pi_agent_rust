@@ -12,12 +12,8 @@
       "summary": "Verifies 3 tool(s), calendar command, event hooks registered for jyaunches-pi-canvas",
       "expect": {
         "tool_count": 3,
-        "commands_contains": [
-          "calendar"
-        ],
-        "event_hooks_contains": [
-          "session_start"
-        ]
+        "commands_contains": ["calendar"],
+        "event_hooks_contains": ["session_start"]
       }
     },
     {

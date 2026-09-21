@@ -34,15 +34,9 @@
       "steps": [],
       "expect": {
         "returns_contains": {
-          "promptPaths": [
-            "dynamic.md"
-          ],
-          "skillPaths": [
-            "SKILL.md"
-          ],
-          "themePaths": [
-            "dynamic.json"
-          ]
+          "promptPaths": ["dynamic.md"],
+          "skillPaths": ["SKILL.md"],
+          "themePaths": ["dynamic.json"]
         },
         "no_error": true
       },

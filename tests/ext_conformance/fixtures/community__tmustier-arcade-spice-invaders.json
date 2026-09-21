@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies spice-invaders command registered for tmustier-arcade-spice-invaders",
       "expect": {
-        "commands_contains": [
-          "spice-invaders"
-        ]
+        "commands_contains": ["spice-invaders"]
       }
     },
     {

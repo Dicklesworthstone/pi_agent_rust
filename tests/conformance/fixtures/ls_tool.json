@@ -7,8 +7,8 @@
       "name": "ls_directory",
       "description": "List directory contents",
       "setup": [
-        {"type": "create_file", "path": "file.txt", "content": "content"},
-        {"type": "create_dir", "path": "subdir"}
+        { "type": "create_file", "path": "file.txt", "content": "content" },
+        { "type": "create_dir", "path": "subdir" }
       ],
       "input": {},
       "expected": {
@@ -28,7 +28,7 @@
     {
       "name": "ls_nonexistent_directory",
       "description": "List nonexistent directory errors",
-      "input": {"path": "/nonexistent/directory"},
+      "input": { "path": "/nonexistent/directory" },
       "expect_error": true,
       "error_contains": "Cannot list outside the working directory",
       "expected": {}
@@ -36,10 +36,8 @@
     {
       "name": "ls_file_not_directory",
       "description": "List a file (not directory) errors",
-      "setup": [
-        {"type": "create_file", "path": "file.txt", "content": "content"}
-      ],
-      "input": {"path": "file.txt"},
+      "setup": [{ "type": "create_file", "path": "file.txt", "content": "content" }],
+      "input": { "path": "file.txt" },
       "expect_error": true,
       "error_contains": "Not a directory",
       "expected": {}
@@ -48,8 +46,8 @@
       "name": "ls_shows_files_and_dirs",
       "description": "Output shows files and directories correctly",
       "setup": [
-        {"type": "create_file", "path": "small.txt", "content": "x"},
-        {"type": "create_dir", "path": "mydir"}
+        { "type": "create_file", "path": "small.txt", "content": "x" },
+        { "type": "create_dir", "path": "mydir" }
       ],
       "input": {},
       "expected": {
@@ -61,8 +59,8 @@
       "name": "ls_directories_have_trailing_slash",
       "description": "Directories are marked with trailing slash",
       "setup": [
-        {"type": "create_file", "path": "zfile.txt", "content": ""},
-        {"type": "create_dir", "path": "adir"}
+        { "type": "create_file", "path": "zfile.txt", "content": "" },
+        { "type": "create_dir", "path": "adir" }
       ],
       "input": {},
       "expected": {
@@ -74,11 +72,11 @@
       "name": "ls_with_limit",
       "description": "Respects limit parameter",
       "setup": [
-        {"type": "create_file", "path": "a.txt", "content": ""},
-        {"type": "create_file", "path": "b.txt", "content": ""},
-        {"type": "create_file", "path": "c.txt", "content": ""}
+        { "type": "create_file", "path": "a.txt", "content": "" },
+        { "type": "create_file", "path": "b.txt", "content": "" },
+        { "type": "create_file", "path": "c.txt", "content": "" }
       ],
-      "input": {"limit": 2},
+      "input": { "limit": 2 },
       "expected": {
         "content_contains": ["limit reached"],
         "details_exact": {
@@ -90,8 +88,8 @@
       "name": "ls_case_insensitive_sort",
       "description": "Sorting is case-insensitive",
       "setup": [
-        {"type": "create_file", "path": "Zebra.txt", "content": ""},
-        {"type": "create_file", "path": "apple.txt", "content": ""}
+        { "type": "create_file", "path": "Zebra.txt", "content": "" },
+        { "type": "create_file", "path": "apple.txt", "content": "" }
       ],
       "input": {},
       "expected": {
@@ -103,10 +101,10 @@
       "name": "ls_mixed_entries_matches_golden",
       "description": "Mixed files, directories, and dotfiles match the committed golden listing",
       "setup": [
-        {"type": "create_file", "path": ".env", "content": ""},
-        {"type": "create_dir", "path": "Beta"},
-        {"type": "create_dir", "path": "alpha"},
-        {"type": "create_file", "path": "Readme.md", "content": ""}
+        { "type": "create_file", "path": ".env", "content": "" },
+        { "type": "create_dir", "path": "Beta" },
+        { "type": "create_dir", "path": "alpha" },
+        { "type": "create_file", "path": "Readme.md", "content": "" }
       ],
       "input": {},
       "expected": {
@@ -118,11 +116,11 @@
       "name": "ls_limit_notice_matches_goldens",
       "description": "Limit notices and details stay locked to committed goldens",
       "setup": [
-        {"type": "create_file", "path": "a.txt", "content": ""},
-        {"type": "create_file", "path": "b.txt", "content": ""},
-        {"type": "create_file", "path": "c.txt", "content": ""}
+        { "type": "create_file", "path": "a.txt", "content": "" },
+        { "type": "create_file", "path": "b.txt", "content": "" },
+        { "type": "create_file", "path": "c.txt", "content": "" }
       ],
-      "input": {"limit": 2},
+      "input": { "limit": 2 },
       "expected": {
         "content_golden": "ls_tool/limit_notice.txt",
         "details_golden": "ls_tool/limit_details.json"
@@ -131,7 +129,7 @@
     {
       "name": "ls_outside_cwd",
       "description": "Listing outside the working directory should be rejected",
-      "input": {"path": "../"},
+      "input": { "path": "../" },
       "expect_error": true,
       "error_contains": "Cannot list outside the working directory",
       "expected": {}

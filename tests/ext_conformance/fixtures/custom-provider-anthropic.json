@@ -35,10 +35,7 @@
       "expect": {
         "api": "custom-anthropic-api",
         "api_key_env": "CUSTOM_ANTHROPIC_API_KEY",
-        "models_contains": [
-          "claude-opus-4-5",
-          "claude-sonnet-4-5"
-        ],
+        "models_contains": ["claude-opus-4-5", "claude-sonnet-4-5"],
         "no_error": true
       },
       "outputs": {

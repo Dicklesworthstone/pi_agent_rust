@@ -12,14 +12,8 @@
       "summary": "Verifies 1 tool(s), subagent command, event hooks registered for charles-cooper-pi-extensions",
       "expect": {
         "tool_count": 1,
-        "commands_contains": [
-          "subagent"
-        ],
-        "event_hooks_contains": [
-          "before_agent_start",
-          "model_select",
-          "session_start"
-        ]
+        "commands_contains": ["subagent"],
+        "event_hooks_contains": ["before_agent_start", "model_select", "session_start"]
       }
     },
     {

@@ -6,9 +6,7 @@
     {
       "name": "subagent_single_runs_the_fixture_child_protocol",
       "description": "a discovered project agent executes the stub child and returns the real v2 result envelope",
-      "requirement_ids": [
-        "SUBAGENT-V2-SINGLE-1"
-      ],
+      "requirement_ids": ["SUBAGENT-V2-SINGLE-1"],
       "setup": [
         {
           "type": "create_file",
@@ -30,10 +28,7 @@
         "task": "inspect the fixture"
       },
       "expected": {
-        "content_contains": [
-          "## scout",
-          "fixture child result"
-        ],
+        "content_contains": ["## scout", "fixture child result"],
         "details": {
           "schema": "pi.subagent.result.v2",
           "mode": "single",
@@ -52,9 +47,7 @@
     {
       "name": "subagent_parallel_preserves_task_result_order",
       "description": "two bounded parallel tasks settle through the same hermetic child while the returned array preserves request order",
-      "requirement_ids": [
-        "SUBAGENT-V2-PARALLEL-1"
-      ],
+      "requirement_ids": ["SUBAGENT-V2-PARALLEL-1"],
       "setup": [
         {
           "type": "create_file",
@@ -85,9 +78,7 @@
         "concurrency": 2
       },
       "expected": {
-        "content_contains": [
-          "fixture child result"
-        ],
+        "content_contains": ["fixture child result"],
         "details": {
           "mode": "parallel",
           "results": [
@@ -106,9 +97,7 @@
     {
       "name": "subagent_rejects_multiple_request_modes",
       "description": "single and parallel forms are mutually exclusive and fail before discovery or child execution",
-      "requirement_ids": [
-        "SUBAGENT-V2-ERR-1"
-      ],
+      "requirement_ids": ["SUBAGENT-V2-ERR-1"],
       "input": {
         "agent": "scout",
         "task": "single",

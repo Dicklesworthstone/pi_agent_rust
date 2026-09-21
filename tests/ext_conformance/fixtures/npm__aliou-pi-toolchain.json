@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Validates aliou-pi-toolchain registers event hooks",
       "expect": {
-        "event_hooks_contains": [
-          "tool_call"
-        ]
+        "event_hooks_contains": ["tool_call"]
       }
     },
     {

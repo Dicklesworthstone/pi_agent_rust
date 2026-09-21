@@ -35,9 +35,7 @@
       "setup": null,
       "steps": [],
       "expect": {
-        "content_contains": [
-          "Invalid parameters. Provide exactly one mode."
-        ]
+        "content_contains": ["Invalid parameters. Provide exactly one mode."]
       },
       "outputs": {
         "stdout_normalized_jsonl": [

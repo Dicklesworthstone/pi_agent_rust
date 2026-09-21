@@ -16,9 +16,7 @@
         "arguments": ""
       },
       "expect": {
-        "content_contains": [
-          "pong"
-        ]
+        "content_contains": ["pong"]
       }
     },
     {

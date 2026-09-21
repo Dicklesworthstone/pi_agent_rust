@@ -11,13 +11,8 @@
   },
   "merge_policy": {
     "description": "Cross-platform merge policy for pi_agent_rust CI",
-    "required_platforms": [
-      "linux"
-    ],
-    "informational_platforms": [
-      "macos",
-      "windows"
-    ],
+    "required_platforms": ["linux"],
+    "informational_platforms": ["macos", "windows"],
     "rules": [
       {
         "blocking": true,

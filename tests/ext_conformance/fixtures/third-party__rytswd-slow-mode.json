@@ -11,12 +11,8 @@
       "kind": "registration",
       "summary": "Verifies slow-mode command, event hooks registered for rytswd-slow-mode",
       "expect": {
-        "commands_contains": [
-          "slow-mode"
-        ],
-        "event_hooks_contains": [
-          "tool_call"
-        ]
+        "commands_contains": ["slow-mode"],
+        "event_hooks_contains": ["tool_call"]
       }
     },
     {

@@ -5,61 +5,369 @@
   "canonicalization": {
     "object_keys": "sorted_recursively",
     "arrays": "order_preserved",
-    "volatile_fields": [
-      "timestamp",
-      "durationMs",
-      "sessionFile",
-      "pid"
-    ]
+    "volatile_fields": ["timestamp", "durationMs", "sessionFile", "pid"]
   },
   "commands": [
-    { "id": "cmd-prompt-basic", "command": "prompt", "input": { "id": "cmd-prompt-basic", "type": "prompt", "message": "hello" }, "expect": { "type": "response", "command": "prompt", "success": true } },
-    { "id": "cmd-steer-basic", "command": "steer", "input": { "id": "cmd-steer-basic", "type": "steer", "message": "adjust" }, "expect": { "type": "response", "command": "steer" } },
-    { "id": "cmd-follow-up-basic", "command": "follow_up", "input": { "id": "cmd-follow-up-basic", "type": "follow_up", "message": "next" }, "expect": { "type": "response", "command": "follow_up" } },
-    { "id": "cmd-abort-basic", "command": "abort", "input": { "id": "cmd-abort-basic", "type": "abort" }, "expect": { "type": "response", "command": "abort", "success": true } },
-    { "id": "cmd-new-session-basic", "command": "new_session", "input": { "id": "cmd-new-session-basic", "type": "new_session" }, "expect": { "type": "response", "command": "new_session", "success": true } },
-    { "id": "cmd-switch-session-missing", "command": "switch_session", "input": { "id": "cmd-switch-session-missing", "type": "switch_session" }, "expect": { "type": "response", "command": "switch_session", "success": false, "error": "Missing sessionId" } },
-    { "id": "cmd-set-session-name-basic", "command": "set_session_name", "input": { "id": "cmd-set-session-name-basic", "type": "set_session_name", "name": "G05" }, "expect": { "type": "response", "command": "set_session_name", "success": true } },
-    { "id": "cmd-export-html-basic", "command": "export_html", "input": { "id": "cmd-export-html-basic", "type": "export_html" }, "expect": { "type": "response", "command": "export_html", "success": true } },
-    { "id": "cmd-compact-basic", "command": "compact", "input": { "id": "cmd-compact-basic", "type": "compact", "instructions": "summarize" }, "expect": { "type": "response", "command": "compact" } },
-    { "id": "cmd-fork-missing", "command": "fork", "input": { "id": "cmd-fork-missing", "type": "fork" }, "expect": { "type": "response", "command": "fork", "success": false, "error": "Missing messageId" } },
-    { "id": "cmd-get-fork-messages-basic", "command": "get_fork_messages", "input": { "id": "cmd-get-fork-messages-basic", "type": "get_fork_messages" }, "expect": { "type": "response", "command": "get_fork_messages", "success": true } },
-    { "id": "cmd-get-state-basic", "command": "get_state", "input": { "id": "cmd-get-state-basic", "type": "get_state" }, "expect": { "type": "response", "command": "get_state", "success": true } },
-    { "id": "cmd-get-session-stats-basic", "command": "get_session_stats", "input": { "id": "cmd-get-session-stats-basic", "type": "get_session_stats" }, "expect": { "type": "response", "command": "get_session_stats", "success": true } },
-    { "id": "cmd-get-messages-basic", "command": "get_messages", "input": { "id": "cmd-get-messages-basic", "type": "get_messages" }, "expect": { "type": "response", "command": "get_messages", "success": true } },
-    { "id": "cmd-get-available-models-basic", "command": "get_available_models", "input": { "id": "cmd-get-available-models-basic", "type": "get_available_models" }, "expect": { "type": "response", "command": "get_available_models", "success": true } },
-    { "id": "cmd-set-model-missing", "command": "set_model", "input": { "id": "cmd-set-model-missing", "type": "set_model" }, "expect": { "type": "response", "command": "set_model", "success": false, "error": "Missing model" } },
-    { "id": "cmd-cycle-model-basic", "command": "cycle_model", "input": { "id": "cmd-cycle-model-basic", "type": "cycle_model", "direction": "next" }, "expect": { "type": "response", "command": "cycle_model" } },
-    { "id": "cmd-set-thinking-level-missing", "command": "set_thinking_level", "input": { "id": "cmd-set-thinking-level-missing", "type": "set_thinking_level" }, "expect": { "type": "response", "command": "set_thinking_level", "success": false, "error": "Missing level" } },
-    { "id": "cmd-cycle-thinking-level-basic", "command": "cycle_thinking_level", "input": { "id": "cmd-cycle-thinking-level-basic", "type": "cycle_thinking_level", "direction": "next" }, "expect": { "type": "response", "command": "cycle_thinking_level", "success": true } },
-    { "id": "cmd-set-steering-mode-missing", "command": "set_steering_mode", "input": { "id": "cmd-set-steering-mode-missing", "type": "set_steering_mode" }, "expect": { "type": "response", "command": "set_steering_mode", "success": false, "error": "Missing mode" } },
-    { "id": "cmd-set-follow-up-mode-missing", "command": "set_follow_up_mode", "input": { "id": "cmd-set-follow-up-mode-missing", "type": "set_follow_up_mode" }, "expect": { "type": "response", "command": "set_follow_up_mode", "success": false, "error": "Missing mode" } },
-    { "id": "cmd-set-auto-compaction-basic", "command": "set_auto_compaction", "input": { "id": "cmd-set-auto-compaction-basic", "type": "set_auto_compaction", "enabled": true }, "expect": { "type": "response", "command": "set_auto_compaction", "success": true } },
-    { "id": "cmd-set-auto-retry-basic", "command": "set_auto_retry", "input": { "id": "cmd-set-auto-retry-basic", "type": "set_auto_retry", "enabled": false }, "expect": { "type": "response", "command": "set_auto_retry", "success": true } },
-    { "id": "cmd-abort-retry-basic", "command": "abort_retry", "input": { "id": "cmd-abort-retry-basic", "type": "abort_retry" }, "expect": { "type": "response", "command": "abort_retry", "success": true } },
-    { "id": "cmd-bash-missing", "command": "bash", "input": { "id": "cmd-bash-missing", "type": "bash" }, "expect": { "type": "response", "command": "bash", "success": false, "error": "Missing command" } },
-    { "id": "cmd-abort-bash-basic", "command": "abort_bash", "input": { "id": "cmd-abort-bash-basic", "type": "abort_bash" }, "expect": { "type": "response", "command": "abort_bash", "success": true } },
-    { "id": "cmd-get-last-assistant-text-basic", "command": "get_last_assistant_text", "input": { "id": "cmd-get-last-assistant-text-basic", "type": "get_last_assistant_text" }, "expect": { "type": "response", "command": "get_last_assistant_text", "success": true } },
-    { "id": "cmd-get-commands-basic", "command": "get_commands", "input": { "id": "cmd-get-commands-basic", "type": "get_commands" }, "expect": { "type": "response", "command": "get_commands", "success": true } },
-    { "id": "cmd-extension-ui-response-missing", "command": "extension_ui_response", "input": { "id": "cmd-extension-ui-response-missing", "type": "extension_ui_response" }, "expect": { "type": "response", "command": "extension_ui_response", "success": false, "error": "Missing requestId (or id) field" } }
+    {
+      "id": "cmd-prompt-basic",
+      "command": "prompt",
+      "input": { "id": "cmd-prompt-basic", "type": "prompt", "message": "hello" },
+      "expect": { "type": "response", "command": "prompt", "success": true }
+    },
+    {
+      "id": "cmd-steer-basic",
+      "command": "steer",
+      "input": { "id": "cmd-steer-basic", "type": "steer", "message": "adjust" },
+      "expect": { "type": "response", "command": "steer" }
+    },
+    {
+      "id": "cmd-follow-up-basic",
+      "command": "follow_up",
+      "input": { "id": "cmd-follow-up-basic", "type": "follow_up", "message": "next" },
+      "expect": { "type": "response", "command": "follow_up" }
+    },
+    {
+      "id": "cmd-abort-basic",
+      "command": "abort",
+      "input": { "id": "cmd-abort-basic", "type": "abort" },
+      "expect": { "type": "response", "command": "abort", "success": true }
+    },
+    {
+      "id": "cmd-new-session-basic",
+      "command": "new_session",
+      "input": { "id": "cmd-new-session-basic", "type": "new_session" },
+      "expect": { "type": "response", "command": "new_session", "success": true }
+    },
+    {
+      "id": "cmd-switch-session-missing",
+      "command": "switch_session",
+      "input": { "id": "cmd-switch-session-missing", "type": "switch_session" },
+      "expect": {
+        "type": "response",
+        "command": "switch_session",
+        "success": false,
+        "error": "Missing sessionId"
+      }
+    },
+    {
+      "id": "cmd-set-session-name-basic",
+      "command": "set_session_name",
+      "input": { "id": "cmd-set-session-name-basic", "type": "set_session_name", "name": "G05" },
+      "expect": { "type": "response", "command": "set_session_name", "success": true }
+    },
+    {
+      "id": "cmd-export-html-basic",
+      "command": "export_html",
+      "input": { "id": "cmd-export-html-basic", "type": "export_html" },
+      "expect": { "type": "response", "command": "export_html", "success": true }
+    },
+    {
+      "id": "cmd-compact-basic",
+      "command": "compact",
+      "input": { "id": "cmd-compact-basic", "type": "compact", "instructions": "summarize" },
+      "expect": { "type": "response", "command": "compact" }
+    },
+    {
+      "id": "cmd-fork-missing",
+      "command": "fork",
+      "input": { "id": "cmd-fork-missing", "type": "fork" },
+      "expect": {
+        "type": "response",
+        "command": "fork",
+        "success": false,
+        "error": "Missing messageId"
+      }
+    },
+    {
+      "id": "cmd-get-fork-messages-basic",
+      "command": "get_fork_messages",
+      "input": { "id": "cmd-get-fork-messages-basic", "type": "get_fork_messages" },
+      "expect": { "type": "response", "command": "get_fork_messages", "success": true }
+    },
+    {
+      "id": "cmd-get-state-basic",
+      "command": "get_state",
+      "input": { "id": "cmd-get-state-basic", "type": "get_state" },
+      "expect": { "type": "response", "command": "get_state", "success": true }
+    },
+    {
+      "id": "cmd-get-session-stats-basic",
+      "command": "get_session_stats",
+      "input": { "id": "cmd-get-session-stats-basic", "type": "get_session_stats" },
+      "expect": { "type": "response", "command": "get_session_stats", "success": true }
+    },
+    {
+      "id": "cmd-get-messages-basic",
+      "command": "get_messages",
+      "input": { "id": "cmd-get-messages-basic", "type": "get_messages" },
+      "expect": { "type": "response", "command": "get_messages", "success": true }
+    },
+    {
+      "id": "cmd-get-available-models-basic",
+      "command": "get_available_models",
+      "input": { "id": "cmd-get-available-models-basic", "type": "get_available_models" },
+      "expect": { "type": "response", "command": "get_available_models", "success": true }
+    },
+    {
+      "id": "cmd-set-model-missing",
+      "command": "set_model",
+      "input": { "id": "cmd-set-model-missing", "type": "set_model" },
+      "expect": {
+        "type": "response",
+        "command": "set_model",
+        "success": false,
+        "error": "Missing model"
+      }
+    },
+    {
+      "id": "cmd-cycle-model-basic",
+      "command": "cycle_model",
+      "input": { "id": "cmd-cycle-model-basic", "type": "cycle_model", "direction": "next" },
+      "expect": { "type": "response", "command": "cycle_model" }
+    },
+    {
+      "id": "cmd-set-thinking-level-missing",
+      "command": "set_thinking_level",
+      "input": { "id": "cmd-set-thinking-level-missing", "type": "set_thinking_level" },
+      "expect": {
+        "type": "response",
+        "command": "set_thinking_level",
+        "success": false,
+        "error": "Missing level"
+      }
+    },
+    {
+      "id": "cmd-cycle-thinking-level-basic",
+      "command": "cycle_thinking_level",
+      "input": {
+        "id": "cmd-cycle-thinking-level-basic",
+        "type": "cycle_thinking_level",
+        "direction": "next"
+      },
+      "expect": { "type": "response", "command": "cycle_thinking_level", "success": true }
+    },
+    {
+      "id": "cmd-set-steering-mode-missing",
+      "command": "set_steering_mode",
+      "input": { "id": "cmd-set-steering-mode-missing", "type": "set_steering_mode" },
+      "expect": {
+        "type": "response",
+        "command": "set_steering_mode",
+        "success": false,
+        "error": "Missing mode"
+      }
+    },
+    {
+      "id": "cmd-set-follow-up-mode-missing",
+      "command": "set_follow_up_mode",
+      "input": { "id": "cmd-set-follow-up-mode-missing", "type": "set_follow_up_mode" },
+      "expect": {
+        "type": "response",
+        "command": "set_follow_up_mode",
+        "success": false,
+        "error": "Missing mode"
+      }
+    },
+    {
+      "id": "cmd-set-auto-compaction-basic",
+      "command": "set_auto_compaction",
+      "input": {
+        "id": "cmd-set-auto-compaction-basic",
+        "type": "set_auto_compaction",
+        "enabled": true
+      },
+      "expect": { "type": "response", "command": "set_auto_compaction", "success": true }
+    },
+    {
+      "id": "cmd-set-auto-retry-basic",
+      "command": "set_auto_retry",
+      "input": { "id": "cmd-set-auto-retry-basic", "type": "set_auto_retry", "enabled": false },
+      "expect": { "type": "response", "command": "set_auto_retry", "success": true }
+    },
+    {
+      "id": "cmd-abort-retry-basic",
+      "command": "abort_retry",
+      "input": { "id": "cmd-abort-retry-basic", "type": "abort_retry" },
+      "expect": { "type": "response", "command": "abort_retry", "success": true }
+    },
+    {
+      "id": "cmd-bash-missing",
+      "command": "bash",
+      "input": { "id": "cmd-bash-missing", "type": "bash" },
+      "expect": {
+        "type": "response",
+        "command": "bash",
+        "success": false,
+        "error": "Missing command"
+      }
+    },
+    {
+      "id": "cmd-abort-bash-basic",
+      "command": "abort_bash",
+      "input": { "id": "cmd-abort-bash-basic", "type": "abort_bash" },
+      "expect": { "type": "response", "command": "abort_bash", "success": true }
+    },
+    {
+      "id": "cmd-get-last-assistant-text-basic",
+      "command": "get_last_assistant_text",
+      "input": { "id": "cmd-get-last-assistant-text-basic", "type": "get_last_assistant_text" },
+      "expect": { "type": "response", "command": "get_last_assistant_text", "success": true }
+    },
+    {
+      "id": "cmd-get-commands-basic",
+      "command": "get_commands",
+      "input": { "id": "cmd-get-commands-basic", "type": "get_commands" },
+      "expect": { "type": "response", "command": "get_commands", "success": true }
+    },
+    {
+      "id": "cmd-extension-ui-response-missing",
+      "command": "extension_ui_response",
+      "input": { "id": "cmd-extension-ui-response-missing", "type": "extension_ui_response" },
+      "expect": {
+        "type": "response",
+        "command": "extension_ui_response",
+        "success": false,
+        "error": "Missing requestId (or id) field"
+      }
+    }
   ],
   "events": [
-    { "id": "evt-response-basic", "event": "response", "sample": { "type": "response", "command": "get_state", "success": true } },
-    { "id": "evt-agent-start-basic", "event": "agent_start", "sample": { "type": "agent_start", "sessionId": "session-1" } },
-    { "id": "evt-agent-end-basic", "event": "agent_end", "sample": { "type": "agent_end", "messages": [] } },
-    { "id": "evt-turn-start-basic", "event": "turn_start", "sample": { "type": "turn_start", "sessionId": "session-1", "turnIndex": 0, "timestamp": "2026-04-22T00:00:00Z" } },
-    { "id": "evt-turn-end-basic", "event": "turn_end", "sample": { "type": "turn_end", "sessionId": "session-1", "turnIndex": 0, "message": null, "toolResults": [] } },
-    { "id": "evt-message-start-basic", "event": "message_start", "sample": { "type": "message_start", "message": { "role": "assistant", "content": [] } } },
-    { "id": "evt-message-update-basic", "event": "message_update", "sample": { "type": "message_update", "message": { "role": "assistant", "content": [] }, "assistantMessageEvent": { "type": "text_delta", "text": "hi" } } },
-    { "id": "evt-message-end-basic", "event": "message_end", "sample": { "type": "message_end", "message": { "role": "assistant", "content": [] } } },
-    { "id": "evt-tool-execution-start-basic", "event": "tool_execution_start", "sample": { "type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "read", "args": { "path": "README.md" } } },
-    { "id": "evt-tool-execution-update-basic", "event": "tool_execution_update", "sample": { "type": "tool_execution_update", "toolCallId": "tool-1", "toolName": "read", "args": { "path": "README.md" }, "partialResult": "line 1" } },
-    { "id": "evt-tool-execution-end-basic", "event": "tool_execution_end", "sample": { "type": "tool_execution_end", "toolCallId": "tool-1", "toolName": "read", "result": "ok", "isError": false } },
-    { "id": "evt-auto-compaction-start-basic", "event": "auto_compaction_start", "sample": { "type": "auto_compaction_start", "reason": "threshold" } },
-    { "id": "evt-auto-compaction-end-basic", "event": "auto_compaction_end", "sample": { "type": "auto_compaction_end", "aborted": false, "willRetry": false, "result": "ok" } },
-    { "id": "evt-auto-retry-start-basic", "event": "auto_retry_start", "sample": { "type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 2000, "errorMessage": "transient" } },
-    { "id": "evt-auto-retry-end-basic", "event": "auto_retry_end", "sample": { "type": "auto_retry_end", "success": true, "attempt": 1 } },
-    { "id": "evt-extension-error-basic", "event": "extension_error", "sample": { "type": "extension_error", "event": "session_before_compact", "error": "denied", "extensionId": "test/ext" } },
-    { "id": "evt-extension-ui-request-basic", "event": "extension_ui_request", "sample": { "type": "extension_ui_request", "requestId": "ui-1", "request": { "id": "ui-1", "method": "confirm", "payload": { "title": "Continue?" } } } }
+    {
+      "id": "evt-response-basic",
+      "event": "response",
+      "sample": { "type": "response", "command": "get_state", "success": true }
+    },
+    {
+      "id": "evt-agent-start-basic",
+      "event": "agent_start",
+      "sample": { "type": "agent_start", "sessionId": "session-1" }
+    },
+    {
+      "id": "evt-agent-end-basic",
+      "event": "agent_end",
+      "sample": { "type": "agent_end", "messages": [] }
+    },
+    {
+      "id": "evt-turn-start-basic",
+      "event": "turn_start",
+      "sample": {
+        "type": "turn_start",
+        "sessionId": "session-1",
+        "turnIndex": 0,
+        "timestamp": "2026-04-22T00:00:00Z"
+      }
+    },
+    {
+      "id": "evt-turn-end-basic",
+      "event": "turn_end",
+      "sample": {
+        "type": "turn_end",
+        "sessionId": "session-1",
+        "turnIndex": 0,
+        "message": null,
+        "toolResults": []
+      }
+    },
+    {
+      "id": "evt-message-start-basic",
+      "event": "message_start",
+      "sample": { "type": "message_start", "message": { "role": "assistant", "content": [] } }
+    },
+    {
+      "id": "evt-message-update-basic",
+      "event": "message_update",
+      "sample": {
+        "type": "message_update",
+        "message": { "role": "assistant", "content": [] },
+        "assistantMessageEvent": { "type": "text_delta", "text": "hi" }
+      }
+    },
+    {
+      "id": "evt-message-end-basic",
+      "event": "message_end",
+      "sample": { "type": "message_end", "message": { "role": "assistant", "content": [] } }
+    },
+    {
+      "id": "evt-tool-execution-start-basic",
+      "event": "tool_execution_start",
+      "sample": {
+        "type": "tool_execution_start",
+        "toolCallId": "tool-1",
+        "toolName": "read",
+        "args": { "path": "README.md" }
+      }
+    },
+    {
+      "id": "evt-tool-execution-update-basic",
+      "event": "tool_execution_update",
+      "sample": {
+        "type": "tool_execution_update",
+        "toolCallId": "tool-1",
+        "toolName": "read",
+        "args": { "path": "README.md" },
+        "partialResult": "line 1"
+      }
+    },
+    {
+      "id": "evt-tool-execution-end-basic",
+      "event": "tool_execution_end",
+      "sample": {
+        "type": "tool_execution_end",
+        "toolCallId": "tool-1",
+        "toolName": "read",
+        "result": "ok",
+        "isError": false
+      }
+    },
+    {
+      "id": "evt-auto-compaction-start-basic",
+      "event": "auto_compaction_start",
+      "sample": { "type": "auto_compaction_start", "reason": "threshold" }
+    },
+    {
+      "id": "evt-auto-compaction-end-basic",
+      "event": "auto_compaction_end",
+      "sample": {
+        "type": "auto_compaction_end",
+        "aborted": false,
+        "willRetry": false,
+        "result": "ok"
+      }
+    },
+    {
+      "id": "evt-auto-retry-start-basic",
+      "event": "auto_retry_start",
+      "sample": {
+        "type": "auto_retry_start",
+        "attempt": 1,
+        "maxAttempts": 3,
+        "delayMs": 2000,
+        "errorMessage": "transient"
+      }
+    },
+    {
+      "id": "evt-auto-retry-end-basic",
+      "event": "auto_retry_end",
+      "sample": { "type": "auto_retry_end", "success": true, "attempt": 1 }
+    },
+    {
+      "id": "evt-extension-error-basic",
+      "event": "extension_error",
+      "sample": {
+        "type": "extension_error",
+        "event": "session_before_compact",
+        "error": "denied",
+        "extensionId": "test/ext"
+      }
+    },
+    {
+      "id": "evt-extension-ui-request-basic",
+      "event": "extension_ui_request",
+      "sample": {
+        "type": "extension_ui_request",
+        "requestId": "ui-1",
+        "request": { "id": "ui-1", "method": "confirm", "payload": { "title": "Continue?" } }
+      }
+    }
   ]
 }

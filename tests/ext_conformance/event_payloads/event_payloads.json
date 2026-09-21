@@ -72,7 +72,7 @@
           "messages": [
             {
               "role": "assistant",
-              "content": [{"type": "text", "text": "Hello!"}]
+              "content": [{ "type": "text", "text": "Hello!" }]
             }
           ],
           "error": null
@@ -134,14 +134,14 @@
           "turnIndex": 0,
           "message": {
             "role": "assistant",
-            "content": [{"type": "text", "text": "I'll help you with that."}],
+            "content": [{ "type": "text", "text": "I'll help you with that." }],
             "stop_reason": "end_turn"
           },
           "toolResults": [
             {
               "type": "tool_result",
               "tool_use_id": "tool-001",
-              "content": [{"type": "text", "text": "file.txt contents"}]
+              "content": [{ "type": "text", "text": "file.txt contents" }]
             }
           ]
         },
@@ -156,7 +156,7 @@
           "turnIndex": 0,
           "message": {
             "role": "assistant",
-            "content": [{"type": "text", "text": "Sure, here's the answer."}],
+            "content": [{ "type": "text", "text": "Sure, here's the answer." }],
             "stop_reason": "end_turn"
           },
           "toolResults": []
@@ -223,9 +223,9 @@
           "type": "tool_call",
           "toolName": "bash",
           "toolCallId": "tc-001",
-          "input": {"command": "echo hello"}
+          "input": { "command": "echo hello" }
         },
-        "default_response": {"block": false}
+        "default_response": { "block": false }
       },
       {
         "name": "blocked_tool_call",
@@ -234,9 +234,9 @@
           "type": "tool_call",
           "toolName": "bash",
           "toolCallId": "tc-002",
-          "input": {"command": "rm -rf /"}
+          "input": { "command": "rm -rf /" }
         },
-        "default_response": {"block": true, "reason": "Destructive command blocked"}
+        "default_response": { "block": true, "reason": "Destructive command blocked" }
       },
       {
         "name": "tool_call_with_complex_input",
@@ -250,7 +250,7 @@
             "content": "line 1\nline 2\n\u2603 snowman"
           }
         },
-        "default_response": {"block": false}
+        "default_response": { "block": false }
       }
     ],
     "tool_result": [
@@ -261,9 +261,9 @@
           "type": "tool_result",
           "toolName": "bash",
           "toolCallId": "tc-001",
-          "input": {"command": "echo hello"},
-          "content": [{"type": "text", "text": "hello\n"}],
-          "details": {"exitCode": 0, "duration_ms": 42},
+          "input": { "command": "echo hello" },
+          "content": [{ "type": "text", "text": "hello\n" }],
+          "details": { "exitCode": 0, "duration_ms": 42 },
           "isError": false
         },
         "default_response": {}
@@ -275,9 +275,9 @@
           "type": "tool_result",
           "toolName": "bash",
           "toolCallId": "tc-004",
-          "input": {"command": "false"},
-          "content": [{"type": "text", "text": ""}],
-          "details": {"exitCode": 1},
+          "input": { "command": "false" },
+          "content": [{ "type": "text", "text": "" }],
+          "details": { "exitCode": 1 },
           "isError": true
         },
         "default_response": {}
@@ -289,13 +289,13 @@
           "type": "tool_result",
           "toolName": "read",
           "toolCallId": "tc-005",
-          "input": {"file_path": "/tmp/secret.env"},
-          "content": [{"type": "text", "text": "API_KEY=sk-secret123"}],
+          "input": { "file_path": "/tmp/secret.env" },
+          "content": [{ "type": "text", "text": "API_KEY=sk-secret123" }],
           "details": null,
           "isError": false
         },
         "default_response": {
-          "content": [{"type": "text", "text": "API_KEY=***REDACTED***"}]
+          "content": [{ "type": "text", "text": "API_KEY=***REDACTED***" }]
         }
       }
     ],
@@ -308,7 +308,7 @@
           "content": "Please explain this code",
           "attachments": []
         },
-        "default_response": {"action": "continue"}
+        "default_response": { "action": "continue" }
       },
       {
         "name": "transformed_input",
@@ -331,7 +331,7 @@
           "content": "/quit",
           "attachments": []
         },
-        "default_response": {"action": "handled"}
+        "default_response": { "action": "handled" }
       },
       {
         "name": "input_with_unicode",
@@ -341,7 +341,7 @@
           "content": "\u4f60\u597d\u4e16\u754c \ud83d\ude80 caf\u00e9",
           "attachments": []
         },
-        "default_response": {"action": "continue"}
+        "default_response": { "action": "continue" }
       }
     ],
     "before_agent_start": [
@@ -377,8 +377,8 @@
         "payload": {
           "type": "context",
           "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]}
+            { "role": "user", "content": [{ "type": "text", "text": "Hello" }] },
+            { "role": "assistant", "content": [{ "type": "text", "text": "Hi!" }] }
           ]
         },
         "default_response": {}
@@ -389,12 +389,12 @@
         "payload": {
           "type": "context",
           "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "Secret: password123"}]}
+            { "role": "user", "content": [{ "type": "text", "text": "Secret: password123" }] }
           ]
         },
         "default_response": {
           "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "Secret: ***REDACTED***"}]}
+            { "role": "user", "content": [{ "type": "text", "text": "Secret: ***REDACTED***" }] }
           ]
         }
       },
@@ -522,7 +522,7 @@
           "branchEntries": [],
           "customInstructions": null
         },
-        "default_response": {"cancel": true}
+        "default_response": { "cancel": true }
       }
     ],
     "session_compact": [
@@ -552,7 +552,7 @@
             "summary": "Extension compacted branch",
             "firstKeptEntryId": "entry-002",
             "tokensBefore": 45000,
-            "details": {"note": "extension-compaction"},
+            "details": { "note": "extension-compaction" },
             "fromHook": true
           },
           "fromExtension": true
@@ -600,7 +600,7 @@
             "type": "branch_summary",
             "fromId": "entry-010",
             "summary": "Branch summary for alternate approach",
-            "details": {"reason": "auto"},
+            "details": { "reason": "auto" },
             "fromHook": true
           },
           "fromExtension": true
@@ -639,7 +639,7 @@
           "targetSession": "sess-002",
           "reason": "new"
         },
-        "default_response": {"cancel": true}
+        "default_response": { "cancel": true }
       }
     ],
     "session_switch": [
@@ -683,7 +683,7 @@
           "currentSession": "sess-001",
           "forkEntryId": "entry-003"
         },
-        "default_response": {"cancel": true}
+        "default_response": { "cancel": true }
       }
     ],
     "session_fork": [

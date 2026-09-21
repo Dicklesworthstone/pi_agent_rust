@@ -11,15 +11,8 @@
       "kind": "registration",
       "summary": "Verifies color command, event hooks registered for qualisero-session-color",
       "expect": {
-        "commands_contains": [
-          "color",
-          "color-char",
-          "color-config"
-        ],
-        "event_hooks_contains": [
-          "session_start",
-          "session_switch"
-        ]
+        "commands_contains": ["color", "color-char", "color-config"],
+        "event_hooks_contains": ["session_start", "session_switch"]
       }
     },
     {
