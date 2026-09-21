@@ -2618,23 +2618,49 @@ impl PiFtuiModel {
     }
 
     fn handle_picker_key(&mut self, key: &ftui::KeyEvent) {
-        let Some(picker) = self.picker.as_mut() else {
+        if self.picker.is_none() {
+            return;
+        }
+        let Some(action) = self.picker_action(key) else {
             return;
         };
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.selected = picker.selected.saturating_sub(1);
+        let page = self.body_height().saturating_sub(1).max(1);
+        match action {
+            AppAction::SelectUp => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.selected = (picker.selected + 1).min(picker.items.len().saturating_sub(1));
+            AppAction::SelectDown => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = (picker.selected + 1).min(picker.items.len().saturating_sub(1));
+                }
             }
-            KeyCode::Escape => {
+            AppAction::SelectPageUp => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(page);
+                }
+            }
+            AppAction::SelectPageDown => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = (picker.selected + page).min(picker.items.len().saturating_sub(1));
+                }
+            }
+            AppAction::SelectCancel => {
                 self.picker = None;
             }
-            KeyCode::Enter => {
+            AppAction::SelectConfirm => {
                 let Some(mut picker) = self.picker.take() else {
                     return;
                 };
+                let len = if picker.values.is_empty() {
+                    picker.items.len()
+                } else {
+                    picker.values.len()
+                };
+                if picker.selected >= len {
+                    return;
+                }
                 let choice = if picker.values.is_empty() {
                     picker.items.swap_remove(picker.selected)
                 } else {
@@ -2645,6 +2671,36 @@ impl PiFtuiModel {
             _ => {}
         }
     }
+
+    fn picker_action(&self, key: &ftui::KeyEvent) -> Option<AppAction> {
+        let binding = KeyBinding::from_ftui_key(key)?;
+        let matches = self.keybindings.matching_actions(&binding);
+        [
+            AppAction::SelectCancel,
+            AppAction::SelectConfirm,
+            AppAction::SelectPageUp,
+            AppAction::SelectPageDown,
+            AppAction::SelectUp,
+            AppAction::SelectDown,
+        ]
+        .into_iter()
+        .find(|action| matches.contains(action))
+        .or_else(|| self.picker_default_alias(key))
+    }
+
+    fn picker_default_alias(&self, key: &ftui::KeyEvent) -> Option<AppAction> {
+        if !key.modifiers.is_empty() {
+            return None;
+        }
+        let action = match key.code {
+            KeyCode::Char('j') => AppAction::SelectDown,
+            KeyCode::Char('k') => AppAction::SelectUp,
+            _ => return None,
+        };
+        (self.keybindings.get_bindings(action) == KeyBindings::new().get_bindings(action))
+            .then_some(action)
+    }
+
 
     fn apply_picker_choice(&mut self, kind: PickerKind, choice: &str) {
         match kind {
@@ -7882,6 +7938,87 @@ mod tests {
             "confirmation note missing"
         );
     }
+
+    #[test]
+    fn picker_respects_custom_keybindings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "selectDown": ["ctrl+j"],
+                "selectUp": ["ctrl+k"],
+                "selectCancel": ["q"],
+                "selectConfirm": ["ctrl+g"]
+            }"#,
+        )
+        .expect("write keybindings");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings));
+        sim.init();
+
+        type_str(&mut sim, "/theme");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "picker did not open");
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+
+        // Plain 'j' and 'down' should not navigate because selectDown was overridden
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+
+        // Rebound 'ctrl+j' navigates down
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+
+        // Plain 'k' and 'up' should not navigate because selectUp was overridden
+        sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+
+        // Rebound 'ctrl+k' navigates up
+        sim.inject_event(key(KeyCode::Char('k'), Modifiers::CTRL));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+
+        // Plain 'Escape' should not close because selectCancel was rebound to 'q'
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "picker unexpectedly closed on Escape");
+
+        // Rebound 'q' closes the picker
+        sim.inject_event(key(KeyCode::Char('q'), Modifiers::empty()));
+        assert!(sim.model().picker.is_none(), "picker did not close on rebound key 'q'");
+    }
+
+    #[test]
+    fn picker_supports_page_up_page_down() {
+        let (_tx, mut model) = new_model();
+        // Give the picker 20 items so paging has visible effect
+        model.picker = Some(PickerOverlay {
+            title: String::from("Long list"),
+            items: (0..20).map(|i| format!("item-{i}")).collect(),
+            values: Vec::new(),
+            selected: 0,
+            kind: PickerKind::Theme,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+
+        // PageDown jumps by body_height() page size
+        sim.inject_event(key(KeyCode::PageDown, Modifiers::empty()));
+        let after_pagedown = sim.model().picker.as_ref().unwrap().selected;
+        assert!(after_pagedown > 0, "PageDown did not advance selection");
+
+        // PageUp jumps back toward top
+        sim.inject_event(key(KeyCode::PageUp, Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+    }
+
 
     #[test]
     fn bare_model_command_opens_picker_and_selection_routes_set_model() {

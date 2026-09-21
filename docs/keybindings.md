@@ -151,12 +151,12 @@ Keys are specified as `modifier+key`.
 
 | Action ID | Default Keys | Description |
 |-----------|--------------|-------------|
-| `toggleSessionPath` | `ctrl+p` | Toggle path display |
-| `toggleSessionSort` | `ctrl+s` | Toggle sort mode |
-| `toggleSessionNamedFilter` | `ctrl+n` | Toggle named-only filter |
-| `renameSession` | `ctrl+r` | Rename session |
 | `deleteSession` | `ctrl+d` | Delete session |
-| `deleteSessionNoninvasive` | `ctrl+backspace` | Delete session when query is empty |
+| `toggleSessionPath` | *(none)* | Toggle path display (reserved) |
+| `toggleSessionSort` | *(none)* | Toggle sort mode (reserved) |
+| `toggleSessionNamedFilter` | *(none)* | Toggle named-only filter (reserved) |
+| `renameSession` | *(none)* | Rename session (reserved) |
+| `deleteSessionNoninvasive` | *(none)* | Delete session when query is empty (reserved) |
 
 ## Context-dependent conflicts
 
@@ -165,4 +165,4 @@ Some keys are intentionally bound to multiple actions and are resolved based on 
 - `ctrl+c` can mean **Copy** (selection), **Clear** (editor), or **abort** (when running).
 - `ctrl+d` is **DeleteCharForward** in the editor, **Exit** when the editor is empty, and
   **DeleteSession** inside the session picker.
-- `ctrl+p` cycles models in the editor but toggles session path display in the picker.
+

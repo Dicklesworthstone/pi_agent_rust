@@ -1619,18 +1619,15 @@ impl KeyBindings {
         );
 
         // Session Picker
-        m.insert(AppAction::ToggleSessionPath, vec![KeyBinding::ctrl("p")]);
-        m.insert(AppAction::ToggleSessionSort, vec![KeyBinding::ctrl("s")]);
-        m.insert(
-            AppAction::ToggleSessionNamedFilter,
-            vec![KeyBinding::ctrl("n")],
-        );
-        m.insert(AppAction::RenameSession, vec![KeyBinding::ctrl("r")]);
+        // Unimplemented actions have no default bindings so `/hotkeys` does not
+        // falsely advertise them; explicit bindings via keybindings.json remain valid.
+        m.insert(AppAction::ToggleSessionPath, vec![]);
+        m.insert(AppAction::ToggleSessionSort, vec![]);
+        m.insert(AppAction::ToggleSessionNamedFilter, vec![]);
+        m.insert(AppAction::RenameSession, vec![]);
         m.insert(AppAction::DeleteSession, vec![KeyBinding::ctrl("d")]);
-        m.insert(
-            AppAction::DeleteSessionNoninvasive,
-            vec![KeyBinding::ctrl("backspace")],
-        );
+        m.insert(AppAction::DeleteSessionNoninvasive, vec![]);
+
 
         m
     }
@@ -2898,5 +2895,44 @@ mod tests {
                     .unwrap();
             assert_eq!(bindings.lookup(&page_up), Some(AppAction::PageUp));
         }
+
+        #[test]
+        fn session_picker_default_bindings_and_hotkeys() {
+            let bindings = KeyBindings::default();
+            // Unimplemented session-picker actions have empty default bindings
+            assert!(bindings.get_bindings(AppAction::ToggleSessionPath).is_empty());
+            assert!(bindings.get_bindings(AppAction::ToggleSessionSort).is_empty());
+            assert!(bindings.get_bindings(AppAction::ToggleSessionNamedFilter).is_empty());
+            assert!(bindings.get_bindings(AppAction::RenameSession).is_empty());
+            assert!(bindings.get_bindings(AppAction::DeleteSessionNoninvasive).is_empty());
+
+            // DeleteSession is implemented and retains ctrl+d
+            assert_eq!(
+                bindings.get_bindings(AppAction::DeleteSession),
+                &[KeyBinding::ctrl("d")]
+            );
+
+            // Selection actions retain defaults
+            assert_eq!(bindings.get_bindings(AppAction::SelectUp), &[KeyBinding::plain("up")]);
+            assert_eq!(bindings.get_bindings(AppAction::SelectDown), &[KeyBinding::plain("down")]);
+            assert_eq!(bindings.get_bindings(AppAction::SelectPageUp), &[KeyBinding::plain("pageup")]);
+            assert_eq!(bindings.get_bindings(AppAction::SelectPageDown), &[KeyBinding::plain("pagedown")]);
+            assert_eq!(bindings.get_bindings(AppAction::SelectConfirm), &[KeyBinding::plain("enter")]);
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectCancel),
+                &[KeyBinding::plain("escape"), KeyBinding::ctrl("c")]
+            );
+
+            // Hotkeys formatting lists DeleteSession under Session Picker, but none of the retired actions
+            let hotkeys = format_hotkeys(&bindings);
+            assert!(hotkeys.contains("## Session Picker"));
+            assert!(hotkeys.contains("Delete session"));
+            assert!(!hotkeys.contains("Toggle path display"));
+            assert!(!hotkeys.contains("Toggle sort mode"));
+            assert!(!hotkeys.contains("Toggle named-only filter"));
+            assert!(!hotkeys.contains("Rename session"));
+            assert!(!hotkeys.contains("Delete session (when query empty)"));
+        }
     }
 }
+
