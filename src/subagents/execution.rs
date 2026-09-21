@@ -19,12 +19,20 @@ use crate::agent_hub::{ChildKind, ChildStatus};
 use crate::worktree_iso::{IsoApplyMode, IsoHandle, IsoOutcome};
 use serde_json::Value;
 use std::collections::BTreeMap;
+#[cfg(not(unix))]
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+#[cfg(any(not(unix), test))]
 use std::sync::mpsc::{self, Receiver};
+#[cfg(any(not(unix), test))]
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+#[cfg(any(not(unix), test))]
+use std::time::Instant;
+use std::time::Duration;
+
+#[cfg(unix)]
+mod pipes;
 
 const DRAIN_BATCH: usize = 32;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -309,15 +317,34 @@ impl ChildRunner {
                 .fail("Child stderr was not piped.".to_string());
             return attempt;
         };
-        let (tx, rx) = mpsc::sync_channel(protocol::PIPE_QUEUE_CAPACITY);
-        let stdout = spawn_pipe_reader(stdout, PipeKind::Stdout, tx.clone());
-        let stderr = spawn_pipe_reader(stderr, PipeKind::Stderr, tx);
+        // Unix pipes are owned directly by this future. No blocking reader
+        // can survive a dropped turn or an escaped descendant retaining EOF.
+        #[cfg(unix)]
+        let mut pipes = match pipes::ChildPipes::new(stdout, stderr) {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                attempt.result.fail(format!("PI_SUBAGENT_PIPE_SETUP: {error}"));
+                return attempt;
+            }
+        };
+        // Preserve the existing non-Unix transport until an equivalent owned
+        // overlapped-I/O implementation is available there.
+        #[cfg(not(unix))]
+        let (rx, stdout, stderr) = {
+            let (tx, rx) = mpsc::sync_channel(protocol::PIPE_QUEUE_CAPACITY);
+            let stdout = spawn_pipe_reader(stdout, PipeKind::Stdout, tx.clone());
+            let stderr = spawn_pipe_reader(stderr, PipeKind::Stderr, tx);
+            (rx, stdout, stderr)
+        };
         let mut protocol = protocol::ChildProtocol::default();
         loop {
             if !check_budget(owner, self.deadline, &mut attempt.result) {
                 child.terminate();
                 break;
             }
+            #[cfg(unix)]
+            pipes.drain(&mut protocol, &mut attempt.result, update);
+            #[cfg(not(unix))]
             drain_child_frames(&rx, &mut protocol, &mut attempt.result, update);
             if !check_budget(owner, self.deadline, &mut attempt.result) {
                 // Invalid frames and expired budgets must stop the producer,
@@ -344,6 +371,11 @@ impl ChildRunner {
         // No descendant should keep writing or hold the pipes open after its
         // root exits. Cleanup gets a separate bounded drain, not a new work budget.
         child.stop_descendants();
+        #[cfg(unix)]
+        pipes
+            .finish(&mut protocol, &mut attempt.result, update, owner, self.deadline)
+            .await;
+        #[cfg(not(unix))]
         drain_until_reader_exit(
             rx,
             &mut protocol,
@@ -617,6 +649,7 @@ enum PipeFrame {
     Error(&'static str),
 }
 
+#[cfg(not(unix))]
 fn spawn_pipe_reader<R: Read + Send + 'static>(
     pipe: R,
     kind: PipeKind,
@@ -652,6 +685,7 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
     })
 }
 
+#[cfg(any(not(unix), test))]
 fn drain_child_frames(
     receiver: &Receiver<PipeFrame>,
     protocol: &mut protocol::ChildProtocol,
@@ -663,28 +697,39 @@ fn drain_child_frames(
         let Ok(frame) = receiver.try_recv() else {
             break;
         };
-        match frame {
-            PipeFrame::Error(error) if !result.is_error => result.fail(error.to_string()),
-            PipeFrame::Data(PipeKind::Stderr, line) => {
-                append_bounded_line(&mut result.stderr, &line);
-            }
-            PipeFrame::Data(PipeKind::Stdout, line) if !result.is_error => {
-                match protocol.ingest(&line, &mut result.output) {
-                    Ok(changed) => {
-                        if let Some(id) = &result.hub_id
-                            && let Ok(mut registry) = crate::agent_hub::registry().lock()
-                        {
-                            registry.append_transcript(id, &line);
-                        }
-                        if changed {
-                            emit_progress(update, result);
-                        }
-                    }
-                    Err(error) => result.fail(error.to_string()),
-                }
-            }
-            _ => {}
+        apply_child_frame(frame, protocol, result, update);
+    }
+}
+
+/// One protocol acceptance path for both transports. In particular, a final
+/// answer never turns subsequent malformed stdout into an ignored diagnostic.
+fn apply_child_frame(
+    frame: PipeFrame,
+    protocol: &mut protocol::ChildProtocol,
+    result: &mut SubagentResult,
+    update: Option<&UpdateCallback>,
+) {
+    match frame {
+        PipeFrame::Error(error) if !result.is_error => result.fail(error.to_string()),
+        PipeFrame::Data(PipeKind::Stderr, line) => {
+            append_bounded_line(&mut result.stderr, &line);
         }
+        PipeFrame::Data(PipeKind::Stdout, line) if !result.is_error => {
+            match protocol.ingest(&line, &mut result.output) {
+                Ok(changed) => {
+                    if let Some(id) = &result.hub_id
+                        && let Ok(mut registry) = crate::agent_hub::registry().lock()
+                    {
+                        registry.append_transcript(id, &line);
+                    }
+                    if changed {
+                        emit_progress(update, result);
+                    }
+                }
+                Err(error) => result.fail(error.to_string()),
+            }
+        }
+        _ => {}
     }
 }
 
@@ -692,6 +737,7 @@ async fn poll_pause(owner: &AgentCx) {
     owner.time().sleep(Duration::from_millis(10)).await;
 }
 
+#[cfg(any(not(unix), test))]
 #[allow(clippy::too_many_arguments)]
 async fn drain_until_reader_exit(
     receiver: Receiver<PipeFrame>,

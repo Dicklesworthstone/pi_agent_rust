@@ -5,11 +5,13 @@
 //! text is a preview; reasoning and tool argument deltas are never answers.
 
 use serde_json::Value;
+#[cfg(any(not(unix), test))]
 use std::io::BufRead;
 
 pub(super) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// A frame can contain a whole turn history. Bound queued frames independently
 /// from the answer preview instead of retaining 256 multi-megabyte histories.
+#[cfg(any(not(unix), test))]
 pub(super) const PIPE_QUEUE_CAPACITY: usize = 2;
 const MAX_ANSWER_BYTES: usize = 256 * 1024;
 const MAX_CONTENT_BLOCKS: usize = 4096;
@@ -24,6 +26,7 @@ const ANSWER_LIMIT: &str = "PI_SUBAGENT_OUTPUT_LIMIT: child answer exceeds 256 K
 /// Read a complete line without first allocating an unbounded `String` through
 /// `BufRead::lines`. CRLF and a complete final line without a newline are legal.
 /// The caller decides whether a non-UTF-8 diagnostic is lossy or fatal.
+#[cfg(any(not(unix), test))]
 pub(super) fn read_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, &'static str> {
     let mut frame = Vec::new();
     loop {
