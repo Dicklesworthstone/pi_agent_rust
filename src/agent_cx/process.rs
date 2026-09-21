@@ -162,9 +162,13 @@ impl Deref for AgentCommand {
 
 /// Owns a subprocess until reaped. Extracted pipe handles are ordinary OS
 /// handles; they do not transfer or disable this child's cleanup ownership.
+/// Unclaimed stdout and stderr remain available after reaping or killing the
+/// process. Waiting only closes stdin; it must not discard unread output.
 pub struct AgentChild {
     owner: AgentCx,
     child: Option<Child>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
     id: u32,
     status: Option<ExitStatus>,
     descendants_stopped: bool,
@@ -172,10 +176,12 @@ pub struct AgentChild {
 }
 
 impl AgentChild {
-    fn new(owner: AgentCx, child: Child) -> Self {
+    fn new(owner: AgentCx, mut child: Child) -> Self {
         Self {
             owner,
             id: child.id(),
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
             child: Some(child),
             status: None,
             descendants_stopped: false,
@@ -193,11 +199,11 @@ impl AgentChild {
     }
 
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.child.as_mut().and_then(|child| child.stdout.take())
+        self.stdout.take()
     }
 
     pub fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.child.as_mut().and_then(|child| child.stderr.take())
+        self.stderr.take()
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -405,5 +411,100 @@ mod tests {
         assert!(child.child.as_ref().unwrap().stdin.is_some());
         assert!(runtime.block_on(child.wait()).unwrap().success());
         assert!(child.child.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_preserves_both_output_pipes_and_nonzero_status() {
+        use std::io::Read as _;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+        let mut child = AgentCommand::new(owner, "sh")
+            .args(["-c", "printf 'out\\000tail'; printf err >&2; exit 7"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = runtime.block_on(child.wait()).unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(runtime.block_on(child.wait()).unwrap(), status);
+        assert!(child.child.is_none());
+        child.kill().unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        child.take_stdout().unwrap().read_to_end(&mut stdout).unwrap();
+        child.take_stderr().unwrap().read_to_end(&mut stderr).unwrap();
+        assert_eq!(stdout, b"out\0tail");
+        assert_eq!(stderr, b"err");
+        assert!(child.take_stdout().is_none());
+        assert!(child.take_stderr().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_wait_preserves_unclaimed_output_after_reaping() {
+        use std::io::Read as _;
+        use std::time::Instant;
+
+        let mut child = AgentCommand::new(AgentCx::for_request(), "sh")
+            .args(["-c", "printf complete"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut stdout = String::new();
+        child.take_stdout().unwrap().read_to_string(&mut stdout).unwrap();
+        assert_eq!(stdout, "complete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_output_survives_wait_without_duplication() {
+        use std::io::Read as _;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+        let mut child = AgentCommand::new(owner, "sh")
+            .args(["-c", "printf complete"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut pipe = child.take_stdout().unwrap();
+        assert!(runtime.block_on(child.wait()).unwrap().success());
+        assert!(child.take_stdout().is_none());
+        let mut stdout = String::new();
+        pipe.read_to_string(&mut stdout).unwrap();
+        assert_eq!(stdout, "complete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaping_does_not_invent_output_for_unpiped_streams() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+        let mut child = AgentCommand::new(owner, "sh")
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(runtime.block_on(child.wait()).unwrap().success());
+        assert!(child.take_stdout().is_none());
+        assert!(child.take_stderr().is_none());
     }
 }
