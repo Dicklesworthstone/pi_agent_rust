@@ -15,7 +15,42 @@ const PICKER_ACTIONS: &[AppAction] = &[
     AppAction::SelectUp,
     AppAction::SelectDown,
     AppAction::DeleteSession,
+    AppAction::ToggleSessionPath,
+    AppAction::ToggleSessionSort,
+    AppAction::ToggleSessionNamedFilter,
 ];
+
+/// Preserve the caller's order on entry; only an explicit sort action changes
+/// it. Sorting is a projection of record indices, never a mutation of storage
+/// identities (or of a pending delete target).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserSort {
+    Listed,
+    Recent,
+    Name,
+}
+
+impl BrowserSort {
+    const fn next(self) -> Self {
+        match self {
+            Self::Listed => Self::Recent,
+            Self::Recent => Self::Name,
+            Self::Name => Self::Listed,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Listed => "listed",
+            Self::Recent => "recent",
+            Self::Name => "name",
+        }
+    }
+}
+
+fn session_name(session: &SessionMeta) -> &str {
+    session.name.as_deref().unwrap_or_default().trim()
+}
 
 pub(super) struct BrowserState {
     visible: Vec<usize>,
@@ -27,6 +62,9 @@ pub(super) struct BrowserState {
     width: usize,
     height: usize,
     bindings: KeyBindings,
+    sort: BrowserSort,
+    named_only: bool,
+    show_path: bool,
 }
 
 impl BrowserState {
@@ -39,6 +77,9 @@ impl BrowserState {
             width: 96,
             height: 24,
             bindings: KeyBindings::new(),
+            sort: BrowserSort::Listed,
+            named_only: false,
+            show_path: true,
         }
     }
 
@@ -68,6 +109,9 @@ impl BrowserState {
             .iter()
             .enumerate()
             .filter(|(_, session)| {
+                if self.named_only && session_name(session).is_empty() {
+                    return false;
+                }
                 if terms.is_empty() {
                     return true;
                 }
@@ -83,6 +127,29 @@ impl BrowserState {
             })
             .map(|(index, _)| index)
             .collect();
+        // Name keys are folded once per row, not once per comparison. Path
+        // and id are deterministic tie-breakers even for duplicate names or
+        // timestamps; neither becomes a display-position identity.
+        match self.sort {
+            BrowserSort::Listed => {}
+            BrowserSort::Recent => self.visible.sort_by(|&a, &b| {
+                sessions[b]
+                    .last_modified_ms
+                    .cmp(&sessions[a].last_modified_ms)
+                    .then_with(|| sessions[a].path.cmp(&sessions[b].path))
+                    .then_with(|| sessions[a].id.cmp(&sessions[b].id))
+            }),
+            BrowserSort::Name => self.visible.sort_by_cached_key(|&index| {
+                let session = &sessions[index];
+                let name = session_name(session);
+                (
+                    name.is_empty(),
+                    name.to_lowercase(),
+                    session.path.clone(),
+                    session.id.clone(),
+                )
+            }),
+        }
         *selected = anchor
             .and_then(|index| {
                 self.visible
@@ -157,6 +224,26 @@ impl SessionPicker {
         self.browser.action(key) == Some(AppAction::SelectCancel)
     }
 
+    /// View controls preserve the selected record when it remains visible.
+    /// A filter which hides it selects the first result, never the old row
+    /// number in the new projection. No session file or index is modified.
+    fn apply_browser_control(&mut self, action: AppAction) {
+        let anchor = self.browser.original_index(self.selected);
+        match action {
+            AppAction::ToggleSessionPath => {
+                self.browser.show_path = !self.browser.show_path;
+                return;
+            }
+            AppAction::ToggleSessionSort => self.browser.sort = self.browser.sort.next(),
+            AppAction::ToggleSessionNamedFilter => {
+                self.browser.named_only = !self.browser.named_only;
+            }
+            _ => return,
+        }
+        self.browser
+            .rebuild(&self.sessions, &mut self.selected, anchor);
+    }
+
     fn edit_query(&mut self, chars: impl IntoIterator<Item = char>) {
         let anchor = self.browser.original_index(self.selected);
         for ch in chars {
@@ -202,6 +289,11 @@ impl SessionPicker {
             ) => {
                 self.move_selection(action);
             }
+            Some(
+                action @ (AppAction::ToggleSessionPath
+                | AppAction::ToggleSessionSort
+                | AppAction::ToggleSessionNamedFilter),
+            ) => self.apply_browser_control(action),
             _ if key.key_type == KeyType::Backspace || key.key_type == KeyType::CtrlH => {
                 let anchor = self.browser.original_index(self.selected);
                 self.browser.query.pop();
@@ -261,6 +353,11 @@ impl SessionPicker {
                     self.status_message = Some("Delete session? Press y/n to confirm.".to_string());
                 }
             }
+            Some(
+                action @ (AppAction::ToggleSessionPath
+                | AppAction::ToggleSessionSort
+                | AppAction::ToggleSessionNamedFilter),
+            ) => self.apply_browser_control(action),
             Some(action) => self.move_selection(action),
             None if !key.alt && key.key_type == KeyType::Runes && key.runes == ['/'] => {
                 self.browser.search_before = Some((
@@ -325,9 +422,11 @@ impl SessionPicker {
             .min(browser.visible.len());
         lines.push(display_line(
             &format!(
-                "{} matches / {} sessions · rows {start}-{end}",
+                "{} matches / {} sessions · rows {start}-{end} · {} · {}",
                 browser.visible.len(),
                 self.sessions.len(),
+                browser.sort.label(),
+                if browser.named_only { "named only" } else { "all" },
             ),
             width,
         ));
@@ -352,7 +451,7 @@ impl SessionPicker {
                 if self.sessions.is_empty() {
                     "No sessions found for this project."
                 } else {
-                    "No matching sessions. Press / to edit the search."
+                    "No matching sessions. Edit search or toggle the named filter."
                 },
                 width,
             ));
@@ -388,11 +487,14 @@ impl SessionPicker {
         lines.push(self.styles.muted.render(&display_line(&help, width)));
         lines.push(self.styles.muted.render(&display_line(
             &format!(
-                "{} / {}: move  {} / {}: page",
+                "{}/{} move · {}/{} page · {} path · {} sort · {} named",
                 browser.keys(AppAction::SelectUp),
                 browser.keys(AppAction::SelectDown),
                 browser.keys(AppAction::SelectPageUp),
                 browser.keys(AppAction::SelectPageDown),
+                browser.keys(AppAction::ToggleSessionPath),
+                browser.keys(AppAction::ToggleSessionSort),
+                browser.keys(AppAction::ToggleSessionNamedFilter),
             ),
             width,
         )));
@@ -400,7 +502,10 @@ impl SessionPicker {
             .original_index(self.selected)
             .and_then(|i| self.sessions.get(i))
             .map_or("", |meta| meta.path.as_str());
-        lines.push(self.styles.muted.render(&display_line(path, width)));
+        lines.push(self.styles.muted.render(&display_line(
+            if browser.show_path { path } else { "" },
+            width,
+        )));
         if let Some(message) = &self.status_message {
             lines.push(
                 self.styles
@@ -660,3 +765,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "browse_controls_tests.rs"]
+mod controls_tests;
