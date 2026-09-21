@@ -1314,3 +1314,48 @@ fn agent_done_invalidates_all_outstanding_cards_before_idle() {
         app.status_message
     );
 }
+
+#[test]
+fn export_paths_are_chosen_the_same_way_for_both_stacks() {
+    // These two are free functions rather than `PiApp` methods so the ftui
+    // stack's `/export` lands the same file in the same place. Pin the naming
+    // here, where both callers can be broken by one change.
+    use super::{default_export_path, resolve_output_path};
+
+    let cwd = std::path::Path::new("/work/project");
+
+    let mut saved = crate::session::Session::in_memory();
+    saved.path = Some(std::path::PathBuf::from("/sessions/2026-09-20-abc.jsonl"));
+    assert_eq!(
+        default_export_path(cwd, &saved),
+        std::path::PathBuf::from("/work/project/pi-session-2026-09-20-abc.html"),
+        "a saved session is named after its file stem"
+    );
+
+    let unsaved = crate::session::Session::in_memory();
+    let expected = format!(
+        "/work/project/pi-session-unsaved-{}.html",
+        crate::session_picker::truncate_session_id(&unsaved.header.id, 8)
+    );
+    assert_eq!(
+        default_export_path(cwd, &unsaved),
+        std::path::PathBuf::from(expected),
+        "an unsaved session falls back to a truncated id, not a bare name"
+    );
+
+    assert_eq!(
+        resolve_output_path(cwd, "report.html"),
+        std::path::PathBuf::from("/work/project/report.html"),
+        "a relative argument resolves against the working directory"
+    );
+    assert_eq!(
+        resolve_output_path(cwd, "  /tmp/elsewhere.html  "),
+        std::path::PathBuf::from("/tmp/elsewhere.html"),
+        "an absolute argument is taken as given, after trimming"
+    );
+    assert_eq!(
+        resolve_output_path(cwd, "   "),
+        std::path::PathBuf::from("/work/project/pi-session.html"),
+        "whitespace is not a filename"
+    );
+}

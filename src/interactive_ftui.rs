@@ -1053,6 +1053,11 @@ pub enum UiCommand {
     RemoveDir { dir: String },
     /// Crash bundle management (`/crash list|show|delete`, bd-cv653.7.12).
     Crash { action: String },
+    /// Write the conversation to an HTML file (`/export [path]`). The driver
+    /// owns it because the rendering is `Session::to_html` and only the driver
+    /// holds the session; `path` is the raw argument, resolved against the
+    /// working directory by the shared helpers the charmed stack uses.
+    Export { path: String },
 }
 
 /// Does this action edit the input, rather than drive the application?
@@ -2360,6 +2365,13 @@ impl PiFtuiModel {
             );
             self.send_command(UiCommand::RemoveDir {
                 dir: rest.trim().to_string(),
+            });
+            return true;
+        }
+        if let Some(rest) = strip_command(clean, "/export") {
+            self.begin_busy(String::from("exporting ..."));
+            self.send_command(UiCommand::Export {
+                path: rest.trim().to_string(),
             });
             return true;
         }
@@ -4782,6 +4794,50 @@ async fn run_cycle_thinking_command(
     let _ = agent_tx.send(msg);
 }
 
+/// Handle `/export [path]`: write the conversation to an HTML file.
+///
+/// The same `Session::to_html` the charmed stack exports, written to the path
+/// its own helpers choose, so a conversation exported from either stack lands
+/// in the same place with the same contents.
+async fn run_export_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    raw_path: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let (output_path, html) = {
+        let store = handle.session_store();
+        let Ok(session) = store.lock(cx.cx()).await else {
+            let _ = agent_tx.send(PiMsg::AgentError(String::from(
+                "export: session busy; try again",
+            )));
+            return;
+        };
+        let output_path = if raw_path.trim().is_empty() {
+            crate::interactive::default_export_path(cwd, &session)
+        } else {
+            crate::interactive::resolve_output_path(cwd, raw_path)
+        };
+        (output_path, session.to_html())
+    };
+
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "export: failed to create dir: {err}"
+        )));
+        return;
+    }
+    let message = match std::fs::write(&output_path, html) {
+        Ok(()) => PiMsg::System(format!("Exported HTML: {}", output_path.display())),
+        Err(err) => PiMsg::AgentError(format!("export: failed to write: {err}")),
+    };
+    let _ = agent_tx.send(message);
+}
+
 /// Handle `/name <name>`: set the session display name.
 async fn run_set_name_command(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -5352,6 +5408,9 @@ pub fn run(
                         }
                         Ok(UiCommand::CycleThinking) => {
                             run_cycle_thinking_command(&mut handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Export { path }) => {
+                            run_export_command(&handle, &bash_cwd, &path, &agent_tx).await;
                         }
                         Ok(UiCommand::SetName(name)) => {
                             run_set_name_command(&mut handle, &name, &agent_tx).await;
@@ -6010,6 +6069,37 @@ mod tests {
                 "/{name} is a real pi command and must not be called unknown: {message}"
             );
         }
+    }
+
+    #[test]
+    fn slash_export_routes_with_and_without_a_path() {
+        // /export was one of the 24 this stack did not implement; it answered
+        // "Unknown command: /export" until it was routed.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        type_str(&mut sim, "/export");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("bare /export routed"),
+            UiCommand::Export {
+                path: String::new()
+            },
+            "a bare /export must let the driver choose the default filename"
+        );
+
+        type_str(&mut sim, "/export  out/report.html ");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("/export <path> routed"),
+            UiCommand::Export {
+                path: String::from("out/report.html")
+            },
+            "the argument must reach the driver trimmed and otherwise untouched"
+        );
     }
 
     #[test]

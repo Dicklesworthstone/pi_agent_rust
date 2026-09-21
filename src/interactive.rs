@@ -101,6 +101,38 @@ use self::commands::{
 // Session→conversation snapshot; re-exported for the ftui migration stack
 // (bd-cv653.9.1) to rebuild its transcript after /resume.
 pub use self::conversation::conversation_from_session;
+
+/// Where `/export` writes when it is given no argument.
+///
+/// Free rather than a `PiApp` method because the ftui stack runs the same
+/// `/export` (bd-cv653) and must not name its files differently: an exported
+/// conversation should land in the same place whichever stack wrote it.
+pub(crate) fn default_export_path(cwd: &Path, session: &Session) -> PathBuf {
+    if let Some(path) = session.path.as_ref() {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session");
+        return cwd.join(format!("pi-session-{stem}.html"));
+    }
+    let id = crate::session_picker::truncate_session_id(&session.header.id, 8);
+    cwd.join(format!("pi-session-unsaved-{id}.html"))
+}
+
+/// Resolve an explicit `/export <path>` argument against the working
+/// directory. A relative path is joined; an absolute one is taken as given.
+pub(crate) fn resolve_output_path(cwd: &Path, raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return cwd.join("pi-session.html");
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
 use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
 pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
 use self::file_refs::{
@@ -1082,28 +1114,11 @@ impl PiApp {
     }
 
     fn default_export_path(&self, session: &Session) -> PathBuf {
-        if let Some(path) = session.path.as_ref() {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session");
-            return self.cwd.join(format!("pi-session-{stem}.html"));
-        }
-        let id = crate::session_picker::truncate_session_id(&session.header.id, 8);
-        self.cwd.join(format!("pi-session-unsaved-{id}.html"))
+        default_export_path(&self.cwd, session)
     }
 
     fn resolve_output_path(&self, raw: &str) -> PathBuf {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            return self.cwd.join("pi-session.html");
-        }
-        let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            path
-        } else {
-            self.cwd.join(path)
-        }
+        resolve_output_path(&self.cwd, raw)
     }
 
     fn spawn_save_session(&self) {
