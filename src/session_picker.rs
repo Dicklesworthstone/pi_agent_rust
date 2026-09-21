@@ -1638,18 +1638,35 @@ mod tests {
         fs::write(v2_path.join("manifest.json"), "manifest").expect("write V2 manifest");
 
         let trash_script = tmp.path().join("successful-noop-trash.sh");
-        fs::write(&trash_script, "#!/bin/sh\nexit 0\n").expect("write trash script");
+        // The script records that it ran. Without that, a spawn failure — fork
+        // exhaustion or ETXTBSY on a loaded host — sends
+        // `delete_session_file_with_trash_cmd` down its fallback path, which
+        // deletes directly and returns Ok, and this test then fails claiming
+        // sidecar deletion was authorized. It was not: the command never ran,
+        // and that is a different fact deserving a different message.
+        let trash_ran = tmp.path().join("trash-ran");
+        fs::write(
+            &trash_script,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", trash_ran.display()),
+        )
+        .expect("write trash script");
         let mut permissions = fs::metadata(&trash_script)
             .expect("trash script metadata")
             .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&trash_script, permissions).expect("chmod trash script");
 
-        let error = delete_session_file_with_trash_cmd(
+        let outcome = delete_session_file_with_trash_cmd(
             &session_path,
             trash_script.to_string_lossy().as_ref(),
-        )
-        .expect_err("an exit-zero no-op trash command must not authorize sidecar deletion");
+        );
+        assert!(
+            trash_ran.exists(),
+            "the trash command never ran, so this exercised the direct-removal \
+             fallback rather than the no-op trash path it is named for"
+        );
+        let error = outcome
+            .expect_err("an exit-zero no-op trash command must not authorize sidecar deletion");
         assert!(error.to_string().contains("left the session in place"));
         for artifact in [&session_path, &wal_path, &shm_path, &journal_path, &v2_path] {
             assert!(

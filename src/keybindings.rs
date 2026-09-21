@@ -1621,9 +1621,15 @@ impl KeyBindings {
         // Session Picker
         // Unimplemented actions have no default bindings so `/hotkeys` does not
         // falsely advertise them; explicit bindings via keybindings.json remain valid.
-        m.insert(AppAction::ToggleSessionPath, vec![]);
-        m.insert(AppAction::ToggleSessionSort, vec![]);
-        m.insert(AppAction::ToggleSessionNamedFilter, vec![]);
+        // Session-picker controls. Scoped: `browse::action` resolves a key
+        // only against PICKER_ACTIONS, so these coexist with the same chords
+        // elsewhere the way DeleteSession=ctrl+d already coexists with Exit.
+        m.insert(AppAction::ToggleSessionPath, vec![KeyBinding::ctrl("p")]);
+        m.insert(AppAction::ToggleSessionSort, vec![KeyBinding::ctrl("s")]);
+        m.insert(
+            AppAction::ToggleSessionNamedFilter,
+            vec![KeyBinding::ctrl("n")],
+        );
         m.insert(AppAction::RenameSession, vec![]);
         m.insert(AppAction::DeleteSession, vec![KeyBinding::ctrl("d")]);
         m.insert(AppAction::DeleteSessionNoninvasive, vec![]);
@@ -2899,12 +2905,31 @@ mod tests {
         #[test]
         fn session_picker_default_bindings_and_hotkeys() {
             let bindings = KeyBindings::default();
-            // Unimplemented session-picker actions have empty default bindings
-            assert!(bindings.get_bindings(AppAction::ToggleSessionPath).is_empty());
-            assert!(bindings.get_bindings(AppAction::ToggleSessionSort).is_empty());
-            assert!(bindings.get_bindings(AppAction::ToggleSessionNamedFilter).is_empty());
+            // The rule here is "unimplemented actions stay unbound, so
+            // /hotkeys never advertises a dead key". The three browse controls
+            // were unimplemented when that rule was written and are not any
+            // more: 1f2a2e7aa added `apply_browser_control` and the arms in
+            // `handle_browse_key` that reach it. Binding them is the same rule
+            // applied to the new facts, not an exception to it.
+            assert_eq!(
+                bindings.get_bindings(AppAction::ToggleSessionPath),
+                &[KeyBinding::ctrl("p")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::ToggleSessionSort),
+                &[KeyBinding::ctrl("s")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::ToggleSessionNamedFilter),
+                &[KeyBinding::ctrl("n")]
+            );
+            // Still genuinely unimplemented, so still unbound.
             assert!(bindings.get_bindings(AppAction::RenameSession).is_empty());
-            assert!(bindings.get_bindings(AppAction::DeleteSessionNoninvasive).is_empty());
+            assert!(
+                bindings
+                    .get_bindings(AppAction::DeleteSessionNoninvasive)
+                    .is_empty()
+            );
 
             // DeleteSession is implemented and retains ctrl+d
             assert_eq!(
@@ -2923,13 +2948,15 @@ mod tests {
                 &[KeyBinding::plain("escape"), KeyBinding::ctrl("c")]
             );
 
-            // Hotkeys formatting lists DeleteSession under Session Picker, but none of the retired actions
+            // /hotkeys lists what works and nothing else: the three browse
+            // controls now appear because they now do something, while the
+            // two that remain unimplemented stay off the list.
             let hotkeys = format_hotkeys(&bindings);
             assert!(hotkeys.contains("## Session Picker"));
             assert!(hotkeys.contains("Delete session"));
-            assert!(!hotkeys.contains("Toggle path display"));
-            assert!(!hotkeys.contains("Toggle sort mode"));
-            assert!(!hotkeys.contains("Toggle named-only filter"));
+            assert!(hotkeys.contains("Toggle path display"));
+            assert!(hotkeys.contains("Toggle sort mode"));
+            assert!(hotkeys.contains("Toggle named-only filter"));
             assert!(!hotkeys.contains("Rename session"));
             assert!(!hotkeys.contains("Delete session (when query empty)"));
         }
