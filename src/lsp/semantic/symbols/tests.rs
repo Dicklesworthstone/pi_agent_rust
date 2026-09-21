@@ -142,3 +142,5 @@ fn validates_query_and_anchor_before_any_file_or_server_access() {
     let missing: LspInput = serde_json::from_value(json!({"action":"symbols","query":"Module"})).unwrap();
     assert!(request(&missing).is_err());
 }
+
+mod protocol;
