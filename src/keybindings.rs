@@ -1634,7 +1634,6 @@ impl KeyBindings {
         m.insert(AppAction::DeleteSession, vec![KeyBinding::ctrl("d")]);
         m.insert(AppAction::DeleteSessionNoninvasive, vec![]);
 
-
         m
     }
 }
@@ -2938,11 +2937,26 @@ mod tests {
             );
 
             // Selection actions retain defaults
-            assert_eq!(bindings.get_bindings(AppAction::SelectUp), &[KeyBinding::plain("up")]);
-            assert_eq!(bindings.get_bindings(AppAction::SelectDown), &[KeyBinding::plain("down")]);
-            assert_eq!(bindings.get_bindings(AppAction::SelectPageUp), &[KeyBinding::plain("pageup")]);
-            assert_eq!(bindings.get_bindings(AppAction::SelectPageDown), &[KeyBinding::plain("pagedown")]);
-            assert_eq!(bindings.get_bindings(AppAction::SelectConfirm), &[KeyBinding::plain("enter")]);
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectUp),
+                &[KeyBinding::plain("up")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectDown),
+                &[KeyBinding::plain("down")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectPageUp),
+                &[KeyBinding::plain("pageup")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectPageDown),
+                &[KeyBinding::plain("pagedown")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectConfirm),
+                &[KeyBinding::plain("enter")]
+            );
             assert_eq!(
                 bindings.get_bindings(AppAction::SelectCancel),
                 &[KeyBinding::plain("escape"), KeyBinding::ctrl("c")]
@@ -2962,4 +2976,3 @@ mod tests {
         }
     }
 }
-

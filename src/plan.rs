@@ -271,6 +271,7 @@ impl PlanState {
         }
         let plan = inner.plan.clone()?;
         inner.mode = PlanMode::Approved;
+        drop(inner);
         Some(plan)
     }
 
@@ -285,6 +286,7 @@ impl PlanState {
         }
         let plan = inner.plan.clone()?;
         inner.mode = PlanMode::Approved;
+        drop(inner);
         Some(plan)
     }
 
@@ -620,9 +622,7 @@ mod tests {
         assert_eq!(state.mode(), PlanMode::Off);
         state.enter_planning();
         assert!(!execute_plan(&state, false, text).is_error);
-        assert!(
-            execute_plan(&state, true, "another complete plan to substitute").is_error
-        );
+        assert!(execute_plan(&state, true, "another complete plan to substitute").is_error);
         assert_eq!(state.mode(), PlanMode::PendingApproval);
         assert_eq!(state.plan().as_deref(), Some(text));
     }

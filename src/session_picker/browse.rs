@@ -426,7 +426,11 @@ impl SessionPicker {
                 browser.visible.len(),
                 self.sessions.len(),
                 browser.sort.label(),
-                if browser.named_only { "named only" } else { "all" },
+                if browser.named_only {
+                    "named only"
+                } else {
+                    "all"
+                },
             ),
             width,
         ));

@@ -45,6 +45,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/agent_hub.rs` | Agent hub registry (bd-cv653.5.3): session-scoped roster of spawned child agents | Unit (7 tests); `tests/agent_hub.rs`. |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
 | `src/approval.rs` | Tool approval flow | `tests/e2e_plan_mode.rs`, `tests/e2e_rpc.rs` approval paths. |
+| `src/approval/scope.rs` | Approval plan file scoping | Unit; in-module unit tests; `tests/e2e_plan_mode.rs`. |
 | `src/artifact_output.rs` | Artifact output formatting | Unit; covered through agent/tools suites. |
 | `src/ask.rs` | Ask prompts | Interactive coverage via `tests/tui_state.rs` and RPC suites. |
 | `src/ast_tools.rs` | AST tools | `tests/ast_tools.rs`, `tests/e2e_ast_tools.rs`. |
@@ -362,6 +363,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_metrics.rs` | Session metrics | Unit; `tests/provider_session_coverage.rs` and session evidence suites. |
 | `src/session_picker.rs` | Session picker UI | Unit; `tests/session_picker.rs`. |
 | `src/session_picker/browse.rs` | Session picker browse state and navigation | Unit; `tests/session_picker.rs`. |
+| `src/session_picker/browse_controls_tests.rs` | Session picker keyboard navigation and filter controls tests | Test module; in-module unit tests. |
 | `src/session_sqlite.rs` | SQLite session backend | Unit; `tests/session_sqlite.rs`, `tests/fault_injection_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/session_sqlite/attachments.rs` | SQLite session attachment and media blob storage | Unit; `tests/session_sqlite.rs`. |
 | `src/session_sqlite/entry_io.rs` | SQLite session entry serialization, paging, and batch insertion | Unit; `tests/session_sqlite.rs`. |

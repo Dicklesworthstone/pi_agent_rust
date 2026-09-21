@@ -176,7 +176,11 @@
     {
       "evidence": [
         {
-          "forbidden_fragments": ["git clean -fd", "git reset --hard", "rm -rf"]
+          "forbidden_fragments": [
+            "git clean -fd",
+            "git reset --hard",
+            "rm -rf"
+          ]
         },
         {
           "path": "scripts/build_swarm_operator_runpack.py"

@@ -233,7 +233,12 @@ fn empty_collection_and_small_viewports_remain_bounded_under_all_controls() {
     let mut picker = SessionPicker::new(Vec::new());
     for height in [0, 1, 8, 9, 12, 24] {
         picker.update(Message::new(WindowSizeMsg { width: 20, height }));
-        for kind in [KeyType::CtrlN, KeyType::CtrlS, KeyType::CtrlP, KeyType::PgDown] {
+        for kind in [
+            KeyType::CtrlN,
+            KeyType::CtrlS,
+            KeyType::CtrlP,
+            KeyType::PgDown,
+        ] {
             press(&mut picker, kind, "");
             assert!(picker.browser.visible.is_empty());
             assert_eq!(picker.selected, 0);

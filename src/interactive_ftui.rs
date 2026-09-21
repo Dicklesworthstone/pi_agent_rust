@@ -2636,7 +2636,8 @@ impl PiFtuiModel {
             }
             AppAction::SelectDown => {
                 if let Some(picker) = self.picker.as_mut() {
-                    picker.selected = (picker.selected + 1).min(picker.items.len().saturating_sub(1));
+                    picker.selected =
+                        (picker.selected + 1).min(picker.items.len().saturating_sub(1));
                 }
             }
             AppAction::SelectPageUp => {
@@ -2646,7 +2647,8 @@ impl PiFtuiModel {
             }
             AppAction::SelectPageDown => {
                 if let Some(picker) = self.picker.as_mut() {
-                    picker.selected = (picker.selected + page).min(picker.items.len().saturating_sub(1));
+                    picker.selected =
+                        (picker.selected + page).min(picker.items.len().saturating_sub(1));
                 }
             }
             AppAction::SelectCancel => {
@@ -2703,7 +2705,6 @@ impl PiFtuiModel {
         (self.keybindings.get_bindings(action) == KeyBindings::new().get_bindings(action))
             .then_some(action)
     }
-
 
     fn apply_picker_choice(&mut self, kind: PickerKind, choice: &str) {
         match kind {
@@ -8034,11 +8035,17 @@ mod tests {
 
         // Plain 'Escape' should not close because selectCancel was rebound to 'q'
         sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
-        assert!(sim.model().picker.is_some(), "picker unexpectedly closed on Escape");
+        assert!(
+            sim.model().picker.is_some(),
+            "picker unexpectedly closed on Escape"
+        );
 
         // Rebound 'q' closes the picker
         sim.inject_event(key(KeyCode::Char('q'), Modifiers::empty()));
-        assert!(sim.model().picker.is_none(), "picker did not close on rebound key 'q'");
+        assert!(
+            sim.model().picker.is_none(),
+            "picker did not close on rebound key 'q'"
+        );
     }
 
     #[test]
@@ -8066,7 +8073,6 @@ mod tests {
         sim.inject_event(key(KeyCode::PageUp, Modifiers::empty()));
         assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
     }
-
 
     #[test]
     fn bare_model_command_opens_picker_and_selection_routes_set_model() {

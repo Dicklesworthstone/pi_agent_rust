@@ -26,7 +26,9 @@
         "normalized_inputs.budget_drift.signals",
         "normalized_inputs.budget_drift.recommended_adjustments"
       ],
-      "forbidden_actions": ["local heavyweight cargo fallback"],
+      "forbidden_actions": [
+        "local heavyweight cargo fallback"
+      ],
       "id": "AUTO-001-adjust_swarm_budget",
       "omitted_commands": [
         {
@@ -69,7 +71,9 @@
         "normalized_inputs.cargo_admission.queue_forecast.recommended_action",
         "normalized_inputs.cargo_admission.queue_forecast.slot_pressure"
       ],
-      "forbidden_actions": ["local heavyweight cargo fallback"],
+      "forbidden_actions": [
+        "local heavyweight cargo fallback"
+      ],
       "id": "AUTO-002-wait_for_rch",
       "omitted_commands": [
         {
@@ -114,7 +118,9 @@
         "normalized_inputs.agent_mail.recovery_action",
         "normalized_inputs.agent_mail.recovery_preview_action"
       ],
-      "forbidden_actions": ["automatic file reservation"],
+      "forbidden_actions": [
+        "automatic file reservation"
+      ],
       "id": "AUTO-003-use_beads_soft_lock",
       "omitted_commands": [
         {
@@ -156,7 +162,9 @@
         "normalized_inputs.beads.stale",
         "normalized_inputs.beads.stale_after_hours"
       ],
-      "forbidden_actions": ["destructive cleanup of another agent worktree"],
+      "forbidden_actions": [
+        "destructive cleanup of another agent worktree"
+      ],
       "id": "AUTO-004-reopen_stale_bead_candidate",
       "omitted_commands": [
         {
@@ -275,13 +283,18 @@
     ],
     "status": "deny_new_work"
   },
-  "degraded_reasons": ["Agent Mail status is `degraded`", "budget drift status is `deny_new_work`"],
+  "degraded_reasons": [
+    "Agent Mail status is `degraded`",
+    "budget drift status is `deny_new_work`"
+  ],
   "failure_actions": [
     {
       "catalog_schema": "pi.swarm.failure_action_catalog.v1",
       "category": "agent_mail",
       "escalation": "Run repair only after the dry-run output is understood; continue with Beads assignment as the temporary coordination lock.",
-      "evidence_paths": ["command_provenance[0]"],
+      "evidence_paths": [
+        "command_provenance[0]"
+      ],
       "explanation": "Agent Mail coordination cannot be trusted for reservations or inbox state until the mailbox schema is repaired or restored.",
       "id": "FAIL-AGENT-MAIL-SCHEMA",
       "match_confidence": "high",
@@ -311,7 +324,9 @@
       "catalog_schema": "pi.swarm.failure_action_catalog.v1",
       "category": "rch",
       "escalation": "If saturation persists, split validation by surface or pause heavy cargo work instead of allowing local fallback.",
-      "evidence_paths": ["normalized_inputs.cargo_admission"],
+      "evidence_paths": [
+        "normalized_inputs.cargo_admission"
+      ],
       "explanation": "Cargo admission or queue forecast says RCH capacity is saturated. Keep work narrow and wait before launching heavyweight checks.",
       "id": "FAIL-RCH-QUEUE-SATURATED",
       "match_confidence": "high",
@@ -341,7 +356,9 @@
       "catalog_schema": "pi.swarm.failure_action_catalog.v1",
       "category": "agent_mail",
       "escalation": "Do not assume reservation writes landed while Mail is degraded; use Beads status and narrow file surfaces until Mail is healthy.",
-      "evidence_paths": ["normalized_inputs.agent_mail"],
+      "evidence_paths": [
+        "normalized_inputs.agent_mail"
+      ],
       "explanation": "Mail may still provide partial read evidence, but it should not be treated as the write-side reservation ledger.",
       "id": "FAIL-AGENT-MAIL-DEGRADED-READONLY",
       "match_confidence": "medium",
@@ -371,7 +388,9 @@
       "catalog_schema": "pi.swarm.failure_action_catalog.v1",
       "category": "beads",
       "escalation": "Do not force-release reservations or alter another agent's files unless Mail or recent commits confirm the claim is abandoned.",
-      "evidence_paths": ["normalized_inputs.beads.stale[0]"],
+      "evidence_paths": [
+        "normalized_inputs.beads.stale[0]"
+      ],
       "explanation": "The captured Beads state shows old in-progress ownership. Confirm abandonment before reopening or taking over the work.",
       "id": "FAIL-BEADS-STALE-OWNER",
       "match_confidence": "medium",
@@ -432,7 +451,10 @@
   },
   "purpose": "dry_run_swarm_autopilot_plan_not_source_of_truth",
   "redaction_summary": {
-    "fields": ["agent_mail_status.registration_token", "doctor_swarm.findings[0].detail"],
+    "fields": [
+      "agent_mail_status.registration_token",
+      "doctor_swarm.findings[0].detail"
+    ],
     "redacted_count": 2
   },
   "schema": "pi.swarm.autopilot_plan.v1",

@@ -152,9 +152,9 @@ Keys are specified as `modifier+key`.
 | Action ID | Default Keys | Description |
 |-----------|--------------|-------------|
 | `deleteSession` | `ctrl+d` | Delete session |
-| `toggleSessionPath` | *(none)* | Toggle path display (reserved) |
-| `toggleSessionSort` | *(none)* | Toggle sort mode (reserved) |
-| `toggleSessionNamedFilter` | *(none)* | Toggle named-only filter (reserved) |
+| `toggleSessionPath` | `ctrl+p` | Toggle path display |
+| `toggleSessionSort` | `ctrl+s` | Toggle sort mode |
+| `toggleSessionNamedFilter` | `ctrl+n` | Toggle named-only filter |
 | `renameSession` | *(none)* | Rename session (reserved) |
 | `deleteSessionNoninvasive` | *(none)* | Delete session when query is empty (reserved) |
 

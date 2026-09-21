@@ -56,7 +56,12 @@
     {
       "boundary": "summarize_beads",
       "details": {
-        "first_retained_ids": ["bd-fuzz-000", "bd-fuzz-004", "bd-fuzz-008", "bd-fuzz-012"],
+        "first_retained_ids": [
+          "bd-fuzz-000",
+          "bd-fuzz-004",
+          "bd-fuzz-008",
+          "bd-fuzz-012"
+        ],
         "input_issue_count": 17,
         "open_candidate_count": 17,
         "retained_open_candidates": 4
@@ -70,7 +75,11 @@
     {
       "boundary": "parse_issue_list/summarize_beads",
       "details": {
-        "normalized_order": ["bd-order-a", "bd-order-b", "bd-order-c"]
+        "normalized_order": [
+          "bd-order-a",
+          "bd-order-b",
+          "bd-order-c"
+        ]
       },
       "expected_classification": "equivalent_ok",
       "id": "ordering_perturbation_equivalence",
@@ -98,11 +107,15 @@
       "details": {
         "deletion_request": {
           "classification": "never_execute",
-          "reason_codes": ["filesystem_deletion_request"]
+          "reason_codes": [
+            "filesystem_deletion_request"
+          ]
         },
         "missing_text": {
           "classification": "blocked",
-          "reason_codes": ["missing_command_text"]
+          "reason_codes": [
+            "missing_command_text"
+          ]
         }
       },
       "expected_classification": "blocked_or_never_execute",

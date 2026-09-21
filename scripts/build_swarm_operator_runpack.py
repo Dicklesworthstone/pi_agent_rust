@@ -37877,17 +37877,29 @@ def run_self_test() -> int:
             real_beads_workspace = workspace / "real-beads-workspace"
             real_beads_workspace.mkdir()
 
+            beads_env = dict(os.environ)
+            for key in (
+                "BEADS_DB",
+                "BEADS_DIR",
+                "BD_DB",
+                "BD_DATABASE",
+                "BEADS_WORKSPACE",
+                "BEADS_CONFIG",
+            ):
+                beads_env.pop(key, None)
+
             def run_real_br(*command: str) -> str:
                 completed = subprocess.run(
                     ["br", *command],
                     cwd=real_beads_workspace,
+                    env=beads_env,
                     text=True,
                     capture_output=True,
                     check=False,
                 )
                 if completed.returncode != 0:
                     raise AssertionError(
-                        f"br {' '.join(command)} failed: {completed.stderr}"
+                        f"br {' '.join(command)} failed (code {completed.returncode}): stdout={completed.stdout!r} stderr={completed.stderr!r}"
                     )
                 return completed.stdout
 

@@ -602,7 +602,7 @@
 | Select model | Y | Y | Ctrl+L | ftui gained it in d5bcc2eb6 |
 | Expand tools | Y | P | Ctrl+O | Classic only; ftui renders no expandable tool output |
 | Toggle thinking | Y | P | Ctrl+T | Classic only; ftui renders no thinking content to toggle |
-| Toggle session named filter | Y | X | (none) | Unimplemented; default binding retired so `/hotkeys` does not advertise it |
+| Toggle session named filter | Y | P | Ctrl+N | Classic only; inert on ftui |
 | External editor | Y | P | Ctrl+G | Classic only; inert on ftui |
 | Follow up | Y | P | Alt+Enter | Classic only. On ftui the chord reaches the editor and inserts a newline |
 | Dequeue | Y | P | Alt+Up | Classic only; inert on ftui |

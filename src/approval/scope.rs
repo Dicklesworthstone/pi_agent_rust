@@ -19,7 +19,7 @@ const MAX_COMPONENTS: usize = 64;
 
 /// Make structured tool input part of the exact text that gets reviewed.
 /// It must not override another declaration or live only in hidden metadata.
-pub(crate) fn append_files_declaration(plan: &str, files: &Value) -> Result<String, &'static str> {
+pub fn append_files_declaration(plan: &str, files: &Value) -> Result<String, &'static str> {
     if plan.len() > crate::plan::MAX_PLAN_BYTES {
         return Err("plan plus files exceeds the 256 KiB UTF-8 limit");
     }
@@ -42,7 +42,9 @@ pub(crate) fn append_files_declaration(plan: &str, files: &Value) -> Result<Stri
     }
     let text = format!("{plan}\n\nFiles: {declaration}");
     if parse_plan_files(&text).len() != entries.len() {
-        return Err("use files or one top-level Files: declaration, not both; close any code fence");
+        return Err(
+            "use files or one top-level Files: declaration, not both; close any code fence",
+        );
     }
     Ok(text)
 }
@@ -141,7 +143,9 @@ fn normalized_path(path: &str, pattern: bool) -> Option<&str> {
         || path.len() > MAX_PATH_BYTES
         || path.trim() != path
         || path.chars().any(char::is_control)
-        || path.contains(['\\', ':', '~', '$', '?', '[', ']', '{', '}', '"', '\'', '`', '#'])
+        || path.contains([
+            '\\', ':', '~', '$', '?', '[', ']', '{', '}', '"', '\'', '`', '#',
+        ])
     {
         return None;
     }
@@ -187,7 +191,10 @@ fn reserved_device(component: &str) -> bool {
             .strip_prefix("COM")
             .or_else(|| upper.strip_prefix("LPT"))
             .is_some_and(|number| {
-                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+                matches!(
+                    number,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
             })
 }
 
@@ -263,14 +270,38 @@ mod tests {
     #[test]
     fn traversal_and_ambiguous_paths_never_inherit_directory_approval() {
         for path in [
-            "src/../secret", "src/a/../../secret", "../src/a", "/src/a",
-            "src/./a", "src//a", "src/a/", "src/a.", "src/a /b",
-            "src/a\0b", "src/a\nb", "src\\a", "C:/src/a", "//host/src/a",
-            "src/a:stream", "~/src/a", "$HOME/src/a", "src/NUL.txt",
-            "src/COM1", "src/LPT9.log", "src/COM¹.txt", "src/LPT²", "src/NUL .txt",
-            "src/CONIN$", "./", ".", "",
+            "src/../secret",
+            "src/a/../../secret",
+            "../src/a",
+            "/src/a",
+            "src/./a",
+            "src//a",
+            "src/a/",
+            "src/a.",
+            "src/a /b",
+            "src/a\0b",
+            "src/a\nb",
+            "src\\a",
+            "C:/src/a",
+            "//host/src/a",
+            "src/a:stream",
+            "~/src/a",
+            "$HOME/src/a",
+            "src/NUL.txt",
+            "src/COM1",
+            "src/LPT9.log",
+            "src/COM¹.txt",
+            "src/LPT²",
+            "src/NUL .txt",
+            "src/CONIN$",
+            "./",
+            ".",
+            "",
         ] {
-            assert!(!covers("Files: src/", path), "unexpected grant for {path:?}");
+            assert!(
+                !covers("Files: src/", path),
+                "unexpected grant for {path:?}"
+            );
         }
         assert!(covers("Files: src/", "./src/a"));
         assert!(covers("Files: src/", "src/a/b"));
@@ -299,7 +330,10 @@ mod tests {
         assert!(!covers("Files: src/**", "src"));
         assert!(!covers("Files: sr*/**", "src"));
         assert!(covers("Files: src/**", "src/file"));
-        assert!(covers("Files: src/**/test*/case.rs", "src/tests/a/test_one/case.rs"));
+        assert!(covers(
+            "Files: src/**/test*/case.rs",
+            "src/tests/a/test_one/case.rs"
+        ));
     }
 
     #[test]
@@ -308,7 +342,10 @@ mod tests {
         assert!(!covers("Files: src/**", "src/.git/hooks/pre-commit"));
         assert!(!covers("Files: src/*.rs", "src/.secret.rs"));
         assert!(covers("Files: src/.*.rs", "src/.config.rs"));
-        assert!(covers("Files: src/.private/**/*.rs", "src/.private/test.rs"));
+        assert!(covers(
+            "Files: src/.private/**/*.rs",
+            "src/.private/test.rs"
+        ));
     }
 
     #[test]
@@ -348,7 +385,7 @@ mod tests {
             r#"Files: ["src/", ""]"#,
             r#"Files: ["src/",]"#,
             r#"Files: ["src/"] trailing"#,
-            r#"Files: []"#,
+            r"Files: []",
             r#"Files: ["src/", null]"#,
         ] {
             assert!(!covers(declaration, "src/main.rs"), "{declaration}");
@@ -385,7 +422,10 @@ mod tests {
         );
         assert!(!covers(&excess_json, "src/main.rs"));
         assert!(!covers("Files: **", &"x".repeat(MAX_PATH_BYTES + 1)));
-        assert!(!covers("Files: **", &vec!["x"; MAX_COMPONENTS + 1].join("/")));
+        assert!(!covers(
+            "Files: **",
+            &vec!["x"; MAX_COMPONENTS + 1].join("/")
+        ));
         let plan = format!("Files: src/\n{}", "x".repeat(crate::plan::MAX_PLAN_BYTES));
         assert!(!covers(&plan, "src/main.rs"));
         let invalid_tail = format!("Files: src/, {}", "x".repeat(MAX_PATH_BYTES + 1));
@@ -394,7 +434,12 @@ mod tests {
 
     #[test]
     fn absent_or_nonliteral_target_arguments_cannot_inherit_scope() {
-        for arguments in [json!({}), json!({"path": null}), json!({"path": ["src/a"]}), json!({"path": "src/*.rs"})] {
+        for arguments in [
+            json!({}),
+            json!({"path": null}),
+            json!({"path": ["src/a"]}),
+            json!({"path": "src/*.rs"}),
+        ] {
             assert!(!plan_covers_target(Some("Files: src/"), &arguments));
         }
         assert!(!plan_covers_target(None, &json!({"path": "src/a"})));
@@ -403,13 +448,22 @@ mod tests {
     #[test]
     fn component_glob_is_anchored_nonoverlapping_and_unicode_safe() {
         for (pattern, name, expected) in [
-            ("a*a", "a", false), ("ab*bc", "abc", false),
-            ("ab*bc", "abbc", true), ("a*b*c", "a1b2c", true),
-            ("a*b*c", "xa1b2c", false), ("a*b*c", "a1b2cx", false),
-            ("*é*计划", "café和计划", true), ("é*é", "é", false),
-            ("*", "name", true), ("*", ".hidden", false),
+            ("a*a", "a", false),
+            ("ab*bc", "abc", false),
+            ("ab*bc", "abbc", true),
+            ("a*b*c", "a1b2c", true),
+            ("a*b*c", "xa1b2c", false),
+            ("a*b*c", "a1b2cx", false),
+            ("*é*计划", "café和计划", true),
+            ("é*é", "é", false),
+            ("*", "name", true),
+            ("*", ".hidden", false),
         ] {
-            assert_eq!(component_matches(pattern, name), expected, "{pattern} / {name}");
+            assert_eq!(
+                component_matches(pattern, name),
+                expected,
+                "{pattern} / {name}"
+            );
         }
     }
 
@@ -425,11 +479,31 @@ mod tests {
     fn production_approval_rejects_traversal_despite_a_matching_raw_prefix() {
         let approval = ApprovalState::new(ApprovalMode::AlwaysAsk, true, Vec::new());
         let plan = approved("Files: src/");
-        for path in ["src/../outside", "src/main.rs/../../outside", "src\\..\\outside"] {
-            let result = approval.evaluate("write", &json!({"path": path}), ToolEffects::write(), Some(&plan), None);
+        for path in [
+            "src/../outside",
+            "src/main.rs/../../outside",
+            "src\\..\\outside",
+        ] {
+            let result = approval.evaluate(
+                "write",
+                &json!({"path": path}),
+                ToolEffects::write(),
+                Some(&plan),
+                None,
+            );
             assert!(result.requires_approval(), "{path}");
         }
-        assert!(approval.evaluate("write", &json!({"path": "src/main.rs"}), ToolEffects::write(), Some(&plan), None).is_auto_approved());
+        assert!(
+            approval
+                .evaluate(
+                    "write",
+                    &json!({"path": "src/main.rs"}),
+                    ToolEffects::write(),
+                    Some(&plan),
+                    None
+                )
+                .is_auto_approved()
+        );
     }
 
     #[test]
@@ -437,13 +511,46 @@ mod tests {
         let approval = ApprovalState::new(ApprovalMode::AlwaysAsk, true, Vec::new());
         let plan = approved("Files: src/");
         for name in ["write", "edit", "hashline_edit"] {
-            assert!(approval.evaluate(name, &json!({"path": "src/a"}), ToolEffects::write(), Some(&plan), None).is_auto_approved());
+            assert!(
+                approval
+                    .evaluate(
+                        name,
+                        &json!({"path": "src/a"}),
+                        ToolEffects::write(),
+                        Some(&plan),
+                        None
+                    )
+                    .is_auto_approved()
+            );
         }
         for name in ["custom_writer", "ast_edit", "lsp", "mcp", "append"] {
-            assert!(approval.evaluate(name, &json!({"path": "src/a"}), ToolEffects::write(), Some(&plan), None).requires_approval());
+            assert!(
+                approval
+                    .evaluate(
+                        name,
+                        &json!({"path": "src/a"}),
+                        ToolEffects::write(),
+                        Some(&plan),
+                        None
+                    )
+                    .requires_approval()
+            );
         }
-        for effects in [ToolEffects::write().union(ToolEffects::process()), ToolEffects::write().union(ToolEffects::network())] {
-            assert!(approval.evaluate("write", &json!({"path": "src/a"}), effects, Some(&plan), None).requires_approval());
+        for effects in [
+            ToolEffects::write().union(ToolEffects::process()),
+            ToolEffects::write().union(ToolEffects::network()),
+        ] {
+            assert!(
+                approval
+                    .evaluate(
+                        "write",
+                        &json!({"path": "src/a"}),
+                        effects,
+                        Some(&plan),
+                        None
+                    )
+                    .requires_approval()
+            );
         }
     }
 
@@ -456,7 +563,17 @@ mod tests {
         for mode in [PlanMode::PendingApproval, PlanMode::Planning] {
             assert_eq!(plan.mode(), mode);
             for path in ["src/a", "other/a"] {
-                assert!(approval.evaluate("write", &json!({"path": path}), ToolEffects::write(), Some(&plan), None).requires_approval());
+                assert!(
+                    approval
+                        .evaluate(
+                            "write",
+                            &json!({"path": path}),
+                            ToolEffects::write(),
+                            Some(&plan),
+                            None
+                        )
+                        .requires_approval()
+                );
             }
             let _ = plan.reject();
         }
@@ -467,10 +584,30 @@ mod tests {
         let plan = approved("Files: src/");
         for mode in [ApprovalMode::Write, ApprovalMode::Yolo] {
             let approval = ApprovalState::new(mode, true, Vec::new());
-            assert!(approval.evaluate("write", &json!({"path": "outside"}), ToolEffects::write(), Some(&plan), None).is_auto_approved());
+            assert!(
+                approval
+                    .evaluate(
+                        "write",
+                        &json!({"path": "outside"}),
+                        ToolEffects::write(),
+                        Some(&plan),
+                        None
+                    )
+                    .is_auto_approved()
+            );
         }
         let disabled = ApprovalState::new(ApprovalMode::AlwaysAsk, false, Vec::new());
-        assert!(disabled.evaluate("write", &json!({"path": "src/a"}), ToolEffects::write(), Some(&plan), None).requires_approval());
+        assert!(
+            disabled
+                .evaluate(
+                    "write",
+                    &json!({"path": "src/a"}),
+                    ToolEffects::write(),
+                    Some(&plan),
+                    None
+                )
+                .requires_approval()
+        );
     }
 
     fn submit_input(plan: &PlanState, auto: bool, input: Value) -> crate::tools::ToolOutput {
@@ -479,7 +616,9 @@ mod tests {
             .build()
             .unwrap();
         let tool = crate::plan::SubmitPlanTool::new(plan.clone(), auto);
-        runtime.block_on(tool.execute("scope-test", input, None)).unwrap()
+        runtime
+            .block_on(tool.execute("scope-test", input, None))
+            .unwrap()
     }
 
     #[test]
@@ -488,28 +627,43 @@ mod tests {
         for auto in [false, true] {
             let plan = PlanState::new();
             plan.enter_planning();
-            let result = submit_input(&plan, auto, json!({
-                "plan": text,
-                "files": ["src/hello world.rs", "src/a,b.rs", "tests/**/*.rs"]
-            }));
+            let result = submit_input(
+                &plan,
+                auto,
+                json!({
+                    "plan": text,
+                    "files": ["src/hello world.rs", "src/a,b.rs", "tests/**/*.rs"]
+                }),
+            );
             assert!(!result.is_error);
             let reviewed = plan.plan().unwrap();
-            assert_eq!(reviewed, format!(
-                "{text}\n\nFiles: [\"src/hello world.rs\",\"src/a,b.rs\",\"tests/**/*.rs\"]"
-            ));
+            assert_eq!(
+                reviewed,
+                format!(
+                    "{text}\n\nFiles: [\"src/hello world.rs\",\"src/a,b.rs\",\"tests/**/*.rs\"]"
+                )
+            );
             if !auto {
                 assert_eq!(plan.mode(), PlanMode::PendingApproval);
                 assert_eq!(plan.approve_reviewed(&reviewed), Some(reviewed));
             }
             let policy = ApprovalState::new(ApprovalMode::AlwaysAsk, true, Vec::new());
             for (path, expected) in [
-                ("src/hello world.rs", true), ("src/a,b.rs", true),
-                ("tests/nested/unit.rs", true), ("src/hello", false),
-                ("world.rs", false), ("src/a", false), ("b.rs", false),
+                ("src/hello world.rs", true),
+                ("src/a,b.rs", true),
+                ("tests/nested/unit.rs", true),
+                ("src/hello", false),
+                ("world.rs", false),
+                ("src/a", false),
+                ("b.rs", false),
                 ("tests/../secret.rs", false),
             ] {
                 let decision = policy.evaluate(
-                    "write", &json!({"path": path}), ToolEffects::write(), Some(&plan), None,
+                    "write",
+                    &json!({"path": path}),
+                    ToolEffects::write(),
+                    Some(&plan),
+                    None,
                 );
                 assert_eq!(decision.is_auto_approved(), expected, "{path}");
             }
@@ -523,13 +677,21 @@ mod tests {
         assert!(plan.submit_plan("retained previous proposal".to_string()));
         assert!(plan.reject());
         for files in [
-            json!(null), json!([]), json!(["src/", 7]), json!(["src/", "../secret"]),
-            json!(["src/", ""]), json!(["src/", "C:/secret"]),
+            json!(null),
+            json!([]),
+            json!(["src/", 7]),
+            json!(["src/", "../secret"]),
+            json!(["src/", ""]),
+            json!(["src/", "C:/secret"]),
             json!(vec!["src/"; MAX_ENTRIES + 1]),
         ] {
-            let result = submit_input(&plan, true, json!({
-                "plan": "Goal: replace files. Verification: test the change.", "files": files
-            }));
+            let result = submit_input(
+                &plan,
+                true,
+                json!({
+                    "plan": "Goal: replace files. Verification: test the change.", "files": files
+                }),
+            );
             assert!(result.is_error);
             assert_eq!(result.details.unwrap()["planReview"], "invalid_scope");
             assert_eq!(plan.mode(), PlanMode::Planning);
@@ -560,9 +722,13 @@ mod tests {
     fn structured_files_share_the_plan_byte_budget() {
         let plan = PlanState::new();
         plan.enter_planning();
-        let result = submit_input(&plan, true, json!({
-            "plan": "x".repeat(crate::plan::MAX_PLAN_BYTES), "files": ["src/"]
-        }));
+        let result = submit_input(
+            &plan,
+            true,
+            json!({
+                "plan": "x".repeat(crate::plan::MAX_PLAN_BYTES), "files": ["src/"]
+            }),
+        );
         assert!(result.is_error);
         assert_eq!(plan.mode(), PlanMode::Planning);
         assert!(plan.plan().is_none());
@@ -573,8 +739,9 @@ mod tests {
         fn oracle(pattern: &[u8], name: &[u8]) -> bool {
             match pattern.first() {
                 None => name.is_empty(),
-                Some(b'*') => oracle(&pattern[1..], name)
-                    || (!name.is_empty() && oracle(pattern, &name[1..])),
+                Some(b'*') => {
+                    oracle(&pattern[1..], name) || (!name.is_empty() && oracle(pattern, &name[1..]))
+                }
                 Some(byte) => name.first() == Some(byte) && oracle(&pattern[1..], &name[1..]),
             }
         }
