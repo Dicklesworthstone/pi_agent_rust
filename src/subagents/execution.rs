@@ -31,9 +31,9 @@ use std::time::Duration;
 #[cfg(any(not(unix), test))]
 use std::time::Instant;
 
+mod ownership;
 #[cfg(unix)]
 mod pipes;
-mod ownership;
 use ownership::HubLease;
 
 const DRAIN_BATCH: usize = 32;
@@ -232,7 +232,10 @@ impl ChildRunner {
         }
         // Tracking is a launch prerequisite, not optional telemetry. A failed
         // registration must never leave an unsteerable/uncontrollable child.
-        let hub_entry = match attempt.hub.register(&agent.name, &attempt.result.task, self.hub_kind) {
+        let hub_entry = match attempt
+            .hub
+            .register(&agent.name, &attempt.result.task, self.hub_kind)
+        {
             Ok(entry) => entry,
             Err(error) => {
                 attempt.result.fail(error.to_string());
