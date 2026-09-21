@@ -1669,12 +1669,24 @@ async fn run(
         for name in &unknown_tools {
             eprintln!("Warning: --tools: \"{name}\" is not a tool pi provides; it is ignored");
         }
-        // The constant groups registry-built names ahead of host-coupled ones,
+        // The constants group registry-built names ahead of host-coupled ones,
         // which is the right order to read the code in and the wrong one to
         // scan for a name.
         let mut provided = ToolRegistry::KNOWN_TOOL_NAMES.to_vec();
+        provided.extend(
+            ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                .iter()
+                .map(|(name, _)| *name),
+        );
         provided.sort_unstable();
         eprintln!("Warning: --tools: pi provides {}", provided.join(", "));
+    }
+    // A real tool the flag has no say over. Saying nothing invites the user to
+    // conclude the tool is missing; saying "not a tool pi provides" — which is
+    // what this printed before — tells them something false about a tool they
+    // can actually have.
+    for (name, how) in pi::tools::unselectable_tool_names(&shared_enabled_tools) {
+        eprintln!("Warning: --tools: \"{name}\" is not selected with --tools; {how}");
     }
     let shared_tools = pi::tools::SharedToolRegistry::new(ToolRegistry::with_mutation_recorder(
         &shared_enabled_tools,

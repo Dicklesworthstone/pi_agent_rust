@@ -5373,7 +5373,14 @@ pub struct ToolRegistry {
     shared: Option<std::sync::Weak<SharedToolRegistryInner>>,
 }
 
-/// The requested tool names pi will silently ignore.
+/// How the memory-bank tools are turned on, quoted in the `--tools` warning.
+const MEMORY_BANK_HOW: &str = "set memory.backend to \"local\" in settings.json";
+
+/// The requested tool names pi does not provide at all.
+///
+/// A name pi DOES provide but does not select through `--tools` is not one of
+/// these; see [`unselectable_tool_names`]. Calling both a typo and a real tool
+/// "not a tool pi provides" was wrong about seven shipped tools.
 ///
 /// Order and duplicates follow the request, so the warning reads back what the
 /// user typed.
@@ -5381,8 +5388,32 @@ pub struct ToolRegistry {
 pub fn unknown_tool_names(requested: &[&str]) -> Vec<String> {
     requested
         .iter()
-        .filter(|name| !ToolRegistry::KNOWN_TOOL_NAMES.contains(*name))
+        .filter(|name| {
+            !ToolRegistry::KNOWN_TOOL_NAMES.contains(*name)
+                && !ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                    .iter()
+                    .any(|(name_, _)| name_ == *name)
+        })
         .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// The requested names that are real tools `--tools` has no say over, paired
+/// with what does decide them.
+///
+/// Listing one of these is harmless but has no effect, which is worth saying:
+/// the user asked for a tool by name and pi is about to decide its presence on
+/// other grounds entirely.
+#[must_use]
+pub fn unselectable_tool_names(requested: &[&str]) -> Vec<(String, &'static str)> {
+    requested
+        .iter()
+        .filter_map(|name| {
+            ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                .iter()
+                .find(|(name_, _)| name_ == name)
+                .map(|(_, how)| ((*name).to_string(), *how))
+        })
         .collect()
 }
 
@@ -5409,8 +5440,11 @@ impl ToolRegistry {
     ///
     /// Keep it in step with that match. `tool_registry_builds_every_listed_name`
     /// fails if a name here builds nothing, which is the direction that would
-    /// promise a tool pi cannot deliver; the reverse — an arm nobody listed —
-    /// costs a spurious warning for a tool that still works.
+    /// promise a tool pi cannot deliver. The reverse direction — a tool pi
+    /// registers that no list mentions — used to cost a spurious "not a tool pi
+    /// provides" warning; it is now covered by
+    /// [`Self::TOOLS_NOT_SELECTED_BY_FLAG`] and
+    /// `every_registerable_tool_is_named_in_one_of_the_two_lists`.
     pub const KNOWN_TOOL_NAMES: &'static [&'static str] = &[
         // Built here, one arm each.
         "ast_edit",
@@ -5443,6 +5477,33 @@ impl ToolRegistry {
         "ask",
         "todo",
         "submit_plan",
+    ];
+
+    /// Tools pi provides that `--tools` does not select, and what decides them.
+    ///
+    /// These reach the registry outside the `--tools` match, so naming one on
+    /// the flag changes nothing. That is worth telling the user, and it is not
+    /// the same thing as a typo: before this list existed, `--tools xdev` was
+    /// answered with "xdev is not a tool pi provides", which is false about the
+    /// dispatcher the entire discoverable tier hangs off.
+    ///
+    /// The second field is the whole message a user needs to actually get the
+    /// tool, so keep it specific enough to act on.
+    pub const TOOLS_NOT_SELECTED_BY_FLAG: &'static [(&'static str, &'static str)] = &[
+        (
+            "xdev",
+            "the dispatcher appears whenever any discoverable-tier tool is enabled \
+             (ast_grep, ast_edit, lsp, debug, or the memory bank)",
+        ),
+        (
+            "manage_skill",
+            "always registered; it cannot touch user-authored skills, so it needs no opt-in",
+        ),
+        ("retain", MEMORY_BANK_HOW),
+        ("recall", MEMORY_BANK_HOW),
+        ("reflect", MEMORY_BANK_HOW),
+        ("memory_edit", MEMORY_BANK_HOW),
+        ("learn", MEMORY_BANK_HOW),
     ];
 
     /// Like [`ToolRegistry::new`] but attaches a session undo recorder to the
@@ -21625,6 +21686,96 @@ mod known_tool_name_tests {
              {built_nothing:?} — either the arm went away or the name is \
              misspelled in KNOWN_TOOL_NAMES"
         );
+    }
+
+    #[test]
+    fn every_registerable_tool_is_named_in_one_of_the_two_lists() {
+        // The direction `tool_registry_builds_every_listed_name` leaves open,
+        // and the one that shipped a false warning: a tool the registry really
+        // does build, named in neither list, is reported to the user as "not a
+        // tool pi provides". Seven were in that state — xdev, manage_skill and
+        // the five memory-bank tools — because they join outside the --tools
+        // match and nothing measured that.
+        //
+        // Build with everything the config can switch on, so config-gated
+        // tools are present rather than silently skipped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "memory": {"backend": "local"},
+            "browser": {"enableBrowser": true},
+            "computer": {"enableComputer": true},
+            "media": {
+                "enableInspectImage": true,
+                "enableGenerateImage": true,
+                "enableTts": true,
+                "enableReadMedia": true
+            }
+        }))
+        .expect("config");
+        let enabled: Vec<&str> = ToolRegistry::KNOWN_TOOL_NAMES.to_vec();
+        let registry = ToolRegistry::new(&enabled, dir.path(), Some(&config));
+
+        let unnamed: Vec<String> = registry
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .filter(|name| {
+                !ToolRegistry::KNOWN_TOOL_NAMES.contains(&name.as_str())
+                    && !ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                        .iter()
+                        .any(|(listed, _)| listed == name)
+            })
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "the registry builds {unnamed:?}, which appears in neither \
+             KNOWN_TOOL_NAMES nor TOOLS_NOT_SELECTED_BY_FLAG — `--tools` will \
+             tell a user these are not tools pi provides"
+        );
+
+        // And the converse for the new list: a name here that the registry
+        // never produces would be advice pointing at nothing.
+        let built: Vec<String> = registry
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let phantom: Vec<&str> = ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !built.iter().any(|b| b == name))
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "listed as provided-but-unselectable yet never registered: {phantom:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_tool_the_flag_cannot_select_is_not_called_unknown() {
+        for name in [
+            "xdev",
+            "manage_skill",
+            "retain",
+            "recall",
+            "reflect",
+            "memory_edit",
+            "learn",
+        ] {
+            assert!(
+                unknown_tool_names(&[name]).is_empty(),
+                "{name} is a tool pi provides; --tools must not call it unknown"
+            );
+            let advice = unselectable_tool_names(&[name]);
+            assert_eq!(advice.len(), 1, "{name} should be explained, not ignored");
+            assert!(
+                !advice[0].1.is_empty(),
+                "{name} needs advice a user can act on"
+            );
+        }
+        // A genuine typo is still a typo.
+        assert_eq!(unknown_tool_names(&["bsah"]), vec!["bsah".to_string()]);
+        assert!(unselectable_tool_names(&["bsah"]).is_empty());
     }
 
     #[test]

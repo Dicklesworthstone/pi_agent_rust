@@ -387,6 +387,33 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn every_tiered_name_is_a_name_the_tools_flag_knows_about() {
+        // AGENTS.md already requires the README inventory and these two
+        // constants to stay in step. This makes the `--tools` vocabulary the
+        // third: a name tiered here but absent from both lists in tools.rs is
+        // a tool the flag reports as nonexistent, which is what
+        // bd-tools-known-names-missing-seven-mbo3g was about. `xdev` itself
+        // was in exactly that state while sitting in ESSENTIAL_DEFAULTS.
+        use crate::tools::ToolRegistry;
+        let mut missing = Vec::new();
+        for name in ESSENTIAL_DEFAULTS.iter().chain(OPT_IN_ONLY) {
+            let known = ToolRegistry::KNOWN_TOOL_NAMES.contains(name);
+            let unselectable = ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                .iter()
+                .any(|(listed, _)| listed == name);
+            if !known && !unselectable {
+                missing.push(*name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "tiered here but unknown to --tools: {missing:?}; add each to \
+             ToolRegistry::KNOWN_TOOL_NAMES, or to TOOLS_NOT_SELECTED_BY_FLAG \
+             with a line saying what does turn it on"
+        );
+    }
+
+    #[test]
     fn default_tiers_cover_core_and_opt_in() {
         assert_eq!(default_tier("read"), LoadMode::Essential);
         assert_eq!(default_tier("bash"), LoadMode::Essential);
