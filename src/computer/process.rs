@@ -11,7 +11,7 @@ use std::io::{Read, Seek, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(super) const TEXT_LIMIT: usize = 256 * 1024;
 
@@ -27,14 +27,14 @@ fn nonblocking(fd: &impl AsFd) -> std::io::Result<()> {
     rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)
 }
 
-pub(super) fn start(
+fn spawn(
     owner: &AgentCx,
     cwd: &Path,
     helpers: &BTreeMap<String, PathBuf>,
     name: &str,
     args: &[String],
     input: &[u8],
-) -> Result<Running> {
+) -> Result<AgentChild> {
     native::check_owner(owner)?;
     if input.len() > 128 * 1024 {
         return Err(error("desktop helper input exceeds 128 KiB"));
@@ -55,9 +55,20 @@ pub(super) fn start(
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(|failure| error(format!(
+    command.spawn().map_err(|failure| error(format!(
         "cannot start desktop helper {name}: {failure}; install the required OS helper or configure its trusted path",
-    )))?;
+    )))
+}
+
+pub(super) fn start(
+    owner: &AgentCx,
+    cwd: &Path,
+    helpers: &BTreeMap<String, PathBuf>,
+    name: &str,
+    args: &[String],
+    input: &[u8],
+) -> Result<Running> {
+    let mut child = spawn(owner, cwd, helpers, name, args, input)?;
     let stdout = child
         .take_stdout()
         .ok_or_else(|| error("missing helper stdout pipe"))?;
@@ -102,34 +113,6 @@ impl Running {
         }
         Ok(self.child.try_wait()?)
     }
-
-    pub(super) async fn finish(
-        mut self,
-        owner: &AgentCx,
-        name: &str,
-        limit: usize,
-    ) -> Result<Vec<u8>> {
-        let started = Instant::now();
-        loop {
-            native::check_owner(owner)?;
-            if started.elapsed() >= Duration::from_secs(30) {
-                return Err(error(format!(
-                    "desktop helper {name} timed out; side effects may already have occurred"
-                )));
-            }
-            if let Some(status) = self.poll(limit)?
-                && self.stdout_eof
-            {
-                if !status.success() {
-                    return Err(error(format!(
-                        "desktop helper {name} failed ({status}); check the display session and OS permissions",
-                    )));
-                }
-                return Ok(std::mem::take(&mut self.bytes));
-            }
-            owner.time().sleep(Duration::from_millis(2)).await;
-        }
-    }
 }
 
 pub(super) async fn run(
@@ -141,9 +124,17 @@ pub(super) async fn run(
     input: &[u8],
     limit: usize,
 ) -> Result<Vec<u8>> {
-    start(owner, cwd, helpers, name, args, input)?
-        .finish(owner, name, limit)
+    let output = spawn(owner, cwd, helpers, name, args, input)?
+        .wait_with_output_limited(limit, Duration::from_secs(30))
         .await
+        .map_err(|failure| error(format!("desktop helper {name}: {failure}")))?;
+    if !output.status.success() {
+        return Err(error(format!(
+            "desktop helper {name} failed ({}); check the display session and OS permissions",
+            output.status,
+        )));
+    }
+    Ok(output.stdout)
 }
 
 pub(super) fn strings(args: &[&str]) -> Vec<String> {
@@ -213,5 +204,20 @@ mod tests {
     fn helper_diagnostics_cannot_fill_a_pipe_or_leak_private_text() {
         let bytes = run_script("i=0; while [ $i -lt 20000 ]; do printf private-secret >&2; i=$((i+1)); done; printf done", b"", 1024).unwrap();
         assert_eq!(bytes, b"done");
+    }
+
+    #[test]
+    fn helper_can_fill_stdout_before_reading_large_literal_input() {
+        let input = vec![37; 65_536];
+        let bytes = run_script("head -c 131072 /dev/zero; cat", &input, 196_608).unwrap();
+        assert_eq!(&bytes[..131_072], vec![0; 131_072]);
+        assert_eq!(&bytes[131_072..], input);
+    }
+
+    #[test]
+    fn oversized_stdout_is_not_embedded_in_the_reported_error() {
+        let failure = run_script("printf private-output-secret", b"", 1).unwrap_err();
+        assert!(failure.to_string().contains("byte limit"));
+        assert!(!failure.to_string().contains("private-output-secret"));
     }
 }

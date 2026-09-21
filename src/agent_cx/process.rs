@@ -5,6 +5,9 @@
 //! Owned children are killed and reaped on cancellation or drop. Cleanup is
 //! synchronous and is not a hard real-time bound on foreign OS operations.
 
+#[cfg(unix)]
+mod capture;
+
 use super::{AgentCx, AgentProcess};
 use std::ffi::OsStr;
 use std::io;
