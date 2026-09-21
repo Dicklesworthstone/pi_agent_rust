@@ -123,7 +123,11 @@ impl PlanPin {
     }
 
     fn applied(&self) -> String {
-        format!("{}{}", self.before.as_deref().unwrap_or_default(), self.block)
+        format!(
+            "{}{}",
+            self.before.as_deref().unwrap_or_default(),
+            self.block
+        )
     }
 
     fn remove(&self, current: Option<&str>) -> Result<Option<String>> {
@@ -165,7 +169,10 @@ fn prompt_changed() -> Error {
 
 fn check_owner(owner: &AgentCx, save_enabled: bool) -> Result<()> {
     owner.checkpoint().map_err(|_| {
-        control_error("PLAN_CANCELLED", "operation cancelled before its live transition")
+        control_error(
+            "PLAN_CANCELLED",
+            "operation cancelled before its live transition",
+        )
     })?;
     if save_enabled && (!owner.capabilities().io || !owner.capabilities().time) {
         return Err(control_error(
@@ -229,10 +236,15 @@ impl AgentSessionHandle {
             return Ok(None);
         }
         let plan = inner.plan.as_ref().ok_or_else(|| {
-            control_error("PLAN_TEXT_UNAVAILABLE", "pending plan has no reviewable text")
+            control_error(
+                "PLAN_TEXT_UNAVAILABLE",
+                "pending plan has no reviewable text",
+            )
         })?;
         Ok(Some(SessionPlanReview {
-            proposal: PlanReview { plan: Arc::clone(plan) },
+            proposal: PlanReview {
+                plan: Arc::clone(plan),
+            },
             store: Arc::downgrade(&store),
             session_id: session.header.id.clone(),
         }))
@@ -292,7 +304,10 @@ async fn change(
     check_owner(owner, save_enabled)?;
     let store = handle.session_store();
     let mut session = store.try_lock().map_err(|_| {
-        control_error("PLAN_SESSION_BUSY", "session busy; no plan transition was applied")
+        control_error(
+            "PLAN_SESSION_BUSY",
+            "session busy; no plan transition was applied",
+        )
     })?;
     let state = handle.session().agent.plan_state();
     let (mode, journal_mode) = apply_change(handle, &state, &store, &session, owner, action)?;
@@ -305,7 +320,11 @@ async fn change(
         Some(serde_json::json!({"mode": journal_mode})),
     );
     let persistence = persist(&mut session, owner, save_enabled).await;
-    Ok(PlanChange { mode, changed: true, persistence })
+    Ok(PlanChange {
+        mode,
+        changed: true,
+        persistence,
+    })
 }
 
 // Deliberately synchronous: never retain a std::sync guard across an await.
@@ -317,9 +336,10 @@ fn apply_change(
     owner: &AgentCx,
     action: Change<'_>,
 ) -> Result<(PlanMode, Option<&'static str>)> {
-    let mut inner = state.inner.try_write().map_err(|_| {
-        control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable")
-    })?;
+    let mut inner = state
+        .inner
+        .try_write()
+        .map_err(|_| control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable"))?;
     pin_owner(&inner, store, session)?;
     if let Change::Approve(review) | Change::Reject(review) = action {
         if !review.belongs_to(store, session) {
@@ -343,8 +363,10 @@ fn apply_change(
                 ));
             }
             let pin = PlanPin::new(
-                store, &session.header.id,
-                agent.system_prompt().map(str::to_string), review.text(),
+                store,
+                &session.header.id,
+                agent.system_prompt().map(str::to_string),
+                review.text(),
             );
             let prompt = pin.applied();
             agent.set_system_prompt(Some(prompt));
@@ -359,7 +381,8 @@ fn apply_change(
         Change::Enter => {
             if inner.mode == PlanMode::PendingApproval {
                 return Err(control_error(
-                    "PLAN_REVIEW_PENDING", "reject or exit the pending proposal first",
+                    "PLAN_REVIEW_PENDING",
+                    "reject or exit the pending proposal first",
                 ));
             }
             let changed = inner.mode != PlanMode::Planning || inner.session_pin.is_some();
@@ -371,10 +394,11 @@ fn apply_change(
             // tools. Bind the actual live helper and invalidate cached schemas
             // through the agent's normal registry publication path. Explicit
             // manual review must not inherit a foreign/auto-approving helper.
-            agent.extend_tools(std::iter::once(
-                Box::new(super::SubmitPlanTool::new(state.clone(), false))
-                    as Box<dyn crate::tools::Tool>,
-            ));
+            agent.extend_tools(std::iter::once(Box::new(super::SubmitPlanTool::new(
+                state.clone(),
+                false,
+            ))
+                as Box<dyn crate::tools::Tool>));
             inner.session_pin = None;
             inner.mode = PlanMode::Planning;
             Ok((PlanMode::Planning, changed.then_some("planning")))
@@ -401,11 +425,15 @@ async fn persist(session: &mut Session, owner: &AgentCx, enabled: bool) -> PlanP
         return PlanPersistence::MemoryOnly;
     }
     if let Err(error) = check_owner(owner, true) {
-        return PlanPersistence::Unconfirmed { reason: error.to_string() };
+        return PlanPersistence::Unconfirmed {
+            reason: error.to_string(),
+        };
     }
     match owner.with_current(session.save()).await {
         Ok(()) => PlanPersistence::Saved,
-        Err(error) => PlanPersistence::Unconfirmed { reason: error.to_string() },
+        Err(error) => PlanPersistence::Unconfirmed {
+            reason: error.to_string(),
+        },
     }
 }
 

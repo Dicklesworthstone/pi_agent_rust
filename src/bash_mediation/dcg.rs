@@ -52,7 +52,9 @@ pub(super) fn verdict(command: &str, cwd: &Path) -> Option<Vec<RuleHit>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         // Do not copy arbitrary stderr or OS error payloads into audit reasons:
         // guard diagnostics may contain environment values or command secrets.
-        Err(_) => Some(unavailable("The configured dcg guard could not be executed")),
+        Err(_) => Some(unavailable(
+            "The configured dcg guard could not be executed",
+        )),
     }
 }
 

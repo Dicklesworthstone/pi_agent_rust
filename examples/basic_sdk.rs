@@ -90,11 +90,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Plan submission and tool approval are separate decisions. Keep file
         // mutation denied until this example's explicit human confirmation.
         options.approval_state = Some(pi::approval::ApprovalState::new(
-            pi::approval::ApprovalMode::AlwaysAsk, false, Vec::new(),
+            pi::approval::ApprovalMode::AlwaysAsk,
+            false,
+            Vec::new(),
         ));
         options.enabled_tools = Some(
-            ["read", "grep", "find", "ls", "write", "edit", "hashline_edit", "submit_plan"]
-                .into_iter().map(str::to_string).collect(),
+            [
+                "read",
+                "grep",
+                "find",
+                "ls",
+                "write",
+                "edit",
+                "hashline_edit",
+                "submit_plan",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         );
     }
 
@@ -217,13 +230,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn plan_task(args: impl Iterator<Item = String>) -> Result<Option<String>, std::io::Error> {
     let mut args = args;
-    let Some(flag) = args.next() else { return Ok(None) };
+    let Some(flag) = args.next() else {
+        return Ok(None);
+    };
     if flag != "--plan" {
         return Err(std::io::Error::other("usage: basic_sdk [--plan <task>]"));
     }
     let task = args.collect::<Vec<_>>().join(" ");
     if task.trim().is_empty() || task.len() > 16 * 1024 {
-        return Err(std::io::Error::other("plan task must be nonblank and at most 16 KiB"));
+        return Err(std::io::Error::other(
+            "plan task must be nonblank and at most 16 KiB",
+        ));
     }
     Ok(Some(task))
 }
@@ -231,7 +248,8 @@ fn plan_task(args: impl Iterator<Item = String>) -> Result<Option<String>, std::
 fn check_plan_change(change: &pi::plan::PlanChange) -> Result<(), std::io::Error> {
     if let pi::plan::PlanPersistence::Unconfirmed { reason } = &change.persistence {
         return Err(std::io::Error::other(format!(
-            "Live plan state is {:?}, but saving was not confirmed: {reason}", change.mode,
+            "Live plan state is {:?}, but saving was not confirmed: {reason}",
+            change.mode,
         )));
     }
     Ok(())
@@ -245,20 +263,25 @@ async fn run_reviewed_plan(
 
     let owner = pi::agent_cx::AgentCx::for_current_or_request();
     check_plan_change(&handle.enter_plan_mode(&owner).await?)?;
-    let _ = handle.prompt(format!(
-        "Plan this task without making changes: {task}\n\
+    let _ = handle
+        .prompt(
+            format!(
+                "Plan this task without making changes: {task}\n\
          Finish by calling submit_plan with the complete plan and its files array."
-    ), |_| {}).await?;
-    let review = handle.pending_plan_review()?.ok_or_else(|| {
-        std::io::Error::other(
-            "No proposal was submitted for review; no execution turn started.",
+            ),
+            |_| {},
         )
+        .await?;
+    let review = handle.pending_plan_review()?.ok_or_else(|| {
+        std::io::Error::other("No proposal was submitted for review; no execution turn started.")
     })?;
     println!("\n--- Exact submitted plan (control characters escaped) ---");
     for line in review.text().split('\n') {
         println!("{}", line.escape_debug());
     }
-    println!("\nType approve to accept this plan and allow its scoped file edits. Anything else rejects it.");
+    println!(
+        "\nType approve to accept this plan and allow its scoped file edits. Anything else rejects it."
+    );
     std::io::stdout().flush()?;
     let mut answer = String::new();
     // Bound input and release the stdin guard before any await. EOF rejects.
@@ -298,11 +321,20 @@ mod tests {
     #[test]
     fn plan_task_is_explicit_and_bounded() {
         assert!(plan_task(std::iter::empty()).unwrap().is_none());
-        for args in [vec!["--plan"], vec!["--plan", " "], vec!["--unknown", "task"]] {
+        for args in [
+            vec!["--plan"],
+            vec!["--plan", " "],
+            vec!["--unknown", "task"],
+        ] {
             assert!(plan_task(args.into_iter().map(str::to_string)).is_err());
         }
         assert_eq!(
-            plan_task(["--plan", "improve", "parser"].into_iter().map(str::to_string)).unwrap(),
+            plan_task(
+                ["--plan", "improve", "parser"]
+                    .into_iter()
+                    .map(str::to_string)
+            )
+            .unwrap(),
             Some("improve parser".to_string()),
         );
         assert!(plan_task(["--plan".to_string(), "x".repeat(16 * 1024 + 1)].into_iter()).is_err());

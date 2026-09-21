@@ -544,7 +544,12 @@ mod tests {
         assert!(!state.reject_review(&other_review));
         assert!(!other.reject_review(&review));
         assert!(state.pending_review().unwrap().same_submission(&review));
-        assert!(other.pending_review().unwrap().same_submission(&other_review));
+        assert!(
+            other
+                .pending_review()
+                .unwrap()
+                .same_submission(&other_review)
+        );
     }
 
     #[test]

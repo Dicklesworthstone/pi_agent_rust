@@ -27,9 +27,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 #[cfg(any(not(unix), test))]
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 #[cfg(any(not(unix), test))]
 use std::time::Instant;
-use std::time::Duration;
 
 #[cfg(unix)]
 mod pipes;
@@ -332,7 +332,9 @@ impl ChildRunner {
         let mut pipes = match pipes::ChildPipes::new(stdout, stderr) {
             Ok(pipes) => pipes,
             Err(error) => {
-                attempt.result.fail(format!("PI_SUBAGENT_PIPE_SETUP: {error}"));
+                attempt
+                    .result
+                    .fail(format!("PI_SUBAGENT_PIPE_SETUP: {error}"));
                 return attempt;
             }
         };
@@ -382,7 +384,13 @@ impl ChildRunner {
         child.stop_descendants();
         #[cfg(unix)]
         pipes
-            .finish(&mut protocol, &mut attempt.result, update, owner, self.deadline)
+            .finish(
+                &mut protocol,
+                &mut attempt.result,
+                update,
+                owner,
+                self.deadline,
+            )
             .await;
         #[cfg(not(unix))]
         drain_until_reader_exit(
