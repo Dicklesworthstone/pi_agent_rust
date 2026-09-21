@@ -25,6 +25,8 @@ while True:
         document = message['params']['textDocument']
         send({'jsonrpc':'2.0','method':'textDocument/publishDiagnostics',
               'params':{'uri':document['uri'],'version':document['version'],'diagnostics':[]}})
+    if method == 'textDocument/didOpen' and mode in ('push_empty', 'pull_empty'):
+        send({'jsonrpc':'2.0','method':'experimental/serverStatus','params':{'quiescent':True}})
     if 'id' not in message: continue
     response = {'jsonrpc':'2.0','id':message['id']}
     if method == 'initialize':
