@@ -245,3 +245,68 @@ fn prepare_rename_retries_during_warmup_on_no_references_found() {
         2
     );
 }
+
+#[test]
+fn prepare_rename_retries_during_warmup_on_null_until_target_ready() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+        return;
+    };
+    peer.configure(json!({
+        "textDocument/prepareRename": [
+            {"result": null},
+            {"result": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}
+        ]
+    }));
+    let result = peer
+        .runtime
+        .block_on(peer.client.call(
+            "textDocument/prepareRename",
+            json!({"textDocument": {"uri": "file:///test.rs"}, "position": {"line": 0, "character": 0}}),
+            Duration::from_secs(5),
+        ))
+        .unwrap();
+    assert_eq!(
+        result,
+        json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}})
+    );
+    let frames = peer.frames();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["method"] == "textDocument/prepareRename")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn prepare_rename_does_not_retry_null_when_server_is_quiescent() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+        return;
+    };
+    peer.client.quiescent.store(true, Ordering::SeqCst);
+    peer.configure(json!({
+        "textDocument/prepareRename": [
+            {"result": null}
+        ]
+    }));
+    let result = peer
+        .runtime
+        .block_on(peer.client.call(
+            "textDocument/prepareRename",
+            json!({"textDocument": {"uri": "file:///test.rs"}, "position": {"line": 0, "character": 0}}),
+            Duration::from_secs(5),
+        ))
+        .unwrap();
+    assert_eq!(result, Value::Null);
+    let frames = peer.frames();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["method"] == "textDocument/prepareRename")
+            .count(),
+        1
+    );
+}

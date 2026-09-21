@@ -32,6 +32,7 @@ fn is_warmup_empty_retryable(method: &str) -> bool {
             | "textDocument/implementation"
             | "textDocument/references"
             | "textDocument/hover"
+            | "textDocument/prepareRename"
             | "textDocument/rename"
             | "workspace/willRenameFiles"
     )
@@ -135,7 +136,7 @@ pub struct LspClient {
     request_lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
     capabilities: Mutex<ServerCapabilities>,
     connected_at: std::time::Instant,
-    quiescent: std::sync::atomic::AtomicBool,
+    pub(in crate::lsp) quiescent: std::sync::atomic::AtomicBool,
     // Never reuse version 1 after closing/reopening a file. Delayed versioned
     // edits must not accidentally match a new incarnation of that document.
     next_document_version: AtomicU64,
@@ -229,7 +230,8 @@ impl LspClient {
                     },"workspaceFolders":true,
                     "fileOperations":{"didRename":true,"willRename":true}
                 },
-                "window":{"workDoneProgress":true}
+                "window":{"workDoneProgress":true},
+                "experimental":{"serverStatusNotification":true}
             }
         });
         if let Some(options) = initialization_options {

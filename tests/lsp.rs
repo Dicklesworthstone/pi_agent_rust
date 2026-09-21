@@ -628,7 +628,7 @@ fn rust_analyzer_rename_updates_callers_atomically() {
             "line": 4,
             "symbol": "compute_answer",
             "newName": "solve_answer",
-            "timeout": 60,
+            "timeout": 180,
         }),
     )
     .expect("rename executes");

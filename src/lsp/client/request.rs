@@ -5,6 +5,7 @@
 //! the protocol cancellation notification; it does not undo server side effects.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use asupersync::sync::{Mutex, OwnedMutexGuard};
@@ -120,10 +121,10 @@ impl LspClient {
     ) -> Result<Value, LspCallError> {
         loop {
             let attempt = self.call_once(method, params.clone(), budget).await;
+            self.poll_notifications();
             // Only idempotent lookups participate in the warmup policy.
             // A failed command is not evidence that its effects were undone.
             let retryable = (is_warmup_empty_retryable(method)
-                || method == "textDocument/prepareRename"
                 || method == "textDocument/diagnostic")
                 && matches!(
                     &attempt, Err(LspCallError::Transport(TransportError::Server(err)))
@@ -133,6 +134,7 @@ impl LspClient {
                 );
             let empty_during_warmup = matches!(&attempt, Ok(value) if is_empty_result(value))
                 && is_warmup_empty_retryable(method)
+                && !self.quiescent.load(Ordering::SeqCst)
                 && self.connected_at.elapsed() < WARMUP_EMPTY_RESULT_WINDOW;
             if !retryable && !empty_during_warmup {
                 return attempt;
