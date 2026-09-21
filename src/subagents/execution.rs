@@ -15,7 +15,7 @@ use super::{
     emit_progress, protocol, validate_child_output,
 };
 use crate::agent_cx::AgentCx;
-use crate::agent_hub::{ChildKind, ChildStatus};
+use crate::agent_hub::ChildKind;
 use crate::worktree_iso::{IsoApplyMode, IsoHandle, IsoOutcome};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -33,6 +33,8 @@ use std::time::Duration;
 
 #[cfg(unix)]
 mod pipes;
+mod ownership;
+use ownership::HubLease;
 
 const DRAIN_BATCH: usize = 32;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -122,6 +124,11 @@ impl ChildRunner {
         let errors = attempt.result.validation_errors.clone().unwrap_or_default();
         attempt.result.fail("Child output failed schema validation; preserving this attempt before one corrective retry.".to_string());
         let mut previous = attempt.finish(&owner, false, update);
+        // A hub kill during validation/settlement is not a schema failure to
+        // repair by launching a replacement child behind the operator's back.
+        if matches!(previous.status, SubagentStatus::Cancelled) {
+            return previous;
+        }
         // Finishing an attempt can perform a snapshot or invoke a host callback.
         // Never spend a new launch after either cancellation or budget expiry.
         if owner.checkpoint().is_err() {
@@ -223,6 +230,20 @@ impl ChildRunner {
             ));
             return attempt;
         }
+        // Tracking is a launch prerequisite, not optional telemetry. A failed
+        // registration must never leave an unsteerable/uncontrollable child.
+        let hub_entry = match attempt.hub.register(&agent.name, &attempt.result.task, self.hub_kind) {
+            Ok(entry) => entry,
+            Err(error) => {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+        };
+        attempt.result.hub_id = Some(hub_entry.id.clone());
+        emit_progress(update, &attempt.result);
+        if !check_budget(owner, self.deadline, &mut attempt.result) {
+            return attempt;
+        }
         if isolated {
             match crate::worktree_iso::isolate(&cwd, &attempt.result.task) {
                 Ok(handle) => {
@@ -238,21 +259,6 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
-        let hub_entry = crate::agent_hub::registry()
-            .lock()
-            .ok()
-            .and_then(|mut registry| {
-                registry
-                    .register_kind(&agent.name, &attempt.result.task, self.hub_kind)
-                    .ok()
-            });
-        attempt.result.hub_id = hub_entry.as_ref().map(|entry| entry.id.clone());
-        attempt.hub.id.clone_from(&attempt.result.hub_id);
-        emit_progress(update, &attempt.result);
-        if !check_budget(owner, self.deadline, &mut attempt.result) {
-            return attempt;
-        }
-
         let mut command = Command::new(&self.child_binary);
         if let Err(error) = self.deadline.configure_child(&mut command) {
             attempt.result.fail(error.to_string());
@@ -267,13 +273,8 @@ impl ChildRunner {
             .env("PI_CODING_AGENT_DIR", &self.global_dir)
             .env("PI_SUBAGENT_PARENT_PID", std::process::id().to_string())
             .env("PI_SUBAGENT_DEPTH", child_depth().to_string())
-            .env_remove("PI_SUBAGENT_STEER_FILE")
-            .env_remove("PI_SUBAGENT_RUN_ID");
-        if let Some(entry) = &hub_entry {
-            command
-                .env("PI_SUBAGENT_STEER_FILE", &entry.steer_path)
-                .env("PI_SUBAGENT_RUN_ID", &entry.id);
-        }
+            .env("PI_SUBAGENT_STEER_FILE", &hub_entry.steer_path)
+            .env("PI_SUBAGENT_RUN_ID", &hub_entry.id);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -296,13 +297,21 @@ impl ChildRunner {
         // Guard ownership precedes platform attachment, which may itself fail
         // or unwind. Every successfully spawned child already has a reaper.
         let mut child = ChildProcessGuard::new(child);
-        crate::tools::attach_child_job_discipline(child.child.as_ref().expect("owned child"));
         attempt.result.pid = Some(child.id());
-        attempt.result.status = SubagentStatus::Running;
-        if let Some(id) = &attempt.result.hub_id
-            && let Ok(mut registry) = crate::agent_hub::registry().lock()
-        {
-            registry.mark_running(id, child.id());
+        if !crate::tools::attach_child_job_discipline(child.child.as_ref().expect("owned child")) {
+            attempt.result.fail(
+                "PI_SUBAGENT_CONTAINMENT: failed to attach child process cleanup discipline"
+                    .to_string(),
+            );
+            return attempt;
+        }
+        // Close the registration-to-spawn race. A kill observed after OS spawn
+        // still owns a reaper and must not be announced as a new running task.
+        if !check_budget(owner, self.deadline, &mut attempt.result) {
+            return attempt;
+        }
+        if !attempt.hub.mark_running(child.id(), &mut attempt.result) {
+            return attempt;
         }
         emit_progress(update, &attempt.result);
         let Some(stdout) = child.child.as_mut().and_then(|child| child.stdout.take()) else {
@@ -432,7 +441,12 @@ fn cancel(result: &mut SubagentResult, message: &str) {
 fn check_budget(owner: &AgentCx, deadline: Deadline, result: &mut SubagentResult) -> bool {
     if owner.checkpoint().is_err() {
         cancel(result, CANCELLED);
-    } else if !result.is_error
+        return false;
+    }
+    if !ownership::checkpoint(result) {
+        return false;
+    }
+    if !result.is_error
         && let Err(error) = deadline.check()
     {
         result.fail(error.to_string());
@@ -452,7 +466,7 @@ impl Attempt {
         Self {
             result,
             isolation: None,
-            hub: HubLease { id: None },
+            hub: HubLease::empty(),
             deadline,
         }
     }
@@ -464,9 +478,6 @@ impl Attempt {
         update: Option<&UpdateCallback>,
     ) -> SubagentResult {
         check_budget(owner, self.deadline, &mut self.result);
-        if self.hub.was_killed() {
-            cancel(&mut self.result, "Child was killed by the operator.");
-        }
         let accepted = accepted
             && !self.result.is_error
             && matches!(self.result.status, SubagentStatus::Completed);
@@ -496,10 +507,7 @@ impl Attempt {
                     // mutation dispatch. Once apply begins it is not rolled
                     // back or misreported merely because the clock advances.
                     let in_budget = check_budget(owner, self.deadline, &mut self.result);
-                    if self.hub.was_killed() {
-                        cancel(&mut self.result, CANCELLED);
-                        outcome.apply_mode = "keep".to_string();
-                    } else if !in_budget {
+                    if !in_budget {
                         outcome.apply_mode = "keep".to_string();
                     } else if mode == IsoApplyMode::Apply {
                         match crate::worktree_iso::apply_to_parent(&handle, &outcome.patch) {
@@ -536,53 +544,6 @@ impl Attempt {
         self.hub.settle(&self.result);
         emit_progress(update, &self.result);
         self.result
-    }
-}
-
-/// Independent of process ownership: a future can be dropped before spawn or
-/// after process exit but before its result is accepted and written back.
-struct HubLease {
-    id: Option<String>,
-}
-
-impl HubLease {
-    fn was_killed(&self) -> bool {
-        self.id.as_ref().is_some_and(|id| {
-            crate::agent_hub::registry()
-                .lock()
-                .ok()
-                .and_then(|registry| registry.get(id))
-                .is_some_and(|entry| entry.status == ChildStatus::Killed)
-        })
-    }
-
-    fn settle(&mut self, result: &SubagentResult) {
-        if let Some(id) = self.id.take()
-            && let Ok(mut registry) = crate::agent_hub::registry().lock()
-            && registry
-                .get(&id)
-                .is_some_and(|entry| entry.status != ChildStatus::Killed)
-        {
-            let status = match result.status {
-                SubagentStatus::Cancelled => ChildStatus::Cancelled,
-                SubagentStatus::Completed if !result.is_error => ChildStatus::Done,
-                _ => ChildStatus::Failed,
-            };
-            registry.settle(&id, status);
-        }
-    }
-}
-
-impl Drop for HubLease {
-    fn drop(&mut self) {
-        if let Some(id) = self.id.take()
-            && let Ok(mut registry) = crate::agent_hub::registry().lock()
-            && registry.get(&id).is_some_and(|entry| {
-                matches!(entry.status, ChildStatus::Starting | ChildStatus::Running)
-            })
-        {
-            registry.settle(&id, ChildStatus::Cancelled);
-        }
     }
 }
 
@@ -714,7 +675,9 @@ fn apply_child_frame(
         PipeFrame::Data(PipeKind::Stderr, line) => {
             append_bounded_line(&mut result.stderr, &line);
         }
-        PipeFrame::Data(PipeKind::Stdout, line) if !result.is_error => {
+        PipeFrame::Data(PipeKind::Stdout, line)
+            if !result.is_error && ownership::checkpoint(result) =>
+        {
             match protocol.ingest(&line, &mut result.output) {
                 Ok(changed) => {
                     if let Some(id) = &result.hub_id
