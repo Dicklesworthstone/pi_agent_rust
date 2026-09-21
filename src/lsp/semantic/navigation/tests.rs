@@ -2,7 +2,7 @@ use super::*;
 use std::path::Path;
 use std::time::Duration;
 
-fn span(start: u32, end: u32) -> Value {
+pub(super) fn span(start: u32, end: u32) -> Value {
     json!({"start":{"line":0,"character":start},"end":{"line":0,"character":end}})
 }
 

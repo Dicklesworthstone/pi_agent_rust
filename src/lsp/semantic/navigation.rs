@@ -269,3 +269,6 @@ impl LspTool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod protocol;
