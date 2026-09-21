@@ -265,10 +265,14 @@ mod tests {
         runtime.block_on(async {
             let child = command(&owner, "exec sleep 30").spawn().unwrap();
             let pid = child.id();
-            let mut capture = Box::pin(child.wait_with_output_limited(1024, Duration::from_secs(30)));
+            let mut capture =
+                Box::pin(child.wait_with_output_limited(1024, Duration::from_secs(30)));
             assert!(futures::poll!(&mut capture).is_pending());
             owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel capture"));
-            assert_eq!(capture.await.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert_eq!(
+                capture.await.unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
             assert_reaped(pid);
         });
     }
@@ -294,7 +298,8 @@ mod tests {
                 .spawn()
                 .unwrap();
             let pid = child.id();
-            let mut capture = Box::pin(child.wait_with_output_limited(1024, Duration::from_secs(30)));
+            let mut capture =
+                Box::pin(child.wait_with_output_limited(1024, Duration::from_secs(30)));
             assert!(futures::poll!(&mut capture).is_pending());
             drop(capture);
             assert_reaped(pid);

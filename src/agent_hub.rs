@@ -474,7 +474,10 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
         file.seek(SeekFrom::End(-1))
             .and_then(|_| file.read_exact(&mut last))
             .map_err(|e| {
-                Error::tool("hub", format!("inspect steer queue {}: {e}", path.display()))
+                Error::tool(
+                    "hub",
+                    format!("inspect steer queue {}: {e}", path.display()),
+                )
             })?;
         if last[0] != b'\n' {
             return Err(Error::tool(
@@ -546,7 +549,10 @@ fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
         if frame.len() > MAX_STEER_FRAME_BYTES {
             return Err(Error::tool(
                 "hub",
-                format!("steering frame at line {} exceeds 64 KiB; batch retained", index + 1),
+                format!(
+                    "steering frame at line {} exceeds 64 KiB; batch retained",
+                    index + 1
+                ),
             ));
         }
         if frame.trim().is_empty() {
@@ -555,7 +561,10 @@ fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
         let message: BusMessage = serde_json::from_str(frame).map_err(|_| {
             Error::tool(
                 "hub",
-                format!("invalid steering frame at line {}; batch retained", index + 1),
+                format!(
+                    "invalid steering frame at line {}; batch retained",
+                    index + 1
+                ),
             )
         })?;
         messages.push(format!("[hub:{}] {}", message.from, message.body));
@@ -889,7 +898,8 @@ mod tests {
         reg.set_dir_for_tests(temp.path().to_path_buf());
         let child = reg.register("worker", "task").expect("register");
         let other = reg.register("other", "task").expect("register other");
-        reg.steer(&child.id, "parent", "earlier").expect("first send");
+        reg.steer(&child.id, "parent", "earlier")
+            .expect("first send");
         let original = fs::read(&child.steer_path).expect("original queue");
         let lock = open_steer_lock(&child.steer_path).expect("lock file");
         lock.lock().expect("reader lock");
@@ -928,7 +938,10 @@ mod tests {
         );
         assert_eq!(reg.bus_seq, 2);
         assert_eq!(reg.inbox(&child.id).len(), 1);
-        assert_eq!(fs::read(&child.steer_path).expect("untouched queue"), original);
+        assert_eq!(
+            fs::read(&child.steer_path).expect("untouched queue"),
+            original
+        );
         assert_eq!(
             reg.steer(&child.id, "parent", "retry").expect("retry").seq,
             3
@@ -960,7 +973,10 @@ mod tests {
         fs::create_dir(path.with_extension("steer.lock")).expect("block lock open");
         let err = poll_steer_file(&path).expect_err("I/O failure is not empty or busy");
         assert!(err.to_string().contains("open steer lock"));
-        assert_eq!(fs::read(&path).expect("pending queue retained"), original.to_vec());
+        assert_eq!(
+            fs::read(&path).expect("pending queue retained"),
+            original.to_vec()
+        );
         assert!(!path.with_extension("draining").exists());
     }
 
@@ -1057,8 +1073,8 @@ mod tests {
             .expect("fixture");
         file.write_all(b"{broken\n").expect("partial frame");
         drop(file);
-        let err = poll_until_uncontended(&child.steer_path)
-            .expect_err("malformed batch is not empty");
+        let err =
+            poll_until_uncontended(&child.steer_path).expect_err("malformed batch is not empty");
         assert!(err.to_string().contains("invalid steering frame at line 2"));
         let draining = child.steer_path.with_extension("draining");
         assert!(draining.exists(), "failed batch must remain recoverable");
@@ -1095,7 +1111,8 @@ mod tests {
         let mut reg = fresh_registry();
         reg.set_dir_for_tests(temp.path().to_path_buf());
         let child = reg.register("worker", "task").expect("register");
-        reg.steer(&child.id, "parent", "earlier").expect("first send");
+        reg.steer(&child.id, "parent", "earlier")
+            .expect("first send");
         let original = fs::read(&child.steer_path).expect("first frame");
         let torn = &original[..original.len() - 1];
         fs::write(&child.steer_path, torn).expect("simulate missing final newline");
@@ -1105,9 +1122,15 @@ mod tests {
         assert!(err.to_string().contains("unterminated frame"));
         assert_eq!(reg.bus_seq, 1);
         assert_eq!(reg.inbox(&child.id).len(), 1);
-        assert_eq!(fs::read(&child.steer_path).expect("torn bytes retained"), torn.to_vec());
+        assert_eq!(
+            fs::read(&child.steer_path).expect("torn bytes retained"),
+            torn.to_vec()
+        );
         fs::write(&child.steer_path, original).expect("repair terminator");
-        assert_eq!(reg.steer(&child.id, "parent", "retry").expect("retry").seq, 2);
+        assert_eq!(
+            reg.steer(&child.id, "parent", "retry").expect("retry").seq,
+            2
+        );
         assert_eq!(
             poll_until_ready(&child.steer_path),
             SteerDrain::Messages(vec![
@@ -1124,7 +1147,8 @@ mod tests {
         reg.set_dir_for_tests(temp.path().to_path_buf());
         let child = reg.register("worker", "task").expect("register");
         reg.steer(&child.id, "parent", "first").expect("first send");
-        reg.steer(&child.id, "parent", "second").expect("second send");
+        reg.steer(&child.id, "parent", "second")
+            .expect("second send");
         let mut torn = fs::read(&child.steer_path).expect("queued frames");
         assert_eq!(torn.pop(), Some(b'\n'));
         fs::write(&child.steer_path, &torn).expect("simulate torn terminator");
@@ -1196,7 +1220,10 @@ mod tests {
         fs::write(&path, &frame).expect("oversized blank frame");
         let err = poll_until_uncontended(&path).expect_err("check size before skipping blanks");
         assert!(err.to_string().contains("line 1 exceeds 64 KiB"));
-        assert_eq!(fs::read(path.with_extension("draining")).expect("retained frame"), frame);
+        assert_eq!(
+            fs::read(path.with_extension("draining")).expect("retained frame"),
+            frame
+        );
     }
 
     #[test]
@@ -1207,12 +1234,22 @@ mod tests {
         let child = reg.register("worker", "task").expect("register");
         let body = "\"".repeat(MAX_STEER_FRAME_BYTES / 2);
         assert!(body.len() < MAX_STEER_FRAME_BYTES);
-        let err = reg.steer(&child.id, "parent", &body).expect_err("escaped wire size");
-        assert!(err.to_string().contains("serialized steering frame exceeds"));
+        let err = reg
+            .steer(&child.id, "parent", &body)
+            .expect_err("escaped wire size");
+        assert!(
+            err.to_string()
+                .contains("serialized steering frame exceeds")
+        );
         assert_eq!(reg.bus_seq, 0);
         assert!(reg.inbox(&child.id).is_empty());
         assert!(!child.steer_path.exists());
-        assert_eq!(reg.steer(&child.id, "parent", "small").expect("later send").seq, 1);
+        assert_eq!(
+            reg.steer(&child.id, "parent", "small")
+                .expect("later send")
+                .seq,
+            1
+        );
     }
 
     #[test]

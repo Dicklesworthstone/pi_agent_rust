@@ -440,8 +440,16 @@ mod tests {
         child.kill().unwrap();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        child.take_stdout().unwrap().read_to_end(&mut stdout).unwrap();
-        child.take_stderr().unwrap().read_to_end(&mut stderr).unwrap();
+        child
+            .take_stdout()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        child
+            .take_stderr()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
         assert_eq!(stdout, b"out\0tail");
         assert_eq!(stderr, b"err");
         assert!(child.take_stdout().is_none());
@@ -469,7 +477,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let mut stdout = String::new();
-        child.take_stdout().unwrap().read_to_string(&mut stdout).unwrap();
+        child
+            .take_stdout()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
         assert_eq!(stdout, "complete");
     }
 

@@ -43,7 +43,10 @@ impl FormatBudget {
     fn verify(&self, entry: &ServerEntry, snapshot: &RefactorSnapshot) -> Result<()> {
         self.remaining()?;
         if !entry.client.is_alive() {
-            return Err(tool_err("LSP_TRANSPORT_CLOSED", "formatting connection closed"));
+            return Err(tool_err(
+                "LSP_TRANSPORT_CLOSED",
+                "formatting connection closed",
+            ));
         }
         snapshot.verify_request_source(entry)?;
         self.remaining()?;
@@ -53,13 +56,23 @@ impl FormatBudget {
 
 fn validate_input(input: &LspInput) -> Result<()> {
     if input.file.as_deref().is_none_or(str::is_empty)
-        || input.line.is_some() || input.symbol.is_some() || input.position.is_some()
-        || input.query.is_some() || input.new_name.is_some() || input.new_file.is_some()
-        || input.action_id.is_some() || input.refactor_id.is_some()
-        || input.completion_id.is_some() || input.snippet_values.is_some()
-        || input.hierarchy_id.is_some() || input.only.is_some() || input.after.is_some()
-        || input.resolve.is_some() || input.limit.is_some()
-        || input.method.is_some() || input.payload.is_some()
+        || input.line.is_some()
+        || input.symbol.is_some()
+        || input.position.is_some()
+        || input.query.is_some()
+        || input.new_name.is_some()
+        || input.new_file.is_some()
+        || input.action_id.is_some()
+        || input.refactor_id.is_some()
+        || input.completion_id.is_some()
+        || input.snippet_values.is_some()
+        || input.hierarchy_id.is_some()
+        || input.only.is_some()
+        || input.after.is_some()
+        || input.resolve.is_some()
+        || input.limit.is_some()
+        || input.method.is_some()
+        || input.payload.is_some()
     {
         return Err(tool_err(
             "LSP_USAGE",
@@ -205,14 +218,25 @@ impl LspTool {
         self.refactors.clear();
         let path = requested.canonicalize()?;
         let hash = content_hash_for_drift(&source);
-        let now = budget.owner.cx().timer_driver()
+        let now = budget
+            .owner
+            .cx()
+            .timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         let (uri, entry) = asupersync::time::timeout(now, budget.remaining()?, self.synced(&path))
             .await
-            .map_err(|_| tool_err("LSP_TIMEOUT", "format server startup exceeded the request budget"))??;
+            .map_err(|_| {
+                tool_err(
+                    "LSP_TIMEOUT",
+                    "format server startup exceeded the request budget",
+                )
+            })??;
         let snapshot = RefactorSnapshot::capture(&entry, &path, hash)?;
         if snapshot.source_text.as_ref() != source.as_str() {
-            return Err(tool_err("LSP_EDIT_CONFLICT", "format source changed during synchronization"));
+            return Err(tool_err(
+                "LSP_EDIT_CONFLICT",
+                "format source changed during synchronization",
+            ));
         }
         let ranged = input.range.is_some();
         require_capability(&entry.client.capabilities().raw, ranged)?;
@@ -312,9 +336,8 @@ impl LspTool {
                 "edits":shown,"previewTruncated":truncated,"workspaceEditComplete":true,
                 "note":"The edits overview may be shortened; workspaceEdit is the complete reviewed plan. Approve with action:format, refactorId and apply:true; supplying file computes a new plan."
             });
-            let output = self.cache_refactor(
-                &entry, prepared, workspace, metadata, None, &budget.owner,
-            )?;
+            let output =
+                self.cache_refactor(&entry, prepared, workspace, metadata, None, &budget.owner)?;
             // Caching verifies disk preimages and serializes the complete edit.
             // Do not leave an approvable handle behind if that spent the budget.
             if let Err(error) = budget.verify(&entry, &snapshot) {

@@ -294,8 +294,12 @@ impl LspTool {
             if metadata["changed"] != true {
                 metadata["filesChanged"] = json!([]);
             }
-            metadata["note"] = json!("Approved the exact staged formatting plan without another formatter request.");
-            let fields = metadata.as_object_mut().expect("constructed refactor metadata");
+            metadata["note"] = json!(
+                "Approved the exact staged formatting plan without another formatter request."
+            );
+            let fields = metadata
+                .as_object_mut()
+                .expect("constructed refactor metadata");
             fields.remove("edits");
             fields.remove("previewTruncated");
             fields.remove("workspaceEditComplete");
