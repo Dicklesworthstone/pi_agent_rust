@@ -2028,8 +2028,24 @@ def check_evidence_state_table(
     return errors
 
 
-def check_readme(repo_root: Path, now: datetime | None = None) -> int:
-    """Check the README under repo_root for missing or stale artifact citations."""
+def check_readme(
+    repo_root: Path,
+    now: datetime | None = None,
+    *,
+    enforce_staleness: bool = True,
+) -> int:
+    """Check the README under repo_root for missing or stale artifact citations.
+
+    `enforce_staleness=False` is the `--structural-only` mode. It drops the
+    14-day age limits and keeps everything that compares the README against
+    what the artifacts currently say. The distinction is what makes this
+    script safe to put in the DSR quality recipe: agreement between the README
+    and an artifact is a property of the commit and stays true until someone
+    edits one of them, whereas an age limit goes red on a calendar, with no
+    commit to blame and nothing the committer can do about it. A gate that
+    turns red on its own is the gate this project already has too much
+    experience with.
+    """
     readme_path = repo_root / "README.md"
     if not readme_path.exists():
         print(f"ERROR: README.md not found at {readme_path}")
@@ -2080,8 +2096,12 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     missing_count = 0
     results: list[CitationCheck] = []
 
-    # 14-day staleness threshold
-    staleness_threshold = timedelta(days=14)
+    # 14-day staleness threshold. Structural-only mode sets it beyond any
+    # plausible artifact age rather than branching at each comparison, so the
+    # two modes cannot drift apart: every other check runs identically.
+    staleness_threshold = timedelta(days=14 if enforce_staleness else 36500)
+    if not enforce_staleness:
+        print("INFO: structural-only mode: artifact age limits are not enforced")
     now = as_utc(now or datetime.now(timezone.utc))
     content_error_count = len(uncited_quantitative_claims)
 
@@ -2385,7 +2405,13 @@ def _run_self_test_cases() -> int:
     def cloned(value: object) -> object:
         return json.loads(json.dumps(value))
 
-    def run_check(repo_root: Path, readme_text: str) -> tuple[int, str]:
+    def run_check(
+        repo_root: Path,
+        readme_text: str,
+        *,
+        when: datetime | None = None,
+        enforce_staleness: bool = True,
+    ) -> tuple[int, str]:
         (repo_root / "README.md").write_text(readme_text, encoding="utf-8")
         if (repo_root / ".git").is_dir():
             git(repo_root, "add", "--all")
@@ -2393,7 +2419,11 @@ def _run_self_test_cases() -> int:
                 git(repo_root, "commit", "-q", "-m", "generic evidence fixture")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            result = check_readme(repo_root, now=now)
+            result = check_readme(
+                repo_root,
+                now=when or now,
+                enforce_staleness=enforce_staleness,
+            )
         return result, output.getvalue()
 
     def git(repo_root: Path, *args: str, env: dict[str, str] | None = None) -> bytes:
@@ -2596,6 +2626,28 @@ def _run_self_test_cases() -> int:
         if result != 0:
             print(output)
             print("SELF-TEST FAIL: canonically equivalent generated citation should pass")
+            return 2
+
+        # --structural-only. The same fixture, checked a year later: the
+        # default mode goes red purely on the calendar, and structural-only
+        # does not. This is the whole reason the flag exists -- a gate that
+        # reddens with no commit to blame teaches everyone to ignore it.
+        much_later = now + timedelta(days=400)
+        stale_citation = (
+            "Claim: *(from tests/perf/reports/generated.json, generated "
+            "`2026-05-01T08:00:00.000-04:00`)*\n"
+        )
+        result, output = run_check(generic_root, stale_citation, when=much_later)
+        if result != 1 or "stale" not in output:
+            print(output)
+            print("SELF-TEST FAIL: a year-old artifact must be stale by default")
+            return 2
+        result, output = run_check(
+            generic_root, stale_citation, when=much_later, enforce_staleness=False
+        )
+        if result != 0:
+            print(output)
+            print("SELF-TEST FAIL: --structural-only must not enforce artifact age")
             return 2
 
         run_collision = reports / "run_collision.json"
@@ -3534,11 +3586,21 @@ def main() -> int:
         action="store_true",
         help="run fixture-based checks for citation parsing behavior",
     )
+    parser.add_argument(
+        "--structural-only",
+        action="store_true",
+        help=(
+            "skip the 14-day artifact age limits; check only that the README "
+            "agrees with what the artifacts currently say. This is the form "
+            "that is safe in a per-commit gate, because it cannot go red on "
+            "the calendar."
+        ),
+    )
     args = parser.parse_args()
     if args.self_test:
         return run_self_test()
     repo_root = Path(__file__).resolve().parent.parent
-    return check_readme(repo_root)
+    return check_readme(repo_root, enforce_staleness=not args.structural_only)
 
 
 if __name__ == "__main__":

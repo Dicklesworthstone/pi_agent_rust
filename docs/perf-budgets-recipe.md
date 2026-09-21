@@ -42,8 +42,37 @@ For `pi_agent_rust`, the recipe is, as reported by
 
 `scripts/check_readme_evidence_freshness.py` is **not** in this recipe,
 so nothing in the gate notices when README evidence claims drift away
-from `tests/perf/reports/budget_summary.json`. Run it by hand until that
-is fixed (`bd-readme-freshness-into-recipe-5sgos`).
+from `tests/perf/reports/budget_summary.json`. That is how the README
+spent a month advertising four passing budgets against an artifact whose
+rows were all `NO_DATA` (`bd-readme-evidence-table-diverged-ba8bd`).
+
+To wire it in, the line for `~/.config/dsr/repos.yaml` is:
+
+```yaml
+      - python3 scripts/check_readme_evidence_freshness.py --structural-only
+```
+
+**Use `--structural-only` in the gate, and only there.** The default mode
+also enforces a 14-day age limit on every cited artifact. In a per-commit
+gate that is a time bomb: nobody refreshes `budget_summary.json` on a
+fortnightly cadence, so the check would turn red on the calendar, with no
+commit to blame and nothing the committer could do about it — and a gate
+that reddens by itself is one everybody learns to ignore. This project
+has enough of those already.
+
+`--structural-only` keeps every check that compares the README against
+what the artifacts currently say: per-budget statuses in the evidence
+table, labelled aggregates anywhere in the README, the claim bindings,
+missing artifacts, and the release-authorization contract. All of those
+are properties of the commit, and stay true until somebody edits one side.
+
+The full check, age limits included, belongs where it already is: the
+pre-release list in `docs/releasing.md`, where a stale artifact genuinely
+should block a release.
+
+Tracked as `bd-readme-freshness-into-recipe-5sgos`. The registry lives
+outside this repository, so adding the line is an operator action on the
+release host, not a change anybody can land here.
 
 ## 3. Hidden contract: build scratch on the Data volume
 
