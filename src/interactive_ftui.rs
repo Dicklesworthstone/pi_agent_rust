@@ -2368,6 +2368,36 @@ impl PiFtuiModel {
             });
             return true;
         }
+        if canon == "/changelog" {
+            self.push_entry(
+                EntryRole::System,
+                crate::embedded_assets::changelog().to_string(),
+            );
+            self.scroll_from_tail = 0;
+            return true;
+        }
+        if canon == "/copy" {
+            // The last assistant turn with something in it, which is what a
+            // user means by "copy that".
+            let text = self
+                .transcript
+                .iter()
+                .rev()
+                .find(|entry| entry.role == EntryRole::Assistant && !entry.text.trim().is_empty())
+                .map(|entry| entry.text.clone());
+            match text {
+                Some(text) => {
+                    let outcome = crate::interactive::copy_text_to_clipboard(&text);
+                    self.push_entry(EntryRole::System, outcome);
+                }
+                None => self.push_entry(
+                    EntryRole::Error,
+                    String::from("No agent messages to copy yet."),
+                ),
+            }
+            self.scroll_from_tail = 0;
+            return true;
+        }
         if let Some(rest) = strip_command(clean, "/export") {
             self.begin_busy(String::from("exporting ..."));
             self.send_command(UiCommand::Export {
@@ -6100,6 +6130,98 @@ mod tests {
             },
             "the argument must reach the driver trimmed and otherwise untouched"
         );
+    }
+
+    #[test]
+    fn slash_changelog_prints_the_embedded_changelog_without_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        type_str(&mut sim, "/changelog");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "the changelog is an embedded asset; it must not cost a driver round trip"
+        );
+        // Submitting echoes the typed command as a User entry first, so the
+        // changelog is the System entry that follows it.
+        // Submitting echoes the typed command as a User entry first, so the
+        // changelog is the System entry that follows it.
+        let added: Vec<(EntryRole, String)> = sim.model().transcript[before..]
+            .iter()
+            .map(|entry| (entry.role, entry.text.clone()))
+            .collect();
+        assert_eq!(added.len(), 2, "expected the echo and one reply: {added:?}");
+        assert_eq!(added[0].0, EntryRole::User);
+        assert_eq!(added[1].0, EntryRole::System);
+        assert!(
+            added[1].1.contains("# Changelog"),
+            "expected the embedded changelog, got {:?}",
+            added[1].1
+        );
+    }
+
+    #[test]
+    fn slash_copy_takes_the_last_non_empty_assistant_turn() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        model.push_entry(EntryRole::Assistant, String::from("first answer"));
+        model.push_entry(EntryRole::User, String::from("a follow-up question"));
+        model.push_entry(EntryRole::Assistant, String::from("   "));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        type_str(&mut sim, "/copy");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "copying reads the transcript this stack already has"
+        );
+        let added: Vec<(EntryRole, String)> = sim.model().transcript[before..]
+            .iter()
+            .map(|entry| (entry.role, entry.text.clone()))
+            .collect();
+        assert_eq!(added.len(), 2, "expected the echo and one reply: {added:?}");
+        assert_eq!(added[0].0, EntryRole::User);
+        assert_eq!(
+            added[1].0,
+            EntryRole::System,
+            "a successful copy is not an error: {added:?}"
+        );
+        // Every outcome the shared helper can report names the clipboard —
+        // copied, or disabled/unavailable with where it wrote instead — so
+        // this holds whether or not the host running the suite has one.
+        assert!(
+            added[1].1.contains("lipboard"),
+            "unexpected copy outcome: {:?}",
+            added[1].1
+        );
+    }
+
+    #[test]
+    fn slash_copy_says_so_when_there_is_nothing_to_copy() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        type_str(&mut sim, "/copy");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        let last = {
+            let entry = sim.model().transcript.last().expect("an entry");
+            (entry.role, entry.text.clone())
+        };
+        assert_eq!(last.0, EntryRole::Error);
+        assert!(last.1.contains("No agent messages to copy yet"), "{last:?}");
     }
 
     #[test]

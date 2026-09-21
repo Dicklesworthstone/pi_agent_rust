@@ -893,6 +893,63 @@ pub fn strip_thinking_level_suffix(pattern: &str) -> &str {
     }
 }
 
+/// Put `text` on the system clipboard, falling back to a private temp file,
+/// and return the sentence describing what happened.
+///
+/// Free rather than a `PiApp` method because the ftui stack runs the same
+/// `/copy` (bd-cv653): the feature gating, the 0600 fallback file and the
+/// exact wording of each outcome must not exist twice. The wording is the
+/// charmed stack's, unchanged, so the two stacks report a copy identically.
+pub fn copy_text_to_clipboard(text: &str) -> String {
+    fn write_fallback(text: &str) -> std::io::Result<std::path::PathBuf> {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let filename = format!("pi_copy_{}.txt", Utc::now().timestamp_millis());
+        // ubs:ignore filename is a literal plus a timestamp, never external input
+        let path = dir.join(filename);
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&path)?;
+        file.write_all(text.as_bytes())?;
+
+        Ok(path)
+    }
+
+    #[cfg(feature = "clipboard")]
+    {
+        match ArboardClipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+        {
+            Ok(()) => String::from("Copied to clipboard"),
+            Err(err) => match write_fallback(text) {
+                Ok(path) => format!(
+                    "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
+                    path.display()
+                ),
+                Err(io_err) => format!(
+                    "Clipboard support is disabled or unavailable ({err}); also failed to write fallback file: {io_err}"
+                ),
+            },
+        }
+    }
+
+    #[cfg(not(feature = "clipboard"))]
+    {
+        match write_fallback(text) {
+            Ok(path) => format!("Clipboard support is disabled. Wrote to {}", path.display()),
+            Err(err) => {
+                format!("Clipboard support is disabled; failed to write fallback file: {err}")
+            }
+        }
+    }
+}
+
 pub fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
     args.split(|c: char| c == ',' || c.is_whitespace())
         .map(str::trim)
@@ -2445,64 +2502,7 @@ impl PiApp {
                     return None;
                 };
 
-                let write_fallback = |text: &str| -> std::io::Result<std::path::PathBuf> {
-                    use std::io::Write;
-                    let dir = std::env::temp_dir();
-                    let filename = format!("pi_copy_{}.txt", Utc::now().timestamp_millis());
-                    let path = dir.join(filename);
-
-                    let mut options = std::fs::OpenOptions::new();
-                    options.write(true).create_new(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        options.mode(0o600);
-                    }
-
-                    let mut file = options.open(&path)?;
-                    file.write_all(text.as_bytes())?;
-
-                    Ok(path)
-                };
-
-                #[cfg(feature = "clipboard")]
-                {
-                    match ArboardClipboard::new()
-                        .and_then(|mut clipboard| clipboard.set_text(text.clone()))
-                    {
-                        Ok(()) => self.status_message = Some("Copied to clipboard".to_string()),
-                        Err(err) => match write_fallback(&text) {
-                            Ok(path) => {
-                                self.status_message = Some(format!(
-                                    "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
-                                    path.display()
-                                ));
-                            }
-                            Err(io_err) => {
-                                self.status_message = Some(format!(
-                                    "Clipboard support is disabled or unavailable ({err}); also failed to write fallback file: {io_err}"
-                                ));
-                            }
-                        },
-                    }
-                }
-
-                #[cfg(not(feature = "clipboard"))]
-                {
-                    match write_fallback(&text) {
-                        Ok(path) => {
-                            self.status_message = Some(format!(
-                                "Clipboard support is disabled. Wrote to {}",
-                                path.display()
-                            ));
-                        }
-                        Err(err) => {
-                            self.status_message = Some(format!(
-                                "Clipboard support is disabled; failed to write fallback file: {err}"
-                            ));
-                        }
-                    }
-                }
+                self.status_message = Some(copy_text_to_clipboard(&text));
 
                 None
             }
