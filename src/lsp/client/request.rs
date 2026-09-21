@@ -123,6 +123,7 @@ impl LspClient {
             // Only idempotent lookups participate in the warmup policy.
             // A failed command is not evidence that its effects were undone.
             let retryable = (is_warmup_empty_retryable(method)
+                || method == "textDocument/prepareRename"
                 || method == "textDocument/diagnostic")
                 && matches!(
                     &attempt, Err(LspCallError::Transport(TransportError::Server(err)))

@@ -211,3 +211,37 @@ fn owner_cancellation_before_admission_prevents_dispatch() {
             .any(|frame| frame["method"] == "test/success")
     );
 }
+
+#[test]
+fn prepare_rename_retries_during_warmup_on_no_references_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+        return;
+    };
+    peer.configure(json!({
+        "textDocument/prepareRename": [
+            {"error": {"code": -32602, "message": "No references found at position"}},
+            {"result": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}
+        ]
+    }));
+    let result = peer
+        .runtime
+        .block_on(peer.client.call(
+            "textDocument/prepareRename",
+            json!({"textDocument": {"uri": "file:///test.rs"}, "position": {"line": 0, "character": 0}}),
+            Duration::from_secs(5),
+        ))
+        .unwrap();
+    assert_eq!(
+        result,
+        json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}})
+    );
+    let frames = peer.frames();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["method"] == "textDocument/prepareRename")
+            .count(),
+        2
+    );
+}
