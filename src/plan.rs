@@ -207,10 +207,43 @@ pub struct PlanState {
     inner: Arc<RwLock<PlanStateInner>>,
 }
 
+/// An immutable review of one specific submission, shared without copying its
+/// text. A new submission gets a new identity even when its bytes are identical.
+///
+/// This handle is deliberately not serializable or constructible from text.
+/// It survives cloning within a session, not rejection/resubmission, session
+/// reset, or a different PlanState. It authorizes a state transition only;
+/// executor policy and filesystem checks still apply to each tool call.
+#[derive(Clone)]
+pub struct PlanReview {
+    plan: Arc<str>,
+}
+
+impl PlanReview {
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.plan
+    }
+
+    #[must_use]
+    pub fn same_submission(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.plan, &other.plan)
+    }
+}
+
+impl std::fmt::Debug for PlanReview {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlanReview")
+            .field("bytes", &self.plan.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Default)]
 struct PlanStateInner {
     mode: PlanMode,
-    plan: Option<String>,
+    plan: Option<Arc<str>>,
     /// The model the session ran before plan mode took over (restored on
     /// approval when the plan role was active).
     previous_model: Option<(String, String)>,
@@ -254,7 +287,9 @@ impl PlanState {
         if inner.mode != PlanMode::Planning {
             return false;
         }
-        inner.plan = Some(plan);
+        // Fresh allocation is the submission identity. Keeping an old review
+        // alive prevents that identity from being recycled beneath a reader.
+        inner.plan = Some(Arc::from(plan));
         inner.mode = if auto_approve {
             PlanMode::Approved
         } else {
@@ -269,7 +304,7 @@ impl PlanState {
         if inner.mode != PlanMode::PendingApproval {
             return None;
         }
-        let plan = inner.plan.clone()?;
+        let plan = inner.plan.as_deref()?.to_string();
         inner.mode = PlanMode::Approved;
         drop(inner);
         Some(plan)
@@ -284,10 +319,55 @@ impl PlanState {
         if inner.mode != PlanMode::PendingApproval || inner.plan.as_deref() != Some(reviewed) {
             return None;
         }
-        let plan = inner.plan.clone()?;
+        let plan = inner.plan.as_deref()?.to_string();
         inner.mode = PlanMode::Approved;
         drop(inner);
         Some(plan)
+    }
+
+    /// Capture pending state and its exact submission together under one lock.
+    #[must_use]
+    pub fn pending_review(&self) -> Option<PlanReview> {
+        let inner = self.inner.read().ok()?;
+        if inner.mode != PlanMode::PendingApproval {
+            return None;
+        }
+        Some(PlanReview {
+            plan: Arc::clone(inner.plan.as_ref()?),
+        })
+    }
+
+    /// Approve the submission represented by this review, not merely matching
+    /// text. An identical resubmission or another session cannot reuse it.
+    pub fn approve_review(&self, review: &PlanReview) -> Option<String> {
+        let mut inner = self.inner.write().ok()?;
+        if inner.mode != PlanMode::PendingApproval
+            || !Arc::ptr_eq(inner.plan.as_ref()?, &review.plan)
+        {
+            return None;
+        }
+        let plan = review.text().to_string();
+        inner.mode = PlanMode::Approved;
+        drop(inner);
+        Some(plan)
+    }
+
+    /// Reject exactly the reviewed submission. A queued rejection must not
+    /// discard a different proposal submitted while the user was deciding.
+    pub fn reject_review(&self, review: &PlanReview) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        if inner.mode != PlanMode::PendingApproval
+            || !inner
+                .plan
+                .as_ref()
+                .is_some_and(|plan| Arc::ptr_eq(plan, &review.plan))
+        {
+            return false;
+        }
+        inner.mode = PlanMode::Planning;
+        true
     }
 
     /// Reject the pending plan (back to Planning for the edit loop).
@@ -328,7 +408,10 @@ impl PlanState {
     /// The submitted plan text, if any.
     #[must_use]
     pub fn plan(&self) -> Option<String> {
-        self.inner.read().ok().and_then(|inner| inner.plan.clone())
+        self.inner
+            .read()
+            .ok()
+            .and_then(|inner| inner.plan.as_deref().map(str::to_string))
     }
 
     /// Read approval state and its text together, never a mode from one plan
@@ -340,7 +423,7 @@ impl PlanState {
         if inner.mode != PlanMode::Approved {
             return None;
         }
-        inner.plan.clone()
+        inner.plan.as_deref().map(str::to_string)
     }
 
     /// Record the pre-plan-mode model (for restore on approval).
@@ -383,6 +466,125 @@ impl PlanState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn review_fixture() -> (PlanState, PlanReview) {
+        let state = PlanState::new();
+        state.enter_planning();
+        assert!(state.submit_plan("reviewed proposal".to_string()));
+        let review = state.pending_review().unwrap();
+        (state, review)
+    }
+
+    #[test]
+    fn review_handle_approves_exactly_once_through_a_cloned_owner() {
+        let (state, review) = review_fixture();
+        let another = state.pending_review().unwrap();
+        assert!(review.same_submission(&another));
+        assert_eq!(review.text(), "reviewed proposal");
+        assert_eq!(
+            state.clone().approve_review(&review).as_deref(),
+            Some(review.text())
+        );
+        assert!(state.approve_review(&another).is_none());
+        assert!(state.pending_review().is_none());
+    }
+
+    #[test]
+    fn identical_resubmission_requires_a_new_review_handle() {
+        let (state, review) = review_fixture();
+        assert!(state.reject());
+        assert!(state.pending_review().is_none());
+        assert!(state.approve_review(&review).is_none());
+        assert!(state.submit_plan(review.text().to_string()));
+        let replacement = state.pending_review().unwrap();
+        assert_eq!(review.text(), replacement.text());
+        assert!(!review.same_submission(&replacement));
+        assert!(state.approve_review(&review).is_none());
+        assert_eq!(state.mode(), PlanMode::PendingApproval);
+        assert!(!state.allows_effects(ToolEffects::write()));
+        assert!(state.approve_review(&replacement).is_some());
+    }
+
+    #[test]
+    fn review_cannot_cross_independent_plan_owners() {
+        let (state, review) = review_fixture();
+        let (other, other_review) = review_fixture();
+        assert!(!review.same_submission(&other_review));
+        assert!(other.approve_review(&review).is_none());
+        assert!(state.approve_review(&other_review).is_none());
+        assert_eq!(state.mode(), PlanMode::PendingApproval);
+        assert_eq!(other.mode(), PlanMode::PendingApproval);
+    }
+
+    #[test]
+    fn stale_rejection_does_not_discard_an_identical_new_submission() {
+        let (state, old) = review_fixture();
+        assert!(state.reject_review(&old));
+        assert!(!state.reject_review(&old));
+        assert!(state.submit_plan(old.text().to_string()));
+        let current = state.pending_review().unwrap();
+        assert!(!state.reject_review(&old));
+        assert_eq!(state.mode(), PlanMode::PendingApproval);
+        assert!(state.reject_review(&current));
+        assert_eq!(state.mode(), PlanMode::Planning);
+        assert!(!state.allows_effects(ToolEffects::write()));
+    }
+
+    #[test]
+    fn rejecting_a_foreign_review_preserves_both_owners() {
+        let (state, review) = review_fixture();
+        let (other, other_review) = review_fixture();
+        assert!(!state.reject_review(&other_review));
+        assert!(!other.reject_review(&review));
+        assert!(state.pending_review().unwrap().same_submission(&review));
+        assert!(other.pending_review().unwrap().same_submission(&other_review));
+    }
+
+    #[test]
+    fn session_reset_and_reentry_retire_outstanding_reviews() {
+        for reset in [false, true] {
+            let (state, review) = review_fixture();
+            if reset {
+                state.reset_for_session(PlanMode::PendingApproval);
+            } else {
+                state.exit();
+                state.enter_planning();
+            }
+            assert!(state.submit_plan(review.text().to_string()));
+            assert!(state.approve_review(&review).is_none());
+            assert_eq!(state.mode(), PlanMode::PendingApproval);
+        }
+    }
+
+    #[test]
+    fn invalid_submission_cannot_invalidate_a_live_review() {
+        let (state, review) = review_fixture();
+        assert!(!state.submit_plan("x".repeat(MAX_PLAN_BYTES + 1)));
+        assert!(!state.submit_plan("another submission while pending".to_string()));
+        assert!(review.same_submission(&state.pending_review().unwrap()));
+        assert!(state.approve_review(&review).is_some());
+    }
+
+    #[test]
+    fn review_text_is_immutable_and_not_disclosed_by_debug_output() {
+        let (state, review) = review_fixture();
+        state.exit();
+        assert_eq!(review.text(), "reviewed proposal");
+        assert!(!format!("{review:?}").contains(review.text()));
+        assert!(state.approve_review(&review).is_none());
+    }
+
+    #[test]
+    fn poisoned_review_owner_cannot_authorize_a_transition() {
+        let (state, review) = review_fixture();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.inner.write().unwrap();
+            panic!("poison plan owner");
+        }));
+        assert!(state.pending_review().is_none());
+        assert!(state.approve_review(&review).is_none());
+        assert!(!state.allows_effects(ToolEffects::process()));
+    }
 
     #[test]
     fn state_machine_transitions() {
