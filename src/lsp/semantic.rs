@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 
 mod hints;
 mod signatures;
+mod symbols;
 
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -141,6 +142,16 @@ impl Source {
             .as_deref()
             .filter(|file| !file.is_empty())
             .ok_or_else(|| tool_err("LSP_USAGE", "semantic inspection requires file"))?;
+        Self::open_file(tool, file, budget, validate).await
+    }
+
+    async fn open_file(
+        tool: &LspTool,
+        file: &str,
+        budget: &Budget,
+        validate: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<Self> {
+        budget.remaining()?;
         let requested = super::resolve_tool_path(file, &tool.cwd);
         let text = read_source(&requested)?;
         validate(&text)?;

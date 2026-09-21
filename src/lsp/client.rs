@@ -221,7 +221,12 @@ impl LspClient {
                     "applyEdit":true,"workspaceEdit":{
                         "documentChanges":true,"resourceOperations":["create","rename","delete"]
                     },
-                    "symbol":{},"workspaceFolders":true,
+                    "symbol":{
+                        "dynamicRegistration":false,
+                        "symbolKind":{"valueSet":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26]},
+                        "tagSupport":{"valueSet":[1]},
+                        "resolveSupport":{"properties":["location.range"]}
+                    },"workspaceFolders":true,
                     "fileOperations":{"didRename":true,"willRename":true}
                 },
                 "window":{"workDoneProgress":true}
