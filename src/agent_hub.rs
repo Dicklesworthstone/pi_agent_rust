@@ -95,7 +95,7 @@ impl ChildStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildEntry {
-    /// Unique run id: `<agent>-<seq>` (seq is per-registry monotonic).
+    /// Unique run id: `<agent>-seq` (seq is per-registry monotonic).
     pub id: String,
     /// Agent definition name (e.g. `scout`).
     pub name: String,
@@ -300,6 +300,8 @@ impl AgentHubRegistry {
 
     /// Queue steering for a live child. Report it in the inbox only after
     /// the cross-process queue has accepted the complete frame.
+    /// A busy disk queue returns an error without waiting or recording a
+    /// delivery; the caller can retry without duplicating an accepted frame.
     pub fn steer(&mut self, id: &str, from: &str, body: &str) -> Result<BusMessage> {
         let entry = self
             .entries
@@ -431,9 +433,23 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
     }
     let queue_lock = open_steer_lock(path)
         .map_err(|e| Error::tool("hub", format!("open steer lock {}: {e}", path.display())))?;
-    queue_lock
-        .lock()
-        .map_err(|e| Error::tool("hub", format!("lock steer queue {}: {e}", path.display())))?;
+    // The caller may own the process-wide hub mutex. Waiting for a child
+    // here would also stall roster reads, kills, and steering other children.
+    match queue_lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(Error::tool(
+                "hub",
+                "steering queue is busy; message not accepted, retry delivery",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(Error::tool(
+                "hub",
+                format!("lock steer queue {}: {err}", path.display()),
+            ));
+        }
+    }
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -516,26 +532,42 @@ fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
         .collect()
 }
 
-/// Child-side drain, in delivery order.
+/// Result of one non-blocking disk-queue poll.
 ///
-/// A busy writer never blocks the agent's polling path, and interrupted or
-/// read-failed batches remain available for retry. This acknowledges disk
-/// consumption, not processing by the model: a process crash after return
-/// still requires a higher-level delivery acknowledgment.
-pub fn drain_steer_file(path: &Path) -> Vec<String> {
-    let queue_lock = match open_steer_lock(path) {
-        Ok(lock) => lock,
-        Err(err) => {
-            tracing::debug!(error = %err, "steering queue lock unavailable; retrying later");
-            return Vec::new();
+/// Only `Empty` establishes that no messages were pending while the lock
+/// was held. `Busy` says nothing about queue contents and must be retried.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SteerDrain {
+    Empty,
+    Busy,
+    /// One nonempty, acknowledged disk batch in delivery order.
+    Messages(Vec<String>),
+}
+
+/// Poll the child-side queue without hiding contention or I/O failures.
+///
+/// Recovery always precedes newer messages. Failed batches stay on disk;
+/// no messages are returned until the entire batch has been validated and
+/// consumed. This acknowledges disk consumption, not model processing: a
+/// process crash after return still needs a higher-level acknowledgment.
+pub fn poll_steer_file(path: &Path) -> Result<SteerDrain> {
+    let queue_lock = open_steer_lock(path)
+        .map_err(|e| Error::tool("hub", format!("open steer lock {}: {e}", path.display())))?;
+    match queue_lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(SteerDrain::Busy),
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(Error::tool(
+                "hub",
+                format!("lock steer queue {}: {err}", path.display()),
+            ));
         }
-    };
-    if let Err(err) = queue_lock.try_lock() {
-        tracing::debug!(error = %err, "steering queue busy or unavailable; retrying later");
-        return Vec::new();
     }
     let draining = path.with_extension("draining");
-    let result = (|| -> Result<Vec<String>> {
+    // There can be at most two batches under this lock: an interrupted
+    // drain and the active queue. Skip an empty recovered batch rather than
+    // reporting Empty while a newer accepted message is still pending.
+    for _ in 0..2 {
         let recovering = draining.try_exists().map_err(|e| {
             Error::tool(
                 "hub",
@@ -545,7 +577,9 @@ pub fn drain_steer_file(path: &Path) -> Vec<String> {
         if !recovering {
             match fs::rename(path, &draining) {
                 Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(SteerDrain::Empty);
+                }
                 Err(err) => {
                     return Err(Error::tool(
                         "hub",
@@ -563,12 +597,28 @@ pub fn drain_steer_file(path: &Path) -> Vec<String> {
                 format!("consume draining queue {}: {e}", draining.display()),
             )
         })?;
-        Ok(messages)
-    })();
-    match result {
-        Ok(messages) => messages,
+        if !messages.is_empty() {
+            return Ok(SteerDrain::Messages(messages));
+        }
+    }
+    Ok(SteerDrain::Empty)
+}
+
+/// Adapt disk polling to the agent's [`crate::agent::MessageFetcher`].
+///
+/// This callback can only return messages, so deferral and failures are
+/// logged and left for the next poll. Call [`poll_steer_file`] when the
+/// caller needs to distinguish an empty queue from contention or failure.
+pub fn drain_steer_file(path: &Path) -> Vec<String> {
+    match poll_steer_file(path) {
+        Ok(SteerDrain::Messages(messages)) => messages,
+        Ok(SteerDrain::Empty) => Vec::new(),
+        Ok(SteerDrain::Busy) => {
+            tracing::debug!("steering queue busy; retrying later");
+            Vec::new()
+        }
         Err(err) => {
-            tracing::warn!(error = %err, "steering batch retained for recovery");
+            tracing::warn!(error = %err, "steering poll failed; pending batches retained for retry");
             Vec::new()
         }
     }
@@ -652,6 +702,21 @@ mod tests {
 
     fn fresh_registry() -> AgentHubRegistry {
         AgentHubRegistry::default()
+    }
+
+    /// Retry only real lock contention. Never hide an I/O/protocol error or
+    /// an unexpectedly empty queue behind a blanket retry loop.
+    fn poll_until_ready(path: &Path) -> SteerDrain {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match poll_steer_file(path).expect("steering poll") {
+                SteerDrain::Busy => {
+                    assert!(std::time::Instant::now() < deadline, "queue remained busy");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                ready => return ready,
+            }
+        }
     }
 
     #[test]
@@ -783,6 +848,122 @@ mod tests {
     }
 
     #[test]
+    fn busy_steer_does_not_block_hub_control_or_record_delivery() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        let other = reg.register("other", "task").expect("register other");
+        reg.steer(&child.id, "parent", "earlier").expect("first send");
+        let original = fs::read(&child.steer_path).expect("original queue");
+        let lock = open_steer_lock(&child.steer_path).expect("lock file");
+        lock.lock().expect("reader lock");
+        let child_id = child.id.clone();
+        let other_id = other.id.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let blocked = reg
+                .bus_send(&child_id, "parent", "not accepted")
+                .map(|message| message.seq)
+                .map_err(|err| err.to_string());
+            let accepted = reg
+                .steer(&other_id, "parent", "independent")
+                .map(|message| message.seq)
+                .map_err(|err| err.to_string());
+            reg.mark_killed(&other_id);
+            tx.send((blocked, accepted))
+                .expect("report completed operations");
+            reg
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10));
+        // Release before joining even on timeout, so restoring a blocking
+        // writer makes this test fail instead of hanging the entire suite.
+        drop(lock);
+        let mut reg = worker.join().expect("hub worker");
+        let (blocked, accepted) = result.expect("hub must not wait for the queue lock");
+        assert!(
+            blocked
+                .expect_err("busy send must fail")
+                .contains("not accepted")
+        );
+        assert_eq!(accepted.expect("unrelated child remains steerable"), 2);
+        assert_eq!(
+            reg.get(&other.id).expect("other child").status,
+            ChildStatus::Killed
+        );
+        assert_eq!(reg.bus_seq, 2);
+        assert_eq!(reg.inbox(&child.id).len(), 1);
+        assert_eq!(fs::read(&child.steer_path).expect("untouched queue"), original);
+        assert_eq!(
+            reg.steer(&child.id, "parent", "retry").expect("retry").seq,
+            3
+        );
+        assert_eq!(
+            poll_until_ready(&child.steer_path),
+            SteerDrain::Messages(vec![
+                "[hub:parent] earlier".to_string(),
+                "[hub:parent] retry".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn poll_reports_empty_only_after_inspecting_the_queue() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let path = temp.path().join("worker.steer");
+        assert_eq!(poll_until_ready(&path), SteerDrain::Empty);
+        assert!(!path.exists());
+        assert!(!path.with_extension("draining").exists());
+    }
+
+    #[test]
+    fn poll_reports_lock_open_failure_without_claiming_messages() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let path = temp.path().join("worker.steer");
+        let original = b"pending bytes\n";
+        fs::write(&path, original).expect("pending queue");
+        fs::create_dir(path.with_extension("steer.lock")).expect("block lock open");
+        let err = poll_steer_file(&path).expect_err("I/O failure is not empty or busy");
+        assert!(err.to_string().contains("open steer lock"));
+        assert_eq!(fs::read(&path).expect("pending queue retained"), original.to_vec());
+        assert!(!path.with_extension("draining").exists());
+    }
+
+    #[test]
+    fn poll_reports_recovery_read_failure_without_touching_newer_messages() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        reg.steer(&child.id, "parent", "newer").expect("send");
+        let original = fs::read(&child.steer_path).expect("queued frame");
+        let draining = child.steer_path.with_extension("draining");
+        fs::create_dir(&draining).expect("unreadable recovery batch");
+        assert!(poll_steer_file(&child.steer_path).is_err());
+        assert!(draining.is_dir());
+        assert_eq!(
+            fs::read(&child.steer_path).expect("newer frame retained"),
+            original
+        );
+    }
+
+    #[test]
+    fn empty_recovery_does_not_hide_newer_pending_messages() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        let draining = child.steer_path.with_extension("draining");
+        fs::write(&draining, "\n \n").expect("empty interrupted drain");
+        reg.steer(&child.id, "parent", "pending").expect("send");
+        assert_eq!(
+            poll_until_ready(&child.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] pending".to_string()])
+        );
+        assert_eq!(poll_until_ready(&child.steer_path), SteerDrain::Empty);
+    }
+
+    #[test]
     fn drain_defers_while_a_writer_owns_the_queue_lock() {
         let temp = tempfile::tempdir().expect("hub directory");
         let mut reg = fresh_registry();
@@ -791,14 +972,17 @@ mod tests {
         reg.steer(&child.id, "parent", "accepted").expect("send");
         let lock = open_steer_lock(&child.steer_path).expect("lock file");
         lock.lock().expect("writer lock");
-        assert!(drain_steer_file(&child.steer_path).is_empty());
+        assert_eq!(
+            poll_steer_file(&child.steer_path).expect("poll locked queue"),
+            SteerDrain::Busy
+        );
         assert!(child.steer_path.exists());
         drop(lock);
         assert_eq!(
-            drain_steer_file(&child.steer_path),
-            vec!["[hub:parent] accepted"]
+            poll_until_ready(&child.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] accepted".to_string()])
         );
-        assert!(drain_steer_file(&child.steer_path).is_empty());
+        assert_eq!(poll_until_ready(&child.steer_path), SteerDrain::Empty);
     }
 
     #[test]
@@ -813,15 +997,15 @@ mod tests {
         reg.steer(&child.id, "parent", "second")
             .expect("send second");
         assert_eq!(
-            drain_steer_file(&child.steer_path),
-            vec!["[hub:parent] first"]
+            poll_until_ready(&child.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] first".to_string()])
         );
         assert!(child.steer_path.exists());
         assert_eq!(
-            drain_steer_file(&child.steer_path),
-            vec!["[hub:parent] second"]
+            poll_until_ready(&child.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] second".to_string()])
         );
-        assert!(drain_steer_file(&child.steer_path).is_empty());
+        assert_eq!(poll_until_ready(&child.steer_path), SteerDrain::Empty);
     }
 
     #[test]
@@ -838,7 +1022,8 @@ mod tests {
             .expect("fixture");
         file.write_all(b"{broken\n").expect("partial frame");
         drop(file);
-        assert!(drain_steer_file(&child.steer_path).is_empty());
+        let err = poll_steer_file(&child.steer_path).expect_err("malformed batch is not empty");
+        assert!(err.to_string().contains("invalid steering frame at line 2"));
         let draining = child.steer_path.with_extension("draining");
         assert!(draining.exists(), "failed batch must remain recoverable");
         assert!(
@@ -848,10 +1033,10 @@ mod tests {
         );
         fs::write(&draining, original).expect("repair fixture");
         assert_eq!(
-            drain_steer_file(&child.steer_path),
-            vec!["[hub:parent] valid"]
+            poll_until_ready(&child.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] valid".to_string()])
         );
-        assert!(drain_steer_file(&child.steer_path).is_empty());
+        assert_eq!(poll_until_ready(&child.steer_path), SteerDrain::Empty);
     }
 
     #[test]
@@ -942,13 +1127,16 @@ mod tests {
         assert_eq!(inbox[1].body, "second");
         assert!(inbox[0].seq < inbox[1].seq);
         // The on-disk queue mirrors the bus in the same order.
-        let drained = drain_steer_file(&entry.steer_path);
+        let drained = poll_until_ready(&entry.steer_path);
         assert_eq!(
             drained,
-            vec!["[hub:a] first".to_string(), "[hub:b] second".to_string()]
+            SteerDrain::Messages(vec![
+                "[hub:a] first".to_string(),
+                "[hub:b] second".to_string()
+            ])
         );
         // Drain is consume-once.
-        assert!(drain_steer_file(&entry.steer_path).is_empty());
+        assert_eq!(poll_until_ready(&entry.steer_path), SteerDrain::Empty);
         let _ = fs::remove_dir_all(&temp);
     }
 
