@@ -95,7 +95,7 @@ impl ChildStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildEntry {
-    /// Unique run id: `<agent>-seq` (seq is per-registry monotonic).
+    /// Unique run id: `<agent>-<seq>` (seq is per-registry monotonic).
     pub id: String,
     /// Agent definition name (e.g. `scout`).
     pub name: String,
@@ -302,6 +302,8 @@ impl AgentHubRegistry {
     /// the cross-process queue has accepted the complete frame.
     /// A busy disk queue returns an error without waiting or recording a
     /// delivery; the caller can retry without duplicating an accepted frame.
+    /// An unterminated existing frame must be repaired before appending;
+    /// rejecting it preserves both the old bytes and the delivery sequence.
     pub fn steer(&mut self, id: &str, from: &str, body: &str) -> Result<BusMessage> {
         let entry = self
             .entries
@@ -451,7 +453,7 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
         }
     }
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -464,6 +466,23 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
         .metadata()
         .map_err(|e| Error::tool("hub", format!("stat steer queue {}: {e}", path.display())))?
         .len();
+    if original_len > 0 {
+        // A process can die between writing a JSON value and its newline.
+        // Appending behind that torn record would concatenate the next
+        // accepted frame into invalid JSON and poison subsequent delivery.
+        let mut last = [0_u8; 1];
+        file.seek(SeekFrom::End(-1))
+            .and_then(|_| file.read_exact(&mut last))
+            .map_err(|e| {
+                Error::tool("hub", format!("inspect steer queue {}: {e}", path.display()))
+            })?;
+        if last[0] != b'\n' {
+            return Err(Error::tool(
+                "hub",
+                "steering queue has an unterminated frame; message not accepted, repair the queue before retrying",
+            ));
+        }
+    }
     if original_len.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
         > MAX_STEER_QUEUE_BYTES
     {
@@ -512,24 +531,36 @@ fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
             "draining steering batch exceeds the queue limit",
         ));
     }
-    // Parse the entire batch before acknowledging any of it. A malformed
-    // frame must not silently discard its valid neighbors.
-    raw.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            let message: BusMessage = serde_json::from_str(line).map_err(|_| {
-                Error::tool(
-                    "hub",
-                    format!(
-                        "invalid steering frame at line {}; batch retained",
-                        index + 1
-                    ),
-                )
-            })?;
-            Ok(format!("[hub:{}] {}", message.from, message.body))
-        })
-        .collect()
+    // Newline termination is part of the writer's frame contract, including
+    // during recovery. Valid JSON without its terminator is still torn.
+    if !raw.is_empty() && !raw.ends_with('\n') {
+        return Err(Error::tool(
+            "hub",
+            "unterminated steering frame; batch retained",
+        ));
+    }
+    // Validate every wire frame, including its newline, before acknowledging
+    // any messages. Malformed or oversized frames cannot discard neighbors.
+    let mut messages = Vec::new();
+    for (index, frame) in raw.split_inclusive('\n').enumerate() {
+        if frame.len() > MAX_STEER_FRAME_BYTES {
+            return Err(Error::tool(
+                "hub",
+                format!("steering frame at line {} exceeds 64 KiB; batch retained", index + 1),
+            ));
+        }
+        if frame.trim().is_empty() {
+            continue;
+        }
+        let message: BusMessage = serde_json::from_str(frame).map_err(|_| {
+            Error::tool(
+                "hub",
+                format!("invalid steering frame at line {}; batch retained", index + 1),
+            )
+        })?;
+        messages.push(format!("[hub:{}] {}", message.from, message.body));
+    }
+    Ok(messages)
 }
 
 /// Result of one non-blocking disk-queue poll.
@@ -706,17 +737,21 @@ mod tests {
 
     /// Retry only real lock contention. Never hide an I/O/protocol error or
     /// an unexpectedly empty queue behind a blanket retry loop.
-    fn poll_until_ready(path: &Path) -> SteerDrain {
+    fn poll_until_uncontended(path: &Path) -> Result<SteerDrain> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            match poll_steer_file(path).expect("steering poll") {
-                SteerDrain::Busy => {
+            match poll_steer_file(path) {
+                Ok(SteerDrain::Busy) => {
                     assert!(std::time::Instant::now() < deadline, "queue remained busy");
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 ready => return ready,
             }
         }
+    }
+
+    fn poll_until_ready(path: &Path) -> SteerDrain {
+        poll_until_uncontended(path).expect("steering poll")
     }
 
     #[test]
@@ -939,7 +974,7 @@ mod tests {
         let original = fs::read(&child.steer_path).expect("queued frame");
         let draining = child.steer_path.with_extension("draining");
         fs::create_dir(&draining).expect("unreadable recovery batch");
-        assert!(poll_steer_file(&child.steer_path).is_err());
+        assert!(poll_until_uncontended(&child.steer_path).is_err());
         assert!(draining.is_dir());
         assert_eq!(
             fs::read(&child.steer_path).expect("newer frame retained"),
@@ -1022,7 +1057,8 @@ mod tests {
             .expect("fixture");
         file.write_all(b"{broken\n").expect("partial frame");
         drop(file);
-        let err = poll_steer_file(&child.steer_path).expect_err("malformed batch is not empty");
+        let err = poll_until_uncontended(&child.steer_path)
+            .expect_err("malformed batch is not empty");
         assert!(err.to_string().contains("invalid steering frame at line 2"));
         let draining = child.steer_path.with_extension("draining");
         assert!(draining.exists(), "failed batch must remain recoverable");
@@ -1051,6 +1087,132 @@ mod tests {
         assert!(!child.steer_path.exists());
         reg.steer(&child.id, "parent", "small").expect("later send");
         assert_eq!(reg.inbox(&child.id)[0].seq, 1);
+    }
+
+    #[test]
+    fn writer_rejects_torn_tail_without_poisoning_the_next_frame() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        reg.steer(&child.id, "parent", "earlier").expect("first send");
+        let original = fs::read(&child.steer_path).expect("first frame");
+        let torn = &original[..original.len() - 1];
+        fs::write(&child.steer_path, torn).expect("simulate missing final newline");
+        let err = reg
+            .steer(&child.id, "parent", "must not concatenate")
+            .expect_err("torn tail must reject new delivery");
+        assert!(err.to_string().contains("unterminated frame"));
+        assert_eq!(reg.bus_seq, 1);
+        assert_eq!(reg.inbox(&child.id).len(), 1);
+        assert_eq!(fs::read(&child.steer_path).expect("torn bytes retained"), torn.to_vec());
+        fs::write(&child.steer_path, original).expect("repair terminator");
+        assert_eq!(reg.steer(&child.id, "parent", "retry").expect("retry").seq, 2);
+        assert_eq!(
+            poll_until_ready(&child.steer_path),
+            SteerDrain::Messages(vec![
+                "[hub:parent] earlier".to_string(),
+                "[hub:parent] retry".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn unterminated_valid_json_is_retained_with_its_valid_neighbors() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        reg.steer(&child.id, "parent", "first").expect("first send");
+        reg.steer(&child.id, "parent", "second").expect("second send");
+        let mut torn = fs::read(&child.steer_path).expect("queued frames");
+        assert_eq!(torn.pop(), Some(b'\n'));
+        fs::write(&child.steer_path, &torn).expect("simulate torn terminator");
+        let err = poll_until_uncontended(&child.steer_path)
+            .expect_err("valid JSON is not a complete wire frame");
+        assert!(err.to_string().contains("unterminated steering frame"));
+        let draining = child.steer_path.with_extension("draining");
+        assert_eq!(fs::read(&draining).expect("entire batch retained"), torn);
+        torn.push(b'\n');
+        fs::write(&draining, torn).expect("repair complete batch");
+        assert_eq!(
+            poll_until_ready(&child.steer_path),
+            SteerDrain::Messages(vec![
+                "[hub:parent] first".to_string(),
+                "[hub:parent] second".to_string()
+            ])
+        );
+        assert_eq!(poll_until_ready(&child.steer_path), SteerDrain::Empty);
+    }
+
+    #[test]
+    fn recovered_frames_enforce_the_exact_writer_wire_limit() {
+        for wire_len in [
+            MAX_STEER_FRAME_BYTES - 1,
+            MAX_STEER_FRAME_BYTES,
+            MAX_STEER_FRAME_BYTES + 1,
+        ] {
+            let temp = tempfile::tempdir().expect("hub directory");
+            let mut reg = fresh_registry();
+            reg.set_dir_for_tests(temp.path().to_path_buf());
+            let child = reg.register("worker", "task").expect("register");
+            let mut message = reg.steer(&child.id, "parent", "neighbor").expect("send");
+            let mut batch = fs::read(&child.steer_path).expect("valid prefix");
+            message.seq += 1;
+            message.body.clear();
+            let empty_len = serde_json::to_vec(&message).expect("empty frame").len() + 1;
+            message.body = "x".repeat(wire_len - empty_len);
+            let mut frame = serde_json::to_vec(&message).expect("sized frame");
+            frame.push(b'\n');
+            assert_eq!(frame.len(), wire_len);
+            batch.extend_from_slice(&frame);
+            fs::write(&child.steer_path, &batch).expect("batch fixture");
+            let draining = child.steer_path.with_extension("draining");
+            fs::rename(&child.steer_path, &draining).expect("interrupted drain");
+            if wire_len > MAX_STEER_FRAME_BYTES {
+                let err = poll_until_uncontended(&child.steer_path)
+                    .expect_err("oversized recovered frame must fail");
+                assert!(err.to_string().contains("line 2 exceeds 64 KiB"));
+                assert_eq!(fs::read(&draining).expect("all frames retained"), batch);
+            } else {
+                assert_eq!(
+                    poll_until_ready(&child.steer_path),
+                    SteerDrain::Messages(vec![
+                        "[hub:parent] neighbor".to_string(),
+                        format!("[hub:parent] {}", message.body)
+                    ])
+                );
+                assert_eq!(poll_until_ready(&child.steer_path), SteerDrain::Empty);
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_blank_frame_is_not_mistaken_for_an_empty_batch() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let path = temp.path().join("worker.steer");
+        let mut frame = vec![b' '; MAX_STEER_FRAME_BYTES];
+        frame.push(b'\n');
+        fs::write(&path, &frame).expect("oversized blank frame");
+        let err = poll_until_uncontended(&path).expect_err("check size before skipping blanks");
+        assert!(err.to_string().contains("line 1 exceeds 64 KiB"));
+        assert_eq!(fs::read(path.with_extension("draining")).expect("retained frame"), frame);
+    }
+
+    #[test]
+    fn escaped_body_must_fit_the_serialized_frame_budget() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        let body = "\"".repeat(MAX_STEER_FRAME_BYTES / 2);
+        assert!(body.len() < MAX_STEER_FRAME_BYTES);
+        let err = reg.steer(&child.id, "parent", &body).expect_err("escaped wire size");
+        assert!(err.to_string().contains("serialized steering frame exceeds"));
+        assert_eq!(reg.bus_seq, 0);
+        assert!(reg.inbox(&child.id).is_empty());
+        assert!(!child.steer_path.exists());
+        assert_eq!(reg.steer(&child.id, "parent", "small").expect("later send").seq, 1);
     }
 
     #[test]
