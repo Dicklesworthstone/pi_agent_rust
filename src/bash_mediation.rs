@@ -5,8 +5,11 @@
 //! `bash.mediation` mode. When a `dcg` binary is on PATH it is the
 //! authoritative verdict source (the user's ONE rule set, with their packs);
 //! the in-tree exec_mediation classifier is the fallback when `dcg` is
-//! absent, times out, or errors. Audit payloads carry dcg-compatible rule
-//! ids either way.
+//! absent or explicitly disabled. A present guard that cannot complete its
+//! evaluation is not an allow: enforcing modes block, while warn mode records
+//! the failure. Audit payloads carry dcg-compatible rule ids either way.
+
+mod dcg;
 
 /// PTY allocation mode for the bash tool (bd-cv653.1.7).
 ///
@@ -246,7 +249,8 @@ const fn reason_of_class(class: crate::extensions::DangerousCommandClass) -> &'s
 ///
 /// # Errors
 ///
-/// Never fails: dcg transport problems degrade to the fallback classifier.
+/// Returns a verdict even on guard failure. Only an absent/disabled dcg uses
+/// the fallback classifier; a failed evaluation produces a critical audit hit.
 #[must_use]
 pub fn assess(
     command: &str,
@@ -272,7 +276,7 @@ pub fn assess(
     // never call dcg; use only the in-tree classifier.
     let dcg_enabled = settings.mediation_dcg.unwrap_or(true);
     let hits: Vec<RuleHit> = if dcg_enabled {
-        dcg_verdict(command, cwd).unwrap_or_else(|| fallback_verdict(command))
+        dcg::verdict(command, cwd).unwrap_or_else(|| fallback_verdict(command))
     } else {
         fallback_verdict(command)
     };
@@ -299,79 +303,6 @@ fn fallback_verdict(command: &str) -> Vec<RuleHit> {
             engine: "exec_mediation".to_string(),
         })
         .collect()
-}
-
-/// dcg `test` verdict parsing state for one command.
-struct DcgProbe {
-    blocked: bool,
-    hits: Vec<RuleHit>,
-}
-
-/// Drive the `dcg` binary for the authoritative verdict. Returns None when
-/// the binary is absent, times out, or produces unparsable output (the
-/// caller falls back to the in-tree classifier).
-fn dcg_verdict(command: &str, cwd: &Path) -> Option<Vec<RuleHit>> {
-    let output = std::process::Command::new("dcg")
-        .args(["test", command])
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-    parse_dcg_output(&combined)
-}
-
-/// Parse `dcg test` output into hits. dcg prints `Matched: <rule-id>` lines
-/// for each blocking rule with a following `Reason:` line, or `ALLOWED` for
-/// clean commands.
-fn parse_dcg_output(text: &str) -> Option<Vec<RuleHit>> {
-    if text.contains("ALLOWED") && !text.contains("Matched:") {
-        return Some(Vec::new());
-    }
-    let mut probe = DcgProbe {
-        blocked: false,
-        hits: Vec::new(),
-    };
-    let mut pending_rule: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        // dcg renders rule matches behind a tree-drawing prefix
-        // (`└── Matched: <rule>`), so locate the token, don't anchor it.
-        if let Some(pos) = trimmed.find("Matched:") {
-            let rule = trimmed[pos + "Matched:".len()..].trim().to_string();
-            if !rule.is_empty() {
-                pending_rule = Some(rule);
-                probe.blocked = true;
-            }
-        } else if let Some(reason) = trimmed.strip_prefix("Reason:")
-            && let Some(rule) = pending_rule.take()
-        {
-            probe.hits.push(RuleHit {
-                rule_id: rule,
-                tier: "critical".to_string(), // ubs:ignore cold parse path; RuleHit owns its Strings
-                reason: reason.trim().to_string(), // ubs:ignore cold parse path; RuleHit owns its Strings
-                engine: "dcg".to_string(),
-            });
-        }
-    }
-    // A Matched line without a following Reason still produces a hit.
-    if let Some(rule) = pending_rule {
-        probe.hits.push(RuleHit {
-            rule_id: rule,
-            tier: "critical".to_string(),
-            reason: "blocked by dcg rule".to_string(),
-            engine: "dcg".to_string(),
-        });
-    }
-    if probe.blocked || probe.hits.is_empty() {
-        Some(probe.hits)
-    } else {
-        None
-    }
 }
 
 /// Import `.dcg.toml` overrides from project + global files into the
@@ -487,8 +418,8 @@ mod tests {
 
     #[test]
     fn dcg_output_parses_block() {
-        let text = "Command: rm -rf /\n            └── Matched: core.filesystem:rm-rf-root-home\n\nPack: core.filesystem\nPattern: rm-rf-root-home\nReason: rm -rf on root or home paths is EXTREMELY DANGEROUS.\n";
-        let hits = parse_dcg_output(text).expect("parsed");
+        let text = br#"{"command":"rm -rf /","decision":"deny","rule_id":"core.filesystem:rm-rf-root-home","reason":"rm -rf on root or home paths is EXTREMELY DANGEROUS."}"#;
+        let hits = dcg::parse_output("rm -rf /", Some(1), text);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rule_id, "core.filesystem:rm-rf-root-home");
         assert_eq!(hits[0].tier, "critical");
@@ -498,7 +429,11 @@ mod tests {
 
     #[test]
     fn dcg_output_parses_allowed() {
-        let hits = parse_dcg_output("Command: ls -la\n\nResult: ALLOWED\n").expect("parsed");
+        let hits = dcg::parse_output(
+            "ls -la",
+            Some(0),
+            br#"{"command":"ls -la","decision":"allow"}"#,
+        );
         assert!(hits.is_empty());
     }
 
