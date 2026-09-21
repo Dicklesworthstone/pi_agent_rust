@@ -1,6 +1,6 @@
 //! Agent-facing `lsp` tool: IDE-grade code intelligence over child LSP servers.
 //!
-//! Position-based addressing uses file + 1-based line + symbol substring.
+//! Navigation accepts exact UTF-16 cursors or file + one-based line + symbol.
 //! Code actions support lazy resolution and edit-then-command execution;
 //! server-initiated edits require an explicitly selected command window.
 
@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use client::{hover_to_text, parse_locations, uri_to_path};
+use client::uri_to_path;
 use registry::{LspRegistry, ServerEntry};
 use text::{Position, find_occurrences, offset_to_position};
 
@@ -36,8 +36,6 @@ use crate::model::{ContentBlock, TextContent};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 
 const MAX_PAYLOAD_BYTES: usize = 200 * 1024;
-const DEFAULT_LOCATION_LIMIT: usize = 100;
-const HARD_LOCATION_LIMIT: usize = 1000;
 
 fn text_output(text: String, details: Value) -> ToolOutput {
     ToolOutput {
@@ -213,24 +211,6 @@ impl LspTool {
             .map_or_else(|| self.registry.request_timeout(), Duration::from_secs)
     }
 
-    fn locations_output(
-        &self,
-        action: &str,
-        locations: &[(String, text::Range)],
-        limit: usize,
-    ) -> ToolOutput {
-        let mut entries = Vec::new();
-        for (uri, range) in locations.iter().take(limit) {
-            let path =
-                uri_to_path(uri).map_or_else(|| uri.clone(), |p| display_path(&p, &self.cwd));
-            entries.push(
-                json!({"file":path,"line":range.start.line+1,"character":range.start.character+1}),
-            );
-        }
-        let payload = json!({"action":action,"count":entries.len(),"truncated":locations.len()>limit,"locations":entries});
-        text_output(payload.to_string(), payload)
-    }
-
     async fn run_diagnostics(&self, input: &LspInput) -> Result<ToolOutput> {
         let Some(file) = input.file.as_deref() else {
             return Ok(usage_error(
@@ -270,61 +250,6 @@ impl LspTool {
         let diags = entry.client.document_diagnostics(&uri, wait).await?;
         let payload = json!({"action":"diagnostics","file":display_path(&path,&self.cwd),"server":entry.spec_name,"count":diags.len(),"diagnostics":diags});
         Ok(text_output(payload.to_string(), payload))
-    }
-
-    async fn run_position_request(
-        &self,
-        input: &LspInput,
-        action: &str,
-        method: &str,
-        extra_params: Value,
-    ) -> Result<ToolOutput> {
-        let (path, position) = self.require_position(input)?;
-        let (uri, entry) = self.synced(&path).await?;
-        let mut params = json!({"textDocument":{"uri":uri},"position":position});
-        if let (Some(dst), Some(src)) = (params.as_object_mut(), extra_params.as_object()) {
-            for (key, value) in src {
-                dst.insert(key.clone(), value.clone());
-            }
-        }
-        let result = entry
-            .client
-            .call(method, params, self.request_timeout(input))
-            .await?;
-        if action == "hover" {
-            let text = hover_to_text(&result).unwrap_or_else(|| "no hover information".to_string());
-            let payload = json!({"action":"hover","file":display_path(&path,&self.cwd),"line":position.line+1,"hover":text});
-            return Ok(text_output(payload.to_string(), payload));
-        }
-        let locations = parse_locations(&result);
-        let limit = input
-            .limit
-            .unwrap_or(DEFAULT_LOCATION_LIMIT)
-            .min(HARD_LOCATION_LIMIT);
-        if locations.is_empty() {
-            let payload = json!({"action":action,"file":display_path(&path,&self.cwd),"line":position.line+1,
-                "count":0,"locations":[],"note":format!("no {action} found at that position")});
-            return Ok(text_output(payload.to_string(), payload));
-        }
-        Ok(self.locations_output(action, &locations, limit))
-    }
-
-    fn require_position(&self, input: &LspInput) -> Result<(PathBuf, Position)> {
-        let file = input.file.as_deref().ok_or_else(|| {
-            tool_err("LSP_USAGE", format!("lsp {} requires `file`", input.action))
-        })?;
-        let symbol = input.symbol.as_deref().ok_or_else(|| {
-            tool_err(
-                "LSP_USAGE",
-                format!(
-                    "lsp {} requires `symbol` (project-aware lookups never guess a position)",
-                    input.action
-                ),
-            )
-        })?;
-        let path = resolve_tool_path(file, &self.cwd);
-        let position = Self::resolve_position(&path, input.line, symbol)?;
-        Ok((path, position))
     }
 
     async fn run_symbols(&self, input: &LspInput) -> Result<ToolOutput> {
@@ -589,7 +514,8 @@ impl Tool for LspTool {
             " rename and rename_file with apply:false stage a reviewable workspace edit without writes. Then use the same action with refactorId and apply:true to commit that exact plan without another server request. Omitting apply on a fresh rename preserves immediate application.",
             " prepare_rename inspects the server-confirmed symbol range and placeholder without computing edits. It and rename accept file + exact position instead of symbol/line. Fresh rename automatically prepares when supported; a refusal stops before computing edits. Preparation is not an approval handle.",
             " symbols with query searches the workspace selected by an anchor file (file or symbol, not both); file without query lists document symbols. resolve:true fills missing symbol location ranges when supported. Inspect truncated and unresolvedIndices; returned URIs are metadata, never opened or executed.",
-            " format previews retain an exact plan too. Approve with action:format, refactorId and apply:true without file or formatting options; no second formatter request is made. The full workspaceEdit must fit the preview budget, even when its edits overview is shortened. A fresh format with file and apply:true computes and applies immediately."
+            " format previews retain an exact plan too. Approve with action:format, refactorId and apply:true without file or formatting options; no second formatter request is made. The full workspaceEdit must fit the preview budget, even when its edits overview is shortened. A fresh format with file and apply:true computes and applies immediately.",
+            " definition, references, type_definition, implementation and hover also accept file + exact position instead of symbol/line. Navigation preserves complete target ranges and location-link metadata; inspect total, truncated and responseComplete. Target URIs are never opened. Source changes during the request invalidate the result."
         )
     }
     fn parameters(&self) -> Value {
@@ -598,7 +524,7 @@ impl Tool for LspTool {
             "properties": {
                 "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help","inlay_hints","prepare_rename"]},
                 "resolve":{"type":"boolean","description":"inlay_hints: resolve retained hints for tooltips and label locations. symbols with query: resolve retained symbols missing location ranges. Requires server resolve support; omit or false for inline results. Uses the same request budget and never opens returned URIs, applies edits or executes commands."},
-                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for completion, signature_help, prepare_rename or rename; requires file. For rename targeting, use instead of symbol/line. Put signature_help's cursor inside the call. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
+                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for navigation (definition, references, type_definition, implementation, hover), completion, signature_help or rename targeting; requires file. Use instead of symbol/line. Put signature_help's cursor inside the call. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                 "completionId":{"type":"string","description":"Opaque completion from the latest listing. Select without apply to resolve and preview, or apply:true to insert it with its auto-import edits. Do not combine with other selectors. Expires on source changes, server replacement, reload or another completion listing."},
                 "snippetValues":{"type":"object","maxProperties":64,"additionalProperties":{"type":"string","maxLength":16384},"description":"Selected snippet completion only: literal replacements keyed by canonical numeric placeholder index (0..65535), e.g. {\"1\":\"argument\"}. Values are not evaluated or reparsed. Defaults and first choices apply otherwise; unbound positive tabstops require a value. Repeat the map with apply:true; preview substitutions are not cached."},
                 "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics globs inspect cached reports. workspace_diagnostics uses a positive workspace-relative glob to actively check matching nonignored regular files; it may start language servers."},
@@ -667,11 +593,12 @@ impl Tool for LspTool {
             && !matches!(
                 input.action.as_str(),
                 "completion" | "signature_help" | "prepare_rename" | "rename"
+                    | "definition" | "references" | "type_definition" | "implementation" | "hover"
             )
         {
             return Err(tool_err(
                 "LSP_USAGE",
-                "position requires completion, signature_help, prepare_rename or rename",
+                "position requires completion, signature_help, rename targeting or source navigation",
             ));
         }
         if input.only.is_some() && input.action != "code_actions" {

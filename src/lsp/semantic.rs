@@ -16,6 +16,7 @@ use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 
 mod hints;
+mod navigation;
 mod signatures;
 mod symbols;
 

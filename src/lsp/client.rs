@@ -203,8 +203,8 @@ impl LspClient {
                         },
                         "completionList":{"itemDefaults":["editRange","insertTextFormat","insertTextMode","data"]}
                     },
-                    "definition":{"linkSupport":false},"typeDefinition":{"linkSupport":false},
-                    "implementation":{"linkSupport":false},"references":{},
+                    "definition":{"linkSupport":true},"typeDefinition":{"linkSupport":true},
+                    "implementation":{"linkSupport":true},"references":{},
                     "callHierarchy":{"dynamicRegistration":false},
                     "typeHierarchy":{"dynamicRegistration":false},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
