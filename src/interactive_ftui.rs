@@ -4329,6 +4329,32 @@ fn replacement_options(
 /// Match the bubbletea stack's interactive extension-command budget.
 const EXT_COMMAND_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// What to tell someone whose slash command the extension runtime does not
+/// have.
+///
+/// Reaching this means two things at once: the routing chain in
+/// [`PiFtuiModel::route_slash_command_tail`] did not claim the command, and no
+/// extension registered it. If pi itself defines the name, "Unknown command"
+/// is then false — the command exists, this stack has not implemented it — and
+/// it points at `/help`, which lists only what this stack does have. Saying so
+/// costs nothing and is the difference between "pi is broken" and "use the
+/// other stack for this one".
+///
+/// An extension that registers a name pi also uses still wins: this runs only
+/// after `has_command` has already said no.
+fn unrouted_command_message(name: &str, extensions_enabled: bool) -> String {
+    if crate::interactive::SlashCommand::parse(&format!("/{name}")).is_some() {
+        return format!(
+            "/{name} is a pi command that this stack does not implement yet; run `pi --classic` for it"
+        );
+    }
+    if extensions_enabled {
+        format!("Unknown command: /{name} (try /help)")
+    } else {
+        format!("Unknown command: /{name} (extensions disabled; try /help)")
+    }
+}
+
 /// Dispatch a slash command to the extension runtime (bd-1eoh4): unknown or
 /// unavailable commands report the same way the bubbletea stack does.
 async fn run_extension_command(
@@ -4344,15 +4370,11 @@ async fn run_extension_command(
         .as_ref()
         .map(|region| region.manager().clone());
     let Some(manager) = manager else {
-        let _ = agent_tx.send(PiMsg::System(format!(
-            "Unknown command: /{name} (extensions disabled; try /help)"
-        )));
+        let _ = agent_tx.send(PiMsg::System(unrouted_command_message(name, false)));
         return;
     };
     if !manager.has_command(name) {
-        let _ = agent_tx.send(PiMsg::System(format!(
-            "Unknown command: /{name} (try /help)"
-        )));
+        let _ = agent_tx.send(PiMsg::System(unrouted_command_message(name, true)));
         return;
     }
     let Some(runtime) = manager.runtime() else {
@@ -5932,6 +5954,75 @@ mod tests {
             submit_rx.try_recv().is_err(),
             "the popup must consume shift+tab before the thinking cycle"
         );
+    }
+
+    #[test]
+    fn every_pi_command_is_either_routed_here_or_named_as_unimplemented() {
+        // Type each canonical pi slash command and see whether this stack
+        // claims it. Whatever it does not claim falls through to extension
+        // dispatch, and the message there must not call a real pi command
+        // "Unknown command" — that reads as "pi is broken" and sends the user
+        // to a /help that lists only what this stack already has.
+        //
+        // This also keeps the size of the ftui/charmed command gap measured
+        // rather than asserted: implementing one here moves it between the two
+        // buckets and the test keeps passing either way.
+        let mut routed = Vec::new();
+        let mut unrouted = Vec::new();
+        for command in crate::interactive::SlashCommand::ALL {
+            let name = command.canonical();
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, name);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            match submit_rx.try_recv() {
+                Ok(UiCommand::ExtensionCommand { name: sent, .. }) => unrouted.push(sent),
+                _ => routed.push(name),
+            }
+        }
+
+        assert!(
+            !routed.is_empty() && !unrouted.is_empty(),
+            "expected both buckets to be non-empty; routed {routed:?}, unrouted {unrouted:?}"
+        );
+        // The bucket a command lands in is deliberately not frozen — that is
+        // the point of measuring rather than listing — but these five are what
+        // this stack is FOR, and one of them falling through to extension
+        // dispatch is a routing regression, not progress.
+        for core in ["/help", "/model", "/clear", "/new", "/exit"] {
+            assert!(
+                routed.contains(&core),
+                "{core} must be handled here, not dispatched as an extension command; \
+                 routed {routed:?}"
+            );
+        }
+        for name in &unrouted {
+            let message = unrouted_command_message(name, true);
+            assert!(
+                message.contains("does not implement yet") && message.contains("--classic"),
+                "/{name} is a real pi command; this stack must say so: {message}"
+            );
+            assert!(
+                !message.contains("Unknown command"),
+                "/{name} is a real pi command and must not be called unknown: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_pi_does_not_have_is_still_reported_as_unknown() {
+        // The other half: the honest message must not swallow genuine typos,
+        // and it has to keep saying whether extensions were even available.
+        let message = unrouted_command_message("definitely-not-a-pi-command", true);
+        assert_eq!(
+            message,
+            "Unknown command: /definitely-not-a-pi-command (try /help)"
+        );
+        let disabled = unrouted_command_message("definitely-not-a-pi-command", false);
+        assert!(disabled.contains("extensions disabled"), "{disabled}");
     }
 
     #[test]
