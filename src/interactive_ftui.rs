@@ -2500,10 +2500,13 @@ impl PiFtuiModel {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "ftui preview commands: /model [provider/model], /resume, /compact, \
-                     /theme, /new, /clear, /session, /tree, /mcp, /thinking [level], \
-                     /name <name>, /hotkeys, /exit, /help, !<cmd> (runs + sends output \
-                     to the agent), !!<cmd> (display-only)",
+                    "ftui preview commands: /model [provider/model], /resume, /new, \
+                     /session, /name <name>, /compact, /tree, /undo [n], /redo [n], \
+                     /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
+                     /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
+                     /thinking [level], /theme, /changelog, /clear, /hotkeys, /help, \
+                     /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
+                     (display-only)",
                 ),
             );
             return true;
@@ -6278,6 +6281,51 @@ mod tests {
         };
         assert_eq!(last.0, EntryRole::Error);
         assert!(last.1.contains("No agent messages to copy yet"), "{last:?}");
+    }
+
+    #[test]
+    fn help_lists_every_command_this_stack_actually_routes() {
+        // /help was a hand-written string and had gone stale: it omitted
+        // /share, /undo, /redo, /usage, /add-dir, /remove-dir, /tan and
+        // /crash, all of which work here. A user cannot run what the only
+        // discovery surface does not mention, so the list drifting is the
+        // same bug as a command being missing.
+        //
+        // Rather than trust a second hand-written list, ask the router: any
+        // canonical command this stack claims must appear in /help.
+        let help = {
+            let (_agent_tx, rx) = mpsc::channel();
+            let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+            sim.init();
+            type_str(&mut sim, "/help");
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            sim.model()
+                .transcript
+                .last()
+                .expect("help entry")
+                .text
+                .clone()
+        };
+
+        let mut missing = Vec::new();
+        for command in crate::interactive::SlashCommand::ALL {
+            let name = command.canonical();
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, name);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            let routed = !matches!(submit_rx.try_recv(), Ok(UiCommand::ExtensionCommand { .. }));
+            if routed && !help.contains(name) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "/help omits commands this stack routes: {missing:?}\n\nhelp said: {help}"
+        );
     }
 
     #[test]
