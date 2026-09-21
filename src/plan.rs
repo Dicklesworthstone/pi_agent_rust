@@ -64,7 +64,14 @@ impl crate::tools::Tool for SubmitPlanTool {
                 "plan": {
                     "type": "string",
                     "maxLength": MAX_PLAN_BYTES,
-                    "description": "The full plan (at most 256 KiB of UTF-8): goal, ordered steps, files to touch, and how to verify. Include a `Files:` line listing the paths/globs the plan will modify (e.g. `Files: src/main.rs, src/tools/, tests/*.rs`) — under --plan-yolo only mutations inside that scope are auto-approved."
+                    "description": "The full plan (at most 256 KiB of UTF-8): goal, ordered steps, and verification. Specify files with the optional files array or one top-level Files: line, not both. Only scoped single-file writes can inherit --plan-yolo approval; other tool policies still apply."
+                },
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 128,
+                    "items": {"type": "string", "maxLength": 1024},
+                    "description": "Relative file scopes appended visibly to the reviewed plan. Exact paths match only that file; a trailing / grants a directory tree; * matches within a component; a whole ** component is recursive. Use this array for names containing spaces or commas. Parent traversal, absolute paths, backslashes, unsupported globs and ambiguous names are not admitted. Paths are limited to 1024 UTF-8 bytes and 64 components."
                 }
             },
             "required": ["plan"]
@@ -110,6 +117,23 @@ impl crate::tools::Tool for SubmitPlanTool {
                 is_error: true,
             });
         }
+        let plan = match input.get("files") {
+            Some(files) => match crate::approval::append_files_declaration(plan, files) {
+                Ok(text) => std::borrow::Cow::Owned(text),
+                Err(message) => {
+                    return Ok(crate::tools::ToolOutput {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new(format!(
+                                "Invalid plan file scope: {message}. No plan state was changed."
+                            )),
+                        )],
+                        details: Some(serde_json::json!({"planReview": "invalid_scope"})),
+                        is_error: true,
+                    });
+                }
+            },
+            None => std::borrow::Cow::Borrowed(plan),
+        };
         // Submission and configured auto-approval are one state transition.
         // A separate approve() could authorize another submitter's plan after
         // a concurrent rejection/re-entry, or report success after exit().
