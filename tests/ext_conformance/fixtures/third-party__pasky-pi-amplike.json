@@ -12,9 +12,7 @@
       "summary": "Verifies 1 tool(s), handoff command registered for pasky-pi-amplike",
       "expect": {
         "tool_count": 1,
-        "commands_contains": [
-          "handoff"
-        ]
+        "commands_contains": ["handoff"]
       }
     },
     {

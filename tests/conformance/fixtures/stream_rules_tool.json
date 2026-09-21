@@ -6,9 +6,7 @@
     {
       "name": "stream_rules_match_across_chunk_boundaries",
       "description": "the rolling matcher detects a rule whose regex is split across consecutive assistant deltas",
-      "requirement_ids": [
-        "STREAM-RULES-MATCH-1"
-      ],
+      "requirement_ids": ["STREAM-RULES-MATCH-1"],
       "input": {
         "op": "match",
         "channel": "assistant",
@@ -21,15 +19,10 @@
             "enabled": true
           }
         ],
-        "chunks": [
-          "let value = Box::",
-          "leak(value);"
-        ]
+        "chunks": ["let value = Box::", "leak(value);"]
       },
       "expected": {
-        "content_contains": [
-          "no-box-leak: Box::leak"
-        ],
+        "content_contains": ["no-box-leak: Box::leak"],
         "details_exact": {
           "action": "abort_and_inject",
           "matched": true,
@@ -43,9 +36,7 @@
     {
       "name": "stream_rules_exclude_tool_call_arguments",
       "description": "matching text inside streamed tool JSON is ignored so the rule engine cannot corrupt a tool payload",
-      "requirement_ids": [
-        "STREAM-RULES-CHANNEL-BOUNDARY-1"
-      ],
+      "requirement_ids": ["STREAM-RULES-CHANNEL-BOUNDARY-1"],
       "input": {
         "op": "match",
         "channel": "tool_call_argument",
@@ -58,9 +49,7 @@
             "enabled": true
           }
         ],
-        "chunks": [
-          "{\"content\":\"value.unwrap()\"}"
-        ]
+        "chunks": ["{\"content\":\"value.unwrap()\"}"]
       },
       "expected": {
         "content_exact": "No stream rule matched.",
@@ -73,9 +62,7 @@
     {
       "name": "stream_rules_reject_invalid_regex_patterns",
       "description": "the production pattern-test path returns the named regex validation error",
-      "requirement_ids": [
-        "STREAM-RULES-REGEX-ERR-1"
-      ],
+      "requirement_ids": ["STREAM-RULES-REGEX-ERR-1"],
       "input": {
         "op": "test_pattern",
         "pattern": "[unterminated",

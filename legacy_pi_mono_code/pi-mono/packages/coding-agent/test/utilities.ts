@@ -6,7 +6,12 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Agent } from "@mariozechner/pi-agent-core";
-import { getModel, getOAuthApiKey, type OAuthCredentials, type OAuthProvider } from "@mariozechner/pi-ai";
+import {
+  getModel,
+  getOAuthApiKey,
+  type OAuthCredentials,
+  type OAuthProvider,
+} from "@mariozechner/pi-ai";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createExtensionRuntime } from "../src/core/extensions/loader.js";
@@ -29,12 +34,12 @@ export const API_KEY = process.env.ANTHROPIC_OAUTH_TOKEN || process.env.ANTHROPI
 const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
 
 type ApiKeyCredential = {
-	type: "api_key";
-	key: string;
+  type: "api_key";
+  key: string;
 };
 
 type OAuthCredentialEntry = {
-	type: "oauth";
+  type: "oauth";
 } & OAuthCredentials;
 
 type AuthCredential = ApiKeyCredential | OAuthCredentialEntry;
@@ -42,24 +47,24 @@ type AuthCredential = ApiKeyCredential | OAuthCredentialEntry;
 type AuthStorageData = Record<string, AuthCredential>;
 
 function loadAuthStorage(): AuthStorageData {
-	if (!existsSync(AUTH_PATH)) {
-		return {};
-	}
-	try {
-		const content = readFileSync(AUTH_PATH, "utf-8");
-		return JSON.parse(content);
-	} catch {
-		return {};
-	}
+  if (!existsSync(AUTH_PATH)) {
+    return {};
+  }
+  try {
+    const content = readFileSync(AUTH_PATH, "utf-8");
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
 }
 
 function saveAuthStorage(storage: AuthStorageData): void {
-	const configDir = dirname(AUTH_PATH);
-	if (!existsSync(configDir)) {
-		mkdirSync(configDir, { recursive: true, mode: 0o700 });
-	}
-	writeFileSync(AUTH_PATH, JSON.stringify(storage, null, 2), "utf-8");
-	chmodSync(AUTH_PATH, 0o600);
+  const configDir = dirname(AUTH_PATH);
+  if (!existsSync(configDir)) {
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  }
+  writeFileSync(AUTH_PATH, JSON.stringify(storage, null, 2), "utf-8");
+  chmodSync(AUTH_PATH, 0o600);
 }
 
 /**
@@ -71,44 +76,44 @@ function saveAuthStorage(storage: AuthStorageData): void {
  * For google-gemini-cli and google-antigravity, returns JSON-encoded { token, projectId }
  */
 export async function resolveApiKey(provider: string): Promise<string | undefined> {
-	const storage = loadAuthStorage();
-	const entry = storage[provider];
+  const storage = loadAuthStorage();
+  const entry = storage[provider];
 
-	if (!entry) return undefined;
+  if (!entry) return undefined;
 
-	if (entry.type === "api_key") {
-		return entry.key;
-	}
+  if (entry.type === "api_key") {
+    return entry.key;
+  }
 
-	if (entry.type === "oauth") {
-		// Build OAuthCredentials record for getOAuthApiKey
-		const oauthCredentials: Record<string, OAuthCredentials> = {};
-		for (const [key, value] of Object.entries(storage)) {
-			if (value.type === "oauth") {
-				const { type: _, ...creds } = value;
-				oauthCredentials[key] = creds;
-			}
-		}
+  if (entry.type === "oauth") {
+    // Build OAuthCredentials record for getOAuthApiKey
+    const oauthCredentials: Record<string, OAuthCredentials> = {};
+    for (const [key, value] of Object.entries(storage)) {
+      if (value.type === "oauth") {
+        const { type: _, ...creds } = value;
+        oauthCredentials[key] = creds;
+      }
+    }
 
-		const result = await getOAuthApiKey(provider as OAuthProvider, oauthCredentials);
-		if (!result) return undefined;
+    const result = await getOAuthApiKey(provider as OAuthProvider, oauthCredentials);
+    if (!result) return undefined;
 
-		// Save refreshed credentials back to auth.json
-		storage[provider] = { type: "oauth", ...result.newCredentials };
-		saveAuthStorage(storage);
+    // Save refreshed credentials back to auth.json
+    storage[provider] = { type: "oauth", ...result.newCredentials };
+    saveAuthStorage(storage);
 
-		return result.apiKey;
-	}
+    return result.apiKey;
+  }
 
-	return undefined;
+  return undefined;
 }
 
 /**
  * Check if a provider has credentials in ~/.pi/agent/auth.json
  */
 export function hasAuthForProvider(provider: string): boolean {
-	const storage = loadAuthStorage();
-	return provider in storage;
+  const storage = loadAuthStorage();
+  return provider in storage;
 }
 
 /** Path to the real pi agent config directory */
@@ -119,74 +124,74 @@ export const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
  * Use this for tests that need real OAuth credentials.
  */
 export function getRealAuthStorage(): AuthStorage {
-	return new AuthStorage(AUTH_PATH);
+  return new AuthStorage(AUTH_PATH);
 }
 
 /**
  * Create a minimal user message for testing.
  */
 export function userMsg(text: string) {
-	return { role: "user" as const, content: text, timestamp: Date.now() };
+  return { role: "user" as const, content: text, timestamp: Date.now() };
 }
 
 /**
  * Create a minimal assistant message for testing.
  */
 export function assistantMsg(text: string) {
-	return {
-		role: "assistant" as const,
-		content: [{ type: "text" as const, text }],
-		api: "anthropic-messages" as const,
-		provider: "anthropic",
-		model: "test",
-		usage: {
-			input: 1,
-			output: 1,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 2,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop" as const,
-		timestamp: Date.now(),
-	};
+  return {
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text }],
+    api: "anthropic-messages" as const,
+    provider: "anthropic",
+    model: "test",
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop" as const,
+    timestamp: Date.now(),
+  };
 }
 
 /**
  * Options for creating a test session.
  */
 export interface TestSessionOptions {
-	/** Use in-memory session (no file persistence) */
-	inMemory?: boolean;
-	/** Custom system prompt */
-	systemPrompt?: string;
-	/** Custom settings overrides */
-	settingsOverrides?: Record<string, unknown>;
+  /** Use in-memory session (no file persistence) */
+  inMemory?: boolean;
+  /** Custom system prompt */
+  systemPrompt?: string;
+  /** Custom settings overrides */
+  settingsOverrides?: Record<string, unknown>;
 }
 
 /**
  * Resources returned by createTestSession that need cleanup.
  */
 export interface TestSessionContext {
-	session: AgentSession;
-	sessionManager: SessionManager;
-	tempDir: string;
-	cleanup: () => void;
+  session: AgentSession;
+  sessionManager: SessionManager;
+  tempDir: string;
+  cleanup: () => void;
 }
 
 export function createTestResourceLoader(): ResourceLoader {
-	return {
-		getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
-		getSkills: () => ({ skills: [], diagnostics: [] }),
-		getPrompts: () => ({ prompts: [], diagnostics: [] }),
-		getThemes: () => ({ themes: [], diagnostics: [] }),
-		getAgentsFiles: () => ({ agentsFiles: [] }),
-		getSystemPrompt: () => undefined,
-		getAppendSystemPrompt: () => [],
-		getPathMetadata: () => new Map(),
-		extendResources: () => {},
-		reload: async () => {},
-	};
+  return {
+    getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+    getSkills: () => ({ skills: [], diagnostics: [] }),
+    getPrompts: () => ({ prompts: [], diagnostics: [] }),
+    getThemes: () => ({ themes: [], diagnostics: [] }),
+    getAgentsFiles: () => ({ agentsFiles: [] }),
+    getSystemPrompt: () => undefined,
+    getAppendSystemPrompt: () => [],
+    getPathMetadata: () => new Map(),
+    extendResources: () => {},
+    reload: async () => {},
+  };
 }
 
 /**
@@ -194,49 +199,51 @@ export function createTestResourceLoader(): ResourceLoader {
  * Use this for e2e tests that need real LLM calls.
  */
 export function createTestSession(options: TestSessionOptions = {}): TestSessionContext {
-	const tempDir = join(tmpdir(), `pi-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-	mkdirSync(tempDir, { recursive: true });
+  const tempDir = join(tmpdir(), `pi-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(tempDir, { recursive: true });
 
-	const model = getModel("anthropic", "claude-sonnet-4-5")!;
-	const agent = new Agent({
-		getApiKey: () => API_KEY,
-		initialState: {
-			model,
-			systemPrompt: options.systemPrompt ?? "You are a helpful assistant. Be extremely concise.",
-			tools: codingTools,
-		},
-	});
+  const model = getModel("anthropic", "claude-sonnet-4-5")!;
+  const agent = new Agent({
+    getApiKey: () => API_KEY,
+    initialState: {
+      model,
+      systemPrompt: options.systemPrompt ?? "You are a helpful assistant. Be extremely concise.",
+      tools: codingTools,
+    },
+  });
 
-	const sessionManager = options.inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
-	const settingsManager = SettingsManager.create(tempDir, tempDir);
+  const sessionManager = options.inMemory
+    ? SessionManager.inMemory()
+    : SessionManager.create(tempDir);
+  const settingsManager = SettingsManager.create(tempDir, tempDir);
 
-	if (options.settingsOverrides) {
-		settingsManager.applyOverrides(options.settingsOverrides);
-	}
+  if (options.settingsOverrides) {
+    settingsManager.applyOverrides(options.settingsOverrides);
+  }
 
-	const authStorage = new AuthStorage(join(tempDir, "auth.json"));
-	const modelRegistry = new ModelRegistry(authStorage, tempDir);
+  const authStorage = new AuthStorage(join(tempDir, "auth.json"));
+  const modelRegistry = new ModelRegistry(authStorage, tempDir);
 
-	const session = new AgentSession({
-		agent,
-		sessionManager,
-		settingsManager,
-		cwd: tempDir,
-		modelRegistry,
-		resourceLoader: createTestResourceLoader(),
-	});
+  const session = new AgentSession({
+    agent,
+    sessionManager,
+    settingsManager,
+    cwd: tempDir,
+    modelRegistry,
+    resourceLoader: createTestResourceLoader(),
+  });
 
-	// Must subscribe to enable session persistence
-	session.subscribe(() => {});
+  // Must subscribe to enable session persistence
+  session.subscribe(() => {});
 
-	const cleanup = () => {
-		session.dispose();
-		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true });
-		}
-	};
+  const cleanup = () => {
+    session.dispose();
+    if (tempDir && existsSync(tempDir)) {
+      rmSync(tempDir, { recursive: true });
+    }
+  };
 
-	return { session, sessionManager, tempDir, cleanup };
+  return { session, sessionManager, tempDir, cleanup };
 }
 
 /**
@@ -251,27 +258,29 @@ export function createTestSession(options: TestSessionOptions = {}): TestSession
  * ```
  */
 export function buildTestTree(
-	session: SessionManager,
-	structure: {
-		messages: Array<{ role: "user" | "assistant"; text: string; branchFrom?: string }>;
-	},
+  session: SessionManager,
+  structure: {
+    messages: Array<{ role: "user" | "assistant"; text: string; branchFrom?: string }>;
+  },
 ): Map<string, string> {
-	const ids = new Map<string, string>();
+  const ids = new Map<string, string>();
 
-	for (const msg of structure.messages) {
-		if (msg.branchFrom) {
-			const branchFromId = ids.get(msg.branchFrom);
-			if (!branchFromId) {
-				throw new Error(`Cannot branch from unknown entry: ${msg.branchFrom}`);
-			}
-			session.branch(branchFromId);
-		}
+  for (const msg of structure.messages) {
+    if (msg.branchFrom) {
+      const branchFromId = ids.get(msg.branchFrom);
+      if (!branchFromId) {
+        throw new Error(`Cannot branch from unknown entry: ${msg.branchFrom}`);
+      }
+      session.branch(branchFromId);
+    }
 
-		const id =
-			msg.role === "user" ? session.appendMessage(userMsg(msg.text)) : session.appendMessage(assistantMsg(msg.text));
+    const id =
+      msg.role === "user"
+        ? session.appendMessage(userMsg(msg.text))
+        : session.appendMessage(assistantMsg(msg.text));
 
-		ids.set(msg.text, id);
-	}
+    ids.set(msg.text, id);
+  }
 
-	return ids;
+  return ids;
 }

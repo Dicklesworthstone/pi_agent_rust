@@ -12,16 +12,8 @@
       "summary": "Verifies 1 tool(s), assistant command, event hooks registered for kcosr-pi-extensions",
       "expect": {
         "tool_count": 1,
-        "commands_contains": [
-          "assistant",
-          "codemap",
-          "skill"
-        ],
-        "event_hooks_contains": [
-          "before_agent_start",
-          "session_start",
-          "tool_call"
-        ]
+        "commands_contains": ["assistant", "codemap", "skill"],
+        "event_hooks_contains": ["before_agent_start", "session_start", "tool_call"]
       }
     },
     {

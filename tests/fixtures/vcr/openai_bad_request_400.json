@@ -15,9 +15,7 @@
       },
       "response": {
         "status": 400,
-        "headers": [
-          ["Content-Type", "application/json"]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"error\":{\"message\":\"Invalid request: model is required.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}"
         ]

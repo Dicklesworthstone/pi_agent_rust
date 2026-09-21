@@ -5,9 +5,7 @@
         "provider": 1
       },
       "cache_heat": {
-        "heavy_group_ids": [
-          "all_targets_check"
-        ],
+        "heavy_group_ids": ["all_targets_check"],
         "proof_memory_cache_hint": {
           "authority_boundary": "Cache hints may influence ordering only; proof-memory reuse remains governed by proof_memory_assessment.",
           "decision": "refresh_validation"
@@ -16,9 +14,7 @@
         "shared_rch_env_present": true,
         "status": "ready"
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "coalescing_advice": {
         "advisory_only": true,
         "local_fallback_policy": "Heavy cargo validation remains RCH-only and must not fail open into local cargo.",
@@ -43,15 +39,11 @@
       ],
       "coordination_admission": {
         "recommended_action": "defer_due_to_collision",
-        "reservation_paths": [
-          "src/providers/openai.rs"
-        ],
+        "reservation_paths": ["src/providers/openai.rs"],
         "reservation_reason_hint": "bd-semantic-blocked",
         "risk_factors": [
           {
-            "affected_paths": [
-              "src/providers/openai.rs"
-            ],
+            "affected_paths": ["src/providers/openai.rs"],
             "id": "blocked_coordination_fixture",
             "recommended_action": "defer_due_to_collision",
             "severity": "blocking"
@@ -73,9 +65,7 @@
         "not_release_or_dropin_claim_evidence": true
       },
       "profile_id": "source_only",
-      "required_group_ids": [
-        "all_targets_check"
-      ],
+      "required_group_ids": ["all_targets_check"],
       "route_status": "blocked",
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-semantic-blocked",
@@ -104,9 +94,7 @@
         "shared_rch_env_present": false,
         "status": "ready"
       },
-      "changed_paths": [
-        "docs/swarm-operations-runbook.md"
-      ],
+      "changed_paths": ["docs/swarm-operations-runbook.md"],
       "coalescing_advice": {
         "advisory_only": true,
         "local_fallback_policy": "Heavy cargo validation remains RCH-only and must not fail open into local cargo.",
@@ -131,9 +119,7 @@
       ],
       "coordination_admission": {
         "recommended_action": "claim_with_beads_soft_lock",
-        "reservation_paths": [
-          "docs/swarm-operations-runbook.md"
-        ],
+        "reservation_paths": ["docs/swarm-operations-runbook.md"],
         "reservation_reason_hint": "bd-semantic-degraded",
         "risk_factors": [
           {
@@ -159,9 +145,7 @@
         "not_release_or_dropin_claim_evidence": true
       },
       "profile_id": "docs_scripts_evidence_only",
-      "required_group_ids": [
-        "fast_script_checks"
-      ],
+      "required_group_ids": ["fast_script_checks"],
       "route_status": "degraded",
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-semantic-degraded",
@@ -181,9 +165,7 @@
         "provider": 1
       },
       "cache_heat": {
-        "heavy_group_ids": [
-          "all_targets_check"
-        ],
+        "heavy_group_ids": ["all_targets_check"],
         "proof_memory_cache_hint": {
           "authority_boundary": "Cache hints may influence ordering only; proof-memory reuse remains governed by proof_memory_assessment.",
           "decision": "reuse_available"
@@ -192,9 +174,7 @@
         "shared_rch_env_present": true,
         "status": "ready"
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "coalescing_advice": {
         "advisory_only": true,
         "local_fallback_policy": "Heavy cargo validation remains RCH-only and must not fail open into local cargo.",
@@ -219,9 +199,7 @@
       ],
       "coordination_admission": {
         "recommended_action": "safe_to_claim",
-        "reservation_paths": [
-          "src/providers/openai.rs"
-        ],
+        "reservation_paths": ["src/providers/openai.rs"],
         "reservation_reason_hint": "bd-semantic-healthy",
         "risk_factors": [],
         "risk_level": "low",
@@ -240,9 +218,7 @@
         "not_release_or_dropin_claim_evidence": true
       },
       "profile_id": "source_only",
-      "required_group_ids": [
-        "all_targets_check"
-      ],
+      "required_group_ids": ["all_targets_check"],
       "route_status": "ready",
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-semantic-healthy",

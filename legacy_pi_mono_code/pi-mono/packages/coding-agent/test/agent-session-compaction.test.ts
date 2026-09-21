@@ -22,184 +22,184 @@ import { codingTools } from "../src/core/tools/index.js";
 import { API_KEY, createTestResourceLoader } from "./utilities.js";
 
 describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
-	let session: AgentSession;
-	let tempDir: string;
-	let sessionManager: SessionManager;
-	let events: AgentSessionEvent[];
+  let session: AgentSession;
+  let tempDir: string;
+  let sessionManager: SessionManager;
+  let events: AgentSessionEvent[];
 
-	beforeEach(() => {
-		// Create temp directory for session files
-		tempDir = join(tmpdir(), `pi-compaction-test-${Date.now()}`);
-		mkdirSync(tempDir, { recursive: true });
+  beforeEach(() => {
+    // Create temp directory for session files
+    tempDir = join(tmpdir(), `pi-compaction-test-${Date.now()}`);
+    mkdirSync(tempDir, { recursive: true });
 
-		// Track events
-		events = [];
-	});
+    // Track events
+    events = [];
+  });
 
-	afterEach(async () => {
-		if (session) {
-			session.dispose();
-		}
-		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true });
-		}
-	});
+  afterEach(async () => {
+    if (session) {
+      session.dispose();
+    }
+    if (tempDir && existsSync(tempDir)) {
+      rmSync(tempDir, { recursive: true });
+    }
+  });
 
-	function createSession(inMemory = false) {
-		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		const agent = new Agent({
-			getApiKey: () => API_KEY,
-			initialState: {
-				model,
-				systemPrompt: "You are a helpful assistant. Be concise.",
-				tools: codingTools,
-			},
-		});
+  function createSession(inMemory = false) {
+    const model = getModel("anthropic", "claude-sonnet-4-5")!;
+    const agent = new Agent({
+      getApiKey: () => API_KEY,
+      initialState: {
+        model,
+        systemPrompt: "You are a helpful assistant. Be concise.",
+        tools: codingTools,
+      },
+    });
 
-		sessionManager = inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
-		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		// Use minimal keepRecentTokens so small test conversations have something to summarize
-		settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
-		const authStorage = new AuthStorage(join(tempDir, "auth.json"));
-		const modelRegistry = new ModelRegistry(authStorage);
+    sessionManager = inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
+    const settingsManager = SettingsManager.create(tempDir, tempDir);
+    // Use minimal keepRecentTokens so small test conversations have something to summarize
+    settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+    const authStorage = new AuthStorage(join(tempDir, "auth.json"));
+    const modelRegistry = new ModelRegistry(authStorage);
 
-		session = new AgentSession({
-			agent,
-			sessionManager,
-			settingsManager,
-			cwd: tempDir,
-			modelRegistry,
-			resourceLoader: createTestResourceLoader(),
-		});
+    session = new AgentSession({
+      agent,
+      sessionManager,
+      settingsManager,
+      cwd: tempDir,
+      modelRegistry,
+      resourceLoader: createTestResourceLoader(),
+    });
 
-		// Subscribe to track events
-		session.subscribe((event) => {
-			events.push(event);
-		});
+    // Subscribe to track events
+    session.subscribe((event) => {
+      events.push(event);
+    });
 
-		return session;
-	}
+    return session;
+  }
 
-	it("should trigger manual compaction via compact()", async () => {
-		createSession();
+  it("should trigger manual compaction via compact()", async () => {
+    createSession();
 
-		// Send a few prompts to build up history
-		await session.prompt("What is 2+2? Reply with just the number.");
-		await session.agent.waitForIdle();
+    // Send a few prompts to build up history
+    await session.prompt("What is 2+2? Reply with just the number.");
+    await session.agent.waitForIdle();
 
-		await session.prompt("What is 3+3? Reply with just the number.");
-		await session.agent.waitForIdle();
+    await session.prompt("What is 3+3? Reply with just the number.");
+    await session.agent.waitForIdle();
 
-		// Manually compact
-		const result = await session.compact();
+    // Manually compact
+    const result = await session.compact();
 
-		expect(result.summary).toBeDefined();
-		expect(result.summary.length).toBeGreaterThan(0);
-		expect(result.tokensBefore).toBeGreaterThan(0);
+    expect(result.summary).toBeDefined();
+    expect(result.summary.length).toBeGreaterThan(0);
+    expect(result.tokensBefore).toBeGreaterThan(0);
 
-		// Verify messages were compacted (should have summary + recent)
-		const messages = session.messages;
-		expect(messages.length).toBeGreaterThan(0);
+    // Verify messages were compacted (should have summary + recent)
+    const messages = session.messages;
+    expect(messages.length).toBeGreaterThan(0);
 
-		// First message should be the summary (a user message with summary content)
-		const firstMsg = messages[0];
-		expect(firstMsg.role).toBe("compactionSummary");
-	}, 120000);
+    // First message should be the summary (a user message with summary content)
+    const firstMsg = messages[0];
+    expect(firstMsg.role).toBe("compactionSummary");
+  }, 120000);
 
-	it("should maintain valid session state after compaction", async () => {
-		createSession();
+  it("should maintain valid session state after compaction", async () => {
+    createSession();
 
-		// Build up history
-		await session.prompt("What is the capital of France? One word answer.");
-		await session.agent.waitForIdle();
+    // Build up history
+    await session.prompt("What is the capital of France? One word answer.");
+    await session.agent.waitForIdle();
 
-		await session.prompt("What is the capital of Germany? One word answer.");
-		await session.agent.waitForIdle();
+    await session.prompt("What is the capital of Germany? One word answer.");
+    await session.agent.waitForIdle();
 
-		// Compact
-		await session.compact();
+    // Compact
+    await session.compact();
 
-		// Session should still be usable
-		await session.prompt("What is the capital of Italy? One word answer.");
-		await session.agent.waitForIdle();
+    // Session should still be usable
+    await session.prompt("What is the capital of Italy? One word answer.");
+    await session.agent.waitForIdle();
 
-		// Should have messages after compaction
-		expect(session.messages.length).toBeGreaterThan(0);
+    // Should have messages after compaction
+    expect(session.messages.length).toBeGreaterThan(0);
 
-		// The agent should have responded
-		const assistantMessages = session.messages.filter((m) => m.role === "assistant");
-		expect(assistantMessages.length).toBeGreaterThan(0);
-	}, 180000);
+    // The agent should have responded
+    const assistantMessages = session.messages.filter((m) => m.role === "assistant");
+    expect(assistantMessages.length).toBeGreaterThan(0);
+  }, 180000);
 
-	it("should persist compaction to session file", async () => {
-		createSession();
+  it("should persist compaction to session file", async () => {
+    createSession();
 
-		await session.prompt("Say hello");
-		await session.agent.waitForIdle();
+    await session.prompt("Say hello");
+    await session.agent.waitForIdle();
 
-		await session.prompt("Say goodbye");
-		await session.agent.waitForIdle();
+    await session.prompt("Say goodbye");
+    await session.agent.waitForIdle();
 
-		// Compact
-		await session.compact();
+    // Compact
+    await session.compact();
 
-		// Load entries from session manager
-		const entries = sessionManager.getEntries();
+    // Load entries from session manager
+    const entries = sessionManager.getEntries();
 
-		// Should have a compaction entry
-		const compactionEntries = entries.filter((e) => e.type === "compaction");
-		expect(compactionEntries.length).toBe(1);
+    // Should have a compaction entry
+    const compactionEntries = entries.filter((e) => e.type === "compaction");
+    expect(compactionEntries.length).toBe(1);
 
-		const compaction = compactionEntries[0];
-		expect(compaction.type).toBe("compaction");
-		if (compaction.type === "compaction") {
-			expect(compaction.summary.length).toBeGreaterThan(0);
-			expect(typeof compaction.firstKeptEntryId).toBe("string");
-			expect(compaction.tokensBefore).toBeGreaterThan(0);
-		}
-	}, 120000);
+    const compaction = compactionEntries[0];
+    expect(compaction.type).toBe("compaction");
+    if (compaction.type === "compaction") {
+      expect(compaction.summary.length).toBeGreaterThan(0);
+      expect(typeof compaction.firstKeptEntryId).toBe("string");
+      expect(compaction.tokensBefore).toBeGreaterThan(0);
+    }
+  }, 120000);
 
-	it("should work with --no-session mode (in-memory only)", async () => {
-		createSession(true); // in-memory mode
+  it("should work with --no-session mode (in-memory only)", async () => {
+    createSession(true); // in-memory mode
 
-		// Send prompts
-		await session.prompt("What is 2+2? Reply with just the number.");
-		await session.agent.waitForIdle();
+    // Send prompts
+    await session.prompt("What is 2+2? Reply with just the number.");
+    await session.agent.waitForIdle();
 
-		await session.prompt("What is 3+3? Reply with just the number.");
-		await session.agent.waitForIdle();
+    await session.prompt("What is 3+3? Reply with just the number.");
+    await session.agent.waitForIdle();
 
-		// Compact should work even without file persistence
-		const result = await session.compact();
+    // Compact should work even without file persistence
+    const result = await session.compact();
 
-		expect(result.summary).toBeDefined();
-		expect(result.summary.length).toBeGreaterThan(0);
+    expect(result.summary).toBeDefined();
+    expect(result.summary.length).toBeGreaterThan(0);
 
-		// In-memory entries should have the compaction
-		const entries = sessionManager.getEntries();
-		const compactionEntries = entries.filter((e) => e.type === "compaction");
-		expect(compactionEntries.length).toBe(1);
-	}, 120000);
+    // In-memory entries should have the compaction
+    const entries = sessionManager.getEntries();
+    const compactionEntries = entries.filter((e) => e.type === "compaction");
+    expect(compactionEntries.length).toBe(1);
+  }, 120000);
 
-	it("should emit correct events during auto-compaction", async () => {
-		createSession();
+  it("should emit correct events during auto-compaction", async () => {
+    createSession();
 
-		// Build some history
-		await session.prompt("Say hello");
-		await session.agent.waitForIdle();
+    // Build some history
+    await session.prompt("Say hello");
+    await session.agent.waitForIdle();
 
-		// Manually trigger compaction and check events
-		await session.compact();
+    // Manually trigger compaction and check events
+    await session.compact();
 
-		// Check that no auto_compaction events were emitted for manual compaction
-		const autoCompactionEvents = events.filter(
-			(e) => e.type === "auto_compaction_start" || e.type === "auto_compaction_end",
-		);
-		// Manual compaction doesn't emit auto_compaction events
-		expect(autoCompactionEvents.length).toBe(0);
+    // Check that no auto_compaction events were emitted for manual compaction
+    const autoCompactionEvents = events.filter(
+      (e) => e.type === "auto_compaction_start" || e.type === "auto_compaction_end",
+    );
+    // Manual compaction doesn't emit auto_compaction events
+    expect(autoCompactionEvents.length).toBe(0);
 
-		// Regular events should have been emitted
-		const messageEndEvents = events.filter((e) => e.type === "message_end");
-		expect(messageEndEvents.length).toBeGreaterThan(0);
-	}, 120000);
+    // Regular events should have been emitted
+    const messageEndEvents = events.filter((e) => e.type === "message_end");
+    expect(messageEndEvents.length).toBeGreaterThan(0);
+  }, 120000);
 });

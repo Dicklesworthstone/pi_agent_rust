@@ -44,10 +44,7 @@
       "summary": "Worktree is clean"
     },
     {
-      "evidence": [
-        "abc1234",
-        "origin/main"
-      ],
+      "evidence": ["abc1234", "origin/main"],
       "id": "git_pushed",
       "status": "pass",
       "summary": "HEAD matches upstream"
@@ -59,9 +56,7 @@
       "summary": "validation status=pass"
     },
     {
-      "evidence": [
-        "docs/evidence/dropin-certification-verdict.json"
-      ],
+      "evidence": ["docs/evidence/dropin-certification-verdict.json"],
       "id": "evidence_freshness",
       "status": "block",
       "summary": "evidence freshness=stale"
@@ -85,9 +80,7 @@
       "summary": "rch status=ok"
     },
     {
-      "evidence": [
-        "renew-dropin-verdict"
-      ],
+      "evidence": ["renew-dropin-verdict"],
       "id": "action_plan_decisions",
       "status": "warn",
       "summary": "1 open action-plan decision(s)"
@@ -100,9 +93,7 @@
     }
   ],
   "markdown": "# Operator Handoff Summary\n\n- Status: blocked\n- Project: pi_agent_rust\n- Branch: main\n- Head: abc1234\n- Generated: [GENERATED_AT]\n\n## What Changed\n- No recently closed beads were provided.\n\n## Safe Next Actions\n- Renew stale or missing evidence before relying on release or drop-in claims.\n- Resolve open action-plan decisions before starting the dependent operator lane.\n\n## Must Not Touch\n- Do not make strict release/drop-in claims from stale evidence.\n\n## Gates\n- No validation gates were provided.\n\n## Completion Audit\n- source_present: false\n- status: not_provided\n- completion_allowed: none\n- blocked_requirements: 0\n- unresolved_gaps: 0\n\n## Open Action-Plan Decisions\n- renew-dropin-verdict: renew_stale_evidence\n\n## Invariants\n- git_worktree_clean: pass - Worktree is clean\n- git_pushed: pass - HEAD matches upstream\n- validation_gates: pass - validation status=pass\n- evidence_freshness: block - evidence freshness=stale\n- agent_mail_usable: pass - agent mail health=green semantic=pass\n- reservations_current: pass - No expired reservations\n- rch_available: pass - rch status=ok\n- action_plan_decisions: warn - 1 open action-plan decision(s)\n- completion_audit: pass - completion audit source=not_provided\n",
-  "must_not_touch": [
-    "Do not make strict release/drop-in claims from stale evidence."
-  ],
+  "must_not_touch": ["Do not make strict release/drop-in claims from stale evidence."],
   "open_action_plan_decisions": [
     {
       "decision": "renew_stale_evidence",

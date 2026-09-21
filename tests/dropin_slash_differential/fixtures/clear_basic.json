@@ -12,17 +12,9 @@
     }
   ],
   "command": "/clear",
-  "expected_fields": [
-    "status"
-  ],
-  "should_contain": [
-    "cleared",
-    "success"
-  ],
-  "should_not_contain": [
-    "error",
-    "failed"
-  ],
+  "expected_fields": ["status"],
+  "should_contain": ["cleared", "success"],
+  "should_not_contain": ["error", "failed"],
   "post_verification": {
     "type": "session_check",
     "expected_message_count": 0

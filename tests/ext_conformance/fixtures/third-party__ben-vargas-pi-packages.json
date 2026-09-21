@@ -12,13 +12,8 @@
       "summary": "Verifies 4 tool(s), synthetic-models command, event hooks registered for ben-vargas-pi-packages",
       "expect": {
         "tool_count": 4,
-        "commands_contains": [
-          "synthetic-models"
-        ],
-        "event_hooks_contains": [
-          "model_select",
-          "session_start"
-        ]
+        "commands_contains": ["synthetic-models"],
+        "event_hooks_contains": ["model_select", "session_start"]
       }
     },
     {

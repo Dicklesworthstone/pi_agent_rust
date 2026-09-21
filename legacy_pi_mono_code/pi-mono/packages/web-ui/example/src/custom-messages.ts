@@ -10,18 +10,18 @@ import { html } from "lit";
 
 // Define custom message types
 export interface SystemNotificationMessage {
-	role: "system-notification";
-	message: string;
-	variant: "default" | "destructive";
-	timestamp: string;
+  role: "system-notification";
+  message: string;
+  variant: "default" | "destructive";
+  timestamp: string;
 }
 
 // Extend CustomAgentMessages interface via declaration merging
 // This must target pi-agent-core where CustomAgentMessages is defined
 declare module "@mariozechner/pi-agent-core" {
-	interface CustomAgentMessages {
-		"system-notification": SystemNotificationMessage;
-	}
+  interface CustomAgentMessages {
+    "system-notification": SystemNotificationMessage;
+  }
 }
 
 // ============================================================================
@@ -29,22 +29,22 @@ declare module "@mariozechner/pi-agent-core" {
 // ============================================================================
 
 const systemNotificationRenderer: MessageRenderer<SystemNotificationMessage> = {
-	render: (notification) => {
-		// notification is fully typed as SystemNotificationMessage!
-		return html`
+  render: (notification) => {
+    // notification is fully typed as SystemNotificationMessage!
+    return html`
 			<div class="px-4">
 				${Alert({
-					variant: notification.variant,
-					children: html`
+          variant: notification.variant,
+          children: html`
 						<div class="flex flex-col gap-1">
 							<div>${notification.message}</div>
 							<div class="text-xs opacity-70">${new Date(notification.timestamp).toLocaleTimeString()}</div>
 						</div>
 					`,
-				})}
+        })}
 			</div>
 		`;
-	},
+  },
 };
 
 // ============================================================================
@@ -52,7 +52,7 @@ const systemNotificationRenderer: MessageRenderer<SystemNotificationMessage> = {
 // ============================================================================
 
 export function registerCustomMessageRenderers() {
-	registerMessageRenderer("system-notification", systemNotificationRenderer);
+  registerMessageRenderer("system-notification", systemNotificationRenderer);
 }
 
 // ============================================================================
@@ -60,15 +60,15 @@ export function registerCustomMessageRenderers() {
 // ============================================================================
 
 export function createSystemNotification(
-	message: string,
-	variant: "default" | "destructive" = "default",
+  message: string,
+  variant: "default" | "destructive" = "default",
 ): SystemNotificationMessage {
-	return {
-		role: "system-notification",
-		message,
-		variant,
-		timestamp: new Date().toISOString(),
-	};
+  return {
+    role: "system-notification",
+    message,
+    variant,
+    timestamp: new Date().toISOString(),
+  };
 }
 
 // ============================================================================
@@ -80,20 +80,20 @@ export function createSystemNotification(
  * Handles system-notification messages by converting them to user messages.
  */
 export function customConvertToLlm(messages: AgentMessage[]): Message[] {
-	// First, handle our custom system-notification type
-	const processed = messages.map((m): AgentMessage => {
-		if (m.role === "system-notification") {
-			const notification = m as SystemNotificationMessage;
-			// Convert to user message with <system> tags
-			return {
-				role: "user",
-				content: `<system>${notification.message}</system>`,
-				timestamp: Date.now(),
-			};
-		}
-		return m;
-	});
+  // First, handle our custom system-notification type
+  const processed = messages.map((m): AgentMessage => {
+    if (m.role === "system-notification") {
+      const notification = m as SystemNotificationMessage;
+      // Convert to user message with <system> tags
+      return {
+        role: "user",
+        content: `<system>${notification.message}</system>`,
+        timestamp: Date.now(),
+      };
+    }
+    return m;
+  });
 
-	// Then use defaultConvertToLlm for standard handling
-	return defaultConvertToLlm(processed);
+  // Then use defaultConvertToLlm for standard handling
+  return defaultConvertToLlm(processed);
 }

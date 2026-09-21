@@ -7,25 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://api.cerebras.ai/v1/chat/completions",
-        "headers": [
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ]
+        "headers": [["Authorization", "Bearer [REDACTED]"], ["Content-Type", "application/json"]]
       },
       "response": {
         "status": 401,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"error\":{\"code\":\"invalid_api_key\",\"message\":\"Simulated error 401\",\"param\":null,\"type\":\"invalid_request_error\"}}"
         ]

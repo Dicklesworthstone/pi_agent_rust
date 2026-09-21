@@ -17,32 +17,32 @@ import { streamSimple } from "@mariozechner/pi-ai";
  * @returns true if proxy is required, false otherwise
  */
 export function shouldUseProxyForProvider(provider: string, apiKey: string): boolean {
-	switch (provider.toLowerCase()) {
-		case "zai":
-			// Z-AI always requires proxy
-			return true;
+  switch (provider.toLowerCase()) {
+    case "zai":
+      // Z-AI always requires proxy
+      return true;
 
-		case "anthropic":
-			// Anthropic OAuth tokens (sk-ant-oat-*) require proxy
-			// Regular API keys (sk-ant-api-*) do NOT require proxy
-			return apiKey.startsWith("sk-ant-oat");
+    case "anthropic":
+      // Anthropic OAuth tokens (sk-ant-oat-*) require proxy
+      // Regular API keys (sk-ant-api-*) do NOT require proxy
+      return apiKey.startsWith("sk-ant-oat");
 
-		// These providers work without proxy
-		case "openai":
-		case "google":
-		case "groq":
-		case "openrouter":
-		case "cerebras":
-		case "xai":
-		case "ollama":
-		case "lmstudio":
-			return false;
+    // These providers work without proxy
+    case "openai":
+    case "google":
+    case "groq":
+    case "openrouter":
+    case "cerebras":
+    case "xai":
+    case "ollama":
+    case "lmstudio":
+      return false;
 
-		// Unknown providers - assume no proxy needed
-		// This allows new providers to work by default
-		default:
-			return false;
-	}
+    // Unknown providers - assume no proxy needed
+    // This allows new providers to work by default
+    default:
+      return false;
+  }
 }
 
 /**
@@ -53,27 +53,31 @@ export function shouldUseProxyForProvider(provider: string, apiKey: string): boo
  * @param proxyUrl - CORS proxy URL (e.g., "https://proxy.mariozechner.at/proxy")
  * @returns Model with modified baseUrl if proxy is needed, otherwise original model
  */
-export function applyProxyIfNeeded<T extends Api>(model: Model<T>, apiKey: string, proxyUrl?: string): Model<T> {
-	// If no proxy URL configured, return original model
-	if (!proxyUrl) {
-		return model;
-	}
+export function applyProxyIfNeeded<T extends Api>(
+  model: Model<T>,
+  apiKey: string,
+  proxyUrl?: string,
+): Model<T> {
+  // If no proxy URL configured, return original model
+  if (!proxyUrl) {
+    return model;
+  }
 
-	// If model has no baseUrl, can't proxy it
-	if (!model.baseUrl) {
-		return model;
-	}
+  // If model has no baseUrl, can't proxy it
+  if (!model.baseUrl) {
+    return model;
+  }
 
-	// Check if this provider/key needs proxy
-	if (!shouldUseProxyForProvider(model.provider, apiKey)) {
-		return model;
-	}
+  // Check if this provider/key needs proxy
+  if (!shouldUseProxyForProvider(model.provider, apiKey)) {
+    return model;
+  }
 
-	// Apply proxy to baseUrl
-	return {
-		...model,
-		baseUrl: `${proxyUrl}/?url=${encodeURIComponent(model.baseUrl)}`,
-	};
+  // Apply proxy to baseUrl
+  return {
+    ...model,
+    baseUrl: `${proxyUrl}/?url=${encodeURIComponent(model.baseUrl)}`,
+  };
 }
 
 /**
@@ -87,29 +91,29 @@ export function applyProxyIfNeeded<T extends Api>(model: Model<T>, apiKey: strin
  * @returns true if error is likely a CORS error
  */
 export function isCorsError(error: unknown): boolean {
-	if (!(error instanceof Error)) {
-		return false;
-	}
+  if (!(error instanceof Error)) {
+    return false;
+  }
 
-	// Check for common CORS error patterns
-	const message = error.message.toLowerCase();
+  // Check for common CORS error patterns
+  const message = error.message.toLowerCase();
 
-	// "Failed to fetch" is the standard CORS error in most browsers
-	if (error.name === "TypeError" && message.includes("failed to fetch")) {
-		return true;
-	}
+  // "Failed to fetch" is the standard CORS error in most browsers
+  if (error.name === "TypeError" && message.includes("failed to fetch")) {
+    return true;
+  }
 
-	// Some browsers report "NetworkError"
-	if (error.name === "NetworkError") {
-		return true;
-	}
+  // Some browsers report "NetworkError"
+  if (error.name === "NetworkError") {
+    return true;
+  }
 
-	// CORS-specific messages
-	if (message.includes("cors") || message.includes("cross-origin")) {
-		return true;
-	}
+  // CORS-specific messages
+  if (message.includes("cors") || message.includes("cross-origin")) {
+    return true;
+  }
 
-	return false;
+  return false;
 }
 
 /**
@@ -120,15 +124,15 @@ export function isCorsError(error: unknown): boolean {
  * @returns A streamFn compatible with Agent's streamFn option
  */
 export function createStreamFn(getProxyUrl: () => Promise<string | undefined>) {
-	return async (model: Model<any>, context: Context, options?: SimpleStreamOptions) => {
-		const apiKey = options?.apiKey;
-		const proxyUrl = await getProxyUrl();
+  return async (model: Model<any>, context: Context, options?: SimpleStreamOptions) => {
+    const apiKey = options?.apiKey;
+    const proxyUrl = await getProxyUrl();
 
-		if (!apiKey || !proxyUrl) {
-			return streamSimple(model, context, options);
-		}
+    if (!apiKey || !proxyUrl) {
+      return streamSimple(model, context, options);
+    }
 
-		const proxiedModel = applyProxyIfNeeded(model, apiKey, proxyUrl);
-		return streamSimple(proxiedModel, context, options);
-	};
+    const proxiedModel = applyProxyIfNeeded(model, apiKey, proxyUrl);
+    return streamSimple(proxiedModel, context, options);
+  };
 }

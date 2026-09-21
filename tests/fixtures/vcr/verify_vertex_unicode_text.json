@@ -8,28 +8,14 @@
         "method": "POST",
         "url": "https://us-central1-aiplatform.googleapis.com/v1/projects/verify-project/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent?alt=sse",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ]
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"],
+          ["Authorization", "Bearer [REDACTED]"]
         ]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "text/event-stream"
-          ]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"日本語テスト — émojis: 🦀🔥\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"candidatesTokenCount\":10,\"promptTokenCount\":15,\"totalTokenCount\":25}}\n\n"
         ]

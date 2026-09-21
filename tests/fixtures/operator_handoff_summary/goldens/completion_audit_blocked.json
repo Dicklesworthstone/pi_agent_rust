@@ -11,11 +11,7 @@
         "id": "REQ-004",
         "issue": "missing push evidence",
         "kind": "commit_push",
-        "refs": [
-          "commit[0]",
-          "commit_push:required_pair",
-          "push[0]"
-        ],
+        "refs": ["commit[0]", "commit_push:required_pair", "push[0]"],
         "status": "failed",
         "text": ""
       }
@@ -25,9 +21,7 @@
     },
     "completion_allowed": false,
     "missing_push": true,
-    "operator_next_actions": [
-      "Push the closeout commit before admitting completion."
-    ],
+    "operator_next_actions": ["Push the closeout commit before admitting completion."],
     "proxy_only_count": 0,
     "source_present": true,
     "status": "blocked",
@@ -61,10 +55,7 @@
       "summary": "Worktree is clean"
     },
     {
-      "evidence": [
-        "abc1234",
-        "origin/main"
-      ],
+      "evidence": ["abc1234", "origin/main"],
       "id": "git_pushed",
       "status": "pass",
       "summary": "HEAD matches upstream"
@@ -106,9 +97,7 @@
       "summary": "No open action-plan decisions"
     },
     {
-      "evidence": [
-        "REQ-004"
-      ],
+      "evidence": ["REQ-004"],
       "id": "completion_audit",
       "status": "block",
       "summary": "completion audit status=blocked blocked=1 gaps=0"

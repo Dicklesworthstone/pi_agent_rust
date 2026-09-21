@@ -1,20 +1,14 @@
 {
   "activity_digest": {
-    "evidence_pointers": [
-      "agent:MagentaOak"
-    ],
-    "reasons": [
-      "7 coordination events and 1 throughput event"
-    ],
+    "evidence_pointers": ["agent:MagentaOak"],
+    "reasons": ["7 coordination events and 1 throughput event"],
     "recommendations": [
       {
         "mode": "testing-golden-artifacts"
       }
     ],
     "saturated": true,
-    "signals": [
-      "high_chatter_low_throughput"
-    ],
+    "signals": ["high_chatter_low_throughput"],
     "source_path": "[WORKSPACE]/activity.json",
     "status": "ok"
   },
@@ -162,13 +156,9 @@
         "surface": "queue_pressure"
       },
       {
-        "evidence_pointers": [
-          "agent:MagentaOak"
-        ],
+        "evidence_pointers": ["agent:MagentaOak"],
         "label": "swarm activity saturation",
-        "reasons": [
-          "7 coordination events and 1 throughput event"
-        ],
+        "reasons": ["7 coordination events and 1 throughput event"],
         "signal": "activity_digest_saturation",
         "source": "activity_digest",
         "surface": "queue_pressure"
@@ -322,10 +312,7 @@
           }
         ],
         "id": "cgroup_numa_context",
-        "source_ids": [
-          "host_preflight",
-          "doctor_swarm"
-        ],
+        "source_ids": ["host_preflight", "doctor_swarm"],
         "status": "covered"
       },
       "extension_hostcalls": {
@@ -347,11 +334,7 @@
           }
         ],
         "id": "extension_hostcalls",
-        "source_ids": [
-          "hostcall_swarm_profile",
-          "tail_latency",
-          "flight_recorder"
-        ],
+        "source_ids": ["hostcall_swarm_profile", "tail_latency", "flight_recorder"],
         "status": "covered"
       },
       "local_tools": {
@@ -373,11 +356,7 @@
           }
         ],
         "id": "local_tools",
-        "source_ids": [
-          "smoke_harness",
-          "flight_recorder",
-          "rpc_swarm_e2e"
-        ],
+        "source_ids": ["smoke_harness", "flight_recorder", "rpc_swarm_e2e"],
         "status": "covered"
       },
       "persistence": {
@@ -431,11 +410,7 @@
           }
         ],
         "id": "provider_streaming",
-        "source_ids": [
-          "tail_latency",
-          "flight_recorder",
-          "rpc_swarm_e2e"
-        ],
+        "source_ids": ["tail_latency", "flight_recorder", "rpc_swarm_e2e"],
         "status": "covered"
       },
       "queue_pressure": {
@@ -457,11 +432,7 @@
           }
         ],
         "id": "queue_pressure",
-        "source_ids": [
-          "cargo_admission",
-          "activity_digest",
-          "hostcall_swarm_profile"
-        ],
+        "source_ids": ["cargo_admission", "activity_digest", "hostcall_swarm_profile"],
         "status": "covered"
       },
       "rch_sync_retrieval": {
@@ -478,10 +449,7 @@
           }
         ],
         "id": "rch_sync_retrieval",
-        "source_ids": [
-          "rch_artifact_sync",
-          "cargo_admission"
-        ],
+        "source_ids": ["rch_artifact_sync", "cargo_admission"],
         "status": "covered"
       }
     }
@@ -740,12 +708,8 @@
             "confidence": 0.64,
             "contract_version": "1.0.0",
             "generated_at": "[TIMESTAMP]",
-            "next_actions": [
-              "Back off heavy cargo validation until RCH pressure clears"
-            ],
-            "reason_ids": [
-              "PROGRESS-SLO-RCH-SATURATED"
-            ],
+            "next_actions": ["Back off heavy cargo validation until RCH pressure clears"],
+            "reason_ids": ["PROGRESS-SLO-RCH-SATURATED"],
             "schema": "pi.swarm.progress_slo.v1",
             "status": "build_saturated",
             "suppressed_claims": [],
@@ -807,13 +771,9 @@
         "rch_posture": "saturated",
         "ready_beads": 2
       },
-      "next_actions": [
-        "Back off heavy cargo validation until RCH pressure clears"
-      ],
+      "next_actions": ["Back off heavy cargo validation until RCH pressure clears"],
       "progress_status": "build_saturated",
-      "reason_ids": [
-        "PROGRESS-SLO-RCH-SATURATED"
-      ],
+      "reason_ids": ["PROGRESS-SLO-RCH-SATURATED"],
       "redaction_summary": {
         "omitted_count": 0,
         "redacted_count": 1,
@@ -866,16 +826,9 @@
     "dirty": true,
     "generated_at": "[TIMESTAMP]",
     "head": "abc123fixture",
-    "porcelain_lines": [
-      " M src/doctor.rs",
-      "?? scripts/new-tool.py"
-    ],
-    "recent_commits": [
-      "abc123fixture bd-fixture closeout"
-    ],
-    "recent_remote_commits": [
-      "def456fixture origin/main prior closeout"
-    ],
+    "porcelain_lines": [" M src/doctor.rs", "?? scripts/new-tool.py"],
+    "recent_commits": ["abc123fixture bd-fixture closeout"],
+    "recent_remote_commits": ["def456fixture origin/main prior closeout"],
     "sample": [
       {
         "path": "src/doctor.rs",
@@ -1584,13 +1537,9 @@
       "validation_failures": 0,
       "validation_passes": 1
     },
-    "next_actions": [
-      "Back off heavy cargo validation until RCH pressure clears"
-    ],
+    "next_actions": ["Back off heavy cargo validation until RCH pressure clears"],
     "progress_status": "build_saturated",
-    "reason_ids": [
-      "PROGRESS-SLO-RCH-SATURATED"
-    ],
+    "reason_ids": ["PROGRESS-SLO-RCH-SATURATED"],
     "redaction_summary": {
       "omitted_count": 0,
       "redacted_count": 1,
@@ -1676,19 +1625,14 @@
       "shallow_bytes": 1048576,
       "source_kind": "fixture",
       "status": "ok",
-      "warnings": [
-        "fixture intentionally mirrors an ARG_MAX-prone /tmp scan"
-      ]
+      "warnings": ["fixture intentionally mirrors an ARG_MAX-prone /tmp scan"]
     },
     "status": "ok",
     "storage_remediation": null,
     "tmpdir": "[PI_AGENT_CARGO_TMP]/test/tmp"
   },
   "redaction_summary": {
-    "fields": [
-      "doctor_swarm.findings[0].detail",
-      "validation_outputs[0].snippet"
-    ],
+    "fields": ["doctor_swarm.findings[0].detail", "validation_outputs[0].snippet"],
     "redacted_count": 2
   },
   "remote_validation_proof_ledger": {
@@ -1709,17 +1653,10 @@
         },
         "bead_id": "bd-e5le6.2",
         "command": {
-          "argv": [
-            "cargo",
-            "check",
-            "--all-targets"
-          ],
+          "argv": ["cargo", "check", "--all-targets"],
           "command_fingerprint": "sha256:[SHA256]",
           "cwd": "[PROJECT_ROOT]",
-          "env_allowlist": [
-            "CARGO_TARGET_DIR",
-            "TMPDIR"
-          ],
+          "env_allowlist": ["CARGO_TARGET_DIR", "TMPDIR"],
           "feature_flags": [],
           "rendered": "rch exec -- cargo check --all-targets"
         },
@@ -1729,32 +1666,20 @@
           "clean_remote_proof": false,
           "coverage": {
             "authoritative_for_bead": false,
-            "changed_paths": [
-              "src/doctor.rs",
-              "scripts/new-tool.py"
-            ],
+            "changed_paths": ["src/doctor.rs", "scripts/new-tool.py"],
             "claimed_authoritative": false,
-            "claimed_paths": [
-              "src/doctor.rs",
-              "scripts/new-tool.py"
-            ],
+            "claimed_paths": ["src/doctor.rs", "scripts/new-tool.py"],
             "coverage_rationale": "validation did not complete cleanly, so coverage is not authoritative",
             "coverage_status": "blocked",
-            "covered_paths": [
-              "src/doctor.rs"
-            ],
-            "uncovered_paths": [
-              "scripts/new-tool.py"
-            ]
+            "covered_paths": ["src/doctor.rs"],
+            "uncovered_paths": ["scripts/new-tool.py"]
           },
           "degraded_reasons": [
             "local_fallback_refused",
             "queue_backoff",
             "remote_execution_not_observed"
           ],
-          "next_actions": [
-            "Rerun the validation gate through RCH before closeout."
-          ],
+          "next_actions": ["Rerun the validation gate through RCH before closeout."],
           "operator_evidence_only": true,
           "status": "blocked",
           "suppressed_claims": [
@@ -1822,10 +1747,7 @@
     "generated_at_utc": "[TIMESTAMP]",
     "git": {
       "branch": "main",
-      "dirty_paths": [
-        "src/doctor.rs",
-        "scripts/new-tool.py"
-      ],
+      "dirty_paths": ["src/doctor.rs", "scripts/new-tool.py"],
       "head": "abc123fixture"
     },
     "ledger_id": "rvpl-0adebefc11879754",
@@ -2062,16 +1984,11 @@
         "id": "coordination_health",
         "max_score": 2,
         "missing_evidence": [],
-        "required_source_ids": [
-          "doctor_swarm",
-          "smoke_harness"
-        ],
+        "required_source_ids": ["doctor_swarm", "smoke_harness"],
         "score": 1,
         "status": "yellow",
         "title": "Coordination health",
-        "warnings": [
-          "doctor swarm findings include warnings"
-        ]
+        "warnings": ["doctor swarm findings include warnings"]
       },
       {
         "blockers": [
@@ -2093,9 +2010,7 @@
         "id": "cargo_rch_posture",
         "max_score": 2,
         "missing_evidence": [],
-        "required_source_ids": [
-          "cargo_admission"
-        ],
+        "required_source_ids": ["cargo_admission"],
         "score": 0,
         "status": "red",
         "title": "Cargo/RCH posture",
@@ -2117,9 +2032,7 @@
         "id": "perf_evidence_freshness",
         "max_score": 2,
         "missing_evidence": [],
-        "required_source_ids": [
-          "claim_readiness"
-        ],
+        "required_source_ids": ["claim_readiness"],
         "score": 2,
         "status": "green",
         "title": "Performance evidence freshness",
@@ -2141,27 +2054,16 @@
         "id": "dirty_worktree_tolerance",
         "max_score": 2,
         "missing_evidence": [],
-        "required_source_ids": [
-          "git_status",
-          "smoke_harness"
-        ],
+        "required_source_ids": ["git_status", "smoke_harness"],
         "score": 1,
         "status": "yellow",
         "title": "Dirty-worktree tolerance",
-        "warnings": [
-          "current captured git state is dirty"
-        ]
+        "warnings": ["current captured git state is dirty"]
       },
       {
-        "blockers": [
-          "1 active Beads entries are stale"
-        ],
+        "blockers": ["1 active Beads entries are stale"],
         "detail": "Beads evidence must not show stale active ownership before launching more swarm work.",
-        "evidence_paths": [
-          "beads.stale",
-          "beads.stale_after_hours",
-          "beads.active_count"
-        ],
+        "evidence_paths": ["beads.stale", "beads.stale_after_hours", "beads.active_count"],
         "green_requires": {
           "all_required_evidence_present": true,
           "all_required_sources_ok": true,
@@ -2170,9 +2072,7 @@
         "id": "stalled_bead_hygiene",
         "max_score": 2,
         "missing_evidence": [],
-        "required_source_ids": [
-          "beads"
-        ],
+        "required_source_ids": ["beads"],
         "score": 0,
         "status": "red",
         "title": "Stalled-Bead hygiene",
@@ -2199,10 +2099,7 @@
         "id": "resource_governor_readiness",
         "max_score": 2,
         "missing_evidence": [],
-        "required_source_ids": [
-          "activity_digest",
-          "cargo_admission"
-        ],
+        "required_source_ids": ["activity_digest", "cargo_admission"],
         "score": 0,
         "status": "red",
         "title": "Resource-governor readiness",
@@ -2252,9 +2149,7 @@
         "id": "test_coverage",
         "max_score": 2,
         "missing_evidence": [],
-        "required_source_ids": [
-          "smoke_harness"
-        ],
+        "required_source_ids": ["smoke_harness"],
         "score": 2,
         "status": "green",
         "title": "Test coverage",
@@ -2313,10 +2208,7 @@
         "bead_id": "bd-fixture",
         "cleanup_command": null,
         "deletion_policy": "retain_active",
-        "evidence_paths": [
-          "rch_admission.cargo_target_dir",
-          "capture.temp_artifacts[0].path"
-        ],
+        "evidence_paths": ["rch_admission.cargo_target_dir", "capture.temp_artifacts[0].path"],
         "id": "temp-f9e45eecd2ce",
         "kind": "cargo_target_dir",
         "last_observed_at": "[TIMESTAMP]",
@@ -2335,9 +2227,7 @@
         "bead_id": null,
         "cleanup_command": null,
         "deletion_policy": "retain_active",
-        "evidence_paths": [
-          "rch_admission.tmpdir"
-        ],
+        "evidence_paths": ["rch_admission.tmpdir"],
         "id": "temp-fee35bf4431c",
         "kind": "cargo_tmpdir",
         "last_observed_at": "[TIMESTAMP]",
@@ -2356,9 +2246,7 @@
         "bead_id": null,
         "cleanup_command": null,
         "deletion_policy": "retain_active",
-        "evidence_paths": [
-          "smoke_harness.artifact_manifest[0].path"
-        ],
+        "evidence_paths": ["smoke_harness.artifact_manifest[0].path"],
         "id": "temp-8233707e3f0f",
         "kind": "e2e_artifact",
         "last_observed_at": "[TIMESTAMP]",
@@ -2377,9 +2265,7 @@
         "bead_id": null,
         "cleanup_command": null,
         "deletion_policy": "retain_active",
-        "evidence_paths": [
-          "validation_outputs.outputs[0].path"
-        ],
+        "evidence_paths": ["validation_outputs.outputs[0].path"],
         "id": "temp-61cc7fa94ac7",
         "kind": "validation_output",
         "last_observed_at": "[TIMESTAMP]",
@@ -2398,9 +2284,7 @@
         "bead_id": "bd-fixture",
         "cleanup_command": null,
         "deletion_policy": "retain_active",
-        "evidence_paths": [
-          "capture.temp_artifacts[1].path"
-        ],
+        "evidence_paths": ["capture.temp_artifacts[1].path"],
         "id": "temp-dd220a4846d3",
         "kind": "clean_worktree_validation_dir",
         "last_observed_at": "[TIMESTAMP]",
@@ -2419,9 +2303,7 @@
         "bead_id": "bd-fixture",
         "cleanup_command": null,
         "deletion_policy": "retain_active",
-        "evidence_paths": [
-          "capture.temp_artifacts[2].path"
-        ],
+        "evidence_paths": ["capture.temp_artifacts[2].path"],
         "id": "temp-82ced7cd5a16",
         "kind": "ubs_shadow_workspace",
         "last_observed_at": "[TIMESTAMP]",
@@ -2440,9 +2322,7 @@
         "bead_id": null,
         "cleanup_command": null,
         "deletion_policy": "deletion_protected_unknown_owner",
-        "evidence_paths": [
-          "capture.temp_artifacts[3].path"
-        ],
+        "evidence_paths": ["capture.temp_artifacts[3].path"],
         "id": "temp-74acd2e81ea6",
         "kind": "cargo_target_dir",
         "last_observed_at": "[TIMESTAMP]",
@@ -2505,10 +2385,7 @@
         "status": "blocked"
       },
       {
-        "evidence_paths": [
-          "smoke_harness.artifact_manifest",
-          "validation_outputs.outputs"
-        ],
+        "evidence_paths": ["smoke_harness.artifact_manifest", "validation_outputs.outputs"],
         "id": "tool_artifact_spillover",
         "metrics": {
           "artifact_count": 2,
@@ -2559,9 +2436,7 @@
         "status": "pressured"
       },
       {
-        "evidence_paths": [
-          "tail_latency.metrics"
-        ],
+        "evidence_paths": ["tail_latency.metrics"],
         "id": "tui_frame_budget",
         "metrics": {
           "frame_budget_us": 16667,
@@ -2624,10 +2499,7 @@
       },
       {
         "dimension_id": "tool_artifact_spillover",
-        "evidence_paths": [
-          "smoke_harness.artifact_manifest",
-          "validation_outputs.outputs"
-        ],
+        "evidence_paths": ["smoke_harness.artifact_manifest", "validation_outputs.outputs"],
         "recommendation": "Keep large tool output in evidence artifacts and avoid embedding bulky payloads into prompts.",
         "signal": "tool_artifact_spillover",
         "status": "pressured"
@@ -2683,9 +2555,7 @@
       }
     ],
     "redaction_summary": {
-      "fields": [
-        "validation_outputs[0].snippet"
-      ],
+      "fields": ["validation_outputs[0].snippet"],
       "redacted_count": 1
     },
     "status": "failed"
@@ -2693,10 +2563,7 @@
   "validation_scheduler_plan": {
     "change_profile": {
       "changed_path_count": 2,
-      "changed_paths": [
-        "src/doctor.rs",
-        "scripts/new-tool.py"
-      ],
+      "changed_paths": ["src/doctor.rs", "scripts/new-tool.py"],
       "docs_only": false,
       "mixed_python_rust": true,
       "profile_id": "mixed_python_rust",
@@ -2711,10 +2578,7 @@
         "command_class": "fast_script",
         "dependency_rank": 1,
         "estimated_cost": "low",
-        "evidence_paths": [
-          "git_state.porcelain_lines",
-          "validation_scheduler_plan.contract"
-        ],
+        "evidence_paths": ["git_state.porcelain_lines", "validation_scheduler_plan.contract"],
         "exact_commands": [
           "python3 -m py_compile scripts/build_swarm_operator_runpack.py",
           "python3 -m json.tool docs/contracts/validation-scheduler-plan-contract.json >/dev/null",
@@ -2740,9 +2604,7 @@
           "predictive_telemetry_ledger.status",
           "validation_scheduler_plan.summary"
         ],
-        "exact_commands": [
-          "python3 scripts/build_swarm_operator_runpack.py --self-test"
-        ],
+        "exact_commands": ["python3 scripts/build_swarm_operator_runpack.py --self-test"],
         "id": "evidence_regeneration",
         "local_fallback_rejection_reason": null,
         "no_local_fallback": false,
@@ -2763,10 +2625,7 @@
         "command_class": "cargo_test_focused",
         "dependency_rank": 3,
         "estimated_cost": "medium",
-        "evidence_paths": [
-          "git_state.porcelain_lines",
-          "rch_admission.queue_forecast"
-        ],
+        "evidence_paths": ["git_state.porcelain_lines", "rch_admission.queue_forecast"],
         "exact_commands": [
           "rch exec -- env CARGO_TARGET_DIR=[PI_AGENT_CARGO_TMP]/${USER:-agent}/target TMPDIR=[PI_AGENT_CARGO_TMP]/${USER:-agent}/tmp cargo test conformance"
         ],
@@ -2793,10 +2652,7 @@
         "command_class": "cargo_test_e2e_conformance",
         "dependency_rank": 4,
         "estimated_cost": "high",
-        "evidence_paths": [
-          "smoke_harness.scenario_statuses",
-          "rch_admission.queue_forecast"
-        ],
+        "evidence_paths": ["smoke_harness.scenario_statuses", "rch_admission.queue_forecast"],
         "exact_commands": [
           "rch exec -- env CARGO_TARGET_DIR=[PI_AGENT_CARGO_TMP]/${USER:-agent}/target TMPDIR=[PI_AGENT_CARGO_TMP]/${USER:-agent}/tmp cargo test e2e"
         ],
@@ -2823,10 +2679,7 @@
         "command_class": "cargo_check_all_targets",
         "dependency_rank": 5,
         "estimated_cost": "high",
-        "evidence_paths": [
-          "rch_admission.decision",
-          "remote_validation_proof_ledger.summary"
-        ],
+        "evidence_paths": ["rch_admission.decision", "remote_validation_proof_ledger.summary"],
         "exact_commands": [
           "rch exec -- env CARGO_TARGET_DIR=[PI_AGENT_CARGO_TMP]/${USER:-agent}/target TMPDIR=[PI_AGENT_CARGO_TMP]/${USER:-agent}/tmp cargo check --all-targets"
         ],
@@ -2853,10 +2706,7 @@
         "command_class": "cargo_clippy_all_targets",
         "dependency_rank": 6,
         "estimated_cost": "high",
-        "evidence_paths": [
-          "rch_admission.decision",
-          "remote_validation_proof_ledger.summary"
-        ],
+        "evidence_paths": ["rch_admission.decision", "remote_validation_proof_ledger.summary"],
         "exact_commands": [
           "rch exec -- env CARGO_TARGET_DIR=[PI_AGENT_CARGO_TMP]/${USER:-agent}/target TMPDIR=[PI_AGENT_CARGO_TMP]/${USER:-agent}/tmp cargo clippy --all-targets -- -D warnings"
         ],

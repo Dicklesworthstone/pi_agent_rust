@@ -58,9 +58,7 @@
         "event": {
           "payload": {
             "model": "gpt-5.2-codex",
-            "input": [
-              { "type": "message", "role": "user", "content": "hello" }
-            ]
+            "input": [{ "type": "message", "role": "user", "content": "hello" }]
           }
         }
       },

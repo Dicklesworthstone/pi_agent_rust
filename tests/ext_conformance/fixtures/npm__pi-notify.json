@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Validates event hook registration for agent_end",
       "expect": {
-        "event_hooks_contains": [
-          "agent_end"
-        ]
+        "event_hooks_contains": ["agent_end"]
       }
     },
     {

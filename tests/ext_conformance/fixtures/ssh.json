@@ -9,7 +9,14 @@
       "kind": "registration",
       "summary": "Verifies SSH event handlers are registered",
       "expect": {
-        "event_hooks_contains": ["before_agent_start", "close", "data", "error", "session_start", "user_bash"]
+        "event_hooks_contains": [
+          "before_agent_start",
+          "close",
+          "data",
+          "error",
+          "session_start",
+          "user_bash"
+        ]
       }
     },
     {

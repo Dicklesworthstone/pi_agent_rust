@@ -38,9 +38,7 @@
       "setup": null,
       "steps": [],
       "expect": {
-        "ui_notify_contains": [
-          "DOOM requires interactive mode"
-        ],
+        "ui_notify_contains": ["DOOM requires interactive mode"],
         "no_error": true
       },
       "outputs": {

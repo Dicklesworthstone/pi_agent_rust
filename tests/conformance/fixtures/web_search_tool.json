@@ -9,7 +9,7 @@
       "requirement_ids": ["WS-1"],
       "expect_error": true,
       "error_contains": "query",
-      "input": {"query": ""},
+      "input": { "query": "" },
       "expected": {}
     },
     {
@@ -27,7 +27,7 @@
       "requirement_ids": ["WS-3"],
       "expect_error": true,
       "error_contains": "nosuch",
-      "input": {"query": "rust async", "provider": "nosuch"},
+      "input": { "query": "rust async", "provider": "nosuch" },
       "expected": {}
     },
     {
@@ -36,7 +36,7 @@
       "requirement_ids": ["WS-4"],
       "expect_error": true,
       "error_contains": "web_search",
-      "input": {"query": "rust", "limit": 500, "provider": "nosuch"},
+      "input": { "query": "rust", "limit": 500, "provider": "nosuch" },
       "expected": {}
     }
   ]

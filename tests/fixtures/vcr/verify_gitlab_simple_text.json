@@ -8,18 +8,9 @@
         "method": "POST",
         "url": "https://gitlab.com/api/v4/chat/completions",
         "headers": [
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "application/json"
-          ]
+          ["Authorization", "Bearer [REDACTED]"],
+          ["Content-Type", "application/json"],
+          ["Accept", "application/json"]
         ],
         "body": {
           "content": "Say exactly: 'Hello from the verification harness.'",
@@ -35,15 +26,8 @@
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
-        "body_chunks": [
-          "\"Hello from the verification harness.\""
-        ]
+        "headers": [["Content-Type", "application/json"]],
+        "body_chunks": ["\"Hello from the verification harness.\""]
       }
     }
   ]

@@ -12,9 +12,7 @@
             "id": "REQ-001",
             "kind": "command",
             "evidence_status": "covered",
-            "evidence_refs": [
-              "command[0]:python3 scripts/build_completion_audit.py --self-test"
-            ]
+            "evidence_refs": ["command[0]:python3 scripts/build_completion_audit.py --self-test"]
           }
         ],
         "evidence": {
@@ -32,9 +30,7 @@
       "expected": {
         "status": "pass",
         "blocker_kinds": [],
-        "contains": [
-          "closeout_admitted"
-        ]
+        "contains": ["closeout_admitted"]
       }
     },
     {
@@ -49,11 +45,7 @@
             "kind": "commit_push",
             "evidence_status": "failed",
             "issue": "missing push evidence",
-            "evidence_refs": [
-              "commit[0]",
-              "push[0]",
-              "commit_push:required_pair"
-            ]
+            "evidence_refs": ["commit[0]", "push[0]", "commit_push:required_pair"]
           }
         ],
         "evidence": {
@@ -64,12 +56,8 @@
       },
       "expected": {
         "status": "block",
-        "blocker_kinds": [
-          "missing_push"
-        ],
-        "contains": [
-          "Push the closeout commit"
-        ]
+        "blocker_kinds": ["missing_push"],
+        "contains": ["Push the closeout commit"]
       }
     },
     {
@@ -84,9 +72,7 @@
             "kind": "command",
             "evidence_status": "failed",
             "issue": "exit_code=7",
-            "evidence_refs": [
-              "command[0]:python3 -c 'import sys; sys.exit(7)'"
-            ]
+            "evidence_refs": ["command[0]:python3 -c 'import sys; sys.exit(7)'"]
           }
         ],
         "evidence": {
@@ -103,12 +89,8 @@
       },
       "expected": {
         "status": "block",
-        "blocker_kinds": [
-          "failed_command"
-        ],
-        "contains": [
-          "Fix or rerun the failed command"
-        ]
+        "blocker_kinds": ["failed_command"],
+        "contains": ["Fix or rerun the failed command"]
       }
     },
     {
@@ -123,9 +105,7 @@
             "kind": "command",
             "evidence_status": "proxy_only",
             "issue": "only proxy evidence matched this requirement",
-            "evidence_refs": [
-              "command[0]:python3 --version"
-            ]
+            "evidence_refs": ["command[0]:python3 --version"]
           }
         ],
         "evidence": {
@@ -141,12 +121,8 @@
       },
       "expected": {
         "status": "block",
-        "blocker_kinds": [
-          "proxy_only_evidence"
-        ],
-        "contains": [
-          "Replace proxy-only evidence"
-        ]
+        "blocker_kinds": ["proxy_only_evidence"],
+        "contains": ["Replace proxy-only evidence"]
       }
     },
     {
@@ -161,9 +137,7 @@
             "kind": "artifact_bundle",
             "evidence_status": "contradiction",
             "issue": "artifact status passed but path is missing: missing-completion-audit.md",
-            "evidence_refs": [
-              "artifact[1]:missing-completion-audit.md"
-            ]
+            "evidence_refs": ["artifact[1]:missing-completion-audit.md"]
           }
         ],
         "evidence": {
@@ -185,10 +159,7 @@
       },
       "expected": {
         "status": "block",
-        "blocker_kinds": [
-          "missing_artifact",
-          "unresolved_gap"
-        ],
+        "blocker_kinds": ["missing_artifact", "unresolved_gap"],
         "contains": [
           "Create or correct the missing artifact path",
           "Close the gap or create an active owner bead"

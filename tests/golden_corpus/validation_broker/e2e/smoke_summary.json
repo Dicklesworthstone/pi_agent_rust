@@ -3,9 +3,7 @@
   "generated_at": "2026-05-14T08:30:00Z",
   "status": "pass",
   "correlation_id": "validation-broker-e2e-fixture",
-  "reservation_ids": [
-    7
-  ],
+  "reservation_ids": [7],
   "failed_scenarios": [],
   "scenarios": {
     "reservation_conflict": {

@@ -7,25 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://api.cohere.com/v2/chat",
-        "headers": [
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ]
+        "headers": [["Authorization", "Bearer [REDACTED]"], ["Content-Type", "application/json"]]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "text/event-stream"
-          ]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"id\":\"msg_verify_2\",\"type\":\"message-start\"}\n\n",
           "data: {\"delta\":{\"message\":{\"tool_calls\":{\"function\":{\"arguments\":\"{\\\"text\\\":\\\"verification test\\\"}\",\"name\":\"echo\"},\"id\":\"call_verify_echo\",\"type\":\"function\"}}},\"type\":\"tool-call-start\"}\n\n",

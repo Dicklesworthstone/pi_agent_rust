@@ -7,17 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse",
-        "headers": [
-          ["Content-Type", "application/json"],
-          ["Accept", "text/event-stream"]
-        ]
+        "headers": [["Content-Type", "application/json"], ["Accept", "text/event-stream"]]
       },
       "response": {
         "status": 429,
-        "headers": [
-          ["Content-Type", "application/json"],
-          ["Retry-After", "30"]
-        ],
+        "headers": [["Content-Type", "application/json"], ["Retry-After", "30"]],
         "body_chunks": [
           "{\"error\":{\"code\":429,\"message\":\"Resource has been exhausted (e.g. check quota).\",\"status\":\"RESOURCE_EXHAUSTED\"}}"
         ]

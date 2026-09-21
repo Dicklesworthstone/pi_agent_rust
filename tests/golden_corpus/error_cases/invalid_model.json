@@ -5,15 +5,19 @@
   "description": "Error: invalid/unknown model ID should produce a clear error",
   "cli_args": [
     "-p",
-    "--provider", "anthropic",
-    "--model", "nonexistent-model-xyz",
-    "--api-key", "test-key",
+    "--provider",
+    "anthropic",
+    "--model",
+    "nonexistent-model-xyz",
+    "--api-key",
+    "test-key",
     "--no-tools",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--thinking", "off",
+    "--thinking",
+    "off",
     "Hello"
   ],
   "stdin": null,
@@ -30,9 +34,7 @@
         },
         "response": {
           "status": 400,
-          "headers": [
-            ["Content-Type", "application/json"]
-          ],
+          "headers": [["Content-Type", "application/json"]],
           "body_chunks": [
             "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"model: nonexistent-model-xyz is not supported\"}}"
           ]

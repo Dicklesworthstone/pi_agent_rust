@@ -93,12 +93,8 @@
           "upstream": "origin/main",
           "ahead": 0,
           "behind": 0,
-          "dirty_files": [
-            "scripts/build_swarm_operator_runpack.py"
-          ],
-          "untracked_files": [
-            "docs/contracts/new-contract.json"
-          ]
+          "dirty_files": ["scripts/build_swarm_operator_runpack.py"],
+          "untracked_files": ["docs/contracts/new-contract.json"]
         },
         "validation": {
           "status": "pass",
@@ -175,10 +171,7 @@
       },
       "expected": {
         "status": "watch",
-        "markdown_contains": [
-          "ahead=2 behind=0",
-          "Push or rebase local commits"
-        ],
+        "markdown_contains": ["ahead=2 behind=0", "Push or rebase local commits"],
         "invariants": {
           "git_pushed": "warn"
         }
@@ -285,10 +278,7 @@
       },
       "expected": {
         "status": "blocked",
-        "markdown_contains": [
-          "Renew stale or missing evidence",
-          "renew-dropin-verdict"
-        ],
+        "markdown_contains": ["Renew stale or missing evidence", "renew-dropin-verdict"],
         "invariants": {
           "evidence_freshness": "block",
           "action_plan_decisions": "warn"
@@ -409,9 +399,7 @@
               "id": "REQ-001",
               "kind": "command",
               "evidence_status": "covered",
-              "evidence_refs": [
-                "command[0]:python3 scripts/build_completion_audit.py --self-test"
-              ]
+              "evidence_refs": ["command[0]:python3 scripts/build_completion_audit.py --self-test"]
             }
           ],
           "evidence": {
@@ -481,19 +469,13 @@
               "kind": "commit_push",
               "evidence_status": "failed",
               "issue": "missing push evidence",
-              "evidence_refs": [
-                "commit[0]",
-                "push[0]",
-                "commit_push:required_pair"
-              ]
+              "evidence_refs": ["commit[0]", "push[0]", "commit_push:required_pair"]
             }
           ],
           "evidence": {
             "unresolved_gaps": [],
             "closeout_admission": {
-              "operator_next_actions": [
-                "Push the closeout commit before admitting completion."
-              ],
+              "operator_next_actions": ["Push the closeout commit before admitting completion."],
               "claim_boundaries": {
                 "authorizes_file_deletion": false
               }
@@ -609,9 +591,7 @@
               "kind": "command",
               "evidence_status": "proxy_only",
               "issue": "only proxy evidence matched this requirement",
-              "evidence_refs": [
-                "command[0]:python3 --version"
-              ]
+              "evidence_refs": ["command[0]:python3 --version"]
             }
           ],
           "evidence": {
@@ -684,14 +664,8 @@
       },
       "expected": {
         "status": "clean",
-        "markdown_contains": [
-          "secret_gate: pass [REDACTED]"
-        ],
-        "json_not_contains": [
-          "super-secret-token",
-          "sk-raw-secret",
-          "do not leak this prompt"
-        ],
+        "markdown_contains": ["secret_gate: pass [REDACTED]"],
+        "json_not_contains": ["super-secret-token", "sk-raw-secret", "do not leak this prompt"],
         "invariants": {
           "validation_gates": "pass"
         }

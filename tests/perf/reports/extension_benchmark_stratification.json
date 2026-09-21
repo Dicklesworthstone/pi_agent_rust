@@ -8,27 +8,15 @@
   "execution_contract": {
     "orchestrator": "scripts/bench_legacy_extension_workloads.mjs + target-local perf budget refresh",
     "layer_definition_version": "1.0.0",
-    "required_layers": [
-      "cold_load_init",
-      "per_call_dispatch_micro",
-      "full_e2e_long_session"
-    ],
+    "required_layers": ["cold_load_init", "per_call_dispatch_micro", "full_e2e_long_session"],
     "lineage_contract": "Rust measurements and Node/Bun portable extension API measurements are generated in the same bd-2zcs5.71 refresh window."
   },
   "layers": [
     {
       "layer_id": "cold_load_init",
       "display_name": "Cold-load and initialization",
-      "scenario_tags": [
-        "cold-load",
-        "init",
-        "extension-runtime",
-        "microbench"
-      ],
-      "expected_suites": [
-        "extension_criterion_load_init",
-        "legacy_node_bun_load_init"
-      ],
+      "scenario_tags": ["cold-load", "init", "extension-runtime", "microbench"],
+      "expected_suites": ["extension_criterion_load_init", "legacy_node_bun_load_init"],
       "suite_status": {
         "rust": "pass",
         "node": "pass",
@@ -49,9 +37,7 @@
       "evidence_state": "measured",
       "interpretation": "Cold-load evidence is attribution-only and does not substitute for full-session evidence.",
       "lineage": {
-        "run_id_lineage": [
-          "bd-2zcs5.71-darkgoose-20260510T0058Z"
-        ],
+        "run_id_lineage": ["bd-2zcs5.71-darkgoose-20260510T0058Z"],
         "source_artifacts": [
           "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json",
           "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/perf/legacy_extension_workloads.jsonl"
@@ -61,16 +47,8 @@
     {
       "layer_id": "per_call_dispatch_micro",
       "display_name": "Per-call dispatch microbench",
-      "scenario_tags": [
-        "per-call",
-        "dispatch",
-        "hostcall",
-        "microbench"
-      ],
-      "expected_suites": [
-        "pijs_workload",
-        "legacy_node_bun_tool_call"
-      ],
+      "scenario_tags": ["per-call", "dispatch", "hostcall", "microbench"],
+      "expected_suites": ["pijs_workload", "legacy_node_bun_tool_call"],
       "suite_status": {
         "rust": "pass",
         "node": "pass",
@@ -91,9 +69,7 @@
       "evidence_state": "measured",
       "interpretation": "Per-call evidence is diagnostic and does not substitute for full-session outcomes.",
       "lineage": {
-        "run_id_lineage": [
-          "bd-2zcs5.71-darkgoose-20260510T0058Z"
-        ],
+        "run_id_lineage": ["bd-2zcs5.71-darkgoose-20260510T0058Z"],
         "source_artifacts": [
           "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/perf/perf/pijs_workload_perf.jsonl",
           "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/perf/legacy_extension_workloads.jsonl"
@@ -103,16 +79,8 @@
     {
       "layer_id": "full_e2e_long_session",
       "display_name": "Full end-to-end long-session workload",
-      "scenario_tags": [
-        "full-e2e",
-        "long-session",
-        "user-facing",
-        "release-facing"
-      ],
-      "expected_suites": [
-        "pijs_workload",
-        "legacy_node_bun_full_session"
-      ],
+      "scenario_tags": ["full-e2e", "long-session", "user-facing", "release-facing"],
+      "expected_suites": ["pijs_workload", "legacy_node_bun_full_session"],
       "suite_status": {
         "rust": "pass",
         "node": "pass",
@@ -133,9 +101,7 @@
       "evidence_state": "measured",
       "interpretation": "Full-session evidence is the release-facing signal for extension runtime claims.",
       "lineage": {
-        "run_id_lineage": [
-          "bd-2zcs5.71-darkgoose-20260510T0058Z"
-        ],
+        "run_id_lineage": ["bd-2zcs5.71-darkgoose-20260510T0058Z"],
         "source_artifacts": [
           "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/perf/perf/pijs_workload_perf.jsonl",
           "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/perf/legacy_extension_workloads.jsonl"
@@ -159,18 +125,14 @@
       "global_claim_valid": true,
       "invalidity_reasons": []
     },
-    "required_partition_tags": [
-      "extension-full-session"
-    ],
+    "required_partition_tags": ["extension-full-session"],
     "partition_coverage": {
       "extension-full-session": true
     },
     "policy_ref": "docs/perf_sli_matrix.json#ci_enforcement.fail_closed_conditions"
   },
   "lineage": {
-    "run_id_lineage": [
-      "bd-2zcs5.71-darkgoose-20260510T0058Z"
-    ],
+    "run_id_lineage": ["bd-2zcs5.71-darkgoose-20260510T0058Z"],
     "source_pijs_workload_path": "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/perf/perf/pijs_workload_perf.jsonl",
     "source_cold_load_path": "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json",
     "source_legacy_extension_workloads_path": "/data/tmp/pi_agent_rust_cargo/darkgoose-bd-2zcs5-51/target/perf/legacy_extension_workloads.jsonl"

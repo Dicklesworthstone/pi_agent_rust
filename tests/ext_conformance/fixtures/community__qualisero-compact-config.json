@@ -11,13 +11,8 @@
       "kind": "registration",
       "summary": "Verifies compact-config command, event hooks registered for qualisero-compact-config",
       "expect": {
-        "commands_contains": [
-          "compact-config"
-        ],
-        "event_hooks_contains": [
-          "agent_end",
-          "turn_end"
-        ]
+        "commands_contains": ["compact-config"],
+        "event_hooks_contains": ["agent_end", "turn_end"]
       }
     },
     {

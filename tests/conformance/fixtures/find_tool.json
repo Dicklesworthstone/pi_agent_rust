@@ -7,11 +7,11 @@
       "name": "find_glob_pattern",
       "description": "Find files matching glob pattern",
       "setup": [
-        {"type": "create_file", "path": "file1.txt", "content": ""},
-        {"type": "create_file", "path": "file2.txt", "content": ""},
-        {"type": "create_file", "path": "file.rs", "content": ""}
+        { "type": "create_file", "path": "file1.txt", "content": "" },
+        { "type": "create_file", "path": "file2.txt", "content": "" },
+        { "type": "create_file", "path": "file.rs", "content": "" }
       ],
-      "input": {"pattern": "*.txt"},
+      "input": { "pattern": "*.txt" },
       "expected": {
         "content_contains": ["file1.txt", "file2.txt"],
         "content_not_contains": ["file.rs"],
@@ -21,10 +21,8 @@
     {
       "name": "find_no_matches",
       "description": "Find with no matching files",
-      "setup": [
-        {"type": "create_file", "path": "file.txt", "content": ""}
-      ],
-      "input": {"pattern": "*.rs"},
+      "setup": [{ "type": "create_file", "path": "file.txt", "content": "" }],
+      "input": { "pattern": "*.rs" },
       "expected": {
         "content_exact": "No files found matching pattern",
         "details_none": true
@@ -34,11 +32,11 @@
       "name": "find_recursive_glob",
       "description": "Find files recursively with **",
       "setup": [
-        {"type": "create_dir", "path": "subdir"},
-        {"type": "create_file", "path": "root.txt", "content": ""},
-        {"type": "create_file", "path": "subdir/nested.txt", "content": ""}
+        { "type": "create_dir", "path": "subdir" },
+        { "type": "create_file", "path": "root.txt", "content": "" },
+        { "type": "create_file", "path": "subdir/nested.txt", "content": "" }
       ],
-      "input": {"pattern": "**/*.txt"},
+      "input": { "pattern": "**/*.txt" },
       "expected": {
         "content_contains": ["root.txt", "nested.txt"],
         "details_none": true
@@ -48,13 +46,13 @@
       "name": "find_respects_gitignore",
       "description": "Find honors .gitignore entries",
       "setup": [
-        {"type": "create_file", "path": ".gitignore", "content": "ignored.txt\nignored_dir/\n"},
-        {"type": "create_file", "path": "kept.txt", "content": ""},
-        {"type": "create_file", "path": "ignored.txt", "content": ""},
-        {"type": "create_dir", "path": "ignored_dir"},
-        {"type": "create_file", "path": "ignored_dir/inside.txt", "content": ""}
+        { "type": "create_file", "path": ".gitignore", "content": "ignored.txt\nignored_dir/\n" },
+        { "type": "create_file", "path": "kept.txt", "content": "" },
+        { "type": "create_file", "path": "ignored.txt", "content": "" },
+        { "type": "create_dir", "path": "ignored_dir" },
+        { "type": "create_file", "path": "ignored_dir/inside.txt", "content": "" }
       ],
-      "input": {"pattern": "*.txt"},
+      "input": { "pattern": "*.txt" },
       "expected": {
         "content_contains": ["kept.txt"],
         "content_not_contains": ["ignored.txt", "ignored_dir/inside.txt"],
@@ -65,13 +63,13 @@
       "name": "find_with_limit",
       "description": "Find respects limit parameter",
       "setup": [
-        {"type": "create_file", "path": "a.txt", "content": ""},
-        {"type": "create_file", "path": "b.txt", "content": ""},
-        {"type": "create_file", "path": "c.txt", "content": ""},
-        {"type": "create_file", "path": "d.txt", "content": ""},
-        {"type": "create_file", "path": "e.txt", "content": ""}
+        { "type": "create_file", "path": "a.txt", "content": "" },
+        { "type": "create_file", "path": "b.txt", "content": "" },
+        { "type": "create_file", "path": "c.txt", "content": "" },
+        { "type": "create_file", "path": "d.txt", "content": "" },
+        { "type": "create_file", "path": "e.txt", "content": "" }
       ],
-      "input": {"pattern": "*.txt", "limit": 3},
+      "input": { "pattern": "*.txt", "limit": 3 },
       "expected": {
         "content_contains": ["limit reached"],
         "details_exact": {
@@ -83,11 +81,11 @@
       "name": "find_limit_notice_format",
       "description": "Limit notice formatting stays stable when same-mtime files tie at the cutoff",
       "setup": [
-        {"type": "create_file", "path": "a.txt", "content": ""},
-        {"type": "create_file", "path": "b.txt", "content": ""},
-        {"type": "create_file", "path": "c.txt", "content": ""}
+        { "type": "create_file", "path": "a.txt", "content": "" },
+        { "type": "create_file", "path": "b.txt", "content": "" },
+        { "type": "create_file", "path": "c.txt", "content": "" }
       ],
-      "input": {"pattern": "*.txt", "limit": 2},
+      "input": { "pattern": "*.txt", "limit": 2 },
       "expected": {
         "content_regex": "^[abc]\\.txt\\n[abc]\\.txt\\n\\n\\[2 results limit reached\\. Use limit=4 for more, or refine pattern\\]$",
         "details_golden": "find_tool/limit_details.json"
@@ -97,11 +95,11 @@
       "name": "find_specific_extension",
       "description": "Find only .rs files",
       "setup": [
-        {"type": "create_file", "path": "main.rs", "content": ""},
-        {"type": "create_file", "path": "lib.rs", "content": ""},
-        {"type": "create_file", "path": "test.ts", "content": ""}
+        { "type": "create_file", "path": "main.rs", "content": "" },
+        { "type": "create_file", "path": "lib.rs", "content": "" },
+        { "type": "create_file", "path": "test.ts", "content": "" }
       ],
-      "input": {"pattern": "*.rs"},
+      "input": { "pattern": "*.rs" },
       "expected": {
         "content_contains": ["main.rs", "lib.rs"],
         "content_not_contains": ["test.ts"],
@@ -112,10 +110,10 @@
       "name": "find_multiple_matches_present",
       "description": "Find returns all matches (order unspecified)",
       "setup": [
-        {"type": "create_file", "path": "old.txt", "content": "old"},
-        {"type": "create_file", "path": "new.txt", "content": "new"}
+        { "type": "create_file", "path": "old.txt", "content": "old" },
+        { "type": "create_file", "path": "new.txt", "content": "new" }
       ],
-      "input": {"pattern": "*.txt"},
+      "input": { "pattern": "*.txt" },
       "expected": {
         "content_contains": ["old.txt", "new.txt"],
         "details_none": true
@@ -125,14 +123,14 @@
       "name": "find_orders_by_modified_time_newest_first",
       "description": "Find returns newer files before older files, with deterministic fixture mtimes",
       "setup": [
-        {"type": "create_file", "path": "oldest.txt", "content": "old"},
-        {"type": "create_file", "path": "middle.txt", "content": "middle"},
-        {"type": "create_file", "path": "newest.txt", "content": "new"},
-        {"type": "set_modified", "path": "oldest.txt", "unix_seconds": 1700000000},
-        {"type": "set_modified", "path": "middle.txt", "unix_seconds": 1700000100},
-        {"type": "set_modified", "path": "newest.txt", "unix_seconds": 1700000200}
+        { "type": "create_file", "path": "oldest.txt", "content": "old" },
+        { "type": "create_file", "path": "middle.txt", "content": "middle" },
+        { "type": "create_file", "path": "newest.txt", "content": "new" },
+        { "type": "set_modified", "path": "oldest.txt", "unix_seconds": 1700000000 },
+        { "type": "set_modified", "path": "middle.txt", "unix_seconds": 1700000100 },
+        { "type": "set_modified", "path": "newest.txt", "unix_seconds": 1700000200 }
       ],
-      "input": {"pattern": "*.txt"},
+      "input": { "pattern": "*.txt" },
       "expected": {
         "content_exact": "newest.txt\nmiddle.txt\noldest.txt",
         "details_none": true
@@ -141,7 +139,7 @@
     {
       "name": "find_outside_cwd",
       "description": "Find outside the working directory should be rejected",
-      "input": {"pattern": "*.txt", "path": "../"},
+      "input": { "pattern": "*.txt", "path": "../" },
       "expect_error": true,
       "error_contains": "Cannot find outside the working directory",
       "expected": {}

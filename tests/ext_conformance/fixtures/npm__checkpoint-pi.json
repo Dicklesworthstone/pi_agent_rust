@@ -11,10 +11,7 @@
       "kind": "registration",
       "summary": "Validates checkpoint-pi registers event hooks",
       "expect": {
-        "event_hooks_contains": [
-          "session_start",
-          "turn_start"
-        ]
+        "event_hooks_contains": ["session_start", "turn_start"]
       }
     },
     {

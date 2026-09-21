@@ -50,18 +50,13 @@
       "summary": "Worktree is clean"
     },
     {
-      "evidence": [
-        "abc1234",
-        "origin/main"
-      ],
+      "evidence": ["abc1234", "origin/main"],
       "id": "git_pushed",
       "status": "pass",
       "summary": "HEAD matches upstream"
     },
     {
-      "evidence": [
-        "cargo_clippy_all_targets_rch"
-      ],
+      "evidence": ["cargo_clippy_all_targets_rch"],
       "id": "validation_gates",
       "status": "block",
       "summary": "validation status=fail"
@@ -73,9 +68,7 @@
       "summary": "evidence freshness=fresh"
     },
     {
-      "evidence": [
-        "msg-1"
-      ],
+      "evidence": ["msg-1"],
       "id": "agent_mail_usable",
       "status": "warn",
       "summary": "agent mail health=red semantic=fail"
@@ -87,9 +80,7 @@
       "summary": "No expired reservations"
     },
     {
-      "evidence": [
-        "job-1"
-      ],
+      "evidence": ["job-1"],
       "id": "rch_available",
       "status": "warn",
       "summary": "rch status=degraded"
@@ -108,9 +99,7 @@
     }
   ],
   "markdown": "# Operator Handoff Summary\n\n- Status: blocked\n- Project: pi_agent_rust\n- Branch: main\n- Head: abc1234\n- Generated: [GENERATED_AT]\n\n## What Changed\n- No recently closed beads were provided.\n\n## Safe Next Actions\n- Fix or rerun the failed validation gates before claiming more implementation work.\n- Use Beads comments as the coordination record until Agent Mail is healthy.\n- Wait for RCH pressure to clear or use a smaller validation proof.\n\n## Must Not Touch\n- Do not claim validation is green until failed gates pass.\n\n## Gates\n- cargo_clippy_all_targets_rch: fail clippy.log\n\n## Completion Audit\n- source_present: false\n- status: not_provided\n- completion_allowed: none\n- blocked_requirements: 0\n- unresolved_gaps: 0\n\n## Open Action-Plan Decisions\n- None.\n\n## Invariants\n- git_worktree_clean: pass - Worktree is clean\n- git_pushed: pass - HEAD matches upstream\n- validation_gates: block - validation status=fail\n- evidence_freshness: pass - evidence freshness=fresh\n- agent_mail_usable: warn - agent mail health=red semantic=fail\n- reservations_current: pass - No expired reservations\n- rch_available: warn - rch status=degraded\n- action_plan_decisions: pass - No open action-plan decisions\n- completion_audit: pass - completion audit source=not_provided\n",
-  "must_not_touch": [
-    "Do not claim validation is green until failed gates pass."
-  ],
+  "must_not_touch": ["Do not claim validation is green until failed gates pass."],
   "open_action_plan_decisions": [],
   "project": {
     "name": "pi_agent_rust",

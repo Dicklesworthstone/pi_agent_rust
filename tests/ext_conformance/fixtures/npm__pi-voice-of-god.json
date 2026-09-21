@@ -11,10 +11,7 @@
       "kind": "registration",
       "summary": "Validates command and event hook registrations",
       "expect": {
-        "event_hooks_contains": [
-          "before_agent_start",
-          "session_start"
-        ]
+        "event_hooks_contains": ["before_agent_start", "session_start"]
       }
     },
     {

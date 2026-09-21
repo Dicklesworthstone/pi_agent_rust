@@ -4,17 +4,22 @@
   "surface": "json_mode",
   "description": "JSON mode: OpenAI Responses NDJSON stream playback",
   "cli_args": [
-    "--mode", "json",
+    "--mode",
+    "json",
     "-p",
-    "--provider", "openai",
-    "--model", "gpt-4o-mini",
+    "--provider",
+    "openai",
+    "--model",
+    "gpt-4o-mini",
     "--no-tools",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--thinking", "off",
-    "--system-prompt", "NDJSON stream test.",
+    "--thinking",
+    "off",
+    "--system-prompt",
+    "NDJSON stream test.",
     "Reply with NDJSON pong."
   ],
   "stdin": null,
@@ -40,9 +45,7 @@
             "input": [
               {
                 "role": "user",
-                "content": [
-                  { "type": "input_text", "text": "Reply with NDJSON pong." }
-                ]
+                "content": [{ "type": "input_text", "text": "Reply with NDJSON pong." }]
               }
             ],
             "stream": true,
@@ -51,9 +54,7 @@
         },
         "response": {
           "status": 200,
-          "headers": [
-            ["Content-Type", "application/x-ndjson"]
-          ],
+          "headers": [["Content-Type", "application/x-ndjson"]],
           "body_chunks": [
             "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_ndjson_1\",\"content_index\":0,\"delta\":\"NDJSON \"}\n",
             "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_ndjson_1\",\"content_index\":0,\"delta\":\"pong.\"}\n",

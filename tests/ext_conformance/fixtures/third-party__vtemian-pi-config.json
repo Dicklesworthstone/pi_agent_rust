@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies event hooks registered for vtemian-pi-config",
       "expect": {
-        "event_hooks_contains": [
-          "tool_result"
-        ]
+        "event_hooks_contains": ["tool_result"]
       }
     },
     {

@@ -7,25 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream",
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "application/json"
-          ]
-        ]
+        "headers": [["Content-Type", "application/json"], ["Accept", "application/json"]]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"output\":{\"message\":{\"content\":[{\"toolUse\":{\"input\":{\"text\":\"verification test\"},\"name\":\"echo\",\"toolUseId\":\"call_verify_echo\"}}],\"role\":\"assistant\"}},\"stopReason\":\"tool_use\",\"usage\":{\"inputTokens\":25,\"outputTokens\":15,\"totalTokens\":40}}"
         ]

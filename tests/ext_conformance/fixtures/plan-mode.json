@@ -38,17 +38,8 @@
       "setup": null,
       "steps": [],
       "expect": {
-        "active_tools": [
-          "read",
-          "bash",
-          "grep",
-          "find",
-          "ls",
-          "questionnaire"
-        ],
-        "ui_notify_contains": [
-          "Plan mode enabled"
-        ],
+        "active_tools": ["read", "bash", "grep", "find", "ls", "questionnaire"],
+        "ui_notify_contains": ["Plan mode enabled"],
         "no_error": true
       },
       "outputs": {
@@ -129,9 +120,7 @@
       "steps": [],
       "expect": {
         "block": true,
-        "reason_contains": [
-          "Plan mode: command blocked"
-        ]
+        "reason_contains": ["Plan mode: command blocked"]
       },
       "outputs": {
         "stdout_normalized_jsonl": [

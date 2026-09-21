@@ -6,9 +6,7 @@
     {
       "name": "stats_aggregates_usage_tools_and_compactions",
       "description": "a known local session produces the hand-computed v1 aggregate and text rendering",
-      "requirement_ids": [
-        "STATS-AGGREGATE-1"
-      ],
+      "requirement_ids": ["STATS-AGGREGATE-1"],
       "setup": [
         {
           "type": "create_file",
@@ -50,9 +48,7 @@
     {
       "name": "stats_provider_and_time_filters_keep_tool_attribution",
       "description": "a provider-filtered session retains the following tool result through the admitted assistant attribution anchor",
-      "requirement_ids": [
-        "STATS-FILTER-BOUNDARY-1"
-      ],
+      "requirement_ids": ["STATS-FILTER-BOUNDARY-1"],
       "setup": [
         {
           "type": "create_file",
@@ -67,10 +63,7 @@
         "provider": "anthropic"
       },
       "expected": {
-        "content_contains": [
-          "\"schema\": \"pi.stats.v1\"",
-          "\"tool\": \"grep\""
-        ],
+        "content_contains": ["\"schema\": \"pi.stats.v1\"", "\"tool\": \"grep\""],
         "details": {
           "sessions": 1,
           "messages": 1,
@@ -92,9 +85,7 @@
     {
       "name": "stats_skips_a_malformed_line_and_keeps_later_usage",
       "description": "one malformed JSONL record is isolated instead of discarding the rest of the local session",
-      "requirement_ids": [
-        "STATS-MALFORMED-ERR-1"
-      ],
+      "requirement_ids": ["STATS-MALFORMED-ERR-1"],
       "setup": [
         {
           "type": "create_file",

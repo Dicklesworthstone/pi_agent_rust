@@ -23,9 +23,7 @@
       "summary": "Provider exposes the mock model",
       "provider_id": "mock-provider",
       "expect": {
-        "models_contains": [
-          "mock-model"
-        ]
+        "models_contains": ["mock-model"]
       }
     }
   ]

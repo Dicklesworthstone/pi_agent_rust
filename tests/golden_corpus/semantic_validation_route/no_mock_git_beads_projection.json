@@ -86,9 +86,7 @@
       "classification_counts": {
         "stale": 1
       },
-      "invalidation_reasons": [
-        "stale"
-      ],
+      "invalidation_reasons": ["stale"],
       "reusable_record_count": 0,
       "route_decision": "refresh_validation"
     },
@@ -112,10 +110,7 @@
         }
       ],
       "heavy_group_count": 0,
-      "required_group_ids": [
-        "fast_script_checks",
-        "evidence_regeneration"
-      ]
+      "required_group_ids": ["fast_script_checks", "evidence_regeneration"]
     },
     "schema": "pi.validation.semantic_route_plan.v1",
     "source_bead": "bd-no-mock",

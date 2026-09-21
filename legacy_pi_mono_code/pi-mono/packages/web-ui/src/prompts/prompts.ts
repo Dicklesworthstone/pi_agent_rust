@@ -7,7 +7,9 @@
 // JavaScript REPL Tool
 // ============================================================================
 
-export const JAVASCRIPT_REPL_TOOL_DESCRIPTION = (runtimeProviderDescriptions: string[]) => `# JavaScript REPL
+export const JAVASCRIPT_REPL_TOOL_DESCRIPTION = (
+  runtimeProviderDescriptions: string[],
+) => `# JavaScript REPL
 
 ## Purpose
 Execute JavaScript code in a sandboxed browser environment with full Web APIs.

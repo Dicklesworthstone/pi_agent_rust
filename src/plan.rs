@@ -14,6 +14,10 @@
 use crate::tools::ToolEffects;
 use std::sync::{Arc, RwLock};
 
+/// Maximum UTF-8 bytes retained for one submitted plan. The tool checks this
+/// before copying model input; direct state callers use the same bound.
+pub const MAX_PLAN_BYTES: usize = 256 * 1024;
+
 /// The `submit_plan` tool (bd-cv653.3.5).
 ///
 /// The agent calls this with the full plan to end planning and request
@@ -59,7 +63,15 @@ impl crate::tools::Tool for SubmitPlanTool {
             "properties": {
                 "plan": {
                     "type": "string",
-                    "description": "The full plan: goal, ordered steps, files to touch, and how to verify. Include a `Files:` line listing the paths/globs the plan will modify (e.g. `Files: src/main.rs, src/tools/, tests/*.rs`) — under --plan-yolo only mutations inside that scope are auto-approved."
+                    "maxLength": MAX_PLAN_BYTES,
+                    "description": "The full plan (at most 256 KiB of UTF-8): goal, ordered steps, and verification. Specify files with the optional files array or one top-level Files: line, not both. Only scoped single-file writes can inherit --plan-yolo approval; other tool policies still apply."
+                },
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 128,
+                    "items": {"type": "string", "maxLength": 1024},
+                    "description": "Relative file scopes appended visibly to the reviewed plan. Exact paths match only that file; a trailing / grants a directory tree; * matches within a component; a whole ** component is recursive. Use this array for names containing spaces or commas. Parent traversal, absolute paths, backslashes, unsupported globs and ambiguous names are not admitted. Paths are limited to 1024 UTF-8 bytes and 64 components."
                 }
             },
             "required": ["plan"]
@@ -82,8 +94,18 @@ impl crate::tools::Tool for SubmitPlanTool {
             .get("plan")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
-            .trim()
-            .to_string();
+            .trim();
+        if plan.len() > MAX_PLAN_BYTES {
+            return Ok(crate::tools::ToolOutput {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(format!(
+                        "Plan exceeds the {MAX_PLAN_BYTES}-byte UTF-8 limit. Shorten it and submit again; no plan state was changed."
+                    )),
+                )],
+                details: Some(serde_json::json!({"planReview": "too_large"})),
+                is_error: true,
+            });
+        }
         if plan.len() < 20 {
             return Ok(crate::tools::ToolOutput {
                 content: vec![crate::model::ContentBlock::Text(
@@ -95,7 +117,27 @@ impl crate::tools::Tool for SubmitPlanTool {
                 is_error: true,
             });
         }
-        if !self.state.submit_plan(plan.clone()) {
+        let plan = match input.get("files") {
+            Some(files) => match crate::approval::append_files_declaration(plan, files) {
+                Ok(text) => std::borrow::Cow::Owned(text),
+                Err(message) => {
+                    return Ok(crate::tools::ToolOutput {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new(format!(
+                                "Invalid plan file scope: {message}. No plan state was changed."
+                            )),
+                        )],
+                        details: Some(serde_json::json!({"planReview": "invalid_scope"})),
+                        is_error: true,
+                    });
+                }
+            },
+            None => std::borrow::Cow::Borrowed(plan),
+        };
+        // Submission and configured auto-approval are one state transition.
+        // A separate approve() could authorize another submitter's plan after
+        // a concurrent rejection/re-entry, or report success after exit().
+        if !self.state.submit(plan.to_string(), self.auto_approve) {
             return Ok(crate::tools::ToolOutput {
                 content: vec![crate::model::ContentBlock::Text(
                     crate::model::TextContent::new(
@@ -110,7 +152,6 @@ impl crate::tools::Tool for SubmitPlanTool {
             // --plan-yolo / plan.autoApprove (bd-cv653.3.5): skip review; the
             // plan rides back in the tool result so execution continues with
             // it in context immediately.
-            let _ = self.state.approve();
             return Ok(crate::tools::ToolOutput {
                 content: vec![crate::model::ContentBlock::Text(
                     crate::model::TextContent::new(format!(
@@ -183,7 +224,10 @@ impl PlanState {
 
     #[must_use]
     pub fn mode(&self) -> PlanMode {
-        self.inner.read().map_or(PlanMode::Off, |inner| inner.mode)
+        // A poisoned authorization state is not permission to mutate.
+        self.inner
+            .read()
+            .map_or(PlanMode::Planning, |inner| inner.mode)
     }
 
     /// Enter planning. Returns the previous mode.
@@ -195,25 +239,53 @@ impl PlanState {
     }
 
     /// Submit a plan for review (called by the submit_plan tool). Returns
-    /// false when not planning (the tool reports a usage error).
+    /// false when not planning, unavailable, empty, or over the byte limit.
     pub fn submit_plan(&self, plan: String) -> bool {
-        let mut inner = self.inner.write().expect("plan state lock");
+        self.submit(plan, false)
+    }
+
+    fn submit(&self, plan: String, auto_approve: bool) -> bool {
+        if plan.trim().is_empty() || plan.len() > MAX_PLAN_BYTES {
+            return false;
+        }
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
         if inner.mode != PlanMode::Planning {
             return false;
         }
         inner.plan = Some(plan);
-        inner.mode = PlanMode::PendingApproval;
+        inner.mode = if auto_approve {
+            PlanMode::Approved
+        } else {
+            PlanMode::PendingApproval
+        };
         true
     }
 
     /// Approve the pending plan. Returns the plan text on success.
     pub fn approve(&self) -> Option<String> {
-        let mut inner = self.inner.write().expect("plan state lock");
+        let mut inner = self.inner.write().ok()?;
         if inner.mode != PlanMode::PendingApproval {
             return None;
         }
+        let plan = inner.plan.clone()?;
         inner.mode = PlanMode::Approved;
-        inner.plan.clone()
+        Some(plan)
+    }
+
+    /// Approve exactly the pending text presented by a review surface.
+    /// Comparison and transition share one lock; mismatches keep the gate shut.
+    /// The surface must also discard its review on rejection/session changes:
+    /// this text comparison is not a submission-generation or execution lease.
+    pub fn approve_reviewed(&self, reviewed: &str) -> Option<String> {
+        let mut inner = self.inner.write().ok()?;
+        if inner.mode != PlanMode::PendingApproval || inner.plan.as_deref() != Some(reviewed) {
+            return None;
+        }
+        let plan = inner.plan.clone()?;
+        inner.mode = PlanMode::Approved;
+        Some(plan)
     }
 
     /// Reject the pending plan (back to Planning for the edit loop).
@@ -255,6 +327,18 @@ impl PlanState {
     #[must_use]
     pub fn plan(&self) -> Option<String> {
         self.inner.read().ok().and_then(|inner| inner.plan.clone())
+    }
+
+    /// Read approval state and its text together, never a mode from one plan
+    /// and text from a later submission. This snapshot is not an execution
+    /// lease: the executor still owns its normal plan/policy checks.
+    #[must_use]
+    pub fn approved_plan(&self) -> Option<String> {
+        let inner = self.inner.read().ok()?;
+        if inner.mode != PlanMode::Approved {
+            return None;
+        }
+        inner.plan.clone()
     }
 
     /// Record the pre-plan-mode model (for restore on approval).
@@ -379,5 +463,167 @@ mod tests {
         assert!(message.contains("PLAN_MODE_BLOCKED"));
         assert!(message.contains("submit_plan"));
         assert!(message.contains("\"write\""));
+    }
+
+    fn execute_plan(state: &PlanState, auto_approve: bool, plan: &str) -> crate::tools::ToolOutput {
+        use crate::tools::Tool;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let tool = SubmitPlanTool::new(state.clone(), auto_approve);
+        runtime
+            .block_on(tool.execute("plan-test", serde_json::json!({"plan": plan}), None))
+            .unwrap()
+    }
+
+    #[test]
+    fn auto_approval_commits_the_submitted_text_in_one_transition() {
+        let state = PlanState::new();
+        state.enter_planning();
+        let text = "Goal: fix code\nFiles: src/main.rs\nVerification: test";
+        let output = execute_plan(&state, true, text);
+        assert!(!output.is_error);
+        assert_eq!(output.details.unwrap()["planReview"], "auto_approved");
+        assert_eq!(state.mode(), PlanMode::Approved);
+        assert_eq!(state.approved_plan().as_deref(), Some(text));
+        assert!(state.approve().is_none(), "there is no later approval step");
+    }
+
+    #[test]
+    fn manual_submission_stays_read_only_until_exact_review() {
+        let state = PlanState::new();
+        state.enter_planning();
+        let text = "Goal: fix code\nFiles: src/main.rs\nVerification: test";
+        let output = execute_plan(&state, false, text);
+        assert!(!output.is_error);
+        assert_eq!(output.details.unwrap()["planReview"], "pending");
+        assert!(state.approved_plan().is_none());
+        assert!(!state.allows_effects(ToolEffects::write()));
+        assert_eq!(state.approve_reviewed(text).as_deref(), Some(text));
+        assert!(state.allows_effects(ToolEffects::write()));
+        assert!(state.approve_reviewed(text).is_none());
+    }
+
+    #[test]
+    fn stale_review_cannot_approve_revised_text() {
+        let state = PlanState::new();
+        state.enter_planning();
+        assert!(state.approve_reviewed("plan A").is_none());
+        assert!(state.submit_plan("plan A".to_string()));
+        assert!(state.reject());
+        assert!(state.submit_plan("plan B".to_string()));
+        for stale in ["plan A", "plan B ", "PLAN B"] {
+            assert!(state.approve_reviewed(stale).is_none());
+            assert_eq!(state.mode(), PlanMode::PendingApproval);
+            assert!(!state.allows_effects(ToolEffects::write()));
+        }
+        assert_eq!(state.approve_reviewed("plan B").as_deref(), Some("plan B"));
+    }
+
+    #[test]
+    fn approved_snapshot_never_exposes_pending_or_rejected_revisions() {
+        let state = PlanState::new();
+        state.enter_planning();
+        assert!(state.submit("approved A".to_string(), true));
+        assert_eq!(state.approved_plan().as_deref(), Some("approved A"));
+        state.enter_planning();
+        assert!(state.approved_plan().is_none());
+        assert!(state.submit_plan("pending B".to_string()));
+        assert!(state.approved_plan().is_none());
+        assert!(state.reject());
+        assert!(state.approved_plan().is_none());
+        state.exit();
+        assert!(state.approved_plan().is_none());
+    }
+
+    #[test]
+    fn unavailable_plan_state_fails_closed() {
+        let state = PlanState::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.inner.write().unwrap();
+            panic!("poison the authorization state");
+        }));
+        assert!(result.is_err());
+        assert_eq!(state.mode(), PlanMode::Planning);
+        for effect in [
+            ToolEffects::write(),
+            ToolEffects::append(),
+            ToolEffects::process(),
+        ] {
+            assert!(!state.allows_effects(effect));
+        }
+        assert!(state.allows_effects(ToolEffects::read()));
+        assert!(state.approved_plan().is_none());
+        assert!(state.approve().is_none());
+        assert!(state.approve_reviewed("unavailable").is_none());
+        assert!(!state.submit("cannot authorize this".to_string(), true));
+    }
+
+    #[test]
+    fn missing_pending_text_cannot_open_the_mutation_gate() {
+        let state = PlanState::new();
+        state.inner.write().unwrap().mode = PlanMode::PendingApproval;
+        assert!(state.approve().is_none());
+        assert!(state.approve_reviewed("").is_none());
+        assert_eq!(state.mode(), PlanMode::PendingApproval);
+        assert!(!state.allows_effects(ToolEffects::write()));
+    }
+
+    #[test]
+    fn rejected_submission_preserves_existing_plan_and_mode() {
+        let state = PlanState::new();
+        state.enter_planning();
+        assert!(state.submit_plan("retained proposal".to_string()));
+        assert!(state.reject());
+        for invalid in [
+            String::new(),
+            " \n\t".to_string(),
+            "x".repeat(MAX_PLAN_BYTES + 1),
+        ] {
+            assert!(!state.submit(invalid, true));
+            assert_eq!(state.mode(), PlanMode::Planning);
+            assert_eq!(state.plan().as_deref(), Some("retained proposal"));
+        }
+    }
+
+    #[test]
+    fn tool_enforces_utf8_byte_budget_before_mutating_state() {
+        for auto_approve in [false, true] {
+            let state = PlanState::new();
+            state.enter_planning();
+            // Fewer than MAX_PLAN_BYTES characters, but more UTF-8 bytes.
+            let oversized = "é".repeat(MAX_PLAN_BYTES / 2 + 1);
+            let output = execute_plan(&state, auto_approve, &oversized);
+            assert!(output.is_error);
+            assert_eq!(output.details.unwrap()["planReview"], "too_large");
+            assert_eq!(state.mode(), PlanMode::Planning);
+            assert!(state.plan().is_none());
+        }
+    }
+
+    #[test]
+    fn exact_byte_budget_can_be_reviewed_and_approved() {
+        let state = PlanState::new();
+        state.enter_planning();
+        let text = "é".repeat(MAX_PLAN_BYTES / 2);
+        let output = execute_plan(&state, false, &text);
+        assert!(!output.is_error);
+        assert_eq!(state.plan().unwrap().len(), MAX_PLAN_BYTES);
+        assert_eq!(state.approve_reviewed(&text), Some(text));
+    }
+
+    #[test]
+    fn automatic_tool_call_outside_planning_never_reports_success() {
+        let state = PlanState::new();
+        let text = "Goal: fix code\nFiles: src/main.rs\nVerification: test";
+        assert!(execute_plan(&state, true, text).is_error);
+        assert_eq!(state.mode(), PlanMode::Off);
+        state.enter_planning();
+        assert!(!execute_plan(&state, false, text).is_error);
+        assert!(
+            execute_plan(&state, true, "another complete plan to substitute").is_error
+        );
+        assert_eq!(state.mode(), PlanMode::PendingApproval);
+        assert_eq!(state.plan().as_deref(), Some(text));
     }
 }

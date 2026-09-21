@@ -5,23 +5,17 @@
     {
       "repo": "mitsuhiko/agent-stuff",
       "path": "pi-extensions/review.ts",
-      "registrations": [
-        "registerCommand"
-      ]
+      "registrations": ["registerCommand"]
     },
     {
       "repo": "knoopx/pi",
       "path": "extensions/edit.ts",
-      "registrations": [
-        "registerTool"
-      ]
+      "registrations": ["registerTool"]
     },
     {
       "repo": "towry/agent-share",
       "path": "extensions/review.ts",
-      "registrations": [
-        "registerTool"
-      ]
+      "registrations": ["registerTool"]
     },
     {
       "repo": "Dwsy/agent",
@@ -31,34 +25,22 @@
     {
       "repo": "dejanr/dotfiles",
       "path": ".pi/extensions/project-context/index.ts",
-      "registrations": [
-        "registerTool"
-      ]
+      "registrations": ["registerTool"]
     },
     {
       "repo": "joelazar/dotfiles",
       "path": ".pi/extensions/commands.ts",
-      "registrations": [
-        "registerTool",
-        "registerCommand",
-        "registerFlag"
-      ]
+      "registrations": ["registerTool", "registerCommand", "registerFlag"]
     },
     {
       "repo": "w-winter/dot314",
       "path": "extensions/pi-tool-diff/index.ts",
-      "registrations": [
-        "registerTool",
-        "registerCommand"
-      ]
+      "registrations": ["registerTool", "registerCommand"]
     },
     {
       "repo": "nof0xgiven/pi-coding-agent-eureka",
       "path": "extensions/review/src/index.ts",
-      "registrations": [
-        "registerTool",
-        "registerCommand"
-      ]
+      "registrations": ["registerTool", "registerCommand"]
     }
   ]
 }

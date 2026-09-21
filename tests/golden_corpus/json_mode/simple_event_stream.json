@@ -4,17 +4,22 @@
   "surface": "json_mode",
   "description": "JSON mode: verifies session header and complete event lifecycle",
   "cli_args": [
-    "--mode", "json",
+    "--mode",
+    "json",
     "-p",
-    "--provider", "anthropic",
-    "--model", "claude-sonnet-4-5",
+    "--provider",
+    "anthropic",
+    "--model",
+    "claude-sonnet-4-5",
     "--no-tools",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--thinking", "off",
-    "--system-prompt", "JSON mode event stream test.",
+    "--thinking",
+    "off",
+    "--system-prompt",
+    "JSON mode event stream test.",
     "Reply with JSON mode pong."
   ],
   "stdin": null,
@@ -38,7 +43,10 @@
           "body": {
             "model": "claude-sonnet-4-5",
             "messages": [
-              {"role": "user", "content": [{"type": "text", "text": "Reply with JSON mode pong."}]}
+              {
+                "role": "user",
+                "content": [{ "type": "text", "text": "Reply with JSON mode pong." }]
+              }
             ],
             "system": "JSON mode event stream test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>",
             "max_tokens": 64000,
@@ -47,9 +55,7 @@
         },
         "response": {
           "status": 200,
-          "headers": [
-            ["Content-Type", "text/event-stream; charset=utf-8"]
-          ],
+          "headers": [["Content-Type", "text/event-stream; charset=utf-8"]],
           "body_chunks": [
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"id\":\"msg_golden_json_001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1,\"service_tier\":\"standard\"}}}\n\n",
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",

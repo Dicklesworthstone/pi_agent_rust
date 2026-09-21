@@ -18,9 +18,7 @@
           "evidence_kind": "jsonl_event_log"
         }
       ],
-      "expected_diagnostics": [
-        "agent_mail_source_unavailable"
-      ],
+      "expected_diagnostics": ["agent_mail_source_unavailable"],
       "expected_decisions": [
         {
           "policy_id": "conservative_manual",
@@ -63,9 +61,7 @@
           "evidence_kind": "jsonl_event_log"
         }
       ],
-      "expected_diagnostics": [
-        "rch_progress_from_uncertain_source"
-      ],
+      "expected_diagnostics": ["rch_progress_from_uncertain_source"],
       "expected_decisions": [
         {
           "policy_id": "rch_fanout_limited",

@@ -12,16 +12,8 @@
       "summary": "Verifies 1 tool(s), ad-name command, event hooks registered for aliou-pi-extensions",
       "expect": {
         "tool_count": 1,
-        "commands_contains": [
-          "ad-name",
-          "dumb-zone-status",
-          "extensions:update"
-        ],
-        "event_hooks_contains": [
-          "agent_end",
-          "agent_start",
-          "before_agent_start"
-        ]
+        "commands_contains": ["ad-name", "dumb-zone-status", "extensions:update"],
+        "event_hooks_contains": ["agent_end", "agent_start", "before_agent_start"]
       }
     },
     {

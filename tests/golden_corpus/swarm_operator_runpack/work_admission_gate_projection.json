@@ -4,11 +4,7 @@
     "admit_coordination_work": false,
     "admit_new_implementation": false,
     "blockers": [],
-    "command_safety_classes": [
-      "coordination_probe",
-      "read_only_probe",
-      "validation_probe"
-    ],
+    "command_safety_classes": ["coordination_probe", "read_only_probe", "validation_probe"],
     "commands_require_operator_execution": true,
     "confidence": "high",
     "decision": "wait",
@@ -25,10 +21,7 @@
     "status": "wait",
     "title": "Reduce swarm fanout based on live budget drift"
   },
-  "degraded_reasons": [
-    "Agent Mail status is `degraded`",
-    "budget drift status is `deny_new_work`"
-  ],
+  "degraded_reasons": ["Agent Mail status is `degraded`", "budget drift status is `deny_new_work`"],
   "dry_run_executor": {
     "blocked": [
       {
@@ -43,9 +36,7 @@
         ],
         "id": "BLOCK-wait",
         "operator_required": false,
-        "reason_codes": [
-          "work_admission_decision_wait"
-        ],
+        "reason_codes": ["work_admission_decision_wait"],
         "source_action": "adjust_swarm_budget",
         "source_action_id": "adjust_swarm_budget",
         "source_action_rank": 1,
@@ -69,14 +60,10 @@
         "command": null,
         "command_purpose": null,
         "dry_run_only": true,
-        "evidence_paths": [
-          "forbidden_actions"
-        ],
+        "evidence_paths": ["forbidden_actions"],
         "id": "POLICY-recursive_filesystem_deletion",
         "operator_required": false,
-        "reason_codes": [
-          "recursive_filesystem_deletion_forbidden"
-        ],
+        "reason_codes": ["recursive_filesystem_deletion_forbidden"],
         "source_action": null,
         "source_action_id": null,
         "source_action_rank": null,
@@ -87,14 +74,10 @@
         "command": null,
         "command_purpose": null,
         "dry_run_only": true,
-        "evidence_paths": [
-          "forbidden_actions"
-        ],
+        "evidence_paths": ["forbidden_actions"],
         "id": "POLICY-file_deletion",
         "operator_required": false,
-        "reason_codes": [
-          "file_deletion_forbidden"
-        ],
+        "reason_codes": ["file_deletion_forbidden"],
         "source_action": null,
         "source_action_id": null,
         "source_action_rank": null,
@@ -105,15 +88,10 @@
         "command": null,
         "command_purpose": null,
         "dry_run_only": true,
-        "evidence_paths": [
-          "forbidden_actions",
-          "gate_guards.no_source_mutation"
-        ],
+        "evidence_paths": ["forbidden_actions", "gate_guards.no_source_mutation"],
         "id": "POLICY-agent_mail_mutation",
         "operator_required": false,
-        "reason_codes": [
-          "agent_mail_mutation_forbidden"
-        ],
+        "reason_codes": ["agent_mail_mutation_forbidden"],
         "source_action": null,
         "source_action_id": null,
         "source_action_rank": null,
@@ -124,15 +102,10 @@
         "command": null,
         "command_purpose": null,
         "dry_run_only": true,
-        "evidence_paths": [
-          "forbidden_actions",
-          "source_signals.rch"
-        ],
+        "evidence_paths": ["forbidden_actions", "source_signals.rch"],
         "id": "POLICY-rch_mutation",
         "operator_required": false,
-        "reason_codes": [
-          "rch_mutation_or_heavy_exec_forbidden"
-        ],
+        "reason_codes": ["rch_mutation_or_heavy_exec_forbidden"],
         "source_action": null,
         "source_action_id": null,
         "source_action_rank": null,
@@ -159,9 +132,7 @@
         ],
         "id": "action_command:AUTO-003-use_beads_soft_lock:Claim through Beads",
         "operator_required": true,
-        "reason_codes": [
-          "source_of_truth_mutation_requires_operator"
-        ],
+        "reason_codes": ["source_of_truth_mutation_requires_operator"],
         "source_action": "use_beads_soft_lock",
         "source_action_id": "AUTO-003-use_beads_soft_lock",
         "source_action_rank": 3,
@@ -178,9 +149,7 @@
         ],
         "id": "action_command:AUTO-004-reopen_stale_bead_candidate:Reopen only after confirming abandonment",
         "operator_required": true,
-        "reason_codes": [
-          "source_of_truth_mutation_requires_operator"
-        ],
+        "reason_codes": ["source_of_truth_mutation_requires_operator"],
         "source_action": "reopen_stale_bead_candidate",
         "source_action_id": "AUTO-004-reopen_stale_bead_candidate",
         "source_action_rank": 4,
@@ -191,14 +160,10 @@
         "command": "br update <issue-id> --status open",
         "command_purpose": "Reopen only after confirmation",
         "dry_run_only": true,
-        "evidence_paths": [
-          "normalized_inputs.beads.stale[0]"
-        ],
+        "evidence_paths": ["normalized_inputs.beads.stale[0]"],
         "id": "failure_action_command:FAIL-BEADS-STALE-OWNER:Reopen only after confirmation",
         "operator_required": true,
-        "reason_codes": [
-          "source_of_truth_mutation_requires_operator"
-        ],
+        "reason_codes": ["source_of_truth_mutation_requires_operator"],
         "source_action": null,
         "source_action_id": "FAIL-BEADS-STALE-OWNER",
         "source_action_rank": null,
@@ -227,9 +192,7 @@
         ],
         "id": "action_command:AUTO-001-adjust_swarm_budget:Inspect budget drift",
         "operator_required": false,
-        "reason_codes": [
-          "read_only_probe"
-        ],
+        "reason_codes": ["read_only_probe"],
         "source_action": "adjust_swarm_budget",
         "source_action_id": "AUTO-001-adjust_swarm_budget",
         "source_action_rank": 1,
@@ -247,9 +210,7 @@
         ],
         "id": "action_command:AUTO-001-adjust_swarm_budget:Refresh swarm resource preflight",
         "operator_required": false,
-        "reason_codes": [
-          "read_only_probe"
-        ],
+        "reason_codes": ["read_only_probe"],
         "source_action": "adjust_swarm_budget",
         "source_action_id": "AUTO-001-adjust_swarm_budget",
         "source_action_rank": 1,
@@ -267,9 +228,7 @@
         ],
         "id": "action_command:AUTO-001-adjust_swarm_budget:Refresh cargo admission",
         "operator_required": false,
-        "reason_codes": [
-          "read_only_probe"
-        ],
+        "reason_codes": ["read_only_probe"],
         "source_action": "adjust_swarm_budget",
         "source_action_id": "AUTO-001-adjust_swarm_budget",
         "source_action_rank": 1,
@@ -287,9 +246,7 @@
         ],
         "id": "action_command:AUTO-001-adjust_swarm_budget:Inspect active ownership",
         "operator_required": false,
-        "reason_codes": [
-          "read_only_probe"
-        ],
+        "reason_codes": ["read_only_probe"],
         "source_action": "adjust_swarm_budget",
         "source_action_id": "AUTO-001-adjust_swarm_budget",
         "source_action_rank": 1,
@@ -302,9 +259,7 @@
       "catalog_schema": "pi.swarm.failure_action_catalog.v1",
       "category": "agent_mail",
       "escalation": "Run repair only after the dry-run output is understood; continue with Beads assignment as the temporary coordination lock.",
-      "evidence_paths": [
-        "command_provenance[0]"
-      ],
+      "evidence_paths": ["command_provenance[0]"],
       "explanation": "Agent Mail coordination cannot be trusted for reservations or inbox state until the mailbox schema is repaired or restored.",
       "id": "FAIL-AGENT-MAIL-SCHEMA",
       "match_confidence": "high",
@@ -334,9 +289,7 @@
       "catalog_schema": "pi.swarm.failure_action_catalog.v1",
       "category": "rch",
       "escalation": "If saturation persists, split validation by surface or pause heavy cargo work instead of allowing local fallback.",
-      "evidence_paths": [
-        "normalized_inputs.cargo_admission"
-      ],
+      "evidence_paths": ["normalized_inputs.cargo_admission"],
       "explanation": "Cargo admission or queue forecast says RCH capacity is saturated. Keep work narrow and wait before launching heavyweight checks.",
       "id": "FAIL-RCH-QUEUE-SATURATED",
       "match_confidence": "high",
@@ -366,9 +319,7 @@
       "catalog_schema": "pi.swarm.failure_action_catalog.v1",
       "category": "agent_mail",
       "escalation": "Do not assume reservation writes landed while Mail is degraded; use Beads status and narrow file surfaces until Mail is healthy.",
-      "evidence_paths": [
-        "normalized_inputs.agent_mail"
-      ],
+      "evidence_paths": ["normalized_inputs.agent_mail"],
       "explanation": "Mail may still provide partial read evidence, but it should not be treated as the write-side reservation ledger.",
       "id": "FAIL-AGENT-MAIL-DEGRADED-READONLY",
       "match_confidence": "medium",
@@ -398,9 +349,7 @@
       "catalog_schema": "pi.swarm.failure_action_catalog.v1",
       "category": "beads",
       "escalation": "Do not force-release reservations or alter another agent's files unless Mail or recent commits confirm the claim is abandoned.",
-      "evidence_paths": [
-        "normalized_inputs.beads.stale[0]"
-      ],
+      "evidence_paths": ["normalized_inputs.beads.stale[0]"],
       "explanation": "The captured Beads state shows old in-progress ownership. Confirm abandonment before reopening or taking over the work.",
       "id": "FAIL-BEADS-STALE-OWNER",
       "match_confidence": "medium",
@@ -446,10 +395,7 @@
   "input_pack_schema": "pi.swarm.autopilot_input_pack.v1",
   "purpose": "fail_closed_swarm_work_admission_gate_not_source_of_truth",
   "redaction_summary": {
-    "fields": [
-      "agent_mail_status.registration_token",
-      "doctor_swarm.findings[0].detail"
-    ],
+    "fields": ["agent_mail_status.registration_token", "doctor_swarm.findings[0].detail"],
     "redacted_count": 2
   },
   "schema": "pi.swarm.work_admission_gate.v1",

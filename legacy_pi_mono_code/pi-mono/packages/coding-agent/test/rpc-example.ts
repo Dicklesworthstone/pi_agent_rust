@@ -11,76 +11,79 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  */
 
 async function main() {
-	const client = new RpcClient({
-		cliPath: join(__dirname, "../dist/cli.js"),
-		provider: "anthropic",
-		model: "claude-sonnet-4-20250514",
-		args: ["--no-session"],
-	});
+  const client = new RpcClient({
+    cliPath: join(__dirname, "../dist/cli.js"),
+    provider: "anthropic",
+    model: "claude-sonnet-4-20250514",
+    args: ["--no-session"],
+  });
 
-	// Stream events to console
-	client.onEvent((event) => {
-		if (event.type === "message_update") {
-			const { assistantMessageEvent } = event;
-			if (assistantMessageEvent.type === "text_delta" || assistantMessageEvent.type === "thinking_delta") {
-				process.stdout.write(assistantMessageEvent.delta);
-			}
-		}
+  // Stream events to console
+  client.onEvent((event) => {
+    if (event.type === "message_update") {
+      const { assistantMessageEvent } = event;
+      if (
+        assistantMessageEvent.type === "text_delta" ||
+        assistantMessageEvent.type === "thinking_delta"
+      ) {
+        process.stdout.write(assistantMessageEvent.delta);
+      }
+    }
 
-		if (event.type === "tool_execution_start") {
-			console.log(`\n[Tool: ${event.toolName}]`);
-		}
+    if (event.type === "tool_execution_start") {
+      console.log(`\n[Tool: ${event.toolName}]`);
+    }
 
-		if (event.type === "tool_execution_end") {
-			console.log(`[Result: ${JSON.stringify(event.result).slice(0, 200)}...]\n`);
-		}
-	});
+    if (event.type === "tool_execution_end") {
+      console.log(`[Result: ${JSON.stringify(event.result).slice(0, 200)}...]\n`);
+    }
+  });
 
-	await client.start();
+  await client.start();
 
-	const state = await client.getState();
-	console.log(`Model: ${state.model?.provider}/${state.model?.id}`);
-	console.log(`Thinking: ${state.thinkingLevel ?? "off"}\n`);
+  const state = await client.getState();
+  console.log(`Model: ${state.model?.provider}/${state.model?.id}`);
+  console.log(`Thinking: ${state.thinkingLevel ?? "off"}\n`);
 
-	// Handle user input
-	const rl = readline.createInterface({
-		input: process.stdin,
-		output: process.stdout,
-		terminal: true,
-	});
+  // Handle user input
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+  });
 
-	let isWaiting = false;
+  let isWaiting = false;
 
-	const prompt = () => {
-		if (!isWaiting) process.stdout.write("You: ");
-	};
+  const prompt = () => {
+    if (!isWaiting) process.stdout.write("You: ");
+  };
 
-	rl.on("line", async (line) => {
-		if (isWaiting) return;
-		if (line.trim() === "exit") {
-			await client.stop();
-			process.exit(0);
-		}
+  rl.on("line", async (line) => {
+    if (isWaiting) return;
+    if (line.trim() === "exit") {
+      await client.stop();
+      process.exit(0);
+    }
 
-		isWaiting = true;
-		await client.promptAndWait(line);
-		console.log("\n");
-		isWaiting = false;
-		prompt();
-	});
+    isWaiting = true;
+    await client.promptAndWait(line);
+    console.log("\n");
+    isWaiting = false;
+    prompt();
+  });
 
-	rl.on("SIGINT", () => {
-		if (isWaiting) {
-			console.log("\n[Aborting...]");
-			client.abort();
-		} else {
-			client.stop();
-			process.exit(0);
-		}
-	});
+  rl.on("SIGINT", () => {
+    if (isWaiting) {
+      console.log("\n[Aborting...]");
+      client.abort();
+    } else {
+      client.stop();
+      process.exit(0);
+    }
+  });
 
-	console.log("Interactive RPC example. Type 'exit' to quit.\n");
-	prompt();
+  console.log("Interactive RPC example. Type 'exit' to quit.\n");
+  prompt();
 }
 
 main().catch(console.error);

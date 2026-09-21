@@ -8,26 +8,11 @@
         "method": "POST",
         "url": "https://api.anthropic.com/v1/messages",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "X-API-Key",
-            "[REDACTED]"
-          ],
-          [
-            "anthropic-version",
-            "2023-06-01"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"],
+          ["X-API-Key", "[REDACTED]"],
+          ["anthropic-version", "2023-06-01"],
+          ["Content-Type", "application/json"]
         ],
         "body": {
           "max_tokens": 256,
@@ -55,12 +40,7 @@
       },
       "response": {
         "status": 529,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Anthropic's API is temporarily overloaded.\"}}"
         ]

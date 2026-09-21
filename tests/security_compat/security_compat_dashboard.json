@@ -2,10 +2,7 @@
   "schema": "pi.security.compat_dashboard.v1",
   "generated_at": "2026-08-04T23:06:51.052Z",
   "bead": "bd-1a2cu",
-  "profiles_tested": [
-    "safe",
-    "standard"
-  ],
+  "profiles_tested": ["safe", "standard"],
   "total_checks": 24,
   "total_passed": 24,
   "total_failed": 0,

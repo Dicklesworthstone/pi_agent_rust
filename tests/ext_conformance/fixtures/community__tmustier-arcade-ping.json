@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies ping command registered for tmustier-arcade-ping",
       "expect": {
-        "commands_contains": [
-          "ping"
-        ]
+        "commands_contains": ["ping"]
       }
     },
     {

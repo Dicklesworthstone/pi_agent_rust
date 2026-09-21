@@ -30,9 +30,7 @@
     {
       "name": "write_overwrites_existing",
       "description": "Write should overwrite existing files",
-      "setup": [
-        {"type": "create_file", "path": "existing.txt", "content": "old content"}
-      ],
+      "setup": [{ "type": "create_file", "path": "existing.txt", "content": "old content" }],
       "input": {
         "path": "existing.txt",
         "content": "new content"

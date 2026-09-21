@@ -7,28 +7,12 @@
       "request": {
         "method": "POST",
         "url": "https://api.cohere.com/v2/chat",
-        "headers": [
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ]
+        "headers": [["Authorization", "Bearer [REDACTED]"], ["Content-Type", "application/json"]]
       },
       "response": {
         "status": 429,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
-        "body_chunks": [
-          "{\"message\":\"Simulated error 429\"}"
-        ]
+        "headers": [["Content-Type", "application/json"]],
+        "body_chunks": ["{\"message\":\"Simulated error 429\"}"]
       }
     }
   ]

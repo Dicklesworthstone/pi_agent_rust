@@ -33,21 +33,14 @@
       "setup": {
         "mock_exec": [
           {
-            "args": [
-              "stash",
-              "create"
-            ],
+            "args": ["stash", "create"],
             "code": 0,
             "command": "git",
             "stderr": "",
             "stdout": "deadbeef\n"
           },
           {
-            "args": [
-              "stash",
-              "apply",
-              "deadbeef"
-            ],
+            "args": ["stash", "apply", "deadbeef"],
             "code": 0,
             "command": "git",
             "stderr": "",
@@ -86,26 +79,8 @@
         }
       ],
       "expect": {
-        "exec_called": [
-          [
-            "git",
-            [
-              "stash",
-              "create"
-            ]
-          ],
-          [
-            "git",
-            [
-              "stash",
-              "apply",
-              "deadbeef"
-            ]
-          ]
-        ],
-        "ui_notify_contains": [
-          "Code restored to checkpoint"
-        ],
+        "exec_called": [["git", ["stash", "create"]], ["git", ["stash", "apply", "deadbeef"]]],
+        "ui_notify_contains": ["Code restored to checkpoint"],
         "no_error": true
       },
       "outputs": {

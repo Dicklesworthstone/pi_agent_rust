@@ -6,19 +6,14 @@
     {
       "name": "read_url_fetches_and_converts_html",
       "description": "the real URL pipeline fetches a loopback HTML document and emits reader-mode markdown",
-      "requirement_ids": [
-        "READ-URL-HTML-1"
-      ],
+      "requirement_ids": ["READ-URL-HTML-1"],
       "input": {
         "path": "http://fixture.invalid/page",
         "fixtureContentType": "text/html; charset=utf-8",
         "fixtureBody": "<!doctype html><html><body><main><h1>Fixture Title</h1><p>Alpha body.</p></main></body></html>"
       },
       "expected": {
-        "content_contains": [
-          "Fixture Title",
-          "Alpha body."
-        ],
+        "content_contains": ["Fixture Title", "Alpha body."],
         "details_exact": {
           "contentType": "html",
           "wireContentType": "text/html; charset=utf-8",
@@ -32,9 +27,7 @@
     {
       "name": "read_url_paginates_converted_plaintext",
       "description": "offset and limit apply after conversion and return the stable continuation notice",
-      "requirement_ids": [
-        "READ-URL-PAGINATION-1"
-      ],
+      "requirement_ids": ["READ-URL-PAGINATION-1"],
       "input": {
         "path": "http://fixture.invalid/page.txt",
         "offset": 2,
@@ -58,9 +51,7 @@
     {
       "name": "read_url_surfaces_http_status_failures",
       "description": "a non-success response fails with the status and final URL instead of converting the error page",
-      "requirement_ids": [
-        "READ-URL-HTTP-ERR-1"
-      ],
+      "requirement_ids": ["READ-URL-HTTP-ERR-1"],
       "input": {
         "path": "http://fixture.invalid/unavailable",
         "fixtureStatus": 503,

@@ -6,17 +6,13 @@
     {
       "name": "reflect_synthesizes_from_seeded_memory",
       "description": "a canned provider synthesizes a cited answer over the matching project memory without network access",
-      "requirement_ids": [
-        "MEM-REFLECT-1"
-      ],
+      "requirement_ids": ["MEM-REFLECT-1"],
       "setup": [
         {
           "type": "retain_memory",
           "content": "Cargo checks must run through the remote compilation helper.",
           "kind": "lesson",
-          "tags": [
-            "cargo"
-          ]
+          "tags": ["cargo"]
         }
       ],
       "input": {
@@ -27,21 +23,15 @@
         "details_exact": {
           "schema": "pi.memory.v1",
           "question": "How should Cargo checks run?",
-          "citations": [
-            1
-          ]
+          "citations": [1]
         },
-        "details_contains": [
-          "Cargo checks must run through the remote compilation helper."
-        ]
+        "details_contains": ["Cargo checks must run through the remote compilation helper."]
       }
     },
     {
       "name": "reflect_empty_bank_skips_provider",
       "description": "an empty memory bank returns an explicit no-evidence response without resolving auth or a provider",
-      "requirement_ids": [
-        "MEM-REFLECT-2"
-      ],
+      "requirement_ids": ["MEM-REFLECT-2"],
       "input": {
         "question": "What should I remember?"
       },
@@ -57,9 +47,7 @@
     {
       "name": "reflect_requires_question",
       "description": "a question-less request fails before provider resolution",
-      "requirement_ids": [
-        "MEM-REFLECT-ERR-1"
-      ],
+      "requirement_ids": ["MEM-REFLECT-ERR-1"],
       "input": {},
       "expect_error": true,
       "error_contains": "missing field `question`",

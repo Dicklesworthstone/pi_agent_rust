@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies code command registered for tmustier-code-actions",
       "expect": {
-        "commands_contains": [
-          "code"
-        ]
+        "commands_contains": ["code"]
       }
     },
     {

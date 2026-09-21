@@ -56,11 +56,7 @@
         }
       ],
       "expect": {
-        "ui_status_contains_sequence": [
-          "Ready",
-          "Turn 1",
-          "complete"
-        ],
+        "ui_status_contains_sequence": ["Ready", "Turn 1", "complete"],
         "ui_status_key": "status-demo",
         "no_error": true
       },

@@ -3,19 +3,7 @@
   "description": "Basic /help command should show available commands",
   "setup": [],
   "command": "/help",
-  "expected_fields": [
-    "commands",
-    "status"
-  ],
-  "should_contain": [
-    "Available commands",
-    "/clear",
-    "/model",
-    "/thinking",
-    "/exit"
-  ],
-  "should_not_contain": [
-    "error",
-    "unknown command"
-  ]
+  "expected_fields": ["commands", "status"],
+  "should_contain": ["Available commands", "/clear", "/model", "/thinking", "/exit"],
+  "should_not_contain": ["error", "unknown command"]
 }

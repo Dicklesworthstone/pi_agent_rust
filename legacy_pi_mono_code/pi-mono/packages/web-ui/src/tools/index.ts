@@ -19,28 +19,28 @@ let showJsonMode = false;
  * When enabled, all tool renderers will use the default JSON renderer
  */
 export function setShowJsonMode(enabled: boolean): void {
-	showJsonMode = enabled;
+  showJsonMode = enabled;
 }
 
 /**
  * Render tool - unified function that handles params, result, and streaming state
  */
 export function renderTool(
-	toolName: string,
-	params: any | undefined,
-	result: ToolResultMessage | undefined,
-	isStreaming?: boolean,
+  toolName: string,
+  params: any | undefined,
+  result: ToolResultMessage | undefined,
+  isStreaming?: boolean,
 ): ToolRenderResult {
-	// If showJsonMode is enabled, always use the default renderer
-	if (showJsonMode) {
-		return defaultRenderer.render(params, result, isStreaming);
-	}
+  // If showJsonMode is enabled, always use the default renderer
+  if (showJsonMode) {
+    return defaultRenderer.render(params, result, isStreaming);
+  }
 
-	const renderer = getToolRenderer(toolName);
-	if (renderer) {
-		return renderer.render(params, result, isStreaming);
-	}
-	return defaultRenderer.render(params, result, isStreaming);
+  const renderer = getToolRenderer(toolName);
+  if (renderer) {
+    return renderer.render(params, result, isStreaming);
+  }
+  return defaultRenderer.render(params, result, isStreaming);
 }
 
 export { getToolRenderer, registerToolRenderer };

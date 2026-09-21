@@ -11,7 +11,15 @@
       "expect": {
         "tool_count": 2,
         "commands_contains": ["control-sessions"],
-        "event_hooks_contains": ["connect", "data", "error", "session_shutdown", "session_start", "session_switch", "turn_end"]
+        "event_hooks_contains": [
+          "connect",
+          "data",
+          "error",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "turn_end"
+        ]
       }
     },
     {

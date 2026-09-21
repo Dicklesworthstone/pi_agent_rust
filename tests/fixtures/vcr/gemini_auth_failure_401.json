@@ -7,16 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse",
-        "headers": [
-          ["Content-Type", "application/json"],
-          ["Accept", "text/event-stream"]
-        ]
+        "headers": [["Content-Type", "application/json"], ["Accept", "text/event-stream"]]
       },
       "response": {
         "status": 401,
-        "headers": [
-          ["Content-Type", "application/json"]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"error\":{\"code\":401,\"message\":\"API key not valid. Please pass a valid API key.\",\"status\":\"UNAUTHENTICATED\"}}"
         ]

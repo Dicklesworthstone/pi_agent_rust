@@ -44,10 +44,7 @@
       "summary": "Worktree is clean"
     },
     {
-      "evidence": [
-        "def5678",
-        "origin/main"
-      ],
+      "evidence": ["def5678", "origin/main"],
       "id": "git_pushed",
       "status": "warn",
       "summary": "ahead=2 behind=0"

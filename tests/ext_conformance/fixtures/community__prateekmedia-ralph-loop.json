@@ -12,15 +12,8 @@
       "summary": "Verifies 1 tool(s), ralph-clear command, event hooks registered for prateekmedia-ralph-loop",
       "expect": {
         "tool_count": 1,
-        "commands_contains": [
-          "ralph-clear",
-          "ralph-follow",
-          "ralph-pause"
-        ],
-        "event_hooks_contains": [
-          "close",
-          "data"
-        ]
+        "commands_contains": ["ralph-clear", "ralph-follow", "ralph-pause"],
+        "event_hooks_contains": ["close", "data"]
       }
     },
     {

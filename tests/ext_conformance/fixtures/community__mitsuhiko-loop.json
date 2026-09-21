@@ -11,7 +11,12 @@
       "expect": {
         "tool_count": 1,
         "commands_contains": ["loop"],
-        "event_hooks_contains": ["agent_end", "session_before_compact", "session_start", "session_switch"]
+        "event_hooks_contains": [
+          "agent_end",
+          "session_before_compact",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {

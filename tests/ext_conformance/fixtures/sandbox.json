@@ -111,9 +111,7 @@
       "setup": null,
       "steps": [],
       "expect": {
-        "ui_notify_contains": [
-          "Sandbox is disabled"
-        ]
+        "ui_notify_contains": ["Sandbox is disabled"]
       },
       "outputs": {
         "stdout_normalized_jsonl": [
@@ -183,9 +181,7 @@
       },
       "steps": [],
       "expect": {
-        "ui_notify_contains": [
-          "Sandbox disabled via --no-sandbox"
-        ]
+        "ui_notify_contains": ["Sandbox disabled via --no-sandbox"]
       },
       "outputs": {
         "stdout_normalized_jsonl": [],

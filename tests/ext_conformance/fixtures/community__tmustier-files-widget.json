@@ -11,16 +11,8 @@
       "kind": "registration",
       "summary": "Verifies diff command, event hooks registered for tmustier-files-widget",
       "expect": {
-        "commands_contains": [
-          "diff",
-          "readfiles",
-          "review"
-        ],
-        "event_hooks_contains": [
-          "session_start",
-          "session_switch",
-          "tool_result"
-        ]
+        "commands_contains": ["diff", "readfiles", "review"],
+        "event_hooks_contains": ["session_start", "session_switch", "tool_result"]
       }
     },
     {

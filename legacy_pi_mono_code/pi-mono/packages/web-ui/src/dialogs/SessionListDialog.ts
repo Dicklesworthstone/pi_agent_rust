@@ -9,113 +9,113 @@ import { i18n } from "../utils/i18n.js";
 
 @customElement("session-list-dialog")
 export class SessionListDialog extends DialogBase {
-	@state() private sessions: SessionMetadata[] = [];
-	@state() private loading = true;
+  @state() private sessions: SessionMetadata[] = [];
+  @state() private loading = true;
 
-	private onSelectCallback?: (sessionId: string) => void;
-	private onDeleteCallback?: (sessionId: string) => void;
-	private deletedSessions = new Set<string>();
-	private closedViaSelection = false;
+  private onSelectCallback?: (sessionId: string) => void;
+  private onDeleteCallback?: (sessionId: string) => void;
+  private deletedSessions = new Set<string>();
+  private closedViaSelection = false;
 
-	protected modalWidth = "min(600px, 90vw)";
-	protected modalHeight = "min(700px, 90vh)";
+  protected modalWidth = "min(600px, 90vw)";
+  protected modalHeight = "min(700px, 90vh)";
 
-	static async open(onSelect: (sessionId: string) => void, onDelete?: (sessionId: string) => void) {
-		const dialog = new SessionListDialog();
-		dialog.onSelectCallback = onSelect;
-		dialog.onDeleteCallback = onDelete;
-		dialog.open();
-		await dialog.loadSessions();
-	}
+  static async open(onSelect: (sessionId: string) => void, onDelete?: (sessionId: string) => void) {
+    const dialog = new SessionListDialog();
+    dialog.onSelectCallback = onSelect;
+    dialog.onDeleteCallback = onDelete;
+    dialog.open();
+    await dialog.loadSessions();
+  }
 
-	private async loadSessions() {
-		this.loading = true;
-		try {
-			const storage = getAppStorage();
-			this.sessions = await storage.sessions.getAllMetadata();
-		} catch (err) {
-			console.error("Failed to load sessions:", err);
-			this.sessions = [];
-		} finally {
-			this.loading = false;
-		}
-	}
+  private async loadSessions() {
+    this.loading = true;
+    try {
+      const storage = getAppStorage();
+      this.sessions = await storage.sessions.getAllMetadata();
+    } catch (err) {
+      console.error("Failed to load sessions:", err);
+      this.sessions = [];
+    } finally {
+      this.loading = false;
+    }
+  }
 
-	private async handleDelete(sessionId: string, event: Event) {
-		event.stopPropagation();
+  private async handleDelete(sessionId: string, event: Event) {
+    event.stopPropagation();
 
-		if (!confirm(i18n("Delete this session?"))) {
-			return;
-		}
+    if (!confirm(i18n("Delete this session?"))) {
+      return;
+    }
 
-		try {
-			const storage = getAppStorage();
-			if (!storage.sessions) return;
+    try {
+      const storage = getAppStorage();
+      if (!storage.sessions) return;
 
-			await storage.sessions.deleteSession(sessionId);
-			await this.loadSessions();
+      await storage.sessions.deleteSession(sessionId);
+      await this.loadSessions();
 
-			// Track deleted session
-			this.deletedSessions.add(sessionId);
-		} catch (err) {
-			console.error("Failed to delete session:", err);
-		}
-	}
+      // Track deleted session
+      this.deletedSessions.add(sessionId);
+    } catch (err) {
+      console.error("Failed to delete session:", err);
+    }
+  }
 
-	override close() {
-		super.close();
+  override close() {
+    super.close();
 
-		// Only notify about deleted sessions if dialog wasn't closed via selection
-		if (!this.closedViaSelection && this.onDeleteCallback && this.deletedSessions.size > 0) {
-			for (const sessionId of this.deletedSessions) {
-				this.onDeleteCallback(sessionId);
-			}
-		}
-	}
+    // Only notify about deleted sessions if dialog wasn't closed via selection
+    if (!this.closedViaSelection && this.onDeleteCallback && this.deletedSessions.size > 0) {
+      for (const sessionId of this.deletedSessions) {
+        this.onDeleteCallback(sessionId);
+      }
+    }
+  }
 
-	private handleSelect(sessionId: string) {
-		this.closedViaSelection = true;
-		if (this.onSelectCallback) {
-			this.onSelectCallback(sessionId);
-		}
-		this.close();
-	}
+  private handleSelect(sessionId: string) {
+    this.closedViaSelection = true;
+    if (this.onSelectCallback) {
+      this.onSelectCallback(sessionId);
+    }
+    this.close();
+  }
 
-	private formatDate(isoString: string): string {
-		const date = new Date(isoString);
-		const now = new Date();
-		const diff = now.getTime() - date.getTime();
-		const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+  private formatDate(isoString: string): string {
+    const date = new Date(isoString);
+    const now = new Date();
+    const diff = now.getTime() - date.getTime();
+    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
 
-		if (days === 0) {
-			return i18n("Today");
-		} else if (days === 1) {
-			return i18n("Yesterday");
-		} else if (days < 7) {
-			return i18n("{days} days ago").replace("{days}", days.toString());
-		} else {
-			return date.toLocaleDateString();
-		}
-	}
+    if (days === 0) {
+      return i18n("Today");
+    } else if (days === 1) {
+      return i18n("Yesterday");
+    } else if (days < 7) {
+      return i18n("{days} days ago").replace("{days}", days.toString());
+    } else {
+      return date.toLocaleDateString();
+    }
+  }
 
-	protected override renderContent() {
-		return html`
+  protected override renderContent() {
+    return html`
 			${DialogContent({
-				className: "h-full flex flex-col",
-				children: html`
+        className: "h-full flex flex-col",
+        children: html`
 					${DialogHeader({
-						title: i18n("Sessions"),
-						description: i18n("Load a previous conversation"),
-					})}
+            title: i18n("Sessions"),
+            description: i18n("Load a previous conversation"),
+          })}
 
 					<div class="flex-1 overflow-y-auto mt-4 space-y-2">
 						${
-							this.loading
-								? html`<div class="text-center py-8 text-muted-foreground">${i18n("Loading...")}</div>`
-								: this.sessions.length === 0
-									? html`<div class="text-center py-8 text-muted-foreground">${i18n("No sessions yet")}</div>`
-									: this.sessions.map(
-											(session) => html`
+              this.loading
+                ? html`<div class="text-center py-8 text-muted-foreground">${i18n("Loading...")}</div>`
+                : this.sessions.length === 0
+                  ? html`<div class="text-center py-8 text-muted-foreground">${i18n("No sessions yet")}</div>`
+                  : this.sessions.map(
+                      (session) => html`
 											<div
 												class="group flex items-start gap-3 p-3 rounded-lg border border-border hover:bg-secondary/50 cursor-pointer transition-colors"
 												@click=${() => this.handleSelect(session.id)}
@@ -140,11 +140,11 @@ export class SessionListDialog extends DialogBase {
 												</button>
 											</div>
 										`,
-										)
-						}
+                    )
+            }
 					</div>
 				`,
-			})}
+      })}
 		`;
-	}
+  }
 }

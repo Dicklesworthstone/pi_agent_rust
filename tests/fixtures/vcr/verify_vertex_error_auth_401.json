@@ -8,28 +8,14 @@
         "method": "POST",
         "url": "https://us-central1-aiplatform.googleapis.com/v1/projects/verify-project/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent?alt=sse",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ]
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"],
+          ["Authorization", "Bearer [REDACTED]"]
         ]
       },
       "response": {
         "status": 401,
-        "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"error\":{\"code\":401,\"message\":\"Simulated error 401\",\"status\":\"UNAUTHENTICATED\"}}"
         ]

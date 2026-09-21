@@ -12,9 +12,7 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-beads-jsonl",
       "redaction_state": "none",
-      "authoritative_for": [
-        "bead_lifecycle"
-      ],
+      "authoritative_for": ["bead_lifecycle"],
       "uncertainty": []
     },
     {
@@ -25,9 +23,7 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-beads-db",
       "redaction_state": "none",
-      "authoritative_for": [
-        "bead_lifecycle"
-      ],
+      "authoritative_for": ["bead_lifecycle"],
       "uncertainty": []
     },
     {
@@ -44,9 +40,7 @@
         "agent_message",
         "build_slot_state"
       ],
-      "uncertainty": [
-        "sqlite_schema_missing_required_tables"
-      ]
+      "uncertainty": ["sqlite_schema_missing_required_tables"]
     },
     {
       "source_id": "doctor_swarm_diagnostics",
@@ -56,9 +50,7 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-doctor",
       "redaction_state": "redacted",
-      "authoritative_for": [
-        "doctor_finding"
-      ],
+      "authoritative_for": ["doctor_finding"],
       "uncertainty": []
     },
     {
@@ -69,9 +61,7 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-rch",
       "redaction_state": "none",
-      "authoritative_for": [
-        "rch_job_state"
-      ],
+      "authoritative_for": ["rch_job_state"],
       "uncertainty": []
     },
     {
@@ -82,13 +72,8 @@
       "freshness_state": "freshness_unknown",
       "source_hash": "sha256:fixture-runpack",
       "redaction_state": "redacted",
-      "authoritative_for": [
-        "runpack_recommendation",
-        "operator_handoff"
-      ],
-      "uncertainty": [
-        "optional_runpack_snapshot"
-      ]
+      "authoritative_for": ["runpack_recommendation", "operator_handoff"],
+      "uncertainty": ["optional_runpack_snapshot"]
     },
     {
       "source_id": "git_refs",
@@ -98,9 +83,7 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-git",
       "redaction_state": "none",
-      "authoritative_for": [
-        "worktree_state"
-      ],
+      "authoritative_for": ["worktree_state"],
       "uncertainty": []
     },
     {
@@ -111,10 +94,7 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-validation",
       "redaction_state": "none",
-      "authoritative_for": [
-        "cargo_gate_result",
-        "validation_artifact"
-      ],
+      "authoritative_for": ["cargo_gate_result", "validation_artifact"],
       "uncertainty": []
     },
     {
@@ -125,9 +105,7 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-context",
       "redaction_state": "redacted",
-      "authoritative_for": [
-        "validation_artifact"
-      ],
+      "authoritative_for": ["validation_artifact"],
       "uncertainty": []
     },
     {
@@ -138,9 +116,7 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-flight",
       "redaction_state": "redacted",
-      "authoritative_for": [
-        "validation_artifact"
-      ],
+      "authoritative_for": ["validation_artifact"],
       "uncertainty": []
     },
     {
@@ -151,21 +127,14 @@
       "freshness_state": "current",
       "source_hash": "sha256:fixture-activity",
       "redaction_state": "redacted",
-      "authoritative_for": [
-        "operator_handoff",
-        "validation_artifact"
-      ],
+      "authoritative_for": ["operator_handoff", "validation_artifact"],
       "uncertainty": []
     }
   ],
   "ordering": {
     "monotonic_sequence_required": true,
     "timestamp_normalization": "utc_rfc3339_z",
-    "tie_breakers": [
-      "sequence",
-      "source_ref",
-      "event_id"
-    ]
+    "tie_breakers": ["sequence", "source_ref", "event_id"]
   },
   "events": [
     {
@@ -203,9 +172,7 @@
       "redaction_state": "sensitive_omitted",
       "uncertainty": {
         "state": "missing_source",
-        "reasons": [
-          "sqlite_schema_missing_required_tables"
-        ],
+        "reasons": ["sqlite_schema_missing_required_tables"],
         "suppressed_claims": [
           "ack_latency",
           "active_reservation_holder",
@@ -290,22 +257,13 @@
   ],
   "redaction_summary": {
     "redacted_count": 2,
-    "redacted_fields": [
-      "doctor_swarm.findings[0].detail",
-      "agent_mail_status.registration_token"
-    ],
+    "redacted_fields": ["doctor_swarm.findings[0].detail", "agent_mail_status.registration_token"],
     "redaction_reason": "Agent Mail archive unavailable and doctor details redacted"
   },
   "uncertainty_summary": {
     "uncertain_event_count": 1,
-    "missing_sources": [
-      "agent_mail_archive"
-    ],
-    "suppressed_claims": [
-      "ack_latency",
-      "active_reservation_holder",
-      "mail_thread_completeness"
-    ]
+    "missing_sources": ["agent_mail_archive"],
+    "suppressed_claims": ["ack_latency", "active_reservation_holder", "mail_thread_completeness"]
   },
   "replay_guards": {
     "read_only": true,

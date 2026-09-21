@@ -49,9 +49,7 @@
       "id": "agents-mikeastock/extensions",
       "entry_path": "agents-mikeastock/extensions/pi/AskUserQuestion/index.ts",
       "source_tier": "agents-mikeastock",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/agents-mikeastock/extensions/pi/AskUserQuestion/index.ts",
       "load_success": false,
       "error": "timeout after 15000ms",
@@ -80,9 +78,7 @@
             "description": "Generate an image via Google Antigravity image models. Returns the image as a tool result attachment. Optional saving via save=project|global|custom|none, or PI_IMAGE_SAVE_MODE/PI_IMAGE_SAVE_DIR.",
             "parameters": {
               "type": "object",
-              "required": [
-                "prompt"
-              ],
+              "required": ["prompt"],
               "properties": {
                 "prompt": {
                   "description": "Image description.",
@@ -94,27 +90,11 @@
                 },
                 "aspectRatio": {
                   "type": "string",
-                  "enum": [
-                    "1:1",
-                    "2:3",
-                    "3:2",
-                    "3:4",
-                    "4:3",
-                    "4:5",
-                    "5:4",
-                    "9:16",
-                    "16:9",
-                    "21:9"
-                  ]
+                  "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
                 },
                 "save": {
                   "type": "string",
-                  "enum": [
-                    "none",
-                    "project",
-                    "global",
-                    "custom"
-                  ]
+                  "enum": ["none", "project", "global", "custom"]
                 },
                 "saveDir": {
                   "description": "Directory to save image when save=custom. Defaults to PI_IMAGE_SAVE_DIR if set.",
@@ -137,9 +117,7 @@
       "id": "auto-commit-on-exit",
       "entry_path": "auto-commit-on-exit/auto-commit-on-exit.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/auto-commit-on-exit/auto-commit-on-exit.ts",
       "load_success": true,
       "error": null,
@@ -181,9 +159,7 @@
             "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
             "parameters": {
               "type": "object",
-              "required": [
-                "command"
-              ],
+              "required": ["command"],
               "properties": {
                 "command": {
                   "description": "Bash command to execute",
@@ -272,9 +248,7 @@
       "id": "community/ferologics-notify",
       "entry_path": "community/ferologics-notify/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/ferologics-notify/index.ts",
       "load_success": true,
       "error": null,
@@ -316,9 +290,7 @@
             "description": "Copy text to the user's system clipboard. Use this when the user asks you to put something in their clipboard, write a draft reply to clipboard, or copy any generated text for easy pasting. The text will be available for pasting immediately.",
             "parameters": {
               "type": "object",
-              "required": [
-                "text"
-              ],
+              "required": ["text"],
               "properties": {
                 "text": {
                   "description": "The text to copy to the clipboard",
@@ -557,9 +529,7 @@
       "id": "community/hjanuschka-speedreading",
       "entry_path": "community/hjanuschka-speedreading/speedreading.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/hjanuschka-speedreading/speedreading.ts",
       "load_success": true,
       "error": null,
@@ -676,9 +646,7 @@
       "id": "community/hjanuschka-usage-bar",
       "entry_path": "community/hjanuschka-usage-bar/usage-bar.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/hjanuschka-usage-bar/usage-bar.ts",
       "load_success": false,
       "error": "timeout after 15000ms",
@@ -690,9 +658,7 @@
       "id": "community/jyaunches-canvas",
       "entry_path": "community/jyaunches-canvas/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/jyaunches-canvas/index.ts",
       "load_success": true,
       "error": null,
@@ -721,12 +687,7 @@
                   "type": "array",
                   "items": {
                     "type": "object",
-                    "required": [
-                      "id",
-                      "title",
-                      "startTime",
-                      "endTime"
-                    ],
+                    "required": ["id", "title", "startTime", "endTime"],
                     "properties": {
                       "id": {
                         "type": "string"
@@ -744,14 +705,7 @@
                       },
                       "color": {
                         "type": "string",
-                        "enum": [
-                          "blue",
-                          "green",
-                          "yellow",
-                          "red",
-                          "magenta",
-                          "cyan"
-                        ]
+                        "enum": ["blue", "green", "yellow", "red", "magenta", "cyan"]
                       }
                     }
                   }
@@ -770,9 +724,7 @@
             "description": "Display a document in an interactive TUI viewer. Users can navigate and select text.\n\nUse this to:\n- Show text/markdown content for review\n- Let users select portions of text\n- Display logs, code, or any text content\n\nThe document opens inline in pi's TUI. User navigates with arrow keys, uses 'v' to start selection, and Enter to confirm.",
             "parameters": {
               "type": "object",
-              "required": [
-                "content"
-              ],
+              "required": ["content"],
               "properties": {
                 "content": {
                   "description": "Document content to display",
@@ -792,9 +744,7 @@
             "description": "Display flight search results in an interactive TUI. Users can browse and select flights.\n\nUse this to:\n- Show flight options for a route\n- Let users compare and select flights\n- Display pricing, times, and stops\n\nThe flight list opens inline in pi's TUI. User navigates with arrow keys and presses Enter to select a flight.",
             "parameters": {
               "type": "object",
-              "required": [
-                "flights"
-              ],
+              "required": ["flights"],
               "properties": {
                 "title": {
                   "description": "Title for the flight search",
@@ -832,11 +782,7 @@
                       },
                       "origin": {
                         "type": "object",
-                        "required": [
-                          "code",
-                          "name",
-                          "city"
-                        ],
+                        "required": ["code", "name", "city"],
                         "properties": {
                           "code": {
                             "description": "Airport code, e.g., 'SFO'",
@@ -854,11 +800,7 @@
                       },
                       "destination": {
                         "type": "object",
-                        "required": [
-                          "code",
-                          "name",
-                          "city"
-                        ],
+                        "required": ["code", "name", "city"],
                         "properties": {
                           "code": {
                             "description": "Airport code, e.g., 'JFK'",
@@ -974,12 +916,7 @@
                 },
                 "action": {
                   "type": "string",
-                  "enum": [
-                    "send",
-                    "get_message",
-                    "get_summary",
-                    "clear"
-                  ],
+                  "enum": ["send", "get_message", "get_summary", "clear"],
                   "description": "Action to perform (default: send)",
                   "default": "send"
                 },
@@ -989,19 +926,13 @@
                 },
                 "mode": {
                   "type": "string",
-                  "enum": [
-                    "steer",
-                    "follow_up"
-                  ],
+                  "enum": ["steer", "follow_up"],
                   "description": "Delivery mode for send: steer (immediate) or follow_up (after task)",
                   "default": "steer"
                 },
                 "wait_until": {
                   "type": "string",
-                  "enum": [
-                    "turn_end",
-                    "message_processed"
-                  ],
+                  "enum": ["turn_end", "message_processed"],
                   "description": "Wait behavior for send action"
                 }
               }
@@ -1036,9 +967,7 @@
             "description": "Enable per-session control socket under ~/.pi/session-control"
           }
         ],
-        "messageRenderers": [
-          "session-message"
-        ],
+        "messageRenderers": ["session-message"],
         "providers": [],
         "flagValues": {}
       }
@@ -1059,9 +988,7 @@
       "id": "community/mitsuhiko-files",
       "entry_path": "community/mitsuhiko-files/files.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/mitsuhiko-files/files.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/mitsuhiko-files/files.ts: Failed to load extension: Export named 'DynamicBorder' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -1110,9 +1037,7 @@
       "id": "community/mitsuhiko-review",
       "entry_path": "community/mitsuhiko-review/review.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/mitsuhiko-review/review.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/mitsuhiko-review/review.ts: Failed to load extension: Export named 'DynamicBorder' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -1155,9 +1080,7 @@
             "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
             "parameters": {
               "type": "object",
-              "required": [
-                "command"
-              ],
+              "required": ["command"],
               "properties": {
                 "command": {
                   "description": "Bash command to execute",
@@ -1222,10 +1145,7 @@
       "id": "community/nicobailon-interview-tool",
       "entry_path": "community/nicobailon-interview-tool/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec",
-        "ui"
-      ],
+      "mock_requirements": ["exec", "ui"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/nicobailon-interview-tool/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/nicobailon-interview-tool/index.ts: Failed to load extension: ENOENT: no such file or directory, open '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/nicobailon-interview-tool/form/index.html'",
@@ -1237,9 +1157,7 @@
       "id": "community/nicobailon-mcp-adapter",
       "entry_path": "community/nicobailon-mcp-adapter/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/nicobailon-mcp-adapter/index.ts",
       "load_success": true,
       "error": null,
@@ -1329,9 +1247,7 @@
       "id": "community/nicobailon-powerline-footer",
       "entry_path": "community/nicobailon-powerline-footer/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/nicobailon-powerline-footer/index.ts",
       "load_success": true,
       "error": null,
@@ -1376,9 +1292,7 @@
       "id": "community/nicobailon-rewind-hook",
       "entry_path": "community/nicobailon-rewind-hook/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/nicobailon-rewind-hook/index.ts",
       "load_success": true,
       "error": null,
@@ -1408,9 +1322,7 @@
       "id": "community/nicobailon-subagents",
       "entry_path": "community/nicobailon-subagents/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/nicobailon-subagents/index.ts",
       "load_success": true,
       "error": null,
@@ -1447,10 +1359,7 @@
                   "type": "array",
                   "items": {
                     "type": "object",
-                    "required": [
-                      "agent",
-                      "task"
-                    ],
+                    "required": ["agent", "task"],
                     "properties": {
                       "agent": {
                         "type": "string"
@@ -1561,9 +1470,7 @@
       "id": "community/ogulcancelik-ghostty-theme-sync",
       "entry_path": "community/ogulcancelik-ghostty-theme-sync/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/ogulcancelik-ghostty-theme-sync/index.ts",
       "load_success": true,
       "error": null,
@@ -1588,9 +1495,7 @@
       "id": "community/prateekmedia-checkpoint",
       "entry_path": "community/prateekmedia-checkpoint/checkpoint.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/prateekmedia-checkpoint/checkpoint.ts",
       "load_success": true,
       "error": null,
@@ -1620,9 +1525,7 @@
       "id": "community/prateekmedia-lsp",
       "entry_path": "community/prateekmedia-lsp/lsp-tool.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/prateekmedia-lsp/lsp-tool.ts",
       "load_success": true,
       "error": null,
@@ -1639,9 +1542,7 @@
             "description": "Query language server for definitions, references, types, symbols, diagnostics, rename, and code actions.\n\nActions: definition, references, hover, signature, rename (require file + line/column or query), symbols (file, optional query), diagnostics (file), workspace-diagnostics (files array), codeAction (file + position).\nUse bash to find files: find src -name \"*.ts\" -type f",
             "parameters": {
               "type": "object",
-              "required": [
-                "action"
-              ],
+              "required": ["action"],
               "properties": {
                 "action": {
                   "type": "string",
@@ -1694,13 +1595,7 @@
                 },
                 "severity": {
                   "type": "string",
-                  "enum": [
-                    "all",
-                    "error",
-                    "warning",
-                    "info",
-                    "hint"
-                  ],
+                  "enum": ["all", "error", "warning", "info", "hint"],
                   "description": "Filter diagnostics: \"all\"|\"error\"|\"warning\"|\"info\"|\"hint\""
                 }
               }
@@ -1720,9 +1615,7 @@
       "id": "community/prateekmedia-permission",
       "entry_path": "community/prateekmedia-permission/permission.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/prateekmedia-permission/permission.ts",
       "load_success": true,
       "error": null,
@@ -1761,9 +1654,7 @@
       "id": "community/prateekmedia-ralph-loop",
       "entry_path": "community/prateekmedia-ralph-loop/ralph-loop.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/prateekmedia-ralph-loop/ralph-loop.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/prateekmedia-ralph-loop/ralph-loop.ts: Failed to load extension: Export named 'AssistantMessageComponent' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -1775,9 +1666,7 @@
       "id": "community/prateekmedia-repeat",
       "entry_path": "community/prateekmedia-repeat/repeat.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/prateekmedia-repeat/repeat.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/prateekmedia-repeat/repeat.ts: Failed to load extension: Export named 'DynamicBorder' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -1863,9 +1752,7 @@
       "id": "community/qualisero-pi-agent-scip",
       "entry_path": "community/qualisero-pi-agent-scip/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/qualisero-pi-agent-scip/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/qualisero-pi-agent-scip/index.ts: Failed to load extension: ResolveMessage: Cannot find module './dist/extension.js' from '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/qualisero-pi-agent-scip/index.ts'",
@@ -2235,9 +2122,7 @@
       "id": "community/tmustier-code-actions",
       "entry_path": "community/tmustier-code-actions/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/tmustier-code-actions/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/tmustier-code-actions/index.ts: Failed to load extension: Export named 'DynamicBorder' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -2249,9 +2134,7 @@
       "id": "community/tmustier-files-widget",
       "entry_path": "community/tmustier-files-widget/index.ts",
       "source_tier": "community",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/tmustier-files-widget/index.ts",
       "load_success": true,
       "error": null,
@@ -2319,10 +2202,7 @@
             "description": "Start a long-running development loop. Use for complex multi-iteration tasks.",
             "parameters": {
               "type": "object",
-              "required": [
-                "name",
-                "taskContent"
-              ],
+              "required": ["name", "taskContent"],
               "properties": {
                 "name": {
                   "description": "Loop name (e.g., 'refactor-auth')",
@@ -2612,9 +2492,7 @@
       "id": "dirty-repo-guard",
       "entry_path": "dirty-repo-guard/dirty-repo-guard.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/dirty-repo-guard/dirty-repo-guard.ts",
       "load_success": true,
       "error": null,
@@ -2640,9 +2518,7 @@
       "id": "doom-overlay",
       "entry_path": "doom-overlay/index.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/doom-overlay/index.ts",
       "load_success": true,
       "error": null,
@@ -2754,9 +2630,7 @@
       "id": "git-checkpoint",
       "entry_path": "git-checkpoint/git-checkpoint.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/git-checkpoint/git-checkpoint.ts",
       "load_success": true,
       "error": null,
@@ -2813,9 +2687,7 @@
             "description": "A simple greeting tool",
             "parameters": {
               "type": "object",
-              "required": [
-                "name"
-              ],
+              "required": ["name"],
               "properties": {
                 "name": {
                   "description": "Name to greet",
@@ -2838,9 +2710,7 @@
       "id": "inline-bash",
       "entry_path": "inline-bash/inline-bash.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/inline-bash/inline-bash.ts",
       "load_success": true,
       "error": null,
@@ -2890,9 +2760,7 @@
       "id": "interactive-shell",
       "entry_path": "interactive-shell/interactive-shell.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/interactive-shell/interactive-shell.ts",
       "load_success": true,
       "error": null,
@@ -2917,9 +2785,7 @@
       "id": "mac-system-theme",
       "entry_path": "mac-system-theme/mac-system-theme.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/mac-system-theme/mac-system-theme.ts",
       "load_success": true,
       "error": null,
@@ -2966,9 +2832,7 @@
         ],
         "shortcuts": [],
         "flags": [],
-        "messageRenderers": [
-          "status-update"
-        ],
+        "messageRenderers": ["status-update"],
         "providers": [],
         "flagValues": {}
       }
@@ -3051,9 +2915,7 @@
       "id": "npm/aliou-pi-guardrails",
       "entry_path": "npm/aliou-pi-guardrails/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/aliou-pi-guardrails/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/aliou-pi-guardrails/index.ts: Failed to load extension: Export named 'getAgentDir' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -3090,9 +2952,7 @@
       "id": "npm/aliou-pi-processes",
       "entry_path": "npm/aliou-pi-processes/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/aliou-pi-processes/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/aliou-pi-processes/index.ts: Failed to load extension: ResolveMessage: Cannot find module '../components/processes-component' from '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/aliou-pi-processes/commands/index.ts'",
@@ -3170,9 +3030,7 @@
             "description": "Generate an image via Google Antigravity's Gemini 3 Pro Image model. Returns the image as a tool result attachment for inline terminal rendering. Optional saving via save=project|global|custom|none, or PI_IMAGE_SAVE_MODE/PI_IMAGE_SAVE_DIR.",
             "parameters": {
               "type": "object",
-              "required": [
-                "prompt"
-              ],
+              "required": ["prompt"],
               "properties": {
                 "prompt": {
                   "description": "Image description.",
@@ -3180,27 +3038,11 @@
                 },
                 "aspectRatio": {
                   "type": "string",
-                  "enum": [
-                    "1:1",
-                    "2:3",
-                    "3:2",
-                    "3:4",
-                    "4:3",
-                    "4:5",
-                    "5:4",
-                    "9:16",
-                    "16:9",
-                    "21:9"
-                  ]
+                  "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
                 },
                 "save": {
                   "type": "string",
-                  "enum": [
-                    "none",
-                    "project",
-                    "global",
-                    "custom"
-                  ]
+                  "enum": ["none", "project", "global", "custom"]
                 },
                 "saveDir": {
                   "description": "Directory to save image when save=custom. Defaults to PI_IMAGE_SAVE_DIR if set.",
@@ -3284,9 +3126,7 @@
       "id": "npm/checkpoint-pi",
       "entry_path": "npm/checkpoint-pi/checkpoint.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/checkpoint-pi/checkpoint.ts",
       "load_success": true,
       "error": null,
@@ -3335,9 +3175,7 @@
             "description": "Search the web for information based on a query. Returns search results and related search suggestions.\n\nUsage:\n- web_search({ query: \"TypeScript best practices 2025\" })\n- web_search({ query: \"How to configure pi coding agent\" })\n\nExample:\nQuery: \"React server components tutorial\"\nReturns: List of relevant web pages with titles, URLs, snippets, and date\n\nTips:\n- Use 3-5 keywords for better results\n- Add current year for time-sensitive queries (e.g., \"React 19 features 2025\")\n- Be specific: \"TypeScript 5.4 generics\" instead of \"TypeScript help\"",
             "parameters": {
               "type": "object",
-              "required": [
-                "query"
-              ],
+              "required": ["query"],
               "properties": {
                 "query": {
                   "description": "Search query string. Use 3-5 keywords. Add current year for time-sensitive queries.",
@@ -3355,10 +3193,7 @@
             "description": "Analyze and understand image content using AI.\n\nUsage:\n- understand_image({ \n    prompt: \"What is in this image?\",\n    image_url: \"https://example.com/screenshot.png\"\n  })\n- understand_image({ \n    prompt: \"Extract text from this image (OCR)\",\n    image_url: \"/path/to/local/image.jpg\"\n  })\n\nImage sources:\n- HTTP/HTTPS URLs: \"https://example.com/image.jpg\"\n- Local file paths: \"/Users/username/Documents/image.jpg\" or \"images/photo.png\"\n- Removes @ prefix if present in file paths\n\nSupported formats: JPEG, PNG, WebP (max size varies)\n\nExamples:\n- Analyze screenshots, diagrams, or photos\n- Extract text from images (OCR)\n- Describe visual content\n- Identify UI components or code in screenshots",
             "parameters": {
               "type": "object",
-              "required": [
-                "prompt",
-                "image_url"
-              ],
+              "required": ["prompt", "image_url"],
               "properties": {
                 "prompt": {
                   "description": "Question or analysis request for the image",
@@ -3438,9 +3273,7 @@
       "id": "npm/lsp-pi",
       "entry_path": "npm/lsp-pi/lsp.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/lsp-pi/lsp.ts",
       "load_success": true,
       "error": null,
@@ -3471,9 +3304,7 @@
         ],
         "shortcuts": [],
         "flags": [],
-        "messageRenderers": [
-          "lsp-diagnostics"
-        ],
+        "messageRenderers": ["lsp-diagnostics"],
         "providers": [],
         "flagValues": {}
       }
@@ -3482,9 +3313,7 @@
       "id": "npm/marckrenn-pi-sub-bar",
       "entry_path": "npm/marckrenn-pi-sub-bar/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/marckrenn-pi-sub-bar/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/marckrenn-pi-sub-bar/index.ts: Failed to load extension: Export named 'getAgentDir' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -3496,9 +3325,7 @@
       "id": "npm/marckrenn-pi-sub-core",
       "entry_path": "npm/marckrenn-pi-sub-core/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/marckrenn-pi-sub-core/index.ts",
       "load_success": false,
       "error": "timeout after 15000ms",
@@ -3510,9 +3337,7 @@
       "id": "npm/ogulcancelik-pi-sketch",
       "entry_path": "npm/ogulcancelik-pi-sketch/extensions/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/ogulcancelik-pi-sketch/extensions/index.ts",
       "load_success": true,
       "error": null,
@@ -3542,9 +3367,7 @@
       "id": "npm/permission-pi",
       "entry_path": "npm/permission-pi/permission.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/permission-pi/permission.ts",
       "load_success": true,
       "error": null,
@@ -3748,9 +3571,7 @@
       "id": "npm/pi-ephemeral",
       "entry_path": "npm/pi-ephemeral/extensions/ephemeral-mode.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-ephemeral/extensions/ephemeral-mode.ts",
       "load_success": true,
       "error": null,
@@ -3790,9 +3611,7 @@
       "id": "npm/pi-ghostty-theme-sync",
       "entry_path": "npm/pi-ghostty-theme-sync/extensions/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-ghostty-theme-sync/extensions/index.ts",
       "load_success": true,
       "error": null,
@@ -3817,9 +3636,7 @@
       "id": "npm/pi-md-export",
       "entry_path": "npm/pi-md-export/extensions/md.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-md-export/extensions/md.ts",
       "load_success": true,
       "error": null,
@@ -3861,9 +3678,7 @@
       "id": "npm/pi-messenger",
       "entry_path": "npm/pi-messenger/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-messenger/index.ts",
       "load_success": true,
       "error": null,
@@ -3956,10 +3771,7 @@
                 },
                 "type": {
                   "type": "string",
-                  "enum": [
-                    "plan",
-                    "impl"
-                  ],
+                  "enum": ["plan", "impl"],
                   "description": "Review type (inferred from target if omitted)"
                 },
                 "autonomous": {
@@ -4052,11 +3864,7 @@
                 },
                 "autoRegisterPath": {
                   "type": "string",
-                  "enum": [
-                    "add",
-                    "remove",
-                    "list"
-                  ],
+                  "enum": ["add", "remove", "list"],
                   "description": "Manage auto-register paths: add/remove current folder, or list all"
                 },
                 "list": {
@@ -4078,9 +3886,7 @@
         ],
         "shortcuts": [],
         "flags": [],
-        "messageRenderers": [
-          "agent_message"
-        ],
+        "messageRenderers": ["agent_message"],
         "providers": [],
         "flagValues": {}
       }
@@ -4106,9 +3912,7 @@
             "description": "List, search, or switch models. Supports aliases defined in aliases.json (e.g. 'cheap', 'coding'). Use when the user asks to change models or when you need a model with different capabilities (reasoning, vision, cost, context window).",
             "parameters": {
               "type": "object",
-              "required": [
-                "action"
-              ],
+              "required": ["action"],
               "properties": {
                 "action": {
                   "description": "Action to perform: 'list' (show all models), 'search' (filter by query), or 'switch' (change model)",
@@ -4196,9 +4000,7 @@
       "id": "npm/pi-multicodex",
       "entry_path": "npm/pi-multicodex/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-multicodex/index.ts",
       "load_success": true,
       "error": null,
@@ -4269,9 +4071,7 @@
       "id": "npm/pi-notify",
       "entry_path": "npm/pi-notify/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-notify/index.ts",
       "load_success": true,
       "error": null,
@@ -4296,9 +4096,7 @@
       "id": "npm/pi-poly-notify",
       "entry_path": "npm/pi-poly-notify/extensions/poly-notify/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-poly-notify/extensions/poly-notify/index.ts",
       "load_success": true,
       "error": null,
@@ -4356,9 +4154,7 @@
         "commands": [],
         "shortcuts": [],
         "flags": [],
-        "messageRenderers": [
-          "skill-loaded"
-        ],
+        "messageRenderers": ["skill-loaded"],
         "providers": [],
         "flagValues": {}
       }
@@ -4367,9 +4163,7 @@
       "id": "npm/pi-repoprompt-mcp",
       "entry_path": "npm/pi-repoprompt-mcp/extensions/repoprompt-mcp/src/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-repoprompt-mcp/extensions/repoprompt-mcp/src/index.ts",
       "load_success": false,
       "error": "timeout after 15000ms",
@@ -4393,9 +4187,7 @@
       "id": "npm/pi-screenshots-picker",
       "entry_path": "npm/pi-screenshots-picker/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-screenshots-picker/index.ts",
       "load_success": true,
       "error": null,
@@ -4444,9 +4236,7 @@
       "id": "npm/pi-search-agent",
       "entry_path": "npm/pi-search-agent/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-search-agent/index.ts",
       "load_success": false,
       "error": "timeout after 15000ms",
@@ -4470,9 +4260,7 @@
       "id": "npm/pi-shadow-git",
       "entry_path": "npm/pi-shadow-git/extensions/shadow-git.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-shadow-git/extensions/shadow-git.ts",
       "load_success": true,
       "error": null,
@@ -4529,9 +4317,7 @@
       "id": "npm/pi-shell-completions",
       "entry_path": "npm/pi-shell-completions/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-shell-completions/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-shell-completions/index.ts: Failed to load extension: Export named 'CustomEditor' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -4566,9 +4352,7 @@
         ],
         "shortcuts": [],
         "flags": [],
-        "messageRenderers": [
-          "skill-context"
-        ],
+        "messageRenderers": ["skill-context"],
         "providers": [],
         "flagValues": {}
       }
@@ -4604,9 +4388,7 @@
       "id": "npm/pi-super-curl",
       "entry_path": "npm/pi-super-curl/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-super-curl/index.ts",
       "load_success": true,
       "error": null,
@@ -4651,10 +4433,7 @@
       "id": "npm/pi-telemetry-otel",
       "entry_path": "npm/pi-telemetry-otel/extensions/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec",
-        "session"
-      ],
+      "mock_requirements": ["exec", "session"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-telemetry-otel/extensions/index.ts",
       "load_success": true,
       "error": null,
@@ -4731,11 +4510,7 @@
                 },
                 "sort": {
                   "type": "string",
-                  "enum": [
-                    "recent",
-                    "oldest",
-                    "relevance"
-                  ],
+                  "enum": ["recent", "oldest", "relevance"],
                   "description": "Sort order: recent (default), oldest, or relevance (by match count)",
                   "default": "recent"
                 }
@@ -4749,9 +4524,7 @@
             "description": "Read a specific conversation thread by ID or file path. Returns the full conversation history with user messages, assistant responses, and optionally tool results.",
             "parameters": {
               "type": "object",
-              "required": [
-                "thread_id"
-              ],
+              "required": ["thread_id"],
               "properties": {
                 "thread_id": {
                   "description": "Thread ID (session UUID) or file path",
@@ -4816,9 +4589,7 @@
       "id": "npm/pi-wakatime",
       "entry_path": "npm/pi-wakatime/src/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-wakatime/src/index.ts",
       "load_success": true,
       "error": null,
@@ -4881,9 +4652,7 @@
       "id": "npm/pi-web-access",
       "entry_path": "npm/pi-web-access/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/pi-web-access/index.ts",
       "load_success": true,
       "error": null,
@@ -4928,12 +4697,7 @@
                 },
                 "recencyFilter": {
                   "type": "string",
-                  "enum": [
-                    "day",
-                    "week",
-                    "month",
-                    "year"
-                  ],
+                  "enum": ["day", "week", "month", "year"],
                   "description": "Filter by recency"
                 },
                 "domainFilter": {
@@ -4945,11 +4709,7 @@
                 },
                 "provider": {
                   "type": "string",
-                  "enum": [
-                    "auto",
-                    "perplexity",
-                    "gemini"
-                  ],
+                  "enum": ["auto", "perplexity", "gemini"],
                   "description": "Search provider (default: auto)"
                 }
               }
@@ -5006,9 +4766,7 @@
             "description": "Retrieve full content from a previous web_search or fetch_content call.",
             "parameters": {
               "type": "object",
-              "required": [
-                "responseId"
-              ],
+              "required": ["responseId"],
               "properties": {
                 "responseId": {
                   "description": "The responseId from web_search or fetch_content",
@@ -5060,9 +4818,7 @@
       "id": "npm/ralph-loop-pi",
       "entry_path": "npm/ralph-loop-pi/ralph-loop.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/ralph-loop-pi/ralph-loop.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/ralph-loop-pi/ralph-loop.ts: Failed to load extension: Export named 'AssistantMessageComponent' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -5074,9 +4830,7 @@
       "id": "npm/repeat-pi",
       "entry_path": "npm/repeat-pi/repeat.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/repeat-pi/repeat.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/repeat-pi/repeat.ts: Failed to load extension: Export named 'DynamicBorder' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -5117,9 +4871,7 @@
       "id": "npm/vaayne-agent-kit",
       "entry_path": "npm/vaayne-agent-kit/extensions/mcp/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/vaayne-agent-kit/extensions/mcp/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/vaayne-agent-kit/extensions/mcp/index.ts: Failed to load extension: Export named 'VERSION' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -5131,9 +4883,7 @@
       "id": "npm/vaayne-pi-mcp",
       "entry_path": "npm/vaayne-pi-mcp/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/vaayne-pi-mcp/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/vaayne-pi-mcp/index.ts: Failed to load extension: Export named 'VERSION' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -5145,9 +4895,7 @@
       "id": "npm/vaayne-pi-subagent",
       "entry_path": "npm/vaayne-pi-subagent/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/vaayne-pi-subagent/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/vaayne-pi-subagent/index.ts: Failed to load extension: Export named 'parseFrontmatter' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -5171,9 +4919,7 @@
       "id": "npm/vpellegrino-pi-skills",
       "entry_path": "npm/vpellegrino-pi-skills/pi-extensions/bash-compat.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/vpellegrino-pi-skills/pi-extensions/bash-compat.ts",
       "load_success": true,
       "error": null,
@@ -5190,9 +4936,7 @@
             "description": "Execute shell commands without streaming callbacks.",
             "parameters": {
               "type": "object",
-              "required": [
-                "command"
-              ],
+              "required": ["command"],
               "properties": {
                 "command": {
                   "description": "Shell command to execute.",
@@ -5227,9 +4971,7 @@
       "id": "npm/walterra-pi-charts",
       "entry_path": "npm/walterra-pi-charts/extensions/vega-chart/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/walterra-pi-charts/extensions/vega-chart/index.ts",
       "load_success": true,
       "error": null,
@@ -5246,9 +4988,7 @@
             "description": "Render a Vega-Lite specification as a PNG image.\n\nDependencies are auto-installed via uv (Python package manager):\n- uv itself is auto-installed if missing\n- Python 3, altair, pandas, vl-convert-python are managed by uv\nIf setup fails, the tool returns installation instructions - do NOT fall back to ASCII charts.\n\nIMPORTANT: Before using this tool, read the complete reference documentation at:\n/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/walterra-pi-charts/extensions/vega-chart/vega-lite-reference.md\n\nThe reference contains critical information about:\n- Data types (N, O, Q, T) and encoding channels\n- All mark types and their properties\n- Common pitfalls (dot-notation fields, label truncation, facet issues)\n- Professional chart patterns with complete working examples\n- Theming and best practices\n\nPass a complete Vega-Lite JSON spec. The agent has full control over:\n- Mark types: bar, line, point, area, rect, arc, rule, text, boxplot, etc.\n- Encodings: x, y, color, size, shape, opacity, row, column, etc.\n- Scales: linear, log, sqrt, pow, time, utc, ordinal, band, point\n- Aggregations: count, sum, mean, median, min, max, distinct, etc.\n- Transforms: filter, calculate, aggregate, fold, pivot, window, etc.\n- Composition: layer, hconcat, vconcat, facet, repeat\n\nData can be inline in the spec (values) or passed separately as TSV.\n\nExample spec structure:\n{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": { \"values\": [...] },\n  \"mark\": \"bar\",\n  \"encoding\": {\n    \"x\": { \"field\": \"category\", \"type\": \"nominal\" },\n    \"y\": { \"field\": \"value\", \"type\": \"quantitative\" }\n  }\n}\n\nReference: https://vega.github.io/vega-lite/docs/",
             "parameters": {
               "type": "object",
-              "required": [
-                "spec"
-              ],
+              "required": ["spec"],
               "properties": {
                 "spec": {
                   "description": "Vega-Lite JSON specification (complete spec with $schema, data, mark, encoding)",
@@ -5287,9 +5027,7 @@
       "id": "npm/walterra-pi-graphviz",
       "entry_path": "npm/walterra-pi-graphviz/extensions/graphviz-chart/index.ts",
       "source_tier": "npm-registry",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/walterra-pi-graphviz/extensions/graphviz-chart/index.ts",
       "load_success": true,
       "error": null,
@@ -5306,9 +5044,7 @@
             "description": "Render a Graphviz DOT specification as a PNG image.\n\nGraphviz will be auto-installed if not present (via brew on macOS, apt/dnf on Linux).\nIf auto-install fails, the tool returns installation instructions - do NOT fall back to ASCII art.\n\nIMPORTANT: Before using this tool, read the complete reference documentation at:\n/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/walterra-pi-graphviz/extensions/graphviz-chart/graphviz-reference.md\n\nThe reference contains critical information about:\n- DOT language syntax for graphs, nodes, and edges\n- All node shapes (box, cylinder, diamond, ellipse, etc.)\n- Edge styles and arrow types\n- Clusters and subgraphs\n- Layout engines (dot, neato, fdp, circo, twopi)\n- Professional theming (light/dark themes, SaaS aesthetics)\n- Common patterns (flowcharts, architecture diagrams, state machines)\n\nPass a complete DOT graph definition. Supports:\n- Graph types: graph (undirected), digraph (directed), strict\n- Node shapes: box, ellipse, circle, diamond, cylinder, record, etc.\n- Edge styles: solid, dashed, dotted, bold\n- Arrows: normal, dot, diamond, box, vee, none, etc.\n- Clusters: subgraph cluster_name { ... }\n- Attributes: color, fillcolor, style, label, fontname, etc.\n- Layout engines: dot (default), neato, fdp, circo, twopi\n\nExample DOT syntax:\n```\ndigraph G {\n    rankdir=LR;\n    node [shape=box style=\"rounded,filled\" fillcolor=lightblue];\n    \n    A [label=\"Start\"];\n    B [label=\"Process\"];\n    C [label=\"End\" fillcolor=lightgreen];\n    \n    A -> B [label=\"step 1\"];\n    B -> C [label=\"step 2\"];\n}\n```\n\nReference: https://graphviz.org/doc/info/lang.html",
             "parameters": {
               "type": "object",
-              "required": [
-                "dot"
-              ],
+              "required": ["dot"],
               "properties": {
                 "dot": {
                   "description": "Graphviz DOT specification (complete graph definition)",
@@ -5416,9 +5152,7 @@
       "id": "overlay-qa-tests",
       "entry_path": "overlay-qa-tests/overlay-qa-tests.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/overlay-qa-tests/overlay-qa-tests.ts",
       "load_success": true,
       "error": null,
@@ -5713,10 +5447,7 @@
             "description": "Ask the user a question and let them pick from options. Use when you need user input to proceed.",
             "parameters": {
               "type": "object",
-              "required": [
-                "question",
-                "options"
-              ],
+              "required": ["question", "options"],
               "properties": {
                 "question": {
                   "description": "The question to ask the user",
@@ -5727,9 +5458,7 @@
                   "type": "array",
                   "items": {
                     "type": "object",
-                    "required": [
-                      "label"
-                    ],
+                    "required": ["label"],
                     "properties": {
                       "label": {
                         "description": "Display label for the option",
@@ -5776,20 +5505,14 @@
             "description": "Ask the user one or more questions. Use for clarifying requirements, getting preferences, or confirming decisions. For single questions, shows a simple option list. For multiple questions, shows a tab-based interface.",
             "parameters": {
               "type": "object",
-              "required": [
-                "questions"
-              ],
+              "required": ["questions"],
               "properties": {
                 "questions": {
                   "description": "Questions to ask the user",
                   "type": "array",
                   "items": {
                     "type": "object",
-                    "required": [
-                      "id",
-                      "prompt",
-                      "options"
-                    ],
+                    "required": ["id", "prompt", "options"],
                     "properties": {
                       "id": {
                         "description": "Unique identifier for this question",
@@ -5808,10 +5531,7 @@
                         "type": "array",
                         "items": {
                           "type": "object",
-                          "required": [
-                            "value",
-                            "label"
-                          ],
+                          "required": ["value", "label"],
                           "properties": {
                             "value": {
                               "description": "The value returned when selected",
@@ -5913,9 +5633,7 @@
       "id": "sandbox",
       "entry_path": "sandbox/index.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/sandbox/index.ts",
       "load_success": true,
       "error": null,
@@ -5936,9 +5654,7 @@
             "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
             "parameters": {
               "type": "object",
-              "required": [
-                "command"
-              ],
+              "required": ["command"],
               "properties": {
                 "command": {
                   "description": "Bash command to execute",
@@ -6059,9 +5775,7 @@
       "id": "shutdown-command",
       "entry_path": "shutdown-command/shutdown-command.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/shutdown-command/shutdown-command.ts",
       "load_success": true,
       "error": null,
@@ -6088,9 +5802,7 @@
             "description": "Deploy the application and exit pi",
             "parameters": {
               "type": "object",
-              "required": [
-                "environment"
-              ],
+              "required": ["environment"],
               "properties": {
                 "environment": {
                   "description": "Target environment (e.g., production, staging)",
@@ -6180,9 +5892,7 @@
       "id": "ssh",
       "entry_path": "ssh/ssh.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/ssh/ssh.ts",
       "load_success": true,
       "error": null,
@@ -6203,9 +5913,7 @@
             "description": "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.",
             "parameters": {
               "type": "object",
-              "required": [
-                "path"
-              ],
+              "required": ["path"],
               "properties": {
                 "path": {
                   "description": "Path to the file to read (relative or absolute)",
@@ -6229,10 +5937,7 @@
             "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
             "parameters": {
               "type": "object",
-              "required": [
-                "path",
-                "content"
-              ],
+              "required": ["path", "content"],
               "properties": {
                 "path": {
                   "description": "Path to the file to write (relative or absolute)",
@@ -6252,11 +5957,7 @@
             "description": "Edit a file by replacing exact text. The oldText must match exactly (including whitespace). Use this for precise, surgical edits.",
             "parameters": {
               "type": "object",
-              "required": [
-                "path",
-                "oldText",
-                "newText"
-              ],
+              "required": ["path", "oldText", "newText"],
               "properties": {
                 "path": {
                   "description": "Path to the file to edit (relative or absolute)",
@@ -6280,9 +5981,7 @@
             "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
             "parameters": {
               "type": "object",
-              "required": [
-                "command"
-              ],
+              "required": ["command"],
               "properties": {
                 "command": {
                   "description": "Bash command to execute",
@@ -6344,9 +6043,7 @@
       "id": "subagent",
       "entry_path": "subagent/index.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/subagent/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/subagent/index.ts: Failed to load extension: Export named 'parseFrontmatter' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -6396,9 +6093,7 @@
       "id": "third-party/aliou-pi-extensions",
       "entry_path": "third-party/aliou-pi-extensions/defaults/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/aliou-pi-extensions/defaults/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/aliou-pi-extensions/defaults/index.ts: Failed to load extension: Export named 'DynamicBorder' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -6435,9 +6130,7 @@
       "id": "third-party/charles-cooper-pi-extensions",
       "entry_path": "third-party/charles-cooper-pi-extensions/per-model-system-prompt.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/charles-cooper-pi-extensions/per-model-system-prompt.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/charles-cooper-pi-extensions/per-model-system-prompt.ts: Failed to load extension: Export named 'getAgentDir' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -6449,9 +6142,7 @@
       "id": "third-party/cv-pi-ssh-remote",
       "entry_path": "third-party/cv-pi-ssh-remote/src/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/cv-pi-ssh-remote/src/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/cv-pi-ssh-remote/src/index.ts: Failed to load extension: Export named 'formatSize' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -6463,9 +6154,7 @@
       "id": "third-party/graffioh-pi-screenshots-picker",
       "entry_path": "third-party/graffioh-pi-screenshots-picker/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/graffioh-pi-screenshots-picker/index.ts",
       "load_success": true,
       "error": null,
@@ -6514,9 +6203,7 @@
       "id": "third-party/graffioh-pi-super-curl",
       "entry_path": "third-party/graffioh-pi-super-curl/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/graffioh-pi-super-curl/index.ts",
       "load_success": true,
       "error": null,
@@ -6590,12 +6277,7 @@
                   "type": "array",
                   "items": {
                     "type": "object",
-                    "required": [
-                      "id",
-                      "title",
-                      "startTime",
-                      "endTime"
-                    ],
+                    "required": ["id", "title", "startTime", "endTime"],
                     "properties": {
                       "id": {
                         "type": "string"
@@ -6613,14 +6295,7 @@
                       },
                       "color": {
                         "type": "string",
-                        "enum": [
-                          "blue",
-                          "green",
-                          "yellow",
-                          "red",
-                          "magenta",
-                          "cyan"
-                        ]
+                        "enum": ["blue", "green", "yellow", "red", "magenta", "cyan"]
                       }
                     }
                   }
@@ -6639,9 +6314,7 @@
             "description": "Display a document in an interactive TUI viewer. Users can navigate and select text.\n\nUse this to:\n- Show text/markdown content for review\n- Let users select portions of text\n- Display logs, code, or any text content\n\nThe document opens inline in pi's TUI. User navigates with arrow keys, uses 'v' to start selection, and Enter to confirm.",
             "parameters": {
               "type": "object",
-              "required": [
-                "content"
-              ],
+              "required": ["content"],
               "properties": {
                 "content": {
                   "description": "Document content to display",
@@ -6661,9 +6334,7 @@
             "description": "Display flight search results in an interactive TUI. Users can browse and select flights.\n\nUse this to:\n- Show flight options for a route\n- Let users compare and select flights\n- Display pricing, times, and stops\n\nThe flight list opens inline in pi's TUI. User navigates with arrow keys and presses Enter to select a flight.",
             "parameters": {
               "type": "object",
-              "required": [
-                "flights"
-              ],
+              "required": ["flights"],
               "properties": {
                 "title": {
                   "description": "Title for the flight search",
@@ -6701,11 +6372,7 @@
                       },
                       "origin": {
                         "type": "object",
-                        "required": [
-                          "code",
-                          "name",
-                          "city"
-                        ],
+                        "required": ["code", "name", "city"],
                         "properties": {
                           "code": {
                             "description": "Airport code, e.g., 'SFO'",
@@ -6723,11 +6390,7 @@
                       },
                       "destination": {
                         "type": "object",
-                        "required": [
-                          "code",
-                          "name",
-                          "city"
-                        ],
+                        "required": ["code", "name", "city"],
                         "properties": {
                           "code": {
                             "description": "Airport code, e.g., 'JFK'",
@@ -6798,9 +6461,7 @@
       "id": "third-party/kcosr-pi-extensions",
       "entry_path": "third-party/kcosr-pi-extensions/apply-patch-tool/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/kcosr-pi-extensions/apply-patch-tool/index.ts",
       "load_success": true,
       "error": null,
@@ -6820,9 +6481,7 @@
             "description": "Apply a patch to files using the Codex apply_patch format.",
             "parameters": {
               "type": "object",
-              "required": [
-                "input"
-              ],
+              "required": ["input"],
               "properties": {
                 "input": {
                   "description": "Patch text starting with *** Begin Patch and ending with *** End Patch.",
@@ -6845,9 +6504,7 @@
       "id": "third-party/limouren-agent-things",
       "entry_path": "third-party/limouren-agent-things/sandbox/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/limouren-agent-things/sandbox/index.ts",
       "load_success": true,
       "error": null,
@@ -6868,9 +6525,7 @@
             "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
             "parameters": {
               "type": "object",
-              "required": [
-                "command"
-              ],
+              "required": ["command"],
               "properties": {
                 "command": {
                   "description": "Bash command to execute",
@@ -6913,9 +6568,7 @@
       "id": "third-party/lsj5031-pi-notification-extension",
       "entry_path": "third-party/lsj5031-pi-notification-extension/notification.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/lsj5031-pi-notification-extension/notification.ts",
       "load_success": true,
       "error": null,
@@ -6948,9 +6601,7 @@
       "id": "third-party/marckrenn-pi-sub",
       "entry_path": "third-party/marckrenn-pi-sub/sub-bar/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/marckrenn-pi-sub/sub-bar/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/marckrenn-pi-sub/sub-bar/index.ts: Failed to load extension: Export named 'getAgentDir' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -6987,9 +6638,7 @@
       "id": "third-party/ogulcancelik-pi-sketch",
       "entry_path": "third-party/ogulcancelik-pi-sketch/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/ogulcancelik-pi-sketch/index.ts",
       "load_success": true,
       "error": null,
@@ -7019,9 +6668,7 @@
       "id": "third-party/openclaw-openclaw",
       "entry_path": "third-party/openclaw-openclaw/extensions/diff.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/openclaw-openclaw/extensions/diff.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/openclaw-openclaw/extensions/diff.ts: Failed to load extension: Export named 'DynamicBorder' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -7045,9 +6692,7 @@
       "id": "third-party/qualisero-pi-agent-scip",
       "entry_path": "third-party/qualisero-pi-agent-scip/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/qualisero-pi-agent-scip/index.ts",
       "load_success": true,
       "error": null,
@@ -7067,9 +6712,7 @@
             "description": "Locate the definition of a symbol using SCIP indexes. Output is truncated to 2000 lines or 50.0KB (whichever is hit first).",
             "parameters": {
               "type": "object",
-              "required": [
-                "symbol"
-              ],
+              "required": ["symbol"],
               "properties": {
                 "symbol": {
                   "description": "Symbol to find (class, function, variable)",
@@ -7089,9 +6732,7 @@
             "description": "Find all references to a symbol across the project. Output is truncated to 2000 lines or 50.0KB (whichever is hit first).",
             "parameters": {
               "type": "object",
-              "required": [
-                "symbol"
-              ],
+              "required": ["symbol"],
               "properties": {
                 "symbol": {
                   "description": "Symbol name to search for",
@@ -7114,9 +6755,7 @@
             "description": "List all symbols defined in a single file. Output is truncated to 2000 lines or 50.0KB (whichever is hit first).",
             "parameters": {
               "type": "object",
-              "required": [
-                "file"
-              ],
+              "required": ["file"],
               "properties": {
                 "file": {
                   "description": "Relative file path within the project",
@@ -7132,9 +6771,7 @@
             "description": "Search for symbols by (partial) name across the project. Output is truncated to 2000 lines or 50.0KB (whichever is hit first).",
             "parameters": {
               "type": "object",
-              "required": [
-                "query"
-              ],
+              "required": ["query"],
               "properties": {
                 "query": {
                   "description": "Substring to match against symbol names",
@@ -7192,9 +6829,7 @@
       "id": "third-party/raunovillberg-pi-stuffed",
       "entry_path": "third-party/raunovillberg-pi-stuffed/extensions/reddit.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/raunovillberg-pi-stuffed/extensions/reddit.ts",
       "load_success": true,
       "error": null,
@@ -7224,9 +6859,7 @@
       "id": "third-party/rytswd-direnv",
       "entry_path": "third-party/rytswd-direnv/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/rytswd-direnv/index.ts",
       "load_success": true,
       "error": null,
@@ -7269,20 +6902,14 @@
             "description": "Ask the user one or more questions. Use for clarifying requirements, getting preferences, or confirming decisions. For single questions, shows a simple option list. For multiple questions, shows a tab-based interface.",
             "parameters": {
               "type": "object",
-              "required": [
-                "questions"
-              ],
+              "required": ["questions"],
               "properties": {
                 "questions": {
                   "description": "Questions to ask the user",
                   "type": "array",
                   "items": {
                     "type": "object",
-                    "required": [
-                      "id",
-                      "prompt",
-                      "options"
-                    ],
+                    "required": ["id", "prompt", "options"],
                     "properties": {
                       "id": {
                         "description": "Unique identifier for this question",
@@ -7301,10 +6928,7 @@
                         "type": "array",
                         "items": {
                           "type": "object",
-                          "required": [
-                            "value",
-                            "label"
-                          ],
+                          "required": ["value", "label"],
                           "properties": {
                             "value": {
                               "description": "The value returned when selected",
@@ -7345,9 +6969,7 @@
       "id": "third-party/rytswd-slow-mode",
       "entry_path": "third-party/rytswd-slow-mode/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/rytswd-slow-mode/index.ts",
       "load_success": true,
       "error": null,
@@ -7379,10 +7001,7 @@
       "id": "third-party/vtemian-pi-config",
       "entry_path": "third-party/vtemian-pi-config/tools/subagent/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec",
-        "ui"
-      ],
+      "mock_requirements": ["exec", "ui"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/vtemian-pi-config/tools/subagent/index.ts",
       "load_success": true,
       "error": null,
@@ -7405,9 +7024,7 @@
       "id": "third-party/w-winter-dot314",
       "entry_path": "third-party/w-winter-dot314/agentic-compaction/index.ts",
       "source_tier": "third-party-github",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/w-winter-dot314/agentic-compaction/index.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/third-party/w-winter-dot314/agentic-compaction/index.ts: Failed to load extension: Export named 'convertToLlm' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -7579,18 +7196,11 @@
             "description": "Manage a todo list. Actions: list, add (text), toggle (id), clear",
             "parameters": {
               "type": "object",
-              "required": [
-                "action"
-              ],
+              "required": ["action"],
               "properties": {
                 "action": {
                   "type": "string",
-                  "enum": [
-                    "list",
-                    "add",
-                    "toggle",
-                    "clear"
-                  ]
+                  "enum": ["list", "add", "toggle", "clear"]
                 },
                 "text": {
                   "description": "Todo text (for add)",
@@ -7641,9 +7251,7 @@
             "description": "Read the contents of a file with access logging. Some sensitive paths (.env, secrets, credentials) are blocked.",
             "parameters": {
               "type": "object",
-              "required": [
-                "path"
-              ],
+              "required": ["path"],
               "properties": {
                 "path": {
                   "description": "Path to the file to read (relative or absolute)",
@@ -7725,9 +7333,7 @@
       "id": "truncated-tool",
       "entry_path": "truncated-tool/truncated-tool.ts",
       "source_tier": "official-pi-mono",
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": ["exec"],
       "abs_path": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/truncated-tool/truncated-tool.ts",
       "load_success": false,
       "error": "/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/truncated-tool/truncated-tool.ts: Failed to load extension: Export named 'formatSize' not found in module '/data/projects/pi_agent_rust/legacy_pi_mono_code/pi-mono/node_modules/@mariozechner/pi-coding-agent/dist/index.js'.",
@@ -7782,9 +7388,7 @@
             "description": "Parse a human-readable duration string (e.g., '2 days', '1h', '5m') to milliseconds",
             "parameters": {
               "type": "object",
-              "required": [
-                "duration"
-              ],
+              "required": ["duration"],
               "properties": {
                 "duration": {
                   "description": "Duration string like '2 days', '1h', '5m'",

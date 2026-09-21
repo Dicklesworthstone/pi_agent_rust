@@ -50,158 +50,58 @@
         "writer_recovery_remaining": 0
       },
       "enabled": true,
-      "max_queue_depths": [
-        0,
-        0,
-        0,
-        0
-      ],
+      "max_queue_depths": [0, 0, 0, 0],
       "migration_event_total": 0,
       "migration_events": {},
-      "queue_depths_final": [
-        0,
-        0,
-        0,
-        0
-      ],
+      "queue_depths_final": [0, 0, 0, 0],
       "queue_samples": [
         {
-          "max_queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
-          "queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
+          "max_queue_depths": [0, 0, 0, 0],
+          "queue_depths": [0, 0, 0, 0],
           "rejected_enqueues": 0,
           "t_s": 0,
           "total_dispatched": 0,
-          "total_enqueued_by_shard": [
-            0,
-            0,
-            0,
-            0
-          ]
+          "total_enqueued_by_shard": [0, 0, 0, 0]
         },
         {
-          "max_queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
-          "queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
+          "max_queue_depths": [0, 0, 0, 0],
+          "queue_depths": [0, 0, 0, 0],
           "rejected_enqueues": 0,
           "t_s": 5,
           "total_dispatched": 0,
-          "total_enqueued_by_shard": [
-            0,
-            0,
-            0,
-            0
-          ]
+          "total_enqueued_by_shard": [0, 0, 0, 0]
         },
         {
-          "max_queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
-          "queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
+          "max_queue_depths": [0, 0, 0, 0],
+          "queue_depths": [0, 0, 0, 0],
           "rejected_enqueues": 0,
           "t_s": 10,
           "total_dispatched": 0,
-          "total_enqueued_by_shard": [
-            0,
-            0,
-            0,
-            0
-          ]
+          "total_enqueued_by_shard": [0, 0, 0, 0]
         },
         {
-          "max_queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
-          "queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
+          "max_queue_depths": [0, 0, 0, 0],
+          "queue_depths": [0, 0, 0, 0],
           "rejected_enqueues": 0,
           "t_s": 15,
           "total_dispatched": 0,
-          "total_enqueued_by_shard": [
-            0,
-            0,
-            0,
-            0
-          ]
+          "total_enqueued_by_shard": [0, 0, 0, 0]
         },
         {
-          "max_queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
-          "queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
+          "max_queue_depths": [0, 0, 0, 0],
+          "queue_depths": [0, 0, 0, 0],
           "rejected_enqueues": 0,
           "t_s": 20,
           "total_dispatched": 0,
-          "total_enqueued_by_shard": [
-            0,
-            0,
-            0,
-            0
-          ]
+          "total_enqueued_by_shard": [0, 0, 0, 0]
         },
         {
-          "max_queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
-          "queue_depths": [
-            0,
-            0,
-            0,
-            0
-          ],
+          "max_queue_depths": [0, 0, 0, 0],
+          "queue_depths": [0, 0, 0, 0],
           "rejected_enqueues": 0,
           "t_s": 25,
           "total_dispatched": 0,
-          "total_enqueued_by_shard": [
-            0,
-            0,
-            0,
-            0
-          ]
+          "total_enqueued_by_shard": [0, 0, 0, 0]
         }
       ],
       "rejected_enqueues": 0,
@@ -215,12 +115,7 @@
       "shard_count": 4,
       "stall_reasons": {},
       "total_dispatched": 0,
-      "total_enqueued_by_shard": [
-        0,
-        0,
-        0,
-        0
-      ]
+      "total_enqueued_by_shard": [0, 0, 0, 0]
     },
     "rss": {
       "growth_pct": 0.0025331030512377663,

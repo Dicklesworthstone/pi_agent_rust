@@ -14,9 +14,7 @@
     "decision": "NO_DECISION",
     "mode": "fail_closed",
     "ready_for_phase5": false,
-    "blocking_reasons": [
-      "phase1_matrix_not_ready_for_phase5"
-    ]
+    "blocking_reasons": ["phase1_matrix_not_ready_for_phase5"]
   },
   "ranked_opportunities": []
 }

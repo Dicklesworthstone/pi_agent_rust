@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Validates event hook registration for tool_call",
       "expect": {
-        "event_hooks_contains": [
-          "tool_call"
-        ]
+        "event_hooks_contains": ["tool_call"]
       }
     },
     {

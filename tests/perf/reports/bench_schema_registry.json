@@ -38,10 +38,7 @@
       "maximum": "actual <= threshold",
       "minimum": "actual >= threshold"
     },
-    "comparison_values": [
-      "maximum",
-      "minimum"
-    ],
+    "comparison_values": ["maximum", "minimum"],
     "inventory_digest": {
       "algorithm": "sha256",
       "budget_order": "producer_declaration_order",
@@ -101,46 +98,27 @@
   ],
   "protocol_contract": {
     "evidence_labels": {
-      "confidence": [
-        "high",
-        "medium",
-        "low"
-      ],
-      "evidence_class": [
-        "measured",
-        "inferred"
-      ]
+      "confidence": ["high", "medium", "low"],
+      "evidence_class": ["measured", "inferred"]
     },
     "matched_state_scenarios": [
       {
         "replay_input": {
-          "extension_fixture_set": [
-            "hello",
-            "pirate",
-            "diff"
-          ],
+          "extension_fixture_set": ["hello", "pirate", "diff"],
           "runs": 5
         },
         "scenario": "cold_start"
       },
       {
         "replay_input": {
-          "extension_fixture_set": [
-            "hello",
-            "pirate",
-            "diff"
-          ],
+          "extension_fixture_set": ["hello", "pirate", "diff"],
           "runs": 5
         },
         "scenario": "warm_start"
       },
       {
         "replay_input": {
-          "extension_fixture_set": [
-            "hello",
-            "pirate",
-            "diff"
-          ],
+          "extension_fixture_set": ["hello", "pirate", "diff"],
           "iterations": 500
         },
         "scenario": "tool_call"
@@ -155,10 +133,7 @@
     ],
     "partition_interpretation": {
       "forbid_single_partition_conclusion": true,
-      "global_claim_requires_partitions": [
-        "matched-state",
-        "realistic"
-      ],
+      "global_claim_requires_partitions": ["matched-state", "realistic"],
       "interpretation_notes": {
         "matched-state": "Use matched-state for controlled equivalence and attribution; do not generalize alone.",
         "realistic": "Use realistic workloads as primary user-impact evidence and release-facing performance narrative."
@@ -166,10 +141,7 @@
       "primary_partition": "realistic",
       "secondary_partition": "matched-state"
     },
-    "partition_tags": [
-      "matched-state",
-      "realistic"
-    ],
+    "partition_tags": ["matched-state", "realistic"],
     "partition_weighting": {
       "matched-state": 0.3,
       "realistic": 0.7,
@@ -213,10 +185,7 @@
       "required_scenario": "tool_call_roundtrip",
       "required_schema": "pi.perf.workload.v1",
       "required_tool": "pijs_workload",
-      "required_tool_calls_per_iteration": [
-        1,
-        10
-      ],
+      "required_tool_calls_per_iteration": [1, 10],
       "scope": "pi.perf.workload.v1/pijs_workload"
     },
     "realistic_replay_inputs": [
@@ -271,13 +240,7 @@
         "session_messages": 5000000
       }
     ],
-    "realistic_session_sizes": [
-      100000,
-      200000,
-      500000,
-      1000000,
-      5000000
-    ],
+    "realistic_session_sizes": [100000, 200000, 500000, 1000000, 5000000],
     "regression_gate_admission": {
       "allowed_disk_cache_policies": [
         "disabled",
@@ -297,10 +260,7 @@
         "synthetic_seed_generation",
         "synthetic_seed_projection"
       ],
-      "allowed_measurement_methods": [
-        "wall_clock_observation",
-        "synthetic_seed_projection"
-      ],
+      "allowed_measurement_methods": ["wall_clock_observation", "synthetic_seed_projection"],
       "eligible_confidence": "high",
       "eligible_evidence_class": "measured",
       "eligible_measurement_boundaries": [
@@ -308,15 +268,8 @@
         "production_extension_runtime"
       ],
       "eligible_measurement_method": "wall_clock_observation",
-      "load_scenario_required_fields": [
-        "disk_cache_policy",
-        "host_page_cache_policy"
-      ],
-      "positive_sample_count_fields": [
-        "runs",
-        "iterations",
-        "total_calls"
-      ],
+      "load_scenario_required_fields": ["disk_cache_policy", "host_page_cache_policy"],
+      "positive_sample_count_fields": ["runs", "iterations", "total_calls"],
       "require_positive_sample_count": true,
       "required_eligible_host_page_cache_policy": "not_applicable_measured_region",
       "required_eligible_provenance_fields": [
@@ -359,10 +312,7 @@
     "scenario_sli_matrix": [
       {
         "partition": "matched-state",
-        "phase_validation_beads": [
-          "bd-3ar8v.1.5",
-          "bd-3ar8v.2.11"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.1.5", "bd-3ar8v.2.11"],
         "scenario_id": "cold_start",
         "sli_ids": [
           "interactive_turn_p95_ms",
@@ -373,23 +323,14 @@
       },
       {
         "partition": "matched-state",
-        "phase_validation_beads": [
-          "bd-3ar8v.1.5",
-          "bd-3ar8v.2.11"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.1.5", "bd-3ar8v.2.11"],
         "scenario_id": "warm_start",
-        "sli_ids": [
-          "interactive_turn_p95_ms",
-          "tail_stability_p99_over_p50_ratio"
-        ],
+        "sli_ids": ["interactive_turn_p95_ms", "tail_stability_p99_over_p50_ratio"],
         "ux_outcome": "Steady-state turn latency remains consistently snappy."
       },
       {
         "partition": "matched-state",
-        "phase_validation_beads": [
-          "bd-3ar8v.2.11",
-          "bd-3ar8v.6.7"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.2.11", "bd-3ar8v.6.7"],
         "scenario_id": "tool_call",
         "sli_ids": [
           "tool_roundtrip_p95_ms",
@@ -400,23 +341,14 @@
       },
       {
         "partition": "matched-state",
-        "phase_validation_beads": [
-          "bd-3ar8v.3.11",
-          "bd-3ar8v.6.7"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.3.11", "bd-3ar8v.6.7"],
         "scenario_id": "event_dispatch",
-        "sli_ids": [
-          "extension_dispatch_p95_ms",
-          "tail_stability_p99_over_p50_ratio"
-        ],
+        "sli_ids": ["extension_dispatch_p95_ms", "tail_stability_p99_over_p50_ratio"],
         "ux_outcome": "Extension events execute without perceptible stalls."
       },
       {
         "partition": "realistic",
-        "phase_validation_beads": [
-          "bd-3ar8v.3.11",
-          "bd-3ar8v.6.7"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.3.11", "bd-3ar8v.6.7"],
         "scenario_id": "realistic/session_100000",
         "sli_ids": [
           "interactive_turn_p95_ms",
@@ -427,10 +359,7 @@
       },
       {
         "partition": "realistic",
-        "phase_validation_beads": [
-          "bd-3ar8v.3.11",
-          "bd-3ar8v.6.7"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.3.11", "bd-3ar8v.6.7"],
         "scenario_id": "realistic/session_200000",
         "sli_ids": [
           "interactive_turn_p95_ms",
@@ -441,10 +370,7 @@
       },
       {
         "partition": "realistic",
-        "phase_validation_beads": [
-          "bd-3ar8v.3.11",
-          "bd-3ar8v.6.7"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.3.11", "bd-3ar8v.6.7"],
         "scenario_id": "realistic/session_500000",
         "sli_ids": [
           "interactive_turn_p95_ms",
@@ -455,10 +381,7 @@
       },
       {
         "partition": "realistic",
-        "phase_validation_beads": [
-          "bd-3ar8v.3.11",
-          "bd-3ar8v.6.7"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.3.11", "bd-3ar8v.6.7"],
         "scenario_id": "realistic/session_1000000",
         "sli_ids": [
           "interactive_turn_p95_ms",
@@ -469,10 +392,7 @@
       },
       {
         "partition": "realistic",
-        "phase_validation_beads": [
-          "bd-3ar8v.3.11",
-          "bd-3ar8v.6.7"
-        ],
+        "phase_validation_beads": ["bd-3ar8v.3.11", "bd-3ar8v.6.7"],
         "scenario_id": "realistic/session_5000000",
         "sli_ids": [
           "interactive_turn_p95_ms",
@@ -489,35 +409,11 @@
         "rch_required": "./scripts/perf/orchestrate.sh --require-rch --profile full"
       },
       "fail_closed_on_missing_measurements": true,
-      "required_component_breakdown_keys": [
-        "tool",
-        "provider",
-        "extension",
-        "session"
-      ],
-      "required_latency_quantiles": [
-        "p50",
-        "p95",
-        "p99",
-        "p999"
-      ],
-      "required_queue_depth_quantiles": [
-        "p50",
-        "p95",
-        "p99",
-        "p999",
-        "max"
-      ],
-      "required_resource_usage_keys": [
-        "rss_mb",
-        "cpu_pct"
-      ],
-      "required_stage_breakdown_keys": [
-        "open",
-        "append",
-        "save",
-        "index"
-      ],
+      "required_component_breakdown_keys": ["tool", "provider", "extension", "session"],
+      "required_latency_quantiles": ["p50", "p95", "p99", "p999"],
+      "required_queue_depth_quantiles": ["p50", "p95", "p99", "p999", "max"],
+      "required_resource_usage_keys": ["rss_mb", "cpu_pct"],
+      "required_stage_breakdown_keys": ["open", "append", "save", "index"],
       "target_cpu_cores": 64
     },
     "user_perceived_sli_catalog": [

@@ -98,25 +98,15 @@
             "redaction": {
               "state": "sensitive_omitted",
               "summary": "database path retained; no message bodies or registration tokens emitted",
-              "redacted_fields": [
-                "message_bodies",
-                "registration_tokens"
-              ],
-              "secret_classes_removed": [
-                "registration_token"
-              ],
+              "redacted_fields": ["message_bodies", "registration_tokens"],
+              "secret_classes_removed": ["registration_token"],
               "raw_secret_bytes_emitted": 0
             },
             "uncertainty": {
               "state": "unavailable_source",
               "reason": "agent_mail_schema_missing",
               "confidence": 1.0,
-              "missing_inputs": [
-                "projects",
-                "agents",
-                "messages",
-                "message_recipients"
-              ]
+              "missing_inputs": ["projects", "agents", "messages", "message_recipients"]
             },
             "payload": {
               "health_level": "red",
@@ -181,9 +171,7 @@
             "redaction": {
               "state": "redacted",
               "summary": "worker host identifiers omitted",
-              "redacted_fields": [
-                "worker_host"
-              ],
+              "redacted_fields": ["worker_host"],
               "secret_classes_removed": [],
               "raw_secret_bytes_emitted": 0
             },
@@ -219,9 +207,7 @@
             "redaction": {
               "state": "redacted",
               "summary": "absolute temp paths retained, host-specific detail summarized",
-              "redacted_fields": [
-                "hostname"
-              ],
+              "redacted_fields": ["hostname"],
               "secret_classes_removed": [],
               "raw_secret_bytes_emitted": 0
             },
@@ -239,12 +225,7 @@
         ],
         "ordering": {
           "logical_clock_monotonic": true,
-          "tie_breakers": [
-            "occurred_at",
-            "source_id",
-            "source_sequence",
-            "event_id"
-          ]
+          "tie_breakers": ["occurred_at", "source_id", "source_sequence", "event_id"]
         },
         "redaction_summary": {
           "redacted_count": 3,
@@ -265,11 +246,7 @@
       },
       "expected": {
         "trace_status": "degraded_not_blocked",
-        "usable_sources": [
-          "beads_jsonl",
-          "rch_queue_status",
-          "doctor_swarm_diagnostics"
-        ],
+        "usable_sources": ["beads_jsonl", "rch_queue_status", "doctor_swarm_diagnostics"],
         "required_event_kinds": [
           "source_unavailable",
           "bead_lifecycle",
@@ -331,9 +308,7 @@
             "redaction": {
               "state": "redacted",
               "summary": "raw malformed payload omitted",
-              "redacted_fields": [
-                "raw_payload"
-              ],
+              "redacted_fields": ["raw_payload"],
               "secret_classes_removed": [],
               "raw_secret_bytes_emitted": 0
             },
@@ -341,29 +316,17 @@
               "state": "malformed_source",
               "reason": "missing_required_rch_fields",
               "confidence": 1.0,
-              "missing_inputs": [
-                "queue_depth",
-                "workers"
-              ]
+              "missing_inputs": ["queue_depth", "workers"]
             },
             "payload": {
               "source_id": "rch_queue_status",
-              "suppressed_claims": [
-                "queue_depth",
-                "worker_availability",
-                "cargo_admission"
-              ]
+              "suppressed_claims": ["queue_depth", "worker_availability", "cargo_admission"]
             }
           }
         ],
         "ordering": {
           "logical_clock_monotonic": true,
-          "tie_breakers": [
-            "occurred_at",
-            "source_id",
-            "source_sequence",
-            "event_id"
-          ]
+          "tie_breakers": ["occurred_at", "source_id", "source_sequence", "event_id"]
         },
         "redaction_summary": {
           "redacted_count": 1,
@@ -384,14 +347,8 @@
       },
       "expected": {
         "trace_status": "degraded_fail_closed",
-        "required_event_kinds": [
-          "source_malformed"
-        ],
-        "suppressed_claims": [
-          "queue_depth",
-          "worker_availability",
-          "cargo_admission"
-        ],
+        "required_event_kinds": ["source_malformed"],
+        "suppressed_claims": ["queue_depth", "worker_availability", "cargo_admission"],
         "silently_dropped_events_allowed": false
       }
     }

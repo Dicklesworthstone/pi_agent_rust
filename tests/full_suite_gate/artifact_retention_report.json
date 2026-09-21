@@ -1,35 +1,22 @@
 {
   "artifact_categories": [
     {
-      "includes": [
-        "ext_conformance/**",
-        "e2e_results/**",
-        "quarantine_*"
-      ],
+      "includes": ["ext_conformance/**", "e2e_results/**", "quarantine_*"],
       "name": "conformance-reports",
       "retention_days": 30
     },
     {
-      "includes": [
-        "full_suite_gate/**",
-        "cross_platform_reports/**"
-      ],
+      "includes": ["full_suite_gate/**", "cross_platform_reports/**"],
       "name": "provider-test-artifacts",
       "retention_days": 30
     },
     {
-      "includes": [
-        "e2e_results/ci-shards/<shard>/"
-      ],
+      "includes": ["e2e_results/ci-shards/<shard>/"],
       "name": "ci-shard-*",
       "retention_days": 30
     },
     {
-      "includes": [
-        "llvm-cov-summary.txt",
-        "lcov.info",
-        "llvm-cov/html"
-      ],
+      "includes": ["llvm-cov-summary.txt", "lcov.info", "llvm-cov/html"],
       "name": "coverage",
       "retention_days": 90
     }

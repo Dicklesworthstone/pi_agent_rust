@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies repeat command registered for prateekmedia-repeat",
       "expect": {
-        "commands_contains": [
-          "repeat"
-        ]
+        "commands_contains": ["repeat"]
       }
     },
     {

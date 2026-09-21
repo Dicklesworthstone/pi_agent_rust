@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies picman command registered for tmustier-arcade-picman",
       "expect": {
-        "commands_contains": [
-          "picman"
-        ]
+        "commands_contains": ["picman"]
       }
     },
     {

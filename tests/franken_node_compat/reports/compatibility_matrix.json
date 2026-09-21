@@ -135,9 +135,7 @@
             "error": "FRANKEN_NODE_RUNTIME is not set",
             "node_divergences": []
           },
-          "divergences": [
-            "stack_has_function_names: node=true, bun=false"
-          ]
+          "divergences": ["stack_has_function_names: node=true, bun=false"]
         }
       ]
     }

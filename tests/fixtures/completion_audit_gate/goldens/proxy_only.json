@@ -4,9 +4,7 @@
       "id": "REQ-002",
       "issue": "only proxy evidence matched this requirement",
       "kind": "proxy_only_evidence",
-      "refs": [
-        "command[0]:python3 --version"
-      ],
+      "refs": ["command[0]:python3 --version"],
       "remediation": "Replace proxy-only evidence with direct command, artifact, git, or Beads evidence.",
       "requirement_kind": "command",
       "status": "proxy_only"

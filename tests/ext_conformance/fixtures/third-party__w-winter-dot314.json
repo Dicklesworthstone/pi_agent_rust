@@ -12,16 +12,8 @@
       "summary": "Verifies 9 tool(s), ask command, event hooks registered for w-winter-dot314",
       "expect": {
         "tool_count": 9,
-        "commands_contains": [
-          "ask",
-          "askwith",
-          "branch"
-        ],
-        "event_hooks_contains": [
-          "agent_end",
-          "agent_start",
-          "before_agent_start"
-        ]
+        "commands_contains": ["ask", "askwith", "branch"],
+        "event_hooks_contains": ["agent_end", "agent_start", "before_agent_start"]
       }
     },
     {

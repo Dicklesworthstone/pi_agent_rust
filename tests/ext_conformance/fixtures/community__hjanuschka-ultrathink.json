@@ -10,7 +10,13 @@
       "summary": "Verifies ultrathink command and event handlers are registered",
       "expect": {
         "commands_contains": ["ultrathink"],
-        "event_hooks_contains": ["agent_start", "before_agent_start", "session_shutdown", "session_start", "session_switch"]
+        "event_hooks_contains": [
+          "agent_start",
+          "before_agent_start",
+          "session_shutdown",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {

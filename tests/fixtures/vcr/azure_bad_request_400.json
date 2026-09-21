@@ -15,9 +15,7 @@
       },
       "response": {
         "status": 400,
-        "headers": [
-          ["Content-Type", "application/json"]
-        ],
+        "headers": [["Content-Type", "application/json"]],
         "body_chunks": [
           "{\"error\":{\"code\":\"BadRequest\",\"message\":\"Invalid request: the 'messages' field is required and must contain at least one message.\"}}"
         ]

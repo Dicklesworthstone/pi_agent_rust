@@ -243,11 +243,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "-1 HelloWorld",
-          "+1 Hello",
-          "+2 World"
-        ]
+        "details_contains": ["-1 HelloWorld", "+1 Hello", "+2 World"]
       }
     },
     {
@@ -267,9 +263,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "diff"
-        ]
+        "details_contains": ["diff"]
       }
     },
     {
@@ -334,12 +328,8 @@
         "newText": "modified"
       },
       "expected": {
-        "content_contains": [
-          "Successfully replaced text in a/b/c/deep.txt"
-        ],
-        "details_contains": [
-          "diff"
-        ]
+        "content_contains": ["Successfully replaced text in a/b/c/deep.txt"],
+        "details_contains": ["diff"]
       }
     },
     {
@@ -359,9 +349,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "+1   modified  "
-        ]
+        "details_contains": ["+1   modified  "]
       }
     },
     {
@@ -423,9 +411,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "diff"
-        ]
+        "details_contains": ["diff"]
       }
     },
     {
@@ -445,9 +431,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "diff"
-        ]
+        "details_contains": ["diff"]
       }
     },
     {
@@ -467,9 +451,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "diff"
-        ]
+        "details_contains": ["diff"]
       }
     },
     {
@@ -514,10 +496,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "-1 Hello World",
-          "+1 Hello Rust"
-        ]
+        "details_contains": ["-1 Hello World", "+1 Hello Rust"]
       }
     },
     {
@@ -537,9 +516,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "diff"
-        ]
+        "details_contains": ["diff"]
       }
     },
     {
@@ -559,9 +536,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "diff"
-        ]
+        "details_contains": ["diff"]
       }
     },
     {
@@ -581,9 +556,7 @@
       },
       "expected": {
         "content_exact": "Successfully replaced text in test.txt.",
-        "details_contains": [
-          "diff"
-        ]
+        "details_contains": ["diff"]
       }
     },
     {

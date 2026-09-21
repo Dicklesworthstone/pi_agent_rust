@@ -93,20 +93,14 @@
           "beta": "partial",
           "gamma": "partial"
         },
-        "conflict_types": [
-          "provider_budget_exhausted"
-        ],
+        "conflict_types": ["provider_budget_exhausted"],
         "summary": {
           "expired_lease_count": 0
         },
         "allocation_checks": [
           {
             "difference_at_most": {
-              "agents": [
-                "alpha",
-                "beta",
-                "gamma"
-              ],
+              "agents": ["alpha", "beta", "gamma"],
               "resource": "provider_tokens",
               "value": 1
             }
@@ -159,9 +153,7 @@
           "compile": "reject",
           "review": "reject"
         },
-        "conflict_types": [
-          "over_commit_rejected"
-        ],
+        "conflict_types": ["over_commit_rejected"],
         "summary": {
           "conflict_count": 1
         }
@@ -249,9 +241,7 @@
           "senior": "partial",
           "junior": "partial"
         },
-        "conflict_types": [
-          "provider_budget_exhausted"
-        ],
+        "conflict_types": ["provider_budget_exhausted"],
         "allocation_checks": [
           {
             "greater_than": {
@@ -300,10 +290,7 @@
         "decisions": {
           "new-builder": "reject"
         },
-        "conflict_types": [
-          "over_commit_rejected",
-          "rch_saturation"
-        ],
+        "conflict_types": ["over_commit_rejected", "rch_saturation"],
         "summary": {
           "active_lease_count": 1
         }
@@ -336,10 +323,7 @@
         "decisions": {
           "provider-agent": "reject"
         },
-        "conflict_types": [
-          "over_commit_rejected",
-          "provider_budget_exhausted"
-        ],
+        "conflict_types": ["over_commit_rejected", "provider_budget_exhausted"],
         "summary": {
           "conflict_count": 2
         }

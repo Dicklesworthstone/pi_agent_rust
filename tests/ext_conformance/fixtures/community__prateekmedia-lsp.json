@@ -12,14 +12,8 @@
       "summary": "Verifies 1 tool(s), lsp command, event hooks registered for prateekmedia-lsp",
       "expect": {
         "tool_count": 1,
-        "commands_contains": [
-          "lsp"
-        ],
-        "event_hooks_contains": [
-          "agent_end",
-          "agent_start",
-          "session_shutdown"
-        ]
+        "commands_contains": ["lsp"],
+        "event_hooks_contains": ["agent_end", "agent_start", "session_shutdown"]
       }
     },
     {

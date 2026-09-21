@@ -22,9 +22,7 @@
           "json": {
             "schema": "pi.fixture.fresh.v1",
             "generated_at": "2026-05-16T07:00:00+00:00",
-            "source_paths": [
-              "docs/contracts/fresh-contract.json"
-            ],
+            "source_paths": ["docs/contracts/fresh-contract.json"],
             "status": "pass"
           }
         }
@@ -56,9 +54,7 @@
           "json": {
             "schema": "pi.fixture.expired.v1",
             "generated_at": "2026-05-10T00:00:00+00:00",
-            "source_paths": [
-              "docs/contracts/expired-contract.json"
-            ],
+            "source_paths": ["docs/contracts/expired-contract.json"],
             "status": "pass"
           }
         }
@@ -92,9 +88,7 @@
           "json": {
             "schema": "pi.fixture.missing_source.v1",
             "generated_at": "2026-05-16T07:00:00+00:00",
-            "source_paths": [
-              "docs/evidence/does-not-exist.json"
-            ],
+            "source_paths": ["docs/evidence/does-not-exist.json"],
             "status": "pass"
           }
         }
@@ -129,9 +123,7 @@
             "schema": "pi.fixture.changed_contract.v1",
             "contract_schema": "pi.fixture.contract.v1",
             "generated_at": "2026-05-16T07:00:00+00:00",
-            "source_paths": [
-              "docs/contracts/changed-contract.json"
-            ],
+            "source_paths": ["docs/contracts/changed-contract.json"],
             "status": "pass"
           }
         }
@@ -165,9 +157,7 @@
           "json": {
             "schema": "pi.fixture.rch.v1",
             "generated_at": "2026-05-16T07:00:00+00:00",
-            "source_paths": [
-              "docs/contracts/rch-contract.json"
-            ],
+            "source_paths": ["docs/contracts/rch-contract.json"],
             "rch_status": "blocked"
           }
         }
@@ -201,9 +191,7 @@
           "json": {
             "schema": "pi.fixture.safe_commands.v1",
             "generated_at": "2026-05-15T00:00:00+00:00",
-            "source_paths": [
-              "docs/contracts/safe-command-contract.json"
-            ],
+            "source_paths": ["docs/contracts/safe-command-contract.json"],
             "status": "pass"
           }
         }
@@ -221,10 +209,7 @@
       "generated_at": "2026-05-16T08:00:00+00:00",
       "freshness_hours": 24,
       "cache_budget_bytes": 80,
-      "cache_roots": [
-        "tests/perf/reports",
-        "tests/ext_conformance/reports"
-      ],
+      "cache_roots": ["tests/perf/reports", "tests/ext_conformance/reports"],
       "files": [
         {
           "path": "tests/perf/reports/old-large.json",

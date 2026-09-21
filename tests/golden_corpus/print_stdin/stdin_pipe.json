@@ -4,15 +4,19 @@
   "surface": "print_stdin",
   "description": "Print mode with stdin pipe: content piped to provider",
   "cli_args": [
-    "--provider", "anthropic",
-    "--model", "claude-sonnet-4-5",
+    "--provider",
+    "anthropic",
+    "--model",
+    "claude-sonnet-4-5",
     "--no-tools",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--thinking", "off",
-    "--system-prompt", "Echo test."
+    "--thinking",
+    "off",
+    "--system-prompt",
+    "Echo test."
   ],
   "stdin": "Hello from stdin pipe content.\n",
   "env_overrides": {},
@@ -35,7 +39,10 @@
           "body": {
             "model": "claude-sonnet-4-5",
             "messages": [
-              {"role": "user", "content": [{"type": "text", "text": "Hello from stdin pipe content."}]}
+              {
+                "role": "user",
+                "content": [{ "type": "text", "text": "Hello from stdin pipe content." }]
+              }
             ],
             "system": "Echo test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>",
             "max_tokens": 64000,
@@ -44,9 +51,7 @@
         },
         "response": {
           "status": 200,
-          "headers": [
-            ["Content-Type", "text/event-stream; charset=utf-8"]
-          ],
+          "headers": [["Content-Type", "text/event-stream; charset=utf-8"]],
           "body_chunks": [
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"id\":\"msg_golden_stdin_001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":15,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1,\"service_tier\":\"standard\"}}}\n\n",
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",

@@ -76,7 +76,11 @@
       "name": "tool_call",
       "events": [
         { "type": "message_start", "message": { "usage": { "input_tokens": 20 } } },
-        { "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "toolu_001", "name": "read_file" } },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": { "type": "tool_use", "id": "toolu_001", "name": "read_file" }
+        },
         {
           "type": "content_block_delta",
           "index": 0,
@@ -189,7 +193,11 @@
           "delta": { "type": "text_delta", "text": "Let me check." }
         },
         { "type": "content_block_stop", "index": 0 },
-        { "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "toolu_bash01", "name": "bash" } },
+        {
+          "type": "content_block_start",
+          "index": 1,
+          "content_block": { "type": "tool_use", "id": "toolu_bash01", "name": "bash" }
+        },
         {
           "type": "content_block_delta",
           "index": 1,

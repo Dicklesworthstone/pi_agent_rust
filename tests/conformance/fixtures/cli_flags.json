@@ -38,14 +38,7 @@
     {
       "name": "thinking_and_system",
       "input": {
-        "args": [
-          "--thinking",
-          "high",
-          "--system-prompt",
-          "SYS",
-          "--append-system-prompt",
-          "APP"
-        ]
+        "args": ["--thinking", "high", "--system-prompt", "SYS", "--append-system-prompt", "APP"]
       },
       "expected": {
         "details_exact": {

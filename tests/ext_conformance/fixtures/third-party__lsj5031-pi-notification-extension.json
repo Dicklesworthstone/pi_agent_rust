@@ -11,13 +11,8 @@
       "kind": "registration",
       "summary": "Verifies notify command, event hooks registered for lsj5031-pi-notification-extension",
       "expect": {
-        "commands_contains": [
-          "notify"
-        ],
-        "event_hooks_contains": [
-          "agent_end",
-          "session_start"
-        ]
+        "commands_contains": ["notify"],
+        "event_hooks_contains": ["agent_end", "session_start"]
       }
     },
     {

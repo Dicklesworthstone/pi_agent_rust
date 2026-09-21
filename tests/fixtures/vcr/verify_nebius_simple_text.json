@@ -7,25 +7,11 @@
       "request": {
         "method": "POST",
         "url": "https://api.tokenfactory.nebius.com/v1/chat/completions",
-        "headers": [
-          [
-            "Authorization",
-            "Bearer [REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
-        ]
+        "headers": [["Authorization", "Bearer [REDACTED]"], ["Content-Type", "application/json"]]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "text/event-stream"
-          ]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":1738875600,\"id\":\"chatcmpl-verify-001\",\"model\":\"NousResearch/hermes-4-70b\",\"object\":\"chat.completion.chunk\"}\n\n",
           "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from the verification harness.\"},\"finish_reason\":null,\"index\":0}],\"created\":1738875600,\"id\":\"chatcmpl-verify-001\",\"model\":\"NousResearch/hermes-4-70b\",\"object\":\"chat.completion.chunk\"}\n\n",

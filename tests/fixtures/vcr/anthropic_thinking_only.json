@@ -8,26 +8,11 @@
         "method": "POST",
         "url": "https://api.anthropic.com/v1/messages",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "X-API-Key",
-            "[REDACTED]"
-          ],
-          [
-            "anthropic-version",
-            "2023-06-01"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"],
+          ["X-API-Key", "[REDACTED]"],
+          ["anthropic-version", "2023-06-01"],
+          ["Content-Type", "application/json"]
         ],
         "body": {
           "max_tokens": 256,
@@ -60,62 +45,20 @@
       "response": {
         "status": 400,
         "headers": [
-          [
-            "Date",
-            "Thu, 05 Feb 2026 03:41:04 GMT"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Content-Length",
-            "332"
-          ],
-          [
-            "Connection",
-            "keep-alive"
-          ],
-          [
-            "x-should-retry",
-            "false"
-          ],
-          [
-            "request-id",
-            "req_011CXpEDwGBpmVEDaB7UvSnn"
-          ],
-          [
-            "strict-transport-security",
-            "max-age=31536000; includeSubDomains; preload"
-          ],
-          [
-            "anthropic-organization-id",
-            "2c19872b-debd-4294-9e6a-43d74c1afba3"
-          ],
-          [
-            "Server",
-            "cloudflare"
-          ],
-          [
-            "x-envoy-upstream-service-time",
-            "56"
-          ],
-          [
-            "cf-cache-status",
-            "DYNAMIC"
-          ],
-          [
-            "X-Robots-Tag",
-            "none"
-          ],
-          [
-            "Content-Security-Policy",
-            "default-src 'none'; frame-ancestors 'none'"
-          ],
-          [
-            "CF-RAY",
-            "9c8f63d37912dd94-STL"
-          ]
+          ["Date", "Thu, 05 Feb 2026 03:41:04 GMT"],
+          ["Content-Type", "application/json"],
+          ["Content-Length", "332"],
+          ["Connection", "keep-alive"],
+          ["x-should-retry", "false"],
+          ["request-id", "req_011CXpEDwGBpmVEDaB7UvSnn"],
+          ["strict-transport-security", "max-age=31536000; includeSubDomains; preload"],
+          ["anthropic-organization-id", "2c19872b-debd-4294-9e6a-43d74c1afba3"],
+          ["Server", "cloudflare"],
+          ["x-envoy-upstream-service-time", "56"],
+          ["cf-cache-status", "DYNAMIC"],
+          ["X-Robots-Tag", "none"],
+          ["Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'"],
+          ["CF-RAY", "9c8f63d37912dd94-STL"]
         ],
         "body_chunks": [
           "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"`temperature` may only be set to 1 when thinking is enabled. Please consult our documentation at https://docs.claude.com/en/docs/build-with-claude/extended-thinking#important-considerations-when-using-extended-thinking\"},\"request_id\":\"req_011CXpEDwGBpmVEDaB7UvSnn\"}"
@@ -127,26 +70,11 @@
         "method": "POST",
         "url": "https://api.anthropic.com/v1/messages",
         "headers": [
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ],
-          [
-            "X-API-Key",
-            "[REDACTED]"
-          ],
-          [
-            "anthropic-version",
-            "2023-06-01"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ]
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"],
+          ["X-API-Key", "[REDACTED]"],
+          ["anthropic-version", "2023-06-01"],
+          ["Content-Type", "application/json"]
         ],
         "body": {
           "max_tokens": 1280,
@@ -179,62 +107,20 @@
       "response": {
         "status": 200,
         "headers": [
-          [
-            "Date",
-            "Thu, 05 Feb 2026 03:45:20 GMT"
-          ],
-          [
-            "Content-Type",
-            "text/event-stream; charset=utf-8"
-          ],
-          [
-            "Transfer-Encoding",
-            "chunked"
-          ],
-          [
-            "Connection",
-            "keep-alive"
-          ],
-          [
-            "Cache-Control",
-            "no-cache"
-          ],
-          [
-            "request-id",
-            "req_011CXpEYoLijozXzEHLB1ebP"
-          ],
-          [
-            "strict-transport-security",
-            "max-age=31536000; includeSubDomains; preload"
-          ],
-          [
-            "anthropic-organization-id",
-            "2c19872b-debd-4294-9e6a-43d74c1afba3"
-          ],
-          [
-            "Server",
-            "cloudflare"
-          ],
-          [
-            "x-envoy-upstream-service-time",
-            "1082"
-          ],
-          [
-            "cf-cache-status",
-            "DYNAMIC"
-          ],
-          [
-            "X-Robots-Tag",
-            "none"
-          ],
-          [
-            "Content-Security-Policy",
-            "default-src 'none'; frame-ancestors 'none'"
-          ],
-          [
-            "CF-RAY",
-            "9c8f6a12df6a183c-STL"
-          ]
+          ["Date", "Thu, 05 Feb 2026 03:45:20 GMT"],
+          ["Content-Type", "text/event-stream; charset=utf-8"],
+          ["Transfer-Encoding", "chunked"],
+          ["Connection", "keep-alive"],
+          ["Cache-Control", "no-cache"],
+          ["request-id", "req_011CXpEYoLijozXzEHLB1ebP"],
+          ["strict-transport-security", "max-age=31536000; includeSubDomains; preload"],
+          ["anthropic-organization-id", "2c19872b-debd-4294-9e6a-43d74c1afba3"],
+          ["Server", "cloudflare"],
+          ["x-envoy-upstream-service-time", "1082"],
+          ["cf-cache-status", "DYNAMIC"],
+          ["X-Robots-Tag", "none"],
+          ["Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'"],
+          ["CF-RAY", "9c8f6a12df6a183c-STL"]
         ],
         "body_chunks": [
           "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-20250514\",\"id\":\"msg_015nCEsG2aXJyXbyPX4TWvPD\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":65,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0},\"output_tokens\":8,\"service_tier\":\"standard\"}}        }\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}           }\n\n",

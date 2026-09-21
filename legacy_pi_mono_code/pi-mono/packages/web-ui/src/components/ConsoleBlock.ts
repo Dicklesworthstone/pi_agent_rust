@@ -6,44 +6,44 @@ import { Check, Copy } from "lucide";
 import { i18n } from "../utils/i18n.js";
 
 export class ConsoleBlock extends LitElement {
-	@property() content: string = "";
-	@property() variant: "default" | "error" = "default";
-	@state() private copied = false;
+  @property() content: string = "";
+  @property() variant: "default" | "error" = "default";
+  @state() private copied = false;
 
-	protected override createRenderRoot(): HTMLElement | DocumentFragment {
-		return this;
-	}
+  protected override createRenderRoot(): HTMLElement | DocumentFragment {
+    return this;
+  }
 
-	override connectedCallback(): void {
-		super.connectedCallback();
-		this.style.display = "block";
-	}
+  override connectedCallback(): void {
+    super.connectedCallback();
+    this.style.display = "block";
+  }
 
-	private async copy() {
-		try {
-			await navigator.clipboard.writeText(this.content || "");
-			this.copied = true;
-			setTimeout(() => {
-				this.copied = false;
-			}, 1500);
-		} catch (e) {
-			console.error("Copy failed", e);
-		}
-	}
+  private async copy() {
+    try {
+      await navigator.clipboard.writeText(this.content || "");
+      this.copied = true;
+      setTimeout(() => {
+        this.copied = false;
+      }, 1500);
+    } catch (e) {
+      console.error("Copy failed", e);
+    }
+  }
 
-	override updated() {
-		// Auto-scroll to bottom on content changes
-		const container = this.querySelector(".console-scroll") as HTMLElement | null;
-		if (container) {
-			container.scrollTop = container.scrollHeight;
-		}
-	}
+  override updated() {
+    // Auto-scroll to bottom on content changes
+    const container = this.querySelector(".console-scroll") as HTMLElement | null;
+    if (container) {
+      container.scrollTop = container.scrollHeight;
+    }
+  }
 
-	override render() {
-		const isError = this.variant === "error";
-		const textClass = isError ? "text-destructive" : "text-foreground";
+  override render() {
+    const isError = this.variant === "error";
+    const textClass = isError ? "text-destructive" : "text-foreground";
 
-		return html`
+    return html`
 			<div class="border border-border rounded-lg overflow-hidden">
 				<div class="flex items-center justify-between px-3 py-1.5 bg-muted border-b border-border">
 					<span class="text-xs text-muted-foreground font-mono">${i18n("console")}</span>
@@ -63,10 +63,10 @@ ${this.content || ""}</pre
 				</div>
 			</div>
 		`;
-	}
+  }
 }
 
 // Register custom element
 if (!customElements.get("console-block")) {
-	customElements.define("console-block", ConsoleBlock);
+  customElements.define("console-block", ConsoleBlock);
 }

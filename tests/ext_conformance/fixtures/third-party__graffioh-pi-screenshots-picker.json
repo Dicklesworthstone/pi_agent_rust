@@ -11,13 +11,8 @@
       "kind": "registration",
       "summary": "Verifies ss command, event hooks registered for graffioh-pi-screenshots-picker",
       "expect": {
-        "commands_contains": [
-          "ss",
-          "ss-clear"
-        ],
-        "event_hooks_contains": [
-          "input"
-        ]
+        "commands_contains": ["ss", "ss-clear"],
+        "event_hooks_contains": ["input"]
       }
     },
     {

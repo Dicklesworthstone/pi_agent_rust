@@ -11,14 +11,8 @@
       "kind": "registration",
       "summary": "Verifies scurl command, event hooks registered for graffioh-pi-super-curl",
       "expect": {
-        "commands_contains": [
-          "scurl",
-          "scurl-history",
-          "scurl-log"
-        ],
-        "event_hooks_contains": [
-          "session_start"
-        ]
+        "commands_contains": ["scurl", "scurl-history", "scurl-log"],
+        "event_hooks_contains": ["session_start"]
       }
     },
     {

@@ -20,27 +20,20 @@
         },
         "provenance": {
           "status": "present",
-          "evidence_paths": [
-            "docs/evidence/extensions/startup-loop.json"
-          ],
+          "evidence_paths": ["docs/evidence/extensions/startup-loop.json"],
           "generated_at": "2026-05-16T00:00:00+00:00",
           "manifest_hash": "sha256:startup"
         },
         "policy": {
           "status": "present",
-          "allowed_permissions": [
-            "filesystem.read"
-          ],
+          "allowed_permissions": ["filesystem.read"],
           "quarantine_threshold": 3
         }
       },
       "expected": {
         "status": "quarantine_recommended",
         "decision": "quarantine",
-        "reason_codes": [
-          "startup_crash_loop",
-          "action_plan_projection"
-        ],
+        "reason_codes": ["startup_crash_loop", "action_plan_projection"],
         "action_plan_decision": "pause_or_surface_blocker",
         "mutating_commands_require_confirmation": true
       }
@@ -63,17 +56,13 @@
         },
         "provenance": {
           "status": "present",
-          "evidence_paths": [
-            "docs/evidence/extensions/runtime-loop.json"
-          ],
+          "evidence_paths": ["docs/evidence/extensions/runtime-loop.json"],
           "generated_at": "2026-05-16T00:00:00+00:00",
           "manifest_hash": "sha256:runtime"
         },
         "policy": {
           "status": "present",
-          "allowed_permissions": [
-            "filesystem.read"
-          ],
+          "allowed_permissions": ["filesystem.read"],
           "quarantine_threshold": 3
         },
         "rollback_candidates": [
@@ -112,36 +101,25 @@
         "event": {
           "kind": "permission_drift",
           "failures_24h": 0,
-          "requested_permissions": [
-            "filesystem.read",
-            "network.fetch",
-            "process.spawn"
-          ],
+          "requested_permissions": ["filesystem.read", "network.fetch", "process.spawn"],
           "last_error": "manifest requested new permissions"
         },
         "provenance": {
           "status": "present",
-          "evidence_paths": [
-            "docs/evidence/extensions/permission-drift.json"
-          ],
+          "evidence_paths": ["docs/evidence/extensions/permission-drift.json"],
           "generated_at": "2026-05-16T00:00:00+00:00",
           "manifest_hash": "sha256:permission"
         },
         "policy": {
           "status": "present",
-          "allowed_permissions": [
-            "filesystem.read"
-          ],
+          "allowed_permissions": ["filesystem.read"],
           "quarantine_threshold": 3
         }
       },
       "expected": {
         "status": "permission_escalation_rejected",
         "decision": "reject_permission_change",
-        "reason_codes": [
-          "permission_escalation_rejected",
-          "action_plan_projection"
-        ],
+        "reason_codes": ["permission_escalation_rejected", "action_plan_projection"],
         "action_plan_decision": "pause_or_surface_blocker",
         "mutating_commands_require_confirmation": true
       }
@@ -164,27 +142,20 @@
         },
         "provenance": {
           "status": "stale",
-          "evidence_paths": [
-            "docs/evidence/extensions/stale-provenance.json"
-          ],
+          "evidence_paths": ["docs/evidence/extensions/stale-provenance.json"],
           "generated_at": "2026-05-10T00:00:00+00:00",
           "manifest_hash": "sha256:stale"
         },
         "policy": {
           "status": "present",
-          "allowed_permissions": [
-            "filesystem.read"
-          ],
+          "allowed_permissions": ["filesystem.read"],
           "quarantine_threshold": 3
         }
       },
       "expected": {
         "status": "blocked",
         "decision": "pause_escalate",
-        "reason_codes": [
-          "stale_provenance",
-          "action_plan_projection"
-        ],
+        "reason_codes": ["stale_provenance", "action_plan_projection"],
         "action_plan_decision": "pause_or_surface_blocker",
         "mutating_commands_require_confirmation": true
       }
@@ -207,17 +178,13 @@
         },
         "provenance": {
           "status": "present",
-          "evidence_paths": [
-            "docs/evidence/extensions/rollback.json"
-          ],
+          "evidence_paths": ["docs/evidence/extensions/rollback.json"],
           "generated_at": "2026-05-16T00:00:00+00:00",
           "manifest_hash": "sha256:rollback"
         },
         "policy": {
           "status": "present",
-          "allowed_permissions": [
-            "filesystem.read"
-          ],
+          "allowed_permissions": ["filesystem.read"],
           "quarantine_threshold": 3
         },
         "rollback_candidates": [
@@ -270,27 +237,20 @@
         },
         "provenance": {
           "status": "present",
-          "evidence_paths": [
-            "docs/evidence/extensions/action-plan.json"
-          ],
+          "evidence_paths": ["docs/evidence/extensions/action-plan.json"],
           "generated_at": "2026-05-16T00:00:00+00:00",
           "manifest_hash": "sha256:action"
         },
         "policy": {
           "status": "present",
-          "allowed_permissions": [
-            "filesystem.read"
-          ],
+          "allowed_permissions": ["filesystem.read"],
           "quarantine_threshold": 3
         }
       },
       "expected": {
         "status": "quarantine_recommended",
         "decision": "quarantine",
-        "reason_codes": [
-          "startup_crash_loop",
-          "action_plan_projection"
-        ],
+        "reason_codes": ["startup_crash_loop", "action_plan_projection"],
         "action_plan_decision": "pause_or_surface_blocker",
         "mutating_commands_require_confirmation": true
       }
@@ -308,16 +268,12 @@
         "event": {
           "kind": "permission_drift",
           "failures_24h": 0,
-          "requested_permissions": [
-            "network.fetch"
-          ],
+          "requested_permissions": ["network.fetch"],
           "last_error": "policy unavailable"
         },
         "provenance": {
           "status": "present",
-          "evidence_paths": [
-            "docs/evidence/extensions/missing-policy.json"
-          ],
+          "evidence_paths": ["docs/evidence/extensions/missing-policy.json"],
           "generated_at": "2026-05-16T00:00:00+00:00",
           "manifest_hash": "sha256:missing-policy"
         },
@@ -329,10 +285,7 @@
       "expected": {
         "status": "blocked",
         "decision": "pause_escalate",
-        "reason_codes": [
-          "missing_policy",
-          "action_plan_projection"
-        ],
+        "reason_codes": ["missing_policy", "action_plan_projection"],
         "action_plan_decision": "pause_or_surface_blocker",
         "mutating_commands_require_confirmation": true
       }
@@ -361,19 +314,14 @@
         },
         "policy": {
           "status": "present",
-          "allowed_permissions": [
-            "filesystem.read"
-          ],
+          "allowed_permissions": ["filesystem.read"],
           "quarantine_threshold": 3
         }
       },
       "expected": {
         "status": "blocked",
         "decision": "pause_escalate",
-        "reason_codes": [
-          "missing_provenance",
-          "action_plan_projection"
-        ],
+        "reason_codes": ["missing_provenance", "action_plan_projection"],
         "action_plan_decision": "pause_or_surface_blocker",
         "mutating_commands_require_confirmation": true
       }

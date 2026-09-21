@@ -11,9 +11,7 @@
       "kind": "registration",
       "summary": "Verifies mario-not command registered for tmustier-arcade-mario-not",
       "expect": {
-        "commands_contains": [
-          "mario-not"
-        ]
+        "commands_contains": ["mario-not"]
       }
     },
     {

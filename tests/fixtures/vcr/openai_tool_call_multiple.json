@@ -8,28 +8,14 @@
         "method": "POST",
         "url": "https://api.openai.com/v1/chat/completions",
         "headers": [
-          [
-            "Authorization",
-            "[REDACTED]"
-          ],
-          [
-            "Content-Type",
-            "application/json"
-          ],
-          [
-            "Accept",
-            "text/event-stream"
-          ]
+          ["Authorization", "[REDACTED]"],
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"]
         ]
       },
       "response": {
         "status": 200,
-        "headers": [
-          [
-            "Content-Type",
-            "text/event-stream"
-          ]
-        ],
+        "headers": [["Content-Type", "text/event-stream"]],
         "body_chunks": [
           "data: {\"id\":\"chatcmpl-vcr005\",\"object\":\"chat.completion.chunk\",\"created\":1738875600,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_vcr005a\",\"type\":\"function\",\"function\":{\"name\":\"add\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
           "data: {\"id\":\"chatcmpl-vcr005\",\"object\":\"chat.completion.chunk\",\"created\":1738875600,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":2,\\\"b\\\":3}\"}}]},\"finish_reason\":null}]}\n\n",

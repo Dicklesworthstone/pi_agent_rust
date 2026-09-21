@@ -7,9 +7,13 @@
       "name": "grep_basic_pattern",
       "description": "Simple pattern match",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "hello world\ngoodbye world\nhello again"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "hello world\ngoodbye world\nhello again"
+        }
       ],
-      "input": {"pattern": "hello"},
+      "input": { "pattern": "hello" },
       "expected": {
         "content_contains": ["hello world", "hello again"],
         "details_none": true
@@ -19,9 +23,13 @@
       "name": "grep_case_sensitive",
       "description": "Case-sensitive matching by default",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "Hello World\nHELLO WORLD\nhello world"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "Hello World\nHELLO WORLD\nhello world"
+        }
       ],
-      "input": {"pattern": "hello"},
+      "input": { "pattern": "hello" },
       "expected": {
         "content_contains": ["hello world"],
         "content_not_contains": ["Hello World", "HELLO WORLD"],
@@ -32,9 +40,13 @@
       "name": "grep_case_insensitive",
       "description": "Case-insensitive matching",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "Hello World\nHELLO WORLD\nhello world"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "Hello World\nHELLO WORLD\nhello world"
+        }
       ],
-      "input": {"pattern": "hello", "ignoreCase": true},
+      "input": { "pattern": "hello", "ignoreCase": true },
       "expected": {
         "content_contains": ["Hello World", "HELLO WORLD", "hello world"],
         "details_none": true
@@ -43,10 +55,8 @@
     {
       "name": "grep_regex_pattern",
       "description": "Regex pattern matching",
-      "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "foo123\nbar456\nfoo789"}
-      ],
-      "input": {"pattern": "foo\\d+"},
+      "setup": [{ "type": "create_file", "path": "test.txt", "content": "foo123\nbar456\nfoo789" }],
+      "input": { "pattern": "foo\\d+" },
       "expected": {
         "content_contains": ["foo123", "foo789"],
         "content_not_contains": ["bar456"],
@@ -57,9 +67,9 @@
       "name": "grep_literal_pattern",
       "description": "Literal string matching (escapes regex)",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "foo.bar\nfooXbar\nfoo*bar"}
+        { "type": "create_file", "path": "test.txt", "content": "foo.bar\nfooXbar\nfoo*bar" }
       ],
-      "input": {"pattern": "foo.bar", "literal": true},
+      "input": { "pattern": "foo.bar", "literal": true },
       "expected": {
         "content_contains": ["foo.bar"],
         "content_not_contains": ["fooXbar"],
@@ -69,10 +79,8 @@
     {
       "name": "grep_no_matches",
       "description": "Pattern with no matches",
-      "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "hello world"}
-      ],
-      "input": {"pattern": "notfound"},
+      "setup": [{ "type": "create_file", "path": "test.txt", "content": "hello world" }],
+      "input": { "pattern": "notfound" },
       "expected": {
         "content_exact": "No matches found",
         "details_none": true
@@ -82,11 +90,11 @@
       "name": "grep_multiple_files",
       "description": "Search across multiple files",
       "setup": [
-        {"type": "create_file", "path": "file1.txt", "content": "hello in file1"},
-        {"type": "create_file", "path": "file2.txt", "content": "hello in file2"},
-        {"type": "create_file", "path": "file3.txt", "content": "no match here"}
+        { "type": "create_file", "path": "file1.txt", "content": "hello in file1" },
+        { "type": "create_file", "path": "file2.txt", "content": "hello in file2" },
+        { "type": "create_file", "path": "file3.txt", "content": "no match here" }
       ],
-      "input": {"pattern": "hello"},
+      "input": { "pattern": "hello" },
       "expected": {
         "content_contains": ["file1.txt", "file2.txt"],
         "details_none": true
@@ -96,10 +104,10 @@
       "name": "grep_with_glob",
       "description": "Search with glob filter",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "hello world"},
-        {"type": "create_file", "path": "test.rs", "content": "hello rust"}
+        { "type": "create_file", "path": "test.txt", "content": "hello world" },
+        { "type": "create_file", "path": "test.rs", "content": "hello rust" }
       ],
-      "input": {"pattern": "hello", "glob": "*.txt"},
+      "input": { "pattern": "hello", "glob": "*.txt" },
       "expected": {
         "content_contains": ["hello world"],
         "content_not_contains": ["hello rust"],
@@ -110,9 +118,13 @@
       "name": "grep_with_limit",
       "description": "Limit number of matches",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "match1\nmatch2\nmatch3\nmatch4\nmatch5"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "match1\nmatch2\nmatch3\nmatch4\nmatch5"
+        }
       ],
-      "input": {"pattern": "match", "limit": 3},
+      "input": { "pattern": "match", "limit": 3 },
       "expected": {
         "content_contains": ["limit reached"],
         "details_exact": {
@@ -124,9 +136,9 @@
       "name": "grep_limit_notice_golden",
       "description": "Limit notice formatting stays locked to golden output",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "match1\nmatch2\nmatch3\nmatch4"}
+        { "type": "create_file", "path": "test.txt", "content": "match1\nmatch2\nmatch3\nmatch4" }
       ],
-      "input": {"pattern": "match", "limit": 2},
+      "input": { "pattern": "match", "limit": 2 },
       "expected": {
         "content_golden": "grep_tool/limit_notice.txt",
         "details_exact": {
@@ -138,9 +150,13 @@
       "name": "grep_with_context",
       "description": "Include context lines",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\ntarget\nline4\nline5"}
+        {
+          "type": "create_file",
+          "path": "test.txt",
+          "content": "line1\nline2\ntarget\nline4\nline5"
+        }
       ],
-      "input": {"pattern": "target", "context": 1},
+      "input": { "pattern": "target", "context": 1 },
       "expected": {
         "content_contains": ["line2", "target", "line4"],
         "details_none": true
@@ -149,10 +165,8 @@
     {
       "name": "grep_line_numbers",
       "description": "Output includes line numbers",
-      "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "first\nsecond\nthird"}
-      ],
-      "input": {"pattern": "second"},
+      "setup": [{ "type": "create_file", "path": "test.txt", "content": "first\nsecond\nthird" }],
+      "input": { "pattern": "second" },
       "expected": {
         "content_regex": ":2:",
         "details_none": true
@@ -168,7 +182,7 @@
           "content": "match aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         }
       ],
-      "input": {"pattern": "match"},
+      "input": { "pattern": "match" },
       "expected": {
         "content_contains": [
           "... [truncated]",
@@ -183,9 +197,9 @@
       "name": "grep_context_matches_golden",
       "description": "Context output formatting stays locked to golden output",
       "setup": [
-        {"type": "create_file", "path": "sample.txt", "content": "alpha\nbeta\ngamma\nbeta\n"}
+        { "type": "create_file", "path": "sample.txt", "content": "alpha\nbeta\ngamma\nbeta\n" }
       ],
-      "input": {"pattern": "beta", "context": 1},
+      "input": { "pattern": "beta", "context": 1 },
       "expected": {
         "content_golden": "grep_tool/context_output.txt",
         "details_none": true
@@ -194,10 +208,8 @@
     {
       "name": "grep_hashline_format",
       "description": "Hashline mode emits N#AB tags in grep output",
-      "setup": [
-        {"type": "create_file", "path": "hashline.txt", "content": "alpha\nbeta"}
-      ],
-      "input": {"pattern": "beta", "path": "hashline.txt", "hashline": true},
+      "setup": [{ "type": "create_file", "path": "hashline.txt", "content": "alpha\nbeta" }],
+      "input": { "pattern": "beta", "path": "hashline.txt", "hashline": true },
       "expected": {
         "content_regex": "(?s)hashline\\.txt:2#[A-Z]{2}: beta",
         "details_none": true
@@ -207,9 +219,14 @@
       "name": "grep_hashline_with_context",
       "description": "Hashline mode marks context lines with dash separators",
       "setup": [
-        {"type": "create_file", "path": "hashline_context.txt", "content": "alpha\nbeta\ngamma"}
+        { "type": "create_file", "path": "hashline_context.txt", "content": "alpha\nbeta\ngamma" }
       ],
-      "input": {"pattern": "beta", "path": "hashline_context.txt", "hashline": true, "context": 1},
+      "input": {
+        "pattern": "beta",
+        "path": "hashline_context.txt",
+        "hashline": true,
+        "context": 1
+      },
       "expected": {
         "content_regex": "(?s)hashline_context\\.txt-1#[A-Z]{2}- alpha.*hashline_context\\.txt:2#[A-Z]{2}: beta.*hashline_context\\.txt-3#[A-Z]{2}- gamma",
         "details_none": true
@@ -218,7 +235,7 @@
     {
       "name": "grep_outside_cwd",
       "description": "Grep outside the working directory should be rejected",
-      "input": {"pattern": "needle", "path": "../"},
+      "input": { "pattern": "needle", "path": "../" },
       "expect_error": true,
       "error_contains": "Cannot grep outside the working directory",
       "expected": {}

@@ -4,11 +4,7 @@
       "id": "REQ-004",
       "issue": "missing push evidence",
       "kind": "missing_push",
-      "refs": [
-        "commit[0]",
-        "push[0]",
-        "commit_push:required_pair"
-      ],
+      "refs": ["commit[0]", "push[0]", "commit_push:required_pair"],
       "remediation": "Push the closeout commit, then regenerate completion-audit evidence.",
       "requirement_kind": "commit_push",
       "status": "failed"
@@ -16,9 +12,7 @@
   ],
   "decision": "closeout_blocked",
   "generated_at": "[GENERATED_AT]",
-  "operator_next_actions": [
-    "Push the closeout commit, then regenerate completion-audit evidence."
-  ],
+  "operator_next_actions": ["Push the closeout commit, then regenerate completion-audit evidence."],
   "schema": "pi.completion_audit.closeout_gate.v1",
   "source": {
     "completion_allowed": false,

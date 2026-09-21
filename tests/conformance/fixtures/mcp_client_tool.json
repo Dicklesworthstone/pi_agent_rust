@@ -6,9 +6,7 @@
     {
       "name": "mcp_client_discovers_project_servers_without_connecting",
       "description": "listing exposes a project MCP server and its pending trust state without spawning its nonexistent command",
-      "requirement_ids": [
-        "MCP-DISCOVERY-1"
-      ],
+      "requirement_ids": ["MCP-DISCOVERY-1"],
       "setup": [
         {
           "type": "create_file",
@@ -43,9 +41,7 @@
     {
       "name": "mcp_client_refuses_pending_servers_before_spawn",
       "description": "calling a discovered but untrusted server fails with the named remedy before resolving its command",
-      "requirement_ids": [
-        "MCP-TRUST-BOUNDARY-1"
-      ],
+      "requirement_ids": ["MCP-TRUST-BOUNDARY-1"],
       "setup": [
         {
           "type": "create_file",
@@ -68,9 +64,7 @@
     {
       "name": "mcp_client_names_unknown_servers",
       "description": "an absent server fails with MCP_UNKNOWN_SERVER instead of an untyped transport error",
-      "requirement_ids": [
-        "MCP-UNKNOWN-ERR-1"
-      ],
+      "requirement_ids": ["MCP-UNKNOWN-ERR-1"],
       "input": {
         "op": "call",
         "server": "absent",

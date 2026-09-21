@@ -9,7 +9,14 @@
       "kind": "registration",
       "summary": "Verifies event handler registrations for rewind-hook",
       "expect": {
-        "event_hooks_contains": ["session_before_fork", "session_before_tree", "session_start", "session_switch", "turn_end", "turn_start"]
+        "event_hooks_contains": [
+          "session_before_fork",
+          "session_before_tree",
+          "session_start",
+          "session_switch",
+          "turn_end",
+          "turn_start"
+        ]
       }
     },
     {

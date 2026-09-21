@@ -3,15 +3,9 @@
   "generated_at": "2026-05-14T08:30:00Z",
   "saturation": {
     "saturated": true,
-    "signals": [
-      "rch_queue_saturated"
-    ],
-    "reasons": [
-      "validation broker fixture carries one saturated RCH queue snapshot"
-    ],
-    "evidence_pointers": [
-      "tests/golden_corpus/validation_broker/e2e/rch_queue_saturated.txt"
-    ]
+    "signals": ["rch_queue_saturated"],
+    "reasons": ["validation broker fixture carries one saturated RCH queue snapshot"],
+    "evidence_pointers": ["tests/golden_corpus/validation_broker/e2e/rch_queue_saturated.txt"]
   },
   "recommendations": [
     {

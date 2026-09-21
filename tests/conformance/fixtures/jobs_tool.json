@@ -6,9 +6,7 @@
     {
       "name": "jobs_list_returns_session_registry",
       "description": "list returns the versioned background-job registry whether it is empty or populated by another case in the process",
-      "requirement_ids": [
-        "JOBS-LIST-1"
-      ],
+      "requirement_ids": ["JOBS-LIST-1"],
       "input": {
         "action": "list"
       },
@@ -22,9 +20,7 @@
     {
       "name": "jobs_wait_requires_job_id",
       "description": "wait refuses an ambiguous request before entering a wait loop",
-      "requirement_ids": [
-        "JOBS-WAIT-1"
-      ],
+      "requirement_ids": ["JOBS-WAIT-1"],
       "input": {
         "action": "wait",
         "timeoutMs": 1
@@ -36,9 +32,7 @@
     {
       "name": "jobs_rejects_unknown_action",
       "description": "unknown actions fail with the complete accepted action set",
-      "requirement_ids": [
-        "JOBS-ERR-1"
-      ],
+      "requirement_ids": ["JOBS-ERR-1"],
       "input": {
         "action": "detach"
       },

@@ -6,9 +6,7 @@
     {
       "name": "ast_grep_rust_unwrap_match",
       "description": "Structural unwrap() match in rust with line info",
-      "requirement_ids": [
-        "AST-1"
-      ],
+      "requirement_ids": ["AST-1"],
       "setup": [
         {
           "type": "create_dir",
@@ -36,9 +34,7 @@
     {
       "name": "ast_grep_comment_exclusion_planted_negative",
       "description": "Planted negative: $EXPR.unwrap() must NOT match a comment or string containing unwrap()",
-      "requirement_ids": [
-        "AST-1"
-      ],
+      "requirement_ids": ["AST-1"],
       "setup": [
         {
           "type": "create_file",
@@ -51,22 +47,14 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "compute().unwrap()",
-          "\"matchCount\": 1"
-        ],
-        "content_not_contains": [
-          "data.unwrap()",
-          "thing.unwrap()"
-        ]
+        "content_contains": ["compute().unwrap()", "\"matchCount\": 1"],
+        "content_not_contains": ["data.unwrap()", "thing.unwrap()"]
       }
     },
     {
       "name": "ast_grep_metavar_identity",
       "description": "Same metavariable twice matches identical code only",
-      "requirement_ids": [
-        "AST-2"
-      ],
+      "requirement_ids": ["AST-2"],
       "setup": [
         {
           "type": "create_file",
@@ -79,21 +67,14 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "value == value",
-          "\"matchCount\": 1"
-        ],
-        "content_not_contains": [
-          "left == right"
-        ]
+        "content_contains": ["value == value", "\"matchCount\": 1"],
+        "content_not_contains": ["left == right"]
       }
     },
     {
       "name": "ast_grep_python_call_match",
       "description": "Structural call match in python",
-      "requirement_ids": [
-        "AST-3"
-      ],
+      "requirement_ids": ["AST-3"],
       "setup": [
         {
           "type": "create_file",
@@ -116,9 +97,7 @@
     {
       "name": "ast_grep_javascript_match",
       "description": "Structural call match in javascript",
-      "requirement_ids": [
-        "AST-3"
-      ],
+      "requirement_ids": ["AST-3"],
       "setup": [
         {
           "type": "create_file",
@@ -131,18 +110,13 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "console.log(\\\"hello\\\", 42)",
-          "\"language\": \"javascript\""
-        ]
+        "content_contains": ["console.log(\\\"hello\\\", 42)", "\"language\": \"javascript\""]
       }
     },
     {
       "name": "ast_grep_typescript_match",
       "description": "Structural call match in typescript",
-      "requirement_ids": [
-        "AST-3"
-      ],
+      "requirement_ids": ["AST-3"],
       "setup": [
         {
           "type": "create_file",
@@ -155,18 +129,13 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "console.log(\\\"typed\\\")",
-          "\"language\": \"typescript\""
-        ]
+        "content_contains": ["console.log(\\\"typed\\\")", "\"language\": \"typescript\""]
       }
     },
     {
       "name": "ast_grep_bash_command_match",
       "description": "Structural command match in bash",
-      "requirement_ids": [
-        "AST-3"
-      ],
+      "requirement_ids": ["AST-3"],
       "setup": [
         {
           "type": "create_file",
@@ -179,19 +148,13 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "rm -rf /tmp/scratch",
-          "\"language\": \"bash\"",
-          "\"matchCount\": 1"
-        ]
+        "content_contains": ["rm -rf /tmp/scratch", "\"language\": \"bash\"", "\"matchCount\": 1"]
       }
     },
     {
       "name": "ast_grep_glob_scoping",
       "description": "Glob restricts the scan to matching files",
-      "requirement_ids": [
-        "AST-1"
-      ],
+      "requirement_ids": ["AST-1"],
       "setup": [
         {
           "type": "create_file",
@@ -210,21 +173,14 @@
         "glob": "**/*.rs"
       },
       "expected": {
-        "content_contains": [
-          "a.rs",
-          "\"matchCount\": 1"
-        ],
-        "content_not_contains": [
-          "b.py"
-        ]
+        "content_contains": ["a.rs", "\"matchCount\": 1"],
+        "content_not_contains": ["b.py"]
       }
     },
     {
       "name": "ast_grep_multi_language_scan",
       "description": "One scan parses each file in its own language",
-      "requirement_ids": [
-        "AST-3"
-      ],
+      "requirement_ids": ["AST-3"],
       "setup": [
         {
           "type": "create_file",
@@ -247,20 +203,13 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "a.rs",
-          "b.py",
-          "c.js",
-          "\"matchCount\": 3"
-        ]
+        "content_contains": ["a.rs", "b.py", "c.js", "\"matchCount\": 3"]
       }
     },
     {
       "name": "ast_grep_no_matches",
       "description": "Pattern with no structural matches returns an empty match list",
-      "requirement_ids": [
-        "AST-1"
-      ],
+      "requirement_ids": ["AST-1"],
       "setup": [
         {
           "type": "create_file",
@@ -273,18 +222,13 @@
         "path": "."
       },
       "expected": {
-        "content_contains": [
-          "\"matchCount\": 0",
-          "\"matches\": []"
-        ]
+        "content_contains": ["\"matchCount\": 0", "\"matches\": []"]
       }
     },
     {
       "name": "ast_grep_invalid_pattern_named_error",
       "description": "Unparseable pattern returns a named AST_PATTERN_PARSE error",
-      "requirement_ids": [
-        "AST-4"
-      ],
+      "requirement_ids": ["AST-4"],
       "setup": [
         {
           "type": "create_file",
@@ -304,9 +248,7 @@
     {
       "name": "ast_grep_limit_zero_rejected",
       "description": "limit=0 is a validation error",
-      "requirement_ids": [
-        "AST-1"
-      ],
+      "requirement_ids": ["AST-1"],
       "setup": [
         {
           "type": "create_file",

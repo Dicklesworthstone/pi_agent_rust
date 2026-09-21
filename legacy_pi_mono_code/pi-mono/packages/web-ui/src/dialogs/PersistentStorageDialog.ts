@@ -7,91 +7,93 @@ import { i18n } from "../utils/i18n.js";
 
 @customElement("persistent-storage-dialog")
 export class PersistentStorageDialog extends DialogBase {
-	@state() private requesting = false;
+  @state() private requesting = false;
 
-	private resolvePromise?: (userApproved: boolean) => void;
+  private resolvePromise?: (userApproved: boolean) => void;
 
-	protected modalWidth = "min(500px, 90vw)";
-	protected modalHeight = "auto";
+  protected modalWidth = "min(500px, 90vw)";
+  protected modalHeight = "auto";
 
-	/**
-	 * Request persistent storage permission.
-	 * Returns true if browser granted persistent storage, false otherwise.
-	 */
-	static async request(): Promise<boolean> {
-		// Check if already persisted
-		if (navigator.storage?.persisted) {
-			const alreadyPersisted = await navigator.storage.persisted();
-			if (alreadyPersisted) {
-				console.log("✓ Persistent storage already granted");
-				return true;
-			}
-		}
+  /**
+   * Request persistent storage permission.
+   * Returns true if browser granted persistent storage, false otherwise.
+   */
+  static async request(): Promise<boolean> {
+    // Check if already persisted
+    if (navigator.storage?.persisted) {
+      const alreadyPersisted = await navigator.storage.persisted();
+      if (alreadyPersisted) {
+        console.log("✓ Persistent storage already granted");
+        return true;
+      }
+    }
 
-		// Show dialog and wait for user response
-		const dialog = new PersistentStorageDialog();
-		dialog.open();
+    // Show dialog and wait for user response
+    const dialog = new PersistentStorageDialog();
+    dialog.open();
 
-		const userApproved = await new Promise<boolean>((resolve) => {
-			dialog.resolvePromise = resolve;
-		});
+    const userApproved = await new Promise<boolean>((resolve) => {
+      dialog.resolvePromise = resolve;
+    });
 
-		if (!userApproved) {
-			console.warn("⚠ User declined persistent storage - sessions may be lost");
-			return false;
-		}
+    if (!userApproved) {
+      console.warn("⚠ User declined persistent storage - sessions may be lost");
+      return false;
+    }
 
-		// User approved, request from browser
-		if (!navigator.storage?.persist) {
-			console.warn("⚠ Persistent storage API not available");
-			return false;
-		}
+    // User approved, request from browser
+    if (!navigator.storage?.persist) {
+      console.warn("⚠ Persistent storage API not available");
+      return false;
+    }
 
-		try {
-			const granted = await navigator.storage.persist();
-			if (granted) {
-				console.log("✓ Persistent storage granted - sessions will be preserved");
-			} else {
-				console.warn("⚠ Browser denied persistent storage - sessions may be lost under storage pressure");
-			}
-			return granted;
-		} catch (error) {
-			console.error("Failed to request persistent storage:", error);
-			return false;
-		}
-	}
+    try {
+      const granted = await navigator.storage.persist();
+      if (granted) {
+        console.log("✓ Persistent storage granted - sessions will be preserved");
+      } else {
+        console.warn(
+          "⚠ Browser denied persistent storage - sessions may be lost under storage pressure",
+        );
+      }
+      return granted;
+    } catch (error) {
+      console.error("Failed to request persistent storage:", error);
+      return false;
+    }
+  }
 
-	private handleGrant() {
-		if (this.resolvePromise) {
-			this.resolvePromise(true);
-			this.resolvePromise = undefined;
-		}
-		this.close();
-	}
+  private handleGrant() {
+    if (this.resolvePromise) {
+      this.resolvePromise(true);
+      this.resolvePromise = undefined;
+    }
+    this.close();
+  }
 
-	private handleDeny() {
-		if (this.resolvePromise) {
-			this.resolvePromise(false);
-			this.resolvePromise = undefined;
-		}
-		this.close();
-	}
+  private handleDeny() {
+    if (this.resolvePromise) {
+      this.resolvePromise(false);
+      this.resolvePromise = undefined;
+    }
+    this.close();
+  }
 
-	override close() {
-		super.close();
-		if (this.resolvePromise) {
-			this.resolvePromise(false);
-		}
-	}
+  override close() {
+    super.close();
+    if (this.resolvePromise) {
+      this.resolvePromise(false);
+    }
+  }
 
-	protected override renderContent() {
-		return html`
+  protected override renderContent() {
+    return html`
 			${DialogContent({
-				children: html`
+        children: html`
 					${DialogHeader({
-						title: i18n("Storage Permission Required"),
-						description: i18n("This app needs persistent storage to save your conversations"),
-					})}
+            title: i18n("Storage Permission Required"),
+            description: i18n("This app needs persistent storage to save your conversations"),
+          })}
 
 					<div class="mt-4 flex flex-col gap-4">
 						<div class="flex gap-3 p-4 bg-warning/10 border border-warning/20 rounded-lg">
@@ -106,8 +108,8 @@ export class PersistentStorageDialog extends DialogBase {
 								<p class="font-medium text-foreground mb-1">${i18n("Why is this needed?")}</p>
 								<p class="text-muted-foreground">
 									${i18n(
-										"Without persistent storage, your browser may delete saved conversations when it needs disk space. Granting this permission ensures your chat history is preserved.",
-									)}
+                    "Without persistent storage, your browser may delete saved conversations when it needs disk space. Granting this permission ensures your chat history is preserved.",
+                  )}
 								</p>
 							</div>
 						</div>
@@ -125,20 +127,20 @@ export class PersistentStorageDialog extends DialogBase {
 
 					<div class="mt-6 flex gap-3 justify-end">
 						${Button({
-							variant: "outline",
-							onClick: () => this.handleDeny(),
-							disabled: this.requesting,
-							children: i18n("Continue Anyway"),
-						})}
+              variant: "outline",
+              onClick: () => this.handleDeny(),
+              disabled: this.requesting,
+              children: i18n("Continue Anyway"),
+            })}
 						${Button({
-							variant: "default",
-							onClick: () => this.handleGrant(),
-							disabled: this.requesting,
-							children: this.requesting ? i18n("Requesting...") : i18n("Grant Permission"),
-						})}
+              variant: "default",
+              onClick: () => this.handleGrant(),
+              disabled: this.requesting,
+              children: this.requesting ? i18n("Requesting...") : i18n("Grant Permission"),
+            })}
 					</div>
 				`,
-			})}
+      })}
 		`;
-	}
+  }
 }

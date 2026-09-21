@@ -2,18 +2,11 @@
   "cases": {
     "active_overlap": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -56,9 +49,7 @@
         ]
       },
       "coordination": {
-        "reasons": [
-          "active_overlap"
-        ],
+        "reasons": ["active_overlap"],
         "recommended_action": "defer_due_to_collision",
         "reservation_reason_hint": "bd-4w2mw.2",
         "status": "blocked",
@@ -72,9 +63,7 @@
           "group_id": "focused_tests",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 1,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         },
         {
@@ -83,9 +72,7 @@
           "group_id": "e2e_conformance",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 2,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         },
         {
@@ -94,9 +81,7 @@
           "group_id": "e2e_conformance",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 3,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         },
         {
@@ -105,9 +90,7 @@
           "group_id": "all_targets_check",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 4,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         },
         {
@@ -116,9 +99,7 @@
           "group_id": "clippy",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 5,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         }
       ],
@@ -174,12 +155,7 @@
           }
         ],
         "heavy_group_count": 4,
-        "required_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -198,18 +174,11 @@
     },
     "agent_mail_degraded_read_only": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -252,9 +221,7 @@
         ]
       },
       "coordination": {
-        "reasons": [
-          "agent_mail_not_authoritative"
-        ],
+        "reasons": ["agent_mail_not_authoritative"],
         "recommended_action": "claim_with_beads_soft_lock",
         "reservation_reason_hint": "bd-4w2mw.2",
         "status": "degraded",
@@ -314,12 +281,7 @@
           }
         ],
         "heavy_group_count": 4,
-        "required_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -384,18 +346,11 @@
     },
     "dirty_worktree_admission_denied": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -438,9 +393,7 @@
         ]
       },
       "coordination": {
-        "reasons": [
-          "dirty_worktree_mismatch"
-        ],
+        "reasons": ["dirty_worktree_mismatch"],
         "recommended_action": "stop_surface_blocker",
         "reservation_reason_hint": "bd-4w2mw.2",
         "status": "blocked",
@@ -454,9 +407,7 @@
           "group_id": "focused_tests",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 1,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         },
         {
@@ -465,9 +416,7 @@
           "group_id": "e2e_conformance",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 2,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         },
         {
@@ -476,9 +425,7 @@
           "group_id": "e2e_conformance",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 3,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         },
         {
@@ -487,9 +434,7 @@
           "group_id": "all_targets_check",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 4,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         },
         {
@@ -498,9 +443,7 @@
           "group_id": "clippy",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 5,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         }
       ],
@@ -556,12 +499,7 @@
           }
         ],
         "heavy_group_count": 4,
-        "required_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -584,9 +522,7 @@
         "route_heat_level": "low",
         "shared_rch_env_present": false
       },
-      "changed_paths": [
-        "docs/swarm-operations-runbook.md"
-      ],
+      "changed_paths": ["docs/swarm-operations-runbook.md"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -639,9 +575,7 @@
         "classification_counts": {
           "reusable": 1
         },
-        "invalidation_reasons": [
-          "path_coverage_mismatch"
-        ],
+        "invalidation_reasons": ["path_coverage_mismatch"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -665,10 +599,7 @@
           }
         ],
         "heavy_group_count": 0,
-        "required_group_ids": [
-          "fast_script_checks",
-          "evidence_regeneration"
-        ]
+        "required_group_ids": ["fast_script_checks", "evidence_regeneration"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -728,9 +659,7 @@
         "route_heat_level": "low",
         "shared_rch_env_present": false
       },
-      "changed_paths": [
-        "docs/swarm-operations-runbook.md"
-      ],
+      "changed_paths": ["docs/swarm-operations-runbook.md"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -763,9 +692,7 @@
         ]
       },
       "coordination": {
-        "reasons": [
-          "ready_queue_empty"
-        ],
+        "reasons": ["ready_queue_empty"],
         "recommended_action": "stop_surface_blocker",
         "reservation_reason_hint": "bd-4w2mw.2",
         "status": "blocked",
@@ -779,9 +706,7 @@
           "group_id": "fast_script_checks",
           "local_fallback_rejection_reason": null,
           "rank": 1,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": false
         },
         {
@@ -790,9 +715,7 @@
           "group_id": "fast_script_checks",
           "local_fallback_rejection_reason": null,
           "rank": 2,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": false
         },
         {
@@ -801,9 +724,7 @@
           "group_id": "fast_script_checks",
           "local_fallback_rejection_reason": null,
           "rank": 3,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": false
         },
         {
@@ -812,9 +733,7 @@
           "group_id": "evidence_regeneration",
           "local_fallback_rejection_reason": null,
           "rank": 4,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": false
         }
       ],
@@ -830,9 +749,7 @@
         "classification_counts": {
           "reusable": 1
         },
-        "invalidation_reasons": [
-          "path_coverage_mismatch"
-        ],
+        "invalidation_reasons": ["path_coverage_mismatch"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -856,10 +773,7 @@
           }
         ],
         "heavy_group_count": 0,
-        "required_group_ids": [
-          "fast_script_checks",
-          "evidence_regeneration"
-        ]
+        "required_group_ids": ["fast_script_checks", "evidence_regeneration"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -878,19 +792,11 @@
     },
     "extension_rust": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/extensions.rs",
-        "src/extensions_js.rs"
-      ],
+      "changed_paths": ["src/extensions.rs", "src/extensions_js.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -953,9 +859,7 @@
         "classification_counts": {
           "reusable": 1
         },
-        "invalidation_reasons": [
-          "path_coverage_mismatch"
-        ],
+        "invalidation_reasons": ["path_coverage_mismatch"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -995,12 +899,7 @@
           }
         ],
         "heavy_group_count": 4,
-        "required_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -1125,9 +1024,7 @@
         "classification_counts": {
           "reusable": 1
         },
-        "invalidation_reasons": [
-          "path_coverage_mismatch"
-        ],
+        "invalidation_reasons": ["path_coverage_mismatch"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -1151,10 +1048,7 @@
           }
         ],
         "heavy_group_count": 0,
-        "required_group_ids": [
-          "fast_script_checks",
-          "evidence_regeneration"
-        ]
+        "required_group_ids": ["fast_script_checks", "evidence_regeneration"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -1210,18 +1104,11 @@
     },
     "mixed_python_rust": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "scripts/new-tool.py",
-        "src/doctor.rs"
-      ],
+      "changed_paths": ["scripts/new-tool.py", "src/doctor.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -1290,9 +1177,7 @@
         "classification_counts": {
           "reusable": 1
         },
-        "invalidation_reasons": [
-          "path_coverage_mismatch"
-        ],
+        "invalidation_reasons": ["path_coverage_mismatch"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -1429,18 +1314,11 @@
     },
     "provider_rust": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -1543,12 +1421,7 @@
           }
         ],
         "heavy_group_count": 4,
-        "required_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -1613,18 +1486,11 @@
     },
     "rch_unavailable": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -1681,9 +1547,7 @@
           "group_id": "focused_tests",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 1,
-          "reasons": [
-            "slot_pressure=saturated"
-          ],
+          "reasons": ["slot_pressure=saturated"],
           "requires_rch": true
         },
         {
@@ -1692,9 +1556,7 @@
           "group_id": "e2e_conformance",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 2,
-          "reasons": [
-            "slot_pressure=saturated"
-          ],
+          "reasons": ["slot_pressure=saturated"],
           "requires_rch": true
         },
         {
@@ -1703,9 +1565,7 @@
           "group_id": "e2e_conformance",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 3,
-          "reasons": [
-            "slot_pressure=saturated"
-          ],
+          "reasons": ["slot_pressure=saturated"],
           "requires_rch": true
         },
         {
@@ -1714,9 +1574,7 @@
           "group_id": "all_targets_check",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 4,
-          "reasons": [
-            "slot_pressure=saturated"
-          ],
+          "reasons": ["slot_pressure=saturated"],
           "requires_rch": true
         },
         {
@@ -1725,9 +1583,7 @@
           "group_id": "clippy",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 5,
-          "reasons": [
-            "slot_pressure=saturated"
-          ],
+          "reasons": ["slot_pressure=saturated"],
           "requires_rch": true
         }
       ],
@@ -1783,12 +1639,7 @@
           }
         ],
         "heavy_group_count": 4,
-        "required_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -1811,9 +1662,7 @@
         "route_heat_level": "low",
         "shared_rch_env_present": false
       },
-      "changed_paths": [
-        "scripts/build_swarm_operator_runpack.py"
-      ],
+      "changed_paths": ["scripts/build_swarm_operator_runpack.py"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -1866,9 +1715,7 @@
         "classification_counts": {
           "reusable": 1
         },
-        "invalidation_reasons": [
-          "path_coverage_mismatch"
-        ],
+        "invalidation_reasons": ["path_coverage_mismatch"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -1892,10 +1739,7 @@
           }
         ],
         "heavy_group_count": 0,
-        "required_group_ids": [
-          "fast_script_checks",
-          "evidence_regeneration"
-        ]
+        "required_group_ids": ["fast_script_checks", "evidence_regeneration"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -1951,17 +1795,11 @@
     },
     "session_rust": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/session.rs"
-      ],
+      "changed_paths": ["src/session.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -2019,9 +1857,7 @@
         "classification_counts": {
           "reusable": 1
         },
-        "invalidation_reasons": [
-          "path_coverage_mismatch"
-        ],
+        "invalidation_reasons": ["path_coverage_mismatch"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -2053,11 +1889,7 @@
           }
         ],
         "heavy_group_count": 3,
-        "required_group_ids": [
-          "focused_tests",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -2104,18 +1936,11 @@
     },
     "stale_in_progress_issue": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -2158,10 +1983,7 @@
         ]
       },
       "coordination": {
-        "reasons": [
-          "active_in_progress_beads_present",
-          "stale_in_progress_issue"
-        ],
+        "reasons": ["active_in_progress_beads_present", "stale_in_progress_issue"],
         "recommended_action": "claim_with_beads_soft_lock",
         "reservation_reason_hint": "bd-4w2mw.2",
         "status": "degraded",
@@ -2221,12 +2043,7 @@
           }
         ],
         "heavy_group_count": 4,
-        "required_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -2291,18 +2108,11 @@
     },
     "stale_proof": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ],
+        "heavy_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"],
         "route_heat_level": "high",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "src/providers/openai.rs"
-      ],
+      "changed_paths": ["src/providers/openai.rs"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -2365,9 +2175,7 @@
         "classification_counts": {
           "stale": 1
         },
-        "invalidation_reasons": [
-          "stale"
-        ],
+        "invalidation_reasons": ["stale"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -2407,12 +2215,7 @@
           }
         ],
         "heavy_group_count": 4,
-        "required_group_ids": [
-          "focused_tests",
-          "e2e_conformance",
-          "all_targets_check",
-          "clippy"
-        ]
+        "required_group_ids": ["focused_tests", "e2e_conformance", "all_targets_check", "clippy"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",
@@ -2477,15 +2280,11 @@
     },
     "unknown_path": {
       "cache_heat": {
-        "heavy_group_ids": [
-          "all_targets_check"
-        ],
+        "heavy_group_ids": ["all_targets_check"],
         "route_heat_level": "medium",
         "shared_rch_env_present": true
       },
-      "changed_paths": [
-        "weird.binary"
-      ],
+      "changed_paths": ["weird.binary"],
       "claim_boundaries": {
         "advisory_evidence_as_source_of_truth_authorized": false,
         "does_not_delete_files": true,
@@ -2500,9 +2299,7 @@
           "unknown": 1
         },
         "profile_id": "source_only",
-        "unknown_paths": [
-          "weird.binary"
-        ]
+        "unknown_paths": ["weird.binary"]
       },
       "coalescing_advice": {
         "advisory_only": true,
@@ -2520,9 +2317,7 @@
         ]
       },
       "coordination": {
-        "reasons": [
-          "unknown_changed_path_bucket"
-        ],
+        "reasons": ["unknown_changed_path_bucket"],
         "recommended_action": "stop_surface_blocker",
         "reservation_reason_hint": "bd-4w2mw.2",
         "status": "blocked",
@@ -2536,9 +2331,7 @@
           "group_id": "fast_script_checks",
           "local_fallback_rejection_reason": null,
           "rank": 1,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": false
         },
         {
@@ -2547,9 +2340,7 @@
           "group_id": "fast_script_checks",
           "local_fallback_rejection_reason": null,
           "rank": 2,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": false
         },
         {
@@ -2558,9 +2349,7 @@
           "group_id": "fast_script_checks",
           "local_fallback_rejection_reason": null,
           "rank": 3,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": false
         },
         {
@@ -2569,9 +2358,7 @@
           "group_id": "all_targets_check",
           "local_fallback_rejection_reason": "RCH-required validation must not fail open into a local cargo build.",
           "rank": 4,
-          "reasons": [
-            "coordination_admission_blocked"
-          ],
+          "reasons": ["coordination_admission_blocked"],
           "requires_rch": true
         }
       ],
@@ -2587,9 +2374,7 @@
         "classification_counts": {
           "reusable": 1
         },
-        "invalidation_reasons": [
-          "path_coverage_mismatch"
-        ],
+        "invalidation_reasons": ["path_coverage_mismatch"],
         "reusable_record_count": 0,
         "route_decision": "refresh_validation"
       },
@@ -2613,10 +2398,7 @@
           }
         ],
         "heavy_group_count": 1,
-        "required_group_ids": [
-          "fast_script_checks",
-          "all_targets_check"
-        ]
+        "required_group_ids": ["fast_script_checks", "all_targets_check"]
       },
       "schema": "pi.validation.semantic_route_plan.v1",
       "source_bead": "bd-4w2mw.2",

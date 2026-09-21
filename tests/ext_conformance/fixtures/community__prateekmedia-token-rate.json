@@ -11,11 +11,7 @@
       "kind": "registration",
       "summary": "Verifies event hooks registered for prateekmedia-token-rate",
       "expect": {
-        "event_hooks_contains": [
-          "session_start",
-          "session_switch",
-          "tool_call"
-        ]
+        "event_hooks_contains": ["session_start", "session_switch", "tool_call"]
       }
     },
     {
