@@ -257,7 +257,10 @@ impl LspTool {
             return self.run_workspace_symbols(input).await;
         }
         if input.resolve.is_some() {
-            return Err(tool_err("LSP_USAGE", "symbol resolution requires a workspace query"));
+            return Err(tool_err(
+                "LSP_USAGE",
+                "symbol resolution requires a workspace query",
+            ));
         }
         match (input.file.as_deref(), input.query.as_deref()) {
             (Some(file), _) => {

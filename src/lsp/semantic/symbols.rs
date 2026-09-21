@@ -20,21 +20,44 @@ fn malformed(message: &str) -> crate::error::Error {
 
 fn request(input: &LspInput) -> Result<(&str, &str)> {
     let query = input.query.as_deref().ok_or_else(|| {
-        tool_err("LSP_USAGE", "workspace symbols require query and an anchor file")
+        tool_err(
+            "LSP_USAGE",
+            "workspace symbols require query and an anchor file",
+        )
     })?;
     let anchor = match (input.file.as_deref(), input.symbol.as_deref()) {
         (Some(file), None) | (None, Some(file)) if !file.is_empty() && file.len() <= 8192 => file,
-        _ => return Err(tool_err("LSP_USAGE", "workspace symbols require one anchor file: file or symbol, not both")),
+        _ => {
+            return Err(tool_err(
+                "LSP_USAGE",
+                "workspace symbols require one anchor file: file or symbol, not both",
+            ));
+        }
     };
-    if query.len() > MAX_QUERY_BYTES || query.contains('\0') || input.limit == Some(0)
-        || input.position.is_some() || input.line.is_some() || input.range.is_some()
-        || input.apply.is_some() || input.new_name.is_some() || input.new_file.is_some()
-        || input.action_id.is_some() || input.refactor_id.is_some()
-        || input.completion_id.is_some() || input.snippet_values.is_some()
-        || input.hierarchy_id.is_some() || input.method.is_some() || input.payload.is_some()
-        || input.only.is_some() || input.after.is_some() || input.format_options.is_some()
+    if query.len() > MAX_QUERY_BYTES
+        || query.contains('\0')
+        || input.limit == Some(0)
+        || input.position.is_some()
+        || input.line.is_some()
+        || input.range.is_some()
+        || input.apply.is_some()
+        || input.new_name.is_some()
+        || input.new_file.is_some()
+        || input.action_id.is_some()
+        || input.refactor_id.is_some()
+        || input.completion_id.is_some()
+        || input.snippet_values.is_some()
+        || input.hierarchy_id.is_some()
+        || input.method.is_some()
+        || input.payload.is_some()
+        || input.only.is_some()
+        || input.after.is_some()
+        || input.format_options.is_some()
     {
-        return Err(tool_err("LSP_USAGE", "workspace symbols accept only anchor, query (up to 1024 bytes without NUL), positive limit, resolve and timeout"));
+        return Err(tool_err(
+            "LSP_USAGE",
+            "workspace symbols accept only anchor, query (up to 1024 bytes without NUL), positive limit, resolve and timeout",
+        ));
     }
     Ok((anchor, query))
 }
@@ -44,19 +67,28 @@ fn resolve_supported(capabilities: &Value) -> Result<bool> {
         // Missing metadata is not evidence of lazy resolution support. Keep
         // older servers' ordinary workspace/symbol request behavior.
         None | Some(Value::Null | Value::Bool(true)) => Ok(false),
-        Some(Value::Bool(false)) => Err(tool_err("LSP_UNSUPPORTED", "server disabled workspace symbols")),
+        Some(Value::Bool(false)) => Err(tool_err(
+            "LSP_UNSUPPORTED",
+            "server disabled workspace symbols",
+        )),
         Some(Value::Object(options)) => match options.get("resolveProvider") {
             None => Ok(false),
             Some(Value::Bool(supported)) => Ok(*supported),
-            _ => Err(malformed("workspace symbol resolveProvider must be boolean")),
+            _ => Err(malformed(
+                "workspace symbol resolveProvider must be boolean",
+            )),
         },
-        _ => Err(malformed("workspaceSymbolProvider must be boolean or options")),
+        _ => Err(malformed(
+            "workspaceSymbolProvider must be boolean or options",
+        )),
     }
 }
 
 fn range(value: &Value) -> Result<()> {
     let position = |key: &str| -> Result<(usize, usize)> {
-        let position = value.get(key).ok_or_else(|| malformed("symbol range needs start and end"))?;
+        let position = value
+            .get(key)
+            .ok_or_else(|| malformed("symbol range needs start and end"))?;
         Ok((uint(&position["line"])?, uint(&position["character"])?))
     };
     if position("start")? > position("end")? {
@@ -69,7 +101,10 @@ fn range(value: &Value) -> Result<()> {
 /// Unknown numeric kinds/tags are preserved rather than treated as known ones.
 fn item(value: &Value) -> Result<bool> {
     bounded_size(value, MAX_ITEM_BYTES)?;
-    if value.get("name").and_then(Value::as_str).is_none_or(str::is_empty)
+    if value
+        .get("name")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
         || uint(&value["kind"])? == 0
     {
         return Err(malformed("workspace symbol needs a name and positive kind"));
@@ -85,13 +120,20 @@ fn item(value: &Value) -> Result<bool> {
         return Err(malformed("symbol deprecated must be boolean"));
     }
     if let Some(tags) = value.get("tags").filter(|v| !v.is_null()) {
-        for tag in tags.as_array().ok_or_else(|| malformed("symbol tags must be an array"))? {
+        for tag in tags
+            .as_array()
+            .ok_or_else(|| malformed("symbol tags must be an array"))?
+        {
             uint(tag)?;
         }
     }
-    let location = value.get("location").and_then(Value::as_object)
+    let location = value
+        .get("location")
+        .and_then(Value::as_object)
         .ok_or_else(|| malformed("workspace symbol needs a location"))?;
-    let uri = location.get("uri").and_then(Value::as_str)
+    let uri = location
+        .get("uri")
+        .and_then(Value::as_str)
         .filter(|uri| !uri.is_empty() && uri.len() <= 8192 && !uri.chars().any(char::is_control))
         .ok_or_else(|| malformed("symbol location needs a bounded URI"))?;
     url::Url::parse(uri).map_err(|_| malformed("symbol location URI must be absolute"))?;
@@ -111,9 +153,14 @@ fn items(raw: &Value) -> Result<&[Value]> {
         _ => return Err(malformed("workspace/symbol must return an array or null")),
     };
     if items.len() > MAX_SERVER_ITEMS {
-        return Err(tool_err("LSP_SEMANTIC_LIMIT", "server returned more than 4096 workspace symbols"));
+        return Err(tool_err(
+            "LSP_SEMANTIC_LIMIT",
+            "server returned more than 4096 workspace symbols",
+        ));
     }
-    for value in items { item(value)?; }
+    for value in items {
+        item(value)?;
+    }
     Ok(items)
 }
 
@@ -124,25 +171,45 @@ fn resolved(original: &Value, result: Value) -> Result<Value> {
         return Err(malformed("resolved symbol still has no location range"));
     }
     let mut identity = result.clone();
-    identity["location"].as_object_mut().ok_or_else(|| malformed("missing location"))?.remove("range");
+    identity["location"]
+        .as_object_mut()
+        .ok_or_else(|| malformed("missing location"))?
+        .remove("range");
     if &identity != original {
-        return Err(tool_err("LSP_SYMBOL_CHANGED", "workspaceSymbol/resolve changed symbol identity or unnegotiated properties"));
+        return Err(tool_err(
+            "LSP_SYMBOL_CHANGED",
+            "workspaceSymbol/resolve changed symbol identity or unnegotiated properties",
+        ));
     }
     Ok(result)
 }
 
 impl LspTool {
-    pub(in crate::lsp) async fn run_workspace_symbols(&self, input: &LspInput) -> Result<ToolOutput> {
+    pub(in crate::lsp) async fn run_workspace_symbols(
+        &self,
+        input: &LspInput,
+    ) -> Result<ToolOutput> {
         let (anchor, query) = request(input)?;
         let budget = Budget::new(self.request_timeout(input));
         let source = Source::open_file(self, anchor, &budget, |_| Ok(())).await?;
         let can_resolve = resolve_supported(&source.entry.client.capabilities().raw)?;
         let resolve = input.resolve == Some(true);
         if resolve && !can_resolve {
-            return Err(tool_err("LSP_UNSUPPORTED", "server does not advertise workspace symbol resolution; omit resolve for inline locations"));
+            return Err(tool_err(
+                "LSP_UNSUPPORTED",
+                "server does not advertise workspace symbol resolution; omit resolve for inline locations",
+            ));
         }
         source.verify(&budget)?;
-        let raw = source.entry.client.call("workspace/symbol", json!({"query":query}), budget.remaining()?).await?;
+        let raw = source
+            .entry
+            .client
+            .call(
+                "workspace/symbol",
+                json!({"query":query}),
+                budget.remaining()?,
+            )
+            .await?;
         source.verify(&budget)?;
         let all = items(&raw)?;
         let limit = input.limit.unwrap_or(50).min(MAX_ITEMS);
@@ -165,24 +232,39 @@ impl LspTool {
         for original in all.iter().take(limit) {
             budget.remaining()?;
             let original_size = bounded_size(original, MAX_ITEM_BYTES)?;
-            if original_size + 1 > remaining { break; }
+            if original_size + 1 > remaining {
+                break;
+            }
             let has_location = original["location"].get("range").is_some();
             let value = if resolve && !has_location {
                 source.verify(&budget)?;
-                let result = source.entry.client.call(
-                    "workspaceSymbol/resolve", original.clone(), budget.remaining()?,
-                ).await?;
+                let result = source
+                    .entry
+                    .client
+                    .call(
+                        "workspaceSymbol/resolve",
+                        original.clone(),
+                        budget.remaining()?,
+                    )
+                    .await?;
                 source.verify(&budget)?;
                 let result = resolved(original, result)?;
                 resolved_count += 1;
                 result
-            } else { original.clone() };
+            } else {
+                original.clone()
+            };
             let bytes = bounded_size(&value, MAX_ITEM_BYTES)?;
             if bytes + 1 > remaining {
-                return Err(tool_err("LSP_SEMANTIC_LIMIT", "resolved symbol output exceeds its byte budget; request fewer results"));
+                return Err(tool_err(
+                    "LSP_SEMANTIC_LIMIT",
+                    "resolved symbol output exceeds its byte budget; request fewer results",
+                ));
             }
             remaining -= bytes + 1;
-            if !has_location && !resolve { unresolved.push(retained.len() + 1); }
+            if !has_location && !resolve {
+                unresolved.push(retained.len() + 1);
+            }
             retained.push(value);
         }
         let truncated = retained.len() != all.len();
@@ -198,7 +280,10 @@ impl LspTool {
         let text = payload.to_string();
         budget.remaining()?;
         // Retain the existing symbols details envelope for both query forms.
-        Ok(text_output(text, json!({"truncated":truncated,"payload":payload})))
+        Ok(text_output(
+            text,
+            json!({"truncated":truncated,"payload":payload}),
+        ))
     }
 }
 
