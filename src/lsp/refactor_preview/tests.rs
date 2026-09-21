@@ -230,19 +230,21 @@ fn selected_refactor_rejects_all_overriding_selectors() {
             json!({"start":{"line":0,"character":0},"end":{"line":0,"character":1}}),
         ),
     ] {
-        let mut raw = json!({"action":"rename","refactorId":"test"});
-        raw[key] = value;
-        let input: LspInput = serde_json::from_value(raw).unwrap();
-        assert!(validate_selection(&input).is_err(), "{key}");
+        for action in ["rename", "rename_file", "code_actions", "format"] {
+            let mut raw = json!({"action":action,"refactorId":"test"});
+            raw[key] = value.clone();
+            let input: LspInput = serde_json::from_value(raw).unwrap();
+            assert!(validate_selection(&input).is_err(), "{action}: {key}");
+        }
     }
     for raw in [
-        json!({"action":"format","refactorId":"test"}),
+        json!({"action":"diagnostics","refactorId":"test"}),
         json!({"action":"rename","refactorId":""}),
         json!({"action":"rename","refactorId":"x".repeat(129)}),
     ] {
         assert!(validate_selection(&serde_json::from_value(raw).unwrap()).is_err());
     }
-    for action in ["rename", "rename_file"] {
+    for action in ["rename", "rename_file", "code_actions", "format"] {
         let input: LspInput = serde_json::from_value(
             json!({"action":action,"refactorId":"test","apply":true,"timeout":10}),
         )

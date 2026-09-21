@@ -51,7 +51,7 @@ pub(super) fn validate_selection(input: &LspInput) -> Result<()> {
     };
     if !matches!(
         input.action.as_str(),
-        "rename" | "rename_file" | "code_actions"
+        "rename" | "rename_file" | "code_actions" | "format"
     ) || id.is_empty()
         || id.len() > 128
         || input.file.is_some()
@@ -286,6 +286,20 @@ impl LspTool {
         metadata["applied"] = json!(true);
         metadata["preview"] = json!(false);
         metadata["filesChanged"] = json!(files);
+        if input.action == "format" {
+            metadata["previewOnly"] = json!(false);
+            // A reviewed no-op is consumed and checked but does not represent
+            // a file mutation. Keep the formatter's applied/changed contract.
+            metadata["applied"] = json!(metadata["changed"] == true);
+            if metadata["changed"] != true {
+                metadata["filesChanged"] = json!([]);
+            }
+            metadata["note"] = json!("Approved the exact staged formatting plan without another formatter request.");
+            let fields = metadata.as_object_mut().expect("constructed refactor metadata");
+            fields.remove("edits");
+            fields.remove("previewTruncated");
+            fields.remove("workspaceEditComplete");
+        }
         if input.action == "rename_file" {
             metadata["importUpdates"] = json!(files);
         }
