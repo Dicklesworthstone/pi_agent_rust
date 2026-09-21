@@ -41,6 +41,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/agent_cx.rs` | Agent context | Unit; covered through agent/RPC suites. |
 | `src/agent_cx/http.rs` | Agent context HTTP | Unit; covered through agent/RPC suites. |
 | `src/agent_cx/process.rs` | Agent context process execution | Unit; covered through agent/RPC suites. |
+| `src/agent_cx/process/capture.rs` | Agent context process output capture | Unit; in-module tests. |
 | `src/agent_hub.rs` | Agent hub registry (bd-cv653.5.3): session-scoped roster of spawned child agents | Unit (7 tests); `tests/agent_hub.rs`. |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
 | `src/approval.rs` | Tool approval flow | `tests/e2e_plan_mode.rs`, `tests/e2e_rpc.rs` approval paths. |
@@ -203,6 +204,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/actions/refactor.rs` | LSP symbol rename and refactor operations | Unit; `src/lsp/actions/refactor/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/actions/refactor/formatting.rs` | LSP document and range formatting | Unit; `src/lsp/actions/refactor/formatting/tests.rs`. |
 | `src/lsp/actions/refactor/formatting/tests.rs` | LSP document formatting test suite | Test module; document formatting tests. |
+| `src/lsp/actions/refactor/formatting/review_tests.rs` | LSP document formatting review test suite | Test module; document formatting review tests. |
 | `src/lsp/actions/refactor/prepare.rs` | LSP rename preparation and target confirmation | Unit; `src/lsp/actions/refactor/prepare/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/actions/refactor/prepare/tests.rs` | LSP rename preparation test suite | Test module; prepare rename tests. |
 | `src/lsp/actions/refactor/prepare/tests/protocol.rs` | LSP rename preparation protocol test cases | Test support module; exercises prepare rename protocol. |
@@ -247,8 +249,14 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/semantic.rs` | LSP semantic inspection, signature help, and inlay hints | Unit; `src/lsp/semantic/tests.rs`, `src/lsp/semantic/tests/hints.rs`. |
 | `src/lsp/semantic/hints.rs` | LSP inlay hints resolution and parameter/type hints | Unit; `src/lsp/semantic/hints/tests.rs`. |
 | `src/lsp/semantic/hints/tests.rs` | LSP inlay hints parser and contract test suite | Test module; inlay hint tests. |
+| `src/lsp/semantic/navigation.rs` | LSP exact source-bound definition, reference, and hover navigation | Unit; `src/lsp/semantic/navigation/tests.rs`, `tests/lsp.rs`. |
+| `src/lsp/semantic/navigation/protocol.rs` | LSP source-bound navigation protocol test cases | Test support module; exercises navigation protocol. |
+| `src/lsp/semantic/navigation/tests.rs` | LSP source-bound navigation test suite | Test module; navigation tests. |
 | `src/lsp/semantic/signatures.rs` | LSP signature help, parameter doc extraction, and overload resolution | Unit; `src/lsp/semantic/signatures/tests.rs`. |
 | `src/lsp/semantic/signatures/tests.rs` | LSP signature help parsing and formatting test suite | Test module; signature help tests. |
+| `src/lsp/semantic/symbols.rs` | LSP workspace symbol search and lazy location resolution | Unit; `src/lsp/semantic/symbols/tests.rs`, `tests/lsp.rs`. |
+| `src/lsp/semantic/symbols/tests.rs` | LSP workspace symbol test suite | Test module; workspace symbol tests. |
+| `src/lsp/semantic/symbols/tests/protocol.rs` | LSP workspace symbol protocol test cases | Test support module; exercises symbol protocol. |
 | `src/lsp/semantic/tests.rs` | LSP semantic inspection and signature help integration test suite | Test module; semantic inspection tests. |
 | `src/lsp/semantic/tests/hints.rs` | LSP inlay hint integration and resolve scenario tests | Test module; inlay hint integration tests. |
 | `src/lsp/text.rs` | LSP text mapping | `tests/lsp.rs`. |
