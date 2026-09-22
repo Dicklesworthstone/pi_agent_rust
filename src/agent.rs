@@ -21078,6 +21078,56 @@ mod tests {
         });
     }
 
+    /// bd-wfcu7: the github tool declares a process effect, so plan mode must
+    /// refuse it through the real dispatch path before any `gh` is spawned.
+    #[cfg(unix)]
+    #[test]
+    fn plan_gate_refuses_github_before_spawning_gh() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let spawned = temp.path().join("gh-was-spawned");
+            let stub = temp.path().join("gh");
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\ntouch '{}'\nprintf '[]'\n", spawned.display()),
+            )
+            .expect("write gh stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod gh stub");
+            let tools = ToolRegistry::from_tools(vec![Box::new(crate::github::GithubTool::new(
+                temp.path(),
+                Some(stub.to_str().expect("utf-8 path")),
+            ))]);
+            let agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            agent.plan_state().enter_planning();
+
+            let call = ToolCall {
+                id: "gh1".to_string(),
+                name: "github".to_string(),
+                arguments: json!({"op": "run_list", "repo": "o/r"}),
+                thought_signature: None,
+            };
+            let (output, is_error) = agent
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .await;
+            assert!(is_error, "github must be blocked while planning");
+            let text = match &output.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(text.contains("PLAN_MODE_BLOCKED"), "gate error: {text}");
+            assert!(
+                !spawned.exists(),
+                "plan mode must refuse before gh is spawned"
+            );
+        });
+    }
+
     #[test]
     fn plan_gate_xdev_run_uses_inner_tool_effects() {
         let runtime = RuntimeBuilder::current_thread()

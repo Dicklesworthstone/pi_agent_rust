@@ -714,7 +714,6 @@ impl GithubTool {
         on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     ) -> Result<ToolOutput> {
         let run_id = parse_workflow_run_id(input)?;
-        let repo = self.resolve_repo(repo_arg).await?;
         let budget = Duration::from_secs(
             input
                 .get("timeout_secs")
@@ -722,7 +721,10 @@ impl GithubTool {
                 .unwrap_or(DEFAULT_WATCH_TIMEOUT_SECS)
                 .clamp(10, 6 * 3600),
         );
+        // The budget covers the whole call, including repository resolution,
+        // which runs its own `git` subprocess.
         let started = Instant::now();
+        let repo = self.resolve_repo(repo_arg).await?;
         let mut poll = Duration::from_secs(2);
         loop {
             let elapsed = started.elapsed();
@@ -1409,6 +1411,40 @@ mod tests {
         assert!(
             !leak_path.exists(),
             "descendant survived timeout and performed a delayed side effect"
+        );
+    }
+
+    /// bd-wfcu7: a run that never completes ends the watch at its total
+    /// budget, not after an unbounded sequence of polls.
+    #[cfg(unix)]
+    #[test]
+    fn run_watch_ends_at_its_total_budget_when_the_run_never_completes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '{\"status\":\"in_progress\",\"conclusion\":null}'\n",
+        )
+        .expect("write gh stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod gh stub");
+        let tool = GithubTool::new(dir.path(), Some(stub.to_str().expect("utf-8 path")));
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime build");
+        let started = Instant::now();
+        let err = runtime.block_on(async {
+            tool.op_run_watch(&json!({"run_id": 7, "timeout_secs": 10}), Some("o/r"), None)
+                .await
+                .expect_err("a run that never completes must time out")
+        });
+        let elapsed = started.elapsed();
+        assert!(err.to_string().contains("GH_WATCH_TIMEOUT"), "err: {err}");
+        assert!(
+            elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(20),
+            "watch must end at its 10s budget, took {elapsed:?}"
         );
     }
 
