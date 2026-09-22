@@ -2,9 +2,10 @@
 //!
 //! Reads are bounded by the tool read limit; writes accept at most 16 MiB of
 //! decoded data. Unix read/write handles are opened through no-follow pinned
-//! parents and validated before data I/O. Writes remain in-place, not atomic
-//! transactions; storage failure can leave a partial update. Other operations
-//! and concurrent directory relocation require additional race hardening.
+//! parents and validated before data I/O. Writes stage complete data before
+//! atomic publication; errors distinguish unpublished writes from published
+//! writes whose durability is uncertain. Other operations and concurrent
+//! directory relocation require additional race hardening.
 
 use super::{
     CapabilityManifest, Error, ExtensionPolicy, FsConnector, FsOp, FsScopes, HostCallError,
@@ -16,8 +17,10 @@ use serde_json::{Value, json};
 use sha2::Digest as _;
 use std::borrow::Cow;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+mod atomic_write;
 
 // ============================================================================
 // Connectors
@@ -579,6 +582,10 @@ fn open_io_parent(path: &Path, create: bool) -> std::io::Result<(fs::File, &std:
                     Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(error) => return Err(error.into()),
                 }
+                // Persist each newly created parent link, not just the final
+                // file's directory. Otherwise a durable rename into a fresh
+                // directory can still disappear with an unsynced ancestor.
+                directory.sync_all()?;
                 // Also checks a racing creator: directories only, no links.
                 openat(&directory, part, flags, Mode::empty())?
             }
@@ -732,15 +739,7 @@ fn fs_op_read(params: &Value, path: &Path) -> std::result::Result<Value, HostCal
 }
 
 fn fs_op_write(params: &Value, path: &Path) -> std::result::Result<Value, HostCallError> {
-    // Validate size/encoding before parent creation or opening the destination.
-    let bytes = write_data(params, FS_WRITE_MAX_BYTES)?;
-    let (mut file, _) = open_regular_file(path, true)?;
-    file.set_len(0)
-        .map_err(|error| fs_path_error("truncate", path, &error))?;
-    file.write_all(&bytes)
-        .map_err(|error| fs_path_error("write", path, &error))?;
-
-    Ok(json!({ "bytes_written": bytes.len() }))
+    atomic_write::write(params, path)
 }
 
 fn fs_op_list(path: &Path) -> std::result::Result<Value, HostCallError> {
