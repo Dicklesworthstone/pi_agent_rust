@@ -491,13 +491,19 @@ fn append_plan_checkpoint(session: &mut Session, inner: &PlanStateInner) {
 }
 
 fn decode_plan_checkpoint(data: &serde_json::Value, session_id: &str) -> Result<PlanCheckpoint> {
-    let object = data.as_object().ok_or_else(|| checkpoint_error("expected a checkpoint object"))?;
+    let object = data
+        .as_object()
+        .ok_or_else(|| checkpoint_error("expected a checkpoint object"))?;
     if object.len() != 4
-        || object.keys().any(|key| !matches!(key.as_str(), "schema" | "sessionId" | "mode" | "plan"))
+        || object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "schema" | "sessionId" | "mode" | "plan"))
         || object.get("schema").and_then(serde_json::Value::as_str) != Some(PLAN_CHECKPOINT_SCHEMA)
         || object.get("sessionId").and_then(serde_json::Value::as_str) != Some(session_id)
     {
-        return Err(checkpoint_error("unsupported checkpoint schema, fields or session identity"));
+        return Err(checkpoint_error(
+            "unsupported checkpoint schema, fields or session identity",
+        ));
     }
     let mode = match object.get("mode").and_then(serde_json::Value::as_str) {
         Some("off") => PlanMode::Off,
@@ -514,21 +520,29 @@ fn decode_plan_checkpoint(data: &serde_json::Value, session_id: &str) -> Result<
     // Validate borrowed data BEFORE cloning. Malformed or oversized records
     // must not trigger an unbounded copy, or fall back to an older approval.
     if !valid_checkpoint_plan(mode, plan) {
-        return Err(checkpoint_error("checkpoint plan is missing, empty, oversized or inconsistent with its mode"));
+        return Err(checkpoint_error(
+            "checkpoint plan is missing, empty, oversized or inconsistent with its mode",
+        ));
     }
-    Ok(PlanCheckpoint { mode, plan: plan.map(Arc::from) })
+    Ok(PlanCheckpoint {
+        mode,
+        plan: plan.map(Arc::from),
+    })
 }
 
 fn latest_plan_checkpoint(session: &Session) -> Result<Option<PlanCheckpoint>> {
     let mut cursor = session.leaf_id();
     for _ in 0..MAX_CHECKPOINT_ANCESTORS {
         let Some(id) = cursor else { return Ok(None) };
-        let entry = session.get_entry(id).ok_or_else(|| {
-            checkpoint_error("current branch has a missing ancestor")
-        })?;
+        let entry = session
+            .get_entry(id)
+            .ok_or_else(|| checkpoint_error("current branch has a missing ancestor"))?;
         if let crate::session::SessionEntry::Custom(custom) = entry {
             if custom.custom_type == PLAN_CHECKPOINT_TYPE {
-                let data = custom.data.as_ref().ok_or_else(|| checkpoint_error("checkpoint has no data"))?;
+                let data = custom
+                    .data
+                    .as_ref()
+                    .ok_or_else(|| checkpoint_error("checkpoint has no data"))?;
                 return decode_plan_checkpoint(data, &session.header.id).map(Some);
             }
             // Older clients journal only mode changes. Such a newer change
@@ -539,7 +553,9 @@ fn latest_plan_checkpoint(session: &Session) -> Result<Option<PlanCheckpoint>> {
         }
         cursor = entry.base().parent_id.as_deref();
     }
-    Err(checkpoint_error("current branch exceeds the checkpoint ancestry budget or contains a cycle"))
+    Err(checkpoint_error(
+        "current branch exceeds the checkpoint ancestry budget or contains a cycle",
+    ))
 }
 
 impl AgentSessionHandle {
@@ -553,7 +569,10 @@ impl AgentSessionHandle {
         check_owner(owner, save_enabled)?;
         let store = self.session_store();
         let mut session = store.try_lock_owned().map_err(|_| {
-            control_error("PLAN_SESSION_BUSY", "session busy; no checkpoint was appended")
+            control_error(
+                "PLAN_SESSION_BUSY",
+                "session busy; no checkpoint was appended",
+            )
         })?;
         let previous = latest_plan_checkpoint(&session)?;
         let state = self.session().agent.plan_state();
@@ -590,16 +609,27 @@ impl AgentSessionHandle {
         check_owner(owner, save_enabled)?;
         let store = self.session_store();
         let mut session = store.try_lock_owned().map_err(|_| {
-            control_error("PLAN_SESSION_BUSY", "session busy; no checkpoint was restored")
+            control_error(
+                "PLAN_SESSION_BUSY",
+                "session busy; no checkpoint was restored",
+            )
         })?;
         let checkpoint = latest_plan_checkpoint(&session)?.ok_or_else(|| {
-            control_error("PLAN_CHECKPOINT_MISSING", "this branch has no current recoverable plan checkpoint")
+            control_error(
+                "PLAN_CHECKPOINT_MISSING",
+                "this branch has no current recoverable plan checkpoint",
+            )
         })?;
         let state = self.session().agent.plan_state();
-        let mode = restore_checkpoint_in_memory(self, &state, &store, &mut session, owner, checkpoint)?;
+        let mode =
+            restore_checkpoint_in_memory(self, &state, &store, &mut session, owner, checkpoint)?;
         self.session_mut().invalidate_background_compaction();
         let persistence = persist(&mut session, owner, save_enabled).await;
-        Ok(PlanChange { mode, changed: true, persistence })
+        Ok(PlanChange {
+            mode,
+            changed: true,
+            persistence,
+        })
     }
 }
 
@@ -612,11 +642,15 @@ fn restore_checkpoint_in_memory(
     owner: &AgentCx,
     checkpoint: PlanCheckpoint,
 ) -> Result<PlanMode> {
-    let mut inner = state.inner.try_write().map_err(|_| {
-        control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable")
-    })?;
+    let mut inner = state
+        .inner
+        .try_write()
+        .map_err(|_| control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable"))?;
     if inner.plan.is_some() || inner.session_pin.is_some() {
-        return Err(control_error("PLAN_ALREADY_ACTIVE", "cannot restore over a live plan or its owned context"));
+        return Err(control_error(
+            "PLAN_ALREADY_ACTIVE",
+            "cannot restore over a live plan or its owned context",
+        ));
     }
     let save_enabled = handle.session().save_enabled();
     check_owner(owner, save_enabled)?;
@@ -624,7 +658,13 @@ fn restore_checkpoint_in_memory(
         PlanMode::PendingApproval | PlanMode::Approved => PlanMode::PendingApproval,
         PlanMode::Off | PlanMode::Planning => checkpoint.mode,
     };
-    install_checkpointed_submit(&mut handle.session_mut().agent, state, store, session, save_enabled);
+    install_checkpointed_submit(
+        &mut handle.session_mut().agent,
+        state,
+        store,
+        session,
+        save_enabled,
+    );
     inner.mode = mode;
     // Decoding allocated new text; persisted data cannot reconstruct a live
     // PlanReview capability even when resuming through the very same store.
@@ -663,11 +703,21 @@ struct CheckpointedSubmitPlan {
 
 #[async_trait::async_trait]
 impl Tool for CheckpointedSubmitPlan {
-    fn name(&self) -> &str { self.native.name() }
-    fn label(&self) -> &str { self.native.label() }
-    fn description(&self) -> &str { self.native.description() }
-    fn parameters(&self) -> serde_json::Value { self.native.parameters() }
-    fn effects(&self) -> ToolEffects { self.native.effects() }
+    fn name(&self) -> &str {
+        self.native.name()
+    }
+    fn label(&self) -> &str {
+        self.native.label()
+    }
+    fn description(&self) -> &str {
+        self.native.description()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        self.native.parameters()
+    }
+    fn effects(&self) -> ToolEffects {
+        self.native.effects()
+    }
 
     async fn execute(
         &self,
@@ -678,13 +728,19 @@ impl Tool for CheckpointedSubmitPlan {
         let owner = AgentCx::for_current_or_request();
         check_owner(&owner, false)?;
         let store = self.store.upgrade().ok_or_else(|| {
-            control_error("PLAN_SESSION_CHANGED", "the submission's session is no longer available")
+            control_error(
+                "PLAN_SESSION_CHANGED",
+                "the submission's session is no longer available",
+            )
         })?;
         let mut session = store.try_lock_owned().map_err(|_| {
             control_error("PLAN_SESSION_BUSY", "session busy; plan was not submitted")
         })?;
         if session.header.id != self.session_id {
-            return Err(control_error("PLAN_SESSION_CHANGED", "the submission belongs to another session"));
+            return Err(control_error(
+                "PLAN_SESSION_CHANGED",
+                "the submission belongs to another session",
+            ));
         }
         let mut output = self.native.execute(tool_call_id, input, on_update).await?;
         if output.is_error {
@@ -695,7 +751,9 @@ impl Tool for CheckpointedSubmitPlan {
         let captured = record_submitted_checkpoint(&mut session, &store, &self.state);
         let persistence = match captured {
             Ok(()) => persist(&mut session, &owner, self.save_enabled).await,
-            Err(error) => PlanPersistence::Unconfirmed { reason: error.to_string() },
+            Err(error) => PlanPersistence::Unconfirmed {
+                reason: error.to_string(),
+            },
         };
         let label = match &persistence {
             PlanPersistence::Saved => "saved",
@@ -703,8 +761,15 @@ impl Tool for CheckpointedSubmitPlan {
             PlanPersistence::Unchanged => "unchanged",
             PlanPersistence::Unconfirmed { .. } => "unconfirmed",
         };
-        if let Some(details) = output.details.as_mut().and_then(serde_json::Value::as_object_mut) {
-            details.insert("checkpointPersistence".to_string(), serde_json::json!(label));
+        if let Some(details) = output
+            .details
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            details.insert(
+                "checkpointPersistence".to_string(),
+                serde_json::json!(label),
+            );
         }
         if matches!(persistence, PlanPersistence::Unconfirmed { .. }) {
             // Keep filesystem paths and other persistence diagnostics out of
@@ -719,13 +784,22 @@ impl Tool for CheckpointedSubmitPlan {
     }
 }
 
-fn record_submitted_checkpoint(session: &mut Session, store: &Arc<Store>, state: &PlanState) -> Result<()> {
+fn record_submitted_checkpoint(
+    session: &mut Session,
+    store: &Arc<Store>,
+    state: &PlanState,
+) -> Result<()> {
     let inner = state.inner.try_read().map_err(|_| {
-        control_error("PLAN_STATE_UNAVAILABLE", "plan submitted but checkpoint state is unavailable")
+        control_error(
+            "PLAN_STATE_UNAVAILABLE",
+            "plan submitted but checkpoint state is unavailable",
+        )
     })?;
     pin_owner(&inner, store, session)?;
     if !valid_checkpoint_plan(inner.mode, inner.plan.as_deref()) {
-        return Err(checkpoint_error("submitted plan state cannot be checkpointed"));
+        return Err(checkpoint_error(
+            "submitted plan state cannot be checkpointed",
+        ));
     }
     append_plan_transition(session, &inner, inner.mode.as_str());
     Ok(())
@@ -741,29 +815,42 @@ mod checkpoint_tests {
     use crate::session::SessionEntry;
     use serde_json::{Value, json};
 
-    const TEXT: &str = "Goal: retain this proposal. Steps: edit the named file. Verification: inspect the result.";
+    const TEXT: &str =
+        "Goal: retain this proposal. Steps: edit the named file. Verification: inspect the result.";
 
     fn run<F: std::future::Future>(future: F) -> F::Output {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
-            .build().unwrap().block_on(future)
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn handle(session: Session, save: bool) -> AgentSessionHandle {
-        let provider = Arc::new(crate::providers::openai::OpenAIProvider::new("checkpoint-fixture")
-            .with_base_url("http://127.0.0.1:1/v1"));
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("checkpoint-fixture")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
         let agent = crate::agent::Agent::new(
             provider,
             crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
             crate::agent::AgentConfig {
                 system_prompt: Some("fresh session instructions".to_string()),
-                approval_state: Some(ApprovalState::new(ApprovalMode::AlwaysAsk, true, Vec::new())),
+                approval_state: Some(ApprovalState::new(
+                    ApprovalMode::AlwaysAsk,
+                    true,
+                    Vec::new(),
+                )),
                 ..crate::agent::AgentConfig::default()
             },
         );
         AgentSessionHandle::from_session_with_listeners(
-            crate::agent::AgentSession::new(agent, Arc::new(Store::new(session)), save,
-                crate::compaction::ResolvedCompactionSettings::default()),
+            crate::agent::AgentSession::new(
+                agent,
+                Arc::new(Store::new(session)),
+                save,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            ),
             crate::sdk::EventListeners::default(),
         )
     }
@@ -782,16 +869,24 @@ mod checkpoint_tests {
     }
 
     fn submit(handle: &AgentSessionHandle) -> ToolOutput {
-        run(submission_tool(handle).execute("submit", json!({
-            "plan": TEXT, "files": ["src/hello world.rs", "文档/a,b.md"]
-        }), None)).unwrap()
+        run(submission_tool(handle).execute(
+            "submit",
+            json!({
+                "plan": TEXT, "files": ["src/hello world.rs", "文档/a,b.md"]
+            }),
+            None,
+        ))
+        .unwrap()
     }
 
     fn checkpoint(session: &mut Session, mode: &str, text: Option<&str>) -> String {
-        session.append_custom_entry(PLAN_CHECKPOINT_TYPE.to_string(), Some(json!({
-            "schema": PLAN_CHECKPOINT_SCHEMA, "sessionId": session.header.id,
-            "mode": mode, "plan": text,
-        })))
+        session.append_custom_entry(
+            PLAN_CHECKPOINT_TYPE.to_string(),
+            Some(json!({
+                "schema": PLAN_CHECKPOINT_SCHEMA, "sessionId": session.header.id,
+                "mode": mode, "plan": text,
+            })),
+        )
     }
 
     fn count(handle: &AgentSessionHandle) -> usize {
@@ -814,7 +909,12 @@ mod checkpoint_tests {
         let output = submit(&first);
         assert!(!output.is_error);
         assert_eq!(output.details.unwrap()["checkpointPersistence"], "saved");
-        let text = first.pending_plan_review().unwrap().unwrap().text().to_string();
+        let text = first
+            .pending_plan_review()
+            .unwrap()
+            .unwrap()
+            .text()
+            .to_string();
         assert!(text.contains("Files: [\"src/hello world.rs\",\"文档/a,b.md\"]"));
         drop(first);
         let opened = run(Session::open(path.to_str().unwrap())).unwrap();
@@ -823,8 +923,17 @@ mod checkpoint_tests {
         assert_eq!(result.mode, PlanMode::PendingApproval);
         assert_eq!(result.persistence, PlanPersistence::Saved);
         assert_eq!(resumed.pending_plan_review().unwrap().unwrap().text(), text);
-        assert!(!resumed.session().agent.plan_state().allows_effects(ToolEffects::write()));
-        assert_eq!(resumed.session().agent.system_prompt(), Some("fresh session instructions"));
+        assert!(
+            !resumed
+                .session()
+                .agent
+                .plan_state()
+                .allows_effects(ToolEffects::write())
+        );
+        assert_eq!(
+            resumed.session().agent.system_prompt(),
+            Some("fresh session instructions")
+        );
     }
 
     #[test]
@@ -847,14 +956,33 @@ mod checkpoint_tests {
         let state = resumed.session().agent.plan_state();
         let policy = resumed.session().agent.approval_state().unwrap();
         assert_eq!(policy.mode(), ApprovalMode::AlwaysAsk);
-        assert!(policy.evaluate("write", &json!({"path":"src/hello world.rs"}),
-            ToolEffects::write(), Some(&state), None).requires_approval());
+        assert!(
+            policy
+                .evaluate(
+                    "write",
+                    &json!({"path":"src/hello world.rs"}),
+                    ToolEffects::write(),
+                    Some(&state),
+                    None
+                )
+                .requires_approval()
+        );
         let _ = run(resumed.approve_plan_review(&owner, &new)).unwrap();
-        assert!(resumed.session().agent.system_prompt().unwrap().contains(new.text()));
+        assert!(
+            resumed
+                .session()
+                .agent
+                .system_prompt()
+                .unwrap()
+                .contains(new.text())
+        );
         let _ = run(resumed.exit_plan_mode(&owner)).unwrap();
         drop(resumed);
         let mut closed = handle(run(Session::open(path.to_str().unwrap())).unwrap(), false);
-        assert_eq!(run(closed.restore_plan_checkpoint(&owner)).unwrap().mode, PlanMode::Off);
+        assert_eq!(
+            run(closed.restore_plan_checkpoint(&owner)).unwrap().mode,
+            PlanMode::Off
+        );
         assert!(closed.session().agent.plan_state().plan().is_none());
     }
 
@@ -864,10 +992,22 @@ mod checkpoint_tests {
         checkpoint(&mut stored, "planning", Some(TEXT));
         let mut resumed = handle(stored, false);
         let owner = AgentCx::for_request();
-        assert_eq!(run(resumed.restore_plan_checkpoint(&owner)).unwrap().mode, PlanMode::Planning);
+        assert_eq!(
+            run(resumed.restore_plan_checkpoint(&owner)).unwrap().mode,
+            PlanMode::Planning
+        );
         assert!(resumed.pending_plan_review().unwrap().is_none());
-        assert_eq!(resumed.session().agent.plan_state().plan().as_deref(), Some(TEXT));
-        assert!(!resumed.session().agent.plan_state().allows_effects(ToolEffects::process()));
+        assert_eq!(
+            resumed.session().agent.plan_state().plan().as_deref(),
+            Some(TEXT)
+        );
+        assert!(
+            !resumed
+                .session()
+                .agent
+                .plan_state()
+                .allows_effects(ToolEffects::process())
+        );
         assert!(!submit(&resumed).is_error);
         assert!(resumed.pending_plan_review().unwrap().is_some());
     }
@@ -878,11 +1018,18 @@ mod checkpoint_tests {
         let root = stored.append_custom_entry("root".to_string(), None);
         let branch_a = checkpoint(&mut stored, "approved", Some("proposal on branch A"));
         assert!(stored.navigate_to(&root));
-        checkpoint(&mut stored, "pending_approval", Some("proposal on branch B"));
+        checkpoint(
+            &mut stored,
+            "pending_approval",
+            Some("proposal on branch B"),
+        );
         assert!(stored.navigate_to(&branch_a));
         let mut resumed = handle(stored, false);
         let _ = run(resumed.restore_plan_checkpoint(&AgentCx::for_request())).unwrap();
-        assert_eq!(resumed.pending_plan_review().unwrap().unwrap().text(), "proposal on branch A");
+        assert_eq!(
+            resumed.pending_plan_review().unwrap().unwrap().text(),
+            "proposal on branch A"
+        );
     }
 
     #[test]
@@ -908,7 +1055,10 @@ mod checkpoint_tests {
             let mut resumed = handle(stored, false);
             assert!(run(resumed.restore_plan_checkpoint(&AgentCx::for_request())).is_err());
             assert!(resumed.session().agent.plan_state().plan().is_none());
-            assert_eq!(resumed.session().agent.system_prompt(), Some("fresh session instructions"));
+            assert_eq!(
+                resumed.session().agent.system_prompt(),
+                Some("fresh session instructions")
+            );
         }
     }
 
@@ -919,18 +1069,35 @@ mod checkpoint_tests {
         assert!(decode_plan_checkpoint(&valid, "session").is_ok());
         assert!(decode_plan_checkpoint(&valid, "another").is_err());
         for (key, value) in [
-            ("mode", json!("yolo")), ("mode", json!("off")),
-            ("plan", Value::Null), ("plan", json!(7)), ("plan", json!("  \n")),
-            ("plan", json!("é".repeat(super::super::MAX_PLAN_BYTES / 2 + 1))),
-            ("schema", json!("pi.plan.checkpoint.v2")), ("extra", json!(true)),
+            ("mode", json!("yolo")),
+            ("mode", json!("off")),
+            ("plan", Value::Null),
+            ("plan", json!(7)),
+            ("plan", json!("  \n")),
+            (
+                "plan",
+                json!("é".repeat(super::super::MAX_PLAN_BYTES / 2 + 1)),
+            ),
+            ("schema", json!("pi.plan.checkpoint.v2")),
+            ("extra", json!(true)),
         ] {
             let mut invalid = valid.clone();
             invalid[key] = value;
-            assert!(decode_plan_checkpoint(&invalid, "session").is_err(), "key={key}");
+            assert!(
+                decode_plan_checkpoint(&invalid, "session").is_err(),
+                "key={key}"
+            );
         }
         let mut exact = valid;
         exact["plan"] = json!("é".repeat(super::super::MAX_PLAN_BYTES / 2));
-        assert_eq!(decode_plan_checkpoint(&exact, "session").unwrap().plan.unwrap().len(), super::super::MAX_PLAN_BYTES);
+        assert_eq!(
+            decode_plan_checkpoint(&exact, "session")
+                .unwrap()
+                .plan
+                .unwrap()
+                .len(),
+            super::super::MAX_PLAN_BYTES
+        );
     }
 
     #[test]
@@ -939,8 +1106,14 @@ mod checkpoint_tests {
             let mut stored = Session::in_memory();
             checkpoint(&mut stored, "approved", Some(TEXT));
             let leaf = stored.append_custom_entry("ordinary".to_string(), None);
-            let target = if parent == "cycle" { leaf.clone() } else { parent.to_string() };
-            let Some(SessionEntry::Custom(entry)) = stored.get_entry_mut(&leaf) else { panic!("custom") };
+            let target = if parent == "cycle" {
+                leaf.clone()
+            } else {
+                parent.to_string()
+            };
+            let Some(SessionEntry::Custom(entry)) = stored.get_entry_mut(&leaf) else {
+                panic!("custom")
+            };
             entry.base.parent_id = Some(target);
             assert!(latest_plan_checkpoint(&stored).is_err());
         }
@@ -954,7 +1127,10 @@ mod checkpoint_tests {
         assert!(!submit(&live).is_error);
         let before = count(&live);
         for _ in 0..3 {
-            assert_eq!(run(live.checkpoint_plan(&owner)).unwrap(), PlanPersistence::MemoryOnly);
+            assert_eq!(
+                run(live.checkpoint_plan(&owner)).unwrap(),
+                PlanPersistence::MemoryOnly
+            );
             assert_eq!(count(&live), before);
         }
     }
@@ -969,13 +1145,23 @@ mod checkpoint_tests {
         let _ = run(live.enter_plan_mode(&owner)).unwrap();
         let output = submit(&live);
         assert!(!output.is_error);
-        assert_eq!(output.details.as_ref().unwrap()["checkpointPersistence"], "unconfirmed");
-        assert!(!serde_json::to_string(&output.content).unwrap().contains("private-persistence-path"));
+        assert_eq!(
+            output.details.as_ref().unwrap()["checkpointPersistence"],
+            "unconfirmed"
+        );
+        assert!(
+            !serde_json::to_string(&output.content)
+                .unwrap()
+                .contains("private-persistence-path")
+        );
         let review = live.pending_plan_review().unwrap().unwrap();
         let before = count(&live);
         let path = temp.path().join("recovered.jsonl");
         live.session_store().try_lock().unwrap().path = Some(path.clone());
-        assert_eq!(run(live.checkpoint_plan(&owner)).unwrap(), PlanPersistence::Saved);
+        assert_eq!(
+            run(live.checkpoint_plan(&owner)).unwrap(),
+            PlanPersistence::Saved
+        );
         assert_eq!(count(&live), before);
         assert!(review.same_submission(&live.pending_plan_review().unwrap().unwrap()));
         assert!(path.is_file());
@@ -988,7 +1174,11 @@ mod checkpoint_tests {
         let _ = run(live.enter_plan_mode(&AgentCx::for_request())).unwrap();
         let tool = submission_tool(&live);
         let before = count(&live);
-        assert!(run(tool.execute("bad", json!({"plan":"short"}), None)).unwrap().is_error);
+        assert!(
+            run(tool.execute("bad", json!({"plan":"short"}), None))
+                .unwrap()
+                .is_error
+        );
         assert_eq!(count(&live), before);
         let store = live.session_store();
         let held = store.try_lock().unwrap();
@@ -1008,8 +1198,15 @@ mod checkpoint_tests {
         stored.path = Some(path.clone());
         let mut live = handle(stored, false);
         let _ = run(live.enter_plan_mode(&AgentCx::for_request())).unwrap();
-        assert_eq!(submit(&live).details.unwrap()["checkpointPersistence"], "memory_only");
-        assert!(latest_plan_checkpoint(&live.session_store().try_lock().unwrap()).unwrap().is_some());
+        assert_eq!(
+            submit(&live).details.unwrap()["checkpointPersistence"],
+            "memory_only"
+        );
+        assert!(
+            latest_plan_checkpoint(&live.session_store().try_lock().unwrap())
+                .unwrap()
+                .is_some()
+        );
         assert!(!path.exists());
     }
 
@@ -1036,7 +1233,10 @@ mod checkpoint_tests {
         let _ = run(live.enter_plan_mode(&owner)).unwrap();
         assert!(!submit(&live).is_error);
         let old = live.pending_plan_review().unwrap().unwrap();
-        live.session().agent.plan_state().reset_for_session(PlanMode::Planning);
+        live.session()
+            .agent
+            .plan_state()
+            .reset_for_session(PlanMode::Planning);
         let _ = run(live.restore_plan_checkpoint(&owner)).unwrap();
         let new = live.pending_plan_review().unwrap().unwrap();
         assert_eq!(old.text(), new.text());
