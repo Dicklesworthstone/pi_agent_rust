@@ -35,14 +35,14 @@ fn register_in(
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
     Live,
     Cancelled(&'static str),
     Refused(&'static str),
 }
 
-fn disposition(status: Option<ChildStatus>) -> Admission {
+const fn disposition(status: Option<ChildStatus>) -> Admission {
     match status {
         Some(ChildStatus::Starting | ChildStatus::Running) => Admission::Live,
         Some(ChildStatus::Killed) => Admission::Cancelled(OPERATOR_KILLED),
@@ -75,10 +75,9 @@ fn activate_in(hub: &Mutex<AgentHubRegistry>, id: &str, pid: u32) -> Admission {
 
 fn apply_admission(result: &mut SubagentResult, admission: Admission) -> bool {
     match admission {
-        Admission::Live => {}
         Admission::Cancelled(reason) => cancel(result, reason),
         Admission::Refused(reason) if !result.is_error => result.fail(reason.to_string()),
-        Admission::Refused(_) => {}
+        Admission::Live | Admission::Refused(_) => {}
     }
     !result.is_error
 }

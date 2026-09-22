@@ -1625,7 +1625,7 @@ enum McpShutdownOutcome {
 
 /// Outcome of exhaustively stopping resources owned by one SDK session handle.
 #[derive(Debug, Default)]
-pub(crate) struct SessionResourceShutdown {
+pub struct SessionResourceShutdown {
     failures: Vec<String>,
     mcp: McpShutdownOutcome,
 }
@@ -1634,12 +1634,12 @@ const SESSION_MCP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::f
 
 impl SessionResourceShutdown {
     #[must_use]
-    pub(crate) const fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.failures.is_empty()
     }
 
     #[must_use]
-    pub(crate) const fn completed_cleanly(&self) -> bool {
+    pub const fn completed_cleanly(&self) -> bool {
         self.failures.is_empty()
     }
 
@@ -1653,11 +1653,11 @@ impl SessionResourceShutdown {
         )
     }
 
-    pub(crate) fn failures(&self) -> impl Iterator<Item = &str> {
+    pub fn failures(&self) -> impl Iterator<Item = &str> {
         self.failures.iter().map(String::as_str)
     }
 
-    pub(crate) fn messages(&self) -> impl Iterator<Item = &str> {
+    pub fn messages(&self) -> impl Iterator<Item = &str> {
         self.failures.iter().map(String::as_str)
     }
 
@@ -1853,7 +1853,7 @@ impl AgentSessionHandle {
     ///
     /// Final driver exit uses this exhaustive seam: persistence or ownership
     /// failures are reported, but they never skip later independent cleanup.
-    pub(crate) async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
+    pub async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
         let mut report = SessionResourceShutdown::default();
         let cx = crate::agent_cx::AgentCx::for_request();
         let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(

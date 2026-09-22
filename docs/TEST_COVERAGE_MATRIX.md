@@ -52,6 +52,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/auth.rs` | Auth and OAuth | Unit; `tests/auth_oauth_refresh_vcr.rs`, `tests/extensions_provider_oauth.rs`. |
 | `src/autocomplete.rs` | Prompt autocomplete | Unit; interactive coverage via `tests/tui_state.rs`. |
 | `src/bash_mediation.rs` | Bash mediation | `tests/bash_mediation.rs`. |
+| `src/bash_mediation/dcg.rs` | Bash deterministic command generator grammar and constraints | Unit; `tests/bash_mediation.rs`. |
 | `src/bin/pi_legacy_capture.rs` | Legacy capture utility | Unit; opt-in capture utility, not a default user path. |
 | `src/bin/pi_mcp_fixture.rs` | MCP test fixture binary | Waived glue; test-support binary driven by `tests/mcp.rs`. |
 | `src/bpe.rs` | Vendored tiktoken BPE core (bd-w8q6u): rank tables loaded from gzip assets for token counting | Unit (2 tests); exercised through `src/token_count.rs` and its tests. |
@@ -380,6 +381,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/subagents/deadline.rs` | Child subagent deadline and timeout tracking | Unit; `tests/subagent.rs`. |
 | `src/subagents/deadline_tests.rs` | Subagent deadline test cases | Test support module; exercises deadline enforcement. |
 | `src/subagents/execution.rs` | Subagent process execution and lifecycle | Unit; `tests/subagent.rs`. |
+| `src/subagents/execution/ownership.rs` | Subagent execution ownership and registration checkpointing | Unit; `tests/subagent.rs`. |
+| `src/subagents/execution/pipes.rs` | Subagent standard I/O pipe framing and drain loops | Unit; `tests/subagent.rs`. |
 | `src/subagents/execution_tests.rs` | Subagent execution tests | Test support module; exercises subagent runner. |
 | `src/subagents/protocol.rs` | Subagent inter-process protocol messages | Unit; `tests/subagent.rs`. |
 | `src/swarm_activity_ledger.rs` | Swarm activity ledger | Unit; evidence docs in `docs/swarm-activity-ledger.md`, CI evidence bundle tests. |

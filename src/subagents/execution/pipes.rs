@@ -108,10 +108,10 @@ fn next_pipe_frame<R: Read>(
     match pipe.next_frame(chunks_left) {
         Ok(Some(bytes)) => Some(match kind {
             PipeKind::Stderr => PipeFrame::Data(kind, String::from_utf8_lossy(&bytes).into_owned()),
-            PipeKind::Stdout => match String::from_utf8(bytes) {
-                Ok(line) => PipeFrame::Data(kind, line),
-                Err(_) => PipeFrame::Error("PI_SUBAGENT_PROTOCOL: child stdout is not UTF-8"),
-            },
+            PipeKind::Stdout => String::from_utf8(bytes).map_or(
+                PipeFrame::Error("PI_SUBAGENT_PROTOCOL: child stdout is not UTF-8"),
+                |line| PipeFrame::Data(kind, line),
+            ),
         }),
         Ok(None) => None,
         Err(error) => Some(PipeFrame::Error(error)),
@@ -142,7 +142,7 @@ impl<O: Read, E: Read> ChildPipes<O, E> {
         }
     }
 
-    fn is_closed(&self) -> bool {
+    const fn is_closed(&self) -> bool {
         self.stdout.reader.is_none() && self.stderr.reader.is_none()
     }
 
