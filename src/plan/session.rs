@@ -5,6 +5,8 @@
 //! prompt installation together. Neither lock is held by a provider turn.
 //! A transition is committed in memory and journaled before saving. Failure or
 //! cancellation of that save is not a rollback and must not be reported as one.
+//! Persistence uses an owned async session guard, which may migrate with a
+//! Send future. The synchronous plan-state guard never crosses an await.
 
 use super::{PlanMode, PlanReview, PlanState, PlanStateInner};
 use crate::agent_cx::AgentCx;
@@ -304,7 +306,10 @@ async fn change(
     let save_enabled = handle.session().save_enabled();
     check_owner(owner, save_enabled)?;
     let store = handle.session_store();
-    let mut session = store.try_lock().map_err(|_| {
+    // Borrowed asupersync guards are thread-affine. The owned guard keeps the
+    // same nonblocking/exclusive admission contract while allowing migration
+    // during persistence; dropping the future still releases the store.
+    let mut session = store.try_lock_owned().map_err(|_| {
         control_error(
             "PLAN_SESSION_BUSY",
             "session busy; no plan transition was applied",
@@ -547,7 +552,7 @@ impl AgentSessionHandle {
         let save_enabled = self.session().save_enabled();
         check_owner(owner, save_enabled)?;
         let store = self.session_store();
-        let mut session = store.try_lock().map_err(|_| {
+        let mut session = store.try_lock_owned().map_err(|_| {
             control_error("PLAN_SESSION_BUSY", "session busy; no checkpoint was appended")
         })?;
         let previous = latest_plan_checkpoint(&session)?;
@@ -584,7 +589,7 @@ impl AgentSessionHandle {
         let save_enabled = self.session().save_enabled();
         check_owner(owner, save_enabled)?;
         let store = self.session_store();
-        let mut session = store.try_lock().map_err(|_| {
+        let mut session = store.try_lock_owned().map_err(|_| {
             control_error("PLAN_SESSION_BUSY", "session busy; no checkpoint was restored")
         })?;
         let checkpoint = latest_plan_checkpoint(&session)?.ok_or_else(|| {
@@ -675,7 +680,7 @@ impl Tool for CheckpointedSubmitPlan {
         let store = self.store.upgrade().ok_or_else(|| {
             control_error("PLAN_SESSION_CHANGED", "the submission's session is no longer available")
         })?;
-        let mut session = store.try_lock().map_err(|_| {
+        let mut session = store.try_lock_owned().map_err(|_| {
             control_error("PLAN_SESSION_BUSY", "session busy; plan was not submitted")
         })?;
         if session.header.id != self.session_id {
@@ -1052,5 +1057,39 @@ mod checkpoint_tests {
         assert!(run(live.checkpoint_plan(&owner)).is_err());
         assert_eq!(count(&live), before);
         assert_eq!(live.session().agent.plan_state().mode(), PlanMode::Off);
+    }
+
+    #[test]
+    fn checkpoint_and_submission_futures_are_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        let mut live = handle(Session::in_memory(), false);
+        let owner = AgentCx::for_request();
+        assert_send(live.checkpoint_plan(&owner));
+        assert_send(live.restore_plan_checkpoint(&owner));
+        let tool = submission_tool(&live);
+        assert_send(tool.execute("submit", json!({"plan": TEXT}), None));
+    }
+
+    #[test]
+    fn busy_checkpoint_operations_remain_fail_fast_and_leave_history_unchanged() {
+        let mut stored = Session::in_memory();
+        checkpoint(&mut stored, "pending_approval", Some(TEXT));
+        let mut live = handle(stored, false);
+        let before = count(&live);
+        let owner = AgentCx::for_request();
+        let store = live.session_store();
+        let held = store.try_lock_owned().unwrap();
+        for error in [
+            run(live.checkpoint_plan(&owner)).unwrap_err(),
+            run(live.restore_plan_checkpoint(&owner)).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("PLAN_SESSION_BUSY"));
+        }
+        drop(held);
+        assert_eq!(count(&live), before);
+        assert_eq!(live.session().agent.plan_state().mode(), PlanMode::Off);
+        let restored = run(live.restore_plan_checkpoint(&owner)).unwrap();
+        assert_eq!(restored.mode, PlanMode::PendingApproval);
     }
 }
