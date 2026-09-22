@@ -457,6 +457,28 @@ work five times in one day (last: `5d3eb35a`).
   and `AGENT_MAIL_BYPASS=1` (skip) are for the operator, not for agents.
 - The hook files live under `.git/` and are not versioned; reinstall with the
   agent-mail `install_precommit_guard` tool if a fresh clone lacks them.
+- **The guard fails OPEN, and its failure looks like success.** If your commit
+  prints
+
+      WARNING: mcp-agent-mail: no agent-mail archive matches project
+      '/Users/jemanuel/projects/pi_agent_rust'; nothing to guard, allowing
+
+  that does not mean the project is unregistered. It may mean the mailbox
+  database is unreadable, and the guard allows the commit either way. Nothing
+  else signals it, so from the outside an inert guard is indistinguishable
+  from a working one. On 2026-09-21 it had been inert for six days
+  (bd-n0lnc). Diagnose it rather than reading past the line:
+
+      cat ~/.mcp_agent_mail_git_mailbox_repo/.mailbox.activity.lock   # pid, acquired_at
+      ps -p <pid>                                                     # still alive?
+      cat ~/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3.am-recovery-breaker.json
+      ls  ~/.mcp_agent_mail_git_mailbox_repo/*.corrupt-*
+
+  If a live `am` process holds the exclusive storage-root lock, **do not kill
+  it** — a half-finished recovery is how the corrupt snapshots in that
+  directory got there. Escalate to the operator, and until it clears treat
+  reservations as unavailable: announce intent in the bead thread instead, and
+  do not rely on the guard to stop you landing in someone else's file.
 
 ---
 
