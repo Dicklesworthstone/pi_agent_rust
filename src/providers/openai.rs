@@ -3509,6 +3509,31 @@ mod tests {
         assert!(crate::error::is_retryable_error(&error, None, None));
     }
 
+    #[test]
+    fn stream_emits_exactly_one_done_when_transport_ends_after_done_sentinel() {
+        let body = [
+            r#"data: {"choices":[{"delta":{"content":"whole"}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(out.iter().all(Result::is_ok), "complete stream: {out:?}");
+        let done = out
+            .iter()
+            .filter(|item| matches!(item, Ok(StreamEvent::Done { .. })))
+            .count();
+        assert_eq!(done, 1, "a complete stream finishes exactly once: {out:?}");
+        assert!(
+            matches!(out.last(), Some(Ok(StreamEvent::Done { .. }))),
+            "Done must be the terminal item: {out:?}"
+        );
+    }
+
     fn collect_stream_items_from_body(body: &str) -> Vec<Result<StreamEvent>> {
         let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
         let provider = OpenAIProvider::new("gpt-test").with_base_url(base_url);

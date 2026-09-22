@@ -2250,7 +2250,7 @@ async fn run(
     let mcp_manager = if ftui_requested {
         None
     } else {
-        Some(std::sync::Arc::new(pi::mcp::bootstrap_with_project_trust(
+        Some(std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
             &cwd,
             &pi::config::Config::global_dir(),
             &cli.mcp_config,

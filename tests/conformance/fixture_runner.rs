@@ -434,7 +434,8 @@ impl Tool for FixtureMcpClientTool {
         input: Value,
         _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
     ) -> pi::error::Result<pi::tools::ToolOutput> {
-        let manager = pi::mcp::McpManager::bootstrap(&self.cwd, &self.cwd.join("global"), &[])?;
+        let manager =
+            pi::mcp::McpManager::bootstrap(&self.cwd, &self.cwd.join("global"), &[], true)?;
         let op = input.get("op").and_then(Value::as_str).unwrap_or("list");
         let (text, details) = match op {
             "list" => {

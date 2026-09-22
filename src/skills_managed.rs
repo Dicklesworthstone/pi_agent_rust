@@ -65,7 +65,7 @@ fn render_skill_md(name: &str, description: &str, body: &str) -> String {
 /// Read the frontmatter map of an existing SKILL.md (light parse: the
 /// `key: value` lines inside the first `---` fence).
 fn frontmatter_of(path: &Path) -> Option<std::collections::HashMap<String, String>> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = crate::resources::read_resource_file_bounded(path, "skill").ok()?;
     let mut fields = std::collections::HashMap::new();
     let mut inside = false;
     for line in raw.lines() {

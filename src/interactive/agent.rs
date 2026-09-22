@@ -1896,8 +1896,24 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// `pub(super)`: shared with `keybindings`, which promotes the FIFO
     /// successor whenever the user manually resolves the active prompt.
     pub(super) fn activate_next_capability_prompt(&mut self) -> Option<Cmd> {
-        let next = self.capability_prompt_queue.pop_front()?;
-        self.activate_capability_prompt(next)
+        loop {
+            let next = self.capability_prompt_queue.pop_front()?;
+            if self.capability_prompt_is_live(&next.request.id) {
+                return self.activate_capability_prompt(next);
+            }
+            // Its hostcall was cancelled or timed out while it waited; nobody
+            // is left to answer, so it must not occupy the active slot.
+            next.cancel_timer();
+        }
+    }
+
+    /// Whether the manager still awaits an answer for this prompt. A hostcall
+    /// cancelled or timed out on the extension side releases its pending
+    /// entry without telling the TUI, so a displayed prompt can outlive it.
+    fn capability_prompt_is_live(&self, id: &str) -> bool {
+        self.extensions
+            .as_ref()
+            .is_none_or(|manager| manager.ui_request_is_pending(id))
     }
 
     /// Auto-deny path for an elapsed capability-prompt deadline (bd-yllbn).
@@ -1931,6 +1947,12 @@ After approving access in the browser, press Enter in Pi to complete login."
                     && prompt.timer_generation() == timer_generation
             });
             let queue_index = queue_index?;
+            if !self.capability_prompt_is_live(id) {
+                if let Some(orphan) = self.capability_prompt_queue.remove(queue_index) {
+                    orphan.cancel_timer();
+                }
+                return None;
+            }
             let queued = self.capability_prompt_queue.get(queue_index)?;
             if queued.has_time_remaining(now) {
                 let queued = self.capability_prompt_queue.get_mut(queue_index)?;
@@ -1948,6 +1970,14 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.send_extension_ui_response_quiet(response);
             }
             return None;
+        }
+        if !self.capability_prompt_is_live(id) {
+            // The periodic repaint doubles as the liveness probe: an orphaned
+            // overlay is dismissed unanswered and the queue moves on.
+            if let Some(orphan) = self.capability_prompt.take() {
+                orphan.cancel_timer();
+            }
+            return self.activate_next_capability_prompt();
         }
         if self
             .capability_prompt
@@ -6593,6 +6623,57 @@ mod stream_delta_batcher_tests {
         assert!(!manager.ui_request_is_pending("timeout-second"));
         assert!(app.capability_prompt.is_none());
         assert!(app.capability_prompt_queue.is_empty());
+    }
+
+    #[test]
+    fn cancelled_hostcall_dismisses_its_overlay_and_promotes_the_live_successor() {
+        let mut app = build_test_app();
+        let manager = crate::extensions::ExtensionManager::new();
+        let (ui_tx, mut ui_rx) = asupersync::channel::mpsc::channel(4);
+        manager.set_ui_sender(ui_tx);
+        app.extensions = Some(manager.clone());
+
+        let mut first_attempt =
+            Box::pin(manager.request_ui(capability_request("orphan-first", "ext-orphan", "exec")));
+        let first_request = runtime().block_on(async {
+            assert!(futures::poll!(first_attempt.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ui_rx.recv(&cx).await.expect("first prompt reaches TUI")
+        });
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(first_request));
+        let mut second_attempt =
+            Box::pin(manager.request_ui(capability_request("orphan-second", "ext-orphan", "http")));
+        let second_request = runtime().block_on(async {
+            assert!(futures::poll!(second_attempt.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ui_rx.recv(&cx).await.expect("second prompt reaches TUI")
+        });
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(second_request));
+        let (id, generation, timer_generation) =
+            active_capability(&app).expect("first prompt is active");
+        assert_eq!(id, "orphan-first");
+
+        // The extension side gives up (command deadline, cancellation): the
+        // future is dropped and the manager releases its pending entry.
+        drop(first_attempt);
+        assert!(!manager.ui_request_is_pending("orphan-first"));
+
+        let successor_wake = app.handle_pi_message(PiMsg::CapabilityPromptTick {
+            id,
+            generation,
+            timer_generation,
+        });
+        assert!(
+            successor_wake.is_some(),
+            "the live successor owns the active tick"
+        );
+        assert_eq!(
+            active_capability(&app).map(|active| active.0),
+            Some("orphan-second".to_string()),
+            "an orphaned overlay must not keep blocking the queue"
+        );
+        assert!(manager.ui_request_is_pending("orphan-second"));
+        drop(second_attempt);
     }
 
     #[test]

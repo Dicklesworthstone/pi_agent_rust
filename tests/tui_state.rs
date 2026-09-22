@@ -4321,7 +4321,7 @@ fn tui_state_late_extension_mcp_registration_reaches_the_manager_at_the_next_tur
     let global_dir = harness.temp_path("mcp-global");
     fs::create_dir_all(&global_dir).expect("create MCP global dir");
     let mcp_manager = Arc::new(
-        pi::mcp::bootstrap_with_project_trust(&cwd, &global_dir, &[], true)
+        pi::mcp::McpManager::bootstrap(&cwd, &global_dir, &[], true)
             .expect("bootstrap MCP manager"),
     );
     let extension_source = r"

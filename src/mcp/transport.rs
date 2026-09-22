@@ -89,6 +89,10 @@ type StdioPending = Mutex<HashMap<u64, StdSyncSender<StdioOutcome>>>;
 enum McpStdioError {
     Server(RpcErrorObject),
     Closed(String),
+    /// The transport refused the message before writing any of it, so the
+    /// peer cannot have observed it. Distinct from `Closed`, which may follow
+    /// a dispatch whose effects are unknown.
+    Unavailable(String),
     Io(String),
     Backpressure(String),
     Request(String),
@@ -100,6 +104,7 @@ impl McpStdioError {
         match self {
             Self::Server(_) => "MCP_SERVER_ERROR",
             Self::Closed(_) => "MCP_TRANSPORT_CLOSED",
+            Self::Unavailable(_) => "MCP_TRANSPORT_UNAVAILABLE",
             Self::Io(_) => "MCP_TRANSPORT_IO",
             Self::Backpressure(_) => "MCP_BACKPRESSURE",
             Self::Request(_) => "MCP_REQUEST_INVALID",
@@ -111,6 +116,9 @@ impl McpStdioError {
         match self {
             Self::Server(error) => format!("server error {}: {}", error.code, error.message),
             Self::Closed(reason) => format!("transport closed: {reason}"),
+            Self::Unavailable(reason) => {
+                format!("transport unavailable: {reason}; the message was not sent")
+            }
             Self::Io(reason) => format!("transport I/O error: {reason}"),
             Self::Backpressure(reason) => format!("transport backpressure: {reason}"),
             Self::Request(reason) => format!("invalid request: {reason}"),
@@ -211,7 +219,9 @@ fn try_enqueue_client_command(
         TrySendError::Full(_) => {
             McpStdioError::Backpressure("outbound stdio queue is full".to_string())
         }
-        TrySendError::Disconnected(_) => McpStdioError::Closed("stdio writer stopped".to_string()),
+        TrySendError::Disconnected(_) => {
+            McpStdioError::Unavailable("stdio writer stopped".to_string())
+        }
     })
 }
 
@@ -825,7 +835,7 @@ impl McpStdioClient {
 
     fn enqueue(&self, command: WriterCommand) -> std::result::Result<(), McpStdioError> {
         if !self.alive.load(Ordering::SeqCst) {
-            return Err(McpStdioError::Closed(
+            return Err(McpStdioError::Unavailable(
                 "server transport is not alive".to_string(),
             ));
         }
@@ -1854,9 +1864,21 @@ impl HttpTransport {
         }
         if !(200..300).contains(&status) {
             let body = response.text_limited(4096).await.unwrap_or_default();
+            // This text reaches `/mcp` health and model-visible tool errors:
+            // name only the origin (the URL's userinfo, path, and query can
+            // hold credentials) and bound and escape the server-chosen body.
+            let body: String = body
+                .trim()
+                .chars()
+                .take(MAX_HTTP_ERROR_BODY_CHARS)
+                .collect();
             return Err(tool_err(
                 "MCP_HTTP_STATUS",
-                format!("HTTP {status} from {}: {}", self.url, body.trim()),
+                format!(
+                    "HTTP {status} from {}: {}",
+                    redacted_origin(&self.url),
+                    super::config::display_safe(&body)
+                ),
             ));
         }
         let initialize_session_id = match kind {
@@ -2677,6 +2699,21 @@ fn is_delivery_indeterminate(error: &Error) -> bool {
     )
 }
 
+/// Server-controlled error bodies are diagnostics, not payloads.
+const MAX_HTTP_ERROR_BODY_CHARS: usize = 512;
+
+/// `scheme://host[:port]` of an endpoint, for text that leaves the transport.
+fn redacted_origin(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return "<unparseable url>".to_string();
+    };
+    let host = parsed.host_str().unwrap_or("<no host>");
+    parsed.port().map_or_else(
+        || format!("{}://{host}", parsed.scheme()),
+        |port| format!("{}://{host}:{port}", parsed.scheme()),
+    )
+}
+
 fn is_transport_io(error: &Error) -> bool {
     matches!(
         error,
@@ -2949,7 +2986,7 @@ impl McpTransport for HttpTransport {
     }
 
     fn diagnostics_tail(&self) -> String {
-        format!("http transport to {}", self.url)
+        format!("http transport to {}", redacted_origin(&self.url))
     }
 }
 
@@ -2959,6 +2996,19 @@ mod tests {
 
     /// Captured (headers, body) pairs shared with a fixture server thread.
     type CapturedRequests = std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, String)>>>;
+
+    #[test]
+    fn redacted_origin_drops_userinfo_path_and_query() {
+        assert_eq!(
+            redacted_origin("https://user:s3cret@mcp.example.com:8443/t/abc?token=xyz#f"),
+            "https://mcp.example.com:8443"
+        );
+        assert_eq!(
+            redacted_origin("http://127.0.0.1/mcp?key=1"),
+            "http://127.0.0.1"
+        );
+        assert_eq!(redacted_origin("not a url"), "<unparseable url>");
+    }
 
     #[test]
     // Naive count is fine at this data size; not worth a dependency.

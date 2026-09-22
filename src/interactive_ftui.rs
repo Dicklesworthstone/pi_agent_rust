@@ -4592,13 +4592,7 @@ async fn run_mcp_command(
             }
         }
         for warning in manager.warnings() {
-            let _ = writeln!(
-                content,
-                "  ⚠ {}: {} ({})",
-                warning.source_file.display(),
-                warning.entry,
-                warning.reason
-            );
+            let _ = writeln!(content, "  ⚠ {warning}");
         }
         let _ = agent_tx.send(PiMsg::System(content));
         return;

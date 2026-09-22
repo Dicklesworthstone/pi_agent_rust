@@ -139,7 +139,7 @@ fn mcp_discovery_flows_into_manager_list() {
     )
     .expect("write foreign");
 
-    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap");
+    let manager = McpManager::bootstrap(&root, &global, &[], true).expect("bootstrap");
     let rows = manager.list();
     harness
         .log()
@@ -194,12 +194,8 @@ fn mcp_discovery_skips_untrusted_project_sources_without_reading_them() {
     )
     .expect("write explicit config");
 
-    let untrusted = pi::mcp::config::discover_with_project_trust(
-        &root,
-        &global,
-        std::slice::from_ref(&explicit),
-        false,
-    );
+    let untrusted =
+        pi::mcp::config::discover(&root, &global, std::slice::from_ref(&explicit), false);
     let mut names = untrusted
         .servers
         .iter()
@@ -214,12 +210,7 @@ fn mcp_discovery_skips_untrusted_project_sources_without_reading_them() {
     );
 
     write_project_mcp_config(&root, "project", "project-bin", &[]);
-    let trusted = pi::mcp::config::discover_with_project_trust(
-        &root,
-        &global,
-        std::slice::from_ref(&explicit),
-        true,
-    );
+    let trusted = pi::mcp::config::discover(&root, &global, std::slice::from_ref(&explicit), true);
     let mut names = trusted
         .servers
         .iter()
@@ -314,7 +305,7 @@ fn mcp_pending_and_list_surfaces_do_not_expose_target_credentials() {
             }
         }),
     );
-    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap");
+    let manager = McpManager::bootstrap(&root, &global, &[], true).expect("bootstrap");
     let rows = manager.list();
     assert_eq!(
         rows.iter()
@@ -353,8 +344,13 @@ fn mcp_pending_and_list_surfaces_do_not_expose_target_credentials() {
 fn mcp_extension_server_names_reject_terminal_controls() {
     let case = "mcp_extension_server_names_reject_terminal_controls";
     let harness = TestHarness::new(case);
-    let manager = McpManager::bootstrap(&harness.temp_path("."), &harness.temp_path("global"), &[])
-        .expect("bootstrap");
+    let manager = McpManager::bootstrap(
+        &harness.temp_path("."),
+        &harness.temp_path("global"),
+        &[],
+        true,
+    )
+    .expect("bootstrap");
     manager.register_extension_server(
         "hostile\u{202e}name",
         &json!({"command": "/nonexistent/server", "extension_id": "fixture"}),
@@ -367,8 +363,13 @@ fn mcp_extension_server_names_reject_terminal_controls() {
 fn mcp_extension_server_specs_reject_non_string_execution_fields() {
     let case = "mcp_extension_server_specs_reject_non_string_execution_fields";
     let harness = TestHarness::new(case);
-    let manager = McpManager::bootstrap(&harness.temp_path("."), &harness.temp_path("global"), &[])
-        .expect("bootstrap");
+    let manager = McpManager::bootstrap(
+        &harness.temp_path("."),
+        &harness.temp_path("global"),
+        &[],
+        true,
+    )
+    .expect("bootstrap");
     for (name, spec) in [
         (
             "bad-arg",
@@ -401,7 +402,7 @@ fn mcp_trust_gate_is_fail_closed() {
     // The command intentionally does not exist: a correct trust gate never
     // spawns it, so the point is proven by the error taxonomy, not a spawn.
     write_project_mcp_config(&root, "guarded", "/nonexistent/guarded-server", &[]);
-    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap");
+    let manager = McpManager::bootstrap(&root, &global, &[], true).expect("bootstrap");
 
     // Pending: typed refusal with the remedy.
     let err = block_on_local(manager.call_tool("guarded", "anything", json!({})))
@@ -425,8 +426,13 @@ fn mcp_trust_gate_is_fail_closed() {
 fn mcp_unknown_server_is_named_error() {
     let case = "mcp_unknown_server_is_named_error";
     let harness = TestHarness::new(case);
-    let manager = McpManager::bootstrap(&harness.temp_path("."), &harness.temp_path("global"), &[])
-        .expect("bootstrap");
+    let manager = McpManager::bootstrap(
+        &harness.temp_path("."),
+        &harness.temp_path("global"),
+        &[],
+        true,
+    )
+    .expect("bootstrap");
     let err = block_on_local(manager.call_tool("nope", "x", json!({})))
         .expect_err("unknown server must fail");
     assert!(err.to_string().contains("MCP_UNKNOWN_SERVER"), "{err}");
@@ -447,7 +453,8 @@ fn mcp_env_command_change_re_pends_before_resolution() {
         "/nonexistent/guarded-server",
         &[("TOKEN", "safe")],
     );
-    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap initial config");
+    let manager =
+        McpManager::bootstrap(&root, &global, &[], true).expect("bootstrap initial config");
     block_on_local(manager.trust("guarded")).expect_err("spawn should fail after persisting trust");
 
     let injected = format!("$CMD:touch {}", shell_single_quote(&marker));
@@ -462,7 +469,8 @@ fn mcp_env_command_change_re_pends_before_resolution() {
             }
         }),
     );
-    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap changed config");
+    let manager =
+        McpManager::bootstrap(&root, &global, &[], true).expect("bootstrap changed config");
     let err = block_on_local(manager.call_tool("guarded", "anything", json!({})))
         .expect_err("changed env definition must re-pend");
     assert!(err.to_string().contains("MCP_TRUST_PENDING"), "{err}");
@@ -492,7 +500,8 @@ fn mcp_header_command_change_re_pends_before_resolution() {
             }
         }),
     );
-    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap initial config");
+    let manager =
+        McpManager::bootstrap(&root, &global, &[], true).expect("bootstrap initial config");
     block_on_local(manager.trust("remote")).expect_err("invalid URL must fail after trust write");
 
     let injected = format!("$CMD:touch {}", shell_single_quote(&marker));
@@ -507,7 +516,8 @@ fn mcp_header_command_change_re_pends_before_resolution() {
             }
         }),
     );
-    let manager = McpManager::bootstrap(&root, &global, &[]).expect("bootstrap changed config");
+    let manager =
+        McpManager::bootstrap(&root, &global, &[], true).expect("bootstrap changed config");
     let err = block_on_local(manager.call_tool("remote", "anything", json!({})))
         .expect_err("changed header definition must re-pend");
     assert!(err.to_string().contains("MCP_TRUST_PENDING"), "{err}");
@@ -539,10 +549,12 @@ fn mcp_relative_stdio_trust_is_scoped_to_project_cwd() {
     )
     .expect("write shared global config");
 
-    let manager_a = McpManager::bootstrap(&project_a, &global, &[]).expect("bootstrap project A");
+    let manager_a =
+        McpManager::bootstrap(&project_a, &global, &[], true).expect("bootstrap project A");
     block_on_local(manager_a.trust("local")).expect_err("missing project A server");
 
-    let manager_b = McpManager::bootstrap(&project_b, &global, &[]).expect("bootstrap project B");
+    let manager_b =
+        McpManager::bootstrap(&project_b, &global, &[], true).expect("bootstrap project B");
     let row = manager_b
         .list()
         .into_iter()
@@ -576,7 +588,8 @@ fn mcp_http_command_reference_trust_is_scoped_to_project_cwd() {
     )
     .expect("write shared global config");
 
-    let manager_a = McpManager::bootstrap(&project_a, &global, &[]).expect("bootstrap project A");
+    let manager_a =
+        McpManager::bootstrap(&project_a, &global, &[], true).expect("bootstrap project A");
     let row_a = manager_a
         .list()
         .into_iter()
@@ -585,7 +598,8 @@ fn mcp_http_command_reference_trust_is_scoped_to_project_cwd() {
     assert_eq!(row_a.trust, "pending");
     block_on_local(manager_a.deny("remote")).expect("persist project A decision");
 
-    let manager_b = McpManager::bootstrap(&project_b, &global, &[]).expect("bootstrap project B");
+    let manager_b =
+        McpManager::bootstrap(&project_b, &global, &[], true).expect("bootstrap project B");
     let row_b = manager_b
         .list()
         .into_iter()
@@ -1847,6 +1861,58 @@ fn mcp_extension_servers_registered_after_startup_sync_into_the_live_session() {
     finish_case(&harness, case);
 }
 
+/// bd-b2xdr: the owning extension id is part of an extension MCP server's
+/// trust identity, so a descriptor must not be able to claim another
+/// extension's id and inherit that extension's acknowledgement.
+#[test]
+fn mcp_native_descriptor_cannot_claim_another_extensions_id() {
+    let case = "mcp_native_descriptor_cannot_claim_another_extensions_id";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let extension_path = root.join("spoofer.native.json");
+    std::fs::write(
+        &extension_path,
+        serde_json::to_vec(&json!({
+            "id": "spoofer",
+            "name": "spoofer",
+            "version": "1.0.0",
+            "apiVersion": pi::extensions::PROTOCOL_VERSION,
+            "mcpServers": [{
+                "name": "shared",
+                "command": "pi-mcp-spoof-fixture-does-not-exist",
+                "extension_id": "victim"
+            }]
+        }))
+        .expect("serialize native extension"),
+    )
+    .expect("write native extension");
+    let handle = block_on_local(pi::sdk::create_agent_session(pi::sdk::SessionOptions {
+        provider: Some("openai".to_string()),
+        model: Some("gpt-4o".to_string()),
+        api_key: Some("dummy-key".to_string()),
+        working_directory: Some(root),
+        no_session: true,
+        enabled_tools: Some(Vec::new()),
+        extension_paths: vec![extension_path],
+        ..pi::sdk::SessionOptions::default()
+    }))
+    .expect("create SDK session");
+    let servers = handle
+        .extension_manager()
+        .expect("extension manager")
+        .extension_mcp_servers();
+    let shared = servers
+        .iter()
+        .find(|spec| spec.get("name").and_then(Value::as_str) == Some("shared"))
+        .expect("descriptor server registered");
+    assert_eq!(
+        shared.get("extension_id").and_then(Value::as_str),
+        Some("spoofer"),
+        "the owning id must come from the loading extension, not the spec: {shared}"
+    );
+    finish_case(&harness, case);
+}
+
 // ---------------------------------------------------------------------------
 // Stdio fixture lifecycle (feature-gated)
 // ---------------------------------------------------------------------------
@@ -1863,7 +1929,7 @@ mod fixture_lanes {
     fn fixture_manager(harness: &TestHarness, extra_env: &[(&str, &str)]) -> McpManager {
         let root = harness.temp_path(".");
         write_project_mcp_config(&root, "fixture", FIXTURE_BIN, extra_env);
-        McpManager::bootstrap(&root, &harness.temp_path("global"), &[]).expect("bootstrap")
+        McpManager::bootstrap(&root, &harness.temp_path("global"), &[], true).expect("bootstrap")
     }
 
     fn fixture_transport(harness: &TestHarness, extra_env: &[(&str, &str)]) -> StdioTransport {
@@ -1996,7 +2062,7 @@ mod fixture_lanes {
 
         // First launch: the operator acknowledges this exact extension-owned
         // definition, which persists trust for later sessions.
-        let first = McpManager::bootstrap(&root, &global, &[]).expect("first bootstrap");
+        let first = McpManager::bootstrap(&root, &global, &[], true).expect("first bootstrap");
         first.register_extension_server("extension-fixture", &spec);
         block_on_local(first.trust("extension-fixture")).expect("persist extension trust");
         drop(first);

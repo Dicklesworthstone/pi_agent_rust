@@ -3210,9 +3210,12 @@ impl ExtensionManager {
                 provider
             }));
             all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
+                // The owning id is part of the MCP trust identity, so it is
+                // always stamped from the snapshot and never taken from the
+                // spec: a descriptor claiming another extension's id would
+                // otherwise inherit that extension's acknowledgement.
                 if let Some(obj) = server.as_object_mut() {
-                    obj.entry("extension_id".to_string())
-                        .or_insert_with(|| Value::String(id.clone()));
+                    obj.insert("extension_id".to_string(), Value::String(id.clone()));
                 }
                 server
             }));
@@ -3335,9 +3338,12 @@ impl ExtensionManager {
                 provider
             }));
             all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
+                // The owning id is part of the MCP trust identity, so it is
+                // always stamped from the snapshot and never taken from the
+                // spec: a descriptor claiming another extension's id would
+                // otherwise inherit that extension's acknowledgement.
                 if let Some(obj) = server.as_object_mut() {
-                    obj.entry("extension_id".to_string())
-                        .or_insert_with(|| Value::String(id.clone()));
+                    obj.insert("extension_id".to_string(), Value::String(id.clone()));
                 }
                 server
             }));

@@ -5478,7 +5478,7 @@ fn rpc_late_extension_mcp_registration_reaches_the_session_at_the_next_prompt() 
         let manager = ExtensionManager::default();
         agent_session.extensions = Some(ExtensionRegion::new(manager.clone()));
         let mcp_manager = Arc::new(
-            pi::mcp::bootstrap_with_project_trust(&cwd, &global_dir, &[], true)
+            pi::mcp::McpManager::bootstrap(&cwd, &global_dir, &[], true)
                 .expect("bootstrap MCP manager"),
         );
         agent_session.set_mcp_manager(Arc::clone(&mcp_manager));

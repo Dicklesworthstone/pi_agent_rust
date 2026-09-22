@@ -21,25 +21,10 @@ pub use uri_template::expand_resource_uri;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use crate::model::ContentBlock;
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
-
-/// Build an MCP manager while enforcing the established workspace-trust
-/// decision at discovery time.
-///
-/// Denied workspaces never open project-native or foreign project configs;
-/// explicit CLI files and global Pi configuration remain eligible.
-pub fn bootstrap_with_project_trust(
-    cwd: &Path,
-    global_dir: &Path,
-    cli_paths: &[PathBuf],
-    project_trusted: bool,
-) -> crate::error::Result<McpManager> {
-    McpManager::bootstrap_with_project_trust(cwd, global_dir, cli_paths, project_trusted)
-}
 
 /// Mounted tool name cap (provider schemas reject longer names).
 const MAX_MOUNTED_NAME: usize = 64;

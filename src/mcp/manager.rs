@@ -383,33 +383,22 @@ impl McpManager {
         }
     }
 
-    /// Discover + build in one step.
+    /// Discover + build in one step, enforcing the established workspace-trust
+    /// decision at discovery time: an untrusted workspace never opens
+    /// project-native or foreign project configs, while explicit CLI files
+    /// and global Pi configuration remain eligible.
     ///
     /// # Errors
     ///
     /// Never fails on discovery problems (warnings are collected); the
     /// `Result` is for forward compatibility.
-    pub fn bootstrap(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> Result<Self> {
-        Self::bootstrap_with_project_trust(cwd, global_dir, cli_paths, true)
-    }
-
-    /// Discover + build in one step while honoring workspace trust.
-    ///
-    /// When `project_trusted` is false, project-local and foreign project configs
-    /// are skipped without being opened.
-    ///
-    /// # Errors
-    ///
-    /// Never fails on discovery problems (warnings are collected); the
-    /// `Result` is for forward compatibility.
-    pub fn bootstrap_with_project_trust(
+    pub fn bootstrap(
         cwd: &Path,
         global_dir: &Path,
         cli_paths: &[PathBuf],
         project_trusted: bool,
     ) -> Result<Self> {
-        let discovery =
-            super::config::discover_with_project_trust(cwd, global_dir, cli_paths, project_trusted);
+        let discovery = super::config::discover(cwd, global_dir, cli_paths, project_trusted);
         Ok(Self::new(cwd, global_dir, discovery))
     }
 

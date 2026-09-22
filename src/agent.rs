@@ -12647,9 +12647,6 @@ impl AgentSession {
         if !previous_thinking.is_some_and(|previous| previous.eq(&next_thinking)) {
             candidate.append_thinking_level_change(next_thinking.to_string());
         }
-        if runtime_model_changed {
-            self.invalidate_background_compaction();
-        }
         let _provider_transition = self
             .provider_admission
             .begin_transition(
@@ -12667,6 +12664,11 @@ impl AgentSession {
             );
             self.quarantine_provider_reentry(reason.clone());
             return Err(Error::session_persistence(reason));
+        }
+        // Only a durable switch retires in-flight background compaction; a
+        // failed save leaves the old model live, so its compaction stays valid.
+        if runtime_model_changed {
+            self.invalidate_background_compaction();
         }
         *session = candidate;
         drop(session);
@@ -12705,8 +12707,10 @@ impl AgentSession {
             .effective_thinking_level_for_current_path()
             .as_deref()
             != Some(level_string.as_str());
-        candidate.set_model_header(None, None, Some(level_string.clone()));
+        // An unchanged level is not saved below, so it must not mutate the
+        // header either: the installed session would diverge from disk.
         if changed {
+            candidate.set_model_header(None, None, Some(level_string.clone()));
             candidate.append_thinking_level_change(level_string);
         }
         let _provider_transition = if changed {
@@ -19473,6 +19477,7 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
+        let handle = runtime.handle();
 
         runtime.block_on(async {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -19505,12 +19510,17 @@ mod tests {
             agent_session.save_enabled = true;
             let original_compaction_window =
                 agent_session.compaction_settings().context_window_tokens;
+            agent_session.park_pending_compaction_for_test(&handle, None);
 
             let err = agent_session
                 .set_provider_model("openai", "gpt-4o")
                 .await
                 .expect_err("unwritable model-selection candidate must fail closed");
             assert!(err.is_session_persistence(), "unexpected error: {err}");
+            assert!(
+                agent_session.has_pending_background_compaction(),
+                "a switch that never became durable must not retire the live model's compaction"
+            );
             assert_eq!(agent_session.agent.provider().name(), "anthropic");
             assert_eq!(
                 agent_session.agent.provider().model_id(),

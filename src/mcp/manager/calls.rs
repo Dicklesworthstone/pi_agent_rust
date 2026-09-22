@@ -483,9 +483,12 @@ impl McpManager {
             ));
         }
         if !transport.is_alive() {
+            // Nothing was written, so this is a definite "not sent", never
+            // the uncertain post-dispatch loss that `call_tool` reports as
+            // "may have completed".
             let error = tool_err(
-                "MCP_TRANSPORT_CLOSED",
-                "connection closed before tools/call dispatch",
+                "MCP_TRANSPORT_UNAVAILABLE",
+                "connection closed before tools/call dispatch; the call was not sent",
             );
             Self::detach_failed_call_transport(entry, transport, &error);
             return Err(error);
@@ -1311,6 +1314,27 @@ mod tests {
         assert_eq!(McpManager::lock(&entry.restarts).count, 2);
         assert_eq!(McpManager::lock(&transport.requests).len(), 1);
         assert_eq!(manager.mounted_tool_metas().len(), 1);
+    }
+
+    #[test]
+    fn a_transport_dead_before_dispatch_reports_not_sent_rather_than_indeterminate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, Ok(json!({"content": []})));
+        transport.abort();
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        let error = runtime()
+            .block_on(manager.call_on_transport(&entry, &erased, "execute", &json!({})))
+            .expect_err("a dead transport cannot carry the call");
+        assert!(
+            error.to_string().contains("MCP_TRANSPORT_UNAVAILABLE"),
+            "{error}"
+        );
+        assert!(
+            !is_indeterminate_call_delivery(&error),
+            "an undispatched call must not be reported as possibly completed: {error}"
+        );
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(McpManager::lock(&entry.transport).is_none());
     }
 
     #[test]

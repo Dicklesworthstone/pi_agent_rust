@@ -4497,13 +4497,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
         }
         for warning in manager.warnings() {
-            let _ = writeln!(
-                content,
-                "  ⚠ {}: {} ({})",
-                warning.source_file.display(),
-                warning.entry,
-                warning.reason
-            );
+            let _ = writeln!(content, "  ⚠ {warning}");
         }
         self.messages.push(ConversationMessage {
             role: MessageRole::System,

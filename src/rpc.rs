@@ -3919,7 +3919,9 @@ pub async fn run(
             }
 
             "new_session" => {
-                if let Some(reason) = rpc_session_transition_blocker(
+                // A lock failure here must answer the request, not end the
+                // command loop with the client left waiting.
+                match rpc_session_transition_blocker(
                     &is_streaming,
                     &is_compacting,
                     &turn_phase_linearizer,
@@ -3928,12 +3930,26 @@ pub async fn run(
                     &bash_state,
                     &cx,
                 )
-                .await?
+                .await
                 {
-                    let _ = out_tx.send(response_error(id, "new_session", reason.to_string()));
-                    continue;
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        let _ = out_tx.send(response_error(id, "new_session", reason.to_string()));
+                        continue;
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "new_session", &err));
+                        continue;
+                    }
                 }
-                let transition_baseline = rpc_session_transition_snapshot(&session, &cx).await?;
+                let transition_baseline = match rpc_session_transition_snapshot(&session, &cx).await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "new_session", &err));
+                        continue;
+                    }
+                };
                 if rpc_dispatch_session_before_switch(rpc_extension_manager.clone(), "new", None)
                     .await
                 {
@@ -4060,7 +4076,7 @@ pub async fn run(
             }
 
             "switch_session" => {
-                if let Some(reason) = rpc_session_transition_blocker(
+                match rpc_session_transition_blocker(
                     &is_streaming,
                     &is_compacting,
                     &turn_phase_linearizer,
@@ -4069,10 +4085,18 @@ pub async fn run(
                     &bash_state,
                     &cx,
                 )
-                .await?
+                .await
                 {
-                    let _ = out_tx.send(response_error(id, "switch_session", reason.to_string()));
-                    continue;
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        let _ =
+                            out_tx.send(response_error(id, "switch_session", reason.to_string()));
+                        continue;
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
+                        continue;
+                    }
                 }
                 let Some(session_path) = parsed.get("sessionPath").and_then(Value::as_str) else {
                     let _ = out_tx.send(response_error(
@@ -4082,7 +4106,14 @@ pub async fn run(
                     ));
                     continue;
                 };
-                let transition_baseline = rpc_session_transition_snapshot(&session, &cx).await?;
+                let transition_baseline = match rpc_session_transition_snapshot(&session, &cx).await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
+                        continue;
+                    }
+                };
 
                 if rpc_dispatch_session_before_switch(
                     rpc_extension_manager.clone(),
@@ -4323,7 +4354,7 @@ pub async fn run(
             }
 
             "fork" => {
-                if let Some(reason) = rpc_session_transition_blocker(
+                match rpc_session_transition_blocker(
                     &is_streaming,
                     &is_compacting,
                     &turn_phase_linearizer,
@@ -4332,10 +4363,17 @@ pub async fn run(
                     &bash_state,
                     &cx,
                 )
-                .await?
+                .await
                 {
-                    let _ = out_tx.send(response_error(id, "fork", reason.to_string()));
-                    continue;
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        let _ = out_tx.send(response_error(id, "fork", reason.to_string()));
+                        continue;
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "fork", &err));
+                        continue;
+                    }
                 }
                 let Some(entry_id) = parsed.get("entryId").and_then(Value::as_str) else {
                     let _ = out_tx.send(response_error(id, "fork", "Missing entryId".to_string()));

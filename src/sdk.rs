@@ -3442,7 +3442,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
 
     let mcp_manager = if let Some(mcp) = &options.mcp {
         let global_dir = mcp.global_dir.clone().unwrap_or_else(Config::global_dir);
-        let manager = Arc::new(crate::mcp::bootstrap_with_project_trust(
+        let manager = Arc::new(crate::mcp::McpManager::bootstrap(
             &cwd,
             &global_dir,
             &mcp.config_paths,

@@ -620,6 +620,39 @@ pub struct ConfigWarning {
     pub reason: String,
 }
 
+/// Every field can carry workspace-controlled text (a rejected server name,
+/// a parser message quoting file contents), so the rendering escapes control
+/// and bidi characters instead of letting them reach the terminal.
+impl std::fmt::Display for ConfigWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {} ({})",
+            display_safe(&self.source_file.display().to_string()),
+            display_safe(&self.entry),
+            display_safe(&self.reason)
+        )
+    }
+}
+
+/// Escape control characters and Unicode bidi controls so remote or
+/// workspace-controlled text cannot move the cursor, recolor, or visually
+/// reorder the surrounding terminal output.
+pub(crate) fn display_safe(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let bidi_control = matches!(ch, '\u{061C}' | '\u{200E}' | '\u{200F}')
+            || ('\u{202A}'..='\u{202E}').contains(&ch)
+            || ('\u{2066}'..='\u{2069}').contains(&ch);
+        if ch.is_control() || bidi_control {
+            output.extend(ch.escape_unicode());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 /// One raw server entry (tolerant: unknown fields ignored).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -644,14 +677,32 @@ fn parse_server(name: &str, raw: &Value) -> std::result::Result<RawServer, Strin
 }
 
 fn read_bounded_config(path: &Path) -> std::io::Result<String> {
-    let metadata = std::fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
+    let not_regular = || {
+        std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "MCP config path is not a regular file",
-        ));
+        )
+    };
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_regular());
     }
+    // The path can be replaced between the metadata check and the open.
+    // NONBLOCK keeps a swapped-in FIFO from hanging startup before the
+    // descriptor itself is checked below.
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        File::from(rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
     let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
     let mut bytes = Vec::new();
     file.take((MAX_MCP_CONFIG_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
@@ -839,25 +890,20 @@ pub struct McpDiscovery {
     pub warnings: Vec<ConfigWarning>,
 }
 
-/// Discover and merge MCP server configs.
+/// Discover and merge MCP server configs under the established
+/// workspace-trust decision.
 ///
 /// `cli_paths`: `--mcp-config` files (repeatable, highest precedence).
 /// `global_dir`: the pi global agent dir (`~/.pi/agent`).
-#[must_use]
-pub fn discover(cwd: &Path, global_dir: &Path, cli_paths: &[PathBuf]) -> McpDiscovery {
-    discover_with_project_trust(cwd, global_dir, cli_paths, true)
-}
-
-/// Discover and merge MCP server configs with an explicit workspace-trust
-/// decision.
 ///
 /// When `project_trusted` is false, project-native and foreign project files
 /// are skipped without being opened. Explicit `--mcp-config` paths and the
 /// global Pi config remain eligible because neither is discovered from the
-/// untrusted workspace.
+/// untrusted workspace. The decision is a required argument so no caller can
+/// reach project configuration by omitting it.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn discover_with_project_trust(
+pub fn discover(
     cwd: &Path,
     global_dir: &Path,
     cli_paths: &[PathBuf],
@@ -1072,7 +1118,7 @@ mod tests {
             &cwd.join(".claude/mcp.json"),
             r#"{"mcpServers": {"foreign_one": {"command": "f1"}, "only_project": {"command": "shadowed"}}}"#,
         );
-        let discovery = discover(&cwd, &global, &[]);
+        let discovery = discover(&cwd, &global, &[], true);
         let by_name: HashMap<_, _> = discovery
             .servers
             .iter()
@@ -1105,7 +1151,7 @@ mod tests {
             r#"{"mcpServers": {"s": {"command": "project"}}}"#,
         );
         write(&cli, r#"{"mcpServers": {"s": {"command": "cli"}}}"#);
-        let discovery = discover(&cwd, &global, &[cli]);
+        let discovery = discover(&cwd, &global, &[cli], true);
         assert_eq!(discovery.servers.len(), 1);
         assert_eq!(discovery.servers[0].command.as_deref(), Some("cli"));
         assert_eq!(discovery.servers[0].provenance, Provenance::Cli);
@@ -1120,7 +1166,7 @@ mod tests {
             &cwd.join(".pi/mcp.json"),
             r#"{"mcpServers": {"good": {"command": "ok"}, "bad": 42}}"#,
         );
-        let discovery = discover(&cwd, &global, &[]);
+        let discovery = discover(&cwd, &global, &[], true);
         assert_eq!(discovery.servers.len(), 1, "good entry survives");
         assert_eq!(discovery.warnings.len(), 1, "bad entry warned");
         assert!(discovery.warnings[0].reason.contains("\"bad\""));
@@ -1148,7 +1194,7 @@ mod tests {
             }}"#,
         );
 
-        let discovery = discover(&cwd, &global, &[]);
+        let discovery = discover(&cwd, &global, &[], true);
         assert!(
             discovery.servers.is_empty(),
             "a lower-precedence trusted target must not replace a malformed override"
@@ -1167,7 +1213,7 @@ mod tests {
             r#"{"mcpServers":{"shared":{"command":"global"}}}"#,
         );
 
-        let discovery = discover(&cwd, &global, &[]);
+        let discovery = discover(&cwd, &global, &[], true);
         assert!(
             discovery.servers.is_empty(),
             "a malformed bare-map override must still own its server name"
@@ -1192,7 +1238,7 @@ mod tests {
             }}"#,
         );
 
-        let discovery = discover(&cwd, &temp.path().join("global"), &[]);
+        let discovery = discover(&cwd, &temp.path().join("global"), &[], true);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 6);
     }
@@ -1206,7 +1252,7 @@ mod tests {
             r#"{"mcpServers":[],"unrelated":{"command":"must-not-run"}}"#,
         );
 
-        let discovery = discover(&cwd, &temp.path().join("global"), &[]);
+        let discovery = discover(&cwd, &temp.path().join("global"), &[], true);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
         assert!(discovery.warnings[0].reason.contains("mcpServers"));
@@ -1222,7 +1268,7 @@ mod tests {
             &global.join("mcp.json"),
             r#"{"mcpServers": {"g": {"command": "ok"}}}"#,
         );
-        let discovery = discover(&cwd, &global, &[]);
+        let discovery = discover(&cwd, &global, &[], true);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
     }
@@ -1238,7 +1284,7 @@ mod tests {
             r#"{"mcpServers":{"fallback":{"command":"ok"}}}"#,
         );
 
-        let discovery = discover(&cwd, &global, &[]);
+        let discovery = discover(&cwd, &global, &[], true);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
         assert_eq!(discovery.warnings[0].source_file, cwd.join(".pi/mcp.json"));
@@ -1264,7 +1310,7 @@ mod tests {
             r#"{"mcpServers":{"fallback":{"command":"ok"}}}"#,
         );
 
-        let discovery = discover(&cwd, &global, &[]);
+        let discovery = discover(&cwd, &global, &[], true);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
         assert!(
@@ -1285,7 +1331,7 @@ mod tests {
             r#"{"mcpServers":{"fallback":{"command":"must-not-run"}}}"#,
         );
 
-        let discovery = discover(&cwd, &global, std::slice::from_ref(&missing));
+        let discovery = discover(&cwd, &global, std::slice::from_ref(&missing), true);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
         assert_eq!(discovery.warnings[0].source_file, missing);
@@ -1304,7 +1350,7 @@ mod tests {
             &cwd.join(".pi/mcp.json"),
             r#"{"myserver": {"command": "bare-form"}}"#,
         );
-        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        let discovery = discover(&cwd, &temp.path().join("g"), &[], true);
         assert_eq!(discovery.servers.len(), 1);
         assert_eq!(discovery.servers[0].command.as_deref(), Some("bare-form"));
     }
@@ -1317,7 +1363,7 @@ mod tests {
             &cwd.join(".codex/config.toml"),
             "[mcp_servers.docs]\ncommand = \"docs-mcp\"\nargs = [\"--port\", \"8080\"]\n",
         );
-        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        let discovery = discover(&cwd, &temp.path().join("g"), &[], true);
         assert_eq!(discovery.servers.len(), 1);
         let server = &discovery.servers[0];
         assert_eq!(server.name, "docs");
@@ -1334,7 +1380,7 @@ mod tests {
             &cwd.join(".pi/mcp.json"),
             r#"{"mcpServers": {"remote": {"url": "https://mcp.example.com/sse", "headers": {"Authorization": "$ENV:MCP_TOKEN"}}}}"#,
         );
-        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        let discovery = discover(&cwd, &temp.path().join("g"), &[], true);
         assert!(discovery.servers[0].is_http());
         assert_eq!(discovery.servers[0].headers.len(), 1);
     }
@@ -1348,7 +1394,7 @@ mod tests {
             r#"{"mcpServers":{"remote":{"url":"https://mcp.example.test","headers":{"Authorization":"first","authorization":"second"}}}}"#,
         );
 
-        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        let discovery = discover(&cwd, &temp.path().join("g"), &[], true);
         assert!(discovery.servers.is_empty());
         assert_eq!(discovery.warnings.len(), 1);
         assert!(discovery.warnings[0].reason.contains("case-insensitive"));
@@ -1368,9 +1414,27 @@ mod tests {
             .to_string(),
         );
 
-        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        let discovery = discover(&cwd, &temp.path().join("g"), &[], true);
         assert!(discovery.servers.is_empty());
         assert!(discovery.warnings[0].reason.contains("ASCII"));
+    }
+
+    #[test]
+    fn config_warning_display_escapes_terminal_and_bidi_controls() {
+        let warning = ConfigWarning {
+            source_file: PathBuf::from("/p/.pi/mcp.json"),
+            entry: "evil\u{1b}[2J\u{202e}name".to_string(),
+            reason: "line\nbreak".to_string(),
+        };
+        let rendered = warning.to_string();
+        assert!(!rendered.chars().any(char::is_control), "{rendered:?}");
+        assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+        assert!(rendered.contains(r"\u{1b}[2J\u{202e}name"), "{rendered}");
+        assert!(rendered.contains(r"line\u{a}break"), "{rendered}");
+        assert_eq!(
+            display_safe("plain ascii — ünïcode"),
+            "plain ascii — ünïcode"
+        );
     }
 
     #[test]
@@ -1402,7 +1466,7 @@ mod tests {
             .to_string(),
         );
 
-        let discovery = discover(&cwd, &temp.path().join("g"), &[]);
+        let discovery = discover(&cwd, &temp.path().join("g"), &[], true);
         assert!(discovery.servers.is_empty());
         assert!(discovery.warnings[0].reason.contains("at most 96"));
     }
@@ -1451,7 +1515,7 @@ mod tests {
             &cwd.join(".pi/mcp.json"),
             r#"{"mcpServers": {"s": {"command": "a", "args": ["one"], "env": {"B": "$ENV:TOKEN", "A": "literal"}}}}"#,
         );
-        let server = discover(&cwd, &temp.path().join("g"), &[])
+        let server = discover(&cwd, &temp.path().join("g"), &[], true)
             .servers
             .remove(0);
         let fingerprint = server.fingerprint(&cwd);
@@ -1487,7 +1551,7 @@ mod tests {
             &cwd.join(".pi/mcp.json"),
             r#"{"mcpServers": {"s": {"url": "https://mcp.example.test", "headers": {"X-Token": "$CMD:token-helper", "X-Accept-Mode": "application/json"}}}}"#,
         );
-        let http_server = discover(&cwd, &temp.path().join("g"), &[])
+        let http_server = discover(&cwd, &temp.path().join("g"), &[], true)
             .servers
             .remove(0);
         let http_fingerprint = http_server.fingerprint(&cwd);
