@@ -27,52 +27,47 @@ DSR=/Users/jemanuel/projects/doodlestein_self_releaser/dsr
   --work-dir /Users/jemanuel/projects/pi_agent_rust
 ```
 
-## 2. The DSR quality recipe (7 checks, registered in `~/.config/dsr/repos.yaml`)
+## 2. The DSR quality recipe (8 checks, registered in `~/.config/dsr/repos.yaml`)
 
 For `pi_agent_rust`, the recipe is, as reported by
-`dsr quality --tool pi_agent_rust --dry-run` on 2026-09-21:
+`dsr quality --tool pi_agent_rust --dry-run` on 2026-09-22:
 
 1. `cargo fmt --check`
-2. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check --locked --all-targets`
-3. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy --locked --all-targets -- -D warnings`
+2. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check --locked --all-targets --keep-going`
+3. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy --locked --all-targets --keep-going -- -D warnings`
 4. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test --locked --all-targets --no-fail-fast`
 5. `bash tests/installer_regression.sh`
 6. `python3 scripts/check_module_reachability.py`
 7. `python3 scripts/check_fixture_read_patience.py`
+8. `python3 scripts/check_readme_evidence_freshness.py --structural-only`
 
-Checks 2 and 3 are missing `--keep-going`, so the first target that fails
-to compile hides every other compile failure in the run. AGENTS.md
-documents this hazard by name — nineteen targets broken by one
-`asupersync` bump on 2026-09-13 took nine sequential clippy runs to
-enumerate — and the registered recipe does not take its own advice. The
-flag is documented in `cargo check --help`; clippy accepts it too. Add it
-to both:
+**Two of those changed on 2026-09-22 and are worth understanding before
+anyone "simplifies" them back.**
 
-```yaml
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check --locked --all-targets --keep-going
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy --locked --all-targets --keep-going -- -D warnings
-```
+`--keep-going` on checks 2 and 3. Without it the first target that fails to
+compile hides every other compile failure in the run. AGENTS.md documents the
+hazard by name — nineteen targets broken by one `asupersync` bump on
+2026-09-13 took nine sequential clippy runs to enumerate — and the recipe did
+not take its own advice. It is documented in `cargo check --help`; clippy
+accepts it too. It costs nothing: only a failing run does extra work, and a
+failing run is exactly when you want the whole list. Measured on 2026-09-21,
+its first use reported that the tree's single compile error really was
+single, replacing a guess about hidden breakage with a count.
 
-Not check 4: `--keep-going` is not a `cargo test` flag, and
-`--no-fail-fast` — which the recipe already passes — governs test
-failures, not build failures. No test binary runs while any required
-target fails to build; that is expected behaviour, not a second defect.
-Tracked as `bd-7ilwr`.
+Not check 4: `--keep-going` is not a `cargo test` flag, and `--no-fail-fast`
+— which the recipe already passes — governs test failures, not build
+failures. No test binary runs while any required target fails to build; that
+is expected, not a second defect.
 
-`scripts/check_readme_evidence_freshness.py` is **not** in this recipe,
-so nothing in the gate notices when README evidence claims drift away
-from `tests/perf/reports/budget_summary.json`. That is how the README
-spent a month advertising four passing budgets against an artifact whose
-rows were all `NO_DATA` (`bd-readme-evidence-table-diverged-ba8bd`).
+Check 8 is new. Nothing in the gate used to notice when README evidence
+claims drifted away from `tests/perf/reports/budget_summary.json`, which is
+how the README spent a month advertising four passing budgets against an
+artifact whose rows were all `NO_DATA`
+(`bd-readme-evidence-table-diverged-ba8bd`).
 
-To wire it in, the line for `~/.config/dsr/repos.yaml` is:
-
-```yaml
-      - python3 scripts/check_readme_evidence_freshness.py --structural-only
-```
-
-**Use `--structural-only` in the gate, and only there.** The default mode
-also enforces a 14-day age limit on every cited artifact. In a per-commit
+**It must keep `--structural-only`, and the gate is the only place that flag
+belongs.** The default mode also enforces a 14-day age limit on every cited
+artifact. In a per-commit
 gate that is a time bomb: nobody refreshes `budget_summary.json` on a
 fortnightly cadence, so the check would turn red on the calendar, with no
 commit to blame and nothing the committer could do about it — and a gate
@@ -89,9 +84,18 @@ The full check, age limits included, belongs where it already is: the
 pre-release list in `docs/releasing.md`, where a stale artifact genuinely
 should block a release.
 
-Tracked as `bd-readme-freshness-into-recipe-5sgos`. The registry lives
-outside this repository, so adding the line is an operator action on the
-release host, not a change anybody can land here.
+Tracked as `bd-readme-freshness-into-recipe-5sgos` and `bd-7ilwr`.
+
+**A consequence of check 8 that will bite somebody.** The registry lives
+outside this repository, so it is not versioned with the tree it runs
+against, and `--structural-only` only exists in the script from 49ee4cb11
+onwards. Run the gate against a checkout older than that and check 8 exits 2
+with `unrecognized arguments: --structural-only` — an error, not a verdict.
+On 2026-09-22 the shared checkout at `/Users/jemanuel/projects/pi_agent_rust`
+was 24 commits behind `origin/main` and did exactly that. Point `-w` at a
+worktree that is current (see the DSR isolation notes in section 1), which is
+the recommended practice anyway because a shared tree moves during a run and
+the aggregate then refuses to bind.
 
 ## 3. Hidden contract: build scratch on the Data volume
 

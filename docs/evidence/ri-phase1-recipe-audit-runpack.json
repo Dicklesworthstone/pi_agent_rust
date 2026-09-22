@@ -1,13 +1,13 @@
 {
   "schema": "pi.evidence.ri_phase1_recipe_audit_runpack.v1",
-  "generated_at": "2026-08-28T04:57:27.3NZ",
-  "workdir": "/Users/jemanuel/projects/pi_agent_rust",
+  "generated_at": "2026-09-22T04:16:31.3NZ",
+  "workdir": "/Users/jemanuel/projects/pi-dsr-pinned",
   "dsr": "/Users/jemanuel/projects/doodlestein_self_releaser/dsr",
-  "git_commit": "c4bcd9c65a4c95a6bfd566576b807b3dcf27f641",
+  "git_commit": "39ad8c936b71b282199bd3f698757f59f938cb54",
   "git_dirty": true,
   "ok_count": 14,
   "fail_count": 0,
-  "warn_count": 2,
+  "warn_count": 1,
   "verdict": "ready_with_warnings",
   "findings": [
     {
@@ -23,7 +23,7 @@
     {
       "contract": "WORKDIR_IS_PI_AGENT_RUST",
       "status": "pass",
-      "detail": "/Users/jemanuel/projects/pi_agent_rust"
+      "detail": "/Users/jemanuel/projects/pi-dsr-pinned"
     },
     {
       "contract": "AGENTS_DSR_GOVERNANCE_PRESENT",
@@ -38,12 +38,7 @@
     {
       "contract": "DSR_DRY_RUN_PLANS_6_CHECKS",
       "status": "pass",
-      "detail": "dsr plans 6 checks"
-    },
-    {
-      "contract": "DSR_TMP_TARGET_DIR_USED",
-      "status": "warn",
-      "detail": "repos.yaml hardcodes CARGO_TARGET_DIR=/tmp/pi-agent-rust-dsr; this is the AGENTS.md anti-pattern. Either set RCH_TARGET_BASE and patch, or accept and clean up post-run with sbh check."
+      "detail": "dsr plans 8 checks (expected >=8)"
     },
     {
       "contract": "RCH_ON_PATH",
@@ -58,32 +53,32 @@
     {
       "contract": "RCHIGNORE_PRESENT",
       "status": "pass",
-      "detail": "/Users/jemanuel/projects/pi_agent_rust/.rchignore (      54 lines)"
+      "detail": "/Users/jemanuel/projects/pi-dsr-pinned/.rchignore (      54 lines)"
     },
     {
       "contract": "PREFLIGHT_BUDGET_INPUTS_PRESENT",
       "status": "pass",
-      "detail": "/Users/jemanuel/projects/pi_agent_rust/scripts/perf/preflight_budget_inputs.py"
+      "detail": "/Users/jemanuel/projects/pi-dsr-pinned/scripts/perf/preflight_budget_inputs.py"
     },
     {
       "contract": "CHECK_MODULE_REACHABILITY_PRESENT",
       "status": "pass",
-      "detail": "/Users/jemanuel/projects/pi_agent_rust/scripts/check_module_reachability.py"
+      "detail": "/Users/jemanuel/projects/pi-dsr-pinned/scripts/check_module_reachability.py"
     },
     {
       "contract": "INSTALLER_REGRESSION_PRESENT",
       "status": "pass",
-      "detail": "/Users/jemanuel/projects/pi_agent_rust/tests/installer_regression.sh"
+      "detail": "/Users/jemanuel/projects/pi-dsr-pinned/tests/installer_regression.sh"
     },
     {
       "contract": "EVIDENCE_SCHEMAS_PRESENT",
       "status": "pass",
-      "detail": "all 5 required schemas in /Users/jemanuel/projects/pi_agent_rust/docs/evidence-contract-schema.json"
+      "detail": "all 5 required schemas in /Users/jemanuel/projects/pi-dsr-pinned/docs/evidence-contract-schema.json"
     },
     {
       "contract": "CLOSEOUT_EVIDENCE_REGISTRY_PRESENT",
       "status": "pass",
-      "detail": "/Users/jemanuel/projects/pi_agent_rust/docs/contracts/closeout-evidence-registry.json"
+      "detail": "/Users/jemanuel/projects/pi-dsr-pinned/docs/contracts/closeout-evidence-registry.json"
     },
     {
       "contract": "BUDGET_SUMMARY_PARSEABLE",
