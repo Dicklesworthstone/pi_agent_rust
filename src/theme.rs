@@ -1292,36 +1292,25 @@ mod tests {
     }
 
     /// Issue #195, the table half: a table cell truncated at a double-width
-    /// character boundary is not re-padded, so the grid shears (bd-xxlwk).
+    /// character boundary must be re-padded so the grid does not shear
+    /// (bd-xxlwk).
     ///
-    /// This pins the DEFECT, and it is meant to fail one day. The bug is in
-    /// charmed-glamour, not here. `table::fit_content` pads on the branch where
-    /// the content already fits and returns `truncate_content`'s output
-    /// unpadded on the branch where it does not. `truncate_content` reserves
-    /// one column for the ellipsis and then fills the rest with whole
-    /// characters, so a column holding CJK text comes back one column short
-    /// whenever the cut lands mid-character. The crate's own doc example says
-    /// as much: `truncate_content("日本語", 4) == "日…"`, three columns for a
-    /// budget of four.
+    /// The defect was in charmed-glamour: `truncate_content` reserves one
+    /// column for the ellipsis and fills the rest with whole characters, so a
+    /// CJK cell came back one column short whenever the cut landed
+    /// mid-character (`truncate_content("日本語", 4) == "日…"`, three columns
+    /// for a budget of four), and `table::fit_content` returned it unpadded.
+    /// charmed-glamour 0.2.4 re-pads it (charmed_rust 4150912).
     ///
-    /// The user-visible effect, which is what this asserts, is that the column
-    /// separator in a truncated data row does not line up with the separator in
+    /// The user-visible property, which is what this asserts, is that the
+    /// column separator in a truncated data row lines up with the separator in
     /// the header rule above it. It takes both wide characters and a column
     /// narrow enough to truncate, which is why it was reported from a CJK
-    /// terminal and not seen here.
-    ///
-    /// WHEN THIS TEST FAILS, charmed-glamour has been fixed, and that is the
-    /// point of writing it this way round. The fix is committed upstream in
-    /// charmed_rust but no crates.io release carries it — newest is 0.2.3 from
-    /// 2026-08-25, and the fix landed after — so there is nothing to bump to
-    /// and nothing in this repository can repair it. Rather than leave no
-    /// signal until somebody remembers to check, this turns the eventual
-    /// publish into a failure that says what to do: bump the `charmed-glamour`
-    /// pin in Cargo.toml, then invert this assertion to require the two widths
-    /// to be equal.
+    /// terminal. The untruncated control below shows the widths are otherwise
+    /// computed correctly.
     #[cfg(feature = "tui")]
     #[test]
-    fn glamour_table_shears_when_a_wide_char_cell_is_truncated() {
+    fn glamour_table_stays_aligned_when_a_wide_char_cell_is_truncated() {
         use unicode_width::UnicodeWidthStr;
 
         fn visible(line: &str) -> String {
@@ -1366,11 +1355,10 @@ mod tests {
         let rule_prefix = rule.split('┼').next().expect("rule prefix").width();
         let data_prefix = data.split('│').next().expect("data prefix").width();
 
-        assert_ne!(
+        assert_eq!(
             rule_prefix, data_prefix,
-            "charmed-glamour appears to re-pad truncated wide-character cells now: the header rule \
-             and the data row agree at {rule_prefix} columns. That is the gh #195 fix shipping. \
-             Bump the charmed-glamour pin and invert this assertion (bd-xxlwk).\nrule: {rule:?}\ndata: {data:?}"
+            "a truncated wide-character cell must be re-padded to its column width (gh #195): \
+             the header rule and the data row disagree.\nrule: {rule:?}\ndata: {data:?}"
         );
 
         // The control that makes this a truncation defect rather than a width

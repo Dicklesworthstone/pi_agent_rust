@@ -260,7 +260,9 @@ enable-ansi-support = "0.2"
 bubbletea = { package = "charmed-bubbletea", version = "0.2.0", optional = true }
 lipgloss = { package = "charmed-lipgloss", version = "0.2.0", optional = true }
 bubbles = { package = "charmed-bubbles", version = "0.2.0", optional = true }
-glamour = { package = "charmed-glamour", version = "0.2.0", optional = true }
+# 0.2.4 is the first release that re-pads table cells truncated at a
+# wide-char boundary (charmed_rust 4150912, GH #195).
+glamour = { package = "charmed-glamour", version = "0.2.4", optional = true }
 # unicode-width / textwrap are TUI-layout helpers consumed only by the
 # interactive render code, so they are gated with the rest of the TUI stack.
 unicode-width = { version = "0.2", optional = true }
