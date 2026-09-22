@@ -101,8 +101,8 @@ Keys are specified as `modifier+key`.
 |-----------|--------------|-------------|
 | `copy` | `ctrl+c` | Copy selection |
 | `pasteImage` | `ctrl+v` | Paste image from clipboard |
-| `yank` | `ctrl+y` | Paste most recently deleted text |
-| `yankPop` | `alt+y` | Cycle through deleted text |
+| `yank` | *(none)* | Paste most recently deleted text (reserved) |
+| `yankPop` | *(none)* | Cycle through deleted text (reserved) |
 | `undo` | `ctrl+-` | Undo last edit |
 
 ### Models & Thinking

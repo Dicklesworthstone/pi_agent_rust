@@ -1553,8 +1553,10 @@ impl KeyBindings {
         m.insert(AppAction::Tab, vec![KeyBinding::plain("tab")]);
 
         // Kill Ring
-        m.insert(AppAction::Yank, vec![KeyBinding::ctrl("y")]);
-        m.insert(AppAction::YankPop, vec![KeyBinding::alt("y")]);
+        // Yank and YankPop have no underlying kill ring implementation, so no default
+        // bindings are advertised; explicit bindings via keybindings.json remain valid.
+        m.insert(AppAction::Yank, vec![]);
+        m.insert(AppAction::YankPop, vec![]);
         m.insert(AppAction::Undo, vec![KeyBinding::ctrl("-")]);
 
         // Clipboard
@@ -2973,6 +2975,24 @@ mod tests {
             assert!(hotkeys.contains("Toggle named-only filter"));
             assert!(!hotkeys.contains("Rename session"));
             assert!(!hotkeys.contains("Delete session (when query empty)"));
+        }
+
+        #[test]
+        fn kill_ring_yank_and_yank_pop_are_unbound_by_default() {
+            let bindings = KeyBindings::default();
+            // Yank and YankPop are currently unimplemented across both stacks,
+            // so they must have empty defaults and not be advertised in /hotkeys.
+            assert!(bindings.get_bindings(AppAction::Yank).is_empty());
+            assert!(bindings.get_bindings(AppAction::YankPop).is_empty());
+            // Undo is implemented on FTUI and retains ctrl+-
+            assert_eq!(
+                bindings.get_bindings(AppAction::Undo),
+                &[KeyBinding::ctrl("-")]
+            );
+
+            let hotkeys = format_hotkeys(&bindings);
+            assert!(!hotkeys.contains("Paste most recently deleted text"));
+            assert!(!hotkeys.contains("Cycle through deleted text"));
         }
     }
 }
