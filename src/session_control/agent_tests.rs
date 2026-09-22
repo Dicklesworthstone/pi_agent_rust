@@ -460,3 +460,5 @@ fn queued_native_image_reaches_the_real_provider_without_flattening() {
     );
     assert_eq!(parts[2]["text"], "trailing context");
 }
+
+mod deadline_recovery;
