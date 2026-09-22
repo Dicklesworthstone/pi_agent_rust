@@ -24,9 +24,14 @@ fn register_in(
     task: &str,
     kind: ChildKind,
 ) -> Result<ChildEntry> {
-    let mut hub = hub.lock().map_err(|_| Error::tool("subagent", HUB_POISONED))?;
+    let mut hub = hub
+        .lock()
+        .map_err(|_| Error::tool("subagent", HUB_POISONED))?;
     hub.register_kind(name, task, kind).map_err(|error| {
-        Error::tool("subagent", format!("PI_SUBAGENT_HUB: cannot register child: {error}"))
+        Error::tool(
+            "subagent",
+            format!("PI_SUBAGENT_HUB: cannot register child: {error}"),
+        )
     })
 }
 
@@ -114,7 +119,10 @@ impl HubLease {
         kind: ChildKind,
     ) -> Result<ChildEntry> {
         if self.id.is_some() {
-            return Err(Error::tool("subagent", "PI_SUBAGENT_HUB: child lease already registered"));
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_HUB: child lease already registered",
+            ));
         }
         let entry = register_in(registry(), name, task, kind)?;
         self.id = Some(entry.id.clone());
@@ -127,10 +135,12 @@ impl HubLease {
         if result.is_error {
             return false;
         }
-        let admission = self.id.as_deref().map_or(
-            Admission::Refused(HUB_MISSING),
-            |id| activate_in(registry(), id, pid),
-        );
+        let admission = self
+            .id
+            .as_deref()
+            .map_or(Admission::Refused(HUB_MISSING), |id| {
+                activate_in(registry(), id, pid)
+            });
         if !apply_admission(result, admission) {
             return false;
         }
@@ -174,12 +184,14 @@ mod tests {
         let not_a_directory = dir.path().join("file");
         std::fs::write(&not_a_directory, b"not a directory").unwrap();
         let hub = local_hub(&not_a_directory.join("children"));
-        let error = register_in(&hub, "worker", "private assignment", ChildKind::Subagent)
-            .unwrap_err();
+        let error =
+            register_in(&hub, "worker", "private assignment", ChildKind::Subagent).unwrap_err();
         assert!(error.to_string().contains("PI_SUBAGENT_HUB"));
         assert!(!error.to_string().contains("private assignment"));
         assert!(hub.lock().unwrap().roster().is_empty());
-        hub.lock().unwrap().set_dir_for_tests(dir.path().join("valid"));
+        hub.lock()
+            .unwrap()
+            .set_dir_for_tests(dir.path().join("valid"));
         let child = register_in(&hub, "worker", "assignment", ChildKind::Subagent).unwrap();
         assert_eq!(child.id, "worker-1");
         assert_eq!(admission(&hub, &child.id), Admission::Live);
@@ -190,7 +202,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = local_hub(dir.path());
         for terminal in [
-            ChildStatus::Killed, ChildStatus::Cancelled, ChildStatus::Done, ChildStatus::Failed,
+            ChildStatus::Killed,
+            ChildStatus::Cancelled,
+            ChildStatus::Done,
+            ChildStatus::Failed,
         ] {
             let child = register_in(&hub, "worker", "assignment", ChildKind::Subagent).unwrap();
             assert_eq!(admission(&hub, &child.id), Admission::Live);
@@ -205,7 +220,11 @@ mod tests {
             assert_eq!(admission(&hub, &child.id), expected);
             hub.lock().unwrap().mark_running(&child.id, 456);
             settle_in(&hub, &child.id, ChildStatus::Done);
-            assert_eq!(admission(&hub, &child.id), expected, "terminal state was resurrected");
+            assert_eq!(
+                admission(&hub, &child.id),
+                expected,
+                "terminal state was resurrected"
+            );
         }
         assert_eq!(admission(&hub, "missing"), Admission::Refused(HUB_MISSING));
     }
@@ -223,10 +242,15 @@ mod tests {
         assert_eq!(admission(&hub, &child.id), Admission::Refused(HUB_POISONED));
         assert!(register_in(&hub, "other", "assignment", ChildKind::Tan).is_err());
         settle_in(&hub, &child.id, ChildStatus::Cancelled);
-        let guard = hub.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = hub
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(guard.get(&child.id).unwrap().status, ChildStatus::Cancelled);
         drop(guard);
-        assert!(hub.is_poisoned(), "cleanup must not silently heal admission authority");
+        assert!(
+            hub.is_poisoned(),
+            "cleanup must not silently heal admission authority"
+        );
     }
 
     #[test]
@@ -236,7 +260,10 @@ mod tests {
         let first = register_in(&hub, "worker", "first", ChildKind::Subagent).unwrap();
         let second = register_in(&hub, "worker", "second", ChildKind::Subagent).unwrap();
         hub.lock().unwrap().mark_killed(&first.id);
-        assert_eq!(admission(&hub, &first.id), Admission::Cancelled(OPERATOR_KILLED));
+        assert_eq!(
+            admission(&hub, &first.id),
+            Admission::Cancelled(OPERATOR_KILLED)
+        );
         assert_eq!(admission(&hub, &second.id), Admission::Live);
     }
 
@@ -246,18 +273,24 @@ mod tests {
         let hub = local_hub(dir.path());
         let killed = register_in(&hub, "worker", "first", ChildKind::Subagent).unwrap();
         hub.lock().unwrap().mark_killed(&killed.id);
-        assert_eq!(activate_in(&hub, &killed.id, 123), Admission::Cancelled(OPERATOR_KILLED));
+        assert_eq!(
+            activate_in(&hub, &killed.id, 123),
+            Admission::Cancelled(OPERATOR_KILLED)
+        );
         assert!(hub.lock().unwrap().get(&killed.id).unwrap().pid.is_none());
         let live = register_in(&hub, "worker", "second", ChildKind::Subagent).unwrap();
         assert_eq!(activate_in(&hub, &live.id, 456), Admission::Live);
-        assert_eq!(activate_in(&hub, &live.id, 789), Admission::Refused(HUB_ACTIVATED));
+        assert_eq!(
+            activate_in(&hub, &live.id, 789),
+            Admission::Refused(HUB_ACTIVATED)
+        );
         assert_eq!(hub.lock().unwrap().get(&live.id).unwrap().pid, Some(456));
     }
 
     #[cfg(unix)]
     mod processes {
-        use super::*;
         use super::super::super::{ChildRunner, Deadline, UpdateCallback};
+        use super::*;
         use crate::subagents::SubagentTask;
         use serde_json::json;
         use std::collections::BTreeMap;
@@ -272,8 +305,12 @@ mod tests {
             std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
             let deadline = Deadline::for_request(Some(Duration::from_secs(5)), None).unwrap();
             let runner = ChildRunner::new(
-                dir.path().to_path_buf(), dir.path().join("global"), child,
-                None, ChildKind::Subagent, deadline,
+                dir.path().to_path_buf(),
+                dir.path().join("global"),
+                child,
+                None,
+                ChildKind::Subagent,
+                deadline,
             );
             (dir, runner)
         }
@@ -302,10 +339,14 @@ mod tests {
                     // hub_id is not in the progress schema. Resolve this
                     // test's unique assignment through the real hub roster.
                     let mut hub = registry().lock().unwrap();
-                    let entry = hub.roster().into_iter().find(|entry| {
-                        result["task"].as_str() == Some(entry.task.as_str())
-                            && result["agent"].as_str() == Some(entry.name.as_str())
-                    }).expect("progress must have a registered owner");
+                    let entry = hub
+                        .roster()
+                        .into_iter()
+                        .find(|entry| {
+                            result["task"].as_str() == Some(entry.task.as_str())
+                                && result["agent"].as_str() == Some(entry.name.as_str())
+                        })
+                        .expect("progress must have a registered owner");
                     hub.mark_killed(&entry.id);
                 }
             })
@@ -316,7 +357,10 @@ mod tests {
             assert!(result.is_error);
             assert_eq!(result.error.as_deref(), Some(OPERATOR_KILLED));
             let id = result.hub_id.as_deref().unwrap();
-            assert_eq!(registry().lock().unwrap().get(id).unwrap().status, ChildStatus::Killed);
+            assert_eq!(
+                registry().lock().unwrap().get(id).unwrap().status,
+                ChildStatus::Killed
+            );
             if let Some(pid) = result.pid {
                 let status = std::process::Command::new("kill")
                     .args(["-0", &pid.to_string()])
@@ -331,10 +375,16 @@ mod tests {
         #[test]
         fn operator_kill_at_registration_prevents_os_spawn() {
             let (dir, runner) = fixture("printf launched > sentinel\nexec sleep 30");
-            let agents = BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let agents =
+                BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
             let result = runtime.block_on(runner.run_one(
-                &agents, task(false), None, Some(kill_on("starting", None)),
+                &agents,
+                task(false),
+                None,
+                Some(kill_on("starting", None)),
             ));
             assert_killed(&result);
             assert!(result.pid.is_none(), "a killed starting child was spawned");
@@ -344,15 +394,23 @@ mod tests {
         #[test]
         fn operator_kill_at_running_reaps_before_the_next_async_wait() {
             let (_dir, runner) = fixture("exec sleep 30");
-            let agents = BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let agents =
+                BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
             let result = runtime.block_on(async {
                 let mut run = Box::pin(runner.run_one(
-                    &agents, task(false), None, Some(kill_on("running", None)),
+                    &agents,
+                    task(false),
+                    None,
+                    Some(kill_on("running", None)),
                 ));
                 match futures::poll!(&mut run) {
                     std::task::Poll::Ready(result) => result,
-                    std::task::Poll::Pending => panic!("hub kill waited on a live child instead of reaping"),
+                    std::task::Poll::Pending => {
+                        panic!("hub kill waited on a live child instead of reaping")
+                    }
                 }
             });
             assert!(result.pid.is_some(), "test must reach the actual OS spawn");
@@ -367,13 +425,22 @@ mod tests {
                 "exec sleep 30"
             );
             let (_dir, runner) = fixture(script);
-            let agents = BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let agents =
+                BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
             let result = runtime.block_on(runner.run_one(
-                &agents, task(false), None, Some(kill_on("running", Some("partial"))),
+                &agents,
+                task(false),
+                None,
+                Some(kill_on("running", Some("partial"))),
             ));
             assert_killed(&result);
-            assert_eq!(result.output, "partial", "post-kill output was still consumed");
+            assert_eq!(
+                result.output, "partial",
+                "post-kill output was still consumed"
+            );
         }
 
         #[test]
@@ -383,13 +450,22 @@ mod tests {
                 "printf '%s\\n' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"not JSON\"}]}]}'\n"
             );
             let (dir, runner) = fixture(script);
-            let agents = BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let agents =
+                BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
             let result = runtime.block_on(runner.run_one(
-                &agents, task(true), None, Some(kill_on("running", Some("not JSON"))),
+                &agents,
+                task(true),
+                None,
+                Some(kill_on("running", Some("not JSON"))),
             ));
             assert_killed(&result);
-            assert_eq!(std::fs::read_to_string(dir.path().join("launches")).unwrap(), "launch\n");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("launches")).unwrap(),
+                "launch\n"
+            );
             assert_ne!(result.schema_retries, Some(1));
         }
 
@@ -404,23 +480,51 @@ mod tests {
             for args in [
                 vec!["init", "--quiet"],
                 vec!["add", "tracked.txt"],
-                vec!["-c", "user.name=Pi Test", "-c", "user.email=pi@example.invalid",
-                     "-c", "commit.gpgSign=false", "commit", "--quiet", "-m", "fixture"],
+                vec![
+                    "-c",
+                    "user.name=Pi Test",
+                    "-c",
+                    "user.email=pi@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
             ] {
-                assert!(std::process::Command::new("git").args(args).current_dir(dir.path())
-                    .status().unwrap().success());
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(dir.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
             }
-            let agents = BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
+            let agents =
+                BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
             let mut request = task(false);
             request.isolation = Some("worktree".to_string());
             request.iso_apply = Some("apply".to_string());
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
             let result = runtime.block_on(runner.run_one(
-                &agents, request, None, Some(kill_on("running", Some("finished edit"))),
+                &agents,
+                request,
+                None,
+                Some(kill_on("running", Some("finished edit"))),
             ));
             assert_killed(&result);
-            assert_eq!(std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(), "parent original\n");
-            let iso = result.iso.as_ref().expect("cancelled worktree must remain inspectable");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+                "parent original\n"
+            );
+            let iso = result
+                .iso
+                .as_ref()
+                .expect("cancelled worktree must remain inspectable");
             assert!(!iso.applied);
             assert_eq!(iso.apply_mode, "keep");
             let retained = std::path::Path::new(&iso.worktree_path).join("tracked.txt");

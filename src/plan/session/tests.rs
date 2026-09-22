@@ -55,8 +55,11 @@ fn submit(handle: &AgentSessionHandle) -> SessionPlanReview {
     let state = handle.session().agent.plan_state();
     let tool = crate::plan::SubmitPlanTool::new(state, false);
     let result = run(tool.execute(
-        "proposal", json!({"plan": PLAN, "files": ["src/hello world.rs"]}), None,
-    )).unwrap();
+        "proposal",
+        json!({"plan": PLAN, "files": ["src/hello world.rs"]}),
+        None,
+    ))
+    .unwrap();
     assert!(!result.is_error);
     handle.pending_plan_review().unwrap().unwrap()
 }
@@ -64,11 +67,15 @@ fn submit(handle: &AgentSessionHandle) -> SessionPlanReview {
 fn modes(handle: &AgentSessionHandle) -> Vec<String> {
     let store = handle.session_store();
     let session = store.try_lock().unwrap();
-    session.entries.iter().filter_map(|entry| {
-        let value = serde_json::to_value(entry).unwrap();
-        (value["customType"] == "plan_mode")
-            .then(|| value["data"]["mode"].as_str().unwrap().to_string())
-    }).collect()
+    session
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let value = serde_json::to_value(entry).unwrap();
+            (value["customType"] == "plan_mode")
+                .then(|| value["data"]["mode"].as_str().unwrap().to_string())
+        })
+        .collect()
 }
 
 fn pending() -> (AgentSessionHandle, AgentCx, SessionPlanReview) {
@@ -97,22 +104,40 @@ fn sdk_workflow_pins_the_reviewed_scope_and_preserves_independent_tool_policy() 
     assert_eq!(change.mode, PlanMode::Approved);
     assert_eq!(change.persistence, PlanPersistence::MemoryOnly);
     assert!(handle.pending_plan_review().unwrap().is_none());
-    assert!(handle.session().agent.system_prompt().unwrap().contains(review.text()));
+    assert!(
+        handle
+            .session()
+            .agent
+            .system_prompt()
+            .unwrap()
+            .contains(review.text())
+    );
     assert!(state.allows_effects(ToolEffects::write()));
     let policy = handle.session().agent.approval_state().unwrap();
     assert_eq!(policy.mode(), ApprovalMode::AlwaysAsk);
     for (path, allowed) in [("src/hello world.rs", true), ("src/hello", false)] {
         let verdict = policy.evaluate(
-            "write", &json!({"path": path}), ToolEffects::write(), Some(&state), None,
+            "write",
+            &json!({"path": path}),
+            ToolEffects::write(),
+            Some(&state),
+            None,
         );
         assert_eq!(verdict.is_auto_approved(), allowed);
     }
     let change = run(handle.exit_plan_mode(&owner)).unwrap();
     assert_eq!(change.mode, PlanMode::Off);
-    assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
     assert!(state.plan().is_none());
     assert_eq!(modes(&handle), ["planning", "approved", "off"]);
-    assert_eq!(events.load(Ordering::SeqCst), 0, "controls never start a turn");
+    assert_eq!(
+        events.load(Ordering::SeqCst),
+        0,
+        "controls never start a turn"
+    );
 }
 
 #[test]
@@ -140,8 +165,14 @@ fn identical_resubmissions_invalidate_both_kinds_of_decision() {
     assert!(!old.same_submission(&current));
     assert!(run(handle.approve_plan_review(&owner, &old)).is_err());
     assert!(run(handle.reject_plan_review(&owner, &old)).is_err());
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::PendingApproval);
-    assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
     let _ = run(handle.approve_plan_review(&owner, &current)).unwrap();
     assert!(run(handle.approve_plan_review(&owner, &current)).is_err());
     assert_eq!(modes(&handle), ["planning", "rejected", "approved"]);
@@ -174,8 +205,14 @@ fn foreign_review_with_same_id_and_text_cannot_control_a_new_store() {
     assert!(run(other.approve_plan_review(&owner, &old)).is_err());
     assert!(run(other.reject_plan_review(&owner, &old)).is_err());
     let _ = run(first.approve_plan_review(&owner, &old)).unwrap();
-    assert_eq!(other.session().agent.system_prompt(), Some("original instructions"));
-    assert_eq!(other.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        other.session().agent.system_prompt(),
+        Some("original instructions")
+    );
+    assert_eq!(
+        other.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
 }
 
 #[test]
@@ -203,7 +240,10 @@ fn review_does_not_keep_a_session_alive_or_disclose_text_in_debug() {
 fn pin_cleanup_restores_absent_and_empty_prompts_distinctly() {
     for original in [None, Some(String::new()), Some("base".to_string())] {
         let (mut handle, owner, review) = pending();
-        handle.session_mut().agent.set_system_prompt(original.clone());
+        handle
+            .session_mut()
+            .agent
+            .set_system_prompt(original.clone());
         let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
         let _ = run(handle.exit_plan_mode(&owner)).unwrap();
         assert_eq!(handle.session().agent.system_prompt(), original.as_deref());
@@ -215,10 +255,24 @@ fn unique_pin_removal_preserves_unrelated_prefix_suffix_and_base_changes() {
     let (mut handle, owner, review) = pending();
     let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
     let state = handle.session().agent.plan_state();
-    let block = state.inner.read().unwrap().session_pin.as_ref().unwrap().block.clone();
-    handle.session_mut().agent.set_system_prompt(Some(format!("new prefix{block}new tail")));
+    let block = state
+        .inner
+        .read()
+        .unwrap()
+        .session_pin
+        .as_ref()
+        .unwrap()
+        .block
+        .clone();
+    handle
+        .session_mut()
+        .agent
+        .set_system_prompt(Some(format!("new prefix{block}new tail")));
     let _ = run(handle.exit_plan_mode(&owner)).unwrap();
-    assert_eq!(handle.session().agent.system_prompt(), Some("new prefixnew tail"));
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("new prefixnew tail")
+    );
 }
 
 #[test]
@@ -227,16 +281,30 @@ fn missing_rewritten_or_duplicated_pin_never_overwrites_the_prompt() {
         let (mut handle, owner, review) = pending();
         let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
         let state = handle.session().agent.plan_state();
-        let block = state.inner.read().unwrap().session_pin.as_ref().unwrap().block.clone();
+        let block = state
+            .inner
+            .read()
+            .unwrap()
+            .session_pin
+            .as_ref()
+            .unwrap()
+            .block
+            .clone();
         let modified = match variant {
             0 => String::from("replacement prompt"),
             1 => block.replace("Approved Plan", "Rewritten Plan"),
             _ => format!("{block}{block}"),
         };
-        handle.session_mut().agent.set_system_prompt(Some(modified.clone()));
+        handle
+            .session_mut()
+            .agent
+            .set_system_prompt(Some(modified.clone()));
         assert!(run(handle.exit_plan_mode(&owner)).is_err());
         assert!(run(handle.enter_plan_mode(&owner)).is_err());
-        assert_eq!(handle.session().agent.system_prompt(), Some(modified.as_str()));
+        assert_eq!(
+            handle.session().agent.system_prompt(),
+            Some(modified.as_str())
+        );
         assert_eq!(state.mode(), PlanMode::Approved);
         assert_eq!(modes(&handle), ["planning", "approved"]);
     }
@@ -248,12 +316,30 @@ fn reentering_planning_removes_the_previous_pin_and_closes_the_gate() {
     let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
     let next = run(handle.enter_plan_mode(&owner)).unwrap();
     assert_eq!(next.mode, PlanMode::Planning);
-    assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
-    assert!(!handle.session().agent.plan_state().allows_effects(ToolEffects::write()));
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
+    assert!(
+        !handle
+            .session()
+            .agent
+            .plan_state()
+            .allows_effects(ToolEffects::write())
+    );
     let new = submit(&handle);
     assert!(!new.same_submission(&review));
     let _ = run(handle.approve_plan_review(&owner, &new)).unwrap();
-    assert_eq!(handle.session().agent.system_prompt().unwrap().matches(PLAN).count(), 1);
+    assert_eq!(
+        handle
+            .session()
+            .agent
+            .system_prompt()
+            .unwrap()
+            .matches(PLAN)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -263,7 +349,10 @@ fn raw_gate_exit_does_not_orphan_the_sdk_owned_context() {
     handle.session().agent.plan_state().exit();
     let cleanup = run(handle.exit_plan_mode(&owner)).unwrap();
     assert!(cleanup.changed);
-    assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
 }
 
 #[test]
@@ -276,7 +365,10 @@ fn raw_reentry_cannot_stack_new_approval_on_an_earlier_owned_pin() {
     assert!(run(handle.approve_plan_review(&owner, &new)).is_err());
     assert_eq!(state.mode(), PlanMode::PendingApproval);
     let _ = run(handle.exit_plan_mode(&owner)).unwrap();
-    assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
 }
 
 #[test]
@@ -286,7 +378,10 @@ fn raw_reentry_then_sdk_enter_cleans_the_pin_even_when_already_planning() {
     handle.session().agent.plan_state().enter_planning();
     let change = run(handle.enter_plan_mode(&owner)).unwrap();
     assert!(change.changed);
-    assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
 }
 
 #[test]
@@ -298,7 +393,10 @@ fn a_busy_store_never_blocks_or_partially_applies_a_control() {
     assert!(run(handle.approve_plan_review(&owner, &review)).is_err());
     assert!(run(handle.reject_plan_review(&owner, &review)).is_err());
     assert!(run(handle.exit_plan_mode(&owner)).is_err());
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
     drop(held);
     assert_eq!(modes(&handle), ["planning"]);
     let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
@@ -317,7 +415,10 @@ fn busy_or_poisoned_plan_lock_returns_an_error_without_mutation() {
         panic!("poison plan state");
     }));
     assert!(run(handle.exit_plan_mode(&owner)).is_err());
-    assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
     assert_eq!(modes(&handle), ["planning"]);
 }
 
@@ -342,12 +443,28 @@ fn a_failed_save_is_a_committed_live_change_not_an_error_or_rollback() {
     let (mut handle, _) = fixture(stored, true);
     let owner = AgentCx::for_request();
     let entered = run(handle.enter_plan_mode(&owner)).unwrap();
-    assert!(matches!(entered.persistence, PlanPersistence::Unconfirmed { .. }));
+    assert!(matches!(
+        entered.persistence,
+        PlanPersistence::Unconfirmed { .. }
+    ));
     let review = submit(&handle);
     let approved = run(handle.approve_plan_review(&owner, &review)).unwrap();
-    assert!(matches!(approved.persistence, PlanPersistence::Unconfirmed { .. }));
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Approved);
-    assert!(handle.session().agent.system_prompt().unwrap().contains(review.text()));
+    assert!(matches!(
+        approved.persistence,
+        PlanPersistence::Unconfirmed { .. }
+    ));
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::Approved
+    );
+    assert!(
+        handle
+            .session()
+            .agent
+            .system_prompt()
+            .unwrap()
+            .contains(review.text())
+    );
     assert!(run(handle.approve_plan_review(&owner, &review)).is_err());
     assert_eq!(modes(&handle), ["planning", "approved"]);
     assert_eq!(std::fs::read(&blocker).unwrap(), b"sentinel");
@@ -363,10 +480,14 @@ fn successful_save_contains_the_existing_transition_journal_shape() {
     let change = run(handle.enter_plan_mode(&AgentCx::for_request())).unwrap();
     assert_eq!(change.persistence, PlanPersistence::Saved);
     let lines = std::fs::read_to_string(&path).unwrap();
-    let rows: Vec<Value> = lines.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    assert!(rows.iter().any(|row| {
-        row["customType"] == "plan_mode" && row["data"]["mode"] == "planning"
-    }));
+    let rows: Vec<Value> = lines
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|row| { row["customType"] == "plan_mode" && row["data"]["mode"] == "planning" })
+    );
 }
 
 #[test]
@@ -379,7 +500,10 @@ fn cancelled_controls_and_unpolled_controls_leave_no_transition() {
     assert!(run(handle.approve_plan_review(&owner, &review)).is_err());
     assert!(run(handle.reject_plan_review(&owner, &review)).is_err());
     assert!(run(handle.exit_plan_mode(&owner)).is_err());
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
     assert_eq!(modes(&handle), ["planning"]);
 }
 
@@ -408,8 +532,14 @@ fn cancellation_before_save_reports_unconfirmed_not_saved() {
     let owner = AgentCx::for_request();
     let mut session = Session::in_memory();
     session.append_custom_entry("plan_mode".to_string(), Some(json!({"mode":"approved"})));
-    owner.cancel_with(asupersync::types::CancelKind::User, Some("after live transition"));
-    assert!(matches!(run(persist(&mut session, &owner, true)), PlanPersistence::Unconfirmed { .. }));
+    owner.cancel_with(
+        asupersync::types::CancelKind::User,
+        Some("after live transition"),
+    );
+    assert!(matches!(
+        run(persist(&mut session, &owner, true)),
+        PlanPersistence::Unconfirmed { .. }
+    ));
     assert_eq!(session.entries.len(), 1);
 }
 
@@ -430,7 +560,10 @@ fn existing_controllable_sessions_can_use_the_same_idle_plan_api() {
     let owner = AgentCx::for_request();
     let _ = run(controlled.session_mut().enter_plan_mode(&owner)).unwrap();
     let review = submit(controlled.session_mut());
-    let _ = run(controlled.session_mut().approve_plan_review(&owner, &review)).unwrap();
+    let _ = run(controlled
+        .session_mut()
+        .approve_plan_review(&owner, &review))
+    .unwrap();
     let _ = run(controlled.session_mut().exit_plan_mode(&owner)).unwrap();
 }
 
@@ -453,7 +586,9 @@ mod wire {
     }
 
     fn read_request(stream: &TcpStream) -> Value {
-        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut length = None;
         let mut header_bytes = 0;
@@ -462,7 +597,9 @@ mod wire {
             assert!(reader.read_line(&mut line).unwrap() > 0);
             header_bytes += line.len();
             assert!(header_bytes <= 64 * 1024);
-            if line == "\r\n" { break; }
+            if line == "\r\n" {
+                break;
+            }
             if let Some((key, value)) = line.split_once(':')
                 && key.eq_ignore_ascii_case("content-length")
             {
@@ -477,30 +614,43 @@ mod wire {
     }
 
     fn frame(delta: Value, finish: Value) -> String {
-        format!("data: {}\n\n", json!({
-            "id":"plan-fixture", "object":"chat.completion.chunk",
-            "created":0, "model":"plan-fixture",
-            "choices":[{"index":0, "delta":delta, "finish_reason":finish}]
-        }))
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id":"plan-fixture", "object":"chat.completion.chunk",
+                "created":0, "model":"plan-fixture",
+                "choices":[{"index":0, "delta":delta, "finish_reason":finish}]
+            })
+        )
     }
 
     fn response(index: usize) -> String {
         let (delta, reason) = match index {
-            1 | 4 => (json!({"role":"assistant", "tool_calls":[{
-                "index":0, "id":format!("write-{index}"), "type":"function",
-                "function":{"name":"write", "arguments":json!({
-                    "path":"result.txt", "content":"approved mutation"
-                }).to_string()}
-            }]}), "tool_calls"),
-            2 => (json!({"role":"assistant", "tool_calls":[{
-                "index":0, "id":"submit", "type":"function",
-                "function":{"name":"submit_plan", "arguments":json!({
-                    "plan":PLAN, "files":["result.txt"]
-                }).to_string()}
-            }]}), "tool_calls"),
+            1 | 4 => (
+                json!({"role":"assistant", "tool_calls":[{
+                    "index":0, "id":format!("write-{index}"), "type":"function",
+                    "function":{"name":"write", "arguments":json!({
+                        "path":"result.txt", "content":"approved mutation"
+                    }).to_string()}
+                }]}),
+                "tool_calls",
+            ),
+            2 => (
+                json!({"role":"assistant", "tool_calls":[{
+                    "index":0, "id":"submit", "type":"function",
+                    "function":{"name":"submit_plan", "arguments":json!({
+                        "plan":PLAN, "files":["result.txt"]
+                    }).to_string()}
+                }]}),
+                "tool_calls",
+            ),
             _ => (json!({"role":"assistant", "content":"complete"}), "stop"),
         };
-        format!("{}{}data: [DONE]\n\n", frame(delta, Value::Null), frame(json!({}), json!(reason)))
+        format!(
+            "{}{}data: [DONE]\n\n",
+            frame(delta, Value::Null),
+            frame(json!({}), json!(reason))
+        )
     }
 
     impl Peer {
@@ -516,11 +666,15 @@ mod wire {
                 for index in 0..6 {
                     let deadline = Instant::now() + Duration::from_secs(30);
                     loop {
-                        if stopping.load(Ordering::SeqCst) { return; }
+                        if stopping.load(Ordering::SeqCst) {
+                            return;
+                        }
                         assert!(Instant::now() < deadline, "missing fixture request {index}");
                         match listener.accept() {
                             Ok((mut stream, _)) => {
-                                stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+                                stream
+                                    .set_write_timeout(Some(Duration::from_secs(30)))
+                                    .unwrap();
                                 captured.lock().unwrap().push(read_request(&stream));
                                 let body = response(index);
                                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -535,7 +689,12 @@ mod wire {
                     }
                 }
             });
-            Self { url, requests, stop, worker: Some(worker) }
+            Self {
+                url,
+                requests,
+                stop,
+                worker: Some(worker),
+            }
         }
 
         fn handle(&self, cwd: &std::path::Path) -> AgentSessionHandle {
@@ -550,7 +709,9 @@ mod wire {
                     max_tool_iterations: 8,
                     system_prompt: Some("base instructions".to_string()),
                     approval_state: Some(ApprovalState::new(
-                        ApprovalMode::AlwaysAsk, true, Vec::new(),
+                        ApprovalMode::AlwaysAsk,
+                        true,
+                        Vec::new(),
                     )),
                     stream_options: crate::provider::StreamOptions {
                         api_key: Some("local-fixture-key".to_string()),
@@ -561,11 +722,14 @@ mod wire {
                 },
             );
             let session = crate::agent::AgentSession::new(
-                agent, Arc::new(Store::new(Session::in_memory())), false,
+                agent,
+                Arc::new(Store::new(Session::in_memory())),
+                false,
                 crate::compaction::ResolvedCompactionSettings::default(),
             );
             AgentSessionHandle::from_session_with_listeners(
-                session, crate::sdk::EventListeners::default(),
+                session,
+                crate::sdk::EventListeners::default(),
             )
         }
     }
@@ -575,15 +739,19 @@ mod wire {
             self.stop.store(true, Ordering::SeqCst);
             if let Some(worker) = self.worker.take() {
                 let result = worker.join();
-                if !std::thread::panicking() { result.expect("wire fixture thread"); }
+                if !std::thread::panicking() {
+                    result.expect("wire fixture thread");
+                }
             }
         }
     }
 
     fn has_submit_schema(request: &Value) -> bool {
-        request["tools"].as_array().unwrap().iter().any(|tool| {
-            tool["function"]["name"] == "submit_plan"
-        })
+        request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "submit_plan")
     }
 
     fn lifecycle(rebind: bool) {
@@ -595,10 +763,13 @@ mod wire {
         if rebind {
             foreign.enter_planning();
             state.enter_planning();
-            handle.session_mut().agent.extend_tools(std::iter::once(
-                Box::new(crate::plan::SubmitPlanTool::new(foreign.clone(), true))
-                    as Box<dyn Tool>,
-            ));
+            handle
+                .session_mut()
+                .agent
+                .extend_tools(std::iter::once(Box::new(crate::plan::SubmitPlanTool::new(
+                    foreign.clone(),
+                    true,
+                )) as Box<dyn Tool>));
         }
         run(async {
             let owner = AgentCx::for_current_or_request();
@@ -608,33 +779,64 @@ mod wire {
             assert!(handle.has_tool("submit_plan"));
             handle.prompt("prepare a plan", |_| {}).await.unwrap();
             assert_eq!(state.mode(), PlanMode::PendingApproval);
-            assert!(!temp.path().join("result.txt").exists(), "planning cannot write");
+            assert!(
+                !temp.path().join("result.txt").exists(),
+                "planning cannot write"
+            );
             let review = handle.pending_plan_review().unwrap().unwrap();
             assert!(review.text().contains("Files: [\"result.txt\"]"));
             {
                 let requests = peer.requests.lock().unwrap();
                 assert_eq!(requests.len(), 4);
-                assert!(has_submit_schema(&requests[1]), "invalidate the cached schema");
+                assert!(
+                    has_submit_schema(&requests[1]),
+                    "invalidate the cached schema"
+                );
                 assert!(requests[2].to_string().contains("PLAN_MODE_BLOCKED"));
             }
             let _ = handle.approve_plan_review(&owner, &review).await.unwrap();
-            assert_eq!(peer.requests.lock().unwrap().len(), 4, "approval is not execution");
-            handle.prompt("execute the approved plan", |_| {}).await.unwrap();
-            assert_eq!(std::fs::read(temp.path().join("result.txt")).unwrap(), b"approved mutation");
+            assert_eq!(
+                peer.requests.lock().unwrap().len(),
+                4,
+                "approval is not execution"
+            );
+            handle
+                .prompt("execute the approved plan", |_| {})
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(temp.path().join("result.txt")).unwrap(),
+                b"approved mutation"
+            );
             {
                 let requests = peer.requests.lock().unwrap();
                 assert_eq!(requests.len(), 6);
-                assert!(requests[4]["messages"].as_array().unwrap().iter().any(|message| {
-                    matches!(message["role"].as_str(), Some("system" | "developer"))
-                        && message["content"].as_str().is_some_and(|s| s.contains(review.text()))
-                }), "the actual execution request must carry the full reviewed plan");
+                assert!(
+                    requests[4]["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|message| {
+                            matches!(message["role"].as_str(), Some("system" | "developer"))
+                                && message["content"]
+                                    .as_str()
+                                    .is_some_and(|s| s.contains(review.text()))
+                        }),
+                    "the actual execution request must carry the full reviewed plan"
+                );
             }
             let _ = handle.exit_plan_mode(&owner).await.unwrap();
-            assert_eq!(handle.session().agent.system_prompt(), Some("base instructions"));
+            assert_eq!(
+                handle.session().agent.system_prompt(),
+                Some("base instructions")
+            );
         });
         if rebind {
             assert_eq!(foreign.mode(), PlanMode::Planning);
-            assert!(foreign.plan().is_none(), "the foreign helper must never run");
+            assert!(
+                foreign.plan().is_none(),
+                "the foreign helper must never run"
+            );
         }
     }
 

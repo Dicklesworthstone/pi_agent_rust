@@ -154,8 +154,15 @@ impl<O: Read, E: Read> ChildPipes<O, E> {
         owner: &AgentCx,
         work_deadline: Deadline,
     ) {
-        self.finish_with_timeout(protocol, result, update, owner, work_deadline, PIPE_DRAIN_TIMEOUT)
-            .await;
+        self.finish_with_timeout(
+            protocol,
+            result,
+            update,
+            owner,
+            work_deadline,
+            PIPE_DRAIN_TIMEOUT,
+        )
+        .await;
     }
 
     async fn finish_with_timeout(
@@ -238,12 +245,17 @@ mod tests {
         json!({"type":"agent_end","messages":[{
             "role":"assistant","stopReason":"stop",
             "content":[{"type":"text","text":"complete answer"}]
-        }]}).to_string()
+        }]})
+        .to_string()
     }
 
     fn assert_peer_closed(mut peer: UnixStream) {
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        assert_eq!(peer.read(&mut [0_u8; 1]).unwrap(), 0, "reader descriptor survived drop");
+        assert_eq!(
+            peer.read(&mut [0_u8; 1]).unwrap(),
+            0,
+            "reader descriptor survived drop"
+        );
     }
 
     #[test]
@@ -263,8 +275,12 @@ mod tests {
     #[test]
     fn nonblocking_framing_matches_the_existing_complete_frame_reader() {
         for input in [
-            &b""[..], &b"\n"[..], &b"one\r\ntwo\nlast"[..],
-            &b"final\r"[..], "日本語\n🦀\r\n".as_bytes(), &b"\n\n\r\n"[..],
+            &b""[..],
+            &b"\n"[..],
+            &b"one\r\ntwo\nlast"[..],
+            &b"final\r"[..],
+            "日本語\n🦀\r\n".as_bytes(),
+            &b"\n\n\r\n"[..],
         ] {
             let (mut pipe, mut writer) = socket_pipe(64);
             writer.write_all(input).unwrap();
@@ -346,7 +362,13 @@ mod tests {
         let mut result = result();
         pipes.drain(&mut protocol, &mut result, None);
         assert!(result.is_error);
-        assert!(result.error.as_deref().unwrap().contains("stdout is not UTF-8"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("stdout is not UTF-8")
+        );
         assert!(result.stderr.contains("note\u{fffd}"));
     }
 
@@ -387,7 +409,9 @@ mod tests {
         err.write_all(b"last diagnostic").unwrap();
         out.shutdown(Shutdown::Write).unwrap();
         err.shutdown(Shutdown::Write).unwrap();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
         let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
         let mut protocol = protocol::ChildProtocol::default();
@@ -405,15 +429,25 @@ mod tests {
     fn held_open_peer_cannot_authorize_success_after_the_drain_deadline() {
         let (pipes, mut out, err) = pair();
         writeln!(out, "{}", ended()).unwrap();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
         let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
         let mut protocol = protocol::ChildProtocol::default();
         let mut result = result();
         runtime.block_on(pipes.finish_with_timeout(
-            &mut protocol, &mut result, None, &owner, deadline, Duration::ZERO,
+            &mut protocol,
+            &mut result,
+            None,
+            &owner,
+            deadline,
+            Duration::ZERO,
         ));
-        assert!(protocol.finish().is_ok(), "a valid answer alone is insufficient");
+        assert!(
+            protocol.finish().is_ok(),
+            "a valid answer alone is insufficient"
+        );
         assert!(result.is_error);
         assert_eq!(result.error.as_deref(), Some(PIPE_TIMEOUT));
         assert_peer_closed(out);
@@ -423,17 +457,29 @@ mod tests {
     #[test]
     fn cancellation_closes_open_peers_without_waiting_for_eof() {
         let (pipes, out, err) = pair();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel child drain"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel child drain"),
+        );
         let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
         let mut protocol = protocol::ChildProtocol::default();
         let mut result = result();
         runtime.block_on(async {
-            let mut finish = Box::pin(pipes.finish(&mut protocol, &mut result, None, &owner, deadline));
-            assert!(futures::poll!(&mut finish).is_ready(), "cancellation must not await EOF");
+            let mut finish =
+                Box::pin(pipes.finish(&mut protocol, &mut result, None, &owner, deadline));
+            assert!(
+                futures::poll!(&mut finish).is_ready(),
+                "cancellation must not await EOF"
+            );
         });
-        assert!(matches!(result.status, super::super::SubagentStatus::Cancelled));
+        assert!(matches!(
+            result.status,
+            super::super::SubagentStatus::Cancelled
+        ));
         assert_peer_closed(out);
         assert_peer_closed(err);
     }
@@ -441,13 +487,16 @@ mod tests {
     #[test]
     fn dropping_a_pending_drain_closes_readers_despite_live_writer_peers() {
         let (pipes, out, err) = pair();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
         let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
         let mut protocol = protocol::ChildProtocol::default();
         let mut result = result();
         runtime.block_on(async {
-            let mut finish = Box::pin(pipes.finish(&mut protocol, &mut result, None, &owner, deadline));
+            let mut finish =
+                Box::pin(pipes.finish(&mut protocol, &mut result, None, &owner, deadline));
             assert!(futures::poll!(&mut finish).is_pending());
             drop(finish);
         });
@@ -485,7 +534,10 @@ mod tests {
         let mut result = result();
         let started = Instant::now();
         loop {
-            assert!(started.elapsed() < Duration::from_secs(10), "pipe drainage stalled");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "pipe drainage stalled"
+            );
             pipes.drain(&mut protocol, &mut result, None);
             assert!(!result.is_error, "{:?}", result.error);
             if let Some(status) = child.child.as_mut().unwrap().try_wait().unwrap() {
@@ -495,7 +547,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         child.stop_descendants();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
         let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
         runtime.block_on(pipes.finish(&mut protocol, &mut result, None, &owner, deadline));
