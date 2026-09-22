@@ -11,6 +11,18 @@ It also auto-waives one verified UBS false-positive class (bd-gel2u): the
 where `recv` provably resolves to a Vec-like local declaration in the staged
 file. Anything ambiguous (parameters, fields, shadowed or path-like
 declarations) still fails and needs an inline `ubs:ignore` marker.
+
+And one structural waiver (bd-ubs-delta-vs-fmt-conflict): a file whose staged
+content is byte-for-byte `rustfmt`'s output over its own HEAD blob. Reducing
+findings to changed lines is line-number attribution, and rustfmt moves lines
+without changing code, so reformatting a module drags its whole existing
+backlog onto "changed" lines and this gate refuses the commit. That is not
+hypothetical -- it blocked both of 2026-09-21's `cargo fmt --check` repairs,
+in the two files most in need of them, while Gate 1 stayed red for everyone.
+
+The waiver is whole-file and rule-agnostic, which is only safe because the
+premise is exact: reformat-plus-edit differs from `rustfmt(HEAD)` on the first
+edited byte and keeps every finding. See `content_is_pure_rustfmt`.
 """
 
 from __future__ import annotations
@@ -82,6 +94,72 @@ def staged_file_text(root: Path, rel_path: str) -> str | None:
     if proc.returncode != 0:
         return None
     return proc.stdout
+
+
+EDITION_RE = re.compile(r'^\s*edition\s*=\s*"(\d{4})"', re.M)
+
+
+def crate_edition(root: Path) -> str | None:
+    """The edition rustfmt must be told about, read from Cargo.toml."""
+    try:
+        manifest = (root / "Cargo.toml").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = EDITION_RE.search(manifest)
+    return match.group(1) if match is not None else None
+
+
+def content_is_pure_rustfmt(before: bytes, after: bytes, edition: str) -> bool:
+    """True only when `after` is byte-for-byte what rustfmt makes of `before`.
+
+    This is the one case where a finding on a changed line provably is not
+    this diff's fault. rustfmt rewraps; it does not rewrite. If the staged
+    content is exactly its output over the pre-image, every finding in the
+    file predates the diff, and the only thing that changed is which line
+    number UBS reports it on -- which is the sole thing this gate measures.
+
+    Not a relaxation of what counts as a defect. A commit that reformats AND
+    edits fails the comparison on the first differing byte, and every finding
+    is kept. Unparseable input, a missing rustfmt, or any nonzero exit is
+    also False: uncertainty keeps the finding, as everywhere else here.
+    """
+    if before == after:
+        return False  # nothing changed; there are no changed lines to excuse
+    if shutil.which("rustfmt") is None:
+        return False
+    try:
+        formatted = subprocess.run(
+            ["rustfmt", "--edition", edition, "--emit", "stdout", "--quiet"],
+            input=before,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return formatted.returncode == 0 and formatted.stdout == after
+
+
+def staged_file_is_pure_reflow(root: Path, rel_path: str) -> bool:
+    """`content_is_pure_rustfmt` against HEAD's blob and the staged blob."""
+    edition = crate_edition(root)
+    if edition is None:
+        return False
+    head = subprocess.run(
+        ["git", "show", f"HEAD:{rel_path}"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    staged = subprocess.run(
+        ["git", "show", f":{rel_path}"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    if head.returncode != 0 or staged.returncode != 0:
+        return False
+    return content_is_pure_rustfmt(head.stdout, staged.stdout, edition)
 
 
 def vec_push_false_positive(source: str, line_no: int) -> bool:
@@ -265,7 +343,18 @@ def apply_verified_waivers(
     kept: list[Finding] = []
     waived: list[tuple[Finding, str]] = []
     sources: dict[str, str | None] = {}
+    reflow: dict[str, bool] = {}
     for finding in failures:
+        # Whole-file, and checked first: if the staged content is exactly
+        # rustfmt's output over HEAD's, no finding in it can belong to this
+        # diff, whatever rule produced it.
+        if finding.path not in reflow:
+            reflow[finding.path] = staged_file_is_pure_reflow(root, finding.path)
+        if reflow[finding.path]:
+            waived.append(
+                (finding, "staged content is byte-identical to rustfmt(HEAD) (bd-ubs-delta-vs-fmt-conflict)")
+            )
+            continue
         if PATH_PUSH_FINDING_RE.search(finding.message):
             if finding.path not in sources:
                 sources[finding.path] = staged_file_text(root, finding.path)
@@ -374,6 +463,41 @@ def run_waiver_self_test() -> None:
 
     unterminated_source = "fn f() { let x = r#\"never closed...\n"
     assert not flagged_line_is_loop_free(unterminated_source, 1), "unterminated raw string bails"
+
+    # Pure-reflow waiver. The negatives matter more than the positive here:
+    # this waives every rule for a whole file, so it has to be impossible to
+    # get by editing.
+    if shutil.which("rustfmt") is not None:
+        unformatted = (
+            b"fn demo( a : u32 , b : u32 )->u32{\n"
+            b"let  c = a +b ;\n"
+            b"    c\n"
+            b"}\n"
+        )
+        formatted = subprocess.run(
+            ["rustfmt", "--edition", "2024", "--emit", "stdout", "--quiet"],
+            input=unformatted,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        assert formatted.returncode == 0, "self-test fixture must be formattable"
+        reflowed = formatted.stdout
+        assert content_is_pure_rustfmt(unformatted, reflowed, "2024"), (
+            "rustfmt's own output over the pre-image must be recognised"
+        )
+        assert not content_is_pure_rustfmt(unformatted, unformatted, "2024"), (
+            "an unchanged file has no changed lines to excuse"
+        )
+        assert not content_is_pure_rustfmt(
+            unformatted, reflowed + b"\nfn added() {}\n", "2024"
+        ), "reformat-plus-edit must keep every finding"
+        assert not content_is_pure_rustfmt(
+            unformatted, reflowed.replace(b"a + b", b"a - b"), "2024"
+        ), "a one-operator edit inside a reflow must keep every finding"
+        assert not content_is_pure_rustfmt(b"fn broken( {\n", b"fn broken() {}\n", "2024"), (
+            "unparseable pre-image must keep every finding"
+        )
 
     print("WAIVER SELF-TEST PASS")
 
