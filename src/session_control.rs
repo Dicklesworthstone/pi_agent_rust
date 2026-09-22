@@ -26,6 +26,7 @@ use crate::sdk::AgentSessionHandle;
 mod agent_tests;
 mod attachments;
 mod deadline;
+mod execution;
 mod recovery;
 pub use deadline::{DeadlineTurn, TurnDeadline, TurnDeadlineError};
 pub use recovery::TransferredInput;
@@ -318,6 +319,10 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for ControlledTurn<F> 
 ///
 /// The two additive fetchers are installed once, not once per prompt. Idle session management
 /// stays available through `session_mut`; Rust prevents access during a turn.
+/// Each turn retains its initiating scoped context across polls. With no scoped
+/// context at construction it binds once on first poll, allowing construction
+/// outside a runtime. Owner cancellation wakes the turn, seals live input and
+/// requests native abort; await completion to drain cleanup and inspect errors.
 pub struct ControllableSession {
     session: AgentSessionHandle,
     active: ActiveRun,
@@ -400,7 +405,7 @@ impl ControllableSession {
                 .await
         };
         Ok(ControlledTurn {
-            future: Box::pin(future),
+            future: Box::pin(execution::OwnedTurn::new(future, control.clone())),
             control,
             polled: false,
         })
@@ -422,7 +427,7 @@ impl ControllableSession {
             session.continue_turn_with_abort(signal, on_event).await
         };
         Ok(ControlledTurn {
-            future: Box::pin(future),
+            future: Box::pin(execution::OwnedTurn::new(future, control.clone())),
             control,
             polled: false,
         })
