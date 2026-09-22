@@ -172,7 +172,10 @@ mod tests {
         assert_eq!(source.snapshot().pending_bytes, 0);
         assert_eq!(target.snapshot().pending_bytes, before + existing_bytes);
         assert!(source.transfer_pending_to(&target).unwrap().is_empty());
-        assert!(target.retract(second).is_none(), "old identities are retired");
+        assert!(
+            target.retract(second).is_none(),
+            "old identities are retired"
+        );
         let recovered = target.take_pending();
         assert_eq!(recovered[0].id, existing);
         assert_eq!(recovered[1].id, receipts[0].new_id);

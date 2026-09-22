@@ -57,8 +57,7 @@ fn clock_deadline() -> (Arc<VirtualClock>, TurnDeadline) {
     let clock = Arc::new(VirtualClock::new());
     let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
     let deadline =
-        TurnDeadline::from_timer(&AgentCx::for_request(), timer, Duration::from_secs(10))
-            .unwrap();
+        TurnDeadline::from_timer(&AgentCx::for_request(), timer, Duration::from_secs(10)).unwrap();
     (clock, deadline)
 }
 
@@ -116,8 +115,7 @@ fn invalid_durations_and_clock_overflow_are_rejected() {
     }
     clock.advance_to(Time::from_nanos(u64::MAX - 1));
     assert!(
-        TurnDeadline::from_timer(&deadline.owner, deadline.timer, Duration::from_nanos(2))
-            .is_err()
+        TurnDeadline::from_timer(&deadline.owner, deadline.timer, Duration::from_nanos(2)).is_err()
     );
 }
 
@@ -254,7 +252,10 @@ fn owner_cancellation_drains_without_claiming_deadline_expiry() {
 
 #[test]
 fn normal_completion_preserves_native_success_and_typed_error() {
-    for completion in [Ok(AssistantMessage::default()), Err(Error::session("expected"))] {
+    for completion in [
+        Ok(AssistantMessage::default()),
+        Err(Error::session("expected")),
+    ] {
         let (_, deadline) = clock_deadline();
         let expected_error = completion.is_err();
         let native = turn(completion);
@@ -326,10 +327,9 @@ fn wrapping_an_already_polled_turn_still_drains_its_native_cleanup() {
 #[test]
 fn cancelled_unpolled_turn_never_starts_execution() {
     let (_, deadline) = clock_deadline();
-    deadline.owner.cancel_with(
-        asupersync::types::CancelKind::User,
-        Some("before dispatch"),
-    );
+    deadline
+        .owner
+        .cancel_with(asupersync::types::CancelKind::User, Some("before dispatch"));
     let native = turn(Ok(AssistantMessage::default()));
     let polls = Arc::clone(&native.future.polls);
     let control = native.control();

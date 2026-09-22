@@ -53,7 +53,10 @@ impl TurnDeadline {
             ));
         }
         owner.checkpoint().map_err(|_| {
-            control_error("SESSION_DEADLINE_CANCELLED", "the deadline owner is cancelled")
+            control_error(
+                "SESSION_DEADLINE_CANCELLED",
+                "the deadline owner is cancelled",
+            )
         })?;
         let timer = owner.timer_driver().ok_or_else(|| {
             control_error(
@@ -76,7 +79,10 @@ impl TurnDeadline {
             ));
         }
         let nanos = u64::try_from(timeout.as_nanos()).map_err(|_| {
-            control_error("SESSION_DEADLINE_RANGE", "turn timeout is not representable")
+            control_error(
+                "SESSION_DEADLINE_RANGE",
+                "turn timeout is not representable",
+            )
         })?;
         let at = timer.now().as_nanos().checked_add(nanos).ok_or_else(|| {
             control_error(
@@ -103,7 +109,11 @@ impl TurnDeadline {
 
     #[must_use]
     pub fn remaining(&self) -> Duration {
-        Duration::from_nanos(self.at.as_nanos().saturating_sub(self.timer.now().as_nanos()))
+        Duration::from_nanos(
+            self.at
+                .as_nanos()
+                .saturating_sub(self.timer.now().as_nanos()),
+        )
     }
 
     #[must_use]
