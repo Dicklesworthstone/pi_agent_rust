@@ -11240,6 +11240,145 @@ mod retry_tests {
         });
     }
 
+    /// bd-dexy7: drive `switch_session` through a real JS
+    /// `session_before_switch` hook and return the live session afterwards.
+    async fn run_real_js_switch_session(
+        runtime_handle: &asupersync::runtime::RuntimeHandle,
+        temp: &tempfile::TempDir,
+        hook_result: &str,
+    ) -> (Value, Arc<asupersync::sync::Mutex<Session>>, String, String) {
+        let extension_path = temp.path().join("switch-hook.mjs");
+        std::fs::write(
+            &extension_path,
+            format!(
+                r#"
+                export default function init(pi) {{
+                  pi.on("session_before_switch", async () => {{
+                    await pi.session("appendEntry", {{
+                      customType: "switch-before-hook-entry",
+                      data: {{ owner: "source" }}
+                    }});
+                    return {hook_result};
+                  }});
+                }}
+                "#
+            ),
+        )
+        .expect("write switch hook extension");
+
+        let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
+        target.append_message(SessionMessage::User {
+            content: UserContent::Text("target session prompt".to_string()),
+            timestamp: Some(0),
+        });
+        target.save().await.expect("save switch target");
+        let target_id = target.header.id.clone();
+        let target_path = target.path.clone().expect("saved target path");
+
+        let agent = Agent::new(
+            Arc::new(FlakyProvider::new()),
+            ToolRegistry::new(&[], temp.path(), None),
+            AgentConfig::default(),
+        );
+        let source = Session::in_memory();
+        let source_id = source.header.id.clone();
+        let inner_session = Arc::new(asupersync::sync::Mutex::new(source));
+        let mut agent_session = AgentSession::new(
+            agent,
+            Arc::clone(&inner_session),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        agent_session
+            .enable_extensions(&[], temp.path(), None, &[extension_path])
+            .await
+            .expect("enable switch hook extension");
+        let options = build_test_rpc_options(runtime_handle, temp.path().join("auth.json"));
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+        in_tx
+            .send(
+                &asupersync::Cx::for_testing(),
+                json!({"id": "1", "type": "switch_session", "sessionPath": target_path})
+                    .to_string(),
+            )
+            .await
+            .expect("send switch_session");
+        drop(in_tx);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+
+        // Boxed: clippy::large_futures.
+        Box::pin(run(agent_session, options, in_rx, out_tx))
+            .await
+            .expect("rpc server loop");
+        let response = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+            .find(|value| value["type"] == "response" && value["command"] == "switch_session")
+            .expect("switch_session response");
+        (response, inner_session, source_id, target_id)
+    }
+
+    fn has_switch_hook_entry(session: &Session) -> bool {
+        session.entries_for_current_path().iter().any(|entry| {
+            matches!(entry, SessionEntry::Custom(custom)
+                if custom.custom_type == "switch-before-hook-entry")
+        })
+    }
+
+    #[test]
+    fn rpc_switch_session_cancelled_real_js_hook_keeps_actions_on_the_source_session() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (response, inner_session, source_id, _) =
+                run_real_js_switch_session(&runtime_handle, &temp, "{ cancel: true }").await;
+            assert_eq!(response["success"], true, "unexpected response: {response}");
+            assert_eq!(response["data"]["cancelled"], true, "{response}");
+            let inner = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("session lock");
+            assert_eq!(
+                inner.header.id, source_id,
+                "a vetoed switch keeps the source"
+            );
+            assert!(
+                has_switch_hook_entry(&inner),
+                "the hook's write belongs to the source session it ran against"
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_switch_session_allowed_real_js_hook_does_not_leak_actions_into_the_target() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (response, inner_session, _, target_id) =
+                run_real_js_switch_session(&runtime_handle, &temp, "undefined").await;
+            assert_eq!(response["success"], true, "unexpected response: {response}");
+            assert_ne!(response["data"]["cancelled"], true, "{response}");
+            let inner = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("session lock");
+            assert_eq!(
+                inner.header.id, target_id,
+                "an allowed switch installs the target"
+            );
+            assert!(
+                !has_switch_hook_entry(&inner),
+                "a write the hook made against the source must not land in the target"
+            );
+        });
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn run_bash_rpc_cancelled_context_kills_process_tree() {
