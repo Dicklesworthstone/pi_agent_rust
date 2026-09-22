@@ -72,7 +72,7 @@ impl TurnDeadline {
         timer: TimerDriverHandle,
         timeout: Duration,
     ) -> Result<Self> {
-        if timeout.is_zero() || timeout > Duration::from_secs(86_400) {
+        if timeout.is_zero() || timeout > Duration::from_hours(24) {
             return Err(control_error(
                 "SESSION_DEADLINE_RANGE",
                 "turn timeout must be positive and at most 24 hours",
