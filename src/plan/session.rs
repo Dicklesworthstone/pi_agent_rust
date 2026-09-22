@@ -20,6 +20,7 @@ use std::sync::{Arc, Weak};
 type Store = asupersync::sync::Mutex<Session>;
 
 /// The exact proposal and session incarnation presented to a human or host.
+///
 /// Keep this value while awaiting the decision; do not fetch a fresh review
 /// when processing an old approval. Not serializable and not an execution lease.
 #[derive(Clone)]
@@ -35,16 +36,17 @@ impl SessionPlanReview {
         self.proposal.text()
     }
 
-    /// True only for the same submitted proposal in the same session storage.
+    /// True when two reviews refer to the same exact proposed plan text and
+    /// were taken against the same session storage instance.
     #[must_use]
     pub fn same_submission(&self, other: &Self) -> bool {
-        self.store.ptr_eq(&other.store)
-            && self.session_id == other.session_id
-            && self.proposal.same_submission(&other.proposal)
+        self.session_id == other.session_id
+            && self.store.ptr_eq(&other.store)
+            && self.proposal.text() == other.proposal.text()
     }
 
     fn belongs_to(&self, store: &Arc<Store>, session: &Session) -> bool {
-        same_store(&self.store, store) && self.session_id == session.header.id
+        self.session_id == session.header.id && self.store.as_ptr() == Arc::as_ptr(store)
     }
 }
 
@@ -56,8 +58,7 @@ impl fmt::Debug for SessionPlanReview {
     }
 }
 
-/// Whether this operation's journal and plan checkpoint were saved. Recovery
-/// is explicit and never reconstructs approval authority from persisted text.
+/// Outcome of attempting to persist a plan transition or checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanPersistence {
     /// No transition or journal entry was needed; no save was attempted.
@@ -82,7 +83,7 @@ pub struct PlanChange {
 }
 
 impl PlanChange {
-    fn unchanged(mode: PlanMode) -> Self {
+    const fn unchanged(mode: PlanMode) -> Self {
         Self {
             mode,
             changed: false,
@@ -238,18 +239,19 @@ impl AgentSessionHandle {
         if inner.mode != PlanMode::PendingApproval {
             return Ok(None);
         }
-        let plan = inner.plan.as_ref().ok_or_else(|| {
+        let plan = Arc::clone(inner.plan.as_ref().ok_or_else(|| {
             control_error(
                 "PLAN_TEXT_UNAVAILABLE",
                 "pending plan has no reviewable text",
             )
-        })?;
+        })?);
+        drop(inner);
+        let session_id = session.header.id.clone();
+        drop(session);
         Ok(Some(SessionPlanReview {
-            proposal: PlanReview {
-                plan: Arc::clone(plan),
-            },
+            proposal: PlanReview { plan },
             store: Arc::downgrade(&store),
-            session_id: session.header.id.clone(),
+            session_id,
         }))
     }
 
@@ -421,6 +423,7 @@ fn apply_change(
     if let Some(journal_mode) = result.1 {
         append_plan_transition(session, &inner, journal_mode);
     }
+    drop(inner);
     Ok(result)
 }
 
@@ -591,6 +594,7 @@ impl AgentSessionHandle {
             if !same {
                 append_plan_checkpoint(&mut session, &inner);
             }
+            drop(inner);
         }
         Ok(persist(&mut session, owner, save_enabled).await)
     }
@@ -671,6 +675,7 @@ fn restore_checkpoint_in_memory(
     inner.plan = checkpoint.plan;
     inner.previous_model = None;
     append_plan_transition(session, &inner, mode.as_str());
+    drop(inner);
     Ok(mode)
 }
 
@@ -746,6 +751,9 @@ impl Tool for CheckpointedSubmitPlan {
         if output.is_error {
             return Ok(output);
         }
+        let mut session = store.try_lock_owned().map_err(|_| {
+            control_error("PLAN_SESSION_BUSY", "session busy; plan was not submitted")
+        })?;
         // Capture immediately after the native state transition, before the
         // first save await. Cancellation cannot remove its in-memory journal.
         let captured = record_submitted_checkpoint(&mut session, &store, &self.state);
@@ -802,6 +810,7 @@ fn record_submitted_checkpoint(
         ));
     }
     append_plan_transition(session, &inner, inner.mode.as_str());
+    drop(inner);
     Ok(())
 }
 

@@ -4863,6 +4863,22 @@ impl Agent {
         // masked again in the result heading back to the model.
         let tool_call = self.restore_secrets_inbound(tool_call);
 
+        // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
+        // tool whose effects intersect the mutation/process BARRIER set before
+        // soliciting approval or running extensions.
+        if !self
+            .plan_state
+            .allows_effects(self.effects_for_call(&tool_call))
+        {
+            return (
+                Self::xdev_text_output(
+                    &crate::plan::PlanState::block_message(&tool_call.name),
+                    true,
+                ),
+                true,
+            );
+        }
+
         let approval_denied_output = self
             .request_tool_approval(&tool_call, Arc::clone(&on_event))
             .await;

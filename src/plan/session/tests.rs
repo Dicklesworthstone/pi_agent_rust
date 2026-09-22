@@ -613,7 +613,7 @@ mod wire {
         serde_json::from_slice(&body).unwrap()
     }
 
-    fn frame(delta: Value, finish: Value) -> String {
+    fn frame(delta: &Value, finish: &Value) -> String {
         format!(
             "data: {}\n\n",
             json!({
@@ -648,8 +648,8 @@ mod wire {
         };
         format!(
             "{}{}data: [DONE]\n\n",
-            frame(delta, Value::Null),
-            frame(json!({}), json!(reason))
+            frame(&delta, &Value::Null),
+            frame(&json!({}), &json!(reason))
         )
     }
 
@@ -793,6 +793,7 @@ mod wire {
                     "invalidate the cached schema"
                 );
                 assert!(requests[2].to_string().contains("PLAN_MODE_BLOCKED"));
+                drop(requests);
             }
             let _ = handle.approve_plan_review(&owner, &review).await.unwrap();
             assert_eq!(
@@ -824,6 +825,7 @@ mod wire {
                         }),
                     "the actual execution request must carry the full reviewed plan"
                 );
+                drop(requests);
             }
             let _ = handle.exit_plan_mode(&owner).await.unwrap();
             assert_eq!(

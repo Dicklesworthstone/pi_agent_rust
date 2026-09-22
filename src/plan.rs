@@ -491,8 +491,9 @@ mod tests {
         let another = state.pending_review().unwrap();
         assert!(review.same_submission(&another));
         assert_eq!(review.text(), "reviewed proposal");
+        let cloned_state = state.clone();
         assert_eq!(
-            state.clone().approve_review(&review).as_deref(),
+            cloned_state.approve_review(&review).as_deref(),
             Some(review.text())
         );
         assert!(state.approve_review(&another).is_none());
