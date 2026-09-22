@@ -431,3 +431,216 @@ fn automatic_refresh_continues_after_one_candidate_fails() {
     assert!(failures.contains_key("other-fixture"));
     assert_eq!(auth.api_key("acme-fixture").as_deref(), Some("fresh-access"));
 }
+
+fn registry_identity(registry: &crate::models::ModelRegistry) -> Vec<(String, String)> {
+    registry
+        .models()
+        .iter()
+        .map(|entry| (entry.model.provider.clone(), entry.model.id.clone()))
+        .collect()
+}
+
+fn selection_inputs<'a>(
+    cli: &'a crate::cli::Cli,
+    config: &'a crate::config::Config,
+    dir: &'a Path,
+    refresh: &'a crate::auth::OAuthRefreshReport,
+) -> super::SelectionInputs<'a> {
+    super::SelectionInputs {
+        cli,
+        config,
+        scoped_patterns: &[],
+        global_dir: dir,
+        oauth_refresh: refresh,
+        preserve_compaction_window: false,
+    }
+}
+
+#[test]
+fn failed_final_selection_does_not_publish_the_candidate_registry() {
+    let temp = tempfile::tempdir().unwrap();
+    run_async(async {
+        let mut handle = create_agent_session(options(temp.path())).await.unwrap();
+        let mut auth = crate::auth::AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = crate::models::ModelRegistry::load(&auth, None);
+        let before = registry_identity(&registry);
+        let request = cli(&[
+            "--provider",
+            "unregistered-sdk-provider",
+            "--api-key",
+            "explicit",
+        ]);
+        let config = crate::config::Config::default();
+        let refresh = crate::auth::OAuthRefreshReport::default();
+        // Exercise the actual installation body without the outer startup-only
+        // shutdown, so the same live runtime can witness failure isolation.
+        let result = super::finish_selection_inner(
+            &mut handle.session,
+            &mut registry,
+            &mut auth,
+            selection_inputs(&request, &config, temp.path(), &refresh),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(registry_identity(&registry), before);
+        assert!(registry.find("sdk-extension-fixture", "fixture").is_none());
+        assert_eq!(
+            handle.model(),
+            ("sdk-extension-fixture".into(), "fixture".into())
+        );
+        handle
+            .with_session(|session| {
+                assert_eq!(session.header.model_id.as_deref(), Some("fixture"));
+            })
+            .await
+            .unwrap();
+        let message = handle.prompt("still usable", |_| {}).await.unwrap();
+        assert_eq!(text(&message), "loads:1 starts:1 model:fixture");
+        assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+    });
+}
+
+#[test]
+fn cancelled_owner_cannot_publish_a_new_model_or_registry() {
+    let temp = tempfile::tempdir().unwrap();
+    run_async(async {
+        let mut handle = create_agent_session(options(temp.path())).await.unwrap();
+        let mut auth = crate::auth::AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = crate::models::ModelRegistry::load(&auth, None);
+        let before = registry_identity(&registry);
+        let request = cli(&[
+            "--provider",
+            "sdk-extension-fixture",
+            "--model",
+            "second",
+            "--api-key",
+            "replacement",
+        ]);
+        let config = crate::config::Config::default();
+        let refresh = crate::auth::OAuthRefreshReport::default();
+        let owner = crate::agent_cx::AgentCx::for_request();
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel bootstrap"));
+        let error = owner
+            .with_current(super::finish_selection_inner(
+                &mut handle.session,
+                &mut registry,
+                &mut auth,
+                selection_inputs(&request, &config, temp.path(), &refresh),
+            ))
+            .await
+            .expect_err("cancelled owner must not become a fresh request");
+        assert!(error.to_string().contains("SDK_EXTENSION_STARTUP_CANCELLED"));
+        assert_eq!(registry_identity(&registry), before);
+        assert_eq!(
+            handle.model(),
+            ("sdk-extension-fixture".into(), "fixture".into())
+        );
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some("sdk-explicit-test-key")
+        );
+        assert!(!temp.path().join("auth.json").exists());
+        assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+    });
+}
+
+#[test]
+fn cancellation_while_waiting_for_session_lock_does_not_install_after_release() {
+    let temp = tempfile::tempdir().unwrap();
+    run_async(async {
+        let mut handle = create_agent_session(options(temp.path())).await.unwrap();
+        let mut auth = crate::auth::AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = crate::models::ModelRegistry::load(&auth, None);
+        let before = registry_identity(&registry);
+        let request = cli(&[
+            "--provider",
+            "sdk-extension-fixture",
+            "--model",
+            "second",
+            "--api-key",
+            "replacement",
+        ]);
+        let config = crate::config::Config::default();
+        let refresh = crate::auth::OAuthRefreshReport::default();
+        let parent = crate::agent_cx::AgentCx::for_current_or_request();
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let store = std::sync::Arc::clone(&handle.session.session);
+        let held = store.lock(parent.cx()).await.unwrap();
+        let mut selection = Box::pin(owner.with_current(super::finish_selection_inner(
+            &mut handle.session,
+            &mut registry,
+            &mut auth,
+            selection_inputs(&request, &config, temp.path(), &refresh),
+        )));
+        assert!(futures::poll!(selection.as_mut()).is_pending());
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel lock waiter"));
+        drop(held);
+        // Poll once after release: neither cancellation nor an uncontended lock
+        // needs a timer. A regression cannot hang this test in an infinite wait.
+        let outcome = futures::poll!(selection.as_mut());
+        assert!(matches!(outcome, std::task::Poll::Ready(Err(_))));
+        drop(selection);
+        assert!(!parent.cx().is_cancel_requested());
+        assert_eq!(registry_identity(&registry), before);
+        assert_eq!(
+            handle.model(),
+            ("sdk-extension-fixture".into(), "fixture".into())
+        );
+        handle
+            .with_session(|session| {
+                assert_eq!(session.header.model_id.as_deref(), Some("fixture"));
+            })
+            .await
+            .unwrap();
+        let message = handle.prompt("after cancellation", |_| {}).await.unwrap();
+        assert_eq!(text(&message), "loads:1 starts:1 model:fixture");
+        assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+    });
+}
+
+#[test]
+fn successful_final_selection_installs_registry_provider_options_and_header_together() {
+    let temp = tempfile::tempdir().unwrap();
+    run_async(async {
+        let mut handle = create_agent_session(options(temp.path())).await.unwrap();
+        let mut auth = crate::auth::AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = crate::models::ModelRegistry::load(&auth, None);
+        assert!(registry.find("sdk-extension-fixture", "second").is_none());
+        let request = cli(&[
+            "--provider",
+            "sdk-extension-fixture",
+            "--model",
+            "second",
+            "--api-key",
+            "replacement",
+        ]);
+        let config = crate::config::Config::default();
+        let refresh = crate::auth::OAuthRefreshReport::default();
+        super::finish_selection_inner(
+            &mut handle.session,
+            &mut registry,
+            &mut auth,
+            selection_inputs(&request, &config, temp.path(), &refresh),
+        )
+        .await
+        .unwrap();
+        assert!(registry.find("sdk-extension-fixture", "second").is_some());
+        assert_eq!(
+            handle.model(),
+            ("sdk-extension-fixture".into(), "second".into())
+        );
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some("replacement")
+        );
+        handle
+            .with_session(|session| {
+                assert_eq!(session.header.model_id.as_deref(), Some("second"));
+            })
+            .await
+            .unwrap();
+        let message = handle.prompt("new selection", |_| {}).await.unwrap();
+        assert_eq!(text(&message), "loads:1 starts:1 model:second");
+        assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+    });
+}

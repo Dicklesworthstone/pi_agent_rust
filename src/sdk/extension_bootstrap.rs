@@ -41,7 +41,13 @@ pub(super) async fn finish_selection(
     auth: &mut AuthStorage,
     inputs: SelectionInputs<'_>,
 ) -> Result<()> {
-    let result = finish_selection_inner(session, registry, auth, inputs).await;
+    // Keep the initiating owner's context on every poll, even when an embedder
+    // polls this future from a different task. Cleanup retains its existing
+    // independent runtime shutdown budget after the operation has settled.
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    let result = owner
+        .with_current(finish_selection_inner(session, registry, auth, inputs))
+        .await;
     if result.is_err()
         && let Some(region) = session.extensions.as_ref()
         && !region.shutdown().await
@@ -61,6 +67,8 @@ async fn finish_selection_inner(
     auth: &mut AuthStorage,
     inputs: SelectionInputs<'_>,
 ) -> Result<()> {
+    let cx = crate::agent_cx::AgentCx::for_current_or_request();
+    ensure_startup_active(&cx)?;
     let manager = session
         .extensions
         .as_ref()
@@ -97,31 +105,37 @@ async fn finish_selection_inner(
         &crate::http::client::Client::new(),
     )
     .await;
+    ensure_startup_active(&cx)?;
 
-    // Refresh the registry's credential snapshot as well as the auth store.
+    // Prepare a private registry. A failed selection or cancelled lock waiter
+    // must not publish extension registrations or credentials into the caller's
+    // registry while leaving its provider and stored identity unchanged.
+    // OAuth renewal itself is independent credential maintenance; it is not
+    // rolled back when model selection fails.
     // Provider-only bindings (including overrides of built-in transports) and
     // declared model rows must both participate in selection and later /model.
-    *registry = ModelRegistry::load(auth, Some(default_models_path(inputs.global_dir)));
-    registry
+    let mut candidate_registry =
+        ModelRegistry::load(auth, Some(default_models_path(inputs.global_dir)));
+    candidate_registry
         .merge_extension_registry(&bindings, entries)
         .map_err(|error| Error::validation(error.to_string()))?;
     let scoped_models = if inputs.scoped_patterns.is_empty() {
         Vec::new()
     } else {
-        app::resolve_model_scope(inputs.scoped_patterns, registry, explicit_key)
+        app::resolve_model_scope(inputs.scoped_patterns, &candidate_registry, explicit_key)
     };
     let store = Arc::clone(&session.session);
-    let cx = crate::agent_cx::AgentCx::for_request();
     let selection = {
         let stored = store
             .lock(cx.cx())
             .await
             .map_err(|error| Error::session(error.to_string()))?;
+        ensure_startup_active(&cx)?;
         app::select_model_and_thinking(
             inputs.cli,
             inputs.config,
             &stored,
-            registry,
+            &candidate_registry,
             &scoped_models,
             inputs.global_dir,
         )
@@ -153,6 +167,7 @@ async fn finish_selection_inner(
     }
     let api_key = app::resolve_api_key(auth, inputs.cli, &selection.model_entry)
         .map_err(|error| Error::validation(error.to_string()))?;
+    ensure_startup_active(&cx)?;
     let provider = crate::providers::create_provider(&selection.model_entry, Some(&manager))?;
 
     // Complete every fallible operation before publishing the final identity.
@@ -162,6 +177,9 @@ async fn finish_selection_inner(
         .lock(cx.cx())
         .await
         .map_err(|error| Error::session(error.to_string()))?;
+    // No await or fallible operation separates this final admission check from
+    // installation of provider/options, stored identity and both registries.
+    ensure_startup_active(&cx)?;
     session.agent.set_provider(provider);
     session.agent.set_keyword_max_thinking_level(
         selection
@@ -195,7 +213,8 @@ async fn finish_selection_inner(
     }
     app::update_session_for_selection(&mut stored, &selection);
     drop(stored);
-    session.set_model_registry(registry.clone());
+    session.set_model_registry(candidate_registry.clone());
+    *registry = candidate_registry;
     session.set_auth_storage(auth.clone());
     manager.set_current_model(
         Some(selection.model_entry.model.provider),
@@ -205,7 +224,16 @@ async fn finish_selection_inner(
     Ok(())
 }
 
-/// Match the same explicit-provider precedence as app::select_model_and_thinking.
+fn ensure_startup_active(owner: &crate::agent_cx::AgentCx) -> Result<()> {
+    if owner.cx().is_cancel_requested() {
+        return Err(Error::session(
+            "SDK_EXTENSION_STARTUP_CANCELLED: provider selection owner was cancelled",
+        ));
+    }
+    Ok(())
+}
+
+/// Match the same explicit-provider precedence as `app::select_model_and_thinking`.
 /// A bare model can exist in several providers; do not guess its owner before
 /// credentials are refreshed. The registered runtime identity stays unchanged.
 fn refresh_matches_request(cli: &Cli, provider: &str) -> bool {
