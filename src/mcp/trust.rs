@@ -60,6 +60,15 @@ pub struct TrustAuditEntry {
     pub fingerprint: String,
 }
 
+/// Order used when a failed write must pick the safer of two states.
+const fn restrictiveness(state: TrustState) -> u8 {
+    match state {
+        TrustState::Acknowledged => 0,
+        TrustState::Pending => 1,
+        TrustState::Denied => 2,
+    }
+}
+
 /// One server's persisted record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1013,7 +1022,44 @@ impl TrustStore {
         action: &str,
         execution: Option<super::config::StoredExecutionIdentity>,
     ) -> Result<()> {
+        self.transition_execution_saving(
+            name,
+            fingerprint,
+            state,
+            by,
+            action,
+            execution,
+            Self::save,
+        )
+    }
+
+    /// [`Self::transition_execution`] with the durable write injectable, so
+    /// tests can fail it at the persistence seam.
+    ///
+    /// A failed save must not leave an undurable decision live in memory: the
+    /// store reverts to what the locked reload read from disk, except that the
+    /// record keeps the attempted state when it is more restrictive. A failure
+    /// after the rename commit point (directory sync) leaves the durable
+    /// outcome unknown, and even before it a failed deny is still the
+    /// operator's intent, so an I/O error can never make this process more
+    /// permissive than either outcome. The caller always receives the error.
+    #[allow(clippy::too_many_arguments)]
+    fn transition_execution_saving<F>(
+        &mut self,
+        name: &str,
+        fingerprint: &str,
+        state: TrustState,
+        by: &str,
+        action: &str,
+        execution: Option<super::config::StoredExecutionIdentity>,
+        save: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Self, &TrustWriteGuard) -> Result<()>,
+    {
         let file_guard = self.lock_and_reload()?;
+        let committed_schema = self.schema_version;
+        let committed_servers = self.servers.clone();
         self.migrate_schema_if_needed();
         let at = now_iso();
         let audit = TrustAuditEntry {
@@ -1047,7 +1093,19 @@ impl TrustStore {
             }
         }
         record.audit.push(audit);
-        self.save(&file_guard)
+        let attempted = record.clone();
+        let Err(error) = save(self, &file_guard) else {
+            return Ok(());
+        };
+        self.schema_version = committed_schema;
+        self.servers = committed_servers;
+        let keep_attempted = self.servers.get(name).is_none_or(|previous| {
+            restrictiveness(attempted.state) > restrictiveness(previous.state)
+        }) && attempted.state != TrustState::Acknowledged;
+        if keep_attempted {
+            self.servers.insert(name.to_string(), attempted);
+        }
+        Err(error)
     }
 
     /// Record an acknowledgement together with the canonical execution
@@ -1771,6 +1829,101 @@ mod tests {
         assert!(
             !displaced.join("trust.json").exists(),
             "aborted write must not publish into the displaced directory"
+        );
+    }
+
+    #[cfg(unix)]
+    fn failing_persist(store: &TrustStore, guard: &TrustWriteGuard) -> Result<()> {
+        store.save_with_before_persist(guard, || {
+            Err(std::io::Error::other("injected sync failure"))
+        })
+    }
+
+    #[cfg(unix)]
+    fn trust_temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read trust dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".mcp-trust.tmp-"))
+            .collect()
+    }
+
+    /// bd-qv95g: an acknowledgement whose write fails at the durability seam
+    /// is reported as an error and never becomes live, in memory or on disk.
+    #[cfg(unix)]
+    #[test]
+    fn failed_acknowledge_persist_leaves_the_durable_denial_in_force() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("trust.json");
+        let fingerprint = "a".repeat(64);
+        let mut store = TrustStore::load(&path).expect("load");
+        store
+            .deny("srv", &fingerprint, "operator")
+            .expect("durable deny");
+
+        let error = store
+            .transition_execution_saving(
+                "srv",
+                &fingerprint,
+                TrustState::Acknowledged,
+                "operator",
+                "acknowledged",
+                None,
+                failing_persist,
+            )
+            .expect_err("a failed persist must be reported");
+        assert!(error.to_string().contains("MCP_TRUST_IO"), "{error}");
+        assert_eq!(store.decision("srv", &fingerprint), TrustDecision::Denied);
+        assert_eq!(
+            TrustStore::load(&path)
+                .expect("reload")
+                .decision("srv", &fingerprint),
+            TrustDecision::Denied
+        );
+        assert!(
+            trust_temp_files(temp.path()).is_empty(),
+            "the aborted temporary file must not survive"
+        );
+    }
+
+    /// bd-qv95g: a denial whose write fails is reported, is not claimed as
+    /// durable, and still blocks in this process (fail closed).
+    #[cfg(unix)]
+    #[test]
+    fn failed_deny_persist_is_reported_and_still_blocks_in_process() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("trust.json");
+        let fingerprint = "b".repeat(64);
+        let mut store = TrustStore::load(&path).expect("load");
+        store
+            .acknowledge("srv", &fingerprint, "operator")
+            .expect("durable acknowledge");
+
+        let error = store
+            .transition_execution_saving(
+                "srv",
+                &fingerprint,
+                TrustState::Denied,
+                "operator",
+                "denied",
+                None,
+                failing_persist,
+            )
+            .expect_err("a failed persist must be reported");
+        assert!(error.to_string().contains("MCP_TRUST_IO"), "{error}");
+        assert_eq!(store.decision("srv", &fingerprint), TrustDecision::Denied);
+        assert_eq!(
+            TrustStore::load(&path)
+                .expect("reload")
+                .decision("srv", &fingerprint),
+            TrustDecision::Acknowledged,
+            "the disk was not changed, so the caller must not be told it was"
         );
     }
     /// bd-sp5o3: the acknowledged record persists its bound canonical
