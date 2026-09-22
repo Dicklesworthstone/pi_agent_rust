@@ -118,7 +118,8 @@ impl Snapshot {
 
     pub(super) fn verify_installed(&self, stage: &File) -> io::Result<()> {
         let actual = Self::read(stage)?;
-        let expected_count = self.values.len() - usize::from(self.values.contains_key(CAPABILITIES));
+        let expected_count =
+            self.values.len() - usize::from(self.values.contains_key(CAPABILITIES));
         if actual.values.len() != expected_count
             || actual.values.iter().any(|(name, value)| {
                 name.as_slice() == CAPABILITIES || self.values.get(name) != Some(value)
@@ -225,7 +226,10 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(Snapshot::read(&File::open(&path).unwrap()).unwrap(), expected);
+        assert_eq!(
+            Snapshot::read(&File::open(&path).unwrap()).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -334,6 +338,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.details.unwrap()["commit_state"], "not_committed");
         assert_eq!(fs::read(&path).unwrap(), b"original");
-        assert_eq!(Snapshot::read(&File::open(&path).unwrap()).unwrap(), expected);
+        assert_eq!(
+            Snapshot::read(&File::open(&path).unwrap()).unwrap(),
+            expected
+        );
     }
 }

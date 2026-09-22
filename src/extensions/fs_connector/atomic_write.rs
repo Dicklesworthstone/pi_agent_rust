@@ -535,7 +535,10 @@ mod tests {
             let (temp, path) = root();
             assert!(
                 write_with_hook(&path, b"new", |phase| {
-                    assert!(!path.exists(), "destination became visible before publication");
+                    assert!(
+                        !path.exists(),
+                        "destination became visible before publication"
+                    );
                     if phase == fail {
                         Err(io::Error::other("injected"))
                     } else {

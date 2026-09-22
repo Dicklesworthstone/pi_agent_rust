@@ -243,9 +243,8 @@ fn refresh_matches_request(cli: &Cli, provider: &str) -> bool {
             .and_then(crate::provider_metadata::split_provider_model_spec)
             .map(|(provider, _)| provider)
     });
-    requested.is_none_or(|requested| {
-        crate::provider_metadata::provider_ids_match(requested, provider)
-    })
+    requested
+        .is_none_or(|requested| crate::provider_metadata::provider_ids_match(requested, provider))
 }
 
 async fn refresh_extension_credentials(
@@ -255,7 +254,11 @@ async fn refresh_extension_credentials(
     client: &crate::http::client::Client,
 ) -> HashMap<String, String> {
     let mut failures = HashMap::new();
-    if cli.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+    if cli
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
         return failures;
     }
     for (provider, config) in configs {

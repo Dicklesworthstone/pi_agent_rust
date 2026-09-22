@@ -273,7 +273,9 @@ fn oauth_config(provider: &str) -> crate::models::OAuthConfig {
 /// Playback has no fallback to live networking. An unexpected provider refresh
 /// is a recorded failure, so checking the failure map catches a removed filter.
 fn refresh_client(dir: &Path, responses: &[(&str, u16)]) -> crate::http::client::Client {
-    use crate::vcr::{Cassette, Interaction, RecordedRequest, RecordedResponse, VcrMode, VcrRecorder};
+    use crate::vcr::{
+        Cassette, Interaction, RecordedRequest, RecordedResponse, VcrMode, VcrRecorder,
+    };
     let recorder = VcrRecorder::new_with("sdk-oauth-refresh", VcrMode::Playback, dir);
     let interactions = responses
         .iter()
@@ -340,7 +342,10 @@ fn explicit_route_refreshes_its_expired_token_without_touching_unrelated_login()
         &client,
     ));
     assert!(failures.is_empty(), "unexpected refresh: {failures:?}");
-    assert_eq!(auth.api_key("acme-fixture").as_deref(), Some("fresh-access"));
+    assert_eq!(
+        auth.api_key("acme-fixture").as_deref(),
+        Some("fresh-access")
+    );
     assert_eq!(
         serde_json::to_value(auth.get("other-fixture")).unwrap(),
         unrelated_before
@@ -429,7 +434,10 @@ fn automatic_refresh_continues_after_one_candidate_fails() {
     ));
     assert_eq!(failures.len(), 1);
     assert!(failures.contains_key("other-fixture"));
-    assert_eq!(auth.api_key("acme-fixture").as_deref(), Some("fresh-access"));
+    assert_eq!(
+        auth.api_key("acme-fixture").as_deref(),
+        Some("fresh-access")
+    );
 }
 
 fn registry_identity(registry: &crate::models::ModelRegistry) -> Vec<(String, String)> {
@@ -519,7 +527,10 @@ fn cancelled_owner_cannot_publish_a_new_model_or_registry() {
         let config = crate::config::Config::default();
         let refresh = crate::auth::OAuthRefreshReport::default();
         let owner = crate::agent_cx::AgentCx::for_request();
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel bootstrap"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel bootstrap"),
+        );
         let error = owner
             .with_current(super::finish_selection_inner(
                 &mut handle.session,
@@ -529,7 +540,11 @@ fn cancelled_owner_cannot_publish_a_new_model_or_registry() {
             ))
             .await
             .expect_err("cancelled owner must not become a fresh request");
-        assert!(error.to_string().contains("SDK_EXTENSION_STARTUP_CANCELLED"));
+        assert!(
+            error
+                .to_string()
+                .contains("SDK_EXTENSION_STARTUP_CANCELLED")
+        );
         assert_eq!(registry_identity(&registry), before);
         assert_eq!(
             handle.model(),
@@ -573,7 +588,10 @@ fn cancellation_while_waiting_for_session_lock_does_not_install_after_release() 
             selection_inputs(&request, &config, temp.path(), &refresh),
         )));
         assert!(futures::poll!(selection.as_mut()).is_pending());
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel lock waiter"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel lock waiter"),
+        );
         drop(held);
         // Poll once after release: neither cancellation nor an uncontended lock
         // needs a timer. A regression cannot hang this test in an infinite wait.
