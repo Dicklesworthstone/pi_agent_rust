@@ -41,7 +41,9 @@ fn session(cwd: &std::path::Path, base_url: &str) -> ControllableSession {
 
 #[test]
 fn cancelled_sdk_prompt_and_continuation_never_mutate_history_or_emit_events() {
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let owner = runtime.request_cx_with_budget(Budget::new());
     let temp = tempfile::tempdir().unwrap();
     let mut session = session(temp.path(), "http://127.0.0.1:9/v1");
@@ -50,33 +52,58 @@ fn cancelled_sdk_prompt_and_continuation_never_mutate_history_or_emit_events() {
         let parent = Cx::current().unwrap();
         let store = session.session_mut().session_store();
         let before = serde_json::to_value(
-            store.lock(&parent).await.unwrap().to_messages_for_current_path(),
-        ).unwrap();
+            store
+                .lock(&parent)
+                .await
+                .unwrap()
+                .to_messages_for_current_path(),
+        )
+        .unwrap();
         let captured = Arc::clone(&events);
         let turn = {
             let _current = owner.clone().set_current_restricted();
-            session.prompt("must not enter history".to_string(), move |_| {
-                captured.fetch_add(1, Ordering::SeqCst);
-            }).unwrap()
+            session
+                .prompt("must not enter history".to_string(), move |_| {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap()
         };
         let control = turn.control();
         control.steer("recoverable correction").unwrap();
         cancel(&owner);
-        assert!(turn.await.unwrap_err().to_string().contains("SESSION_CONTROL_CANCELLED"));
+        assert!(
+            turn.await
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_CANCELLED")
+        );
         assert!(control.snapshot().finished);
         assert_eq!(control.take_pending()[0].text, "recoverable correction");
 
         let captured = Arc::clone(&events);
         let continuation = {
             let _current = owner.clone().set_current_restricted();
-            session.continue_turn(move |_| {
-                captured.fetch_add(1, Ordering::SeqCst);
-            }).unwrap()
+            session
+                .continue_turn(move |_| {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap()
         };
-        assert!(continuation.await.unwrap_err().to_string().contains("SESSION_CONTROL_CANCELLED"));
+        assert!(
+            continuation
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_CANCELLED")
+        );
         let after = serde_json::to_value(
-            store.lock(&parent).await.unwrap().to_messages_for_current_path(),
-        ).unwrap();
+            store
+                .lock(&parent)
+                .await
+                .unwrap()
+                .to_messages_for_current_path(),
+        )
+        .unwrap();
         assert_eq!(before, after);
         assert_eq!(events.load(Ordering::SeqCst), 0);
         assert!(!parent.is_cancel_requested());
@@ -85,22 +112,39 @@ fn cancelled_sdk_prompt_and_continuation_never_mutate_history_or_emit_events() {
 
 #[test]
 fn explicit_sdk_abort_before_start_prevents_prompt_installation() {
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut session = session(temp.path(), "http://127.0.0.1:9/v1");
     runtime.block_on(Box::pin(async {
-        let turn = session.prompt("never installed".to_string(), |_| {
-            panic!("unused aborted prompt must not emit a native event");
-        }).unwrap();
+        let turn = session
+            .prompt("never installed".to_string(), |_| {
+                panic!("unused aborted prompt must not emit a native event");
+            })
+            .unwrap();
         assert!(turn.control().abort());
-        assert!(turn.await.unwrap_err().to_string().contains("SESSION_CONTROL_CANCELLED"));
+        assert!(
+            turn.await
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_CANCELLED")
+        );
         let store = session.session_mut().session_store();
         let cx = AgentCx::for_current_or_request();
-        assert!(store.lock(cx.cx()).await.unwrap().to_messages_for_current_path().is_empty());
+        assert!(
+            store
+                .lock(cx.cx())
+                .await
+                .unwrap()
+                .to_messages_for_current_path()
+                .is_empty()
+        );
     }));
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end wire scenario; splitting it hides the sequence
 fn cancelling_initiator_stops_an_idle_wire_stream_without_cancelling_poller() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -123,8 +167,12 @@ fn cancelling_initiator_stops_an_idle_wire_stream_without_cancelling_poller() {
                 Err(error) => panic!("fixture accept: {error}"),
             }
         };
-        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut reader = BufReader::new(socket.try_clone().unwrap());
         let mut length = None;
         let mut total = 0;
@@ -133,9 +181,12 @@ fn cancelling_initiator_stops_an_idle_wire_stream_without_cancelling_poller() {
             assert!(reader.read_line(&mut line).unwrap() > 0);
             total += line.len();
             assert!(total <= 64 * 1024);
-            if line == "\r\n" { break; }
+            if line == "\r\n" {
+                break;
+            }
             if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length") {
+                && name.eq_ignore_ascii_case("content-length")
+            {
                 length = Some(value.trim().parse::<usize>().unwrap());
             }
         }
@@ -145,31 +196,50 @@ fn cancelling_initiator_stops_an_idle_wire_stream_without_cancelling_poller() {
         reader.read_exact(&mut body).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(!body.to_string().contains("unclaimed follow-up"));
-        let chunk = format!("data: {}\n\n", serde_json::json!({
-            "id":"owned-stream", "object":"chat.completion.chunk",
-            "created":0, "model":"ownership-fixture",
-            "choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]
-        }));
+        let chunk = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id":"owned-stream", "object":"chat.completion.chunk",
+                "created":0, "model":"ownership-fixture",
+                "choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]
+            })
+        );
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{chunk}\r\n", chunk.len()).unwrap();
         socket.flush().unwrap();
-        socket.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut byte = [0_u8; 1];
         while Instant::now() < deadline && !stopping.load(Ordering::SeqCst) {
             match socket.read(&mut byte) {
-                Ok(0) => { observed.store(true, Ordering::SeqCst); return; }
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {
+                Ok(0) => {
                     observed.store(true, Ordering::SeqCst);
                     return;
                 }
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    observed.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
                 result => panic!("unexpected fixture read: {result:?}"),
             }
         }
         // A missing cancellation wake becomes a finite, observable stream EOF,
         // not a hung test. It must not satisfy the early-peer-close assertion.
     });
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let owner = runtime.request_cx_with_budget(Budget::new());
     let cancelling = owner.clone();
     let (started, received) = std::sync::mpsc::channel();
@@ -184,16 +254,24 @@ fn cancelling_initiator_stops_an_idle_wire_stream_without_cancelling_poller() {
         let parent = Cx::current().unwrap();
         let turn = {
             let _current = owner.clone().set_current_restricted();
-            session.prompt("begin idle stream".to_string(), move |event| {
-                if matches!(event, AgentEvent::MessageUpdate { .. }) {
-                    let _ = started.send(());
-                }
-            }).unwrap()
+            session
+                .prompt("begin idle stream".to_string(), move |event| {
+                    if matches!(event, AgentEvent::MessageUpdate { .. }) {
+                        let _ = started.send(());
+                    }
+                })
+                .unwrap()
         };
         let control = turn.control();
         control.follow_up("unclaimed follow-up").unwrap();
         let completion = turn.await;
-        assert!(completion.is_err() || completion.as_ref().is_ok_and(|message| matches!(message.stop_reason, StopReason::Aborted | StopReason::Error)));
+        assert!(
+            completion.is_err()
+                || completion.as_ref().is_ok_and(|message| matches!(
+                    message.stop_reason,
+                    StopReason::Aborted | StopReason::Error
+                ))
+        );
         assert!(control.snapshot().finished);
         assert_eq!(control.snapshot().handed_to_agent, 0);
         assert_eq!(control.take_pending()[0].text, "unclaimed follow-up");
@@ -203,5 +281,8 @@ fn cancelling_initiator_stops_an_idle_wire_stream_without_cancelling_poller() {
     // Join before setting stop so the fixture actually observes socket closure.
     peer.join().unwrap();
     stop.store(true, Ordering::SeqCst);
-    assert!(observed_close.load(Ordering::SeqCst), "owner cancellation must close the stream before fixture EOF");
+    assert!(
+        observed_close.load(Ordering::SeqCst),
+        "owner cancellation must close the stream before fixture EOF"
+    );
 }

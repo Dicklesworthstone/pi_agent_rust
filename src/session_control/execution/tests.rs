@@ -24,18 +24,16 @@ impl Wake for WakeCount {
 }
 
 fn cancel(owner: &Cx) {
-    owner.cancel_with(asupersync::types::CancelKind::User, Some("test owner stopped"));
+    owner.cancel_with(
+        asupersync::types::CancelKind::User,
+        Some("test owner stopped"),
+    );
 }
 
-fn never_started(
-    guard: TurnGuard,
-    polls: Arc<AtomicUsize>,
-) -> impl Future<Output = Result<AssistantMessage>> {
-    async move {
-        let _guard = guard;
-        polls.fetch_add(1, Ordering::SeqCst);
-        std::future::pending().await
-    }
+async fn never_started(guard: TurnGuard, polls: Arc<AtomicUsize>) -> Result<AssistantMessage> {
+    let _guard = guard;
+    polls.fetch_add(1, Ordering::SeqCst);
+    std::future::pending().await
 }
 
 #[test]
@@ -71,21 +69,28 @@ fn construction_owner_survives_poll_migration_and_parent_is_restored() {
     let parent_caps = parent.capabilities();
     let _parent = parent.clone().set_current_restricted();
     let waker = Waker::noop();
-    assert!(Pin::new(&mut turn).poll(&mut Context::from_waker(waker)).is_pending());
+    assert!(
+        Pin::new(&mut turn)
+            .poll(&mut Context::from_waker(waker))
+            .is_pending()
+    );
     assert_eq!(Cx::current().unwrap().capabilities(), parent_caps);
     assert_eq!(Cx::current().unwrap().budget(), parent.budget());
 
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let other = Cx::for_request_with_budget(Budget::new().with_poll_quota(59));
-            let _other = other.clone().set_current_restricted();
-            assert!(matches!(
-                Pin::new(&mut turn).poll(&mut Context::from_waker(Waker::noop())),
-                Poll::Ready(Ok(_))
-            ));
-            assert_eq!(Cx::current().unwrap().budget(), other.budget());
-            assert!(!other.is_cancel_requested());
-        }).join().unwrap();
+        scope
+            .spawn(|| {
+                let other = Cx::for_request_with_budget(Budget::new().with_poll_quota(59));
+                let _other = other.clone().set_current_restricted();
+                assert!(matches!(
+                    Pin::new(&mut turn).poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Ok(_))
+                ));
+                assert_eq!(Cx::current().unwrap().budget(), other.budget());
+                assert!(!other.is_cancel_requested());
+            })
+            .join()
+            .unwrap();
     });
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     assert!(control.snapshot().finished);
@@ -101,7 +106,9 @@ fn cancelled_owner_prevents_first_native_poll_and_preserves_attachments() {
         data: "aGVsbG8=".to_string(),
         mime_type: "image/png".to_string(),
     })]);
-    control.follow_up_with_content(&content, "inspect later").unwrap();
+    control
+        .follow_up_with_content(&content, "inspect later")
+        .unwrap();
     let polls = Arc::new(AtomicUsize::new(0));
     let mut turn = {
         let _current = owner.clone().set_current_restricted();
@@ -110,8 +117,8 @@ fn cancelled_owner_prevents_first_native_poll_and_preserves_attachments() {
     cancel(&owner);
     let other = Cx::for_request();
     let _other = other.clone().set_current_restricted();
-    let Poll::Ready(Err(error)) = Pin::new(&mut turn)
-        .poll(&mut Context::from_waker(Waker::noop())) else {
+    let Poll::Ready(Err(error)) = Pin::new(&mut turn).poll(&mut Context::from_waker(Waker::noop()))
+    else {
         panic!("cancelled unused turn must return without dispatch");
     };
     assert!(error.to_string().contains("SESSION_CONTROL_CANCELLED"));
@@ -121,7 +128,10 @@ fn cancelled_owner_prevents_first_native_poll_and_preserves_attachments() {
     let pending = control.take_pending();
     assert_eq!(pending[0].kind, InputKind::FollowUp);
     assert_eq!(pending[0].text, "inspect later");
-    assert_eq!(serde_json::to_value(&pending[0].content).unwrap(), serde_json::to_value(content).unwrap());
+    assert_eq!(
+        serde_json::to_value(&pending[0].content).unwrap(),
+        serde_json::to_value(content).unwrap()
+    );
     assert!(!other.is_cancel_requested());
 }
 
@@ -139,30 +149,30 @@ fn explicit_abort_before_first_poll_does_not_enter_the_sdk() {
     assert!(control.snapshot().finished);
 }
 
-fn draining_native(
+async fn draining_native(
     guard: TurnGuard,
     signal: AbortSignal,
     polls: Arc<AtomicUsize>,
-) -> impl Future<Output = Result<AssistantMessage>> {
-    async move {
-        let _guard = guard;
-        let mut draining = false;
-        poll_fn(move |task| {
-            polls.fetch_add(1, Ordering::SeqCst);
-            if !signal.is_aborted() {
-                return Poll::Pending;
-            }
-            if !draining {
-                draining = true;
-                task.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "native persistence failure must survive cancellation",
-            ).into()))
-        }).await
-    }
+) -> Result<AssistantMessage> {
+    let _guard = guard;
+    let mut draining = false;
+    poll_fn(move |task| {
+        polls.fetch_add(1, Ordering::SeqCst);
+        if !signal.is_aborted() {
+            return Poll::Pending;
+        }
+        if !draining {
+            draining = true;
+            task.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "native persistence failure must survive cancellation",
+        )
+        .into()))
+    })
+    .await
 }
 
 #[test]
@@ -173,7 +183,10 @@ fn owner_cancellation_wakes_a_parked_turn_and_drains_native_cleanup() {
     let polls = Arc::new(AtomicUsize::new(0));
     let mut turn = {
         let _current = owner.clone().set_current_restricted();
-        OwnedTurn::new(draining_native(guard, signal, Arc::clone(&polls)), control.clone())
+        OwnedTurn::new(
+            draining_native(guard, signal, Arc::clone(&polls)),
+            control.clone(),
+        )
     };
     let wakes = Arc::new(WakeCount::default());
     let waker = Waker::from(Arc::clone(&wakes));
@@ -186,7 +199,10 @@ fn owner_cancellation_wakes_a_parked_turn_and_drains_native_cleanup() {
     assert!(wakes.0.load(Ordering::SeqCst) > 0);
     assert!(Pin::new(&mut turn).poll(&mut task).is_pending());
     assert!(!control.snapshot().accepting_input);
-    assert!(!control.snapshot().finished, "native cleanup is still pending");
+    assert!(
+        !control.snapshot().finished,
+        "native cleanup is still pending"
+    );
     assert_eq!(control.snapshot().pending_steering, 1);
     let Poll::Ready(Err(Error::Io(error))) = Pin::new(&mut turn).poll(&mut task) else {
         panic!("retain the native typed error, not a synthetic cancellation success");
@@ -194,7 +210,10 @@ fn owner_cancellation_wakes_a_parked_turn_and_drains_native_cleanup() {
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(polls.load(Ordering::SeqCst), 3);
     assert!(control.snapshot().finished);
-    assert_eq!(control.take_pending()[0].text, "retain this unclaimed input");
+    assert_eq!(
+        control.take_pending()[0].text,
+        "retain this unclaimed input"
+    );
 }
 
 #[test]
@@ -203,14 +222,21 @@ fn completed_turn_retires_cancellation_subscription() {
     let (control, guard, _) = live();
     let mut turn = {
         let _current = owner.clone().set_current_restricted();
-        OwnedTurn::new(async move {
-            let _guard = guard;
-            Ok(AssistantMessage::default())
-        }, control.clone())
+        OwnedTurn::new(
+            async move {
+                let _guard = guard;
+                Ok(AssistantMessage::default())
+            },
+            control.clone(),
+        )
     };
     let wakes = Arc::new(WakeCount::default());
     let waker = Waker::from(Arc::clone(&wakes));
-    assert!(Pin::new(&mut turn).poll(&mut Context::from_waker(&waker)).is_ready());
+    assert!(
+        Pin::new(&mut turn)
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready()
+    );
     let before = wakes.0.load(Ordering::SeqCst);
     cancel(&owner);
     assert_eq!(wakes.0.load(Ordering::SeqCst), before);
@@ -224,7 +250,10 @@ struct DropOwner {
 
 impl Drop for DropOwner {
     fn drop(&mut self) {
-        assert_eq!(Cx::current().expect("owner installed for drop").budget(), self.owner_budget);
+        assert_eq!(
+            Cx::current().expect("owner installed for drop").budget(),
+            self.owner_budget
+        );
         self.count.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -236,12 +265,18 @@ fn unpolled_drop_retires_captured_resources_under_their_owner() {
     let (control, guard, _) = live();
     let turn = {
         let _current = owner.clone().set_current_restricted();
-        let witness = DropOwner { owner_budget: owner.budget(), count: Arc::clone(&count) };
-        OwnedTurn::new(async move {
-            let _guard = guard;
-            let _witness = witness;
-            std::future::pending::<Result<AssistantMessage>>().await
-        }, control.clone())
+        let witness = DropOwner {
+            owner_budget: owner.budget(),
+            count: Arc::clone(&count),
+        };
+        OwnedTurn::new(
+            async move {
+                let _guard = guard;
+                let _witness = witness;
+                std::future::pending::<Result<AssistantMessage>>().await
+            },
+            control.clone(),
+        )
     };
     let other = Cx::for_request_with_budget(Budget::new().with_poll_quota(31));
     let _other = other.clone().set_current_restricted();
@@ -260,30 +295,44 @@ fn outside_context_construction_binds_once_on_first_poll() {
         let owner = Cx::for_request_with_budget(Budget::new().with_poll_quota(37));
         let expected = owner.budget();
         let mut first = true;
-        let mut turn = OwnedTurn::new(async move {
-            let _guard = guard;
-            poll_fn(move |_| {
-                assert_eq!(Cx::current().unwrap().budget(), expected);
-                if first {
-                    first = false;
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Ok(AssistantMessage::default()))
-                }
-            }).await
-        }, control.clone());
+        let mut turn = OwnedTurn::new(
+            async move {
+                let _guard = guard;
+                poll_fn(move |_| {
+                    assert_eq!(Cx::current().unwrap().budget(), expected);
+                    if first {
+                        first = false;
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(AssistantMessage::default()))
+                    }
+                })
+                .await
+            },
+            control.clone(),
+        );
         assert!(turn.owner.is_none());
         {
-            let _current = owner.clone().set_current_restricted();
-            assert!(Pin::new(&mut turn).poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            let _current = owner.set_current_restricted();
+            assert!(
+                Pin::new(&mut turn)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         }
         assert!(Cx::current().is_none());
         let other = Cx::for_request();
         let _other = other.clone().set_current_restricted();
-        assert!(Pin::new(&mut turn).poll(&mut Context::from_waker(Waker::noop())).is_ready());
+        assert!(
+            Pin::new(&mut turn)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
         assert_eq!(Cx::current().unwrap().budget(), other.budget());
         assert!(control.snapshot().finished);
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
 #[path = "agent_tests.rs"]
