@@ -25,6 +25,8 @@ use crate::sdk::AgentSessionHandle;
 #[cfg(test)]
 mod agent_tests;
 mod attachments;
+mod deadline;
+pub use deadline::{DeadlineTurn, TurnDeadline, TurnDeadlineError};
 
 const MAX_PENDING_INPUTS: usize = 100;
 const MAX_INPUT_BYTES: usize = 256 * 1024;
