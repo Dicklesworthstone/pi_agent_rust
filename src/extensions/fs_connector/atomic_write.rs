@@ -7,7 +7,9 @@
 //!
 //! Replacement changes inode identity: open readers and other hard links keep
 //! the old contents. Ordinary Unix mode bits are retained, set-id bits are not;
-//! owner/group changes are rejected. ACLs, xattrs and timestamps are not copied.
+//! owner/group changes are rejected. Linux xattrs (including POSIX ACLs) are
+//! copied and verified, except executable capabilities; integrity-signed files
+//! fail closed. Other platforms' extended metadata and timestamps are not copied.
 //! Non-Unix uses the platform rename operation and reports file-only sync, not
 //! directory crash durability or protection from parent reparse races. This is
 //! not a compare-and-swap against non-cooperating writers or a defense against
@@ -25,6 +27,9 @@ use std::path::Path;
 #[cfg(any(not(unix), test))]
 use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
+mod metadata;
+
 const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 const STAGE_PREFIX: &str = ".pi-fs-write-";
 
@@ -33,6 +38,7 @@ enum Phase {
     Prepare,
     Stage,
     Write,
+    Metadata,
     FileSync,
     Publish,
     DirectorySync,
@@ -44,6 +50,7 @@ impl Phase {
             Self::Prepare => "prepare",
             Self::Stage => "stage",
             Self::Write => "write",
+            Self::Metadata => "metadata",
             Self::FileSync => "file_sync",
             Self::Publish => "publish",
             Self::DirectorySync => "directory_sync",
@@ -379,6 +386,12 @@ fn write_with_hook(
     let existing = parent
         .target()
         .map_err(|error| write_error(path, Phase::Prepare, false, &error))?;
+    #[cfg(target_os = "linux")]
+    let attributes = existing
+        .as_ref()
+        .map(|(file, _)| metadata::Snapshot::read(file))
+        .transpose()
+        .map_err(|error| write_error(path, Phase::Metadata, false, &error))?;
     let mut stage =
         Stage::create(parent).map_err(|error| write_error(path, Phase::Stage, false, &error))?;
     let mut phase = Phase::Stage;
@@ -389,7 +402,13 @@ fn write_with_hook(
             stage.file.write_all(chunk)?;
             hook(phase)?;
         }
+        phase = Phase::Metadata;
+        hook(phase)?;
         stage.permissions(existing.as_ref().map(|(_, meta)| meta))?;
+        #[cfg(target_os = "linux")]
+        if let Some(attributes) = attributes.as_ref() {
+            attributes.install(&stage.file)?;
+        }
         phase = Phase::FileSync;
         hook(phase)?;
         stage.file.sync_all()?;
@@ -401,6 +420,11 @@ fn write_with_hook(
             (None, None) => {}
             (Some((_, old)), Some((_, new))) if same_snapshot(old, new)? => {}
             _ => return Err(conflict()),
+        }
+        #[cfg(target_os = "linux")]
+        if let (Some(attributes), Some((file, _))) = (attributes.as_ref(), current.as_ref()) {
+            attributes.verify_source(file)?;
+            attributes.verify_installed(&stage.file)?;
         }
         stage.parent.publish(&stage.name, existing.is_some())?;
         // Record commit before any later fallible action. No rollback can
@@ -462,7 +486,13 @@ mod tests {
 
     #[test]
     fn unpublished_failures_preserve_existing_bytes_and_remove_stages() {
-        for fail in [Phase::Stage, Phase::Write, Phase::FileSync, Phase::Publish] {
+        for fail in [
+            Phase::Stage,
+            Phase::Write,
+            Phase::Metadata,
+            Phase::FileSync,
+            Phase::Publish,
+        ] {
             let (temp, path) = root();
             fs::write(&path, b"original").unwrap();
             let bytes = vec![b'x'; WRITE_CHUNK_BYTES * 2 + 1];
@@ -486,10 +516,17 @@ mod tests {
 
     #[test]
     fn unpublished_new_writes_never_leave_an_empty_or_partial_destination() {
-        for fail in [Phase::Stage, Phase::Write, Phase::FileSync, Phase::Publish] {
+        for fail in [
+            Phase::Stage,
+            Phase::Write,
+            Phase::Metadata,
+            Phase::FileSync,
+            Phase::Publish,
+        ] {
             let (temp, path) = root();
             assert!(
                 write_with_hook(&path, b"new", |phase| {
+                    assert!(!path.exists(), "destination became visible before publication");
                     if phase == fail {
                         Err(io::Error::other("injected"))
                     } else {
