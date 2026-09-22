@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 """scripts/perf/render_perf_budgets_md.py
 
-Generates tests/perf/reports/PERF_BUDGETS.md from
-tests/perf/reports/budget_summary.json (deterministic, byte-identical
-output modulo the timestamp).
+WARNING: DO NOT RUN THIS TO REGENERATE THE CHECKED-IN REPORT. See bd-o9qzt.
+
+Two things write tests/perf/reports/PERF_BUDGETS.md and they disagree. The
+file in the repository comes from `tests/perf_budgets.rs`, run as
+`PI_GENERATE_PERF_BUDGET_REPORT=1 ... generate_budget_report`; it carries a
+summary table, claim readiness with blocking reason codes, per-category
+sections, per-budget measurement methodology, failing data contracts with
+remediation text, and a CI-enforcement section.
+
+This script renders the same path from the same JSON in a different and
+lossier shape -- 189 diff lines against the checked-in file: no methodology,
+no data-contract remediations, no run id or strict-mode line, each row's
+`source` truncated mid-word at 50 characters, and a "Git commit: unknown"
+line because it reads `git_commit` where the artifact's field is
+`source_commit`. Running it replaces the good report with this one.
+
+Until somebody decides which generator stays (bd-o9qzt), `--check` is the
+only safe mode here: it compares and exits without writing.
 
 Bead: bd-perf-budgets-md-generated-nig4e
 """
@@ -73,12 +88,22 @@ def main() -> int:
     with open(args.inp) as f:
         bs = json.load(f)
     md = render(bs)
-    if args.check and args.out.exists():
+    if args.check:
+        # Previously this compared and then wrote anyway, so `--check` was
+        # indistinguishable from a plain run for anything downstream of it and
+        # could not be used as a read-only gate. It now returns without
+        # touching the file in every path.
+        if not args.out.exists():
+            print(f"MISSING: {args.out} does not exist", file=sys.stderr)
+            return 1
         with open(args.out) as f:
             existing = f.read()
         if existing != md:
-            print(f"OUT OF SYNC: regenerate {args.out}", file=sys.stderr)
+            print(f"OUT OF SYNC: {args.out} differs from this renderer's output",
+                  file=sys.stderr)
             return 1
+        print(f"in sync: {args.out}")
+        return 0
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
         f.write(md)
