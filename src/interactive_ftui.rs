@@ -2500,7 +2500,7 @@ impl PiFtuiModel {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "ftui preview commands: /model [provider/model], /resume, /new, \
+                    "pi commands: /model [provider/model], /resume, /new, \
                      /session, /name <name>, /compact, /tree, /undo [n], /redo [n], \
                      /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
@@ -3746,7 +3746,7 @@ impl PiFtuiModel {
         } else if let Some(usage) = &self.usage_line {
             usage.clone()
         } else {
-            String::from("pi — ftui preview")
+            String::from("pi")
         };
         let footer_style = ftui::Style::new().dim().fg(self.palette.muted);
         Paragraph::new(Text::from_lines([ftui::text::Line::styled(
@@ -5367,12 +5367,7 @@ pub fn run(
                 .await?;
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
-                send_conversation_reset(
-                    &handle,
-                    &agent_tx,
-                    "ftui preview stack — experimental (bd-cv653.9.1)",
-                )
-                .await;
+                send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
                 // Issue #208: extension-contributed slash commands become
                 // completable now that the extension runtime is up.
                 if let Some(manager) = handle.extension_manager() {
@@ -8693,7 +8688,7 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|e| e.text.contains("ftui preview commands")),
+                .any(|e| e.text.contains("pi commands")),
             "uppercase /H must show help"
         );
         type_str(&mut sim, "/Q");
@@ -8779,7 +8774,7 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|e| e.text.contains("ftui preview commands")),
+                .any(|e| e.text.contains("pi commands")),
             "the completed /help must route like a typed one"
         );
     }
@@ -8843,7 +8838,7 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|e| e.text.contains("ftui preview commands")),
+                .any(|e| e.text.contains("pi commands")),
             "Enter with no highlight submits what was typed"
         );
     }

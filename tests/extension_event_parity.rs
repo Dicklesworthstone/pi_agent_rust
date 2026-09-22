@@ -694,7 +694,7 @@ fn run_tmux_surface(name: &str, owner: &str, classic: bool) -> Option<SurfaceRun
 
     // Both stacks print a banner; neither shares the other's wording.
     session.tmux.wait_for_pane_contains_any(
-        &["Welcome to Pi!", "ftui preview stack"],
+        &["Welcome to Pi!", "pi interactive stack"],
         Duration::from_secs(30),
     );
     session.send_text_and_wait("parity_turn", PROMPT, FINAL_TEXT, Duration::from_secs(60));

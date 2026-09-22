@@ -125,15 +125,14 @@ fn e2e_ftui_launch_help_bash_quit() {
 
     // The banner is sent by the driver AFTER the SDK session is created, so
     // seeing it proves the full launch path (runtime, session, bridge).
-    let pane = session.wait_and_capture("startup", "ftui preview stack", STARTUP_TIMEOUT);
+    let pane = session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
     assert!(
         pane.contains("pi ·"),
         "header missing from ftui frame; got:\n{pane}"
     );
 
     // UI-side slash routing.
-    let pane =
-        session.send_text_and_wait("help", "/help", "ftui preview commands", COMMAND_TIMEOUT);
+    let pane = session.send_text_and_wait("help", "/help", "pi commands", COMMAND_TIMEOUT);
     assert!(
         pane.contains("/model"),
         "help text incomplete; got:\n{pane}"
@@ -258,14 +257,14 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
     // poisoned rch execution context against a known-good interactive run.
     let startup_pane = session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     let wrapper_env = std::fs::read_to_string(session.harness.temp_path("wrapper-env.txt"))
         .unwrap_or_else(|_| String::from("<no dump>"));
     let wrapper_trace =
         std::fs::read_to_string(&trace_log).unwrap_or_else(|_| String::from("<no trace>"));
     let script_present = script_path.exists();
     assert!(
-        startup_pane.contains("ftui preview stack"),
+        startup_pane.contains("pi interactive stack"),
         "startup banner never appeared; session_alive={}; script_present={script_present}; wrapper_env:\n{wrapper_env}\nwrapper_trace:\n{wrapper_trace}\nscript:\n{script}\npane:\n{startup_pane}",
         session.tmux.session_exists()
     );
@@ -469,9 +468,9 @@ fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
     // 1) Live launch on the ftui runtime.
     let pane = session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     assert!(
-        pane.contains("ftui preview stack"),
+        pane.contains("pi interactive stack"),
         "startup banner never appeared; pane:\n{pane}"
     );
 
@@ -535,9 +534,9 @@ fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
     }
     let pane = session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", COMMAND_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", COMMAND_TIMEOUT);
     assert!(
-        pane.contains("ftui preview stack"),
+        pane.contains("pi interactive stack"),
         "banner never repainted after fg; pi did not resume cleanly; pane:\n{pane}"
     );
 
@@ -624,7 +623,7 @@ fn scrollback_case(name: &str, sentinel: &str, inline: bool, expect_visible: boo
     launch_with_sentinel(&session, sentinel, inline);
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     let pane = capture_with_history(&session);
     if expect_visible {
         assert!(
@@ -668,7 +667,7 @@ fn e2e_ftui_resize_storm_survives() {
     session.launch(&ftui_args());
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
 
     // Storm: rapid alternating geometries, ending back at 80x24.
     for (w, h) in [
@@ -704,12 +703,7 @@ fn e2e_ftui_resize_storm_survives() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Post-storm: the UI must still route input correctly...
-    session.send_text_and_wait(
-        "post_storm_help",
-        "/help",
-        "ftui preview commands",
-        COMMAND_TIMEOUT,
-    );
+    session.send_text_and_wait("post_storm_help", "/help", "pi commands", COMMAND_TIMEOUT);
     // ...and the steady-state frame must be laid out for the final geometry
     // (a stale-size frame pushes the header off the top of the pane).
     std::thread::sleep(Duration::from_millis(300));
@@ -761,7 +755,7 @@ fn e2e_ftui_resize_storm_stream_is_flicker_free() {
     session.launch(&ftui_args());
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
 
     // Tap the RAW output stream (escape sequences included — capture-pane
     // only exposes rendered text). `-o` pipes everything the pane emits.
@@ -811,12 +805,7 @@ fn e2e_ftui_resize_storm_stream_is_flicker_free() {
         assert!(status.success(), "resize to {w}x{h} failed");
         std::thread::sleep(Duration::from_millis(60));
     }
-    session.send_text_and_wait(
-        "flicker_help",
-        "/help",
-        "ftui preview commands",
-        COMMAND_TIMEOUT,
-    );
+    session.send_text_and_wait("flicker_help", "/help", "pi commands", COMMAND_TIMEOUT);
     for (w, h) in [("90", "28"), ("50", "16"), ("80", "24")] {
         let mut cmd = std::process::Command::new("tmux"); // ubs:ignore test helper — same tmux invocation pattern as tests/common/tmux.rs
         let status = cmd
@@ -1206,7 +1195,7 @@ fn e2e_ftui_vcr_streamed_turn() {
         .start_session(session.harness.temp_dir(), &script_path);
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
 
     session.tmux.send_literal(FTUI_VCR_PROMPT);
     session.tmux.send_key("Enter");
@@ -1277,7 +1266,7 @@ fn e2e_ftui_continue_reopens_the_previous_session() {
         .start_session(session.harness.temp_dir(), &script_path);
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     session.tmux.send_literal(FTUI_VCR_PROMPT);
     session.tmux.send_key("Enter");
     session
@@ -1444,7 +1433,7 @@ fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
 
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     session.tmux.send_literal(FTUI_VCR_PROMPT);
     session.tmux.send_key("Enter");
 
@@ -1505,7 +1494,7 @@ fn e2e_ftui_wheel_scroll_inside_tmux() {
     session.launch(&ftui_args());
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
 
     // Fill the transcript well past one screen. A single tall tool output
     // no longer guarantees overflow: card collapsing (bd-cv653.9.2) can
@@ -1603,7 +1592,7 @@ fn e2e_ftui_share_creates_secret_gist() {
     session.set_env("PI_WORKSPACE_TRUST", "trusted");
 
     session.launch(&ftui_args());
-    session.wait_and_capture("startup", "ftui preview stack", STARTUP_TIMEOUT);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
 
     // The success message's LAST paragraph, so the capture cannot land between
     // two frames of the same multi-paragraph message.
@@ -1663,7 +1652,7 @@ fn e2e_ftui_share_public_never_invokes_gh() {
     session.set_env("PI_WORKSPACE_TRUST", "trusted");
 
     session.launch(&ftui_args());
-    session.wait_and_capture("startup", "ftui preview stack", STARTUP_TIMEOUT);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
 
     let pane = session.send_text_and_wait(
         "share_public",
@@ -1795,7 +1784,7 @@ fn e2e_ftui_tan_delivers_its_summary_to_the_parent_turn() {
         "--system-prompt",
         "ftui tan e2e parent",
     ]);
-    session.wait_and_capture("startup", "ftui preview stack", STARTUP_TIMEOUT);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
 
     let started = session.send_text_and_wait(
         "start_tan",
