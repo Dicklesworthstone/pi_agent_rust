@@ -53,6 +53,7 @@ const MAX_SERVICE_NAME_BYTES: usize = 128;
 pub struct ReadySpec {
     /// Regex that must match retained service output (up to 1 MiB of completed
     /// lines and a 16 KiB tail per line, including the current partial line).
+    /// A match is latched at read time; subsequent eviction cannot undo it.
     pub log: Option<String>,
     /// TCP port on 127.0.0.1 that must accept a connection.
     pub port: Option<u16>,
@@ -102,6 +103,8 @@ impl ServiceStatus {
 /// One ring entry: a completed output line with its cursor index.
 struct Ring {
     lines: VecDeque<String>,
+    /// Distinguish synthetic truncation markers from bytes the service wrote.
+    truncated_lines: VecDeque<bool>,
     next_index: u64,
     /// Partial line currently being assembled (not yet cursor-addressable).
     partial: String,
@@ -109,18 +112,28 @@ struct Ring {
     /// Text bytes in completed lines; the partial line has a separate bound.
     bytes: usize,
     cap: usize,
+    ready_log: Option<regex::Regex>,
+    ready_log_passed: bool,
 }
 
 impl Ring {
     fn new(cap: usize) -> Self {
         Self {
             lines: VecDeque::with_capacity(cap.min(256)),
+            truncated_lines: VecDeque::with_capacity(cap.min(256)),
             next_index: 0,
             partial: String::new(),
             partial_truncated: false,
             bytes: 0,
             cap,
+            ready_log: None,
+            ready_log_passed: true,
         }
+    }
+
+    fn watch_readiness(&mut self, pattern: Option<regex::Regex>) {
+        self.ready_log_passed = pattern.as_ref().is_none_or(|re| re.is_match(&self.text()));
+        self.ready_log = pattern;
     }
 
     fn push_chunk(&mut self, chunk: &str) {
@@ -131,6 +144,14 @@ impl Ring {
             } else {
                 self.push_partial(fragment);
             }
+        }
+        // Observe at the stream seam, before a later burst can evict the
+        // readiness marker. Once observed, the log gate remains satisfied.
+        if !self.ready_log_passed {
+            self.ready_log_passed = self
+                .ready_log
+                .as_ref()
+                .is_some_and(|re| re.is_match(&self.text()));
         }
     }
 
@@ -161,7 +182,8 @@ impl Ring {
     fn finish_line(&mut self) {
         let mut line = std::mem::take(&mut self.partial);
         line.truncate(line.trim_end_matches('\r').len());
-        if std::mem::take(&mut self.partial_truncated) {
+        let truncated = std::mem::take(&mut self.partial_truncated);
+        if truncated {
             line.insert_str(0, TRUNCATED_LINE_PREFIX);
         }
         // Cursors count source lines, not retained bytes or transport chunks.
@@ -173,10 +195,12 @@ impl Ring {
             let Some(evicted) = self.lines.pop_front() else {
                 break;
             };
+            self.truncated_lines.pop_front();
             self.bytes -= evicted.len();
         }
         self.bytes += line.len();
         self.lines.push_back(line);
+        self.truncated_lines.push_back(truncated);
     }
 
     /// Only the output reader knows when all trailing bytes have arrived.
@@ -186,16 +210,16 @@ impl Ring {
         }
     }
 
+    /// Readiness sees only service text, never our truncation annotations.
     fn text(&self) -> String {
-        let mut text = String::with_capacity(
-            self.bytes + self.lines.len() + self.partial.len() + TRUNCATED_LINE_PREFIX.len(),
-        );
-        for line in &self.lines {
-            text.push_str(line);
+        let mut text = String::with_capacity(self.bytes + self.lines.len() + self.partial.len());
+        for (line, truncated) in self.lines.iter().zip(&self.truncated_lines) {
+            text.push_str(if *truncated {
+                line.strip_prefix(TRUNCATED_LINE_PREFIX).unwrap_or(line)
+            } else {
+                line
+            });
             text.push('\n');
-        }
-        if self.partial_truncated {
-            text.push_str(TRUNCATED_LINE_PREFIX);
         }
         text.push_str(&self.partial);
         text
@@ -218,7 +242,7 @@ struct ServiceEntry {
     exit_code: Option<i32>,
     log_path: PathBuf,
     ring: Arc<Mutex<Ring>>,
-    /// PTY master (resize/future); the writer is taken once at spawn —
+    /// Cached PTY writer, taken once before spawn —
     /// portable-pty's `UnixMasterWriter::drop` sends `\n`+VEOF, so caching
     /// the writer is what keeps the child's stdin open across sends.
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
@@ -274,6 +298,203 @@ pub struct LogPage {
 #[derive(Default)]
 struct ServiceRegistry {
     services: HashMap<String, ServiceEntry>,
+}
+
+impl ServiceRegistry {
+    /// Reserve before any filesystem or process side effects. The ring's Arc
+    /// identity is also the incarnation token, so stopped names can be reused
+    /// without letting an old monitor or readiness waiter mutate the new run.
+    fn reserve(
+        &mut self,
+        spec: &LaunchSpec,
+        ring: &Arc<Mutex<Ring>>,
+        log_path: &std::path::Path,
+    ) -> Result<()> {
+        if let Some(existing) = self.services.get(&spec.name)
+            && existing.status.live()
+        {
+            return Err(Error::tool(
+                "hub",
+                format!(
+                    "PI_HUB_NAME_TAKEN: a live service named '{}' already exists (pid {:?})",
+                    spec.name, existing.pid
+                ),
+            ));
+        }
+        self.services.insert(
+            spec.name.clone(),
+            ServiceEntry {
+                spec: spec.clone(),
+                status: ServiceStatus::Starting,
+                pid: None,
+                started_ms: now_ms(),
+                exit_code: None,
+                log_path: log_path.to_path_buf(),
+                ring: Arc::clone(ring),
+                writer: Arc::new(Mutex::new(None)),
+            },
+        );
+        Ok(())
+    }
+
+    fn current(&self, name: &str, ring: &Arc<Mutex<Ring>>) -> Option<&ServiceEntry> {
+        self.services
+            .get(name)
+            .filter(|entry| Arc::ptr_eq(&entry.ring, ring))
+    }
+
+    fn current_mut(&mut self, name: &str, ring: &Arc<Mutex<Ring>>) -> Option<&mut ServiceEntry> {
+        self.services
+            .get_mut(name)
+            .filter(|entry| Arc::ptr_eq(&entry.ring, ring))
+    }
+
+    fn mark_ready(&mut self, name: &str, ring: &Arc<Mutex<Ring>>) -> Result<ServiceSnapshot> {
+        let entry = self
+            .current_mut(name, ring)
+            .ok_or_else(|| stale_service(name))?;
+        if !entry.status.live() {
+            return Err(Error::tool(
+                "hub",
+                format!(
+                    "PI_HUB_NOT_READY: service '{name}' is {} before readiness was observed",
+                    entry.status.as_str()
+                ),
+            ));
+        }
+        entry.status = ServiceStatus::Running;
+        Ok(ServiceSnapshot::from_entry(entry))
+    }
+
+    fn settle(&mut self, name: &str, ring: &Arc<Mutex<Ring>>, code: i32) -> bool {
+        let Some(entry) = self.current_mut(name, ring) else {
+            return false;
+        };
+        if entry.status.live() {
+            entry.status = if code == 0 {
+                ServiceStatus::Exited
+            } else {
+                ServiceStatus::Failed
+            };
+        }
+        entry.exit_code = Some(code);
+        entry.pid = None;
+        true
+    }
+
+    /// A stale timeout has no authority over the current service's PID.
+    fn time_out(&mut self, name: &str, ring: &Arc<Mutex<Ring>>) -> Option<u32> {
+        let entry = self.current_mut(name, ring)?;
+        if !entry.status.live() {
+            return None;
+        }
+        entry.status = ServiceStatus::Killed;
+        entry.pid
+    }
+}
+
+fn stale_service(name: &str) -> Error {
+    Error::tool(
+        "hub",
+        format!("PI_HUB_STALE_SERVICE: service '{name}' was replaced during startup"),
+    )
+}
+
+/// A failed setup settles only its own reservation. This guard is created
+/// before the child guard, so child cleanup runs before the reservation settles.
+struct PendingService {
+    name: String,
+    ring: Arc<Mutex<Ring>>,
+    armed: bool,
+}
+
+impl PendingService {
+    fn reserve(
+        spec: &LaunchSpec,
+        ring: &Arc<Mutex<Ring>>,
+        log_path: &std::path::Path,
+    ) -> Result<Self> {
+        let mut reg = registry().lock().map_err(|_| registry_err())?;
+        reg.reserve(spec, ring, log_path)?;
+        drop(reg);
+        Ok(Self {
+            name: spec.name.clone(),
+            ring: Arc::clone(ring),
+            armed: true,
+        })
+    }
+}
+
+impl Drop for PendingService {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut reg) = registry().lock()
+            && reg.settle(&self.name, &self.ring, -1)
+        {
+            persist_detached_state(&reg);
+        }
+    }
+}
+
+/// Own the child even across thread-start errors or unwinding. On successful
+/// handoff the monitor consumes this guard by waiting; every other path kills
+/// and reaps before dropping the handle.
+struct ServiceChild {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    reaped: bool,
+}
+
+impl ServiceChild {
+    fn wait(mut self) -> i32 {
+        loop {
+            match self.child.wait() {
+                Ok(status) => {
+                    self.reaped = true;
+                    return i32::try_from(status.exit_code()).unwrap_or(-1);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return -1,
+            }
+        }
+    }
+}
+
+impl Drop for ServiceChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            crate::tools::kill_process_group_tree(self.child.process_id());
+            let _ = self.child.kill();
+            loop {
+                match self.child.wait() {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
+struct SpawnedService {
+    child: ServiceChild,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+}
+
+fn readiness_deadline(now: Instant, budget: Duration) -> Result<Instant> {
+    now.checked_add(budget).ok_or_else(|| {
+        Error::validation("PI_HUB_INVALID_READY_TIMEOUT: readiness timeout is too large".to_string())
+    })
+}
+
+fn create_service_log(path: &std::path::Path) -> Result<std::fs::File> {
+    // Never truncate a previous run or follow an existing symlink, even if a
+    // generated name collides. The path is returned in the service descriptor.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| Error::tool("hub", format!("Failed to create service log: {error}")))
 }
 
 fn registry() -> &'static Mutex<ServiceRegistry> {
@@ -353,8 +574,8 @@ fn persist_detached_state(reg: &ServiceRegistry) {
 }
 
 /// Spawn a service and block until readiness is observed (or the budget
-/// expires). Readiness MUST be observed — process creation alone is not
-/// ready.
+/// expires). Both supplied gates must be observed. With no gates, a
+/// successful spawn is acknowledged without resurrecting a later exit.
 ///
 /// # Errors
 /// `PI_HUB_NAME_TAKEN` for a duplicate live name; `PI_HUB_NOT_READY` when
@@ -367,6 +588,7 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
     let ready = spec.ready.clone().unwrap_or_default();
     let has_gates = ready.log.is_some() || ready.port.is_some();
     let budget = Duration::from_secs(ready.timeout_secs.unwrap_or(DEFAULT_READY_TIMEOUT_SECS));
+    let deadline = readiness_deadline(Instant::now(), budget)?;
     let log_regex = ready
         .log
         .as_deref()
@@ -375,190 +597,148 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
                 .map_err(|e| Error::validation(format!("Invalid ready.log regex '{pattern}': {e}")))
         })
         .transpose()?;
-    if !spec.cwd.exists() {
+    if !spec.cwd.is_dir() {
         return Err(Error::tool(
             "hub",
-            format!("Working directory does not exist: {}", spec.cwd.display()),
+            format!("Working directory is not a directory: {}", spec.cwd.display()),
         ));
     }
 
-    {
+    let mut output = Ring::new(RING_LINE_CAP);
+    output.watch_readiness(log_regex);
+    let ring = Arc::new(Mutex::new(output));
+    let log_dir = hub_artifact_dir();
+    let log_path = log_dir.join(format!("{name}-{}.log", uuid::Uuid::new_v4()));
+    let mut pending = PendingService::reserve(spec, &ring, &log_path)?;
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| Error::tool("hub", format!("Failed to create hub artifact dir: {e}")))?;
+    // All fallible artifact/PTY handle setup precedes child creation.
+    let artifact = create_service_log(&log_path)?;
+    let SpawnedService {
+        child,
+        master,
+        reader,
+        writer,
+    } = spawn_pty(spec)?;
+    let initial_snapshot = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
-        if let Some(existing) = reg.services.get(&name)
-            && existing.status.live()
-        {
+        let entry = reg
+            .current_mut(&name, &ring)
+            .ok_or_else(|| stale_service(&name))?;
+        if !entry.status.live() {
+            return Err(Error::tool(
+                "hub",
+                format!("PI_HUB_NOT_READY: service '{name}' was stopped during startup"),
+            ));
+        }
+        entry.pid = child.child.process_id();
+        entry.started_ms = now_ms();
+        entry.writer = Arc::new(Mutex::new(Some(writer)));
+        if !has_gates {
+            entry.status = ServiceStatus::Running;
+        }
+        let snapshot = ServiceSnapshot::from_entry(entry);
+        persist_detached_state(&reg);
+        snapshot
+    };
+
+    let pump_ring = Arc::clone(&ring);
+    std::thread::Builder::new()
+        .name(format!("hub-output-{name}"))
+        .spawn(move || pump_service_stream(reader, artifact, &pump_ring))
+        .map_err(|error| {
+            Error::tool("hub", format!("Failed to start service output pump: {error}"))
+        })?;
+
+    let monitor_name = name.clone();
+    let monitor_ring = Arc::clone(&ring);
+    std::thread::Builder::new()
+        .name(format!("hub-monitor-{name}"))
+        .spawn(move || {
+            // Keep the PTY owner alive for the whole child lifetime, not just
+            // the readiness call. Reader/writer handles need not own it.
+            let _master = master;
+            let code = child.wait();
+            if let Ok(mut reg) = registry().lock()
+                && reg.settle(&monitor_name, &monitor_ring, code)
+            {
+                persist_detached_state(&reg);
+            }
+        })
+        .map_err(|error| {
+            Error::tool("hub", format!("Failed to start service exit monitor: {error}"))
+        })?;
+    pending.armed = false;
+
+    // No-gate starts acknowledge the publication above, even if a very short
+    // command has since exited. Never resurrect its settled registry entry.
+    if !has_gates {
+        return Ok(initial_snapshot);
+    }
+
+    loop {
+        let status = {
+            let reg = registry().lock().map_err(|_| registry_err())?;
+            reg.current(&name, &ring)
+                .ok_or_else(|| stale_service(&name))?
+                .status
+        };
+        if !status.live() {
+            let tail = ring_tail(&ring, 20);
             return Err(Error::tool(
                 "hub",
                 format!(
-                    "PI_HUB_NAME_TAKEN: a live service named '{name}' already exists (pid {:?}); \
-                     stop it first or pick another name",
-                    existing.pid
+                    "PI_HUB_NOT_READY: service '{name}' became {} before readiness was observed.\n\
+                     Log tail:\n{tail}",
+                    status.as_str()
                 ),
             ));
         }
-        // Completed names may be reused: drop the settled entry.
-        reg.services.remove(&name);
-    }
-
-    let log_dir = hub_artifact_dir();
-    std::fs::create_dir_all(&log_dir)
-        .map_err(|e| Error::tool("hub", format!("Failed to create hub artifact dir: {e}")))?;
-    let log_path = log_dir.join(format!("{name}.log"));
-
-    let ring = Arc::new(Mutex::new(Ring::new(RING_LINE_CAP)));
-    let (mut child, master) = spawn_pty(spec)?;
-    let pid = child.process_id();
-    let reader = master
-        .try_clone_reader()
-        .map_err(|e| Error::tool("hub", format!("Failed to clone PTY reader: {e}")))?;
-    let writer = master
-        .take_writer()
-        .map_err(|e| Error::tool("hub", format!("Failed to open PTY writer: {e}")))?;
-
-    {
-        let mut reg = registry().lock().map_err(|_| registry_err())?;
-        reg.services.insert(
-            name.clone(),
-            ServiceEntry {
-                spec: spec.clone(),
-                status: ServiceStatus::Starting,
-                pid,
-                started_ms: now_ms(),
-                exit_code: None,
-                log_path: log_path.clone(),
-                ring: Arc::clone(&ring),
-                writer: Arc::new(Mutex::new(Some(writer))),
-            },
-        );
-        persist_detached_state(&reg);
-    }
-
-    // Pump thread: PTY master reader → artifact file + line ring.
-    let artifact = std::fs::File::create(&log_path)
-        .map_err(|e| Error::tool("hub", format!("Failed to create service log: {e}")))?;
-    let pump_ring = Arc::clone(&ring);
-    std::thread::spawn(move || pump_service_stream(reader, artifact, &pump_ring));
-
-    // Exit monitor: record final status + refresh the detached roster.
-    let monitor_name = name.clone();
-    std::thread::spawn(move || {
-        let code: i64 = child
-            .wait()
-            .map_or(-1, |status| i64::from(status.exit_code()));
-        if let Ok(mut reg) = registry().lock()
-            && let Some(entry) = reg.services.get_mut(&monitor_name)
-        {
-            if entry.status.live() {
-                entry.status = if code == 0 {
-                    ServiceStatus::Exited
-                } else {
-                    ServiceStatus::Failed
-                };
+        let log_passed = ring.lock().map_err(|_| registry_err())?.ready_log_passed;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let port_passed = ready.port.is_none_or(|port| {
+            if remaining.is_zero() {
+                return false;
             }
-            entry.exit_code = Some(i32::try_from(code).unwrap_or(-1));
-            entry.pid = None;
-            persist_detached_state(&reg);
-        }
-    });
-
-    // Readiness gate: block until BOTH supplied gates pass.
-    let deadline = Instant::now() + budget;
-
-    // Cold error paths, hoisted out of the poll loop (ubs loop-allocation
-    // heuristic).
-    let not_ready_exited = |tail: &str| {
-        Error::tool(
-            "hub",
-            format!(
-                "PI_HUB_NOT_READY: service '{name}' exited before readiness was observed.\n\
-                 Log tail:\n{tail}"
-            ),
-        )
-    };
-    let not_ready_timeout = |tail: &str, log_passed: bool, port_passed: bool| {
-        Error::tool(
-            "hub",
-            format!(
-                "PI_HUB_NOT_READY: service '{name}' failed readiness within {}s \
-                 (log gate passed: {log_passed}, port gate passed: {port_passed}). \
-                 The process was killed.\nLog tail:\n{tail}",
-                budget.as_secs()
-            ),
-        )
-    };
-
-    loop {
-        let log_passed = log_regex.as_ref().is_none_or(|re| {
-            ring.lock().is_ok_and(|ring| re.is_match(&ring.text()))
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            std::net::TcpStream::connect_timeout(
+                &address,
+                remaining.min(Duration::from_millis(100)),
+            )
+            .is_ok()
         });
-        let port_passed = ready
-            .port
-            .is_none_or(|port| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
-
-        if log_passed && port_passed {
+        if log_passed && port_passed && Instant::now() <= deadline {
             let mut reg = registry().lock().map_err(|_| registry_err())?;
-            if reg.services.contains_key(&name) {
-                if let Some(entry) = reg.services.get_mut(&name) {
-                    entry.status = ServiceStatus::Running;
-                }
+            let snapshot = reg.mark_ready(&name, &ring)?;
+            persist_detached_state(&reg);
+            return Ok(snapshot);
+        }
+        if Instant::now() >= deadline {
+            let pid = {
+                let mut reg = registry().lock().map_err(|_| registry_err())?;
+                let pid = reg.time_out(&name, &ring);
                 persist_detached_state(&reg);
-                let entry = &reg.services[&name]; // ubs:ignore key presence checked above
-                return Ok(ServiceSnapshot::from_entry(entry));
-            }
+                pid
+            };
+            crate::tools::kill_process_group_tree(pid);
+            let tail = ring_tail(&ring, 20);
             return Err(Error::tool(
                 "hub",
-                "service vanished before ready".to_string(), // ubs:ignore cold error path
+                format!(
+                    "PI_HUB_NOT_READY: service '{name}' failed readiness within {}s \
+                     (log gate passed: {log_passed}, port gate passed: {port_passed}). \
+                     Startup was stopped.\nLog tail:\n{tail}",
+                    budget.as_secs()
+                ),
             ));
         }
-
-        // Process died before becoming ready?
-        let early_status = {
-            let reg = registry().lock().map_err(|_| registry_err())?;
-            reg.services.get(&name).map(|entry| entry.status)
-        };
-        if matches!(
-            early_status,
-            Some(ServiceStatus::Exited | ServiceStatus::Failed)
-        ) {
-            let tail = ring_tail(&ring, 20);
-            return Err(not_ready_exited(&tail));
-        }
-
-        if !has_gates || Instant::now() >= deadline {
-            if has_gates {
-                // Readiness timeout: kill — no half-started daemons.
-                let pid = {
-                    let reg = registry().lock().map_err(|_| registry_err())?;
-                    reg.services.get(&name).and_then(|entry| entry.pid)
-                };
-                crate::tools::kill_process_group_tree(pid);
-                if let Ok(mut reg) = registry().lock()
-                    && let Some(entry) = reg.services.get_mut(&name)
-                {
-                    entry.status = ServiceStatus::Killed;
-                }
-                let tail = ring_tail(&ring, 20);
-                return Err(not_ready_timeout(&tail, log_passed, port_passed));
-            }
-            // No gates supplied: process creation is the readiness signal.
-            let mut reg = registry().lock().map_err(|_| registry_err())?;
-            if let Some(entry) = reg.services.get_mut(&name) {
-                entry.status = ServiceStatus::Running;
-                return Ok(ServiceSnapshot::from_entry(entry));
-            }
-            return Err(Error::tool("hub", "service vanished".to_string())); // ubs:ignore cold error path
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
-fn spawn_pty(
-    spec: &LaunchSpec,
-) -> Result<(
-    Box<dyn portable_pty::Child + Send + Sync>,
-    Box<dyn portable_pty::MasterPty + Send>,
-)> {
+fn spawn_pty(spec: &LaunchSpec) -> Result<SpawnedService> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
     let pty_system = native_pty_system();
@@ -578,12 +758,28 @@ fn spawn_pty(
         cmd.env(key, value);
     }
 
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| Error::tool("hub", format!("Failed to clone PTY reader: {e}")))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| Error::tool("hub", format!("Failed to open PTY writer: {e}")))?;
     let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| Error::tool("hub", format!("Failed to spawn service: {e}")))?;
     drop(pair.slave);
-    Ok((child, pair.master))
+    Ok(SpawnedService {
+        child: ServiceChild {
+            child,
+            reaped: false,
+        },
+        master: pair.master,
+        reader,
+        writer,
+    })
 }
 
 /// Decode only complete UTF-8 prefixes. At most three bytes remain pending
@@ -1175,6 +1371,261 @@ mod tests {
     }
 
     #[test]
+    fn reservation_rejects_duplicate_before_a_pid_exists() {
+        let mut reg = ServiceRegistry::default();
+        let launch = spec("hub-reserved", "unused", &[], None);
+        let first = Arc::new(Mutex::new(Ring::new(8)));
+        let second = Arc::new(Mutex::new(Ring::new(8)));
+        reg.reserve(&launch, &first, &PathBuf::from("first.log")).expect("reserve");
+        let error = reg
+            .reserve(&launch, &second, &PathBuf::from("second.log"))
+            .expect_err("pending launch owns the name");
+        assert!(error.to_string().contains("PI_HUB_NAME_TAKEN"));
+        assert!(reg.current(&launch.name, &first).expect("first").pid.is_none());
+        assert!(reg.current(&launch.name, &second).is_none());
+    }
+
+    #[test]
+    fn stale_exit_readiness_and_timeout_cannot_mutate_replacement() {
+        let mut reg = ServiceRegistry::default();
+        let launch = spec("hub-generation", "unused", &[], None);
+        let old = Arc::new(Mutex::new(Ring::new(8)));
+        let new = Arc::new(Mutex::new(Ring::new(8)));
+        reg.reserve(&launch, &old, &PathBuf::from("old.log")).expect("old");
+        reg.time_out(&launch.name, &old);
+        reg.reserve(&launch, &new, &PathBuf::from("new.log")).expect("new");
+        reg.current_mut(&launch.name, &new).expect("new entry").pid = Some(42);
+        reg.mark_ready(&launch.name, &new).expect("ready");
+        assert!(!reg.settle(&launch.name, &old, 1));
+        assert!(
+            reg.mark_ready(&launch.name, &old)
+                .unwrap_err()
+                .to_string()
+                .contains("PI_HUB_STALE_SERVICE")
+        );
+        assert_eq!(reg.time_out(&launch.name, &old), None);
+        let current = reg.current(&launch.name, &new).expect("replacement");
+        assert_eq!(current.status, ServiceStatus::Running);
+        assert_eq!(current.pid, Some(42));
+        assert_eq!(current.exit_code, None);
+        assert_eq!(current.log_path, PathBuf::from("new.log"));
+    }
+
+    #[test]
+    fn readiness_cannot_resurrect_any_terminal_status() {
+        for terminal in [
+            ServiceStatus::Exited,
+            ServiceStatus::Failed,
+            ServiceStatus::Killed,
+        ] {
+            let mut reg = ServiceRegistry::default();
+            let launch = spec("hub-terminal", "unused", &[], None);
+            let ring = Arc::new(Mutex::new(Ring::new(8)));
+            reg.reserve(&launch, &ring, &PathBuf::from("terminal.log")).expect("reserve");
+            reg.current_mut(&launch.name, &ring).expect("entry").status = terminal;
+            assert!(reg.mark_ready(&launch.name, &ring).is_err());
+            assert_eq!(reg.current(&launch.name, &ring).expect("entry").status, terminal);
+        }
+    }
+
+    #[test]
+    fn exit_monitor_preserves_killed_status_and_clears_only_its_pid() {
+        let mut reg = ServiceRegistry::default();
+        let launch = spec("hub-killed", "unused", &[], None);
+        let ring = Arc::new(Mutex::new(Ring::new(8)));
+        reg.reserve(&launch, &ring, &PathBuf::from("killed.log")).expect("reserve");
+        reg.current_mut(&launch.name, &ring).expect("entry").pid = Some(42);
+        assert_eq!(reg.time_out(&launch.name, &ring), Some(42));
+        assert!(reg.settle(&launch.name, &ring, 137));
+        let settled = reg.current(&launch.name, &ring).expect("entry");
+        assert_eq!(settled.status, ServiceStatus::Killed);
+        assert_eq!(settled.pid, None);
+        assert_eq!(settled.exit_code, Some(137));
+    }
+
+    #[test]
+    fn failed_start_guard_does_not_settle_a_new_reservation() {
+        let _lock = test_lock();
+        let launch = spec("hub-pending-guard", "unused", &[], None);
+        let old = Arc::new(Mutex::new(Ring::new(8)));
+        let new = Arc::new(Mutex::new(Ring::new(8)));
+        let pending_old = PendingService::reserve(&launch, &old, &PathBuf::from("old.log"))
+            .expect("old reservation");
+        registry().lock().expect("registry").time_out(&launch.name, &old);
+        let pending_new = PendingService::reserve(&launch, &new, &PathBuf::from("new.log"))
+            .expect("new reservation");
+        drop(pending_old);
+        assert_eq!(describe(&launch.name).expect("current").status, "starting");
+        drop(pending_new);
+        let failed = describe(&launch.name).expect("failed setup");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.pid, None);
+        assert_eq!(failed.exit_code, Some(-1));
+    }
+
+    #[test]
+    fn readiness_marker_is_latched_before_output_eviction() {
+        let mut output = Ring::new(3);
+        output.watch_readiness(Some(regex::Regex::new("^ready 界🙂").expect("regex")));
+        let ring = Mutex::new(output);
+        let input = "ready 界🙂\na\nb\nc\nd\n".as_bytes();
+        let reader = FragmentedReader {
+            bytes: input,
+            width: 1,
+            interrupt_next: true,
+            terminal_error: false,
+        };
+        pump_service_stream(reader, std::io::sink(), &ring);
+        let output = ring.into_inner().expect("ring");
+        assert_eq!(output.since(0).0, vec!["b", "c", "d"]);
+        assert!(output.ready_log_passed, "observed readiness must survive eviction");
+    }
+
+    #[test]
+    fn readiness_does_not_match_synthetic_truncation_annotations() {
+        let mut ring = Ring::new(8);
+        ring.watch_readiness(Some(regex::Regex::new("truncated").expect("regex")));
+        ring.push_chunk(&"x".repeat(RING_LINE_BYTE_CAP * 2));
+        ring.push_chunk("\n");
+        assert!(ring.since(0).0[0].starts_with(TRUNCATED_LINE_PREFIX));
+        assert!(!ring.ready_log_passed);
+        ring.push_chunk("service says truncated\n");
+        assert!(ring.ready_log_passed, "literal service output still matches");
+    }
+
+    #[test]
+    fn overflowing_readiness_timeout_is_rejected_before_spawn() {
+        let _lock = test_lock();
+        let error = start(&spec(
+            "hub-timeout-overflow",
+            "pi-hub-program-that-does-not-exist",
+            &[],
+            Some(ReadySpec {
+                timeout_secs: Some(u64::MAX),
+                ..ReadySpec::default()
+            }),
+        ))
+        .expect_err("timeout must be validated before program resolution");
+        assert!(error.to_string().contains("PI_HUB_INVALID_READY_TIMEOUT"));
+        assert!(describe("hub-timeout-overflow").is_err());
+        let now = Instant::now();
+        assert_eq!(
+            readiness_deadline(now, Duration::ZERO).expect("zero budget"),
+            now
+        );
+    }
+
+    #[test]
+    fn service_artifact_creation_never_truncates_existing_logs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("service.log");
+        std::fs::write(&path, b"previous run").expect("old log");
+        assert!(create_service_log(&path).is_err());
+        assert_eq!(std::fs::read(&path).expect("old bytes"), b"previous run");
+        let fresh = dir.path().join("fresh.log");
+        create_service_log(&fresh)
+            .expect("fresh log")
+            .write_all(b"new run")
+            .expect("write");
+        assert_eq!(std::fs::read(fresh).expect("fresh bytes"), b"new run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_artifact_creation_rejects_symlinks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        let link = dir.path().join("service.log");
+        std::fs::write(&target, b"untouched").expect("target");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(create_service_log(&link).is_err());
+        assert_eq!(std::fs::read(target).expect("target bytes"), b"untouched");
+    }
+
+    #[derive(Debug, Clone)]
+    enum WaitStep {
+        Interrupted,
+        Failed,
+        Exit(u32),
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingChild {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        steps: VecDeque<WaitStep>,
+    }
+
+    impl portable_pty::ChildKiller for RecordingChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.events.lock().expect("events").push("kill");
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl portable_pty::Child for RecordingChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            self.events.lock().expect("events").push("wait");
+            match self.steps.pop_front().unwrap_or(WaitStep::Exit(0)) {
+                WaitStep::Interrupted => Err(std::io::ErrorKind::Interrupted.into()),
+                WaitStep::Failed => Err(std::io::Error::other("injected wait failure")),
+                WaitStep::Exit(code) => Ok(portable_pty::ExitStatus::with_exit_code(code)),
+            }
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None // No real process: this tests ownership, not OS tree signalling.
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    type ChildEvents = Arc<Mutex<Vec<&'static str>>>;
+
+    fn recording_child(steps: &[WaitStep]) -> (ServiceChild, ChildEvents) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let child = ServiceChild {
+            child: Box::new(RecordingChild {
+                events: Arc::clone(&events),
+                steps: steps.iter().cloned().collect(),
+            }),
+            reaped: false,
+        };
+        (child, events)
+    }
+
+    #[test]
+    fn child_guard_kills_and_reaps_on_setup_failure() {
+        let (child, events) = recording_child(&[WaitStep::Interrupted, WaitStep::Exit(137)]);
+        drop(child);
+        assert_eq!(*events.lock().expect("events"), vec!["kill", "wait", "wait"]);
+    }
+
+    #[test]
+    fn child_monitor_retries_interruption_without_killing_a_reaped_child() {
+        let (child, events) = recording_child(&[WaitStep::Interrupted, WaitStep::Exit(7)]);
+        assert_eq!(child.wait(), 7);
+        assert_eq!(*events.lock().expect("events"), vec!["wait", "wait"]);
+    }
+
+    #[test]
+    fn child_monitor_wait_failure_still_kills_and_reaps() {
+        let (child, events) = recording_child(&[WaitStep::Failed, WaitStep::Exit(137)]);
+        assert_eq!(child.wait(), -1);
+        assert_eq!(*events.lock().expect("events"), vec!["wait", "kill", "wait"]);
+    }
+
+    #[test]
     fn invalid_name_is_rejected_before_program_resolution() {
         let _guard = crate::hub::test_lock();
         let err = start(&spec(
@@ -1294,6 +1745,10 @@ mod tests {
         );
         let restarted = restart(name).expect("restart");
         assert_eq!(restarted.status, "running");
+        assert_ne!(
+            first.log_path, restarted.log_path,
+            "each run must own its artifact"
+        );
         std::thread::sleep(Duration::from_millis(400));
         let page = logs(name, None, Some(50), Some("first-run"), 5_000).expect("logs");
         assert!(
