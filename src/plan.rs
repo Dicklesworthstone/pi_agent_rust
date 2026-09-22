@@ -396,16 +396,16 @@ impl PlanState {
 
     /// Install plan-mode state reconstructed for a newly active Session.
     ///
-    /// Submitted plan text and the pre-plan model are memory-only state and
-    /// must never cross a Session boundary. `PendingApproval` cannot be
-    /// reconstructed safely without that submitted plan, so it fails closed
-    /// to read-only `Planning` until the user submits or exits again.
+    /// Live proposal identity, prompt ownership and the pre-plan model must
+    /// never cross a Session boundary. Neither PendingApproval nor Approved
+    /// can be reconstructed from a mode label alone: both become read-only
+    /// Planning. The host may restore a saved checkpoint for fresh review,
+    /// request a new submission, or explicitly exit planning.
     pub fn reset_for_session(&self, mode: PlanMode) {
         let mut inner = self.inner.write().expect("plan state lock");
-        inner.mode = if mode == PlanMode::PendingApproval {
-            PlanMode::Planning
-        } else {
-            mode
+        inner.mode = match mode {
+            PlanMode::PendingApproval | PlanMode::Approved => PlanMode::Planning,
+            PlanMode::Off | PlanMode::Planning => mode,
         };
         inner.plan = None;
         inner.previous_model = None;
@@ -447,15 +447,18 @@ impl PlanState {
 
     /// The executor gate: whether a tool with these effects may run in the
     /// current mode. Planning/PendingApproval block the mutation/process
-    /// BARRIER set (write|append|process); everything else flows.
+    /// BARRIER set (write|append|process); everything else flows. Approval
+    /// requires a live proposal, not merely a reconstructed mode label.
     #[must_use]
     pub fn allows_effects(&self, effects: ToolEffects) -> bool {
-        match self.mode() {
-            PlanMode::Off | PlanMode::Approved => true,
-            PlanMode::Planning | PlanMode::PendingApproval => {
-                !(effects.writes() || effects.appends() || effects.processes())
-            }
-        }
+        // Observe the mode and its proposal under the same guard. Missing
+        // approval context and poisoned state both retain the read-only gate.
+        let unrestricted = self.inner.read().is_ok_and(|inner| match inner.mode {
+            PlanMode::Off => true,
+            PlanMode::Approved => inner.plan.is_some(),
+            PlanMode::Planning | PlanMode::PendingApproval => false,
+        });
+        unrestricted || !(effects.writes() || effects.appends() || effects.processes())
     }
 
     /// The structured, model-readable block error for the gate.
@@ -839,5 +842,74 @@ mod tests {
         assert!(execute_plan(&state, true, "another complete plan to substitute").is_error);
         assert_eq!(state.mode(), PlanMode::PendingApproval);
         assert_eq!(state.plan().as_deref(), Some(text));
+    }
+
+    #[test]
+    fn session_reset_preserves_only_non_authorizing_modes() {
+        for (restored, expected) in [
+            (PlanMode::Off, PlanMode::Off),
+            (PlanMode::Planning, PlanMode::Planning),
+            (PlanMode::PendingApproval, PlanMode::Planning),
+            (PlanMode::Approved, PlanMode::Planning),
+        ] {
+            let (state, old) = review_fixture();
+            assert!(state.approve_review(&old).is_some());
+            state.stash_previous_model("old-provider", "old-model");
+            state.reset_for_session(restored);
+            assert_eq!(state.mode(), expected);
+            assert!(state.plan().is_none());
+            assert!(state.approved_plan().is_none());
+            assert!(state.pending_review().is_none());
+            assert!(state.take_previous_model().is_none());
+            assert!(state.approve_review(&old).is_none());
+            for effect in [
+                ToolEffects::write(),
+                ToolEffects::append(),
+                ToolEffects::process(),
+                ToolEffects::read().union(ToolEffects::write()),
+            ] {
+                assert_eq!(state.allows_effects(effect), expected == PlanMode::Off);
+            }
+            assert!(state.allows_effects(ToolEffects::read()));
+            assert!(state.allows_effects(ToolEffects::network()));
+        }
+    }
+
+    #[test]
+    fn reset_approval_requires_a_fresh_submission_and_review() {
+        let (state, old) = review_fixture();
+        assert!(state.approve_review(&old).is_some());
+        state.reset_for_session(PlanMode::Approved);
+        assert!(!state.allows_effects(ToolEffects::write()));
+        assert!(state.approve().is_none());
+        assert!(state.approve_reviewed(old.text()).is_none());
+        assert!(state.submit_plan(old.text().to_string()));
+        let fresh = state.pending_review().unwrap();
+        assert!(!old.same_submission(&fresh));
+        assert!(state.approve_review(&old).is_none());
+        assert!(!state.reject_review(&old));
+        assert!(!state.allows_effects(ToolEffects::write()));
+        assert!(state.approve_review(&fresh).is_some());
+        assert!(state.allows_effects(ToolEffects::write()));
+        assert_eq!(state.approved_plan().as_deref(), Some(fresh.text()));
+    }
+
+    #[test]
+    fn orphaned_approved_mode_cannot_open_the_mutation_gate() {
+        let state = PlanState::new();
+        state.inner.write().unwrap().mode = PlanMode::Approved;
+        assert!(state.approved_plan().is_none());
+        for effect in [
+            ToolEffects::write(),
+            ToolEffects::append(),
+            ToolEffects::process(),
+            ToolEffects::read().union(ToolEffects::process()),
+        ] {
+            assert!(!state.allows_effects(effect));
+        }
+        assert!(state.allows_effects(ToolEffects::read()));
+        assert!(state.allows_effects(ToolEffects::network()));
+        state.exit();
+        assert!(state.allows_effects(ToolEffects::write()));
     }
 }
