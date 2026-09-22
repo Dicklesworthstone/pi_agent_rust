@@ -815,7 +815,10 @@ fn fake_node_result(checks: Vec<FixtureCheck>) -> RuntimeResult {
 fn write_fake_franken_node_runtime(payload: &str) -> std::io::Result<(tempfile::TempDir, PathBuf)> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let dir = tempfile::tempdir()?;
+    let dir = tempfile::Builder::new()
+        .prefix("pi-franken-fake-")
+        .tempdir_in("/tmp")
+        .or_else(|_| tempfile::tempdir())?;
     let path = dir.path().join("franken-node-fake");
     let script = format!(
         r#"#!/bin/sh

@@ -62,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines, clippy::future_not_send)]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let invocation = parse_invocation(std::env::args().skip(1))?;
     // ── 1. Configure the session ────────────────────────────────────────
@@ -352,7 +353,7 @@ async fn prepare_storage(
             let saved = pi::sdk::Session::open(text_path).await?;
             check_workspace(&saved.header.cwd, &workspace)?;
             let expected = ResumeIdentity {
-                id: saved.header.id.clone(),
+                id: saved.header.id,
                 path: path.clone(),
                 workspace,
             };

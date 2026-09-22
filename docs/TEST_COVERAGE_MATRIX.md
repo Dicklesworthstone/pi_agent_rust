@@ -358,7 +358,11 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session.rs` | Session JSONL/tree | Unit; `tests/session_conformance.rs`, `tests/e2e_session_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/session_control.rs` | Session control, live steering, follow-up, and input retraction | Unit; `src/session_control/agent_tests.rs`. |
 | `src/session_control/agent_tests.rs` | Session control agent integration test suite | Test module; session control agent tests. |
+| `src/session_control/agent_tests/deadline_recovery.rs` | Session control turn deadline recovery test cases | Test support module; exercises turn timeout recovery. |
 | `src/session_control/attachments.rs` | Session control media attachment admission and authorship tracking | Unit; in-module tests. |
+| `src/session_control/deadline.rs` | Session control turn deadline management and sleep futures | Unit; `src/session_control/deadline/tests.rs`, `src/session_control/agent_tests.rs`. |
+| `src/session_control/deadline/tests.rs` | Turn deadline unit test cases | Test module; exercises turn timeouts. |
+| `src/session_control/recovery.rs` | Session control turn recovery and input reconstruction | Unit; `src/session_control/agent_tests.rs`. |
 | `src/session_import.rs` | Session import | `tests/session_import.rs`. |
 | `src/session_import/conversion.rs` | Session import format conversion and mapping | Unit; `tests/session_import.rs`. |
 | `src/session_import/transcript.rs` | Session import transcript parser | Unit; `tests/session_import.rs`. |

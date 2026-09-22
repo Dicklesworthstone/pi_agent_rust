@@ -36,13 +36,12 @@ impl SessionPlanReview {
         self.proposal.text()
     }
 
-    /// True when two reviews refer to the same exact proposed plan text and
-    /// were taken against the same session storage instance.
+    /// True only for the same submitted proposal in the same session storage.
     #[must_use]
     pub fn same_submission(&self, other: &Self) -> bool {
-        self.session_id == other.session_id
-            && self.store.ptr_eq(&other.store)
-            && self.proposal.text() == other.proposal.text()
+        self.store.ptr_eq(&other.store)
+            && self.session_id == other.session_id
+            && self.proposal.same_submission(&other.proposal)
     }
 
     fn belongs_to(&self, store: &Arc<Store>, session: &Session) -> bool {

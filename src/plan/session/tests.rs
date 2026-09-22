@@ -472,7 +472,10 @@ fn a_failed_save_is_a_committed_live_change_not_an_error_or_rollback() {
 
 #[test]
 fn successful_save_contains_the_existing_transition_journal_shape() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("pi-plan-save-")
+        .tempdir_in("/tmp")
+        .unwrap_or_else(|_| tempfile::tempdir().unwrap());
     let path = temp.path().join("session.jsonl");
     let mut stored = Session::in_memory();
     stored.path = Some(path.clone());
@@ -756,7 +759,10 @@ mod wire {
 
     fn lifecycle(rebind: bool) {
         let peer = Peer::new();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("pi-plan-wire-")
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|_| tempfile::tempdir().unwrap());
         let mut handle = peer.handle(temp.path());
         let state = handle.session().agent.plan_state();
         let foreign = PlanState::new();

@@ -8,10 +8,12 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use asupersync::time::{Sleep, TimerDriverHandle};
+use asupersync::time::{TimerDriverHandle, TimerHandle};
 use asupersync::types::Time;
 
 use super::{ControlledTurn, SessionControlHandle, control_error};
@@ -217,6 +219,23 @@ enum Interruption {
     OwnerCancelled,
 }
 
+struct DeadlineTimerWaker {
+    target: Waker,
+    fired: Arc<AtomicBool>,
+}
+
+impl Wake for DeadlineTimerWaker {
+    fn wake(self: Arc<Self>) {
+        self.fired.store(true, Ordering::SeqCst);
+        self.target.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.fired.store(true, Ordering::SeqCst);
+        self.target.wake_by_ref();
+    }
+}
+
 /// A controlled turn with a deadline and its original live control lane.
 ///
 /// Expiry seals input admission and requests abort exactly once. This future
@@ -229,8 +248,10 @@ pub struct DeadlineTurn<F> {
     turn: Option<Pin<Box<ControlledTurn<F>>>>,
     control: SessionControlHandle,
     deadline: TurnDeadline,
-    sleep: Option<Pin<Box<Sleep>>>,
+    timer_handle: Option<TimerHandle>,
+    timer_fired: Arc<AtomicBool>,
     interruption: Option<Interruption>,
+    monitored: bool,
     started: bool,
     finished: bool,
 }
@@ -241,13 +262,14 @@ impl<F> ControlledTurn<F> {
     pub fn with_deadline(self, deadline: TurnDeadline) -> DeadlineTurn<F> {
         let control = self.control();
         let started = self.polled;
-        let sleep = Sleep::new(deadline.at);
         DeadlineTurn {
             turn: Some(Box::pin(self)),
             control,
             deadline,
-            sleep: Some(Box::pin(sleep)),
+            timer_handle: None,
+            timer_fired: Arc::new(AtomicBool::new(false)),
             interruption: None,
+            monitored: true,
             started,
             finished: false,
         }
@@ -260,20 +282,27 @@ impl<F> DeadlineTurn<F> {
         self.control.clone()
     }
 
+    fn disarm(&mut self) {
+        self.monitored = false;
+        if let Some(handle) = self.timer_handle.take() {
+            let _ = self.deadline.timer.cancel(&handle);
+        }
+    }
+
     fn interrupt(&mut self, reason: Interruption) {
         if self.control.abort() {
             self.interruption = Some(reason);
         }
-        self.sleep = None;
+        self.disarm();
     }
 
-    fn poll_deadline(&mut self, cx: &mut Context<'_>) {
+    fn poll_deadline(&mut self, cx: &Context<'_>) {
         // A prior user abort owns cancellation. Its cleanup must not be relabeled
         // as a timeout just because it eventually crosses the former deadline.
         if !self.control.snapshot().accepting_input {
-            self.sleep = None;
+            self.disarm();
         }
-        if self.sleep.is_none() {
+        if !self.monitored {
             return;
         }
         if self.deadline.is_elapsed() {
@@ -284,24 +313,31 @@ impl<F> DeadlineTurn<F> {
             self.interrupt(Interruption::OwnerCancelled);
             return;
         }
-        let timer_ready = if let Some(sleep) = &mut self.sleep {
-            // Scope authority to the timer poll only. Do not change the native
-            // turn's I/O authority, and never retain a TLS guard across Pending.
-            let _guard = self.deadline.owner.cx().clone().set_current_restricted();
-            sleep.as_mut().poll(cx).is_ready()
+        if self.timer_fired.load(Ordering::SeqCst) {
+            self.interrupt(Interruption::Elapsed);
+            return;
+        }
+        let waker = Waker::from(Arc::new(DeadlineTimerWaker {
+            target: cx.waker().clone(),
+            fired: Arc::clone(&self.timer_fired),
+        }));
+        if let Some(handle) = self.timer_handle.take() {
+            self.timer_handle = Some(self.deadline.timer.update(&handle, self.deadline.at, waker));
         } else {
-            false
-        };
+            self.timer_handle = Some(self.deadline.timer.register(self.deadline.at, waker));
+        }
         // Time/cancellation may have changed while registering the timer.
-        if self.deadline.is_elapsed() {
+        if self.deadline.is_elapsed() || self.timer_fired.load(Ordering::SeqCst) {
             self.interrupt(Interruption::Elapsed);
         } else if self.deadline.owner.checkpoint().is_err() {
             self.interrupt(Interruption::OwnerCancelled);
-        } else if timer_ready {
-            // A latched timer firing remains authoritative even if a custom
-            // clock is rewound afterwards. Never poll a completed Sleep again.
-            self.interrupt(Interruption::Elapsed);
         }
+    }
+}
+
+impl<F> Drop for DeadlineTurn<F> {
+    fn drop(&mut self) {
+        self.disarm();
     }
 }
 
@@ -326,7 +362,7 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for DeadlineTurn<F> {
                 _ => TurnDeadlineError::OwnerCancelled { completion: None },
             }));
         }
-        let monitored = this.sleep.is_some();
+        let monitored = this.monitored;
         this.started = true;
         let result = this
             .turn
@@ -339,7 +375,7 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for DeadlineTurn<F> {
         // it now rather than waiting for another external wakeup.
         let interruption = if !monitored {
             None
-        } else if this.deadline.is_elapsed() {
+        } else if this.deadline.is_elapsed() || this.timer_fired.load(Ordering::SeqCst) {
             Some(Interruption::Elapsed)
         } else if this.deadline.owner.checkpoint().is_err() {
             Some(Interruption::OwnerCancelled)
@@ -349,7 +385,7 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for DeadlineTurn<F> {
         if let Some(reason) = interruption {
             if result.is_ready() {
                 this.interruption = Some(reason);
-                this.sleep = None;
+                this.disarm();
             } else {
                 this.interrupt(reason);
                 cx.waker().wake_by_ref();
@@ -359,7 +395,7 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for DeadlineTurn<F> {
             return Poll::Pending;
         };
         this.finished = true;
-        this.sleep = None;
+        this.disarm();
         Poll::Ready(match this.interruption {
             Some(Interruption::Elapsed) => Err(TurnDeadlineError::Elapsed {
                 completion: Some(Box::new(completion)),

@@ -5935,7 +5935,12 @@ impl ToolRegistry {
     /// Append a tool.
     pub fn push(&mut self, mut tool: Box<dyn Tool>) {
         tool.bind_job_session_scope(self.job_session_scope.clone());
-        self.tools.push(Arc::from(tool));
+        let name = tool.name();
+        if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
+            self.tools[pos] = Arc::from(tool);
+        } else {
+            self.tools.push(Arc::from(tool));
+        }
     }
 
     /// Extend the registry with additional tools.
@@ -5945,7 +5950,12 @@ impl ToolRegistry {
     {
         for mut tool in tools {
             tool.bind_job_session_scope(self.job_session_scope.clone());
-            self.tools.push(Arc::from(tool));
+            let name = tool.name();
+            if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
+                self.tools[pos] = Arc::from(tool);
+            } else {
+                self.tools.push(Arc::from(tool));
+            }
         }
     }
 
