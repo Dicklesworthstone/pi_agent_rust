@@ -2,10 +2,10 @@
 //!
 //! Long-running services, watchers, REPLs, and debuggers live here instead
 //! of timeout-hacked `bash` calls. Every service spawns on a PTY (stdin
-//! stays writable for `send`), output streams to a rolling artifact log plus
-//! a bounded line ring, and readiness is *observed* — a `ready.log` regex
-//! and/or a `ready.port` TCP accept must both pass within the timeout before
-//! `start` returns.
+//! stays writable for `send`), output streams to a raw artifact log plus
+//! a byte- and line-bounded text ring, and readiness is *observed* — a
+//! `ready.log` regex and/or a `ready.port` TCP accept must both pass within
+//! the timeout before `start` returns.
 //!
 //! Lifecycle: session-scoped by default (killed at the main shutdown
 //! chokepoint, same as background jobs); `detached: true` services survive
@@ -35,6 +35,12 @@ const DEFAULT_READY_TIMEOUT_SECS: u64 = 30;
 /// Bounded line ring kept per service for `logs` cursors.
 const RING_LINE_CAP: usize = 10_000;
 
+/// Bound retained text independently of newline frequency. Raw artifact bytes
+/// are unaffected; an oversized line retains its newest UTF-8-safe suffix.
+const RING_BYTE_CAP: usize = 1024 * 1024;
+const RING_LINE_BYTE_CAP: usize = 16 * 1024;
+const TRUNCATED_LINE_PREFIX: &str = "[...truncated...] ";
+
 /// Grace window between TERM and KILL on stop, mirroring the bash tool.
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 
@@ -45,7 +51,8 @@ const MAX_SERVICE_NAME_BYTES: usize = 128;
 /// Readiness gates for `start`. Both supplied gates MUST pass.
 #[derive(Debug, Clone, Default)]
 pub struct ReadySpec {
-    /// Regex that must match the accumulated service output.
+    /// Regex that must match retained service output (up to 1 MiB of completed
+    /// lines and a 16 KiB tail per line, including the current partial line).
     pub log: Option<String>,
     /// TCP port on 127.0.0.1 that must accept a connection.
     pub port: Option<u16>,
@@ -98,6 +105,9 @@ struct Ring {
     next_index: u64,
     /// Partial line currently being assembled (not yet cursor-addressable).
     partial: String,
+    partial_truncated: bool,
+    /// Text bytes in completed lines; the partial line has a separate bound.
+    bytes: usize,
     cap: usize,
 }
 
@@ -107,21 +117,88 @@ impl Ring {
             lines: VecDeque::with_capacity(cap.min(256)),
             next_index: 0,
             partial: String::new(),
+            partial_truncated: false,
+            bytes: 0,
             cap,
         }
     }
 
     fn push_chunk(&mut self, chunk: &str) {
-        self.partial.push_str(chunk);
-        while let Some(pos) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=pos).collect();
-            if self.lines.len() == self.cap {
-                self.lines.pop_front();
+        for fragment in chunk.split_inclusive('\n') {
+            if let Some(text) = fragment.strip_suffix('\n') {
+                self.push_partial(text);
+                self.finish_line();
+            } else {
+                self.push_partial(fragment);
             }
-            self.lines
-                .push_back(line.trim_end_matches(['\n', '\r']).to_string()); // ubs:ignore per-line ring push is the design
-            self.next_index = self.next_index.saturating_add(1);
         }
+    }
+
+    fn push_partial(&mut self, text: &str) {
+        let limit = RING_LINE_BYTE_CAP - TRUNCATED_LINE_PREFIX.len();
+        let total = self.partial.len().saturating_add(text.len());
+        if total > limit {
+            self.partial_truncated = true;
+            let discard = total - limit;
+            if discard >= self.partial.len() {
+                let mut start = discard - self.partial.len();
+                while !text.is_char_boundary(start) {
+                    start += 1;
+                }
+                self.partial.clear();
+                self.partial.push_str(&text[start..]);
+                return;
+            }
+            let mut start = discard;
+            while !self.partial.is_char_boundary(start) {
+                start += 1;
+            }
+            drop(self.partial.drain(..start));
+        }
+        self.partial.push_str(text);
+    }
+
+    fn finish_line(&mut self) {
+        let mut line = std::mem::take(&mut self.partial);
+        line.truncate(line.trim_end_matches('\r').len());
+        if std::mem::take(&mut self.partial_truncated) {
+            line.insert_str(0, TRUNCATED_LINE_PREFIX);
+        }
+        // Cursors count source lines, not retained bytes or transport chunks.
+        self.next_index = self.next_index.saturating_add(1);
+        if self.cap == 0 {
+            return;
+        }
+        while self.lines.len() >= self.cap || self.bytes + line.len() > RING_BYTE_CAP {
+            let Some(evicted) = self.lines.pop_front() else {
+                break;
+            };
+            self.bytes -= evicted.len();
+        }
+        self.bytes += line.len();
+        self.lines.push_back(line);
+    }
+
+    /// Only the output reader knows when all trailing bytes have arrived.
+    fn finish_partial(&mut self) {
+        if !self.partial.is_empty() || self.partial_truncated {
+            self.finish_line();
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut text = String::with_capacity(
+            self.bytes + self.lines.len() + self.partial.len() + TRUNCATED_LINE_PREFIX.len(),
+        );
+        for line in &self.lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        if self.partial_truncated {
+            text.push_str(TRUNCATED_LINE_PREFIX);
+        }
+        text.push_str(&self.partial);
+        text
     }
 
     /// Lines with index >= `since`, plus the current head cursor.
@@ -364,18 +441,10 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
 
     // Exit monitor: record final status + refresh the detached roster.
     let monitor_name = name.clone();
-    let monitor_ring = Arc::clone(&ring);
     std::thread::spawn(move || {
         let code: i64 = child
             .wait()
             .map_or(-1, |status| i64::from(status.exit_code()));
-        if let Ok(mut ring) = monitor_ring.lock() {
-            // Flush any trailing partial line so cursors cover it.
-            let trailing = std::mem::take(&mut ring.partial);
-            if !trailing.is_empty() {
-                ring.push_chunk(&format!("{trailing}\n"));
-            }
-        }
         if let Ok(mut reg) = registry().lock()
             && let Some(entry) = reg.services.get_mut(&monitor_name)
         {
@@ -420,11 +489,7 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
 
     loop {
         let log_passed = log_regex.as_ref().is_none_or(|re| {
-            ring.lock().is_ok_and(|ring| {
-                let (lines, _) = ring.since(0);
-                let body = lines.join("\n") + "\n" + &ring.partial;
-                re.is_match(&body)
-            })
+            ring.lock().is_ok_and(|ring| re.is_match(&ring.text()))
         });
         let port_passed = ready
             .port
@@ -521,19 +586,53 @@ fn spawn_pty(
     Ok((child, pair.master))
 }
 
-fn pump_service_stream<R: Read>(mut reader: R, mut artifact: std::fs::File, ring: &Mutex<Ring>) {
+/// Decode only complete UTF-8 prefixes. At most three bytes remain pending
+/// between reads; malformed sequences use the same replacement as lossy UTF-8.
+fn push_service_bytes(ring: &mut Ring, bytes: &[u8]) -> usize {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(text) => {
+                ring.push_chunk(text);
+                return bytes.len();
+            }
+            Err(error) => {
+                let valid_end = offset + error.valid_up_to();
+                ring.push_chunk(&String::from_utf8_lossy(&bytes[offset..valid_end]));
+                offset = valid_end;
+                let Some(invalid_bytes) = error.error_len() else {
+                    return offset;
+                };
+                ring.push_chunk("\u{fffd}");
+                offset += invalid_bytes;
+            }
+        }
+    }
+    offset
+}
+
+fn pump_service_stream<R: Read, W: Write>(mut reader: R, mut artifact: W, ring: &Mutex<Ring>) {
     let mut chunk = [0u8; 8192];
+    let mut pending = Vec::with_capacity(chunk.len() + 3);
     loop {
         match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(0) | Err(_) => break,
             Ok(n) => {
                 let data = &chunk[..n]; // ubs:ignore n bounded by read into chunk
                 let _ = artifact.write_all(data);
-                if let Ok(mut ring) = ring.lock() {
-                    ring.push_chunk(&String::from_utf8_lossy(data));
-                }
+                pending.extend_from_slice(data);
+                let Ok(mut ring) = ring.lock() else {
+                    return;
+                };
+                let consumed = push_service_bytes(&mut ring, &pending);
+                drop(pending.drain(..consumed));
             }
         }
+    }
+    if let Ok(mut ring) = ring.lock() {
+        ring.push_chunk(&String::from_utf8_lossy(&pending));
+        ring.finish_partial();
     }
 }
 
@@ -571,6 +670,9 @@ pub fn ps() -> Result<Vec<ServiceSnapshot>> {
 /// `since` returns lines newer than the cursor; `tail` returns the last N
 /// lines; `grep` filters (substring, case-sensitive); `wait_ms` bounds how
 /// long `logs` blocks waiting for new lines when `since` is supplied.
+/// Retention is capped at 10,000 lines and 1 MiB of text. Oversized lines
+/// keep a UTF-8-safe tail with an explicit truncation marker; the raw artifact
+/// retains the original bytes. Eviction never rewinds the source-line cursor.
 ///
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` for unknown names.
@@ -918,6 +1020,158 @@ mod tests {
         let (retained, cursor) = capped.since(0);
         assert_eq!(retained, vec!["b", "c", "d"]);
         assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn ring_bounds_unterminated_unicode_lines_and_marks_only_truncated_lines() {
+        let mut ring = Ring::new(8);
+        let chunk = "界🙂".repeat(1024);
+        for _ in 0..64 {
+            ring.push_chunk(&chunk);
+            assert!(ring.partial.len() <= RING_LINE_BYTE_CAP);
+            assert_eq!(ring.next_index, 0);
+        }
+        // Exercise the single-fragment path as well as incremental overflow.
+        ring.push_chunk(&"界".repeat(RING_LINE_BYTE_CAP));
+        ring.push_chunk("ready\nordinary\n");
+        let (lines, cursor) = ring.since(0);
+        assert_eq!(cursor, 2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with(TRUNCATED_LINE_PREFIX));
+        assert!(lines[0].ends_with("ready"));
+        assert!(lines[0].len() <= RING_LINE_BYTE_CAP);
+        assert!(!lines[0].contains('\u{fffd}'));
+        assert_eq!(lines[1], "ordinary");
+        assert!(ring.partial.is_empty());
+        assert!(!ring.partial_truncated);
+    }
+
+    #[test]
+    fn ring_byte_eviction_preserves_source_line_cursors() {
+        let mut ring = Ring::new(RING_LINE_CAP);
+        let padding = "x".repeat(8192);
+        for index in 0..256 {
+            ring.push_chunk(&format!("{index:04}:{padding}\n"));
+            assert!(ring.bytes <= RING_BYTE_CAP);
+            assert_eq!(ring.bytes, ring.lines.iter().map(String::len).sum::<usize>());
+        }
+        let (lines, cursor) = ring.since(0);
+        assert_eq!(cursor, 256);
+        assert!(lines.len() < 256, "byte budget must evict before line cap");
+        assert!(!lines.is_empty());
+        let oldest = cursor - u64::try_from(lines.len()).expect("retained count");
+        assert_eq!(ring.since(oldest).0, lines);
+        assert!(ring.since(255).0[0].starts_with("0255:"));
+        assert!(ring.since(cursor).0.is_empty());
+    }
+
+    #[test]
+    fn ring_zero_capacity_and_final_flush_preserve_cursor_semantics() {
+        let mut ring = Ring::new(0);
+        ring.push_chunk("one\ntail");
+        ring.finish_partial();
+        ring.finish_partial();
+        assert_eq!(ring.since(0), (Vec::<String>::new(), 2));
+        assert_eq!(ring.bytes, 0);
+        assert!(ring.partial.is_empty());
+    }
+
+    #[test]
+    fn readiness_text_preserves_partial_lines_without_a_synthetic_leading_newline() {
+        let mut ring = Ring::new(8);
+        ring.push_chunk("ready");
+        assert_eq!(ring.text(), "ready");
+        ring.push_chunk("\r\nnext");
+        assert_eq!(ring.text(), "ready\nnext");
+        ring.finish_partial();
+        assert_eq!(ring.since(0).0, vec!["ready", "next"]);
+    }
+
+    /// Exercise the actual stream pump with arbitrary read boundaries, EINTR,
+    /// and a terminal read error, without subprocess scheduling or disk I/O.
+    struct FragmentedReader<'a> {
+        bytes: &'a [u8],
+        width: usize,
+        interrupt_next: bool,
+        terminal_error: bool,
+    }
+
+    impl Read for FragmentedReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupt_next {
+                self.interrupt_next = false;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            if self.bytes.is_empty() && self.terminal_error {
+                return Err(std::io::Error::other("terminal PTY read error"));
+            }
+            let count = buffer.len().min(self.width).min(self.bytes.len());
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            self.interrupt_next = true;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn stream_pump_preserves_utf8_across_reads_and_flushes_after_eof_or_error() {
+        let input = "first\nprêt 界🙂 tail".as_bytes();
+        for width in 1..=input.len() {
+            for terminal_error in [false, true] {
+                let reader = FragmentedReader {
+                    bytes: input,
+                    width,
+                    interrupt_next: true,
+                    terminal_error,
+                };
+                let ring = Mutex::new(Ring::new(8));
+                let mut artifact = Vec::new();
+                pump_service_stream(reader, &mut artifact, &ring);
+                let ring = ring.into_inner().expect("ring");
+                assert_eq!(artifact, input);
+                assert_eq!(ring.since(0).0, vec!["first", "prêt 界🙂 tail"]);
+                assert_eq!(ring.next_index, 2);
+                assert!(ring.partial.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn stream_pump_invalid_and_incomplete_utf8_matches_whole_stream_lossy_decoding() {
+        let input = b"head\n\xf0\x9f\x99\x82\xff\xe2\x82!\xf0\x9f";
+        let expected: Vec<String> = String::from_utf8_lossy(input)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        for width in 1..=input.len() {
+            let reader = FragmentedReader {
+                bytes: input,
+                width,
+                interrupt_next: true,
+                terminal_error: false,
+            };
+            let ring = Mutex::new(Ring::new(8));
+            let mut artifact = Vec::new();
+            pump_service_stream(reader, &mut artifact, &ring);
+            assert_eq!(artifact, input);
+            assert_eq!(ring.into_inner().expect("ring").since(0).0, expected);
+        }
+    }
+
+    #[test]
+    fn stream_pump_retains_raw_artifact_when_text_is_truncated() {
+        let input = format!("{}final", "x".repeat(RING_BYTE_CAP * 2));
+        let ring = Mutex::new(Ring::new(8));
+        let mut artifact = Vec::new();
+        pump_service_stream(input.as_bytes(), &mut artifact, &ring);
+        let ring = ring.into_inner().expect("ring");
+        assert_eq!(artifact, input.as_bytes());
+        let (lines, cursor) = ring.since(0);
+        assert_eq!(cursor, 1);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with(TRUNCATED_LINE_PREFIX));
+        assert!(lines[0].ends_with("final"));
+        assert!(lines[0].len() <= RING_LINE_BYTE_CAP);
     }
 
     #[test]
