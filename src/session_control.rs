@@ -26,7 +26,9 @@ use crate::sdk::AgentSessionHandle;
 mod agent_tests;
 mod attachments;
 mod deadline;
+mod recovery;
 pub use deadline::{DeadlineTurn, TurnDeadline, TurnDeadlineError};
+pub use recovery::TransferredInput;
 
 const MAX_PENDING_INPUTS: usize = 100;
 const MAX_INPUT_BYTES: usize = 256 * 1024;
@@ -290,6 +292,9 @@ impl Drop for TurnGuard {
 pub struct ControlledTurn<F> {
     future: Pin<Box<F>>,
     control: SessionControlHandle,
+    // Deadline preflight must distinguish unused input from a turn which was
+    // already polled before the host attached a deadline wrapper.
+    polled: bool,
 }
 
 impl<F> ControlledTurn<F> {
@@ -303,7 +308,9 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for ControlledTurn<F> 
     type Output = Result<AssistantMessage>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().future.as_mut().poll(cx)
+        let this = self.get_mut();
+        this.polled = true;
+        this.future.as_mut().poll(cx)
     }
 }
 
@@ -395,6 +402,7 @@ impl ControllableSession {
         Ok(ControlledTurn {
             future: Box::pin(future),
             control,
+            polled: false,
         })
     }
 
@@ -416,6 +424,7 @@ impl ControllableSession {
         Ok(ControlledTurn {
             future: Box::pin(future),
             control,
+            polled: false,
         })
     }
 }
@@ -525,6 +534,7 @@ mod tests {
         let turn = ControlledTurn {
             future: Box::pin(future),
             control: control.clone(),
+            polled: false,
         };
         drop(turn);
         assert!(control.snapshot().finished);

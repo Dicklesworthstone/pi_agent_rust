@@ -42,7 +42,7 @@ impl Future for DrainProbe {
         if !self.release.load(Ordering::SeqCst) {
             return Poll::Pending;
         }
-        self.guard.take();
+        drop(self.guard.take());
         Poll::Ready(self.completion.take().unwrap())
     }
 }
@@ -66,6 +66,7 @@ fn turn(completion: Result<AssistantMessage>) -> ControlledTurn<DrainProbe> {
     let (control, guard, _) = crate::session_control::tests::live();
     ControlledTurn {
         control,
+        polled: false,
         future: Box::pin(DrainProbe {
             guard: Some(guard),
             release: Arc::new(AtomicBool::new(false)),
@@ -192,6 +193,7 @@ fn late_native_success_is_preserved_but_is_not_accepted_as_timely_success() {
     }));
     let release = Arc::clone(&native.future.release);
     let mut limited = native.with_deadline(deadline);
+    assert!(poll(&mut limited).is_pending());
     clock.advance_to(Time::from_secs(11));
     assert!(poll(&mut limited).is_pending());
     release.store(true, Ordering::SeqCst);
@@ -280,4 +282,82 @@ fn unpolled_drop_retires_control_without_consuming_queued_input() {
     assert_eq!(polls.load(Ordering::SeqCst), 0);
     assert!(control.snapshot().finished);
     assert_eq!(control.take_pending()[0].text, "recover on drop");
+}
+
+#[test]
+fn expired_unpolled_turn_is_retired_without_dispatch_or_fake_completion() {
+    let (clock, deadline) = clock_deadline();
+    let native = turn(Ok(AssistantMessage::default()));
+    let polls = Arc::clone(&native.future.polls);
+    let drops = Arc::clone(&native.future.drops);
+    let control = native.control();
+    control.steer("never dispatched").unwrap();
+    clock.advance_to(Time::from_secs(10));
+    let Poll::Ready(Err(error)) = poll(&mut native.with_deadline(deadline)) else {
+        panic!("expired before execution")
+    };
+    assert!(error.is_elapsed());
+    assert!(error.completion().is_none());
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(control.snapshot().finished);
+    assert_eq!(control.take_pending()[0].text, "never dispatched");
+}
+
+#[test]
+fn wrapping_an_already_polled_turn_still_drains_its_native_cleanup() {
+    let (clock, deadline) = clock_deadline();
+    let mut native = turn(Err(Error::session("actual cleanup")));
+    let release = Arc::clone(&native.future.release);
+    let drops = Arc::clone(&native.future.drops);
+    assert!(poll(&mut native).is_pending());
+    clock.advance_to(Time::from_secs(10));
+    let mut limited = native.with_deadline(deadline);
+    assert!(poll(&mut limited).is_pending());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    release.store(true, Ordering::SeqCst);
+    let Poll::Ready(Err(error)) = poll(&mut limited) else {
+        panic!("drained expired turn")
+    };
+    assert!(error.is_elapsed());
+    assert!(matches!(error.completion(), Some(Err(Error::Session(_)))));
+}
+
+#[test]
+fn cancelled_unpolled_turn_never_starts_execution() {
+    let (_, deadline) = clock_deadline();
+    deadline.owner.cancel_with(
+        asupersync::types::CancelKind::User,
+        Some("before dispatch"),
+    );
+    let native = turn(Ok(AssistantMessage::default()));
+    let polls = Arc::clone(&native.future.polls);
+    let control = native.control();
+    let Poll::Ready(Err(TurnDeadlineError::OwnerCancelled { completion })) =
+        poll(&mut native.with_deadline(deadline))
+    else {
+        panic!("unstarted cancellation")
+    };
+    assert!(completion.is_none());
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert!(control.snapshot().finished);
+}
+
+#[test]
+fn a_fired_timer_is_not_polled_again_after_a_test_clock_rewind() {
+    let (clock, deadline) = clock_deadline();
+    let timer = deadline.timer.clone();
+    let native = turn(Err(Error::session("drained")));
+    let release = Arc::clone(&native.future.release);
+    let mut limited = native.with_deadline(deadline);
+    assert!(poll(&mut limited).is_pending());
+    clock.advance_to(Time::from_secs(10));
+    let _ = timer.process_timers();
+    clock.set(Time::ZERO);
+    assert!(poll(&mut limited).is_pending());
+    release.store(true, Ordering::SeqCst);
+    let Poll::Ready(Err(error)) = poll(&mut limited) else {
+        panic!("latched timeout")
+    };
+    assert!(error.is_elapsed());
 }

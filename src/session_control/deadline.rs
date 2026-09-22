@@ -116,14 +116,16 @@ impl TurnDeadline {
 ///
 /// The completion inside an interruption is the native turn's result AFTER
 /// cooperative cleanup, not permission to replay its input or completed tools.
+/// No completion means expiry/cancellation prevented the first native poll:
+/// no prompt, provider request or session mutation was dispatched by that turn.
 /// A provider may return a partial/aborted message, or even a late success.
 /// Inspect this result and the session history before deciding what to resume.
 pub enum TurnDeadlineError {
     Elapsed {
-        completion: Box<Result<AssistantMessage>>,
+        completion: Option<Box<Result<AssistantMessage>>>,
     },
     OwnerCancelled {
-        completion: Box<Result<AssistantMessage>>,
+        completion: Option<Box<Result<AssistantMessage>>>,
     },
     Turn(Error),
 }
@@ -139,7 +141,9 @@ impl TurnDeadlineError {
     #[must_use]
     pub fn completion(&self) -> Option<&Result<AssistantMessage>> {
         match self {
-            Self::Elapsed { completion } | Self::OwnerCancelled { completion } => Some(completion),
+            Self::Elapsed { completion } | Self::OwnerCancelled { completion } => {
+                completion.as_deref()
+            }
             Self::Turn(_) => None,
         }
     }
@@ -152,11 +156,19 @@ impl fmt::Debug for TurnDeadlineError {
         match self {
             Self::Elapsed { completion } => f
                 .debug_struct("TurnDeadlineElapsed")
-                .field("native_result_is_error", &completion.is_err())
+                .field("started", &completion.is_some())
+                .field(
+                    "native_result_is_error",
+                    &completion.as_deref().map(Result::is_err),
+                )
                 .finish_non_exhaustive(),
             Self::OwnerCancelled { completion } => f
                 .debug_struct("TurnDeadlineOwnerCancelled")
-                .field("native_result_is_error", &completion.is_err())
+                .field("started", &completion.is_some())
+                .field(
+                    "native_result_is_error",
+                    &completion.as_deref().map(Result::is_err),
+                )
                 .finish_non_exhaustive(),
             Self::Turn(_) => f.write_str("TurnDeadlineError::Turn(..)"),
         }
@@ -167,10 +179,10 @@ impl fmt::Display for TurnDeadlineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Elapsed { .. } => f.write_str(
-                "[SESSION_CONTROL_TIMEOUT] turn deadline elapsed; the native turn returned after abort; inspect its completion before replaying work",
+                "[SESSION_CONTROL_TIMEOUT] turn deadline elapsed; inspect completion() before replaying work (None means execution never started)",
             ),
             Self::OwnerCancelled { .. } => f.write_str(
-                "[SESSION_CONTROL_CANCELLED] deadline owner cancelled; the native turn returned after abort",
+                "[SESSION_CONTROL_CANCELLED] deadline owner cancelled; inspect completion() before replaying work (None means execution never started)",
             ),
             Self::Turn(error) => fmt::Display::fmt(error, f),
         }
@@ -181,10 +193,9 @@ impl std::error::Error for TurnDeadlineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Turn(error) => Some(error),
-            Self::Elapsed { completion } | Self::OwnerCancelled { completion } => completion
-                .as_ref()
-                .as_ref()
-                .err()
+            Self::Elapsed { .. } | Self::OwnerCancelled { .. } => self
+                .completion()
+                .and_then(|completion| completion.as_ref().err())
                 .map(|error| error as &(dyn std::error::Error + 'static)),
         }
     }
@@ -205,27 +216,29 @@ enum Interruption {
 /// await it to observe native completion. Cleanup can outlive the deadline.
 #[must_use = "await the turn to drain native cancellation and inspect its outcome"]
 pub struct DeadlineTurn<F> {
-    turn: Pin<Box<ControlledTurn<F>>>,
+    turn: Option<Pin<Box<ControlledTurn<F>>>>,
     control: SessionControlHandle,
     deadline: TurnDeadline,
     sleep: Option<Pin<Box<Sleep>>>,
     interruption: Option<Interruption>,
+    started: bool,
     finished: bool,
 }
 
 impl<F> ControlledTurn<F> {
     /// Apply a turn-wide deadline while retaining steer/follow-up/retraction.
     /// Works on text, attachment-bearing and continuation turns alike.
-    #[must_use]
     pub fn with_deadline(self, deadline: TurnDeadline) -> DeadlineTurn<F> {
         let control = self.control();
+        let started = self.polled;
         let sleep = Sleep::with_timer_driver(deadline.at, deadline.timer.clone());
         DeadlineTurn {
-            turn: Box::pin(self),
+            turn: Some(Box::pin(self)),
             control,
             deadline,
             sleep: Some(Box::pin(sleep)),
             interruption: None,
+            started,
             finished: false,
         }
     }
@@ -261,17 +274,23 @@ impl<F> DeadlineTurn<F> {
             self.interrupt(Interruption::OwnerCancelled);
             return;
         }
-        if let Some(sleep) = &mut self.sleep {
+        let timer_ready = if let Some(sleep) = &mut self.sleep {
             // Scope authority to the timer poll only. Do not change the native
             // turn's I/O authority, and never retain a TLS guard across Pending.
             let _guard = self.deadline.owner.cx().clone().set_current_restricted();
-            let _ = sleep.as_mut().poll(cx);
-        }
+            sleep.as_mut().poll(cx).is_ready()
+        } else {
+            false
+        };
         // Time/cancellation may have changed while registering the timer.
         if self.deadline.is_elapsed() {
             self.interrupt(Interruption::Elapsed);
         } else if self.deadline.owner.checkpoint().is_err() {
             self.interrupt(Interruption::OwnerCancelled);
+        } else if timer_ready {
+            // A latched timer firing remains authoritative even if a custom
+            // clock is rewound afterwards. Never poll a completed Sleep again.
+            self.interrupt(Interruption::Elapsed);
         }
     }
 }
@@ -286,8 +305,25 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for DeadlineTurn<F> {
             "a completed deadline turn cannot be polled again"
         );
         this.poll_deadline(cx);
+        if !this.started && this.interruption.is_some() {
+            // The native async body has never run, so there is no async work
+            // to drain. Dropping it releases its captured TurnGuard without
+            // installing a prompt, invoking hooks or starting provider I/O.
+            drop(this.turn.take());
+            this.finished = true;
+            return Poll::Ready(Err(match this.interruption {
+                Some(Interruption::Elapsed) => TurnDeadlineError::Elapsed { completion: None },
+                _ => TurnDeadlineError::OwnerCancelled { completion: None },
+            }));
+        }
         let monitored = this.sleep.is_some();
-        let result = this.turn.as_mut().poll(cx);
+        this.started = true;
+        let result = this
+            .turn
+            .as_mut()
+            .expect("unfinished deadline turn retains its native future")
+            .as_mut()
+            .poll(cx);
         // A single non-preemptible poll can cross the deadline. Never report
         // its late completion as timely success; if it is still pending, abort
         // it now rather than waiting for another external wakeup.
@@ -316,10 +352,10 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for DeadlineTurn<F> {
         this.sleep = None;
         Poll::Ready(match this.interruption {
             Some(Interruption::Elapsed) => Err(TurnDeadlineError::Elapsed {
-                completion: Box::new(completion),
+                completion: Some(Box::new(completion)),
             }),
             Some(Interruption::OwnerCancelled) => Err(TurnDeadlineError::OwnerCancelled {
-                completion: Box::new(completion),
+                completion: Some(Box::new(completion)),
             }),
             None => completion.map_err(TurnDeadlineError::Turn),
         })
