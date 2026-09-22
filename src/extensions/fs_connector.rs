@@ -245,7 +245,14 @@ impl FsConnector {
         let target = resolve_target_path(&self.cwd, path_str)?;
 
         let canonical_target = match op {
-            FsOp::Read | FsOp::List | FsOp::Stat | FsOp::Delete => canonicalize_existing(&target),
+            // Unlink and lstat operate on the directory entry, not the object
+            // a final symlink names. Canonicalizing that leaf can delete the
+            // target (including a whole directory tree) instead of the link.
+            FsOp::Delete => canonicalize_leaf_nofollow(&target),
+            FsOp::Stat if params.get("follow_symlinks").and_then(Value::as_bool) == Some(false) => {
+                canonicalize_leaf_nofollow(&target)
+            }
+            FsOp::Read | FsOp::List | FsOp::Stat => canonicalize_existing(&target),
             FsOp::Write | FsOp::Mkdir => canonicalize_for_create(&target),
         }?;
 
@@ -279,6 +286,23 @@ impl FsConnector {
                     "scope_roots": root_hashes,
                     "hint": "Add an allowed path to capability_manifest scope.paths."
                 })),
+                retryable: None,
+            });
+        }
+
+        // A directory scope grants access to its contents, not permission to
+        // remove the scope itself. File-scoped grants still permit unlinking
+        // that file, and a symlink to a root is unlinked rather than followed.
+        if matches!(op, FsOp::Delete)
+            && roots.iter().any(|root| root == &canonical_target)
+            && fs::symlink_metadata(&canonical_target)
+                .map_err(|err| fs_path_error("stat", &canonical_target, &err))?
+                .is_dir()
+        {
+            return Err(HostCallError {
+                code: HostCallErrorCode::Denied,
+                message: "Cannot delete an allowed scope root directory".to_string(),
+                details: Some(json!({ "path_hash": hash_path(&canonical_target) })),
                 retryable: None,
             });
         }
@@ -356,86 +380,73 @@ fn canonicalize_existing(path: &Path) -> std::result::Result<PathBuf, HostCallEr
 }
 
 fn canonicalize_for_create(path: &Path) -> std::result::Result<PathBuf, HostCallError> {
-    // For non-existing paths, canonicalize the nearest existing ancestor and re-append suffix.
-    let mut ancestor = path.to_path_buf();
-    while !ancestor.exists() {
-        ancestor = ancestor
-            .parent()
-            .ok_or_else(|| HostCallError {
-                code: HostCallErrorCode::InvalidRequest,
-                message: "Path has no existing ancestor".to_string(),
-                details: Some(json!({ "path": path.display().to_string() })),
-                retryable: None,
-            })?
-            .to_path_buf();
-    }
+    // Resolve every existing component as it becomes reachable. Merely
+    // canonicalizing an ancestor and normalizing a missing suffix is unsafe:
+    // missing/../outside-link/file can expose a symlink *after* normalization.
+    // Do not create anything while deciding which scope authorizes the path.
+    use std::path::Component;
 
-    let canonical_ancestor = std::fs::canonicalize(&ancestor)
-        .map(strip_unc_prefix)
-        .map_err(|err| HostCallError {
-            code: HostCallErrorCode::Io,
-            message: format!("canonicalize: {err}"),
-            details: Some(json!({ "path": ancestor.display().to_string() })),
-            retryable: None,
-        })?;
-
-    let suffix = path.strip_prefix(&ancestor).map_err(|_| HostCallError {
-        code: HostCallErrorCode::Internal,
-        message: "Failed to compute path suffix".to_string(),
-        details: Some(json!({
-            "path": path.display().to_string(),
-            "ancestor": ancestor.display().to_string(),
-        })),
-        retryable: None,
-    })?;
-
-    let mut normalized_parts: Vec<std::ffi::OsString> = Vec::new();
-    let mut up_levels: usize = 0;
-    for component in suffix.components() {
+    let mut resolved = PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
         match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized_parts.push(part.to_os_string()),
-            std::path::Component::ParentDir => {
-                if normalized_parts.pop().is_none() {
-                    up_levels = up_levels.saturating_add(1);
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(HostCallError {
+                        code: HostCallErrorCode::Denied,
+                        message: "Path escapes filesystem root".to_string(),
+                        details: None,
+                        retryable: None,
+                    });
                 }
             }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(HostCallError {
-                    code: HostCallErrorCode::InvalidRequest,
-                    message: "Invalid path suffix".to_string(),
-                    details: Some(json!({
-                        "path": path.display().to_string(),
-                        "ancestor": ancestor.display().to_string(),
-                    })),
-                    retryable: None,
-                });
+            Component::Normal(part) => {
+                resolved.push(part);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        // A dangling link is an error, not an absent path.
+                        resolved = canonicalize_existing(&resolved)?;
+                        if components.peek().is_some()
+                            && !fs::metadata(&resolved)
+                                .map_err(|err| fs_path_error("stat", &resolved, &err))?
+                                .is_dir()
+                        {
+                            return Err(HostCallError {
+                                code: HostCallErrorCode::InvalidRequest,
+                                message: "An intermediate path component is not a directory"
+                                    .to_string(),
+                                details: None,
+                                retryable: None,
+                            });
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(fs_path_error("stat", &resolved, &err)),
+                }
             }
         }
     }
+    Ok(resolved)
+}
 
-    let mut base = canonical_ancestor;
-    for _ in 0..up_levels {
-        base = base
-            .parent()
-            .ok_or_else(|| HostCallError {
-                code: HostCallErrorCode::Denied,
-                message: "Path escapes filesystem root".to_string(),
-                details: Some(json!({
-                    "path": path.display().to_string(),
-                    "ancestor": ancestor.display().to_string(),
-                })),
-                retryable: None,
-            })?
-            .to_path_buf();
+fn canonicalize_leaf_nofollow(path: &Path) -> std::result::Result<PathBuf, HostCallError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return canonicalize_existing(path);
+    };
+    let target = canonicalize_existing(parent)?.join(name);
+    fs::symlink_metadata(&target).map_err(|err| fs_path_error("stat", &target, &err))?;
+    Ok(target)
+}
+
+fn fs_path_error(operation: &str, path: &Path, err: &std::io::Error) -> HostCallError {
+    HostCallError {
+        code: HostCallErrorCode::Io,
+        message: format!("{operation}: {err}"),
+        details: Some(json!({ "path_hash": hash_path(path) })),
+        retryable: None,
     }
-
-    let mut normalized_suffix = PathBuf::new();
-    for part in normalized_parts {
-        normalized_suffix.push(part);
-    }
-
-    Ok(base.join(normalized_suffix))
 }
 
 fn hash_path(path: &Path) -> String {
@@ -652,6 +663,7 @@ fn fs_op_stat(params: &Value, path: &Path) -> std::result::Result<Value, HostCal
     Ok(json!({
         "is_file": meta.is_file(),
         "is_dir": meta.is_dir(),
+        "is_symlink": meta.file_type().is_symlink(),
         "len": meta.len(),
     }))
 }
@@ -694,7 +706,7 @@ fn fs_op_delete(params: &Value, path: &Path) -> std::result::Result<Value, HostC
         return Ok(json!({ "deleted": true, "kind": "dir" }));
     }
 
-    fs::remove_file(path).map_err(|err| HostCallError {
+    remove_file_or_link(path, &meta).map_err(|err| HostCallError {
         code: HostCallErrorCode::Io,
         message: format!("remove_file: {err}"),
         details: None,
@@ -702,4 +714,197 @@ fn fs_op_delete(params: &Value, path: &Path) -> std::result::Result<Value, HostC
     })?;
 
     Ok(json!({ "deleted": true, "kind": "file" }))
+}
+
+fn remove_file_or_link(path: &Path, _meta: &fs::Metadata) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+        if _meta.file_type().is_symlink_dir() {
+            return fs::remove_dir(path);
+        }
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn connector(root: &Path) -> FsConnector {
+        let policy = ExtensionPolicy {
+            default_caps: vec!["read".to_string(), "write".to_string()],
+            deny_caps: Vec::new(),
+            ..ExtensionPolicy::default()
+        };
+        FsConnector::new(root, policy, FsScopes::for_cwd(root).expect("scopes")).expect("connector")
+    }
+
+    fn call(connector: &FsConnector, params: Value) -> std::result::Result<Value, HostCallError> {
+        connector.handle_fs_params(&params, Some("fs-path-test"))
+    }
+
+    #[test]
+    fn create_resolves_missing_components_without_creating_cancelled_prefixes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let connector = connector(temp.path());
+        call(
+            &connector,
+            json!({"op": "write", "path": "missing/../nested/file", "data": "content"}),
+        )
+        .expect("write");
+        assert!(!temp.path().join("missing").exists());
+        assert_eq!(fs::read(temp.path().join("nested/file")).unwrap(), b"content");
+        assert_eq!(
+            call(&connector, json!({"op": "read", "path": "nested/file"})).unwrap()["text"],
+            "content"
+        );
+    }
+
+    #[test]
+    fn create_rejects_an_existing_file_as_a_parent_before_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("file"), b"sentinel").unwrap();
+        let error = call(
+            &connector(temp.path()),
+            json!({"op": "write", "path": "file/../new", "data": "bad"}),
+        )
+        .expect_err("not a directory");
+        assert_eq!(error.code, HostCallErrorCode::InvalidRequest);
+        assert!(!temp.path().join("new").exists());
+        assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"sentinel");
+    }
+
+    #[test]
+    fn recursive_delete_cannot_remove_the_scope_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("sentinel"), b"keep").unwrap();
+        let connector = connector(temp.path());
+        for path in [".", "child/.."] {
+            fs::create_dir_all(temp.path().join("child")).unwrap();
+            let error = call(
+                &connector,
+                json!({"op": "delete", "path": path, "recursive": true}),
+            )
+            .expect_err("scope root protected");
+            assert_eq!(error.code, HostCallErrorCode::Denied);
+            assert_eq!(fs::read(temp.path().join("sentinel")).unwrap(), b"keep");
+        }
+        call(
+            &connector,
+            json!({"op": "delete", "path": "child", "recursive": true}),
+        )
+        .expect("subdirectory deletion still works");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_cannot_hide_an_outside_symlink_behind_missing_dot_dot() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("portal")).unwrap();
+        let connector = connector(&root);
+        for op in ["write", "mkdir"] {
+            let error = call(
+                &connector,
+                json!({"op": op, "path": "missing/../portal/new", "data": "escaped"}),
+            )
+            .expect_err("outside target denied after normalization");
+            assert_eq!(error.code, HostCallErrorCode::Denied);
+            assert!(!outside.join("new").exists());
+            assert!(!root.join("missing").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_through_an_in_scope_symlink_still_works() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("real")).unwrap();
+        symlink("real", temp.path().join("alias")).unwrap();
+        call(
+            &connector(temp.path()),
+            json!({"op": "write", "path": "missing/../alias/new", "data": "allowed"}),
+        )
+        .expect("in-scope symlink");
+        assert_eq!(fs::read(temp.path().join("real/new")).unwrap(), b"allowed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_file_and_directory_links_preserves_the_targets() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("real")).unwrap();
+        fs::write(temp.path().join("real/keep"), b"sentinel").unwrap();
+        symlink("real/keep", temp.path().join("file-link")).unwrap();
+        symlink("real", temp.path().join("dir-link")).unwrap();
+        let connector = connector(temp.path());
+        for path in ["file-link", "dir-link"] {
+            call(
+                &connector,
+                json!({"op": "delete", "path": path, "recursive": true}),
+            )
+            .expect("unlink only");
+            assert!(fs::symlink_metadata(temp.path().join(path)).is_err());
+            assert_eq!(fs::read(temp.path().join("real/keep")).unwrap(), b"sentinel");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_links_can_be_statted_and_unlinked_but_not_written_through() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().expect("tempdir");
+        symlink("absent", temp.path().join("link")).unwrap();
+        let connector = connector(temp.path());
+        let stat = call(
+            &connector,
+            json!({"op": "stat", "path": "link", "follow_symlinks": false}),
+        )
+        .expect("lstat dangling link");
+        assert_eq!(stat["is_symlink"], true);
+        assert_eq!(stat["is_file"], false);
+        assert_eq!(stat["is_dir"], false);
+        assert!(call(&connector, json!({"op": "stat", "path": "link"})).is_err());
+        assert!(
+            call(
+                &connector,
+                json!({"op": "write", "path": "link", "data": "bad"}),
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join("absent").exists());
+        call(&connector, json!({"op": "delete", "path": "link"})).expect("unlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_leaf_links_are_safe_to_unlink_but_parent_links_do_not_grant_access() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"sentinel").unwrap();
+        symlink(&outside, root.join("portal")).unwrap();
+        symlink(outside.join("keep"), root.join("leaf")).unwrap();
+        let connector = connector(&root);
+        for params in [
+            json!({"op": "read", "path": "leaf"}),
+            json!({"op": "delete", "path": "portal/keep"}),
+            json!({"op": "stat", "path": "portal/keep", "follow_symlinks": false}),
+        ] {
+            let error = call(&connector, params).expect_err("outside scope");
+            assert_eq!(error.code, HostCallErrorCode::Denied);
+        }
+        call(&connector, json!({"op": "delete", "path": "leaf"})).expect("safe unlink");
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"sentinel");
+    }
 }
