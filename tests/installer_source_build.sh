@@ -12,7 +12,9 @@ source "$INSTALLER"
 # Sourcing declares the installer's exit trap; fixtures have their own lifetime.
 trap - EXIT
 
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pi-installer-source.XXXXXXXX")"
+# Physical path: build_from_source resolves --source-dir with `pwd -P`, and
+# macOS keeps $TMPDIR behind a /var -> /private/var symlink.
+TEST_ROOT="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/pi-installer-source.XXXXXXXX")" && pwd -P)"
 TEST_CASE=""
 BUILD_MODE=success
 GIT_MODE=success

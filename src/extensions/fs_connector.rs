@@ -193,6 +193,8 @@ impl FsConnector {
         }
     }
 
+    // One match arm per fs op; splitting it would only scatter the op table.
+    #[allow(clippy::too_many_lines)]
     fn handle_fs_params(
         &self,
         params: &Value,
@@ -611,9 +613,7 @@ fn open_io_file(path: &Path, write: bool) -> std::io::Result<fs::File> {
 
 #[cfg(not(unix))]
 fn open_io_file(path: &Path, write: bool) -> std::io::Result<fs::File> {
-    if write
-        && let Some(parent) = path.parent()
-    {
+    if write && let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut options = fs::OpenOptions::new();
@@ -891,8 +891,8 @@ mod path_tests {
         FsConnector::new(root, policy, FsScopes::for_cwd(root).expect("scopes")).expect("connector")
     }
 
-    fn call(connector: &FsConnector, params: Value) -> std::result::Result<Value, HostCallError> {
-        connector.handle_fs_params(&params, Some("fs-path-test"))
+    fn call(connector: &FsConnector, params: &Value) -> std::result::Result<Value, HostCallError> {
+        connector.handle_fs_params(params, Some("fs-path-test"))
     }
 
     #[test]
@@ -901,13 +901,16 @@ mod path_tests {
         let connector = connector(temp.path());
         call(
             &connector,
-            json!({"op": "write", "path": "missing/../nested/file", "data": "content"}),
+            &json!({"op": "write", "path": "missing/../nested/file", "data": "content"}),
         )
         .expect("write");
         assert!(!temp.path().join("missing").exists());
-        assert_eq!(fs::read(temp.path().join("nested/file")).unwrap(), b"content");
         assert_eq!(
-            call(&connector, json!({"op": "read", "path": "nested/file"})).unwrap()["text"],
+            fs::read(temp.path().join("nested/file")).unwrap(),
+            b"content"
+        );
+        assert_eq!(
+            call(&connector, &json!({"op": "read", "path": "nested/file"})).unwrap()["text"],
             "content"
         );
     }
@@ -918,7 +921,7 @@ mod path_tests {
         fs::write(temp.path().join("file"), b"sentinel").unwrap();
         let error = call(
             &connector(temp.path()),
-            json!({"op": "write", "path": "file/../new", "data": "bad"}),
+            &json!({"op": "write", "path": "file/../new", "data": "bad"}),
         )
         .expect_err("not a directory");
         assert_eq!(error.code, HostCallErrorCode::InvalidRequest);
@@ -935,7 +938,7 @@ mod path_tests {
             fs::create_dir_all(temp.path().join("child")).unwrap();
             let error = call(
                 &connector,
-                json!({"op": "delete", "path": path, "recursive": true}),
+                &json!({"op": "delete", "path": path, "recursive": true}),
             )
             .expect_err("scope root protected");
             assert_eq!(error.code, HostCallErrorCode::Denied);
@@ -943,7 +946,7 @@ mod path_tests {
         }
         call(
             &connector,
-            json!({"op": "delete", "path": "child", "recursive": true}),
+            &json!({"op": "delete", "path": "child", "recursive": true}),
         )
         .expect("subdirectory deletion still works");
     }
@@ -962,7 +965,7 @@ mod path_tests {
         for op in ["write", "mkdir"] {
             let error = call(
                 &connector,
-                json!({"op": op, "path": "missing/../portal/new", "data": "escaped"}),
+                &json!({"op": op, "path": "missing/../portal/new", "data": "escaped"}),
             )
             .expect_err("outside target denied after normalization");
             assert_eq!(error.code, HostCallErrorCode::Denied);
@@ -980,7 +983,7 @@ mod path_tests {
         symlink("real", temp.path().join("alias")).unwrap();
         call(
             &connector(temp.path()),
-            json!({"op": "write", "path": "missing/../alias/new", "data": "allowed"}),
+            &json!({"op": "write", "path": "missing/../alias/new", "data": "allowed"}),
         )
         .expect("in-scope symlink");
         assert_eq!(fs::read(temp.path().join("real/new")).unwrap(), b"allowed");
@@ -999,11 +1002,14 @@ mod path_tests {
         for path in ["file-link", "dir-link"] {
             call(
                 &connector,
-                json!({"op": "delete", "path": path, "recursive": true}),
+                &json!({"op": "delete", "path": path, "recursive": true}),
             )
             .expect("unlink only");
             assert!(fs::symlink_metadata(temp.path().join(path)).is_err());
-            assert_eq!(fs::read(temp.path().join("real/keep")).unwrap(), b"sentinel");
+            assert_eq!(
+                fs::read(temp.path().join("real/keep")).unwrap(),
+                b"sentinel"
+            );
         }
     }
 
@@ -1016,22 +1022,22 @@ mod path_tests {
         let connector = connector(temp.path());
         let stat = call(
             &connector,
-            json!({"op": "stat", "path": "link", "follow_symlinks": false}),
+            &json!({"op": "stat", "path": "link", "follow_symlinks": false}),
         )
         .expect("lstat dangling link");
         assert_eq!(stat["is_symlink"], true);
         assert_eq!(stat["is_file"], false);
         assert_eq!(stat["is_dir"], false);
-        assert!(call(&connector, json!({"op": "stat", "path": "link"})).is_err());
+        assert!(call(&connector, &json!({"op": "stat", "path": "link"})).is_err());
         assert!(
             call(
                 &connector,
-                json!({"op": "write", "path": "link", "data": "bad"}),
+                &json!({"op": "write", "path": "link", "data": "bad"}),
             )
             .is_err()
         );
         assert!(!temp.path().join("absent").exists());
-        call(&connector, json!({"op": "delete", "path": "link"})).expect("unlink");
+        call(&connector, &json!({"op": "delete", "path": "link"})).expect("unlink");
     }
 
     #[cfg(unix)]
@@ -1052,10 +1058,10 @@ mod path_tests {
             json!({"op": "delete", "path": "portal/keep"}),
             json!({"op": "stat", "path": "portal/keep", "follow_symlinks": false}),
         ] {
-            let error = call(&connector, params).expect_err("outside scope");
+            let error = call(&connector, &params).expect_err("outside scope");
             assert_eq!(error.code, HostCallErrorCode::Denied);
         }
-        call(&connector, json!({"op": "delete", "path": "leaf"})).expect("safe unlink");
+        call(&connector, &json!({"op": "delete", "path": "leaf"})).expect("safe unlink");
         assert_eq!(fs::read(outside.join("keep")).unwrap(), b"sentinel");
     }
 
@@ -1077,7 +1083,10 @@ mod path_tests {
                 "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
                 "encoding": "BASE64"
             });
-            assert_eq!(write_data(&params, limit).unwrap().as_ref(), bytes.as_slice());
+            assert_eq!(
+                write_data(&params, limit).unwrap().as_ref(),
+                bytes.as_slice()
+            );
             let oversized = json!({
                 "data": base64::engine::general_purpose::STANDARD.encode(vec![0xa5; limit + 1]),
                 "encoding": "base64"
@@ -1137,7 +1146,7 @@ mod path_tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
         let written = call(
             &connector,
-            json!({
+            &json!({
                 "op": "write", "path": "nested/data", "encoding": "base64", "data": encoded
             }),
         )
@@ -1145,15 +1154,15 @@ mod path_tests {
         assert_eq!(written["bytes_written"], binary.len());
         let read = call(
             &connector,
-            json!({"op": "read", "path": "nested/data", "encoding": "base64"}),
+            &json!({"op": "read", "path": "nested/data", "encoding": "base64"}),
         )
         .expect("binary read");
         assert_eq!(read["data"], encoded);
-        assert!(call(&connector, json!({"op": "read", "path": "nested/data"})).is_err());
+        assert!(call(&connector, &json!({"op": "read", "path": "nested/data"})).is_err());
         for replacement in ["ok", ""] {
             call(
                 &connector,
-                json!({"op": "write", "path": "nested/data", "data": replacement}),
+                &json!({"op": "write", "path": "nested/data", "data": replacement}),
             )
             .expect("overwrite");
             assert_eq!(
@@ -1172,12 +1181,15 @@ mod path_tests {
         for op in ["read", "write"] {
             let error = call(
                 &connector,
-                json!({"op": op, "path": "directory", "data": "bad"}),
+                &json!({"op": op, "path": "directory", "data": "bad"}),
             )
             .expect_err("regular files only");
             assert_eq!(error.code, HostCallErrorCode::InvalidRequest);
         }
-        assert_eq!(fs::read(temp.path().join("directory/keep")).unwrap(), b"keep");
+        assert_eq!(
+            fs::read(temp.path().join("directory/keep")).unwrap(),
+            b"keep"
+        );
     }
 
     #[cfg(unix)]

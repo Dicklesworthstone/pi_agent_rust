@@ -525,7 +525,7 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
         return Ok(serde_json::json!(i));
     }
     if let Some(f) = value.as_float() {
-        return Ok(serde_json::json!(f));
+        return Ok(js_float_to_json(f));
     }
     if let Some(s) = value.as_string() {
         let s = s.to_string()?;
@@ -567,6 +567,32 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
     }
     // Fallback for functions, symbols, etc.
     Ok(serde_json::Value::Null)
+}
+
+/// Largest magnitude a JS number can hold while still naming every integer
+/// exactly (`Number.MAX_SAFE_INTEGER`, 2^53 - 1).
+const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Map a QuickJS float64 onto the JSON number that `JSON.stringify` would
+/// produce for it.
+///
+/// QuickJS keeps integers that fit in `i32` under `JS_TAG_INT` and promotes
+/// everything else — including `Date.now()`, which passed 2^31 in 1970 — to
+/// `JS_TAG_FLOAT64`. The tag is a storage detail: a JS number has no integer
+/// vs. float distinction, and `JSON.stringify(2147483648)` is `2147483648`,
+/// not `2147483648.0`. Emitting the tag as-is made every `i64` field on the
+/// Rust side reject an integral timestamp with "invalid type: floating point,
+/// expected i64" (gh #238). Integral finite values inside the exactly
+/// representable range therefore become JSON integers; non-integral, huge,
+/// or non-finite values keep the float path (`serde_json` renders non-finite
+/// as `null`, matching `JSON.stringify`).
+fn js_float_to_json(f: f64) -> serde_json::Value {
+    if f.is_finite() && f.fract() == 0.0 && f.abs() <= JS_MAX_SAFE_INTEGER {
+        // Exact by construction: |f| <= 2^53 - 1 fits in i64 losslessly.
+        #[allow(clippy::cast_possible_truncation)]
+        return serde_json::json!(f as i64);
+    }
+    serde_json::json!(f)
 }
 
 pub type HostcallQueue = Rc<RefCell<HostcallRequestQueue<HostcallRequest>>>;
@@ -25328,6 +25354,61 @@ mod tests {
 
     fn sha256_hex(bytes: &[u8]) -> String {
         hex_lower(&Sha256::digest(bytes))
+    }
+
+    /// gh #238: QuickJS stores integers above `i32` as float64. `js_to_json`
+    /// used to surface the storage tag, so a `Date.now()` timestamp became
+    /// `2147483648.0` and every `i64` field on the Rust side rejected it.
+    #[test]
+    fn js_to_json_renders_integral_floats_as_json_integers() {
+        /// The field shape that failed in the wild: an `i64` timestamp.
+        #[derive(serde::Deserialize)]
+        struct Stamped {
+            timestamp: i64,
+        }
+
+        let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
+        let context = rquickjs::Context::full(&runtime).expect("quickjs context");
+        let converted = context.with(|ctx| {
+            let value: Value<'_> = ctx
+                .eval(
+                    r"({
+                        i32Max: 2147483647,
+                        i32MaxPlusOne: 2147483648,
+                        negative: -2147483649,
+                        epochMs: 1758556800123,
+                        maxSafe: 9007199254740991,
+                        beyondSafe: 9007199254740992,
+                        fraction: 1.5,
+                        negZero: -0,
+                        inf: Infinity,
+                        nan: NaN,
+                        nested: [4294967296, { ts: 3000000000 }],
+                    })",
+                )
+                .expect("eval literal");
+            js_to_json(&value).expect("convert")
+        });
+
+        assert_eq!(converted["i32Max"], json!(2_147_483_647_i64));
+        assert!(converted["i32MaxPlusOne"].is_i64(), "{converted}");
+        assert_eq!(converted["i32MaxPlusOne"], json!(2_147_483_648_i64));
+        assert_eq!(converted["negative"], json!(-2_147_483_649_i64));
+        assert!(converted["epochMs"].is_i64(), "{converted}");
+        assert_eq!(converted["epochMs"], json!(1_758_556_800_123_i64));
+        assert_eq!(converted["maxSafe"], json!(9_007_199_254_740_991_i64));
+        // Past 2^53 integers are no longer exact; keep the float rendering.
+        assert!(converted["beyondSafe"].is_f64(), "{converted}");
+        assert_eq!(converted["fraction"], json!(1.5));
+        assert_eq!(converted["negZero"], json!(0_i64));
+        assert!(converted["inf"].is_null(), "{converted}");
+        assert!(converted["nan"].is_null(), "{converted}");
+        assert_eq!(converted["nested"][0], json!(4_294_967_296_i64));
+        assert_eq!(converted["nested"][1]["ts"], json!(3_000_000_000_i64));
+
+        let stamped: Stamped = serde_json::from_value(json!({ "timestamp": converted["epochMs"] }))
+            .expect("integral float deserializes as i64");
+        assert_eq!(stamped.timestamp, 1_758_556_800_123);
     }
 
     /// Receipt name for `pi_bridge_js()`, which is not a virtual module.

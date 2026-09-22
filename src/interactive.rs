@@ -3851,8 +3851,16 @@ impl PiApp {
             // (e.g., text input handled by TextArea)
         }
 
-        // Forward to appropriate component based on state
-        if matches!(self.agent_state, AgentState::Idle) {
+        // Forward to appropriate component based on state. The editor owns
+        // keystrokes while idle and, because an ask/approval card is answered
+        // through this same editor, while such a card is pending mid-turn
+        // (gh #229: the card rendered but every typed character went to the
+        // spinner). Spinner ticks keep flowing to the spinner regardless: a
+        // pending card never hides the tool-progress row.
+        let editor_owns_input = (matches!(self.agent_state, AgentState::Idle)
+            || self.has_pending_input_card())
+            && msg.downcast_ref::<SpinnerTickMsg>().is_none();
+        if editor_owns_input {
             let old_height = self.input.height();
 
             if let Some(key) = msg.downcast_ref::<KeyMsg>()

@@ -1391,6 +1391,24 @@ const FIXED_CHROME_ROWS: u16 = 3;
 /// The input editor grows with its content up to this many rows.
 const MAX_INPUT_ROWS: u16 = 5;
 
+/// The `[start, end)` slice of a `len`-item picker list that fits in
+/// `visible` rows while keeping `selected` on screen.
+///
+/// The window is anchored to the top until the selection would fall off the
+/// bottom, then slides one row at a time so the selection stays on the last
+/// visible row; paging up slides it back the same way. The window never
+/// starts past the point where it could show `visible` items, so the last
+/// page is always full.
+fn picker_window(selected: usize, len: usize, visible: usize) -> std::ops::Range<usize> {
+    if visible == 0 || len == 0 {
+        return 0..0;
+    }
+    let selected = selected.min(len - 1);
+    let max_start = len.saturating_sub(visible);
+    let start = selected.saturating_sub(visible - 1).min(max_start);
+    start..(start + visible).min(len)
+}
+
 fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16, completion_rows: u16) -> Regions {
     use ftui::layout::{Constraint, Flex};
     let rects = Flex::vertical()
@@ -3602,12 +3620,39 @@ impl PiFtuiModel {
 
     /// Modal picker body + footer hint. Lines borrow the picker's strings —
     /// no per-frame allocation.
+    ///
+    /// Only the window of items that keeps the selection on screen is
+    /// rendered: the body used to draw every item from the top, so a `/model`
+    /// list longer than the terminal never scrolled and the selection walked
+    /// off the bottom edge (gh #228). The title carries the `selected/total`
+    /// position whenever the list is longer than the window.
     fn render_picker(&self, picker: &PickerOverlay, regions: &Regions, frame: &mut Frame) {
-        let mut lines = vec![ftui::text::Line::styled(
-            picker.title.as_str(),
-            ftui::Style::new().bold().fg(self.palette.accent),
-        )];
-        for (i, item) in picker.items.iter().enumerate() {
+        let title_style = ftui::Style::new().bold().fg(self.palette.accent);
+        // One row belongs to the title; the rest show items.
+        let visible = usize::from(regions.body.height).saturating_sub(1);
+        let window = picker_window(picker.selected, picker.items.len(), visible);
+        let position;
+        let title = if picker.items.len() > visible {
+            position = format!(
+                " ({}/{})",
+                picker.selected.saturating_add(1),
+                picker.items.len()
+            );
+            ftui::text::Line::from_spans([
+                ftui::text::Span::styled(picker.title.as_str(), title_style),
+                ftui::text::Span::styled(position.as_str(), title_style.dim()),
+            ])
+        } else {
+            ftui::text::Line::styled(picker.title.as_str(), title_style)
+        };
+        let mut lines = vec![title];
+        for (i, item) in picker
+            .items
+            .iter()
+            .enumerate()
+            .skip(window.start)
+            .take(window.len())
+        {
             let (marker, style) = if i == picker.selected {
                 ("▸ ", ftui::Style::new().bold().fg(self.palette.accent))
             } else {
@@ -8047,6 +8092,97 @@ mod tests {
             sim.model().picker.is_none(),
             "picker did not close on rebound key 'q'"
         );
+    }
+
+    #[test]
+    fn picker_window_keeps_selection_visible() {
+        // Empty inputs render nothing.
+        assert_eq!(picker_window(0, 0, 5), 0..0);
+        assert_eq!(picker_window(3, 10, 0), 0..0);
+        // Short lists are shown whole.
+        assert_eq!(picker_window(2, 3, 5), 0..3);
+        // Anchored to the top until the selection reaches the last row.
+        assert_eq!(picker_window(0, 20, 5), 0..5);
+        assert_eq!(picker_window(4, 20, 5), 0..5);
+        // Then slides one row at a time, selection on the last row.
+        assert_eq!(picker_window(5, 20, 5), 1..6);
+        assert_eq!(picker_window(12, 20, 5), 8..13);
+        // The last page stays full instead of starting past the end.
+        assert_eq!(picker_window(19, 20, 5), 15..20);
+        // Out-of-range selections clamp to the last item.
+        assert_eq!(picker_window(99, 20, 5), 15..20);
+        // Every window contains its selection.
+        for len in 1..40 {
+            for visible in 1..12 {
+                for selected in 0..len {
+                    let window = picker_window(selected, len, visible);
+                    assert!(
+                        window.contains(&selected),
+                        "selected {selected} outside {window:?} (len {len}, visible {visible})"
+                    );
+                    assert_eq!(window.len(), visible.min(len));
+                }
+            }
+        }
+    }
+
+    /// gh #228: a `/model` list longer than the body never scrolled — every
+    /// item was drawn from the top and the selection walked off screen.
+    #[test]
+    fn long_picker_scrolls_to_keep_the_selection_on_screen() {
+        let (_tx, mut model) = new_model();
+        model.picker = Some(PickerOverlay {
+            title: String::from("Select model"),
+            items: (0..40).map(|i| format!("provider/model-{i:02}")).collect(),
+            values: Vec::new(),
+            selected: 0,
+            kind: PickerKind::Model,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // 10 rows: header, body, status, input, footer... the body gets a
+        // handful of rows, far fewer than 40 items.
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(rendered.contains("▸ provider/model-00"), "{rendered:?}");
+        assert!(
+            rendered.contains("(1/40)"),
+            "position missing: {rendered:?}"
+        );
+        assert!(!rendered.contains("model-30"), "{rendered:?}");
+
+        // Walk past the first page with `j`: the selection must stay visible.
+        for _ in 0..30 {
+            sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
+        }
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 30);
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains("▸ provider/model-30"),
+            "selection scrolled off screen: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("(31/40)"),
+            "position missing: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("model-00"),
+            "top of list still drawn: {rendered:?}"
+        );
+
+        // Page to the very end, then walk back to the top.
+        for _ in 0..12 {
+            sim.inject_event(key(KeyCode::PageDown, Modifiers::empty()));
+        }
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 39);
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(rendered.contains("▸ provider/model-39"), "{rendered:?}");
+        assert!(rendered.contains("(40/40)"), "{rendered:?}");
+        for _ in 0..40 {
+            sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
+        }
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(rendered.contains("▸ provider/model-00"), "{rendered:?}");
     }
 
     #[test]

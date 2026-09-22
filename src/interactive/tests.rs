@@ -1229,6 +1229,79 @@ fn pending_ask_card_keeps_editor_visible_while_turn_is_running() {
     app.agent_state = AgentState::Idle;
 }
 
+/// gh #229: with an ask card pending mid-turn the classic stack rendered the
+/// editor (see the test above) but still routed every keystroke to the
+/// spinner, so the "enter a number" instruction could not be followed. Typed
+/// characters must reach the editor while the card is pending, and the
+/// answer must resolve the card through the ordinary Enter path.
+#[test]
+fn pending_ask_card_routes_typed_keys_to_the_editor_mid_turn() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+    app.agent_state = AgentState::ToolRunning;
+    app.current_tool = Some("bash".to_string());
+
+    // No card yet: a running turn swallows keystrokes (the editor is hidden).
+    let _ = app.update(Message::new(KeyMsg::from_char('x')));
+    assert_eq!(app.input.value(), "", "keys must not reach a hidden editor");
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{
+            "question": "Allow the `bash` tool to run?",
+            "options": [{"label": "Allow"}, {"label": "Deny"}]
+        }]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-approval-keys");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-approval-keys".to_string(),
+        request,
+    }));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+
+    // Spinner ticks still belong to the spinner while the card is pending.
+    let _ = app.update(app.spinner.tick());
+    assert_eq!(
+        app.input.value(),
+        "",
+        "a spinner tick must not touch the editor"
+    );
+
+    let _ = app.update(Message::new(KeyMsg::from_char('1')));
+    assert_eq!(
+        app.input.value(),
+        "1",
+        "typed characters must reach the editor while a card is pending mid-turn"
+    );
+
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(
+        app.active_ask_ui.is_none(),
+        "Enter answers the pending card"
+    );
+    assert!(app.active_input_card_kind.is_none());
+    assert_eq!(
+        app.input.value(),
+        "",
+        "the answer is consumed from the editor"
+    );
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+
+    // Card resolved, turn still running: keystrokes go back to the spinner.
+    let _ = app.update(Message::new(KeyMsg::from_char('y')));
+    assert_eq!(
+        app.input.value(),
+        "",
+        "keys must not reach the editor once the card resolves"
+    );
+    app.agent_state = AgentState::Idle;
+}
+
 /// bd-q66i1: turn-end invalidation treats partial card input as consumed and
 /// restores the genuine draft captured before the card burst.
 #[test]
