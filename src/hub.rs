@@ -575,9 +575,10 @@ fn persist_detached_state(reg: &ServiceRegistry) {
     }
 }
 
-/// Spawn a service and block until readiness is observed (or the budget
-/// expires). Both supplied gates must be observed. With no gates, a
-/// successful spawn is acknowledged without resurrecting a later exit.
+/// Spawn a service and block until readiness is observed (or the budget expires).
+///
+/// Both supplied gates must be observed. With no gates, a successful spawn is
+/// acknowledged without resurrecting a later exit.
 ///
 /// # Errors
 /// `PI_HUB_NAME_TAKEN` for a duplicate live name; `PI_HUB_NOT_READY` when
@@ -823,7 +824,7 @@ fn pump_service_stream<R: Read, W: Write>(mut reader: R, mut artifact: W, ring: 
     let mut pending = Vec::with_capacity(chunk.len() + 3);
     loop {
         match reader.read(&mut chunk) {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let data = &chunk[..n]; // ubs:ignore n bounded by read into chunk
@@ -1494,6 +1495,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::trivial_regex)]
     fn readiness_marker_is_latched_before_output_eviction() {
         let mut output = Ring::new(3);
         output.watch_readiness(Some(regex::Regex::new("^ready 界🙂").expect("regex")));
@@ -1515,6 +1517,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::trivial_regex)]
     fn readiness_does_not_match_synthetic_truncation_annotations() {
         let mut ring = Ring::new(8);
         ring.watch_readiness(Some(regex::Regex::new("truncated").expect("regex")));
