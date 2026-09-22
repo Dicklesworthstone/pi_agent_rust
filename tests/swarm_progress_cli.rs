@@ -72,7 +72,11 @@ fn snapshot_files(root: &Path) -> TestResult<BTreeMap<PathBuf, Vec<u8>>> {
             if file_type.is_dir() {
                 visit(root, &path, snapshot)?;
             } else {
-                snapshot.insert(path.strip_prefix(root)?.to_path_buf(), fs::read(&path)?);
+                let relative = path.strip_prefix(root)?.to_path_buf();
+                if relative == Path::new("objects/maintenance.lock") {
+                    continue;
+                }
+                snapshot.insert(relative, fs::read(&path)?);
             }
         }
         Ok(())
@@ -328,6 +332,8 @@ fn swarm_progress_stdout_does_not_mutate_git_or_beads_files() -> TestResult {
     run_git_in(&temp, &["init", "-b", "main"])?;
     run_git_in(&temp, &["config", "user.email", "pi-test@example.invalid"])?;
     run_git_in(&temp, &["config", "user.name", "Pi Test"])?;
+    run_git_in(&temp, &["config", "gc.auto", "0"])?;
+    run_git_in(&temp, &["config", "maintenance.auto", "false"])?;
     let marker_path = temp.join("tracked.txt");
     fs::write(&marker_path, "tracked fixture\n")?;
     run_git_in(&temp, &["add", path_str(&marker_path)?])?;
