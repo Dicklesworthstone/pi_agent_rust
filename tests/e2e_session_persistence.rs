@@ -734,6 +734,28 @@ fn required_chaos_env(name: &str) -> String {
 #[cfg(feature = "internal-persistence-fault-injection")]
 const PERSISTENCE_FAILPOINT_HARD_EXIT_CODE: i32 = 86;
 
+/// A wedged failpoint child must fail the test, not hang the lane.
+#[cfg(feature = "internal-persistence-fault-injection")]
+const PERSISTENCE_FAILPOINT_CHILD_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// Reopen after a crash window without the recovery-tolerant loader's
+/// forgiveness: a crash that left a malformed or orphaned row must fail
+/// here, not be silently skipped (bd-yn7ud).
+#[cfg(feature = "internal-persistence-fault-injection")]
+async fn reopen_strict(path: &Path, window: &str) -> Session {
+    let (session, diagnostics) = Session::open_with_diagnostics(path.to_string_lossy().as_ref())
+        .await
+        .unwrap_or_else(|err| panic!("reopen after {window}: {err}"));
+    assert!(
+        diagnostics.skipped_entries.is_empty() && diagnostics.orphaned_parent_links.is_empty(),
+        "{window} left rows the strict reopen had to skip: skipped={:?} orphaned={:?}",
+        diagnostics.skipped_entries,
+        diagnostics.orphaned_parent_links
+    );
+    session
+}
+
 #[cfg(feature = "internal-persistence-fault-injection")]
 fn run_persistence_failpoint_child(
     session_path: &Path,
@@ -742,7 +764,12 @@ fn run_persistence_failpoint_child(
     failpoint: &str,
     message: &str,
 ) -> std::process::Output {
-    Command::new(std::env::current_exe().expect("current persistence test binary"))
+    // Output goes to files so the parent can poll with a deadline without
+    // a pipe filling up; a child past the deadline is killed and reaped.
+    let logs = tempfile::tempdir().expect("failpoint child log dir");
+    let stdout_path = logs.path().join("stdout");
+    let stderr_path = logs.path().join("stderr");
+    let mut child = Command::new(std::env::current_exe().expect("current persistence test binary"))
         .arg("--exact")
         .arg("persistence_failpoint_worker_process_entrypoint")
         .arg("--nocapture")
@@ -755,8 +782,31 @@ fn run_persistence_failpoint_child(
         .env("PI_SESSION_PERSISTENCE_TEST_MARKER_PATH", marker_path)
         .env("PI_SESSION_PERSISTENCE_TEST_MESSAGE", message)
         .stdin(Stdio::null())
-        .output()
-        .expect("run persistence failpoint child")
+        .stdout(std::fs::File::create(&stdout_path).expect("child stdout file"))
+        .stderr(std::fs::File::create(&stderr_path).expect("child stderr file"))
+        .spawn()
+        .expect("spawn persistence failpoint child");
+    let deadline = std::time::Instant::now() + PERSISTENCE_FAILPOINT_CHILD_DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll failpoint child") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "persistence failpoint child {failpoint} exceeded {:?} and was killed\nstderr:\n{}",
+                PERSISTENCE_FAILPOINT_CHILD_DEADLINE,
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    std::process::Output {
+        status,
+        stdout: std::fs::read(&stdout_path).unwrap_or_default(),
+        stderr: std::fs::read(&stderr_path).unwrap_or_default(),
+    }
 }
 
 #[cfg(feature = "internal-persistence-fault-injection")]
@@ -767,7 +817,9 @@ fn persistence_failpoint_worker_process_entrypoint() {
     }
     let session_path = PathBuf::from(required_chaos_env("PI_SESSION_PERSISTENCE_TEST_PATH"));
     let backend = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_BACKEND");
-    let failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
+    // Read only to fail fast when the parent omitted it; the backend consumes
+    // the variable itself at the checkpoint.
+    let _failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
     let message = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_MESSAGE");
 
     run_async_test(async {
@@ -1840,14 +1892,15 @@ fn multi_turn_persistence() {
 
 #[cfg(feature = "internal-persistence-fault-injection")]
 #[test]
+#[allow(clippy::too_many_lines)] // three sequential crash windows over one session
 fn jsonl_fault_injection_flush_windows_preserve_integrity() {
     let test_name = "e2e_jsonl_fault_injection_flush_windows";
     let harness = TestHarness::new(test_name);
-    let correlation_id = match harness.log().ci_correlation_id() {
-        Some(value) => value,
-        None => harness.log().trace_id(),
-    }
-    .to_string();
+    let correlation_id = harness
+        .log()
+        .ci_correlation_id()
+        .unwrap_or_else(|| harness.log().trace_id())
+        .to_string();
     harness.section("jsonl_fault_injection");
 
     run_async_test(async {
@@ -1868,9 +1921,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         });
         drop(session);
 
-        let reopened_pre = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen after pre-flush crash simulation");
+        let reopened_pre = reopen_strict(&stable_path, "pre-flush crash simulation").await;
         let pre_texts = user_texts_in_order(&reopened_pre.to_messages_for_current_path());
         assert_eq!(pre_texts, vec!["jsonl-base".to_string()]);
         assert_no_duplicate_user_texts(&pre_texts, "jsonl pre-flush window");
@@ -1897,8 +1948,8 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         );
         assert_eq!(
             std::fs::read_to_string(&marker_path).expect("read JSONL checkpoint marker"),
-            format!("{failpoint}\n"),
-            "JSONL hard exit must occur only after the exact backend checkpoint"
+            format!("{failpoint}\njsonl_parent_syncs=0\n"),
+            "JSONL hard exit must occur at the exact backend checkpoint, before the parent sync"
         );
         harness
             .log()
@@ -1907,9 +1958,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             });
 
         // Simulate process crash/restart after failed flush.
-        let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen after mid-flush crash simulation");
+        let reopened_mid = reopen_strict(&stable_path, "mid-flush crash simulation").await;
         let mid_texts = user_texts_in_order(&reopened_mid.to_messages_for_current_path());
         assert_eq!(
             mid_texts,
@@ -1949,7 +1998,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             std::fs::read_to_string(&post_marker_path)
                 .expect("read JSONL post-flush checkpoint marker"),
             format!(
-                "{post_failpoint}\n{}\n",
+                "{post_failpoint}\n{}\njsonl_parent_syncs=1\n",
                 if cfg!(unix) {
                     "parent_sync_completed=unix_fsync"
                 } else {
@@ -1959,9 +2008,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             "JSONL post-flush hard exit must carry the completed platform sync witness"
         );
 
-        let reopened_post = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen after post-flush crash simulation");
+        let reopened_post = reopen_strict(&stable_path, "post-flush crash simulation").await;
         let post_texts = user_texts_in_order(&reopened_post.to_messages_for_current_path());
         assert_eq!(
             post_texts,
@@ -2000,14 +2047,15 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
     feature = "internal-persistence-fault-injection"
 ))]
 #[test]
+#[allow(clippy::too_many_lines)] // three sequential crash windows over one session
 fn sqlite_fault_injection_flush_windows_preserve_integrity() {
     let test_name = "e2e_sqlite_fault_injection_flush_windows";
     let harness = TestHarness::new(test_name);
-    let correlation_id = match harness.log().ci_correlation_id() {
-        Some(value) => value,
-        None => harness.log().trace_id(),
-    }
-    .to_string();
+    let correlation_id = harness
+        .log()
+        .ci_correlation_id()
+        .unwrap_or_else(|| harness.log().trace_id())
+        .to_string();
     harness.section("sqlite_fault_injection");
 
     run_async_test(async {
@@ -2028,9 +2076,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         });
         drop(session);
 
-        let reopened_pre = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen sqlite after pre-flush crash simulation");
+        let reopened_pre = reopen_strict(&stable_path, "sqlite pre-flush crash simulation").await;
         let pre_texts = user_texts_in_order(&reopened_pre.to_messages_for_current_path());
         assert_eq!(pre_texts, vec!["sqlite-base".to_string()]);
         assert_no_duplicate_user_texts(&pre_texts, "sqlite pre-flush window");
@@ -2066,9 +2112,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
                 ctx.push(("checkpoint".into(), failpoint.to_string()));
             });
 
-        let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen sqlite after mid-flush crash simulation");
+        let reopened_mid = reopen_strict(&stable_path, "sqlite mid-flush crash simulation").await;
         let mid_texts = user_texts_in_order(&reopened_mid.to_messages_for_current_path());
         assert_eq!(mid_texts, vec!["sqlite-base".to_string()]);
         assert_no_duplicate_user_texts(&mid_texts, "sqlite mid-flush window");
@@ -2106,9 +2150,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             "SQLite post-flush hard exit must carry completed COMMIT evidence"
         );
 
-        let reopened_post = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen sqlite after post-flush crash simulation");
+        let reopened_post = reopen_strict(&stable_path, "sqlite post-flush crash simulation").await;
         let post_texts = user_texts_in_order(&reopened_post.to_messages_for_current_path());
         assert_eq!(
             post_texts,

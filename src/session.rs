@@ -253,8 +253,16 @@ fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Completed JSONL parent-directory syncs in this process, written into every
+/// JSONL failpoint marker so a checkpoint moved across the sync is visible
+/// (bd-yn7ud). A failpoint child performs exactly one save.
+#[cfg(feature = "internal-persistence-fault-injection")]
+static JSONL_PARENT_SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn sync_jsonl_parent_dir_with_witness(path: &Path) -> std::io::Result<&'static str> {
     sync_parent_dir(path)?;
+    #[cfg(feature = "internal-persistence-fault-injection")]
+    JSONL_PARENT_SYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     #[cfg(unix)]
     {
         Ok("parent_sync_completed=unix_fsync")
@@ -1350,6 +1358,10 @@ pub(crate) fn persistence_test_failpoint(
             if let Some(witness) = mutation_witness {
                 marker.write_all(witness.as_bytes())?;
                 marker.write_all(b"\n")?;
+            }
+            if point.starts_with("jsonl_") {
+                let syncs = JSONL_PARENT_SYNCS.load(std::sync::atomic::Ordering::SeqCst);
+                marker.write_all(format!("jsonl_parent_syncs={syncs}\n").as_bytes())?;
             }
             // File writes are visible to the parent after the child exits. Do
             // not fsync this diagnostic marker: on a shared filesystem that
