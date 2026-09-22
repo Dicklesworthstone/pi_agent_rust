@@ -241,7 +241,7 @@ impl<F> ControlledTurn<F> {
     pub fn with_deadline(self, deadline: TurnDeadline) -> DeadlineTurn<F> {
         let control = self.control();
         let started = self.polled;
-        let sleep = Sleep::with_timer_driver(deadline.at, deadline.timer.clone());
+        let sleep = Sleep::new(deadline.at);
         DeadlineTurn {
             turn: Some(Box::pin(self)),
             control,

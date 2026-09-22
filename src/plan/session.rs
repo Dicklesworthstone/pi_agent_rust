@@ -738,14 +738,16 @@ impl Tool for CheckpointedSubmitPlan {
                 "the submission's session is no longer available",
             )
         })?;
-        let mut session = store.try_lock_owned().map_err(|_| {
-            control_error("PLAN_SESSION_BUSY", "session busy; plan was not submitted")
-        })?;
-        if session.header.id != self.session_id {
-            return Err(control_error(
-                "PLAN_SESSION_CHANGED",
-                "the submission belongs to another session",
-            ));
+        {
+            let session = store.try_lock().map_err(|_| {
+                control_error("PLAN_SESSION_BUSY", "session busy; plan was not submitted")
+            })?;
+            if session.header.id != self.session_id {
+                return Err(control_error(
+                    "PLAN_SESSION_CHANGED",
+                    "the submission belongs to another session",
+                ));
+            }
         }
         let mut output = self.native.execute(tool_call_id, input, on_update).await?;
         if output.is_error {
