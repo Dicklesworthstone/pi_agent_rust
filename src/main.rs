@@ -2019,6 +2019,205 @@ async fn run(
     }
 
     let enabled_tools = cli.enabled_tools();
+    // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
+    // `clamp_max_tool_iterations` keeps invalid values out of the loop and
+    // emits a warning instead of failing the run.
+    let max_tool_iterations = if cli.max_tool_iterations.is_some() {
+        pi::agent::clamp_max_tool_iterations(cli.max_tool_iterations)
+    } else {
+        pi::agent::resolved_max_tool_iterations_default()
+    };
+    // Approval mode (bd-cv653.3.19): CLI flags override config.
+    let approval_mode = if cli.yolo {
+        pi::approval::ApprovalMode::Yolo
+    } else if let Some(ref m) = cli.approval_mode {
+        pi::approval::ApprovalMode::from_setting(Some(m))
+    } else {
+        config.approval_mode()
+    };
+    let dual_confirm_classes = config.approval_dual_confirm_classes();
+    let approval_state = pi::approval::ApprovalState::new(
+        approval_mode,
+        cli.plan_yolo || config.plan_auto_approve(),
+        dual_confirm_classes,
+    );
+
+    // The default FrankenTUI stack runs one SDK session that builds its own
+    // provider, tools, system prompt and extension runtime (bd-2crrf). Launch
+    // it here, before the classic stack constructs any of those, so a single
+    // launch never initializes a second agent session and then discards it.
+    // Everything above stays shared: the bootstrap Session restores the
+    // persisted workspace roots handed over below, and model selection is
+    // the setup/auth gate.
+    #[cfg(feature = "ftui")]
+    if ftui_requested {
+        // The SDK opens its own session; release this bootstrap one first so
+        // nothing holds its resources while the frontend runs. It was never
+        // written.
+        drop(session);
+        let ftui_enabled_tools = enabled_tools
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        // `--continue` (bd-ydz1t.3). The classic stack resolves it inside
+        // Session::from_cli, which this path does not use; SessionOptions
+        // has no "reopen the latest" concept, so the flag was silently
+        // dropped and the user got a fresh session instead of their last
+        // one. Resolve it to a concrete path here, through the same lookup
+        // the classic stack uses, and hand it over as `session_path`.
+        //
+        // `--session` still wins, and `--no-session` short-circuits below,
+        // which is Session::from_cli's own precedence. `None` means this
+        // directory has nothing continuable, and a new session is exactly
+        // what the classic stack produces there too.
+        let continue_session_path = if cli.r#continue && cli.session.is_none() {
+            pi::session::Session::recent_session_path_in_dir(
+                cli.session_dir.as_ref().map(Path::new),
+            )
+            .await?
+        } else {
+            None
+        };
+        let options = pi::sdk::SessionOptions {
+            provider: cli.provider.clone(),
+            model: cli.model.clone(),
+            api_key: cli.api_key.clone(),
+            working_directory: Some(cwd.clone()),
+            workspace_trusted,
+            // Session persistence honors the same flags as the default
+            // stack: saved by default, --no-session for ephemeral,
+            // --session/--session-dir for explicit paths. The SDK path
+            // creates its own session file; the bootstrap session was
+            // dropped above without writing anything.
+            no_session: cli.no_session,
+            session_path: cli
+                .session
+                .as_ref()
+                .map(PathBuf::from)
+                .or(continue_session_path),
+            session_dir: cli.session_dir.as_ref().map(PathBuf::from),
+            workspace: Some(workspace.clone()),
+            // Extensions load with UI prompts bridged (bd-1eoh4): the
+            // ResourceLoader's discovered set (workspace/package/global)
+            // — which already folds in explicit -e paths and honors
+            // trust/policy filtering — plus nothing else.
+            extension_paths: if cli.no_extensions {
+                Vec::new()
+            } else {
+                resources.extensions().to_vec()
+            },
+            extension_policy: cli.extension_policy.clone(),
+            repair_policy: cli.repair_policy.clone(),
+            extension_flags: extension_flags.clone(),
+            // Prompt/tool/thinking flags flow through so deterministic
+            // harnesses (VCR body matching) and users get the same
+            // behavior as the default stack.
+            system_prompt: cli.system_prompt.clone(),
+            append_system_prompt: cli.append_system_prompt.clone(),
+            enabled_tools: Some(ftui_enabled_tools),
+            thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
+            include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
+            max_tool_iterations,
+            package_dir: Some(package_dir.clone()),
+            mcp: Some(pi::sdk::McpSessionOptions {
+                config_paths: cli.mcp_config.clone(),
+                global_dir: Some(pi::config::Config::global_dir()),
+            }),
+            // Approval gating (issue #196): the ftui stack previously
+            // dropped the approval mode entirely; thread the same state
+            // the classic stack uses so `ask`/`write` modes gate here
+            // too, prompting through the ask-card bridge.
+            approval_state: Some(approval_state.clone()),
+            // Provider retry (bd-u2qv4). Until now a 429 or a 529 was a
+            // hard error on this stack while the same request in print
+            // mode or over RPC retried and completed, and this is the
+            // stack most people run. `from_config` returns None when the
+            // user has set `retry.enabled = false`, so turning it off
+            // still means nobody re-enters the provider on their behalf.
+            // The retry events it emits already render here as system
+            // notes.
+            retry: pi::failover::RetryPolicy::from_config(&config),
+            // Cross-model failover (bd-u2qv4). A configured
+            // `retry.fallbackChains` used to be inert on this stack: the
+            // chain the user set up never ran on the surface they set it
+            // up for, while the identical request in print mode or over
+            // RPC walked it. `from_config` yields None when no chain is
+            // configured, which is the same condition under which the
+            // other surfaces decline.
+            failover: pi::sdk::FailoverOptions::from_config(
+                &config,
+                model_registry.get_available(),
+                auth.clone(),
+                cli.api_key.clone(),
+            ),
+            ..Default::default()
+        };
+        let theme = pi::theme::Theme::resolve(&config, &cwd);
+        // Same `disabledProviders` filter the classic stack applies when it
+        // builds its model list: without it the setting was silently
+        // ignored on this frontend and every catalog provider still
+        // appeared in the picker.
+        let ftui_models = model_registry
+            .get_available()
+            .into_iter()
+            .filter(|entry| {
+                !pi::failover::provider_is_disabled(
+                    &disabled_providers,
+                    scope_override,
+                    &entry.model.provider,
+                )
+            })
+            .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+            .collect::<Vec<_>>();
+        // /resume picker entries: this cwd's saved sessions, newest first
+        // (same index the session picker uses). Failures degrade to an
+        // empty list — /resume then reports "no saved sessions".
+        let ftui_sessions = pi::session_index::SessionIndex::new()
+            .list_sessions(Some(&cwd.display().to_string()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|meta| {
+                let label = match &meta.name {
+                    Some(name) => format!("{name} · {} msgs", meta.message_count),
+                    None => format!("{} · {} msgs", meta.id, meta.message_count),
+                };
+                (label, meta.path)
+            })
+            .collect::<Vec<_>>();
+        return pi::interactive_ftui::run(
+            options,
+            &theme,
+            cli.inline,
+            ftui_models,
+            ftui_sessions,
+            pi::interactive_ftui::FtuiSettings {
+                markdown_spacing: config.markdown_spacing(),
+                // Resolved exactly as the classic stack resolves it; the
+                // `--no-mouse-capture` flag has already been folded into
+                // `config.disable_mouse_capture` above.
+                disable_mouse_capture: config.disable_mouse_capture.unwrap_or_else(|| {
+                    std::env::var("PI_NO_MOUSE_CAPTURE").is_ok_and(|val| val == "1")
+                }),
+                // `/share` on this stack (bd-ydz1t.1) runs the same gh flow
+                // the classic stack does, so it reads the same setting.
+                gh_path: config.gh_path.clone(),
+                // `/tan` (bd-ydz1t.2) resolves its child model exactly as
+                // the classic stack does: the `task` role, falling back to
+                // `smol`.
+                subagent_role_spec: pi::app::subagent_role_spec(&config),
+            },
+            pi::interactive_ftui::AutocompleteLaunch {
+                catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
+                cwd: cwd.clone(),
+                max_visible: config
+                    .autocomplete_max_visible
+                    .and_then(|n| usize::try_from(n.clamp(3, 20)).ok())
+                    .unwrap_or(5),
+            },
+        )
+        .map_err(Into::into);
+    }
+
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
     } else {
@@ -2054,28 +2253,6 @@ async fn run(
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
     let stream_options =
         pi::app::build_stream_options(&config, resolved_key.clone(), &selection, &session);
-    // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
-    // `clamp_max_tool_iterations` keeps invalid values out of the loop and
-    // emits a warning instead of failing the run.
-    let max_tool_iterations = if cli.max_tool_iterations.is_some() {
-        pi::agent::clamp_max_tool_iterations(cli.max_tool_iterations)
-    } else {
-        pi::agent::resolved_max_tool_iterations_default()
-    };
-    // Approval mode (bd-cv653.3.19): CLI flags override config.
-    let approval_mode = if cli.yolo {
-        pi::approval::ApprovalMode::Yolo
-    } else if let Some(ref m) = cli.approval_mode {
-        pi::approval::ApprovalMode::from_setting(Some(m))
-    } else {
-        config.approval_mode()
-    };
-    let dual_confirm_classes = config.approval_dual_confirm_classes();
-    let approval_state = pi::approval::ApprovalState::new(
-        approval_mode,
-        cli.plan_yolo || config.plan_auto_approve(),
-        dual_confirm_classes,
-    );
 
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
@@ -2245,22 +2422,17 @@ async fn run(
     // servers under a bounded global budget, and mount their tools as
     // first-class mcp__<server>__<tool> tools. Pending/denied servers are
     // never spawned; /mcp shows provenance + health for everything. The
-    // default FTUI constructs the manager owned by its actual SDK session,
-    // so do not discover and populate a second manager that will be dropped.
-    let mcp_manager = if ftui_requested {
-        None
-    } else {
-        Some(std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
-            &cwd,
-            &pi::config::Config::global_dir(),
-            &cli.mcp_config,
-            workspace_trusted,
-        )?))
-    };
+    // default FTUI launched above owns its manager through its SDK session.
+    let mcp_manager = std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
+        &cwd,
+        &pi::config::Config::global_dir(),
+        &cli.mcp_config,
+        workspace_trusted,
+    )?);
     let mut extension_bindings = Vec::new();
     let mut extension_model_entries = Vec::new();
 
-    if !ftui_requested && !resources.extensions().is_empty() {
+    if !resources.extensions().is_empty() {
         // Await the pre-warmed extension runtime (spawned earlier to overlap with
         // auth refresh, model selection, and session creation).
         let pre_warmed = if let Some((mgr, tools, join_handle)) = extension_prewarm_handle {
@@ -2333,16 +2505,14 @@ async fn run(
             // Bridge extension-registered MCP servers into the unified MCP
             // client registry (bd-cv653.6.1): same spawn path, same trust
             // gate, provenance=extension in /mcp.
-            if let Some(mcp_manager) = &mcp_manager {
-                for spec in region.manager().extension_mcp_servers() {
-                    let name = spec
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if !name.is_empty() {
-                        mcp_manager.register_extension_server(&name, &spec);
-                    }
+            for spec in region.manager().extension_mcp_servers() {
+                let name = spec
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !name.is_empty() {
+                    mcp_manager.register_extension_server(&name, &spec);
                 }
             }
             extension_bindings =
@@ -2421,7 +2591,7 @@ async fn run(
                 }
             }
         }
-    } else if !ftui_requested && !extension_flags.is_empty() {
+    } else if !extension_flags.is_empty() {
         let rendered = extension_flags
             .iter()
             .map(pi::cli::ExtensionCliFlag::display_name)
@@ -2434,23 +2604,15 @@ async fn run(
         );
     }
 
-    // The classic/RPC session owns this manager. FTUI constructs its actual
-    // Agent through the SDK below, so its SDK-owned manager performs the one
-    // connect-and-mount pass after that session's extensions load (bd-vjfol).
-    if let Some(mcp_manager) = &mcp_manager {
-        let mcp_wrappers = pi::mcp::connect_trusted_and_mount_tools(mcp_manager).await;
-        if !mcp_wrappers.is_empty() {
-            agent_session.agent.extend_tools(mcp_wrappers);
-        }
+    // The classic/RPC session owns this manager; FTUI's SDK-owned manager
+    // performs its own connect-and-mount pass after that session's
+    // extensions load (bd-vjfol).
+    let mcp_wrappers = pi::mcp::connect_trusted_and_mount_tools(&mcp_manager).await;
+    if !mcp_wrappers.is_empty() {
+        agent_session.agent.extend_tools(mcp_wrappers);
     }
 
-    #[cfg(feature = "ftui")]
-    let ftui_enabled_tools = enabled_tools
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect::<Vec<_>>();
-
-    if has_extensions && !ftui_requested {
+    if has_extensions {
         let session_snapshot = {
             let cx = pi::agent_cx::AgentCx::for_request();
             let session = agent_session
@@ -2572,9 +2734,7 @@ async fn run(
         // owns the MCP manager: servers extensions register after startup are
         // synced into the session at the next prompt (bd-1wr1n).
         let mut agent_session = agent_session;
-        if let Some(manager) = mcp_manager.clone() {
-            agent_session.set_mcp_manager(manager);
-        }
+        agent_session.set_mcp_manager(mcp_manager.clone());
         // Boxed: this future is large (clippy::large_futures); boxing keeps the
         // enclosing future small.
         Box::pin(run_rpc_mode(
@@ -2589,178 +2749,6 @@ async fn run(
             ask_tool,
         ))
         .await
-    } else if ftui_requested {
-        // FrankenTUI preview stack (bd-cv653.9.1): experimental, runs an
-        // ephemeral SDK session on its own driver runtime; the charmed
-        // stack stays the default until parity is proven. Drop the default
-        // stack's session first so nothing holds its resources while the
-        // preview runs.
-        drop(agent_session);
-        #[cfg(feature = "ftui")]
-        {
-            // `--continue` (bd-ydz1t.3). The classic stack resolves it inside
-            // Session::from_cli, which this path does not use; SessionOptions
-            // has no "reopen the latest" concept, so the flag was silently
-            // dropped and the user got a fresh session instead of their last
-            // one. Resolve it to a concrete path here, through the same lookup
-            // the classic stack uses, and hand it over as `session_path`.
-            //
-            // `--session` still wins, and `--no-session` short-circuits below,
-            // which is Session::from_cli's own precedence. `None` means this
-            // directory has nothing continuable, and a new session is exactly
-            // what the classic stack produces there too.
-            let continue_session_path = if cli.r#continue && cli.session.is_none() {
-                pi::session::Session::recent_session_path_in_dir(
-                    cli.session_dir.as_ref().map(Path::new),
-                )
-                .await?
-            } else {
-                None
-            };
-            let options = pi::sdk::SessionOptions {
-                provider: cli.provider.clone(),
-                model: cli.model.clone(),
-                api_key: cli.api_key.clone(),
-                working_directory: Some(cwd.clone()),
-                workspace_trusted,
-                // Session persistence honors the same flags as the default
-                // stack: saved by default, --no-session for ephemeral,
-                // --session/--session-dir for explicit paths. The SDK path
-                // creates its own session file; the default stack's early
-                // session was dropped above without writing anything.
-                no_session: cli.no_session,
-                session_path: cli
-                    .session
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .or(continue_session_path),
-                session_dir: cli.session_dir.as_ref().map(PathBuf::from),
-                // Explicit -e extension files load with UI prompts bridged
-                workspace: Some(workspace.clone()),
-                // (bd-1eoh4). Workspace/package-discovered extensions are a
-                // ResourceLoader integration follow-up.
-                // Extensions load with UI prompts bridged (bd-1eoh4): the
-                // ResourceLoader's discovered set (workspace/package/global)
-                // — which already folds in explicit -e paths and honors
-                // trust/policy filtering — plus nothing else.
-                extension_paths: if cli.no_extensions {
-                    Vec::new()
-                } else {
-                    resources.extensions().to_vec()
-                },
-                extension_policy: cli.extension_policy.clone(),
-                repair_policy: cli.repair_policy.clone(),
-                extension_flags: extension_flags.clone(),
-                // Prompt/tool/thinking flags flow through so deterministic
-                // harnesses (VCR body matching) and users get the same
-                // behavior as the default stack.
-                system_prompt: cli.system_prompt.clone(),
-                append_system_prompt: cli.append_system_prompt.clone(),
-                enabled_tools: Some(ftui_enabled_tools),
-                thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
-                include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
-                max_tool_iterations,
-                package_dir: Some(package_dir.clone()),
-                mcp: Some(pi::sdk::McpSessionOptions {
-                    config_paths: cli.mcp_config.clone(),
-                    global_dir: Some(pi::config::Config::global_dir()),
-                }),
-                // Approval gating (issue #196): the ftui stack previously
-                // dropped the approval mode entirely; thread the same state
-                // the classic stack uses so `ask`/`write` modes gate here
-                // too, prompting through the ask-card bridge.
-                approval_state: Some(approval_state.clone()),
-                // Provider retry (bd-u2qv4). Until now a 429 or a 529 was a
-                // hard error on this stack while the same request in print
-                // mode or over RPC retried and completed, and this is the
-                // stack most people run. `from_config` returns None when the
-                // user has set `retry.enabled = false`, so turning it off
-                // still means nobody re-enters the provider on their behalf.
-                // The retry events it emits already render here as system
-                // notes.
-                retry: pi::failover::RetryPolicy::from_config(&config),
-                // Cross-model failover (bd-u2qv4). A configured
-                // `retry.fallbackChains` used to be inert on this stack: the
-                // chain the user set up never ran on the surface they set it
-                // up for, while the identical request in print mode or over
-                // RPC walked it. `from_config` yields None when no chain is
-                // configured, which is the same condition under which the
-                // other surfaces decline.
-                failover: pi::sdk::FailoverOptions::from_config(
-                    &config,
-                    model_registry.get_available(),
-                    auth.clone(),
-                    cli.api_key.clone(),
-                ),
-                ..Default::default()
-            };
-            let theme = pi::theme::Theme::resolve(&config, &cwd);
-            // Same `disabledProviders` filter the classic stack applies when it
-            // builds its model list: without it the setting was silently
-            // ignored on this frontend and every catalog provider still
-            // appeared in the picker.
-            let ftui_models = model_registry
-                .get_available()
-                .into_iter()
-                .filter(|entry| {
-                    !pi::failover::provider_is_disabled(
-                        &disabled_providers,
-                        scope_override,
-                        &entry.model.provider,
-                    )
-                })
-                .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
-                .collect::<Vec<_>>();
-            // /resume picker entries: this cwd's saved sessions, newest first
-            // (same index the session picker uses). Failures degrade to an
-            // empty list — /resume then reports "no saved sessions".
-            let ftui_sessions = pi::session_index::SessionIndex::new()
-                .list_sessions(Some(&cwd.display().to_string()))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|meta| {
-                    let label = match &meta.name {
-                        Some(name) => format!("{name} · {} msgs", meta.message_count),
-                        None => format!("{} · {} msgs", meta.id, meta.message_count),
-                    };
-                    (label, meta.path)
-                })
-                .collect::<Vec<_>>();
-            pi::interactive_ftui::run(
-                options,
-                &theme,
-                cli.inline,
-                ftui_models,
-                ftui_sessions,
-                pi::interactive_ftui::FtuiSettings {
-                    markdown_spacing: config.markdown_spacing(),
-                    // Resolved exactly as the classic stack resolves it; the
-                    // `--no-mouse-capture` flag has already been folded into
-                    // `config.disable_mouse_capture` above.
-                    disable_mouse_capture: config.disable_mouse_capture.unwrap_or_else(|| {
-                        std::env::var("PI_NO_MOUSE_CAPTURE").is_ok_and(|val| val == "1")
-                    }),
-                    // `/share` on this stack (bd-ydz1t.1) runs the same gh flow
-                    // the classic stack does, so it reads the same setting.
-                    gh_path: config.gh_path.clone(),
-                    // `/tan` (bd-ydz1t.2) resolves its child model exactly as
-                    // the classic stack does: the `task` role, falling back to
-                    // `smol`.
-                    subagent_role_spec: pi::app::subagent_role_spec(&config),
-                },
-                pi::interactive_ftui::AutocompleteLaunch {
-                    catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
-                    cwd: cwd.clone(),
-                    max_visible: config
-                        .autocomplete_max_visible
-                        .and_then(|n| usize::try_from(n.clamp(3, 20)).ok())
-                        .unwrap_or(5),
-                },
-            )
-            .map_err(Into::into)
-        }
-        #[cfg(not(feature = "ftui"))]
-        unreachable!("ftui_requested is false without the ftui feature")
     } else if is_interactive {
         let model_scope = selection
             .scoped_models
@@ -2799,7 +2787,7 @@ async fn run(
             ask_tool,
             btw_client,
             Some(btw_factory),
-            mcp_manager,
+            Some(mcp_manager),
         ))
         .await
     } else {
@@ -2861,10 +2849,8 @@ async fn run(
 
     // Best-effort autosave flush on shutdown. OwnedMutexGuard: the guard is
     // held across the flush await, and the borrowed MutexGuard is !Send
-    // (clippy::future_not_send). FTUI owns and flushes a different SDK
-    // session; flushing this throwaway bootstrap session afterward could make
-    // stale state the last writer to the same session path.
-    if !cli.no_session && !ftui_requested {
+    // (clippy::future_not_send).
+    if !cli.no_session {
         let cx = pi::agent_cx::AgentCx::for_request();
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx).await
             && let Err(e) = guard.flush_autosave_on_shutdown().await
