@@ -241,8 +241,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Debug, PartialEq, Eq)]
 enum Invocation {
     Demo,
-    Plan { task: String, directory: Option<PathBuf> },
-    Resume { path: PathBuf },
+    Plan {
+        task: String,
+        directory: Option<PathBuf>,
+    },
+    Resume {
+        path: PathBuf,
+    },
 }
 
 fn usage() -> io::Error {
@@ -273,7 +278,12 @@ fn parse_invocation(args: impl Iterator<Item = String>) -> Result<Invocation, io
     let mut task = String::new();
     for word in args {
         let separator = usize::from(!task.is_empty());
-        if task.len().saturating_add(separator).saturating_add(word.len()) > 16 * 1024 {
+        if task
+            .len()
+            .saturating_add(separator)
+            .saturating_add(word.len())
+            > 16 * 1024
+        {
             return Err(io::Error::other("plan task exceeds 16 KiB"));
         }
         if separator != 0 {
@@ -289,7 +299,9 @@ fn parse_invocation(args: impl Iterator<Item = String>) -> Result<Invocation, io
 
 fn argument_path(value: String) -> Result<PathBuf, io::Error> {
     if value.trim().is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
-        return Err(io::Error::other("session path must be nonblank, control-free and at most 4096 UTF-8 bytes"));
+        return Err(io::Error::other(
+            "session path must be nonblank, control-free and at most 4096 UTF-8 bytes",
+        ));
     }
     Ok(PathBuf::from(value))
 }
@@ -320,7 +332,10 @@ async fn prepare_storage(
     let workspace = std::fs::canonicalize(std::env::current_dir()?)?;
     options.working_directory = Some(workspace.clone());
     match invocation {
-        Invocation::Plan { directory: Some(directory), .. } => {
+        Invocation::Plan {
+            directory: Some(directory),
+            ..
+        } => {
             options.no_session = false;
             options.session_dir = Some(directory.clone());
             Ok(None)
@@ -331,10 +346,16 @@ async fn prepare_storage(
             if !std::fs::metadata(&path)?.is_file() {
                 return Err(io::Error::other("resume requires an existing session file").into());
             }
-            let text_path = path.to_str().ok_or_else(|| io::Error::other("session path is not UTF-8"))?;
+            let text_path = path
+                .to_str()
+                .ok_or_else(|| io::Error::other("session path is not UTF-8"))?;
             let saved = pi::sdk::Session::open(text_path).await?;
             check_workspace(&saved.header.cwd, &workspace)?;
-            let expected = ResumeIdentity { id: saved.header.id.clone(), path: path.clone(), workspace };
+            let expected = ResumeIdentity {
+                id: saved.header.id.clone(),
+                path: path.clone(),
+                workspace,
+            };
             options.no_session = false;
             options.session_path = Some(path);
             // Let SDK startup resolve the saved model, not this demo's default.
@@ -342,7 +363,10 @@ async fn prepare_storage(
             options.model = None;
             Ok(Some(expected))
         }
-        Invocation::Demo | Invocation::Plan { directory: None, .. } => Ok(None),
+        Invocation::Demo
+        | Invocation::Plan {
+            directory: None, ..
+        } => Ok(None),
     }
 }
 
@@ -350,9 +374,15 @@ async fn verify_resumed_session(
     handle: &AgentSessionHandle,
     expected: &ResumeIdentity,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (id, cwd, path) = handle.with_session(|session| (
-        session.header.id.clone(), session.header.cwd.clone(), session.path.clone(),
-    )).await?;
+    let (id, cwd, path) = handle
+        .with_session(|session| {
+            (
+                session.header.id.clone(),
+                session.header.cwd.clone(),
+                session.path.clone(),
+            )
+        })
+        .await?;
     check_resume_identity(expected, &id, &cwd, path.as_deref())?;
     Ok(())
 }
@@ -363,9 +393,12 @@ fn check_resume_identity(
     cwd: &str,
     path: Option<&Path>,
 ) -> Result<(), io::Error> {
-    let path = path.ok_or_else(|| io::Error::other("SDK did not open the requested saved session"))?;
+    let path =
+        path.ok_or_else(|| io::Error::other("SDK did not open the requested saved session"))?;
     if id != expected.id || std::fs::canonicalize(path)? != expected.path {
-        return Err(io::Error::other("session identity changed during startup; no plan was restored"));
+        return Err(io::Error::other(
+            "session identity changed during startup; no plan was restored",
+        ));
     }
     check_workspace(cwd, &expected.workspace)
 }
@@ -374,7 +407,10 @@ async fn print_session_path(handle: &AgentSessionHandle) -> Result<(), Box<dyn s
     if handle.session().save_enabled()
         && let Some(path) = handle.with_session(|session| session.path.clone()).await?
     {
-        eprintln!("Saved plan session: {}", path.display().to_string().escape_debug());
+        eprintln!(
+            "Saved plan session: {}",
+            path.display().to_string().escape_debug()
+        );
     }
     Ok(())
 }
@@ -399,13 +435,19 @@ async fn run_reviewed_plan(
         Invocation::Plan { task, .. } => {
             check_plan_change(&handle.enter_plan_mode(&owner).await?)?;
             print_session_path(handle).await?;
-            let _ = handle.prompt(format!(
-                "Plan this task without making changes: {task}\n\
+            let _ = handle
+                .prompt(
+                    format!(
+                        "Plan this task without making changes: {task}\n\
                  Finish by calling submit_plan with the complete plan and its files array."
-            ), |_| {}).await?;
+                    ),
+                    |_| {},
+                )
+                .await?;
         }
         Invocation::Resume { .. } => {
-            let expected = expected_resume.ok_or_else(|| io::Error::other("missing resume identity"))?;
+            let expected =
+                expected_resume.ok_or_else(|| io::Error::other("missing resume identity"))?;
             verify_resumed_session(handle, expected).await?;
             let restored = handle.restore_plan_checkpoint(&owner).await?;
             check_plan_change(&restored)?;
@@ -413,7 +455,12 @@ async fn run_reviewed_plan(
             match restored.mode {
                 pi::plan::PlanMode::PendingApproval => {}
                 pi::plan::PlanMode::Planning => {
-                    let draft = handle.session().agent.plan_state().plan().unwrap_or_default();
+                    let draft = handle
+                        .session()
+                        .agent
+                        .plan_state()
+                        .plan()
+                        .unwrap_or_default();
                     let _ = handle.prompt(format!(
                         "Resume read-only planning. Revise and complete the recovered draft below, \
                          then call submit_plan with the full plan and its files array. \
@@ -421,11 +468,16 @@ async fn run_reviewed_plan(
                     ), |_| {}).await?;
                 }
                 pi::plan::PlanMode::Off => {
-                    println!("This saved plan was exited. No provider turn or execution was started.");
+                    println!(
+                        "This saved plan was exited. No provider turn or execution was started."
+                    );
                     return Ok(());
                 }
                 pi::plan::PlanMode::Approved => {
-                    return Err(io::Error::other("recovery unexpectedly granted approval; execution refused").into());
+                    return Err(io::Error::other(
+                        "recovery unexpectedly granted approval; execution refused",
+                    )
+                    .into());
                 }
             }
         }
@@ -442,31 +494,43 @@ async fn run_reviewed_plan(
 
 fn check_checkpoint(persistence: pi::plan::PlanPersistence) -> Result<(), io::Error> {
     if let pi::plan::PlanPersistence::Unconfirmed { reason } = persistence {
-        return Err(io::Error::other(format!("Plan remains live, but checkpoint saving was not confirmed: {reason}")));
+        return Err(io::Error::other(format!(
+            "Plan remains live, but checkpoint saving was not confirmed: {reason}"
+        )));
     }
     Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ReviewDecision { Approve, Reject, Later }
+enum ReviewDecision {
+    Approve,
+    Reject,
+    Later,
+}
 
 fn read_decision(input: impl io::BufRead) -> Result<ReviewDecision, io::Error> {
     let mut bytes = Vec::new();
     let mut bounded = io::Read::take(input, 129);
     io::BufRead::read_until(&mut bounded, b'\n', &mut bytes)?;
     if bytes.len() > 128 {
-        return Err(io::Error::other("confirmation line exceeds 128 bytes; no decision applied"));
+        return Err(io::Error::other(
+            "confirmation line exceeds 128 bytes; no decision applied",
+        ));
     }
     // A truncated or unterminated prefix must never count as an approval.
     // EOF defers; it does not reject and discard a saved pending proposal.
-    if !bytes.ends_with(b"\n") { return Ok(ReviewDecision::Later); }
+    if !bytes.ends_with(b"\n") {
+        return Ok(ReviewDecision::Later);
+    }
     let line = std::str::from_utf8(&bytes)
         .map_err(|_| io::Error::other("confirmation is not valid UTF-8"))?;
     match line.trim() {
         "approve" => Ok(ReviewDecision::Approve),
         "reject" => Ok(ReviewDecision::Reject),
         "later" | "" => Ok(ReviewDecision::Later),
-        _ => Err(io::Error::other("expected approve, reject or later; no decision applied")),
+        _ => Err(io::Error::other(
+            "expected approve, reject or later; no decision applied",
+        )),
     }
 }
 
@@ -492,13 +556,17 @@ async fn review_and_execute(
             if handle.session().save_enabled() {
                 println!("Review deferred and saved. Resume this session file to review it later.");
             } else {
-                println!("No execution started. This ephemeral plan will not survive exit; use --save-plan to retain a future plan.");
+                println!(
+                    "No execution started. This ephemeral plan will not survive exit; use --save-plan to retain a future plan."
+                );
             }
             return Ok(());
         }
         ReviewDecision::Reject => {
             check_plan_change(&handle.reject_plan_review(owner, review).await?)?;
-            println!("Plan rejected; no execution turn started. Saved sessions resume read-only revision.");
+            println!(
+                "Plan rejected; no execution turn started. Saved sessions resume read-only revision."
+            );
             return Ok(());
         }
         ReviewDecision::Approve => {}
@@ -515,8 +583,8 @@ async fn review_and_execute(
         "Execute the approved plan pinned in context. Only its declared file edits are permitted.",
         |_| {},
     ).await?;
-    let completed = assistant.stop_reason == pi::sdk::StopReason::Stop
-        && !policy.surface_was_unavailable();
+    let completed =
+        assistant.stop_reason == pi::sdk::StopReason::Stop && !policy.surface_was_unavailable();
     for block in assistant.content {
         if let ContentBlock::Text(text) = block {
             for line in text.text.split('\n') {
@@ -539,7 +607,10 @@ mod tests {
 
     #[test]
     fn plan_task_is_explicit_and_bounded() {
-        assert_eq!(parse_invocation(std::iter::empty()).unwrap(), Invocation::Demo);
+        assert_eq!(
+            parse_invocation(std::iter::empty()).unwrap(),
+            Invocation::Demo
+        );
         for args in [
             vec!["--plan"],
             vec!["--plan", " "],
@@ -554,22 +625,40 @@ mod tests {
                     .map(str::to_string)
             )
             .unwrap(),
-            Invocation::Plan { task: "improve parser".to_string(), directory: None },
+            Invocation::Plan {
+                task: "improve parser".to_string(),
+                directory: None
+            },
         );
-        assert!(parse_invocation(["--plan".to_string(), "x".repeat(16 * 1024 + 1)].into_iter()).is_err());
+        assert!(
+            parse_invocation(["--plan".to_string(), "x".repeat(16 * 1024 + 1)].into_iter())
+                .is_err()
+        );
     }
 
     #[test]
     fn saved_planning_and_exact_file_resume_have_distinct_required_arguments() {
         let parse = |args: &[&str]| parse_invocation(args.iter().map(|value| (*value).to_string()));
-        assert_eq!(parse(&["--save-plan", "session folder", "improve", "parser"]).unwrap(),
-            Invocation::Plan { task: "improve parser".to_string(), directory: Some(PathBuf::from("session folder")) });
-        assert_eq!(parse(&["--resume-plan", "session folder/计划.jsonl"]).unwrap(),
-            Invocation::Resume { path: PathBuf::from("session folder/计划.jsonl") });
+        assert_eq!(
+            parse(&["--save-plan", "session folder", "improve", "parser"]).unwrap(),
+            Invocation::Plan {
+                task: "improve parser".to_string(),
+                directory: Some(PathBuf::from("session folder"))
+            }
+        );
+        assert_eq!(
+            parse(&["--resume-plan", "session folder/计划.jsonl"]).unwrap(),
+            Invocation::Resume {
+                path: PathBuf::from("session folder/计划.jsonl")
+            }
+        );
         for args in [
-            vec!["--save-plan"], vec!["--save-plan", "directory"],
-            vec!["--save-plan", " ", "task"], vec!["--resume-plan"],
-            vec!["--resume-plan", ""], vec!["--resume-plan", "file", "ignored task"],
+            vec!["--save-plan"],
+            vec!["--save-plan", "directory"],
+            vec!["--save-plan", " ", "task"],
+            vec!["--resume-plan"],
+            vec!["--resume-plan", ""],
+            vec!["--resume-plan", "file", "ignored task"],
             vec!["--resume-plan", "bad\npath"],
         ] {
             assert!(parse(&args).is_err(), "{args:?}");
@@ -581,7 +670,12 @@ mod tests {
         let exact = "é".repeat(16 * 1024 / 2);
         assert!(parse_invocation(["--plan".to_string(), exact.clone()].into_iter()).is_ok());
         for tail in ["", "x", " "] {
-            assert!(parse_invocation(["--plan".to_string(), exact.clone(), tail.to_string()].into_iter()).is_err());
+            assert!(
+                parse_invocation(
+                    ["--plan".to_string(), exact.clone(), tail.to_string()].into_iter()
+                )
+                .is_err()
+            );
         }
         assert!(argument_path("é".repeat(2048)).is_ok());
         assert!(argument_path("é".repeat(2049)).is_err());
@@ -590,14 +684,27 @@ mod tests {
     #[test]
     fn review_confirmation_requires_an_explicit_complete_line() {
         for (input, expected) in [
-            ("approve\n", ReviewDecision::Approve), (" approve\r\n", ReviewDecision::Approve),
-            ("reject\n", ReviewDecision::Reject), ("later\n", ReviewDecision::Later),
-            ("\n", ReviewDecision::Later), ("", ReviewDecision::Later),
-            ("approve", ReviewDecision::Later), ("reject", ReviewDecision::Later),
+            ("approve\n", ReviewDecision::Approve),
+            (" approve\r\n", ReviewDecision::Approve),
+            ("reject\n", ReviewDecision::Reject),
+            ("later\n", ReviewDecision::Later),
+            ("\n", ReviewDecision::Later),
+            ("", ReviewDecision::Later),
+            ("approve", ReviewDecision::Later),
+            ("reject", ReviewDecision::Later),
         ] {
-            assert_eq!(read_decision(input.as_bytes()).unwrap(), expected, "{input:?}");
+            assert_eq!(
+                read_decision(input.as_bytes()).unwrap(),
+                expected,
+                "{input:?}"
+            );
         }
-        for input in ["yes\n", "APPROVE\n", "approve another plan\n", "approve\0\n"] {
+        for input in [
+            "yes\n",
+            "APPROVE\n",
+            "approve another plan\n",
+            "approve\0\n",
+        ] {
             assert!(read_decision(input.as_bytes()).is_err());
         }
         assert!(read_decision(&b"approve\xff\n"[..]).is_err());
@@ -609,7 +716,10 @@ mod tests {
         assert!(read_decision(attack.as_bytes()).is_err());
         let exact = format!("approve{}\n", " ".repeat(120));
         assert_eq!(exact.len(), 128);
-        assert_eq!(read_decision(exact.as_bytes()).unwrap(), ReviewDecision::Approve);
+        assert_eq!(
+            read_decision(exact.as_bytes()).unwrap(),
+            ReviewDecision::Approve
+        );
         let too_long = format!("approve{}\n", " ".repeat(121));
         assert!(read_decision(too_long.as_bytes()).is_err());
     }
@@ -645,13 +755,36 @@ mod tests {
     #[test]
     fn unconfirmed_save_prevents_execution_while_acknowledging_the_live_decision() {
         use pi::plan::{PlanChange, PlanMode, PlanPersistence};
-        for persistence in [PlanPersistence::Saved, PlanPersistence::MemoryOnly, PlanPersistence::Unchanged] {
+        for persistence in [
+            PlanPersistence::Saved,
+            PlanPersistence::MemoryOnly,
+            PlanPersistence::Unchanged,
+        ] {
             assert!(check_checkpoint(persistence.clone()).is_ok());
-            assert!(check_plan_change(&PlanChange { mode: PlanMode::PendingApproval, changed: true, persistence }).is_ok());
+            assert!(
+                check_plan_change(&PlanChange {
+                    mode: PlanMode::PendingApproval,
+                    changed: true,
+                    persistence
+                })
+                .is_ok()
+            );
         }
-        let persistence = PlanPersistence::Unconfirmed { reason: "disk full".to_string() };
-        assert!(check_checkpoint(persistence.clone()).unwrap_err().to_string().contains("remains live"));
-        let error = check_plan_change(&PlanChange { mode: PlanMode::Approved, changed: true, persistence }).unwrap_err();
+        let persistence = PlanPersistence::Unconfirmed {
+            reason: "disk full".to_string(),
+        };
+        assert!(
+            check_checkpoint(persistence.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("remains live")
+        );
+        let error = check_plan_change(&PlanChange {
+            mode: PlanMode::Approved,
+            changed: true,
+            persistence,
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("Approved"));
         assert!(error.to_string().contains("not confirmed"));
     }
@@ -659,7 +792,9 @@ mod tests {
     fn run<F: std::future::Future>(future: F) -> F::Output {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
-            .build().unwrap().block_on(future)
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     #[test]
@@ -669,10 +804,16 @@ mod tests {
         let workspace = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         let mut saved = pi::sdk::Session::in_memory();
         saved.header.cwd = workspace.to_str().unwrap().to_string();
-        std::fs::write(&path, format!("{}\n", serde_json::to_string(&saved.header).unwrap())).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&saved.header).unwrap()),
+        )
+        .unwrap();
         let invocation = Invocation::Resume { path: path.clone() };
         let mut options = SessionOptions::default();
-        let expected = run(prepare_storage(&invocation, &mut options)).unwrap().unwrap();
+        let expected = run(prepare_storage(&invocation, &mut options))
+            .unwrap()
+            .unwrap();
         assert_eq!(expected.id, saved.header.id);
         assert_eq!(expected.path, std::fs::canonicalize(&path).unwrap());
         assert_eq!(options.session_path, Some(expected.path.clone()));
@@ -680,13 +821,32 @@ mod tests {
         assert!(!options.no_session);
         assert!(options.provider.is_none());
         assert!(options.model.is_none());
-        assert!(check_resume_identity(&expected, &saved.header.id, &saved.header.cwd, Some(&path)).is_ok());
-        assert!(check_resume_identity(&expected, "replacement", &saved.header.cwd, Some(&path)).is_err());
-        assert!(check_resume_identity(&expected, &saved.header.id, &saved.header.cwd, None).is_err());
-        assert!(check_resume_identity(&expected, &saved.header.id, temp.path().to_str().unwrap(), Some(&path)).is_err());
+        assert!(
+            check_resume_identity(&expected, &saved.header.id, &saved.header.cwd, Some(&path))
+                .is_ok()
+        );
+        assert!(
+            check_resume_identity(&expected, "replacement", &saved.header.cwd, Some(&path))
+                .is_err()
+        );
+        assert!(
+            check_resume_identity(&expected, &saved.header.id, &saved.header.cwd, None).is_err()
+        );
+        assert!(
+            check_resume_identity(
+                &expected,
+                &saved.header.id,
+                temp.path().to_str().unwrap(),
+                Some(&path)
+            )
+            .is_err()
+        );
         let other = temp.path().join("other.jsonl");
         std::fs::copy(&path, &other).unwrap();
-        assert!(check_resume_identity(&expected, &saved.header.id, &saved.header.cwd, Some(&other)).is_err());
+        assert!(
+            check_resume_identity(&expected, &saved.header.id, &saved.header.cwd, Some(&other))
+                .is_err()
+        );
     }
 
     #[test]
@@ -707,11 +867,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("plans");
         let mut options = SessionOptions::default();
-        let invocation = Invocation::Plan { task: "task".to_string(), directory: Some(directory.clone()) };
-        assert!(run(prepare_storage(&invocation, &mut options)).unwrap().is_none());
+        let invocation = Invocation::Plan {
+            task: "task".to_string(),
+            directory: Some(directory.clone()),
+        };
+        assert!(
+            run(prepare_storage(&invocation, &mut options))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(options.session_dir, Some(directory.clone()));
         assert!(!options.no_session);
         assert!(options.session_path.is_none());
-        assert!(!directory.exists(), "SDK creation owns persistence, not preflight");
+        assert!(
+            !directory.exists(),
+            "SDK creation owns persistence, not preflight"
+        );
     }
 }
