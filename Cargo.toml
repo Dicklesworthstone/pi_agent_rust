@@ -154,6 +154,14 @@ required-features = ["ftui"]
 name = "pi_debug"
 path = "examples/pi_debug.rs"
 
+# Deliberately also declared as a [[bench]] below. Cargo warns on every
+# invocation that this path "is present in multiple build targets"; the warning
+# is expected and neither half is removable. `scripts/bench_extension_workloads.sh`
+# builds it with `--example pijs_workload` and times the binary at
+# `$profile/examples/pijs_workload` with hyperfine, while `tests/bench_schema.rs`
+# asserts the criterion regression gate invokes `cargo bench --bench
+# pijs_workload --profile perf`. Deleting either declaration to silence the
+# warning breaks one of those.
 [[example]]
 name = "pijs_workload"
 path = "examples/pijs_workload.rs"
@@ -408,6 +416,8 @@ harness = false
 name = "semantic_context"
 harness = false
 
+# The other half of the deliberate duplication; see the [[example]] entry for
+# this same path above before removing either.
 [[bench]]
 name = "pijs_workload"
 path = "examples/pijs_workload.rs"

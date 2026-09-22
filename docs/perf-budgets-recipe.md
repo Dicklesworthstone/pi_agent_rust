@@ -40,6 +40,25 @@ For `pi_agent_rust`, the recipe is, as reported by
 6. `python3 scripts/check_module_reachability.py`
 7. `python3 scripts/check_fixture_read_patience.py`
 
+Checks 2 and 3 are missing `--keep-going`, so the first target that fails
+to compile hides every other compile failure in the run. AGENTS.md
+documents this hazard by name — nineteen targets broken by one
+`asupersync` bump on 2026-09-13 took nine sequential clippy runs to
+enumerate — and the registered recipe does not take its own advice. The
+flag is documented in `cargo check --help`; clippy accepts it too. Add it
+to both:
+
+```yaml
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check --locked --all-targets --keep-going
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy --locked --all-targets --keep-going -- -D warnings
+```
+
+Not check 4: `--keep-going` is not a `cargo test` flag, and
+`--no-fail-fast` — which the recipe already passes — governs test
+failures, not build failures. No test binary runs while any required
+target fails to build; that is expected behaviour, not a second defect.
+Tracked as `bd-7ilwr`.
+
 `scripts/check_readme_evidence_freshness.py` is **not** in this recipe,
 so nothing in the gate notices when README evidence claims drift away
 from `tests/perf/reports/budget_summary.json`. That is how the README
