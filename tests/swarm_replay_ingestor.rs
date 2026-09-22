@@ -418,7 +418,7 @@ fn write_no_mock_e2e_sources(root: &Path) -> std::io::Result<()> {
                 ],
                 "evidence_paths": [
                     "tests/golden_corpus/swarm_replay_trace/normalized_trace.json",
-                    "tests/e2e_results/20260422T201126Z/replay_bundle.json"
+                    "tests/full_suite_gate/replay_bundle.json"
                 ],
                 "created_at": "2026-05-13T18:11:00Z"
             }
@@ -449,7 +449,7 @@ fn write_no_mock_e2e_sources(root: &Path) -> std::io::Result<()> {
             }],
             "artifacts": [
                 {
-                    "artifact_path": "tests/e2e_results/20260422T201126Z/replay_bundle.json",
+                    "artifact_path": "tests/full_suite_gate/replay_bundle.json",
                     "artifact_schema": "pi.e2e.replay_bundle.v1",
                     "verdict": "observed",
                     "command": "scripts/e2e/run_all.sh",
@@ -1550,10 +1550,19 @@ fn no_mock_e2e_harness_emits_auditable_replay_evidence() -> TestResult {
         );
     }
 
+    // The point of this assertion is that the handoff above recommends evidence
+    // a reader can actually open, so the fixture must name real artifacts.
+    //
+    // It named `tests/e2e_results/20260422T201126Z/replay_bundle.json` until
+    // 2026-09-22, which `git log --all` shows was never committed to this
+    // repository — so this test had never passed. It surfaced only when the
+    // suite became runnable again after a fifteen-hour build break.
+    // `tests/full_suite_gate/replay_bundle.json` is checked in and carries the
+    // same `pi.e2e.replay_bundle.v1` schema the fixture claims for it.
     let checked_in_paths = [
         "docs/contracts/swarm-operator-runpack-contract.json",
         "tests/golden_corpus/swarm_operator_runpack/complete_runpack_projection.json",
-        "tests/e2e_results/20260422T201126Z/replay_bundle.json",
+        "tests/full_suite_gate/replay_bundle.json",
     ];
     for path in checked_in_paths {
         assert!(

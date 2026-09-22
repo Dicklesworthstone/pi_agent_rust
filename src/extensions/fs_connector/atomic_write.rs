@@ -298,7 +298,11 @@ impl Stage {
         #[cfg(unix)]
         {
             use rustix::fs::{AtFlags, FileType, fstat, statat};
-            let named = statat(&self.parent.directory, &self.name, AtFlags::SYMLINK_NOFOLLOW)?;
+            let named = statat(
+                &self.parent.directory,
+                &self.name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )?;
             let opened = fstat(&self.file)?;
             if named.st_dev != opened.st_dev
                 || named.st_ino != opened.st_ino
@@ -331,7 +335,8 @@ impl Stage {
                     "atomic replacement would change file ownership",
                 ));
             }
-            self.file.set_permissions(fs::Permissions::from_mode(existing.mode() & 0o777))
+            self.file
+                .set_permissions(fs::Permissions::from_mode(existing.mode() & 0o777))
         }
         #[cfg(not(unix))]
         {
@@ -347,7 +352,11 @@ impl Stage {
         self.verify_name()?;
         #[cfg(unix)]
         {
-            rustix::fs::unlinkat(&self.parent.directory, &self.name, rustix::fs::AtFlags::empty())?;
+            rustix::fs::unlinkat(
+                &self.parent.directory,
+                &self.name,
+                rustix::fs::AtFlags::empty(),
+            )?;
         }
         #[cfg(not(unix))]
         fs::remove_file(self.parent.directory.join(&self.name))?;
@@ -588,7 +597,10 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.details.unwrap()["commit_state"], "not_committed");
-        assert_eq!(fs::read(&path).unwrap(), b"external edit with distinct size");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"external edit with distinct size"
+        );
         assert!(stages(temp.path()).is_empty());
     }
 
@@ -675,7 +687,12 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read(&outside).unwrap(), b"secret");
-        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(stages(temp.path()).is_empty());
     }
 }
