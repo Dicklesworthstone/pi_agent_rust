@@ -1151,6 +1151,15 @@ impl<'de> Deserialize<'de> for KeyBinding {
 /// ever read the catalog, so nothing is lost by moving it here.
 #[must_use]
 pub fn format_hotkeys(keybindings: &KeyBindings) -> String {
+    format_hotkeys_filtered(keybindings, |_| true)
+}
+
+/// Formats keybindings for display in `/hotkeys`, optionally filtering actions.
+#[must_use]
+pub fn format_hotkeys_filtered<F>(keybindings: &KeyBindings, mut filter: F) -> String
+where
+    F: FnMut(AppAction) -> bool,
+{
     use std::fmt::Write;
 
     let mut output = String::new();
@@ -1165,7 +1174,10 @@ pub fn format_hotkeys(keybindings: &KeyBindings) -> String {
     let _ = writeln!(output);
 
     for category in ActionCategory::all() {
-        let actions: Vec<_> = keybindings.iter_category(*category).collect();
+        let actions: Vec<_> = keybindings
+            .iter_category(*category)
+            .filter(|(action, _)| filter(*action))
+            .collect();
 
         // Skip empty categories
         if actions.iter().all(|(_, bindings)| bindings.is_empty()) {
@@ -1193,6 +1205,33 @@ pub fn format_hotkeys(keybindings: &KeyBindings) -> String {
     }
 
     output
+}
+
+/// Formats keybindings for display on the FrankenTUI stack, omitting actions
+/// that are currently unrouted/inert on FTUI.
+#[must_use]
+pub fn format_hotkeys_for_ftui(keybindings: &KeyBindings) -> String {
+    format_hotkeys_filtered(keybindings, |action| !is_inert_on_ftui(action))
+}
+
+/// Checks whether an action is currently unrouted/inert on the FTUI interactive stack.
+#[must_use]
+pub const fn is_inert_on_ftui(action: AppAction) -> bool {
+    matches!(
+        action,
+        AppAction::CycleModelForward
+            | AppAction::CycleModelBackward
+            | AppAction::ExpandTools
+            | AppAction::ToggleThinking
+            | AppAction::OpenSettings
+            | AppAction::ExternalEditor
+            | AppAction::FollowUp
+            | AppAction::Dequeue
+            | AppAction::Copy
+            | AppAction::Clear
+            | AppAction::Yank
+            | AppAction::YankPop
+    )
 }
 
 /// Complete keybindings configuration.
@@ -2993,6 +3032,29 @@ mod tests {
             let hotkeys = format_hotkeys(&bindings);
             assert!(!hotkeys.contains("Paste most recently deleted text"));
             assert!(!hotkeys.contains("Cycle through deleted text"));
+        }
+
+        #[test]
+        fn ftui_hotkeys_filter_omits_inert_actions() {
+            let bindings = KeyBindings::default();
+            let ftui_hotkeys = format_hotkeys_for_ftui(&bindings);
+
+            // Supported actions appear:
+            assert!(ftui_hotkeys.contains("Open model selector"));
+            assert!(ftui_hotkeys.contains("Show help"));
+            assert!(ftui_hotkeys.contains("Cycle thinking level"));
+            assert!(ftui_hotkeys.contains("Submit input"));
+            assert!(ftui_hotkeys.contains("Insert new line"));
+
+            // Inert actions on FTUI are omitted:
+            assert!(!ftui_hotkeys.contains("Cycle to next model"));
+            assert!(!ftui_hotkeys.contains("Cycle to previous model"));
+            assert!(!ftui_hotkeys.contains("Collapse/expand tool output"));
+            assert!(!ftui_hotkeys.contains("Collapse/expand thinking blocks"));
+            assert!(!ftui_hotkeys.contains("Open settings"));
+            assert!(!ftui_hotkeys.contains("Open in external editor"));
+            assert!(!ftui_hotkeys.contains("Queue follow-up message"));
+            assert!(!ftui_hotkeys.contains("Restore queued messages to editor"));
         }
     }
 }

@@ -2486,13 +2486,11 @@ impl PiFtuiModel {
             return true;
         }
         if canon == "/hotkeys" || canon == "/keys" || canon == "/keybindings" {
-            // The same listing the classic stack prints, off the same catalog
-            // this stack now loads from the user's keybindings.json. Without
-            // it there was no way to see the key map on the default stack at
-            // all: the command answered "Unknown command: /hotkeys".
+            // The key map formatted specifically for the FTUI stack from the user's
+            // keybindings catalog, omitting chords that are unrouted/inert on FTUI.
             self.push_entry(
                 EntryRole::System,
-                crate::keybindings::format_hotkeys(&self.keybindings),
+                crate::keybindings::format_hotkeys_for_ftui(&self.keybindings),
             );
             return true;
         }
@@ -5993,6 +5991,14 @@ mod tests {
         assert!(
             text.contains("ctrl+g"),
             "the listing should reflect the user's own override: {text:?}"
+        );
+        assert!(
+            !text.contains("Queue follow-up message"),
+            "unsupported actions like FollowUp must not be advertised on FTUI: {text:?}"
+        );
+        assert!(
+            !text.contains("Open settings"),
+            "unsupported actions like OpenSettings must not be advertised on FTUI: {text:?}"
         );
     }
 
