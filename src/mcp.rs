@@ -38,9 +38,7 @@ pub fn bootstrap_with_project_trust(
     cli_paths: &[PathBuf],
     project_trusted: bool,
 ) -> crate::error::Result<McpManager> {
-    let discovery =
-        config::discover_with_project_trust(cwd, global_dir, cli_paths, project_trusted);
-    Ok(McpManager::new(cwd, global_dir, discovery))
+    McpManager::bootstrap_with_project_trust(cwd, global_dir, cli_paths, project_trusted)
 }
 
 /// Mounted tool name cap (provider schemas reject longer names).

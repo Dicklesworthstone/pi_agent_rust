@@ -234,6 +234,67 @@ fn mcp_discovery_skips_untrusted_project_sources_without_reading_them() {
 }
 
 #[test]
+fn mcp_manager_bootstrap_with_project_trust_honors_workspace_trust() {
+    let case = "mcp_manager_bootstrap_with_project_trust_honors_workspace_trust";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let global = harness.temp_path("global");
+    std::fs::create_dir_all(root.join(".pi")).expect("create project config dir");
+    std::fs::create_dir_all(&global).expect("create global config dir");
+
+    std::fs::write(
+        root.join(".pi/mcp.json"),
+        r#"{"mcpServers":{"project-server":{"command":"project-bin"}}}"#,
+    )
+    .expect("write project MCP config");
+    std::fs::write(
+        global.join("mcp.json"),
+        r#"{"mcpServers":{"global-server":{"command":"global-bin"}}}"#,
+    )
+    .expect("write global MCP config");
+    let explicit = harness.temp_path("explicit-mcp.json");
+    std::fs::write(
+        &explicit,
+        r#"{"mcpServers":{"explicit-server":{"command":"explicit-bin"}}}"#,
+    )
+    .expect("write explicit MCP config");
+
+    let untrusted = McpManager::bootstrap_with_project_trust(
+        &root,
+        &global,
+        std::slice::from_ref(&explicit),
+        false,
+    )
+    .expect("untrusted bootstrap");
+    let mut untrusted_names = untrusted
+        .list()
+        .into_iter()
+        .map(|server| server.name)
+        .collect::<Vec<_>>();
+    untrusted_names.sort_unstable();
+    assert_eq!(untrusted_names, vec!["explicit-server", "global-server"]);
+
+    let trusted = pi::mcp::bootstrap_with_project_trust(
+        &root,
+        &global,
+        std::slice::from_ref(&explicit),
+        true,
+    )
+    .expect("trusted bootstrap");
+    let mut trusted_names = trusted
+        .list()
+        .into_iter()
+        .map(|server| server.name)
+        .collect::<Vec<_>>();
+    trusted_names.sort_unstable();
+    assert_eq!(
+        trusted_names,
+        vec!["explicit-server", "global-server", "project-server"]
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
 fn mcp_pending_and_list_surfaces_do_not_expose_target_credentials() {
     let case = "mcp_pending_and_list_surfaces_do_not_expose_target_credentials";
     let harness = TestHarness::new(case);
