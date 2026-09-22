@@ -76,24 +76,27 @@ async fn finish_selection_inner(
         .is_some_and(|key| !key.trim().is_empty());
 
     // Native startup cannot refresh OAuth configurations that have not been
-    // registered yet. Refresh each extension provider independently, retaining
-    // failures until the selected identity is known. An unrelated stale login
-    // must not prevent a session from opening with a different provider.
-    let mut refresh_failures = HashMap::new();
-    if !explicit_key {
-        let client = crate::http::client::Client::new();
-        for binding in &bindings {
-            if let Some(config) = &binding.oauth_config {
-                let configs = HashMap::from([(binding.provider.clone(), config.clone())]);
-                if let Err(error) = auth
-                    .refresh_expired_extension_oauth_tokens(&client, &configs)
-                    .await
-                {
-                    refresh_failures.insert(binding.provider.clone(), error.to_string());
-                }
-            }
-        }
-    }
+    // registered yet. An explicitly routed session must not contact unrelated
+    // token endpoints at all, rather than merely ignoring their errors later.
+    // Automatic/bare-model selection still refreshes candidates first: expired
+    // OAuth credentials are not ready until refreshed, so selecting beforehand
+    // could silently move a resumed/configured session to a different provider.
+    let configs = bindings
+        .iter()
+        .filter_map(|binding| {
+            binding
+                .oauth_config
+                .as_ref()
+                .map(|config| (binding.provider.clone(), config.clone()))
+        })
+        .collect::<Vec<_>>();
+    let refresh_failures = refresh_extension_credentials(
+        auth,
+        inputs.cli,
+        &configs,
+        &crate::http::client::Client::new(),
+    )
+    .await;
 
     // Refresh the registry's credential snapshot as well as the auth store.
     // Provider-only bindings (including overrides of built-in transports) and
@@ -127,7 +130,9 @@ async fn finish_selection_inner(
 
     let selected_provider = &selection.model_entry.model.provider;
     if !explicit_key {
-        if let Some(error) = refresh_failures.get(selected_provider) {
+        if let Some((_, error)) = refresh_failures.iter().find(|(provider, _)| {
+            crate::provider_metadata::provider_ids_match(provider, selected_provider)
+        }) {
             return Err(Error::auth(format!(
                 "OAuth token refresh failed for: {selected_provider} ({error})"
             )));
@@ -135,10 +140,10 @@ async fn finish_selection_inner(
         // An extension's explicit OAuth configuration supersedes a built-in
         // refresher for the same provider. Otherwise retain native startup's
         // selected-provider error behavior.
-        if !bindings
-            .iter()
-            .any(|binding| binding.provider == *selected_provider && binding.oauth_config.is_some())
-            && let Some(failure) = inputs.oauth_refresh.failure_for(selected_provider)
+        if !bindings.iter().any(|binding| {
+            crate::provider_metadata::provider_ids_match(&binding.provider, selected_provider)
+                && binding.oauth_config.is_some()
+        }) && let Some(failure) = inputs.oauth_refresh.failure_for(selected_provider)
         {
             return Err(Error::auth(format!(
                 "OAuth token refresh failed for: {} ({})",
@@ -198,6 +203,46 @@ async fn finish_selection_inner(
     );
     session.refresh_extension_completion_host_state();
     Ok(())
+}
+
+/// Match the same explicit-provider precedence as app::select_model_and_thinking.
+/// A bare model can exist in several providers; do not guess its owner before
+/// credentials are refreshed. The registered runtime identity stays unchanged.
+fn refresh_matches_request(cli: &Cli, provider: &str) -> bool {
+    let requested = cli.provider.as_deref().or_else(|| {
+        cli.model
+            .as_deref()
+            .and_then(crate::provider_metadata::split_provider_model_spec)
+            .map(|(provider, _)| provider)
+    });
+    requested.is_none_or(|requested| {
+        crate::provider_metadata::provider_ids_match(requested, provider)
+    })
+}
+
+async fn refresh_extension_credentials(
+    auth: &mut AuthStorage,
+    cli: &Cli,
+    configs: &[(String, crate::models::OAuthConfig)],
+    client: &crate::http::client::Client,
+) -> HashMap<String, String> {
+    let mut failures = HashMap::new();
+    if cli.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+        return failures;
+    }
+    for (provider, config) in configs {
+        if !refresh_matches_request(cli, provider) {
+            continue;
+        }
+        let configs = HashMap::from([(provider.clone(), config.clone())]);
+        if let Err(error) = auth
+            .refresh_expired_extension_oauth_tokens(client, &configs)
+            .await
+        {
+            failures.insert(provider.clone(), error.to_string());
+        }
+    }
+    failures
 }
 
 #[cfg(test)]

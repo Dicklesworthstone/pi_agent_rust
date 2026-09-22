@@ -217,3 +217,217 @@ fn configured_model_scope_can_resolve_extension_only_models() {
         assert!(handle.shutdown_owned_resources().await.completed_cleanly());
     });
 }
+
+fn cli(args: &[&str]) -> crate::cli::Cli {
+    use clap::Parser as _;
+    crate::cli::Cli::parse_from(std::iter::once("pi").chain(args.iter().copied()))
+}
+
+#[test]
+fn refresh_scope_follows_explicit_provider_precedence_and_aliases() {
+    let request = cli(&["--provider", "KIMI-CODE", "--model", "openai/fixture"]);
+    assert!(super::refresh_matches_request(&request, "kimi-for-coding"));
+    assert!(!super::refresh_matches_request(&request, "openai"));
+    let request = cli(&["--provider", "Acme-Fixture"]);
+    assert!(super::refresh_matches_request(&request, "acme-fixture"));
+    assert!(!super::refresh_matches_request(&request, "other-fixture"));
+}
+
+#[test]
+fn qualified_model_refreshes_only_its_provider() {
+    let request = cli(&["--model", "openrouter/vendor/model"]);
+    assert!(super::refresh_matches_request(&request, "openrouter"));
+    assert!(!super::refresh_matches_request(&request, "openai"));
+}
+
+#[test]
+fn automatic_and_ambiguous_bare_model_selection_keep_refresh_candidates() {
+    for request in [cli(&[]), cli(&["--model", "fixture"])] {
+        for provider in ["acme-fixture", "other-fixture"] {
+            assert!(super::refresh_matches_request(&request, provider));
+        }
+    }
+}
+
+fn oauth_credential(expires: i64) -> crate::auth::AuthCredential {
+    crate::auth::AuthCredential::OAuth {
+        extra: std::collections::HashMap::new(),
+        access_token: "old-access".to_string(),
+        refresh_token: "old-refresh".to_string(),
+        expires,
+        token_url: None,
+        client_id: None,
+    }
+}
+
+fn oauth_config(provider: &str) -> crate::models::OAuthConfig {
+    crate::models::OAuthConfig {
+        auth_url: format!("https://{provider}.invalid/authorize"),
+        token_url: format!("https://{provider}.invalid/token"),
+        client_id: "sdk-oauth-fixture".to_string(),
+        scopes: vec!["read".to_string()],
+        redirect_uri: None,
+    }
+}
+
+/// Playback has no fallback to live networking. An unexpected provider refresh
+/// is a recorded failure, so checking the failure map catches a removed filter.
+fn refresh_client(dir: &Path, responses: &[(&str, u16)]) -> crate::http::client::Client {
+    use crate::vcr::{Cassette, Interaction, RecordedRequest, RecordedResponse, VcrMode, VcrRecorder};
+    let recorder = VcrRecorder::new_with("sdk-oauth-refresh", VcrMode::Playback, dir);
+    let interactions = responses
+        .iter()
+        .map(|(provider, status)| Interaction {
+            request: RecordedRequest {
+                method: "POST".to_string(),
+                url: oauth_config(provider).token_url,
+                headers: Vec::new(),
+                body: Some(serde_json::json!({
+                    "grant_type": "refresh_token",
+                    "client_id": "sdk-oauth-fixture",
+                    "refresh_token": "[REDACTED]"
+                })),
+                body_text: None,
+            },
+            response: RecordedResponse {
+                status: *status,
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body_chunks: vec![if *status == 200 {
+                    serde_json::json!({
+                        "access_token": "fresh-access",
+                        "refresh_token": "fresh-refresh",
+                        "expires_in": 7200
+                    })
+                    .to_string()
+                } else {
+                    serde_json::json!({"error": "invalid_grant"}).to_string()
+                }],
+                body_chunks_base64: None,
+            },
+        })
+        .collect();
+    let cassette = Cassette {
+        version: "1.0".to_string(),
+        test_name: "sdk-oauth-refresh".to_string(),
+        recorded_at: "2026-09-22T00:00:00.000Z".to_string(),
+        interactions,
+    };
+    std::fs::write(
+        recorder.cassette_path(),
+        serde_json::to_vec(&cassette).unwrap(),
+    )
+    .unwrap();
+    crate::http::client::Client::new().with_vcr(recorder)
+}
+
+#[test]
+fn explicit_route_refreshes_its_expired_token_without_touching_unrelated_login() {
+    let temp = tempfile::tempdir().unwrap();
+    let auth_path = temp.path().join("auth.json");
+    let mut auth = crate::auth::AuthStorage::empty_at(auth_path.clone());
+    auth.set("Acme-Fixture", oauth_credential(0));
+    auth.set("other-fixture", oauth_credential(0));
+    let unrelated_before = serde_json::to_value(auth.get("other-fixture")).unwrap();
+    let configs = vec![
+        ("other-fixture".to_string(), oauth_config("other-fixture")),
+        ("acme-fixture".to_string(), oauth_config("acme-fixture")),
+    ];
+    let client = refresh_client(temp.path(), &[("acme-fixture", 200)]);
+    let failures = run_async(super::refresh_extension_credentials(
+        &mut auth,
+        &cli(&["--provider", "ACME-FIXTURE"]),
+        &configs,
+        &client,
+    ));
+    assert!(failures.is_empty(), "unexpected refresh: {failures:?}");
+    assert_eq!(auth.api_key("acme-fixture").as_deref(), Some("fresh-access"));
+    assert_eq!(
+        serde_json::to_value(auth.get("other-fixture")).unwrap(),
+        unrelated_before
+    );
+    let reopened = crate::auth::AuthStorage::load(auth_path).unwrap();
+    assert_eq!(
+        reopened.api_key("Acme-Fixture").as_deref(),
+        Some("fresh-access")
+    );
+    assert_eq!(
+        serde_json::to_value(reopened.get("other-fixture")).unwrap(),
+        unrelated_before
+    );
+}
+
+#[test]
+fn explicit_key_does_not_refresh_or_persist_any_extension_login() {
+    let temp = tempfile::tempdir().unwrap();
+    let auth_path = temp.path().join("auth.json");
+    let mut auth = crate::auth::AuthStorage::empty_at(auth_path.clone());
+    auth.set("acme-fixture", oauth_credential(0));
+    let before = serde_json::to_value(auth.get("acme-fixture")).unwrap();
+    let configs = vec![("acme-fixture".to_string(), oauth_config("acme-fixture"))];
+    let client = refresh_client(temp.path(), &[]);
+    let failures = run_async(super::refresh_extension_credentials(
+        &mut auth,
+        &cli(&["--provider", "acme-fixture", "--api-key", "override"]),
+        &configs,
+        &client,
+    ));
+    assert!(failures.is_empty());
+    assert_eq!(
+        serde_json::to_value(auth.get("acme-fixture")).unwrap(),
+        before
+    );
+    assert!(!auth_path.exists());
+}
+
+#[test]
+fn selected_refresh_failure_is_retained_and_never_overwrites_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let auth_path = temp.path().join("auth.json");
+    let mut auth = crate::auth::AuthStorage::empty_at(auth_path.clone());
+    auth.set("acme-fixture", oauth_credential(0));
+    auth.set("other-fixture", oauth_credential(0));
+    let before = serde_json::to_value(auth.get("acme-fixture")).unwrap();
+    let configs = vec![
+        ("other-fixture".to_string(), oauth_config("other-fixture")),
+        ("acme-fixture".to_string(), oauth_config("acme-fixture")),
+    ];
+    let client = refresh_client(temp.path(), &[("acme-fixture", 400)]);
+    let failures = run_async(super::refresh_extension_credentials(
+        &mut auth,
+        &cli(&["--provider", "acme-fixture"]),
+        &configs,
+        &client,
+    ));
+    assert_eq!(failures.len(), 1);
+    assert!(failures.contains_key("acme-fixture"));
+    assert_eq!(
+        serde_json::to_value(auth.get("acme-fixture")).unwrap(),
+        before
+    );
+    assert!(!auth_path.exists());
+}
+
+#[test]
+fn automatic_refresh_continues_after_one_candidate_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut auth = crate::auth::AuthStorage::empty_at(temp.path().join("auth.json"));
+    auth.set("acme-fixture", oauth_credential(0));
+    auth.set("other-fixture", oauth_credential(0));
+    let configs = vec![
+        ("other-fixture".to_string(), oauth_config("other-fixture")),
+        ("acme-fixture".to_string(), oauth_config("acme-fixture")),
+    ];
+    let client = refresh_client(
+        temp.path(),
+        &[("other-fixture", 400), ("acme-fixture", 200)],
+    );
+    let failures = run_async(super::refresh_extension_credentials(
+        &mut auth,
+        &cli(&[]),
+        &configs,
+        &client,
+    ));
+    assert_eq!(failures.len(), 1);
+    assert!(failures.contains_key("other-fixture"));
+    assert_eq!(auth.api_key("acme-fixture").as_deref(), Some("fresh-access"));
+}
