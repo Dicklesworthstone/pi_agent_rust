@@ -483,7 +483,9 @@ struct SpawnedService {
 
 fn readiness_deadline(now: Instant, budget: Duration) -> Result<Instant> {
     now.checked_add(budget).ok_or_else(|| {
-        Error::validation("PI_HUB_INVALID_READY_TIMEOUT: readiness timeout is too large".to_string())
+        Error::validation(
+            "PI_HUB_INVALID_READY_TIMEOUT: readiness timeout is too large".to_string(),
+        )
     })
 }
 
@@ -600,7 +602,10 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
     if !spec.cwd.is_dir() {
         return Err(Error::tool(
             "hub",
-            format!("Working directory is not a directory: {}", spec.cwd.display()),
+            format!(
+                "Working directory is not a directory: {}",
+                spec.cwd.display()
+            ),
         ));
     }
 
@@ -647,7 +652,10 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
         .name(format!("hub-output-{name}"))
         .spawn(move || pump_service_stream(reader, artifact, &pump_ring))
         .map_err(|error| {
-            Error::tool("hub", format!("Failed to start service output pump: {error}"))
+            Error::tool(
+                "hub",
+                format!("Failed to start service output pump: {error}"),
+            )
         })?;
 
     let monitor_name = name.clone();
@@ -666,7 +674,10 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
             }
         })
         .map_err(|error| {
-            Error::tool("hub", format!("Failed to start service exit monitor: {error}"))
+            Error::tool(
+                "hub",
+                format!("Failed to start service exit monitor: {error}"),
+            )
         })?;
     pending.armed = false;
 
@@ -1249,7 +1260,10 @@ mod tests {
         for index in 0..256 {
             ring.push_chunk(&format!("{index:04}:{padding}\n"));
             assert!(ring.bytes <= RING_BYTE_CAP);
-            assert_eq!(ring.bytes, ring.lines.iter().map(String::len).sum::<usize>());
+            assert_eq!(
+                ring.bytes,
+                ring.lines.iter().map(String::len).sum::<usize>()
+            );
         }
         let (lines, cursor) = ring.since(0);
         assert_eq!(cursor, 256);
@@ -1376,12 +1390,18 @@ mod tests {
         let launch = spec("hub-reserved", "unused", &[], None);
         let first = Arc::new(Mutex::new(Ring::new(8)));
         let second = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&launch, &first, &PathBuf::from("first.log")).expect("reserve");
+        reg.reserve(&launch, &first, &PathBuf::from("first.log"))
+            .expect("reserve");
         let error = reg
             .reserve(&launch, &second, &PathBuf::from("second.log"))
             .expect_err("pending launch owns the name");
         assert!(error.to_string().contains("PI_HUB_NAME_TAKEN"));
-        assert!(reg.current(&launch.name, &first).expect("first").pid.is_none());
+        assert!(
+            reg.current(&launch.name, &first)
+                .expect("first")
+                .pid
+                .is_none()
+        );
         assert!(reg.current(&launch.name, &second).is_none());
     }
 
@@ -1391,9 +1411,11 @@ mod tests {
         let launch = spec("hub-generation", "unused", &[], None);
         let old = Arc::new(Mutex::new(Ring::new(8)));
         let new = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&launch, &old, &PathBuf::from("old.log")).expect("old");
+        reg.reserve(&launch, &old, &PathBuf::from("old.log"))
+            .expect("old");
         reg.time_out(&launch.name, &old);
-        reg.reserve(&launch, &new, &PathBuf::from("new.log")).expect("new");
+        reg.reserve(&launch, &new, &PathBuf::from("new.log"))
+            .expect("new");
         reg.current_mut(&launch.name, &new).expect("new entry").pid = Some(42);
         reg.mark_ready(&launch.name, &new).expect("ready");
         assert!(!reg.settle(&launch.name, &old, 1));
@@ -1421,10 +1443,14 @@ mod tests {
             let mut reg = ServiceRegistry::default();
             let launch = spec("hub-terminal", "unused", &[], None);
             let ring = Arc::new(Mutex::new(Ring::new(8)));
-            reg.reserve(&launch, &ring, &PathBuf::from("terminal.log")).expect("reserve");
+            reg.reserve(&launch, &ring, &PathBuf::from("terminal.log"))
+                .expect("reserve");
             reg.current_mut(&launch.name, &ring).expect("entry").status = terminal;
             assert!(reg.mark_ready(&launch.name, &ring).is_err());
-            assert_eq!(reg.current(&launch.name, &ring).expect("entry").status, terminal);
+            assert_eq!(
+                reg.current(&launch.name, &ring).expect("entry").status,
+                terminal
+            );
         }
     }
 
@@ -1433,7 +1459,8 @@ mod tests {
         let mut reg = ServiceRegistry::default();
         let launch = spec("hub-killed", "unused", &[], None);
         let ring = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&launch, &ring, &PathBuf::from("killed.log")).expect("reserve");
+        reg.reserve(&launch, &ring, &PathBuf::from("killed.log"))
+            .expect("reserve");
         reg.current_mut(&launch.name, &ring).expect("entry").pid = Some(42);
         assert_eq!(reg.time_out(&launch.name, &ring), Some(42));
         assert!(reg.settle(&launch.name, &ring, 137));
@@ -1451,7 +1478,10 @@ mod tests {
         let new = Arc::new(Mutex::new(Ring::new(8)));
         let pending_old = PendingService::reserve(&launch, &old, &PathBuf::from("old.log"))
             .expect("old reservation");
-        registry().lock().expect("registry").time_out(&launch.name, &old);
+        registry()
+            .lock()
+            .expect("registry")
+            .time_out(&launch.name, &old);
         let pending_new = PendingService::reserve(&launch, &new, &PathBuf::from("new.log"))
             .expect("new reservation");
         drop(pending_old);
@@ -1478,7 +1508,10 @@ mod tests {
         pump_service_stream(reader, std::io::sink(), &ring);
         let output = ring.into_inner().expect("ring");
         assert_eq!(output.since(0).0, vec!["b", "c", "d"]);
-        assert!(output.ready_log_passed, "observed readiness must survive eviction");
+        assert!(
+            output.ready_log_passed,
+            "observed readiness must survive eviction"
+        );
     }
 
     #[test]
@@ -1490,7 +1523,10 @@ mod tests {
         assert!(ring.since(0).0[0].starts_with(TRUNCATED_LINE_PREFIX));
         assert!(!ring.ready_log_passed);
         ring.push_chunk("service says truncated\n");
-        assert!(ring.ready_log_passed, "literal service output still matches");
+        assert!(
+            ring.ready_log_passed,
+            "literal service output still matches"
+        );
     }
 
     #[test]
@@ -1608,7 +1644,10 @@ mod tests {
     fn child_guard_kills_and_reaps_on_setup_failure() {
         let (child, events) = recording_child(&[WaitStep::Interrupted, WaitStep::Exit(137)]);
         drop(child);
-        assert_eq!(*events.lock().expect("events"), vec!["kill", "wait", "wait"]);
+        assert_eq!(
+            *events.lock().expect("events"),
+            vec!["kill", "wait", "wait"]
+        );
     }
 
     #[test]
@@ -1622,7 +1661,10 @@ mod tests {
     fn child_monitor_wait_failure_still_kills_and_reaps() {
         let (child, events) = recording_child(&[WaitStep::Failed, WaitStep::Exit(137)]);
         assert_eq!(child.wait(), -1);
-        assert_eq!(*events.lock().expect("events"), vec!["wait", "kill", "wait"]);
+        assert_eq!(
+            *events.lock().expect("events"),
+            vec!["wait", "kill", "wait"]
+        );
     }
 
     #[test]
