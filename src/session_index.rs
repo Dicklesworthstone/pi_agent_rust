@@ -766,10 +766,26 @@ fn load_session_namespace_generation(sessions_root: &Path) -> Result<u64> {
     }
 }
 
+/// Open the namespace generation counter for a locked append.
+///
+/// The handle must carry read access, not just append. On Windows an
+/// `append(true)`-only handle is opened with `FILE_APPEND_DATA` and without
+/// `GENERIC_READ`/`GENERIC_WRITE`, and `LockFileEx` refuses such a handle with
+/// `ERROR_ACCESS_DENIED` (os error 5) — which failed every session save there
+/// (gh #239). Unix `flock` ignores the access mode, so the bug never showed up
+/// on Linux or macOS. Adding read keeps the append-only write semantics.
+fn open_session_namespace_generation_for_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+}
+
 fn note_session_namespace_change(sessions_root: &Path) -> Result<u64> {
     fs::create_dir_all(sessions_root)?;
     let path = session_namespace_generation_path(sessions_root);
-    let mut generation = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut generation = open_session_namespace_generation_for_lock(&path)?;
     fs4::FileExt::lock(&generation)?;
     generation.write_all(b"\n")?;
     generation.sync_data()?;
@@ -1248,6 +1264,46 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    /// gh #239: the handle `note_session_namespace_change` locks must carry
+    /// read access. Windows `LockFileEx` rejects an append-only handle with
+    /// `ERROR_ACCESS_DENIED`; Unix `flock` does not care, so the lock itself
+    /// cannot demonstrate the bug here. Reading through the handle can: an
+    /// append-only handle refuses reads on every platform.
+    #[test]
+    fn namespace_generation_handle_is_readable_so_windows_can_lock_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(SESSION_INDEX_GENERATION_FILENAME);
+        fs::write(&path, b"\n\n").expect("seed generation");
+
+        let mut handle =
+            open_session_namespace_generation_for_lock(&path).expect("open generation");
+        let mut existing = Vec::new();
+        handle
+            .read_to_end(&mut existing)
+            .expect("the generation handle must be readable; append-only handles cannot be locked on Windows");
+        assert_eq!(existing, b"\n\n");
+
+        fs4::FileExt::lock(&handle).expect("lock generation");
+        handle.write_all(b"\n").expect("append under lock");
+        fs4::FileExt::unlock(&handle).expect("unlock generation");
+        drop(handle);
+        assert_eq!(
+            fs::read(&path).expect("read generation"),
+            b"\n\n\n",
+            "the write must still append, never overwrite from offset 0"
+        );
+    }
+
+    #[test]
+    fn namespace_change_counts_up_from_an_absent_generation_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("sessions");
+        assert_eq!(load_session_namespace_generation(&root).expect("absent"), 0);
+        assert_eq!(note_session_namespace_change(&root).expect("first"), 1);
+        assert_eq!(note_session_namespace_change(&root).expect("second"), 2);
+        assert_eq!(load_session_namespace_generation(&root).expect("load"), 2);
+    }
 
     fn write_session_jsonl(path: &Path, header: &SessionHeader, entries: &[SessionEntry]) {
         let mut jsonl = String::new();

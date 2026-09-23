@@ -2968,6 +2968,15 @@ impl PiFtuiModel {
                 return Cmd::none();
             }
             Event::Key(key) => {
+                // gh #239: only presses and auto-repeats are input. Windows
+                // consoles report a Release for every key as well, and
+                // treating it as a second press moved list selections two
+                // rows per keystroke and let a `/model` Enter's release
+                // confirm the picker it had just opened. (The TextArea already
+                // ignores releases, so typed text was never doubled.)
+                if !key_event_is_input(key) {
+                    return Cmd::none();
+                }
                 // Hard escape hatch independent of the catalog: the preview
                 // stack always quits on ctrl+c. (The bubbletea stack's richer
                 // ctrl+c semantics — clear input, double-press to exit,
@@ -5640,6 +5649,13 @@ pub fn run(
     finish_ftui_run(result, driver.join())
 }
 
+/// Whether a key event is user input. Release events are reported by
+/// Windows consoles (and by kitty-protocol terminals asked for event types)
+/// and must never act a second time.
+const fn key_event_is_input(key: &ftui::KeyEvent) -> bool {
+    !matches!(key.kind, ftui::KeyEventKind::Release)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8236,6 +8252,96 @@ mod tests {
             }
         );
         assert!(sim.model().picker.is_none());
+    }
+
+    /// Deliver one keystroke the way a Windows console does: a Press
+    /// followed by a Release of the same key.
+    fn windows_keystroke(sim: &mut ProgramSimulator<PiFtuiModel>, code: KeyCode) {
+        sim.inject_event(key(code, Modifiers::empty()));
+        sim.inject_event(Event::Key(KeyEvent {
+            code,
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Release,
+        }));
+    }
+
+    fn windows_type_str(sim: &mut ProgramSimulator<PiFtuiModel>, s: &str) {
+        for ch in s.chars() {
+            windows_keystroke(sim, KeyCode::Char(ch));
+        }
+    }
+
+    /// gh #239: with press+release pairs, `/model` + Enter must open the
+    /// picker without confirming it, and each Down must move one row.
+    #[test]
+    fn windows_key_releases_do_not_confirm_or_skip_in_the_model_picker() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_models(vec![
+                String::from("openai/gpt-5"),
+                String::from("anthropic/claude-opus-5"),
+                String::from("google/gemini-3-pro"),
+            ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        windows_type_str(&mut sim, "/model");
+        assert_eq!(sim.model().input.text(), "/model", "typed text doubled");
+        windows_keystroke(&mut sim, KeyCode::Enter);
+        assert!(
+            sim.model().picker.is_some(),
+            "the Enter release confirmed the picker the press had just opened"
+        );
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "no model may be chosen before the user picks one"
+        );
+
+        windows_keystroke(&mut sim, KeyCode::Down);
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains("▸ anthropic/claude-opus-5"),
+            "one Down keystroke must move exactly one row: {rendered:?}"
+        );
+        windows_keystroke(&mut sim, KeyCode::Enter);
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetModel {
+                provider: "anthropic".into(),
+                model: "claude-opus-5".into(),
+            }
+        );
+        assert!(submit_rx.try_recv().is_err(), "exactly one selection");
+        assert!(sim.model().picker.is_none());
+    }
+
+    /// gh #239: the slash completion popup must advance one item per
+    /// keystroke, while a held key (Repeat) still keeps moving.
+    #[test]
+    fn windows_key_releases_do_not_skip_completion_rows() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        windows_type_str(&mut sim, "/");
+        assert!(sim.model().completion_visible(), "slash opens the popup");
+        assert!(sim.model().autocomplete.items.len() >= 4);
+
+        windows_keystroke(&mut sim, KeyCode::Down);
+        assert_eq!(sim.model().autocomplete.selected, Some(0));
+        windows_keystroke(&mut sim, KeyCode::Down);
+        assert_eq!(sim.model().autocomplete.selected, Some(1));
+
+        sim.inject_event(Event::Key(KeyEvent {
+            code: KeyCode::Down,
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Repeat,
+        }));
+        assert_eq!(
+            sim.model().autocomplete.selected,
+            Some(2),
+            "auto-repeat is still input"
+        );
     }
 
     /// bd-cv653.3.13/7.4 parity: /undo //redo //usage route driver commands.

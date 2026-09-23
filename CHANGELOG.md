@@ -14,6 +14,20 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every message failed on Windows with `IO error: Access is denied. (os
+  error 5)`** (#239, regression since v0.5.0). Saving a session bumps the
+  session-index generation counter, which was opened append-only and then
+  locked; Windows `LockFileEx` refuses an append-only handle. The counter is
+  now opened read + append, so the first save of a session succeeds.
+
+- **The TUI acted on key releases on Windows** (#239). Windows consoles
+  report a Release for every key; the FTUI stack treated it as a second
+  press, so menus moved two rows per keystroke and `/model` + Enter picked the
+  first model instead of opening the picker. Releases are now ignored;
+  auto-repeat still counts.
+
 ## [v0.5.1] — 2026-09-12 — Release
 
 Windows-only. Nothing on Linux or macOS behaves differently; the binaries for
