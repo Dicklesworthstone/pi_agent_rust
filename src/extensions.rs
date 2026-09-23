@@ -13463,12 +13463,27 @@ fn collect_extension_roots_from_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
             roots.push(root);
         }
 
+        // An ancestor package donates its directory tree only when its
+        // `pi.extensions` declaration actually resolves to this entry, the
+        // same test co-entry discovery applies. An unrelated package.json
+        // anywhere above (in $HOME, a projects folder, ...) grants nothing
+        // (bd-2rthm); an unreadable or malformed one grants nothing either.
+        let canonical_entry = safe_canonicalize(entry_path);
         for package_json in find_package_json_ancestors(Some(parent)) {
-            if let Some(package_dir) = package_json.parent() {
-                let root = safe_canonicalize(package_dir);
-                if seen.insert(root.clone()) {
-                    roots.push(root);
-                }
+            let Some(package_dir) = package_json.parent() else {
+                continue;
+            };
+            let Ok(Some(package_entries)) = read_pi_extensions_from_package(&package_json) else {
+                continue;
+            };
+            if !resolve_package_declared_entries(package_dir, &package_entries)
+                .contains(&canonical_entry)
+            {
+                continue;
+            }
+            let root = safe_canonicalize(package_dir);
+            if seen.insert(root.clone()) {
+                roots.push(root);
             }
         }
     }

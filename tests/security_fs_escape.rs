@@ -17,9 +17,14 @@ use std::sync::Arc;
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn load_ext(harness: &common::TestHarness, source: &str) -> ExtensionManager {
-    let cwd = harness.temp_dir().to_path_buf();
     let ext_entry_path = harness.create_file("extensions/fs_escape_test.mjs", source.as_bytes());
-    let spec = JsExtensionLoadSpec::from_entry_path(&ext_entry_path).expect("load spec");
+    load_ext_entry(harness, &ext_entry_path)
+}
+
+/// Load an extension entry that may live outside the harness workspace.
+fn load_ext_entry(harness: &common::TestHarness, ext_entry_path: &Path) -> ExtensionManager {
+    let cwd = harness.temp_dir().to_path_buf();
+    let spec = JsExtensionLoadSpec::from_entry_path(ext_entry_path).expect("load spec");
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
@@ -1003,5 +1008,85 @@ fn missing_asset_yaml_returns_empty_string() {
     assert_eq!(
         result, "EMPTY",
         "expected empty string for .yaml, got: {result}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Ancestor package.json authority (bd-2rthm)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Lay out `outer/{package.json, secret.txt, assets/template.html}` with the
+/// extension entry at `outer/nested/ext/fs_escape_test.mjs`, outside the
+/// harness workspace, and return (outer tempdir, entry path).
+fn package_tree_with_extension(manifest: &str, js_expr: &str) -> (tempfile::TempDir, PathBuf) {
+    let outer = tempfile::tempdir().expect("outer package tree");
+    std::fs::write(outer.path().join("package.json"), manifest).expect("write package.json");
+    std::fs::write(outer.path().join("secret.txt"), "ANCESTOR_SECRET").expect("write secret");
+    std::fs::create_dir_all(outer.path().join("assets")).expect("assets dir");
+    std::fs::write(outer.path().join("assets/template.html"), "BUNDLED_ASSET")
+        .expect("write asset");
+    let entry = outer.path().join("nested/ext/fs_escape_test.mjs");
+    std::fs::create_dir_all(entry.parent().expect("entry parent")).expect("entry dir");
+    std::fs::write(&entry, fs_ext_source(js_expr)).expect("write extension");
+    (outer, entry)
+}
+
+fn dispatch_result(mgr: &ExtensionManager) -> String {
+    let mgr = mgr.clone();
+    common::run_async(async move {
+        mgr.dispatch_event_with_response(ExtensionEventName::AgentStart, None, 10000)
+            .await
+            .expect("dispatch agent_start")
+    })
+    .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(String::from))
+    .unwrap_or_else(|| "NO_RESPONSE".to_string())
+}
+
+/// An unrelated package.json above the extension (as `npm init` in $HOME
+/// leaves behind) must not widen the extension's root to that ancestor.
+#[test]
+fn unrelated_ancestor_package_json_grants_no_filesystem_authority() {
+    let harness = common::TestHarness::new("fs_escape_unrelated_ancestor_package");
+    let (outer, entry) = package_tree_with_extension(r#"{"name":"unrelated-home-package"}"#, "");
+    let secret = outer.path().join("secret.txt");
+    let expr = format!(
+        r"(() => {{
+        try {{ return 'LEAKED:' + fs.readFileSync({}, 'utf8'); }}
+        catch (e) {{ return 'DENIED:' + e.message; }}
+    }})()",
+        js_path(&secret)
+    );
+    std::fs::write(&entry, fs_ext_source(&expr)).expect("rewrite extension");
+    let result = dispatch_result(&load_ext_entry(&harness, &entry));
+    // Outside every root the read falls through to the in-memory VFS, so the
+    // refusal surfaces as ENOENT; what matters is that no host bytes leak.
+    assert!(
+        result.starts_with("DENIED:") && !result.contains("ANCESTOR_SECRET"),
+        "an undeclaring ancestor package must not donate its tree: {result}"
+    );
+}
+
+/// A package whose `pi.extensions` declares the entry keeps its package root,
+/// so bundled assets outside the entry's own directory stay readable.
+#[test]
+fn declaring_package_root_still_serves_bundled_assets() {
+    let harness = common::TestHarness::new("fs_escape_declaring_package_root");
+    let (outer, entry) = package_tree_with_extension(
+        r#"{"name":"declared-pkg","pi":{"extensions":["nested/ext/fs_escape_test.mjs"]}}"#,
+        "",
+    );
+    let asset = outer.path().join("assets/template.html");
+    let expr = format!(
+        r"(() => {{
+        try {{ return 'READ:' + fs.readFileSync({}, 'utf8'); }}
+        catch (e) {{ return 'DENIED:' + e.message; }}
+    }})()",
+        js_path(&asset)
+    );
+    std::fs::write(&entry, fs_ext_source(&expr)).expect("rewrite extension");
+    let result = dispatch_result(&load_ext_entry(&harness, &entry));
+    assert_eq!(
+        result, "READ:BUNDLED_ASSET",
+        "a declared package root must keep serving its assets"
     );
 }
