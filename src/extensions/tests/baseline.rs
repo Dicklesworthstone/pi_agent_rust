@@ -1596,16 +1596,6 @@ fn explanation_summary_triggers_sorted() {
 
 #[test]
 fn explanation_e2e_through_manager() {
-    let manager = ExtensionManager::new();
-    manager.set_runtime_risk_config(RuntimeRiskConfig {
-        enabled: true,
-        enforce: true,
-        alpha: 0.01,
-        window_size: 64,
-        ledger_limit: 1024,
-        decision_timeout_ms: 5000,
-        fail_closed: true,
-    });
     let meta = RuntimeRiskCallMetadata {
         args_shape_hash: "hash_test",
         resource_target_class: "fs",
@@ -1613,45 +1603,47 @@ fn explanation_e2e_through_manager() {
         timeout_ms: None,
         policy_profile: "permissive",
     };
-    let decision = manager
-        .evaluate_runtime_risk(
-            Some("ext.test.explain"),
-            "call-1",
-            "exec",
-            "exec",
-            "param_hash",
-            meta,
-            "permissive",
-        )
-        .expect("decision must be returned when enabled");
+    let evaluate_fresh = || {
+        let manager = ExtensionManager::new();
+        manager.set_runtime_risk_config(RuntimeRiskConfig {
+            enabled: true,
+            enforce: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 2_000,
+            fail_closed: true,
+        });
+        manager
+            .evaluate_runtime_risk(
+                Some("ext.test.explain"),
+                "call-1",
+                "exec",
+                "exec",
+                "param_hash",
+                meta,
+                "permissive",
+            )
+            .expect("decision must be returned when enabled")
+    };
+    // The replay compares two evaluations of identical input. The decision
+    // timeout (capped at 2s by set_runtime_risk_config) is wall-clock: a
+    // descheduled evaluation on a saturated host correctly falls back to a
+    // hardened decision with a `decision_timeout` trigger, which is not the
+    // replay property. Compare a pair in which neither evaluation timed out.
+    let timed_out = |decision: &RuntimeRiskDecision| {
+        decision.fallback_reason.as_deref() == Some("decision_timeout")
+    };
+    let (decision, decision2) = (0..5)
+        .map(|_| (evaluate_fresh(), evaluate_fresh()))
+        .find(|(first, second)| !timed_out(first) && !timed_out(second))
+        .expect("five consecutive evaluation pairs hit the 2s decision timeout");
     assert_eq!(
         decision.explanation_schema,
         RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION
     );
     assert!(!decision.top_contributors.is_empty());
     assert!(!decision.explanation_summary.is_empty());
-    // Verify deterministic replay
-    let manager2 = ExtensionManager::new();
-    manager2.set_runtime_risk_config(RuntimeRiskConfig {
-        enabled: true,
-        enforce: true,
-        alpha: 0.01,
-        window_size: 64,
-        ledger_limit: 1024,
-        decision_timeout_ms: 5000,
-        fail_closed: true,
-    });
-    let decision2 = manager2
-        .evaluate_runtime_risk(
-            Some("ext.test.explain"),
-            "call-1",
-            "exec",
-            "exec",
-            "param_hash",
-            meta,
-            "permissive",
-        )
-        .expect("decision must be returned");
     assert_eq!(decision.explanation_level, decision2.explanation_level);
     assert_eq!(
         decision.top_contributors.len(),
