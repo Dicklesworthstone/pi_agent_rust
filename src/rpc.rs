@@ -11245,7 +11245,7 @@ mod retry_tests {
     async fn run_real_js_switch_session(
         runtime_handle: &asupersync::runtime::RuntimeHandle,
         temp: &tempfile::TempDir,
-        hook_result: &str,
+        hook_body: &str,
     ) -> (Value, Arc<asupersync::sync::Mutex<Session>>, String, String) {
         let extension_path = temp.path().join("switch-hook.mjs");
         std::fs::write(
@@ -11254,11 +11254,7 @@ mod retry_tests {
                 r#"
                 export default function init(pi) {{
                   pi.on("session_before_switch", async () => {{
-                    await pi.session("appendEntry", {{
-                      customType: "switch-before-hook-entry",
-                      data: {{ owner: "source" }}
-                    }});
-                    return {hook_result};
+                    {hook_body}
                   }});
                 }}
                 "#
@@ -11266,7 +11262,12 @@ mod retry_tests {
         )
         .expect("write switch hook extension");
 
+        // The switch re-resolves the target's runtime, so it names a model the
+        // options below make available (same shape as the fork fixtures).
         let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
+        target.header.provider = Some("anthropic".to_string());
+        target.header.model_id = Some("test-model".to_string());
+        target.header.thinking_level = Some("off".to_string());
         target.append_message(SessionMessage::User {
             content: UserContent::Text("target session prompt".to_string()),
             timestamp: Some(0),
@@ -11293,7 +11294,7 @@ mod retry_tests {
             .enable_extensions(&[], temp.path(), None, &[extension_path])
             .await
             .expect("enable switch hook extension");
-        let options = build_test_rpc_options(runtime_handle, temp.path().join("auth.json"));
+        let options = rpc_fork_test_options(runtime_handle, temp.path().join("auth.json"));
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
         in_tx
             .send(
@@ -11318,6 +11319,12 @@ mod retry_tests {
         (response, inner_session, source_id, target_id)
     }
 
+    /// Hook statement that writes an entry into the session it runs against.
+    const SWITCH_HOOK_SOURCE_WRITE: &str = r#"await pi.session("appendEntry", {
+                      customType: "switch-before-hook-entry",
+                      data: { owner: "source" }
+                    });"#;
+
     fn has_switch_hook_entry(session: &Session) -> bool {
         session.entries_for_current_path().iter().any(|entry| {
             matches!(entry, SessionEntry::Custom(custom)
@@ -11333,8 +11340,12 @@ mod retry_tests {
         let runtime_handle = runtime.handle();
         runtime.block_on(async move {
             let temp = tempfile::tempdir().expect("tempdir");
-            let (response, inner_session, source_id, _) =
-                run_real_js_switch_session(&runtime_handle, &temp, "{ cancel: true }").await;
+            let (response, inner_session, source_id, _) = run_real_js_switch_session(
+                &runtime_handle,
+                &temp,
+                &format!("{SWITCH_HOOK_SOURCE_WRITE}\nreturn {{ cancel: true }};"),
+            )
+            .await;
             assert_eq!(response["success"], true, "unexpected response: {response}");
             assert_eq!(response["data"]["cancelled"], true, "{response}");
             let inner = inner_session
@@ -11352,8 +11363,50 @@ mod retry_tests {
         });
     }
 
+    /// A hook that writes to the source and does not veto: the write landed
+    /// while the transition was pending, so the switch must be refused rather
+    /// than carry the write away or strand it (post-hook recheck).
     #[test]
-    fn rpc_switch_session_allowed_real_js_hook_does_not_leak_actions_into_the_target() {
+    fn rpc_switch_session_rejects_a_hook_that_mutated_the_source_and_keeps_its_write() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (response, inner_session, source_id, _) = run_real_js_switch_session(
+                &runtime_handle,
+                &temp,
+                &format!("{SWITCH_HOOK_SOURCE_WRITE}\nreturn undefined;"),
+            )
+            .await;
+            assert_eq!(
+                response["success"], false,
+                "unexpected response: {response}"
+            );
+            assert!(
+                response["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("modified the source Session")),
+                "{response}"
+            );
+            let inner = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("session lock");
+            assert_eq!(
+                inner.header.id, source_id,
+                "a refused switch keeps the source"
+            );
+            assert!(
+                has_switch_hook_entry(&inner),
+                "the hook's write stays owned by the source session"
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_switch_session_allowed_by_a_non_mutating_real_js_hook_installs_the_target() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -11361,7 +11414,7 @@ mod retry_tests {
         runtime.block_on(async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let (response, inner_session, _, target_id) =
-                run_real_js_switch_session(&runtime_handle, &temp, "undefined").await;
+                run_real_js_switch_session(&runtime_handle, &temp, "return undefined;").await;
             assert_eq!(response["success"], true, "unexpected response: {response}");
             assert_ne!(response["data"]["cancelled"], true, "{response}");
             let inner = inner_session
@@ -11372,10 +11425,7 @@ mod retry_tests {
                 inner.header.id, target_id,
                 "an allowed switch installs the target"
             );
-            assert!(
-                !has_switch_hook_entry(&inner),
-                "a write the hook made against the source must not land in the target"
-            );
+            assert!(!has_switch_hook_entry(&inner));
         });
     }
 
