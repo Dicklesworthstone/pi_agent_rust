@@ -1618,20 +1618,22 @@ mod tests {
         }
     }
 
-    /// Bare commands resolve through explicit PATH contents in order; the
-    /// current directory is never implicitly searched.
-    #[cfg(unix)]
     /// The path `resolve_command_identity` would report for `path`.
     ///
     /// Resolution canonicalizes, and on macOS a tempdir lives under `/var`,
     /// which is a symlink into `/private/var`, so comparing against the raw
     /// path fails there and passes on Linux — the assertion was testing the
     /// host's filesystem layout rather than PATH order.
+    #[cfg(unix)]
     fn canonical_string(path: &std::path::Path) -> String {
         let resolved = std::fs::canonicalize(path).expect("canonicalize fixture path"); // ubs:ignore a panic is how a test reports a broken fixture
         resolved.display().to_string()
     }
 
+    /// Bare commands resolve through explicit PATH contents in order; the
+    /// current directory is never implicitly searched. Unix-only: the
+    /// fixtures rely on the exec bit.
+    #[cfg(unix)]
     #[test]
     fn bare_command_resolution_follows_path_order_only() {
         let temp = tempfile::tempdir().expect("tempdir");
