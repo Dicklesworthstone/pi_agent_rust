@@ -3706,6 +3706,29 @@ mod tests {
         with_chain_cooldown(handle, spec, 300)
     }
 
+    /// A loopback HTTP endpoint that answers every request with a 401, the
+    /// non-retryable response a real provider gives the tests' fake key.
+    fn spawn_unauthorized_stub() -> String {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let address = listener.local_addr().expect("stub address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request);
+                let body = r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{address}/v1")
+    }
+
     /// [`with_chain`] with an explicit cooldown. Zero means the primary is
     /// restorable the moment it is captured, which is how the restoration path
     /// is exercised without a sleep.
@@ -3716,12 +3739,22 @@ mod tests {
     ) -> AgentSessionHandle {
         let auth_path = tempdir().expect("tempdir").path().join("auth.json");
         let auth = crate::auth::AuthStorage::load(auth_path).expect("auth load");
+        // The fallback must not reach the real provider: with `test-key` the
+        // live endpoint answers 401 on a networked host but a firewalled or
+        // saturated one gets a retryable connection error instead, which adds
+        // a retry cycle and makes the event order host-dependent. Serve the
+        // same deterministic 401 locally.
+        let (provider, model_id) =
+            crate::provider_metadata::split_provider_model_spec(spec).expect("chain spec");
+        let mut fallback =
+            crate::models::ad_hoc_model_entry(provider, model_id).expect("fallback entry");
+        fallback.model.base_url = spawn_unauthorized_stub();
         handle.with_failover(Some(FailoverOptions {
             chains: std::collections::HashMap::from([(
                 "default".to_string(),
                 vec![spec.to_string()],
             )]),
-            available_models: Vec::new(),
+            available_models: vec![fallback],
             auth,
             cli_api_key: Some("test-key".to_string()),
             cooldown_secs,
