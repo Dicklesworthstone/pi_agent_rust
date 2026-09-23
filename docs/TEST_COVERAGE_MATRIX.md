@@ -130,6 +130,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extensions/exec_mediation.rs` | Extension exec mediation | `tests/bash_mediation.rs`; in-source exec-security tests. |
 | `src/extensions/extension_manager_impl.rs` | Extension manager | Extension lifecycle suites (`tests/extensions_runtime_matrix.rs`). |
 | `src/extensions/fs_connector.rs` | Extension fs connector | `tests/extensions_fs_shim.rs`. |
+| `src/extensions/fs_connector/atomic_write.rs` | Staged extension filesystem writes with a single atomic publication point | Unit; in-module tests; `tests/security_fs_escape.rs`. |
+| `src/extensions/fs_connector/atomic_write/metadata.rs` | Linux descriptor-scoped metadata (ACL/xattr) preservation for atomic replacement | Unit; in-module tests. |
 | `src/extensions/native_runtime.rs` | Active native descriptor runtime | Active native descriptor runtime interpreter. |
 | `src/extensions/native_runtime_experimental.rs` | Native runtime (experimental) | In-source runtime-parity tests. |
 | `src/extensions/permission_drift.rs` | Permission drift detection | In-source tests; policy suites. |
@@ -362,6 +364,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_control/attachments.rs` | Session control media attachment admission and authorship tracking | Unit; in-module tests. |
 | `src/session_control/deadline.rs` | Session control turn deadline management and sleep futures | Unit; `src/session_control/deadline/tests.rs`, `src/session_control/agent_tests.rs`. |
 | `src/session_control/deadline/tests.rs` | Turn deadline unit test cases | Test module; exercises turn timeouts. |
+| `src/session_control/execution.rs` | Owned live-turn execution: keeps turns on their initiating owner and drains cooperative aborts | Unit; `src/session_control/execution/tests.rs`, `src/session_control/execution/agent_tests.rs`. |
+| `src/session_control/execution/agent_tests.rs` | Owned live-turn execution tests against real agent turns and wire streams | Test module; exercises initiator cancellation and native drain. |
+| `src/session_control/execution/tests.rs` | Owned live-turn execution unit test cases | Test module; exercises owner migration, pre-poll cancellation and abort drain. |
 | `src/session_control/recovery.rs` | Session control turn recovery and input reconstruction | Unit; `src/session_control/agent_tests.rs`. |
 | `src/session_import.rs` | Session import | `tests/session_import.rs`. |
 | `src/session_import/conversion.rs` | Session import format conversion and mapping | Unit; `tests/session_import.rs`. |
