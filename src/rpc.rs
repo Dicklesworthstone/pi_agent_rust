@@ -7801,6 +7801,54 @@ mod retry_tests {
         }
     }
 
+    /// Fails its first call like `FlakyProvider`, but while that call is in
+    /// flight it quarantines the session's provider-admission gate, standing
+    /// in for a concurrent transition whose persistence became indeterminate.
+    /// Every later call would succeed, so a retry loop that continues past a
+    /// failed tail restoration is visible as a second call.
+    #[derive(Debug)]
+    struct QuarantiningFlakyProvider {
+        inner: FlakyProvider,
+        gate: Arc<std::sync::OnceLock<crate::agent::ProviderAdmissionGate>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for QuarantiningFlakyProvider {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn api(&self) -> &str {
+            self.inner.api()
+        }
+
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            if self.inner.calls.load(Ordering::SeqCst) == 0 {
+                self.gate
+                    .get()
+                    .expect("gate installed before the turn")
+                    .block("planted indeterminate transition".to_string());
+            }
+            self.inner.stream(context, options).await
+        }
+    }
+
     #[derive(Debug)]
     struct AlwaysErrorProvider;
 
@@ -9884,6 +9932,266 @@ mod retry_tests {
                     .await
                     .is_err(),
                 "terminal persistence must honor the production-set quarantine"
+            );
+        });
+    }
+
+    /// bd-35xad: the production retry loop, not the restore helper alone. When
+    /// tail restoration fails, the turn must end there: no second provider
+    /// call, no credential rotation, exactly one failed `auto_retry_end` that
+    /// carries both the restoration error and the original provider error.
+    #[test]
+    fn rpc_retry_loop_stops_when_tail_restoration_fails() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let gate = Arc::new(std::sync::OnceLock::new());
+            let provider = Arc::new(QuarantiningFlakyProvider {
+                inner: FlakyProvider::new(),
+                gate: Arc::clone(&gate),
+            });
+            let provider_probe = Arc::clone(&provider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.stream_options_mut().api_key = Some("original-key".to_string());
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            gate.set(agent_session.provider_admission_gate())
+                .expect("gate installed once");
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(3),
+                base_delay_ms: Some(1),
+                max_delay_ms: Some(1),
+                ..Default::default()
+            });
+            let mut shared = RpcSharedState::new(&config);
+            shared.auto_compaction_enabled = false;
+            let shared_state = Arc::new(Mutex::new(shared));
+
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let auth_dir = tempfile::tempdir().expect("tempdir");
+            let mut auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth load");
+            // A retry that got past restoration would rotate onto this key.
+            auth.set(
+                "test-provider".to_string(),
+                crate::auth::AuthCredential::ApiKey {
+                    key: "rotated-key".to_string(),
+                },
+            );
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: Vec::new(),
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth,
+                runtime_handle,
+                ask_tool: None,
+            };
+
+            run_prompt_with_retry(
+                Arc::clone(&session),
+                Arc::clone(&shared_state),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(std::sync::Mutex::new(())),
+                Arc::new(Mutex::new(None)),
+                out_tx,
+                Arc::new(AtomicBool::new(false)),
+                options,
+                "hello".to_string(),
+                None,
+                Vec::new(),
+                AgentCx::for_request(),
+            )
+            .await;
+
+            let events = out_rx
+                .try_iter()
+                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                .collect::<Vec<_>>();
+            let of_type = |kind: &str| {
+                events
+                    .iter()
+                    .filter(|value| value["type"] == kind)
+                    .collect::<Vec<_>>()
+            };
+            let kinds = events
+                .iter()
+                .filter_map(|value| value["type"].as_str())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                provider_probe.inner.calls.load(Ordering::SeqCst),
+                1,
+                "a failed tail restoration must not re-enter the provider: {kinds:?}"
+            );
+            assert_eq!(
+                of_type("auto_retry_start").len(),
+                1,
+                "the loop must have reached the restoration step: {kinds:?}"
+            );
+            let retry_ends = of_type("auto_retry_end");
+            assert_eq!(retry_ends.len(), 1, "exactly one auto_retry_end: {kinds:?}");
+            assert_eq!(retry_ends[0]["success"], false);
+            let final_error = retry_ends[0]["finalError"].as_str().unwrap_or_default();
+            assert!(
+                final_error.contains("quarantined")
+                    && final_error.contains("original provider error: server error"),
+                "finalError must carry the restoration error and the provider error: {final_error}"
+            );
+            assert!(of_type("failover_start").is_empty(), "{kinds:?}");
+            assert_eq!(of_type("agent_end").len(), 1, "{kinds:?}");
+
+            let cx = AgentCx::for_request();
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            assert_eq!(
+                guard.agent.stream_options().api_key.as_deref(),
+                Some("original-key"),
+                "credential rotation must not run after a failed restoration"
+            );
+        });
+    }
+
+    /// bd-35xad, failover side: when restoration fails, the failover walk must
+    /// not install the fallback. The live provider, key and session path stay
+    /// exactly as they were, no `failover_start` is emitted, and the provider
+    /// is never re-entered.
+    #[test]
+    fn rpc_failover_does_not_swap_when_tail_restoration_fails() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let gate = Arc::new(std::sync::OnceLock::new());
+            let provider = Arc::new(QuarantiningFlakyProvider {
+                inner: FlakyProvider::new(),
+                gate: Arc::clone(&gate),
+            });
+            let provider_probe = Arc::clone(&provider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.stream_options_mut().api_key = Some("original-key".to_string());
+            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            gate.set(agent_session.provider_admission_gate())
+                .expect("gate installed once");
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let mut fallback = dummy_entry("fallback-model", false);
+            fallback.model.provider = "openai".to_string();
+            fallback.model.api = "openai-completions".to_string();
+            fallback.model.base_url = "http://127.0.0.1:1/v1".to_string();
+            fallback.api_key = Some("fallback-key".to_string());
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(0),
+                fallback_chains: Some(HashMap::from([(
+                    "default".to_string(),
+                    vec!["openai/fallback-model".to_string()],
+                )])),
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let mut shared = RpcSharedState::new(&config);
+            shared.auto_compaction_enabled = false;
+            let shared_state = Arc::new(Mutex::new(shared));
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: vec![fallback],
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
+                runtime_handle,
+                ask_tool: None,
+            };
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+
+            run_prompt_with_retry(
+                Arc::clone(&session),
+                Arc::clone(&shared_state),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(std::sync::Mutex::new(())),
+                Arc::new(Mutex::new(None)),
+                out_tx,
+                Arc::new(AtomicBool::new(false)),
+                options,
+                "hello".to_string(),
+                None,
+                Vec::new(),
+                AgentCx::for_request(),
+            )
+            .await;
+
+            let events: Vec<Value> = out_rx
+                .try_iter()
+                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                .collect();
+            let kinds: Vec<&str> = events
+                .iter()
+                .filter_map(|value| value.get("type").and_then(Value::as_str))
+                .collect();
+            assert_eq!(
+                provider_probe.inner.calls.load(Ordering::SeqCst),
+                1,
+                "a failed restoration must not re-enter any provider: {kinds:?}"
+            );
+            assert!(!kinds.contains(&"failover_start"), "{kinds:?}");
+            let agent_ends = events
+                .iter()
+                .filter(|value| value["type"] == "agent_end")
+                .collect::<Vec<_>>();
+            assert_eq!(agent_ends.len(), 1, "{kinds:?}");
+            let error = agent_ends[0]["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("quarantined")
+                    && error.contains("original provider error: server error"),
+                "the failover walk's restoration error must end the turn: {error}"
+            );
+
+            let cx = AgentCx::for_request();
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            assert_eq!(guard.agent.provider().name(), "test-provider");
+            assert_eq!(guard.agent.provider().model_id(), "test-model");
+            assert_eq!(
+                guard.agent.stream_options().api_key.as_deref(),
+                Some("original-key")
+            );
+            drop(guard);
+            let inner = inner_session.lock(&cx).await.expect("inner session lock");
+            let model_changes = inner
+                .entries_for_current_path()
+                .into_iter()
+                .filter(|entry| matches!(entry, SessionEntry::ModelChange(_)))
+                .map(|entry| serde_json::to_string(entry).unwrap_or_default())
+                .collect::<Vec<_>>();
+            assert!(
+                model_changes.iter().all(|entry| !entry.contains("fallback-model")),
+                "no ModelChange may be appended for a failover that never happened: {model_changes:?}"
             );
         });
     }
@@ -13852,108 +14160,116 @@ mod tests {
         }
     }
 
-    /// bd-mgj86: a user turn `key=<secret>` reaches this provider already
-    /// obfuscated, so it captures the placeholder the agent minted. A later
-    /// user turn makes it hand that placeholder to the `record` tool. What the
-    /// tool receives shows whether the agent's secret vault still maps it.
-    struct PlaceholderToolCallProvider {
-        placeholder: Arc<Mutex<Option<String>>>,
-    }
+    /// bd-mgj86: a loopback OpenAI chat-completions endpoint. Session
+    /// transitions rebuild the provider from the target's model entry, so the
+    /// fixture must be a real provider's wire protocol rather than an
+    /// in-process `Provider`. A user turn `key=<secret>` arrives already
+    /// obfuscated, so the stub captures the placeholder the agent minted; any
+    /// other user turn makes the model hand that placeholder to the `record`
+    /// tool; a tool result ends the turn.
+    fn spawn_placeholder_openai_stub(placeholder: Arc<Mutex<Option<String>>>) -> String {
+        use std::io::{Read as _, Write as _};
 
-    fn user_text(message: &Message) -> Option<String> {
-        let Message::User(user) = message else {
-            return None;
-        };
-        Some(match &user.content {
-            UserContent::Text(text) => text.clone(),
-            UserContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                })
-                .collect::<String>(),
-        })
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for PlaceholderToolCallProvider {
-        fn name(&self) -> &str {
-            "placeholder-provider"
+        fn content_text(content: &Value) -> String {
+            match content {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect(),
+                _ => String::new(),
+            }
         }
 
-        fn api(&self) -> &str {
-            "placeholder-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "placeholder-model"
-        }
-
-        async fn stream(
-            &self,
-            context: &crate::provider::Context<'_>,
-            _options: &crate::provider::StreamOptions,
-        ) -> crate::error::Result<
-            Pin<
-                Box<
-                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
-                        + Send,
-                >,
-            >,
-        > {
-            let last = context.messages.last();
-            let last_user_text = last.and_then(user_text);
-            let stop = |text: &str| {
-                (
-                    vec![ContentBlock::Text(TextContent::new(text))],
-                    StopReason::Stop,
-                )
-            };
-            let (content, stop_reason) = match last_user_text {
-                Some(text) if text.starts_with("key=") => {
-                    *self.placeholder.lock().expect("placeholder lock") =
-                        Some(text["key=".len()..].to_string());
-                    stop("noted")
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let address = listener.local_addr().expect("stub address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 8192];
+                let header_end = loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                    }
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(end);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = bytes[header_end + 4..].to_vec();
+                while body.len() < content_length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => body.extend_from_slice(&chunk[..n]),
+                    }
                 }
-                Some(_) => {
-                    let placeholder = self
-                        .placeholder
-                        .lock()
-                        .expect("placeholder lock")
-                        .clone()
-                        .unwrap_or_default();
-                    (
-                        vec![ContentBlock::ToolCall(ToolCall {
-                            id: "record-1".to_string(),
-                            name: "record".to_string(),
-                            arguments: json!({ "token": placeholder }),
-                            thought_signature: None,
-                        })],
-                        StopReason::ToolUse,
-                    )
+                let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let last = request["messages"]
+                    .as_array()
+                    .and_then(|messages| messages.last())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let text_events = |text: &str| {
+                    vec![
+                        json!({"choices":[{"delta":{"role":"assistant","content":text}}]}),
+                        json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+                               "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+                    ]
+                };
+                let events = match last["role"].as_str() {
+                    Some("user") => {
+                        let text = content_text(&last["content"]);
+                        text.strip_prefix("key=").map_or_else(
+                            || {
+                                let token = placeholder
+                                    .lock()
+                                    .expect("placeholder lock")
+                                    .clone()
+                                    .unwrap_or_default();
+                                vec![
+                                    json!({"choices":[{"delta":{"tool_calls":[{
+                                        "index":0,"id":"call_record","type":"function",
+                                        "function":{"name":"record",
+                                                    "arguments":json!({"token":token}).to_string()}
+                                    }]}}]}),
+                                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
+                                           "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+                                ]
+                            },
+                            |minted| {
+                                *placeholder.lock().expect("placeholder lock") =
+                                    Some(minted.to_string());
+                                text_events("noted")
+                            },
+                        )
+                    }
+                    _ => text_events("done"),
+                };
+                let mut sse = String::new();
+                for event in &events {
+                    sse.push_str("data: ");
+                    sse.push_str(&event.to_string());
+                    sse.push_str("\n\n");
                 }
-                None => stop("done"),
-            };
-            let message = AssistantMessage {
-                content,
-                api: self.api().to_string(),
-                provider: self.name().to_string(),
-                model: self.model_id().to_string(),
-                usage: Usage::default(),
-                stop_reason,
-                stop_details: None,
-                error_message: None,
-                timestamp: 0,
-            };
-            Ok(Box::pin(stream::iter(vec![Ok(
-                crate::model::StreamEvent::Done {
-                    reason: stop_reason,
-                    message,
-                },
-            )])))
-        }
+                sse.push_str("data: [DONE]\n\n");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                );
+            }
+        });
+        format!("http://{address}/v1")
     }
 
     struct RecordingTool {
@@ -13998,19 +14314,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum VaultTransition {
+        NewSession,
+        SwitchSession,
+        Fork,
+    }
+
     /// Over one RPC connection: a user turn carrying a raw secret (the agent
     /// obfuscates it on the way out and remembers the mapping), then
     /// `transition` (if any), then a turn in which the model hands the minted
     /// placeholder to the `record` tool. Returns (token the tool received,
     /// the placeholder, the raw secret).
-    fn token_seen_by_tool_after(transition: Option<&str>) -> (String, String, String) {
+    #[allow(clippy::too_many_lines)]
+    fn token_seen_by_tool_after(transition: Option<VaultTransition>) -> (String, String, String) {
         const SECRET: &str = "sk-abcdefghijklmnopqrstuvwxyz123456";
 
-        async fn wait_for_agent_end(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) {
+        async fn wait_for_agent_end(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
             loop {
                 let line = recv_line(out_rx, label).await.expect("turn event");
-                if parse_response(&line)["type"] == "agent_end" {
-                    return;
+                let value = parse_response(&line);
+                if value["type"] == "agent_end" {
+                    return value;
                 }
             }
         }
@@ -14023,21 +14348,43 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let placeholder_slot = Arc::new(Mutex::new(None));
             let seen = Arc::new(Mutex::new(Vec::new()));
-            let provider: Arc<dyn Provider> = Arc::new(PlaceholderToolCallProvider {
-                placeholder: Arc::clone(&placeholder_slot),
-            });
+            let mut entry = crate::models::ad_hoc_model_entry("openai", "gpt-4o-mini")
+                .expect("openai model entry");
+            entry.model.base_url = spawn_placeholder_openai_stub(Arc::clone(&placeholder_slot));
+            // The stub speaks chat completions; OpenAI's default here is the
+            // Responses API.
+            entry.model.api = "openai-completions".to_string();
+            entry.api_key = Some("test-key".to_string());
+            let provider =
+                crate::providers::create_provider(&entry, None).expect("stubbed openai provider");
             let tools = ToolRegistry::from_tools(vec![Box::new(RecordingTool {
                 seen: Arc::clone(&seen),
             })]);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session_value = Session::create_with_dir(Some(temp.path().join("sessions")));
+            let agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    stream_options: crate::provider::StreamOptions {
+                        api_key: Some("test-key".to_string()),
+                        ..crate::provider::StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            let sessions_dir = temp.path().join("sessions");
+            let mut session_value = Session::create_with_dir(Some(sessions_dir.clone()));
+            session_value.header.provider = Some("openai".to_string());
+            session_value.header.model_id = Some("gpt-4o-mini".to_string());
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(session_value));
             let agent_session = AgentSession::new(
                 agent,
-                Arc::new(asupersync::sync::Mutex::new(session_value)),
+                Arc::clone(&inner_session),
                 true,
                 crate::compaction::ResolvedCompactionSettings::default(),
             );
-            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            options.available_models.push(entry);
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
             let out_rx = Arc::new(Mutex::new(out_rx));
@@ -14054,26 +14401,66 @@ mod tests {
             )
             .await;
             assert_ok(&secret_prompt, "prompt");
-            wait_for_agent_end(&out_rx, "secret turn completion").await;
+            let secret_turn = wait_for_agent_end(&out_rx, "secret turn completion").await;
             let placeholder = placeholder_slot
                 .lock()
                 .expect("placeholder lock")
                 .clone()
-                .expect("the provider saw the secret turn");
+                .unwrap_or_else(|| panic!("the stub never saw the secret turn: {secret_turn}"));
             assert_ne!(
                 placeholder, SECRET,
                 "the raw secret must never reach the provider"
             );
 
-            if let Some(command) = transition {
-                let response = send_recv(
-                    &in_tx,
-                    &out_rx,
-                    &json!({ "id": "t", "type": command }).to_string(),
-                    "session transition",
-                )
-                .await;
+            if let Some(transition) = transition {
+                let (command, request) = match transition {
+                    VaultTransition::NewSession => {
+                        ("new_session", json!({ "id": "t", "type": "new_session" }))
+                    }
+                    VaultTransition::SwitchSession => {
+                        // A saved target on the same (stubbed) model, so the
+                        // rebuilt provider still reaches the loopback stub.
+                        let mut target = Session::create_with_dir(Some(sessions_dir.clone()));
+                        target.header.provider = Some("openai".to_string());
+                        target.header.model_id = Some("gpt-4o-mini".to_string());
+                        target.append_message(SessionMessage::User {
+                            content: UserContent::Text("target history".to_string()),
+                            timestamp: Some(0),
+                        });
+                        target.save().await.expect("save switch target");
+                        let path = target.path.clone().expect("saved target path");
+                        (
+                            "switch_session",
+                            json!({ "id": "t", "type": "switch_session", "sessionPath": path }),
+                        )
+                    }
+                    VaultTransition::Fork => {
+                        let entry_id = {
+                            let inner = inner_session
+                                .lock(&AgentCx::for_request())
+                                .await
+                                .expect("session lock");
+                            inner
+                                .entries_for_current_path()
+                                .iter()
+                                .find(|entry| {
+                                    matches!(entry, SessionEntry::Message(message)
+                                        if matches!(message.message, SessionMessage::User { .. }))
+                                })
+                                .and_then(|entry| entry.base_id())
+                                .cloned()
+                                .expect("the secret turn's user entry")
+                        };
+                        (
+                            "fork",
+                            json!({ "id": "t", "type": "fork", "entryId": entry_id }),
+                        )
+                    }
+                };
+                let response =
+                    send_recv(&in_tx, &out_rx, &request.to_string(), "session transition").await;
                 assert_ok(&response, command);
+                assert_ne!(response["data"]["cancelled"], true, "{response}");
             }
             let prompt = send_recv(
                 &in_tx,
@@ -14083,12 +14470,16 @@ mod tests {
             )
             .await;
             assert_ok(&prompt, "prompt");
-            wait_for_agent_end(&out_rx, "tool turn completion").await;
+            let tool_turn = wait_for_agent_end(&out_rx, "tool turn completion").await;
             drop(in_tx);
             let _ = server.await;
 
             let seen = seen.lock().expect("seen lock").clone();
-            assert_eq!(seen.len(), 1, "the tool must run exactly once: {seen:?}");
+            assert_eq!(
+                seen.len(),
+                1,
+                "the tool must run exactly once: {seen:?}; turn: {tool_turn}"
+            );
             let token = seen[0]["token"]
                 .as_str()
                 .expect("token argument")
@@ -14105,17 +14496,31 @@ mod tests {
         assert_eq!(token, secret);
     }
 
-    /// bd-mgj86: `new_session` starts a fresh secret vault, so a placeholder
-    /// minted in the previous session stays opaque and never becomes the raw
-    /// secret in the new session's tool calls.
-    #[test]
-    fn new_session_leaves_a_prior_secret_placeholder_opaque() {
-        let (token, placeholder, secret) = token_seen_by_tool_after(Some("new_session"));
+    fn assert_placeholder_stays_opaque(transition: VaultTransition, label: &str) {
+        let (token, placeholder, secret) = token_seen_by_tool_after(Some(transition));
         assert_ne!(
             token, secret,
-            "the old session's secret leaked across new_session"
+            "the old session's secret leaked across {label}"
         );
         assert_eq!(token, placeholder);
+    }
+
+    /// bd-mgj86: each session boundary starts a fresh secret vault, so a
+    /// placeholder minted in the previous session stays opaque and never
+    /// becomes the raw secret in the next session's tool calls.
+    #[test]
+    fn new_session_leaves_a_prior_secret_placeholder_opaque() {
+        assert_placeholder_stays_opaque(VaultTransition::NewSession, "new_session");
+    }
+
+    #[test]
+    fn switch_session_leaves_a_prior_secret_placeholder_opaque() {
+        assert_placeholder_stays_opaque(VaultTransition::SwitchSession, "switch_session");
+    }
+
+    #[test]
+    fn fork_leaves_a_prior_secret_placeholder_opaque() {
+        assert_placeholder_stays_opaque(VaultTransition::Fork, "fork");
     }
 
     #[derive(Default)]
