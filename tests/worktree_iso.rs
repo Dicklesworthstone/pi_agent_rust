@@ -178,7 +178,19 @@ fn worktree_cli_reaps_only_ours() {
 fn non_git_refusal_through_tool() {
     let case = "non_git_refusal_through_tool";
     let harness = TestHarness::new(case);
-    let root = harness.temp_path("not-a-repo");
+    // Not under the harness temp dir: rch workers put TMPDIR inside the
+    // project checkout, where git discovery finds the enclosing repository
+    // and the directory is not "not a repo" at all. /tmp is outside any
+    // checkout on the Unix hosts this suite runs on.
+    #[cfg(unix)]
+    let outside_base = std::path::PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let outside_base = std::env::temp_dir();
+    let outside = tempfile::Builder::new()
+        .prefix("pi-iso-not-a-repo-")
+        .tempdir_in(outside_base)
+        .expect("non-repository directory");
+    let root = outside.path().join("not-a-repo");
     std::fs::create_dir_all(&root).expect("dir");
 
     let tool = pi::subagents::SubagentTool::new(&root);
