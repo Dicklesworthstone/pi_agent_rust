@@ -1615,7 +1615,12 @@ fn append_jsonl_entries_blocking(
             mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
             let mut file = open_existing_session_file_for_append(path)?;
             file.write_all(&serialized_entries)?;
+            persistence_test_failpoint("jsonl_append_after_write_before_sync", None)?;
             file.sync_all().map_err(|e| crate::Error::Io(Box::new(e)))?;
+            persistence_test_failpoint(
+                "jsonl_append_after_sync",
+                Some("append_sync_completed=true"),
+            )?;
         }
         let mut persisted_entries = disk_session.entries.clone();
         persisted_entries.extend(entries_appended);

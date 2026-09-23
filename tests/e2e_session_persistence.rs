@@ -763,6 +763,7 @@ fn run_persistence_failpoint_child(
     backend: &str,
     failpoint: &str,
     message: &str,
+    save_mode: Option<&str>,
 ) -> std::process::Output {
     // Output goes to files so the parent can poll with a deadline without
     // a pipe filling up; a child past the deadline is killed and reaped.
@@ -781,6 +782,10 @@ fn run_persistence_failpoint_child(
         .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION", "hard_exit")
         .env("PI_SESSION_PERSISTENCE_TEST_MARKER_PATH", marker_path)
         .env("PI_SESSION_PERSISTENCE_TEST_MESSAGE", message)
+        .env(
+            "PI_SESSION_PERSISTENCE_TEST_SAVE_MODE",
+            save_mode.unwrap_or("default"),
+        )
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(&stdout_path).expect("child stdout file"))
         .stderr(std::fs::File::create(&stderr_path).expect("child stderr file"))
@@ -830,8 +835,16 @@ fn persistence_failpoint_worker_process_entrypoint() {
             content: UserContent::Text(message),
             timestamp: Some(0),
         });
-        if backend == "jsonl" {
-            session.set_model_header(Some("failpoint-jsonl".to_string()), None, None);
+        // A dirty header forces the full-rewrite path; leaving it clean takes
+        // the incremental append path. Defaults: JSONL rewrites, SQLite
+        // appends; the save-mode variable selects the other path.
+        let rewrite = match std::env::var("PI_SESSION_PERSISTENCE_TEST_SAVE_MODE").as_deref() {
+            Ok("rewrite") => true,
+            Ok("append") => false,
+            _ => backend == "jsonl",
+        };
+        if rewrite {
+            session.set_model_header(Some(format!("failpoint-{backend}")), None, None);
         }
         let result = session.save().await;
         panic!("hard-exit persistence failpoint returned unexpectedly: {result:?}");
@@ -1938,6 +1951,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             "jsonl",
             failpoint,
             "jsonl-midflush-pending",
+            None,
         );
         assert_eq!(
             child.status.code(),
@@ -1986,6 +2000,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             "jsonl",
             post_failpoint,
             "jsonl-postflush-persisted",
+            None,
         );
         assert_eq!(
             post_child.status.code(),
@@ -2093,6 +2108,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             "sqlite",
             failpoint,
             "sqlite-midflush-pending",
+            None,
         );
         assert_eq!(
             child.status.code(),
@@ -2135,6 +2151,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             "sqlite",
             post_failpoint,
             "sqlite-postflush-persisted",
+            None,
         );
         assert_eq!(
             post_child.status.code(),
@@ -2713,4 +2730,174 @@ fn e2e_print_mode_session_path_persists_and_continues() {
         Some(session_id.as_str()),
         "second process must adopt existing session ID from persisted session"
     );
+}
+
+/// bd-yn7ud: the incremental JSONL append path has its own crash windows. A
+/// hard exit after the append write but before its fsync must leave a strict,
+/// complete log (the bytes are in the page cache; a torn or duplicated row is
+/// the failure), and a hard exit after the fsync must include the new row.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn jsonl_append_fault_windows_preserve_integrity() {
+    let harness = TestHarness::new("e2e_jsonl_append_fault_windows");
+    run_async_test(async {
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Jsonl);
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("append-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save baseline jsonl session");
+        let stable_path = session.path.clone().expect("jsonl session path");
+        drop(session);
+        let markers = tempfile::tempdir().expect("marker dir");
+
+        let point = "jsonl_append_after_write_before_sync";
+        let marker = markers.path().join("append-before-sync.marker");
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            &marker,
+            "jsonl",
+            point,
+            "append-written-unsynced",
+            Some("append"),
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            format!("{point}\njsonl_parent_syncs=0\n"),
+            "the child must stop at the append checkpoint, not in the rewrite path"
+        );
+        let reopened = reopen_strict(&stable_path, "append before fsync").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(texts, vec!["append-base", "append-written-unsynced"]);
+        assert_no_duplicate_user_texts(&texts, "jsonl append before fsync");
+        assert_ne!(
+            reopened.header.provider.as_deref(),
+            Some("failpoint-jsonl"),
+            "an append must not have rewritten the header"
+        );
+        drop(reopened);
+
+        let point = "jsonl_append_after_sync";
+        let marker = markers.path().join("append-after-sync.marker");
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            &marker,
+            "jsonl",
+            point,
+            "append-synced",
+            Some("append"),
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            format!("{point}\nappend_sync_completed=true\njsonl_parent_syncs=0\n")
+        );
+        let reopened = reopen_strict(&stable_path, "append after fsync").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(
+            texts,
+            vec!["append-base", "append-written-unsynced", "append-synced"]
+        );
+        assert_no_duplicate_user_texts(&texts, "jsonl append after fsync");
+    });
+}
+
+/// bd-yn7ud: the SQLite full-rewrite transaction (DELETE + reinsert). A hard
+/// exit inside the transaction must roll back to the previous snapshot,
+/// header included; a hard exit after COMMIT must keep the whole rewrite.
+#[cfg(all(
+    feature = "sqlite-sessions",
+    feature = "internal-persistence-fault-injection"
+))]
+#[test]
+fn sqlite_rewrite_fault_windows_preserve_integrity() {
+    let harness = TestHarness::new("e2e_sqlite_rewrite_fault_windows");
+    run_async_test(async {
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Sqlite);
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("rewrite-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save baseline sqlite session");
+        let stable_path = session.path.clone().expect("sqlite session path");
+        drop(session);
+        let markers = tempfile::tempdir().expect("marker dir");
+
+        let point = "sqlite_rewrite_after_mutation_before_commit";
+        let marker = markers.path().join("rewrite-before-commit.marker");
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            &marker,
+            "sqlite",
+            point,
+            "rewrite-uncommitted",
+            Some("rewrite"),
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let marker_text = std::fs::read_to_string(&marker).expect("read marker");
+        assert!(
+            marker_text.starts_with(&format!("{point}\nentries_after=")),
+            "the child must stop inside the rewrite transaction: {marker_text:?}"
+        );
+        let reopened = reopen_strict(&stable_path, "sqlite rewrite before commit").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(
+            texts,
+            vec!["rewrite-base"],
+            "an uncommitted rewrite must roll back"
+        );
+        assert_ne!(
+            reopened.header.provider.as_deref(),
+            Some("failpoint-sqlite"),
+            "the rolled-back rewrite's header must not survive"
+        );
+        drop(reopened);
+
+        let point = "sqlite_rewrite_after_commit";
+        let marker = markers.path().join("rewrite-after-commit.marker");
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            &marker,
+            "sqlite",
+            point,
+            "rewrite-committed",
+            Some("rewrite"),
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            format!("{point}\ncommit_completed=true\n")
+        );
+        let reopened = reopen_strict(&stable_path, "sqlite rewrite after commit").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(texts, vec!["rewrite-base", "rewrite-committed"]);
+        assert_eq!(
+            reopened.header.provider.as_deref(),
+            Some("failpoint-sqlite"),
+            "a committed rewrite keeps its header"
+        );
+    });
 }

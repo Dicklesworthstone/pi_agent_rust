@@ -2335,6 +2335,11 @@ pub async fn save_session(
                 0,
             )?;
             write_session_meta(&conn, &reconciled.entries)?;
+            #[cfg(feature = "internal-persistence-fault-injection")]
+            crate::session::persistence_test_failpoint(
+                "sqlite_rewrite_after_mutation_before_commit",
+                Some(&format!("entries_after={}", reconciled.entries.len())),
+            )?;
 
             Ok((header_to_write, reconciled.entries))
         })();
@@ -2342,6 +2347,10 @@ pub async fn save_session(
         match save_result {
             Ok((saved_header, saved_entries)) => {
                 map_sqlite_result(conn.execute_raw("COMMIT"))?;
+                crate::session::persistence_test_failpoint(
+                    "sqlite_rewrite_after_commit",
+                    Some("commit_completed=true"),
+                )?;
                 map_sqlite_result(conn.close())?;
                 ensure_private_sqlite_permissions(path)?;
                 Ok((saved_header, saved_entries))
