@@ -1724,7 +1724,7 @@
           "rendered": "rch exec -- cargo check --all-targets"
         },
         "command_class": "cargo_check",
-        "entry_id": "rvpe-3a546a5f40287059",
+        "entry_id": "[ENTRY_ID]",
         "evidence_classification": {
           "clean_remote_proof": false,
           "coverage": {
@@ -1828,7 +1828,7 @@
       ],
       "head": "abc123fixture"
     },
-    "ledger_id": "rvpl-0adebefc11879754",
+    "ledger_id": "[LEDGER_ID]",
     "producer": {
       "name": "scripts/build_swarm_operator_runpack.py",
       "version": "1.0.0"

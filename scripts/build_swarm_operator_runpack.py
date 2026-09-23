@@ -10159,6 +10159,8 @@ def is_temp_artifact_path(path: str) -> bool:
     return (
         lowered.startswith("/data/tmp/")
         or lowered.startswith("/tmp/")
+        # macOS: /tmp is a symlink to /private/tmp, so resolved paths land here.
+        or lowered.startswith("/private/tmp/")
         or "/.rch-target" in lowered
         or "/.rch-tmp" in lowered
         or "clean-worktree" in lowered
@@ -15582,6 +15584,12 @@ def canonicalize_for_golden(value: Any, workspace: Path) -> Any:
         for key, item in value.items():
             if key == "sha256" and isinstance(item, str):
                 canonicalized[key] = "[SHA256]"
+            elif key in {"entry_id", "ledger_id"} and isinstance(item, str) and (
+                item.startswith("rvpe-") or item.startswith("rvpl-")
+            ):
+                # Content hashes over the raw command cwd (the checkout path)
+                # and entries; they differ per checkout location, like sha256.
+                canonicalized[key] = "[ENTRY_ID]" if key == "entry_id" else "[LEDGER_ID]"
             elif key == "size_bytes" and workspace_scoped_path:
                 canonicalized[key] = "[SIZE_BYTES]"
             elif key in GOLDEN_DURATION_KEYS and isinstance(item, (int, float)):
@@ -34121,7 +34129,18 @@ def write_ninth_wave_closeout_gate_output(
 
 
 def run_self_test() -> int:
-    workspace = Path(tempfile.mkdtemp(prefix="pi_swarm_runpack_"))
+    # The temp-artifact inventory keeps only temp-looking paths
+    # (is_temp_artifact_path), so a workspace under macOS's /var/folders
+    # TMPDIR would silently drop entries the golden expects. /tmp qualifies
+    # on every Unix host.
+    # Resolved, because the autopilot scenarios resolve their directories and
+    # the golden scrubbing matches the workspace prefix textually.
+    workspace = Path(
+        tempfile.mkdtemp(
+            prefix="pi_swarm_runpack_",
+            dir="/tmp" if os.name == "posix" and Path("/tmp").is_dir() else None,
+        )
+    ).resolve()
     generated_at = "2026-05-09T09:00:00+00:00"
     accepted_preflight = {
         "schema": HOST_PREFLIGHT_SCHEMA,
