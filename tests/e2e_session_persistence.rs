@@ -2814,6 +2814,103 @@ fn jsonl_append_fault_windows_preserve_integrity() {
     });
 }
 
+/// bd-5jfkl child: a thinking-level change whose JSONL rewrite renames into
+/// place and then reports failure, on the first save and the idempotent
+/// retry alike. The durable outcome is unknown to the caller, so the live
+/// runtime must not install the level and provider re-entry must stay
+/// refused. The child asserts that itself; the parent inspects the file.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn setter_post_rename_worker_process_entrypoint() {
+    if std::env::var_os("PI_SESSION_SETTER_FAILPOINT_WORKER").is_none() {
+        return;
+    }
+    let session_path = PathBuf::from(required_chaos_env("PI_SESSION_PERSISTENCE_TEST_PATH"));
+    run_async_test(async {
+        let session = Session::open(session_path.to_string_lossy().as_ref())
+            .await
+            .expect("open setter worker session");
+        let cwd = session_path.parent().expect("session dir").to_path_buf();
+        let provider = Arc::new(PlannedProvider::new(Vec::new()));
+        let mut agent_session = make_agent_session(
+            &cwd,
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            Arc::new(asupersync::sync::Mutex::new(session)),
+        );
+
+        let err = agent_session
+            .set_thinking_level(pi::model::ThinkingLevel::High)
+            .await
+            .expect_err("both saves fail after their rename");
+        assert!(err.is_session_persistence(), "{err}");
+        assert_eq!(
+            agent_session.agent.stream_options().thinking_level,
+            None,
+            "an indeterminate save must not install the level"
+        );
+
+        let err = agent_session
+            .run_text("after the failed setter".to_string(), |_| {})
+            .await
+            .expect_err("provider re-entry must be quarantined");
+        assert!(err.is_session_persistence(), "{err}");
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+    });
+}
+
+/// bd-5jfkl: see the worker above. The rename landed, so the reopened file
+/// holds the new level while the child's runtime refused it; the file must
+/// still reopen strictly with the prior transcript intact.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn thinking_setter_post_rename_failure_quarantines_reentry() {
+    let harness = TestHarness::new("e2e_thinking_setter_post_rename");
+    run_async_test(async {
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Jsonl);
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("setter-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save baseline jsonl session");
+        let stable_path = session.path.clone().expect("jsonl session path");
+        assert_eq!(session.header.thinking_level, None);
+        drop(session);
+
+        let logs = tempfile::tempdir().expect("setter child log dir");
+        let stderr_path = logs.path().join("stderr");
+        let status = Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("--exact")
+            .arg("setter_post_rename_worker_process_entrypoint")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("PI_SESSION_SETTER_FAILPOINT_WORKER", "1")
+            .env("PI_SESSION_PERSISTENCE_TEST_PATH", &stable_path)
+            .env(
+                "PI_SESSION_PERSISTENCE_TEST_FAILPOINT",
+                "jsonl_after_rename_before_parent_sync",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).expect("child stderr file"))
+            .status()
+            .expect("run setter failpoint child");
+        assert!(
+            status.success(),
+            "setter child failed ({status}):\n{}",
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+
+        let reopened = reopen_strict(&stable_path, "setter post-rename").await;
+        assert!(
+            reopened.header.thinking_level.is_some(),
+            "the rename landed, so the file holds the level the runtime refused"
+        );
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(texts, vec!["setter-base"]);
+    });
+}
+
 /// bd-yn7ud: the SQLite full-rewrite transaction (DELETE + reinsert). A hard
 /// exit inside the transaction must roll back to the previous snapshot,
 /// header included; a hard exit after COMMIT must keep the whole rewrite.
