@@ -28,6 +28,11 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   first model instead of opening the picker. Releases are now ignored;
   auto-repeat still counts.
 
+- **Tool paths written as `~\...` were not expanded on Windows.** Only `~/`
+  was treated as the home directory, so `read ~\notes\todo.txt` looked for a
+  directory literally named `~` under the working directory. On Windows `~\`
+  now expands like `~/`; on Unix `~\x` stays a literal file name.
+
 ## [v0.5.1] — 2026-09-12 — Release
 
 Windows-only. Nothing on Linux or macOS behaves differently; the binaries for

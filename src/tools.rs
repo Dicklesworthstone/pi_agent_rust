@@ -2718,11 +2718,26 @@ fn expand_path(file_path: &str) -> String {
             .to_string_lossy()
             .to_string();
     }
-    if let Some(rest) = normalized.strip_prefix("~/") {
+    if let Some(rest) = home_relative_rest(&normalized, cfg!(windows)) {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
         return home.join(rest).to_string_lossy().to_string();
     }
     normalized
+}
+
+/// The remainder of `path` after a leading `~` home marker, or `None`.
+///
+/// `~/` is a home marker everywhere. `~\` is one only where backslash is a
+/// path separator (Windows, where models naturally write `~\Documents\x`);
+/// on Unix `~\x` is a legal relative file name and must stay literal.
+fn home_relative_rest(path: &str, backslash_separates: bool) -> Option<&str> {
+    path.strip_prefix("~/").or_else(|| {
+        if backslash_separates {
+            path.strip_prefix("~\\")
+        } else {
+            None
+        }
+    })
 }
 
 /// Resolve a path relative to `cwd`. Handles `~` expansion and absolute paths.
@@ -20189,6 +20204,35 @@ mod tests {
         let result = resolve_path("~/file.txt", &cwd);
         // Tilde expansion depends on environment, but should not be literal ~/
         assert!(!result.to_string_lossy().starts_with("~/"));
+    }
+
+    /// Windows models write `~\Documents\x`; that must reach the home
+    /// directory there, while on Unix `~\x` stays a literal relative name.
+    #[test]
+    fn test_home_relative_rest_accepts_backslash_only_where_it_separates() {
+        assert_eq!(home_relative_rest("~/a/b.txt", false), Some("a/b.txt"));
+        assert_eq!(home_relative_rest("~/a/b.txt", true), Some("a/b.txt"));
+        assert_eq!(
+            home_relative_rest("~\\Documents\\b.txt", true),
+            Some("Documents\\b.txt")
+        );
+        assert_eq!(home_relative_rest("~\\Documents\\b.txt", false), None);
+        assert_eq!(home_relative_rest("~user/b.txt", true), None);
+        assert_eq!(home_relative_rest("a/~/b.txt", true), None);
+        assert_eq!(home_relative_rest("~", true), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_path_backslash_tilde_expands_on_windows() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let cwd = PathBuf::from(r"C:\work\project");
+        assert_eq!(
+            resolve_path(r"~\notes\todo.txt", &cwd),
+            home.join("notes").join("todo.txt")
+        );
     }
 
     fn arbitrary_text() -> impl Strategy<Value = String> {
