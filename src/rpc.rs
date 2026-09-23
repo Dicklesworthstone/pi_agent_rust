@@ -13852,6 +13852,272 @@ mod tests {
         }
     }
 
+    /// bd-mgj86: a user turn `key=<secret>` reaches this provider already
+    /// obfuscated, so it captures the placeholder the agent minted. A later
+    /// user turn makes it hand that placeholder to the `record` tool. What the
+    /// tool receives shows whether the agent's secret vault still maps it.
+    struct PlaceholderToolCallProvider {
+        placeholder: Arc<Mutex<Option<String>>>,
+    }
+
+    fn user_text(message: &Message) -> Option<String> {
+        let Message::User(user) = message else {
+            return None;
+        };
+        Some(match &user.content {
+            UserContent::Text(text) => text.clone(),
+            UserContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<String>(),
+        })
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for PlaceholderToolCallProvider {
+        fn name(&self) -> &str {
+            "placeholder-provider"
+        }
+
+        fn api(&self) -> &str {
+            "placeholder-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "placeholder-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let last = context.messages.last();
+            let last_user_text = last.and_then(user_text);
+            let stop = |text: &str| {
+                (
+                    vec![ContentBlock::Text(TextContent::new(text))],
+                    StopReason::Stop,
+                )
+            };
+            let (content, stop_reason) = match last_user_text {
+                Some(text) if text.starts_with("key=") => {
+                    *self.placeholder.lock().expect("placeholder lock") =
+                        Some(text["key=".len()..].to_string());
+                    stop("noted")
+                }
+                Some(_) => {
+                    let placeholder = self
+                        .placeholder
+                        .lock()
+                        .expect("placeholder lock")
+                        .clone()
+                        .unwrap_or_default();
+                    (
+                        vec![ContentBlock::ToolCall(ToolCall {
+                            id: "record-1".to_string(),
+                            name: "record".to_string(),
+                            arguments: json!({ "token": placeholder }),
+                            thought_signature: None,
+                        })],
+                        StopReason::ToolUse,
+                    )
+                }
+                None => stop("done"),
+            };
+            let message = AssistantMessage {
+                content,
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![Ok(
+                crate::model::StreamEvent::Done {
+                    reason: stop_reason,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    struct RecordingTool {
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::tools::Tool for RecordingTool {
+        fn name(&self) -> &str {
+            "record"
+        }
+
+        fn label(&self) -> &str {
+            "Record"
+        }
+
+        fn description(&self) -> &str {
+            "Records the arguments it receives"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": { "token": { "type": "string" } },
+                "required": ["token"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            input: Value,
+            _on_update: Option<Box<dyn Fn(crate::tools::ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<crate::tools::ToolOutput> {
+            self.seen.lock().expect("seen lock").push(input);
+            Ok(crate::tools::ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("recorded"))],
+                details: None,
+                is_error: false,
+            })
+        }
+    }
+
+    /// Over one RPC connection: a user turn carrying a raw secret (the agent
+    /// obfuscates it on the way out and remembers the mapping), then
+    /// `transition` (if any), then a turn in which the model hands the minted
+    /// placeholder to the `record` tool. Returns (token the tool received,
+    /// the placeholder, the raw secret).
+    fn token_seen_by_tool_after(transition: Option<&str>) -> (String, String, String) {
+        const SECRET: &str = "sk-abcdefghijklmnopqrstuvwxyz123456";
+
+        async fn wait_for_agent_end(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) {
+            loop {
+                let line = recv_line(out_rx, label).await.expect("turn event");
+                if parse_response(&line)["type"] == "agent_end" {
+                    return;
+                }
+            }
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let placeholder_slot = Arc::new(Mutex::new(None));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let provider: Arc<dyn Provider> = Arc::new(PlaceholderToolCallProvider {
+                placeholder: Arc::clone(&placeholder_slot),
+            });
+            let tools = ToolRegistry::from_tools(vec![Box::new(RecordingTool {
+                seen: Arc::clone(&seen),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session_value = Session::create_with_dir(Some(temp.path().join("sessions")));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(session_value)),
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = runtime_handle
+                // Boxed: clippy::large_futures.
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+
+            let secret_prompt = send_recv(
+                &in_tx,
+                &out_rx,
+                &json!({ "id": "s", "type": "prompt", "message": format!("key={SECRET}") })
+                    .to_string(),
+                "secret prompt acknowledgment",
+            )
+            .await;
+            assert_ok(&secret_prompt, "prompt");
+            wait_for_agent_end(&out_rx, "secret turn completion").await;
+            let placeholder = placeholder_slot
+                .lock()
+                .expect("placeholder lock")
+                .clone()
+                .expect("the provider saw the secret turn");
+            assert_ne!(
+                placeholder, SECRET,
+                "the raw secret must never reach the provider"
+            );
+
+            if let Some(command) = transition {
+                let response = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &json!({ "id": "t", "type": command }).to_string(),
+                    "session transition",
+                )
+                .await;
+                assert_ok(&response, command);
+            }
+            let prompt = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"p","type":"prompt","message":"use the token"}"#,
+                "prompt acknowledgment",
+            )
+            .await;
+            assert_ok(&prompt, "prompt");
+            wait_for_agent_end(&out_rx, "tool turn completion").await;
+            drop(in_tx);
+            let _ = server.await;
+
+            let seen = seen.lock().expect("seen lock").clone();
+            assert_eq!(seen.len(), 1, "the tool must run exactly once: {seen:?}");
+            let token = seen[0]["token"]
+                .as_str()
+                .expect("token argument")
+                .to_string();
+            (token, placeholder, SECRET.to_string())
+        })
+    }
+
+    /// Control: without a session transition the vault restores the
+    /// placeholder, so the test below observes something real.
+    #[test]
+    fn secret_placeholder_is_restored_for_tools_within_the_same_session() {
+        let (token, _placeholder, secret) = token_seen_by_tool_after(None);
+        assert_eq!(token, secret);
+    }
+
+    /// bd-mgj86: `new_session` starts a fresh secret vault, so a placeholder
+    /// minted in the previous session stays opaque and never becomes the raw
+    /// secret in the new session's tool calls.
+    #[test]
+    fn new_session_leaves_a_prior_secret_placeholder_opaque() {
+        let (token, placeholder, secret) = token_seen_by_tool_after(Some("new_session"));
+        assert_ne!(
+            token, secret,
+            "the old session's secret leaked across new_session"
+        );
+        assert_eq!(token, placeholder);
+    }
+
     #[derive(Default)]
     struct RpcDeadlineProbeState {
         calls: std::sync::atomic::AtomicUsize,
