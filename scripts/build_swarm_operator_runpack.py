@@ -1984,6 +1984,7 @@ def capture_command(
     cwd: Path,
     timeout_seconds: int,
     stdout_path: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], str]:
     result: dict[str, Any] = {
         "id": command_id,
@@ -1999,6 +2000,7 @@ def capture_command(
         completed = subprocess.run(
             command,
             cwd=cwd,
+            env=env,
             text=True,
             capture_output=True,
             timeout=timeout_seconds,
@@ -16507,11 +16509,22 @@ def capture_autopilot_e2e_command(
     cwd: Path,
     timeout_seconds: int,
 ) -> str:
+    env = None
+    if command and command[0] == "br":
+        # Every autopilot br call runs in its own scenario workspace. Pin the
+        # database there: br versions that auto-discover an ancestor tracker
+        # would otherwise attach to whatever .beads sits above the temp dir
+        # (on rch workers TMPDIR is inside the project checkout).
+        env = dict(os.environ)
+        for key in ("BEADS_DIR", "BD_DB", "BD_DATABASE", "BEADS_WORKSPACE", "BEADS_CONFIG"):
+            env.pop(key, None)
+        env["BEADS_DB"] = str(cwd / ".beads" / "beads.db")
     result, stdout = capture_command(
         command_id,
         command,
         cwd=cwd,
         timeout_seconds=timeout_seconds,
+        env=env,
     )
     commands.append(result)
     if result.get("status") != "ok":
@@ -37887,6 +37900,11 @@ def run_self_test() -> int:
                 "BEADS_CONFIG",
             ):
                 beads_env.pop(key, None)
+            # Pin the database to this workspace. Without it, br versions
+            # that auto-discover an ancestor tracker attach to whatever
+            # .beads sits above the temp dir (on rch workers TMPDIR is inside
+            # the project checkout) and refuse on its schema.
+            beads_env["BEADS_DB"] = str(real_beads_workspace / ".beads" / "beads.db")
 
             def run_real_br(*command: str) -> str:
                 completed = subprocess.run(
