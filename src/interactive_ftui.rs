@@ -62,6 +62,7 @@ use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use std::collections::VecDeque;
 
+mod info_commands;
 mod plan_commands;
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
@@ -1048,6 +1049,9 @@ pub enum UiCommand {
     Fork { args: String },
     /// `/reload`: rebuild the session from its file with resources re-read.
     Reload,
+    /// A read-only OMP info command (`/tools`, `/extensions`, `/skills`,
+    /// `/dirs`, `/context`, `/todo`, `/jobs`, `/stats`).
+    Info(info_commands::InfoCommand),
     /// Show session info (`/session`): file, id, name, model, thinking
     /// level, and message count — a read-only snapshot of the live session.
     SessionInfo,
@@ -2559,6 +2563,23 @@ impl PiFtuiModel {
             self.pending_quit = true;
             return true;
         }
+        // OMP's /plan-review re-opens the review of the latest plan.
+        if canon == "/plan-review" {
+            self.begin_busy("updating plan ...");
+            self.send_command(UiCommand::Plan {
+                action: String::from("review"),
+            });
+            return true;
+        }
+        // Read-only OMP info commands answer from state the session has.
+        if let Some(command) = canon
+            .split_whitespace()
+            .next()
+            .and_then(info_commands::InfoCommand::parse)
+        {
+            self.send_command(UiCommand::Info(command));
+            return true;
+        }
         if let Some(rest) = strip_command(clean, "/plan") {
             if plan_commands::parse(rest).is_ok() {
                 self.begin_busy("updating plan ...");
@@ -2725,7 +2746,9 @@ impl PiFtuiModel {
                      /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking [level], /theme, /changelog, /clear, /hotkeys, \
-                     /login [provider], /logout [provider], /fork [n|id|list], /reload, /help, \
+                     /login [provider], /logout [provider], /fork [n|id|list], /reload, \
+                     /rename <name>, /plan-review, /tools, /extensions, /skills, /dirs, \
+                     /context, /todo, /jobs, /stats, /help, \
                      /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
                 ),
@@ -2838,10 +2861,10 @@ impl PiFtuiModel {
                 }
                 return true;
             }
-            "/name" => {
+            "/name" | "/rename" => {
                 let name = cmd_args.trim();
                 if name.is_empty() {
-                    self.push_entry(EntryRole::Error, String::from("Usage: /name <name>"));
+                    self.push_entry(EntryRole::Error, String::from("Usage: /rename <name>"));
                 } else {
                     self.send_command(UiCommand::SetName(name.to_string()));
                 }
@@ -6319,6 +6342,8 @@ pub fn run(
                 Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                 // Issue #208: extension-contributed slash commands become
                 // completable now that the extension runtime is up.
+                // Resource catalog for the info commands (/skills).
+                let info_catalog = driver_catalog.clone();
                 if let Some(manager) = handle.extension_manager() {
                     let mut catalog = driver_catalog;
                     catalog.extension_commands = extension_commands_for_catalog(manager);
@@ -6481,6 +6506,16 @@ pub fn run(
                         }
                         Ok(UiCommand::Logout { args }) => {
                             run_logout_command(&mut handle, &args, &agent_tx);
+                        }
+                        Ok(UiCommand::Info(command)) => {
+                            Box::pin(info_commands::run(
+                                command,
+                                &handle,
+                                &info_catalog,
+                                &bash_cwd,
+                                &agent_tx,
+                            ))
+                            .await;
                         }
                         Ok(UiCommand::Reload) => {
                             // Boxed: clippy::large_futures.
@@ -9986,6 +10021,52 @@ mod tests {
             let _ = unsaved.shutdown_owned_resources().await;
             let _ = handle.shutdown_owned_resources().await;
         });
+    }
+
+    /// OMP's read-only info commands and aliases route on the default stack;
+    /// near-miss tokens still reach extension dispatch.
+    #[test]
+    fn omp_info_commands_and_aliases_route_to_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let mut send = |text: &str| {
+            type_str(&mut sim, text);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            submit_rx.try_recv().expect("routed")
+        };
+        for (text, expected) in [
+            ("/tools", info_commands::InfoCommand::Tools),
+            ("/extensions", info_commands::InfoCommand::Extensions),
+            ("/skills", info_commands::InfoCommand::Skills),
+            ("/dirs", info_commands::InfoCommand::Dirs),
+            ("/context", info_commands::InfoCommand::Context),
+            ("/todo", info_commands::InfoCommand::Todo),
+            ("/jobs", info_commands::InfoCommand::Jobs),
+            ("/stats", info_commands::InfoCommand::Stats),
+        ] {
+            assert_eq!(send(text), UiCommand::Info(expected), "{text}");
+        }
+        assert_eq!(
+            send("/plan-review"),
+            UiCommand::Plan {
+                action: String::from("review")
+            }
+        );
+        assert_eq!(
+            send("/rename release prep"),
+            UiCommand::SetName(String::from("release prep"))
+        );
+        assert_eq!(
+            send("/toolsy"),
+            UiCommand::ExtensionCommand {
+                name: String::from("toolsy"),
+                args: String::new()
+            },
+            "a near-miss token is an extension command, not /tools"
+        );
     }
 
     /// `/fork` existed only on the classic stack. It routes to the driver, and
