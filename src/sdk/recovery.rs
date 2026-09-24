@@ -4,8 +4,9 @@
 //! session's persisted continuation/transition APIs, never the bare Agent loop.
 
 use super::{
-    AbortHandle, AbortSignal, AgentEvent, AgentSessionHandle, AssistantMessage, Error,
-    FailoverOptions, Message, Result, StopReason,
+    AbortHandle, AbortSignal, AgentEvent, AgentSessionHandle, AssistantMessage, ContentBlock,
+    Error, FailoverOptions, ImageContent, Message, Result, SessionPromptResult, SessionTransport,
+    SessionTransportEvent, StopReason, TextContent, UserContent,
 };
 use crate::failover::{RetryPolicy, TurnDecision, TurnOutcome, TurnProgress};
 use std::sync::{Arc, Mutex};
@@ -243,7 +244,53 @@ impl AgentSessionHandle {
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_recoverable_turn(Some(input.into()), abort_signal, on_event)
+        self.run_recoverable_turn(Some(UserContent::Text(input.into())), abort_signal, on_event)
+            .await
+    }
+
+    /// Send text and image attachments as one recoverable user prompt.
+    ///
+    /// Images contain base64-encoded data and a MIME type; this method does not
+    /// read files or resolve URLs. An empty text with nonempty images is an
+    /// image-only prompt. Empty images use the ordinary text path unchanged.
+    ///
+    /// Input extensions receive both text and images. The session persists the
+    /// resulting user message once, and retries/failovers resume that history
+    /// instead of re-appending or re-running the input hooks. Image blocking
+    /// and the active model's image capability remain enforced by the Agent.
+    pub async fn prompt_with_images(
+        &mut self,
+        input: impl Into<String>,
+        images: Vec<ImageContent>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let (_handle, signal) = AbortHandle::new();
+        self.prompt_with_images_with_abort(input, images, signal, on_event)
+            .await
+    }
+
+    /// Send image attachments with the same cancellation and durable recovery
+    /// boundaries as [`Self::prompt_with_abort`].
+    pub async fn prompt_with_images_with_abort(
+        &mut self,
+        input: impl Into<String>,
+        images: Vec<ImageContent>,
+        abort_signal: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        ensure_not_aborted(&abort_signal)?;
+        let text = input.into();
+        let content = if images.is_empty() {
+            UserContent::Text(text)
+        } else {
+            let mut blocks = Vec::with_capacity(images.len().saturating_add(1));
+            if !text.is_empty() {
+                blocks.push(ContentBlock::Text(TextContent::new(text)));
+            }
+            blocks.extend(images.into_iter().map(ContentBlock::Image));
+            UserContent::Blocks(blocks)
+        };
+        self.run_recoverable_turn(Some(content), abort_signal, on_event)
             .await
     }
 
@@ -268,7 +315,7 @@ impl AgentSessionHandle {
 
     async fn run_recoverable_turn(
         &mut self,
-        input: Option<String>,
+        input: Option<UserContent>,
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
@@ -287,11 +334,20 @@ impl AgentSessionHandle {
         let shared = turn.callback();
         let forwarded = Arc::clone(&shared);
         let first = match input {
-            Some(input) => {
+            Some(UserContent::Text(input)) => {
                 self.session
                     .run_text_with_abort(input, Some(abort_signal.clone()), move |event| {
                         forwarded(event);
                     })
+                    .await
+            }
+            Some(UserContent::Blocks(content)) => {
+                self.session
+                    .run_with_content_with_abort(
+                        content,
+                        Some(abort_signal.clone()),
+                        move |event| forwarded(event),
+                    )
                     .await
             }
             None => {
@@ -321,7 +377,7 @@ impl AgentSessionHandle {
         self
     }
 
-    /// Install (or clear) the recovery policy used by all four turn entrypoints.
+    /// Install (or clear) the recovery policy used by every turn entrypoint.
     #[must_use]
     pub const fn with_retry(mut self, policy: Option<RetryPolicy>) -> Self {
         self.retry = policy;
@@ -688,6 +744,44 @@ impl AgentSessionHandle {
             });
         }
         result
+    }
+}
+
+impl SessionTransport {
+    /// Send text and image attachments over either session transport.
+    ///
+    /// In-process sessions use the same durable, recoverable path as
+    /// [`AgentSessionHandle::prompt_with_images`]. Subprocess sessions send the
+    /// RPC protocol's `images` field and deliver events as they arrive, rather
+    /// than flattening the prompt to text or waiting to replay its events.
+    /// Cancellation of an RPC prompt remains available through
+    /// [`super::RpcTransportClient::control_handle`].
+    pub async fn prompt_with_images(
+        &mut self,
+        input: impl Into<String>,
+        images: Vec<ImageContent>,
+        on_event: impl Fn(SessionTransportEvent) + Send + Sync + 'static,
+    ) -> Result<SessionPromptResult> {
+        let input = input.into();
+        match self {
+            Self::InProcess(handle) => {
+                let assistant = handle
+                    .prompt_with_images(input, images, move |event| {
+                        on_event(SessionTransportEvent::InProcess(Box::new(event)));
+                    })
+                    .await?;
+                Ok(SessionPromptResult::InProcess(Box::new(assistant)))
+            }
+            Self::RpcSubprocess(client) => {
+                let images = (!images.is_empty()).then_some(images);
+                let events = client
+                    .prompt_with_options_streaming(input, images, None, move |event| {
+                        on_event(SessionTransportEvent::Rpc(event));
+                    })
+                    .await?;
+                Ok(SessionPromptResult::RpcEvents(events))
+            }
+        }
     }
 }
 
