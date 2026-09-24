@@ -1,9 +1,10 @@
 //! Confined create-only publication for model-selected artifact paths.
 //!
 //! Callers supply a workspace root plus a relative destination. Unix publication
-//! pins every directory component with no-follow descriptors and hard-links a
-//! fully-synced private staging file into the final name, so neither parent
-//! symlink swaps nor destination races can redirect or replace user files.
+//! retains the workspace descriptor from resolution, pins every relative
+//! directory component with no-follow descriptors, and hard-links a fully-synced
+//! private staging file into the final name. Path swaps cannot redirect writes
+//! into a replacement workspace or replace existing user files.
 
 use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
@@ -13,6 +14,8 @@ pub struct OutputTarget {
     root: PathBuf,
     relative: PathBuf,
     absolute: PathBuf,
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    root_directory: std::sync::Arc<rustix::fd::OwnedFd>,
 }
 
 impl OutputTarget {
@@ -66,6 +69,26 @@ pub fn resolve_new(cwd: &Path, requested: &str, tool: &str) -> Result<OutputTarg
     }
     let root = std::fs::canonicalize(cwd)
         .map_err(|failure| error(tool, format!("cannot resolve workspace root: {failure}")))?;
+    // Resolve before remote generation/download work and keep this identity
+    // across awaits. Reopening the pathname in publish() would let a replaced
+    // ancestor redirect even an O_NOFOLLOW open of the workspace itself.
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    let root_directory = {
+        use rustix::fs::{Mode, OFlags};
+        std::sync::Arc::new(
+            rustix::fs::open(
+                &root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|_| {
+                error(
+                    tool,
+                    "workspace root could not be pinned without following links",
+                )
+            })?,
+        )
+    };
     let absolute = root.join(&relative);
     // Early no-clobber check avoids expensive remote work when the destination
     // is already occupied. Final publication repeats this atomically.
@@ -110,6 +133,8 @@ pub fn resolve_new(cwd: &Path, requested: &str, tool: &str) -> Result<OutputTarg
         root,
         relative,
         absolute,
+        #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+        root_directory,
     })
 }
 
@@ -139,13 +164,28 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
         return Err(error(tool, "refusing to publish an empty artifact"));
     }
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let mut directory =
-        rustix::fs::open(&target.root, directory_flags, Mode::empty()).map_err(|_| {
-            error(
-                tool,
-                "workspace root could not be pinned without following links",
-            )
-        })?;
+    let mut directory = target
+        .root_directory
+        .as_ref()
+        .try_clone()
+        .map_err(|_| error(tool, "cannot retain pinned workspace directory"))?;
+    let pinned_root = rustix::fs::fstat(&directory)
+        .map_err(|_| error(tool, "cannot inspect pinned workspace directory"))?;
+    let current_root = rustix::fs::statat(
+        rustix::fs::CWD,
+        &target.root,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|_| error(tool, "workspace root changed before artifact publication"))?;
+    if pinned_root.st_dev != current_root.st_dev || pinned_root.st_ino != current_root.st_ino {
+        return Err(error(
+            tool,
+            "workspace root changed before artifact publication",
+        ));
+    }
+    // The identity check avoids reporting success for an already-stale path.
+    // Subsequent writes use the retained descriptor, never the checked path,
+    // so a later rename cannot redirect publication to a different workspace.
     if let Some(parent) = target.relative.parent() {
         for component in parent.components() {
             let Component::Normal(name) = component else {
@@ -179,14 +219,11 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
         .relative
         .file_name()
         .ok_or_else(|| error(tool, "output_path does not name a file"))?;
-    // Re-check final occupancy through the pinned parent. NOFOLLOW + EXCL on the
-    // staging file and create-only link publication close both leaf and parent races.
-    match rustix::fs::openat(
-        &directory,
-        name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
+    // Inspect without opening: a FIFO inserted after resolve_new() would block
+    // an RDONLY open indefinitely, while opening a device can have side effects.
+    // Every existing entry, including a dangling link, is a no-clobber conflict.
+    // linkat below still enforces create-only publication after this check.
+    match rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => {
             return Err(error(
                 tool,
@@ -320,5 +357,105 @@ mod tests {
         assert_eq!(std::fs::read(target.path()).unwrap(), b"first");
         assert!(publish(&target, b"second", "test").is_err());
         assert_eq!(std::fs::read(target.path()).unwrap(), b"first");
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn cloned_target_rejects_replacement_workspace() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        let moved = parent.path().join("original-workspace");
+        std::fs::create_dir(&root).unwrap();
+        let original = resolve_new(&root, "nested/result.bin", "test").unwrap();
+        let target = original.clone();
+        drop(original);
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let failure = publish(&target, b"private payload", "test").unwrap_err();
+        assert!(failure.to_string().contains("workspace root changed"));
+        assert!(!root.join("nested").exists());
+        assert!(!moved.join("nested").exists());
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn swapped_workspace_ancestor_cannot_redirect_publication() {
+        use std::os::unix::fs::symlink;
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ancestor = parent.path().join("ancestor");
+        let root = ancestor.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(outside.path().join("workspace")).unwrap();
+        let target = resolve_new(&root, "result.bin", "test").unwrap();
+        let moved = parent.path().join("original-ancestor");
+        std::fs::rename(&ancestor, &moved).unwrap();
+        symlink(outside.path(), &ancestor).unwrap();
+
+        assert!(publish(&target, b"private payload", "test").is_err());
+        assert!(!outside.path().join("workspace/result.bin").exists());
+        assert!(!moved.join("workspace/result.bin").exists());
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn symlink_inserted_after_resolution_is_an_occupied_destination() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "result.bin", "test").unwrap();
+        let missing = outside.path().join("missing.bin");
+        symlink(&missing, target.path()).unwrap();
+
+        let failure = publish(&target, b"private payload", "test").unwrap_err();
+        assert!(failure.to_string().contains("output_path already exists"));
+        assert_eq!(std::fs::read_link(target.path()).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn fifo_inserted_after_resolution_does_not_block_publication() {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::unix::fs::FileTypeExt as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "result.bin", "test").unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            target.path(),
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        let worker_target = target.clone();
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = publish(&worker_target, b"payload", "test")
+                .map_err(|failure| failure.to_string());
+            let _ = send.send(result);
+        });
+        let result = receive.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            // Unblock the old RDONLY probe before failing, rather than leaving
+            // a stranded test thread. No sleep or FIFO peer is needed to pass.
+            let peer = rustix::fs::open(
+                target.path(),
+                OFlags::RDWR | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            worker.join().unwrap();
+            drop(peer);
+            panic!("publication did not reject the occupied FIFO without opening it");
+        }
+        worker.join().unwrap();
+        let failure = result.unwrap().unwrap_err();
+        assert!(failure.contains("output_path already exists"));
+        assert!(std::fs::symlink_metadata(target.path()).unwrap().file_type().is_fifo());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }
