@@ -345,6 +345,43 @@ impl AgentSessionHandle {
     }
 }
 
+impl AgentSessionHandle {
+    /// One controlled prompt turn on a borrowed handle, for hosts that keep
+    /// the handle between turns (and may replace it, e.g. `/resume`) rather
+    /// than converting it once with [`Self::into_controllable`]. This turn's
+    /// steering and follow-up fetchers are installed on the current agent, so
+    /// a replaced session is never left without them. Same queue, bounds,
+    /// cancellation and unclaimed-input guarantees as
+    /// [`ControllableSession::prompt`].
+    pub fn prompt_controlled(
+        &mut self,
+        input: String,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
+        let active: ActiveRun = Arc::new(Mutex::new(Weak::new()));
+        self.session_mut().agent.register_message_fetchers(
+            Some(fetcher(&active, InputKind::Steering)),
+            Some(fetcher(&active, InputKind::FollowUp)),
+        );
+        let (run, signal) = Run::new();
+        *lock(&active) = Arc::downgrade(&run);
+        let guard = TurnGuard { active, run };
+        let control = SessionControlHandle {
+            run: Arc::clone(&guard.run),
+        };
+        let session = self;
+        let future = async move {
+            let _guard = guard;
+            session.prompt_with_abort(input, signal, on_event).await
+        };
+        ControlledTurn {
+            future: Box::pin(execution::OwnedTurn::new(future, control.clone())),
+            control,
+            polled: false,
+        }
+    }
+}
+
 impl ControllableSession {
     pub const fn session_mut(&mut self) -> &mut AgentSessionHandle {
         &mut self.session

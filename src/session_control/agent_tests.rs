@@ -182,6 +182,10 @@ impl Peer {
     }
 
     fn session(&self, cwd: &std::path::Path) -> ControllableSession {
+        self.handle(cwd).into_controllable()
+    }
+
+    fn handle(&self, cwd: &std::path::Path) -> AgentSessionHandle {
         let provider = Arc::new(OpenAIProvider::new("control-fixture").with_base_url(&self.url));
         let agent = Agent::new(
             provider,
@@ -204,7 +208,6 @@ impl Peer {
             ResolvedCompactionSettings::default(),
         );
         AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
-            .into_controllable()
     }
 }
 
@@ -292,6 +295,57 @@ fn mid_tool_thread_can_steer_and_follow_up_without_replaying_the_tool() {
             1
         );
     });
+}
+
+/// `prompt_controlled` on a borrowed handle, the way the FTUI driver uses it:
+/// the control lane is published through a shared slot, a steer and a
+/// follow-up sent mid-tool reach the next requests without replaying the tool,
+/// and a finished turn's control cannot feed a later turn on the same handle.
+#[test]
+fn borrowed_handle_turn_steers_mid_tool_and_retires_its_control() {
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("note.txt"), "real read tool fixture").unwrap();
+    let peer = Peer::new(vec![Reply::Tool, Reply::Text, Reply::Text, Reply::Text]);
+    let mut handle = peer.handle(temp.path());
+    let published: Arc<Mutex<Option<SessionControlHandle>>> = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&published);
+    runtime.block_on(async {
+        let turn = handle.prompt_controlled("read note.txt".to_string(), move |event| {
+            if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                let control = lock(&seen).clone().expect("control published");
+                std::thread::spawn(move || {
+                    control.steer("focus on constraints").unwrap();
+                    control.follow_up("then explain tradeoffs").unwrap();
+                })
+                .join()
+                .unwrap();
+            }
+        });
+        *lock(&published) = Some(turn.control());
+        assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
+    });
+    let old = lock(&published).take().unwrap();
+    assert!(old.snapshot().finished);
+    assert_eq!(old.snapshot().handed_to_agent, 2);
+    assert!(
+        old.steer("late input").is_err(),
+        "a finished turn's control must refuse new input"
+    );
+
+    // A second turn on the same handle installs fresh fetchers; nothing from
+    // the old lane leaks into it.
+    runtime.block_on(async {
+        let turn = handle.prompt_controlled("and now?".to_string(), |_| {});
+        assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
+    });
+    let requests = lock(&peer.requests);
+    assert_eq!(requests.len(), 4);
+    assert!(!request_has(&requests[0], "focus on constraints"));
+    assert!(request_has(&requests[1], "focus on constraints"));
+    assert!(request_has(&requests[2], "then explain tradeoffs"));
+    assert!(request_has(&requests[3], "and now?"));
+    assert!(!request_has(&requests[3], "late input"));
 }
 
 #[test]

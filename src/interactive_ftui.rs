@@ -1273,6 +1273,10 @@ pub struct PiFtuiModel {
     /// `run_prompt_turn` installs a fresh handle per turn; Ctrl-C fires it so
     /// exit doesn't block on the provider stream and remaining tool calls.
     turn_abort: Option<TurnAbortSlot>,
+    /// Live control lane of the driver's running prompt turn
+    /// (`session_control`): Enter steers it, alt+enter queues a follow-up,
+    /// Escape aborts it. Empty between turns.
+    turn_control: Option<TurnControlSlot>,
     /// Background answers that arrived mid-turn, rendered at the turn boundary.
     ///
     /// `/tan` runs a child agent while the user keeps working, so its answer
@@ -1498,6 +1502,7 @@ impl PiFtuiModel {
             ext_reply_tx: None,
             ask_reply_tx: None,
             turn_abort: None,
+            turn_control: None,
             term: (80, 24),
             scroll_from_tail: 0,
             rendered_total_lines: std::cell::Cell::new(0),
@@ -1565,6 +1570,23 @@ impl PiFtuiModel {
     pub fn with_turn_abort(mut self, slot: TurnAbortSlot) -> Self {
         self.turn_abort = Some(slot);
         self
+    }
+
+    /// Share the driver's running-turn control lane so the user can steer,
+    /// queue a follow-up, or abort while the agent works.
+    #[must_use]
+    pub fn with_turn_control(mut self, slot: TurnControlSlot) -> Self {
+        self.turn_control = Some(slot);
+        self
+    }
+
+    /// The running turn's control handle, if a controlled turn is live.
+    fn live_turn_control(&self) -> Option<crate::session_control::SessionControlHandle> {
+        self.turn_control.as_ref().and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
     }
 
     /// Route completed ask-tool interactions to the launch path, which pairs
@@ -2295,6 +2317,53 @@ impl PiFtuiModel {
         }
     }
 
+    /// Enter (steer) or alt+enter (`follow_up`) while the agent works: hand the
+    /// editor text to the running turn's control lane (`session_control`).
+    /// Steering lands at the next steering boundary without restarting
+    /// completed tools; a follow-up runs after the current model turn.
+    /// Commands wait for the turn to end; text the lane cannot take yet (the
+    /// turn is starting or ending) becomes the next prompt instead.
+    fn submit_mid_turn(&mut self, follow_up: bool) {
+        let text = self.input.text();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let clean = sanitize(trimmed).into_owned();
+        if clean.starts_with('/') || clean.starts_with('!') {
+            // The text stays in the editor for after the turn.
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Commands wait until the agent finishes; press Escape to abort it."),
+            );
+            return;
+        }
+        self.input.set_text("");
+        self.autocomplete.close();
+        self.scroll_from_tail = 0;
+        let Some(control) = self.live_turn_control() else {
+            self.push_entry(EntryRole::User, clean.clone());
+            self.send_command(UiCommand::Prompt(clean));
+            return;
+        };
+        let queued = if follow_up {
+            control.follow_up(&clean)
+        } else {
+            control.steer(&clean)
+        };
+        match queued {
+            Ok(_) => {
+                let label = if follow_up { "follow-up" } else { "steer" };
+                self.push_entry(EntryRole::User, format!("({label}) {clean}"));
+            }
+            Err(err) => {
+                // Put the text back; nothing was queued.
+                self.input.set_text(&clean);
+                self.push_entry(EntryRole::Error, err.to_string());
+            }
+        }
+    }
+
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
     fn submit_input(&mut self) {
@@ -2325,6 +2394,10 @@ impl PiFtuiModel {
             }
         }
         if trimmed.is_empty() {
+            return;
+        }
+        if self.state == AgentUiState::Working {
+            self.submit_mid_turn(false);
             return;
         }
         // Sending anything dismisses the pinned error banner
@@ -3114,6 +3187,9 @@ impl PiFtuiModel {
                     {
                         handle.abort();
                     }
+                    if let Some(control) = self.live_turn_control() {
+                        control.abort();
+                    }
                     return Cmd::quit();
                 }
 
@@ -3149,6 +3225,13 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::PageUp))
                     .or_else(|| pick(AppAction::PageDown))
                     .or_else(|| pick(AppAction::Submit))
+                    // alt+enter is FollowUp only while the agent works; idle,
+                    // it stays this stack's newline chord.
+                    .or_else(|| {
+                        (self.state == AgentUiState::Working)
+                            .then(|| pick(AppAction::FollowUp))
+                            .flatten()
+                    })
                     .or_else(|| pick(AppAction::NewLine))
                     .or_else(|| pick(AppAction::Interrupt))
                     .or_else(|| pick(AppAction::CursorLineEnd))
@@ -3242,6 +3325,16 @@ impl PiFtuiModel {
                         self.cancel_active_ext();
                         return Cmd::none();
                     }
+                    Some(AppAction::Interrupt) if self.state == AgentUiState::Working => {
+                        // Escape aborts the running turn, as upstream does.
+                        // The driver reports how the turn ended.
+                        if let Some(control) = self.live_turn_control()
+                            && control.abort()
+                        {
+                            self.push_entry(EntryRole::System, String::from("Aborting..."));
+                        }
+                        return Cmd::none();
+                    }
                     Some(AppAction::Submit) if self.input_active() => {
                         if self.active_ask.is_some() {
                             self.submit_ask_answer();
@@ -3256,6 +3349,15 @@ impl PiFtuiModel {
                         // A routed slash command may have armed a busy
                         // operation (issue #203); start its spinner chain.
                         return self.take_busy_tick();
+                    }
+                    Some(AppAction::FollowUp)
+                        if self.input_active()
+                            && self.active_ask.is_none()
+                            && self.active_ext.is_none() =>
+                    {
+                        // Only picked while the agent works (see above).
+                        self.submit_mid_turn(true);
+                        return Cmd::none();
                     }
                     Some(AppAction::NewLine) if self.input_active() => {
                         self.input.insert_newline();
@@ -3342,7 +3444,11 @@ impl PiFtuiModel {
     /// `editor_input_is_available()` in the bubbletea stack) or while an
     /// ask card / extension UI prompt is collecting its reply mid-turn.
     fn input_active(&self) -> bool {
-        self.state == AgentUiState::Ready || self.active_ask.is_some() || self.active_ext.is_some()
+        self.state == AgentUiState::Ready
+            || self.active_ask.is_some()
+            || self.active_ext.is_some()
+            // Mid-turn typing steers or queues through the control lane.
+            || (self.state == AgentUiState::Working && self.turn_control.is_some())
     }
 
     /// Fail closed every modal owned by the completed/replaced turn. Replies
@@ -4335,6 +4441,9 @@ type CurrentAsk = Arc<Mutex<Option<crate::ask::AskTool>>>;
 /// fires it on Ctrl-C.
 type TurnAbortSlot = Arc<Mutex<Option<crate::agent::AbortHandle>>>;
 
+/// The driver's running prompt turn's control lane, shared with the UI thread.
+type TurnControlSlot = Arc<Mutex<Option<crate::session_control::SessionControlHandle>>>;
+
 /// Install the per-handle half of the ask bridge: a channel picker surface on
 /// the tool plus a forwarder task that turns cards into `PiMsg::AskUiRequest`.
 /// The forwarder dies naturally when the handle (and its ask tool clones)
@@ -4521,30 +4630,91 @@ async fn run_tan_command(
     });
 }
 
+/// Run one prompt as a controlled turn (`session_control`): its control lane
+/// is published for the UI thread, so the user can steer, queue follow-ups
+/// or abort (Escape, Ctrl-C) while it runs. Input the turn never claimed
+/// (typed as it was ending) is not lost: it runs as the next turn.
 async fn run_prompt_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
     agent_tx: &Sender<PiMsg>,
-    turn_abort: &TurnAbortSlot,
+    turn_control: &TurnControlSlot,
 ) {
+    let mut next = Some(prompt);
+    while let Some(prompt) = next.take() {
+        let (leftover, stopped) = run_controlled_turn(handle, prompt, agent_tx, turn_control).await;
+        if leftover.is_empty() {
+            continue;
+        }
+        let text = leftover.join("\n\n");
+        if stopped {
+            // The turn was aborted or failed: hand unsent messages back
+            // rather than starting another turn nobody asked for.
+            if let Ok(owner_session_id) = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+            {
+                let _ = agent_tx.send(PiMsg::SetEditorText {
+                    owner_session_id,
+                    text,
+                });
+                let _ = agent_tx.send(PiMsg::System(format!(
+                    "Restored {} unsent message(s) to the editor.",
+                    leftover.len()
+                )));
+            }
+        } else {
+            let _ = agent_tx.send(PiMsg::System(format!(
+                "Running {} message(s) sent as the last turn ended.",
+                leftover.len()
+            )));
+            next = Some(text);
+        }
+    }
+}
+
+/// One controlled turn; returns the text of inputs it never claimed and
+/// whether the turn was aborted or failed.
+async fn run_controlled_turn(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    prompt: String,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) -> (Vec<String>, bool) {
     // ubs:ignore Sender clone per turn — the event callback must own its sender
     let tx = agent_tx.clone();
-    // Issue #205: install a per-turn abort handle the UI thread can fire on
-    // Ctrl-C, so exit doesn't wait out the provider stream and tool calls.
-    let (abort_handle, abort_signal) = crate::sdk::AgentSessionHandle::new_abort_handle();
-    *turn_abort
+    let turn = handle.prompt_controlled(prompt, move |event| {
+        for msg in agent_event_to_pi_msgs(&event) {
+            let _ = tx.send(msg);
+        }
+    });
+    let control = turn.control();
+    *turn_control
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(abort_handle);
-    let result = handle
-        .prompt_with_abort(prompt, abort_signal, move |event| {
-            for msg in agent_event_to_pi_msgs(&event) {
-                let _ = tx.send(msg);
-            }
-        })
-        .await;
-    *turn_abort
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control.clone());
+    let result = turn.await;
+    *turn_control
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let leftover = control
+        .take_pending()
+        .into_iter()
+        .map(|input| input.text)
+        .collect::<Vec<_>>();
+    // An aborted or failed turn hands unsent input back instead of running it.
+    let stopped = result.is_err()
+        || matches!(
+            &result,
+            Ok(message) if message.stop_reason == crate::model::StopReason::Aborted
+        );
+    report_turn_result(result, agent_tx);
+    (leftover, stopped)
+}
+
+fn report_turn_result(
+    result: crate::error::Result<crate::model::AssistantMessage>,
+    agent_tx: &Sender<PiMsg>,
+) {
     match result {
         // #209: the transcript already holds the structured turn-end card
         // (built from `AgentEnd`); the banner pinned above the editor carries
@@ -5931,6 +6101,10 @@ pub fn run(
     // driver's in-flight prompt turn instead of waiting it out.
     let turn_abort: TurnAbortSlot = Arc::new(Mutex::new(None));
     let driver_turn_abort = Arc::clone(&turn_abort);
+    // The running prompt turn's control lane: the UI thread steers, queues
+    // follow-ups and aborts through it while the driver awaits the turn.
+    let turn_control: TurnControlSlot = Arc::new(Mutex::new(None));
+    let driver_turn_control = Arc::clone(&turn_control);
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -5984,7 +6158,7 @@ pub fn run(
                 loop {
                     match submit_rx.try_recv() {
                         Ok(UiCommand::Prompt(prompt)) => {
-                            run_prompt_turn(&mut handle, prompt, &agent_tx, &driver_turn_abort)
+                            run_prompt_turn(&mut handle, prompt, &agent_tx, &driver_turn_control)
                                 .await;
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
@@ -5997,8 +6171,13 @@ pub fn run(
                                 run_bash_ui_command(&bash_cwd, &command, exclude, &agent_tx).await
                                 && !exclude
                             {
-                                run_prompt_turn(&mut handle, output, &agent_tx, &driver_turn_abort)
-                                    .await;
+                                run_prompt_turn(
+                                    &mut handle,
+                                    output,
+                                    &agent_tx,
+                                    &driver_turn_control,
+                                )
+                                .await;
                             }
                         }
                         Ok(UiCommand::Compact) => {
@@ -6238,6 +6417,7 @@ pub fn run(
         .with_keybindings(keybindings_result.bindings)
         .with_submit_channel(submit_tx)
         .with_turn_abort(turn_abort)
+        .with_turn_control(turn_control)
         .with_ask_reply_channel(ask_reply_tx)
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
@@ -6672,8 +6852,8 @@ mod tests {
             "the listing should reflect the user's own override: {text:?}"
         );
         assert!(
-            !text.contains("Queue follow-up message"),
-            "unsupported actions like FollowUp must not be advertised on FTUI: {text:?}"
+            !text.contains("Restore queued messages to editor"),
+            "unsupported actions like Dequeue must not be advertised on FTUI: {text:?}"
         );
         assert!(
             !text.contains("Open settings"),
@@ -6761,6 +6941,95 @@ mod tests {
             "shift+tab should report through the driver, not locally: {:?}",
             sim.model().transcript
         );
+    }
+
+    /// Mid-turn input on the default stack: Enter steers the running turn,
+    /// alt+enter queues a follow-up, commands are refused (text kept), and
+    /// Escape aborts. Everything goes through the turn's real control lane.
+    #[test]
+    fn mid_turn_enter_steers_alt_enter_queues_and_escape_aborts() {
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("ftui-steer-fixture")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        );
+        // Never polled: no request is made, but the lane is live until the
+        // turn is dropped, exactly as while a real turn streams.
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_turn_control(slot);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+
+        type_str(&mut sim, "focus on tests");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        type_str(&mut sim, "then summarize");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.pending_steering, 1, "{snapshot:?}");
+        assert_eq!(snapshot.pending_follow_up, 1, "{snapshot:?}");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "mid-turn input goes to the lane, not the command channel"
+        );
+        let texts = sim
+            .model()
+            .transcript
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.contains(&String::from("(steer) focus on tests")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.contains(&String::from("(follow-up) then summarize")),
+            "{texts:?}"
+        );
+
+        // Commands wait for the turn; the text stays for later.
+        type_str(&mut sim, "/model");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/model");
+        assert!(submit_rx.try_recv().is_err());
+        assert_eq!(control.snapshot().pending_steering, 1);
+
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(
+            !control.snapshot().accepting_input,
+            "Escape must abort the running turn"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "Aborting..."),
+            "the abort is acknowledged"
+        );
+        drop(turn);
     }
 
     /// ctrl+p / shift+ctrl+p were listed by `/hotkeys` on the classic stack
