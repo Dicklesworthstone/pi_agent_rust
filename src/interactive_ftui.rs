@@ -5403,9 +5403,12 @@ pub fn run(
             };
             let runtime_handle = runtime.handle();
             let terminal_agent_tx = agent_tx.clone();
-            // Boxed: the driver future is just over clippy's 16 KiB
-            // large_futures threshold on Windows.
-            let shutdown = runtime.block_on(Box::pin(async move {
+            // The driver future is a few bytes over clippy's 16 KiB
+            // large_futures threshold on Windows. It is built once per FTUI
+            // session and handed straight to block_on, and boxing it does not
+            // help: the lint then fires on the future moved into Box::pin.
+            #[cfg_attr(windows, allow(clippy::large_futures))]
+            let shutdown = runtime.block_on(async move {
                 let (mut handle, ext_handler) = create_driver_session(
                     session_options,
                     &agent_tx,
@@ -5561,7 +5564,7 @@ pub fn run(
                     handle.shutdown_owned_resources().await
                 };
                 Some((shutdown, replacement_failure))
-            }));
+            });
             let Some((shutdown, replacement_failure)) = shutdown else {
                 return Err(std::io::Error::other(
                     "FTUI agent session failed to initialize",
