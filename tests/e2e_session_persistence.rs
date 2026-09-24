@@ -2838,16 +2838,46 @@ fn setter_post_rename_worker_process_entrypoint() {
             Arc::new(asupersync::sync::Mutex::new(session)),
         );
 
-        let err = agent_session
-            .set_thinking_level(pi::model::ThinkingLevel::High)
-            .await
-            .expect_err("both saves fail after their rename");
-        assert!(err.is_session_persistence(), "{err}");
-        assert_eq!(
-            agent_session.agent.stream_options().thinking_level,
-            None,
-            "an indeterminate save must not install the level"
-        );
+        if std::env::var("PI_SESSION_SETTER_KIND").as_deref() == Ok("model") {
+            let auth_dir = tempfile::tempdir().expect("auth dir");
+            let mut auth =
+                pi::auth::AuthStorage::load(auth_dir.path().join("auth.json")).expect("load auth");
+            auth.set(
+                "openai",
+                pi::auth::AuthCredential::ApiKey {
+                    key: "openai-key".to_string(),
+                },
+            );
+            agent_session.set_model_registry(pi::models::ModelRegistry::load(&auth, None));
+            agent_session.set_auth_storage(auth);
+
+            let err = agent_session
+                .set_provider_model("openai", "gpt-4o")
+                .await
+                .expect_err("both saves fail after their rename");
+            assert!(err.is_session_persistence(), "{err}");
+            assert_eq!(
+                agent_session.agent.provider().name(),
+                "planned-provider",
+                "an indeterminate save must not install the target provider"
+            );
+            assert_eq!(
+                agent_session.agent.stream_options().api_key.as_deref(),
+                Some("test-key"),
+                "an indeterminate save must not install the target credential"
+            );
+        } else {
+            let err = agent_session
+                .set_thinking_level(pi::model::ThinkingLevel::High)
+                .await
+                .expect_err("both saves fail after their rename");
+            assert!(err.is_session_persistence(), "{err}");
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                None,
+                "an indeterminate save must not install the level"
+            );
+        }
 
         let err = agent_session
             .run_text("after the failed setter".to_string(), |_| {})
@@ -2864,7 +2894,30 @@ fn setter_post_rename_worker_process_entrypoint() {
 #[cfg(feature = "internal-persistence-fault-injection")]
 #[test]
 fn thinking_setter_post_rename_failure_quarantines_reentry() {
-    let harness = TestHarness::new("e2e_thinking_setter_post_rename");
+    let reopened = run_setter_post_rename_child("thinking");
+    assert!(
+        reopened.header.thinking_level.is_some(),
+        "the rename landed, so the file holds the level the runtime refused"
+    );
+}
+
+/// bd-5jfkl: the model-selection twin. The file names the target model the
+/// child's runtime refused to install.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn model_setter_post_rename_failure_quarantines_reentry() {
+    let reopened = run_setter_post_rename_child("model");
+    assert_eq!(reopened.header.provider.as_deref(), Some("openai"));
+    assert_eq!(reopened.header.model_id.as_deref(), Some("gpt-4o"));
+}
+
+/// Runs the setter worker against a fresh one-message JSONL session with the
+/// post-rename failpoint armed, requires the child's own assertions to pass,
+/// and returns the strictly reopened session.
+#[cfg(feature = "internal-persistence-fault-injection")]
+fn run_setter_post_rename_child(kind: &str) -> Session {
+    let harness = TestHarness::new(format!("e2e_{kind}_setter_post_rename"));
+    let mut reopened_session = None;
     run_async_test(async {
         let cwd = harness.temp_dir().to_path_buf();
         let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Jsonl);
@@ -2885,6 +2938,7 @@ fn thinking_setter_post_rename_failure_quarantines_reentry() {
             .arg("--nocapture")
             .arg("--test-threads=1")
             .env("PI_SESSION_SETTER_FAILPOINT_WORKER", "1")
+            .env("PI_SESSION_SETTER_KIND", kind)
             .env("PI_SESSION_PERSISTENCE_TEST_PATH", &stable_path)
             .env(
                 "PI_SESSION_PERSISTENCE_TEST_FAILPOINT",
@@ -2902,13 +2956,11 @@ fn thinking_setter_post_rename_failure_quarantines_reentry() {
         );
 
         let reopened = reopen_strict(&stable_path, "setter post-rename").await;
-        assert!(
-            reopened.header.thinking_level.is_some(),
-            "the rename landed, so the file holds the level the runtime refused"
-        );
         let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
         assert_eq!(texts, vec!["setter-base"]);
+        reopened_session = Some(reopened);
     });
+    reopened_session.expect("setter child scenario ran")
 }
 
 /// bd-yn7ud: the SQLite full-rewrite transaction (DELETE + reinsert). A hard

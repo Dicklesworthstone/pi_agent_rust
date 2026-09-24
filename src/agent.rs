@@ -19618,6 +19618,61 @@ mod tests {
         });
     }
 
+    /// bd-5jfkl: a setter cancelled while its save is in flight. The write may
+    /// still land on the blocking thread, so the durable outcome is unknown;
+    /// the live runtime and live Session must stay as they were and provider
+    /// re-entry must be quarantined rather than silently resumed.
+    #[test]
+    fn set_thinking_level_cancelled_mid_save_quarantines_without_live_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+            let mut agent_session = build_switch_test_session(&auth);
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock");
+                session.session_dir = Some(dir.path().to_path_buf());
+                session.path = Some(dir.path().join("cancelled.jsonl"));
+            }
+            agent_session.save_enabled = true;
+            let original_thinking = agent_session.agent.stream_options().thinking_level;
+
+            {
+                let setter = agent_session.set_thinking_level(crate::model::ThinkingLevel::High);
+                futures::pin_mut!(setter);
+                assert!(
+                    futures::poll!(setter.as_mut()).is_pending(),
+                    "the first poll must park on the blocking save"
+                );
+            }
+
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                original_thinking
+            );
+            assert!(
+                agent_session.ensure_provider_reentry_allowed().is_err(),
+                "a cancelled transition must leave provider re-entry quarantined"
+            );
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock after cancellation");
+            assert!(session.header.thinking_level.is_none());
+        });
+    }
+
     #[test]
     fn set_provider_model_clamps_thinking_for_non_reasoning_targets() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
