@@ -5,10 +5,12 @@
 
 use super::{
     AbortHandle, AbortSignal, AgentEvent, AgentSessionHandle, AssistantMessage, ContentBlock,
-    Error, FailoverOptions, ImageContent, Message, Result, SessionPromptResult, SessionTransport,
-    SessionTransportEvent, StopReason, TextContent, UserContent,
+    Error, FailoverOptions, ImageContent, Message, Result, RpcControlHandle,
+    RpcExtensionUiResponse, SessionPromptResult, SessionTransport, SessionTransportEvent,
+    StopReason, TextContent, UserContent,
 };
 use crate::failover::{RetryPolicy, TurnDecision, TurnOutcome, TurnProgress};
+use serde_json::{Map, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -783,6 +785,85 @@ impl SessionTransport {
             }
         }
     }
+}
+
+impl RpcControlHandle {
+    /// Answer an extension's UI request while an RPC prompt is still streaming.
+    ///
+    /// Clone the control handle before starting the prompt, then use it from
+    /// the live event callback or a separate UI thread. The prompt remains the
+    /// only stdout reader. Echo the exact request ID and `requestGeneration`
+    /// from the response-bearing `extension_ui_request`; this method neither
+    /// selects a default answer nor substitutes the current generation.
+    ///
+    /// The returned ID identifies the dispatched command, not the UI request.
+    /// Success means the JSON line was written and flushed, not that a pending
+    /// request was resolved. The server retains responsibility for rejecting
+    /// stale generations and expired requests. Use the client's async method
+    /// when idle and an acknowledged `resolved` result is required.
+    pub fn extension_ui_response(
+        &self,
+        request_id: &str,
+        request_generation: u64,
+        response: RpcExtensionUiResponse,
+    ) -> Result<String> {
+        let mut payload = rpc_ui_response_payload(request_id)?;
+        payload.insert(
+            "requestGeneration".to_string(),
+            Value::from(request_generation),
+        );
+        match response {
+            RpcExtensionUiResponse::Value { value } => {
+                payload.insert("value".to_string(), value);
+            }
+            RpcExtensionUiResponse::Confirmed { confirmed } => {
+                payload.insert("confirmed".to_string(), Value::Bool(confirmed));
+            }
+            RpcExtensionUiResponse::Cancelled => {
+                payload.insert("cancelled".to_string(), Value::Bool(true));
+            }
+        }
+        self.send("extension_ui_response", payload)
+    }
+
+    /// Answer or dismiss a live `ask_request` without borrowing the prompt's
+    /// stdout reader. This also supports host permission cards that use `ask`.
+    ///
+    /// Answers retain their exact question IDs, selected labels and free text.
+    /// Explicit dismissal takes precedence and sends no stale answers. No
+    /// recommended option or approval is chosen automatically. The server
+    /// validates answers against the pending request and its timeout.
+    ///
+    /// Like [`Self::extension_ui_response`], returns a dispatch ID after the
+    /// serialized writer flushes; it does not await an acknowledgement.
+    pub fn ask_response(
+        &self,
+        request_id: &str,
+        response: crate::ask::AskResponse,
+    ) -> Result<String> {
+        let mut payload = rpc_ui_response_payload(request_id)?;
+        if response.dismissed {
+            payload.insert("dismissed".to_string(), Value::Bool(true));
+        } else {
+            payload.insert(
+                "answers".to_string(),
+                serde_json::to_value(response.answers)
+                    .map_err(|error| Error::Json(Box::new(error)))?,
+            );
+        }
+        self.send("ask_response", payload)
+    }
+}
+
+/// Keep UI correlation distinct from the transport's separately allocated ID.
+/// Reject missing correlation before consuming an ID or touching the pipe.
+fn rpc_ui_response_payload(request_id: &str) -> Result<Map<String, Value>> {
+    if request_id.trim().is_empty() {
+        return Err(Error::validation("RPC UI response requires a nonempty request ID"));
+    }
+    let mut payload = Map::new();
+    payload.insert("requestId".to_string(), Value::String(request_id.to_string()));
+    Ok(payload)
 }
 
 fn ensure_not_aborted(signal: &AbortSignal) -> Result<()> {
