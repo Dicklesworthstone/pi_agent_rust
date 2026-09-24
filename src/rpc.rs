@@ -11555,7 +11555,8 @@ mod retry_tests {
         temp: &tempfile::TempDir,
         hook_body: &str,
     ) -> (Value, Arc<asupersync::sync::Mutex<Session>>, String, String) {
-        let fixture = real_js_switch_fixture(runtime_handle, temp, hook_body).await;
+        let fixture =
+            real_js_switch_fixture(runtime_handle, temp, hook_body, "switch_session").await;
         let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
 
         // Boxed: clippy::large_futures.
@@ -11589,21 +11590,29 @@ mod retry_tests {
         target_id: String,
     }
 
-    /// An RPC server input with one queued switch_session to a saved target,
-    /// and a source session whose extension runs `hook_body` as its
-    /// session_before_switch handler.
+    /// An RPC server input with one queued `command` (switch_session to a
+    /// saved target, new_session, or fork of the source's user entry), and a
+    /// source session whose extension runs `hook_body` as the command's
+    /// before-hook (session_before_fork for fork, else session_before_switch).
     async fn real_js_switch_fixture(
         runtime_handle: &asupersync::runtime::RuntimeHandle,
         temp: &tempfile::TempDir,
         hook_body: &str,
+        command: &str,
     ) -> RealJsSwitchFixture {
+        let is_fork = command == "fork";
+        let hook_event = if is_fork {
+            "session_before_fork"
+        } else {
+            "session_before_switch"
+        };
         let extension_path = temp.path().join("switch-hook.mjs");
         std::fs::write(
             &extension_path,
             format!(
                 r#"
                 export default function init(pi) {{
-                  pi.on("session_before_switch", async () => {{
+                  pi.on("{hook_event}", async () => {{
                     {hook_body}
                   }});
                 }}
@@ -11631,7 +11640,18 @@ mod retry_tests {
             ToolRegistry::new(&[], temp.path(), None),
             AgentConfig::default(),
         );
-        let source = Session::in_memory();
+        let (source, request) = if is_fork {
+            let (source, entry_id) = rpc_fork_source_session();
+            (
+                source,
+                json!({"id": "1", "type": command, "entryId": entry_id}),
+            )
+        } else {
+            (
+                Session::in_memory(),
+                json!({"id": "1", "type": command, "sessionPath": target_path}),
+            )
+        };
         let source_id = source.header.id.clone();
         let inner_session = Arc::new(asupersync::sync::Mutex::new(source));
         let mut agent_session = AgentSession::new(
@@ -11647,13 +11667,9 @@ mod retry_tests {
         let options = rpc_fork_test_options(runtime_handle, temp.path().join("auth.json"));
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
         in_tx
-            .send(
-                &asupersync::Cx::for_testing(),
-                json!({"id": "1", "type": "switch_session", "sessionPath": target_path})
-                    .to_string(),
-            )
+            .send(&asupersync::Cx::for_testing(), request.to_string())
             .await
-            .expect("send switch_session");
+            .expect("send transition command");
         drop(in_tx);
         RealJsSwitchFixture {
             agent_session,
@@ -11716,6 +11732,23 @@ mod retry_tests {
     /// hook resolved.
     #[test]
     fn rpc_switch_session_dropped_while_hook_pends_keeps_the_source_session() {
+        assert_transition_dropped_mid_hook_keeps_the_source("switch_session");
+    }
+
+    /// bd-dexy7: the same probe for new_session, whose session_before_switch
+    /// hook runs with reason "new".
+    #[test]
+    fn rpc_new_session_dropped_while_hook_pends_keeps_the_source_session() {
+        assert_transition_dropped_mid_hook_keeps_the_source("new_session");
+    }
+
+    /// bd-dexy7: the same probe for fork, parked in session_before_fork.
+    #[test]
+    fn rpc_fork_dropped_while_hook_pends_keeps_the_source_session() {
+        assert_transition_dropped_mid_hook_keeps_the_source("fork");
+    }
+
+    fn assert_transition_dropped_mid_hook_keeps_the_source(command: &'static str) {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -11726,6 +11759,7 @@ mod retry_tests {
                 &runtime_handle,
                 &temp,
                 &format!("{SWITCH_HOOK_SOURCE_WRITE}\nawait new Promise(() => {{}});"),
+                command,
             )
             .await;
             let inner_session = Arc::clone(&fixture.inner_session);
@@ -11762,8 +11796,8 @@ mod retry_tests {
                 out_rx
                     .try_iter()
                     .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-                    .all(|value| value["command"] != "switch_session"),
-                "an abandoned switch must not have answered"
+                    .all(|value| value["command"] != command),
+                "an abandoned {command} must not have answered"
             );
             let inner = inner_session
                 .lock(&AgentCx::for_request())
