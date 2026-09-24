@@ -3,6 +3,7 @@
 mod common;
 
 use sha2::{Digest as _, Sha256};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -217,12 +218,13 @@ fn serve_one(mut stream: TcpStream, route: &Route, port: u16, seen: &Mutex<Vec<S
     };
     let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
     for (name, value) in headers {
-        response.push_str(&format!("{name}: {value}\r\n"));
+        let _ = write!(response, "{name}: {value}\r\n");
     }
-    response.push_str(&format!(
+    let _ = write!(
+        response,
         "Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    ));
+    );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.write_all(&body);
     let _ = stream.flush();
@@ -232,16 +234,15 @@ fn found(location: String) -> (u16, Vec<(String, String)>, Vec<u8>) {
     (302, vec![("Location".to_string(), location)], Vec::new())
 }
 
-fn ok(body: Vec<u8>) -> (u16, Vec<(String, String)>, Vec<u8>) {
+const fn ok(body: Vec<u8>) -> (u16, Vec<(String, String)>, Vec<u8>) {
     (200, Vec::new(), body)
 }
 
-fn not_found() -> (u16, Vec<(String, String)>, Vec<u8>) {
+const fn not_found() -> (u16, Vec<(String, String)>, Vec<u8>) {
     (404, Vec::new(), Vec::new())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
     Sha256::digest(bytes)
         .iter()
         .fold(String::new(), |mut hex, byte| {
