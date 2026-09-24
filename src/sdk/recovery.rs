@@ -5,13 +5,219 @@
 
 use super::{
     AbortHandle, AbortSignal, AgentEvent, AgentSessionHandle, AssistantMessage, Error,
-    FailoverOptions, Result, StopReason,
+    FailoverOptions, Message, Result, StopReason,
 };
 use crate::failover::{RetryPolicy, TurnDecision, TurnOutcome, TurnProgress};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 type EventCallback = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
+/// One logical SDK call owns its terminal event, not any provider attempt.
+/// In particular, the raw AgentEnd precedes AgentSession's persistence step.
+struct LogicalTurn {
+    output: EventCallback,
+    state: Arc<Mutex<LogicalTurnState>>,
+}
+
+#[derive(Default)]
+struct LogicalTurnState {
+    session_id: Option<Arc<str>>,
+    messages: Vec<Message>,
+    retry: Option<u32>,
+    fallback: Option<(String, String)>,
+    finished: bool,
+}
+
+impl LogicalTurnState {
+    fn end_retry(&mut self, success: bool, error: Option<String>) -> Option<AgentEvent> {
+        self.retry.take().map(|attempt| AgentEvent::AutoRetryEnd {
+            success,
+            attempt,
+            final_error: error,
+        })
+    }
+
+    fn end_fallback(&mut self, success: bool) -> Option<AgentEvent> {
+        self.fallback
+            .take()
+            .map(|(provider, model)| AgentEvent::FailoverEnd {
+                success,
+                provider,
+                model,
+                restored_primary: false,
+            })
+    }
+
+    fn forget_incomplete_tail(&mut self) {
+        while self.messages.last().is_some_and(|message| {
+            matches!(
+                message,
+                Message::Assistant(assistant)
+                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
+            )
+        }) {
+            let _ = self.messages.pop();
+        }
+    }
+
+    /// At most two pending lifecycles close before an incoming event. A fixed
+    /// array avoids allocating a Vec for every streamed text delta.
+    fn observe(&mut self, mut event: AgentEvent) -> [Option<AgentEvent>; 3] {
+        if self.finished {
+            return [None, None, None];
+        }
+        if let AgentEvent::AgentEnd { messages, .. } = event {
+            self.messages.extend(messages);
+            return [None, None, None];
+        }
+        let mut retry_end = None;
+        let mut fallback_end = None;
+        let forward = match &mut event {
+            AgentEvent::AgentStart { session_id } => {
+                if self.session_id.is_some() {
+                    false
+                } else {
+                    self.session_id = Some(Arc::clone(session_id));
+                    true
+                }
+            }
+            AgentEvent::AutoRetryStart {
+                attempt,
+                error_message,
+                ..
+            } => {
+                retry_end = self.end_retry(false, Some(error_message.clone()));
+                self.retry = Some(*attempt);
+                true
+            }
+            AgentEvent::AutoRetryEnd { attempt, .. } => {
+                let matches = self.retry == Some(*attempt);
+                if matches {
+                    self.retry = None;
+                }
+                matches
+            }
+            AgentEvent::FailoverStart {
+                to_provider,
+                to_model,
+                ..
+            } => {
+                retry_end = self.end_retry(false, Some("Retry budget exhausted".to_string()));
+                fallback_end = self.end_fallback(false);
+                self.fallback = Some((to_provider.clone(), to_model.clone()));
+                true
+            }
+            AgentEvent::FailoverEnd {
+                provider,
+                model,
+                restored_primary: false,
+                ..
+            } => {
+                if let Some(target) = self.fallback.take() {
+                    // Pair the end with the target that its Start announced,
+                    // even if another runtime mutation changed the live model.
+                    (*provider, *model) = target;
+                    true
+                } else {
+                    false
+                }
+            }
+            AgentEvent::AutoCompactionEnd {
+                aborted: false,
+                will_retry: true,
+                error_message: None,
+                ..
+            } => {
+                self.forget_incomplete_tail();
+                true
+            }
+            _ => true,
+        };
+        [retry_end, fallback_end, forward.then_some(event)]
+    }
+}
+
+impl LogicalTurn {
+    fn new(output: EventCallback) -> Self {
+        Self {
+            output,
+            state: Arc::new(Mutex::new(LogicalTurnState::default())),
+        }
+    }
+
+    fn callback(&self) -> EventCallback {
+        let output = Arc::clone(&self.output);
+        let state = Arc::clone(&self.state);
+        Arc::new(move |event| Self::dispatch(&output, &state, event))
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        Self::dispatch(&self.output, &self.state, event);
+    }
+
+    fn dispatch(output: &EventCallback, state: &Mutex<LogicalTurnState>, event: AgentEvent) {
+        let events = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(event);
+        // Never invoke user callbacks or subscribers while holding state.
+        for event in events.into_iter().flatten() {
+            output(event);
+        }
+    }
+
+    fn restored_tail(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget_incomplete_tail();
+    }
+
+    fn finish(&self, outcome: &Result<AssistantMessage>) {
+        let error = match outcome {
+            Ok(message) if message.stop_reason == StopReason::Error => Some(
+                message
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Request error".to_string()),
+            ),
+            Ok(message) if message.stop_reason == StopReason::Aborted => Some(
+                message
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Aborted".to_string()),
+            ),
+            Ok(_) => None,
+            Err(error) => Some(error.to_string()),
+        };
+        let events = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.finished {
+                return;
+            }
+            state.finished = true;
+            let success = error.is_none();
+            let retry_end = state.end_retry(success, error.clone());
+            let fallback_end = state.end_fallback(success);
+            let terminal = state
+                .session_id
+                .take()
+                .map(|session_id| AgentEvent::AgentEnd {
+                    session_id,
+                    messages: std::mem::take(&mut state.messages),
+                    error,
+                });
+            [retry_end, fallback_end, terminal]
+        };
+        for event in events.into_iter().flatten() {
+            (self.output)(event);
+        }
+    }
+}
 
 impl AgentSessionHandle {
     /// Send one user prompt, applying this handle's configured retry/failover policy.
@@ -77,6 +283,8 @@ impl AgentSessionHandle {
         let shared: EventCallback = Arc::new(self.make_combined_callback(on_event));
         self.maybe_restore_primary(&shared).await?;
         ensure_not_aborted(&abort_signal)?;
+        let turn = LogicalTurn::new(shared);
+        let shared = turn.callback();
         let forwarded = Arc::clone(&shared);
         let first = match input {
             Some(input) => {
@@ -94,7 +302,11 @@ impl AgentSessionHandle {
                     .await
             }
         };
-        self.apply_retry_policy(first, &abort_signal, &shared).await
+        let result = self
+            .apply_retry_policy(first, &abort_signal, &shared, &turn)
+            .await;
+        turn.finish(&result);
+        result
     }
 
     /// Install (or clear) fallback-chain configuration on a pre-built handle.
@@ -119,11 +331,13 @@ impl AgentSessionHandle {
     /// A chain belongs to its original primary, not the currently installed
     /// fallback. Candidate preparation and durable installation remain shared
     /// with print and RPC in `AgentSession::try_failover`.
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn try_chain_failover(
         &mut self,
         current: &Result<AssistantMessage>,
         require_incomplete_tail: bool,
         retry_attempt_to_end: Option<u32>,
+        swap_attempt: u32,
         shared: &EventCallback,
     ) -> Result<bool> {
         let Some(options) = self.failover.clone() else {
@@ -132,7 +346,15 @@ impl AgentSessionHandle {
         let Some(error_text) = Self::turn_error_text_for(current) else {
             return Ok(false);
         };
-        let Some(class) = crate::failover::classify_failover(&error_text) else {
+        let Some(class) = crate::failover::classify_failover(&error_text).or_else(|| {
+            // A typed transport drop need not spell its kind in Display.
+            // Reuse the same refusal-aware typed classifier as the decision.
+            current
+                .as_ref()
+                .err()
+                .filter(|error| crate::failover::call_error_is_retryable(error))
+                .map(|_| crate::failover::FailoverClass::Transient)
+        }) else {
             return Ok(false);
         };
         let live = {
@@ -210,7 +432,7 @@ impl AgentSessionHandle {
             to_provider: committed.to_provider,
             to_model: committed.to_model,
             class: format!("{class:?}").to_ascii_lowercase(),
-            attempt: 0,
+            attempt: swap_attempt,
             chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
         });
         Ok(true)
@@ -340,6 +562,7 @@ impl AgentSessionHandle {
         first: Result<AssistantMessage>,
         abort_signal: &AbortSignal,
         shared: &EventCallback,
+        turn: &LogicalTurn,
     ) -> Result<AssistantMessage> {
         let Some(policy) = self.retry else {
             return first;
@@ -378,11 +601,13 @@ impl AgentSessionHandle {
                         &current,
                         current.is_ok(),
                         (progress.retry_count > 0).then_some(progress.retry_count),
+                        progress.failovers_this_turn.saturating_add(1),
                         shared,
                     )
                     .await
                 {
                     Ok(true) => {
+                        turn.restored_tail();
                         failed_over = true;
                         progress.failovers_this_turn += 1;
                         progress.retry_count = 0;
@@ -409,7 +634,7 @@ impl AgentSessionHandle {
                     delay_ms,
                     policy,
                     abort_signal,
-                    shared,
+                    turn,
                 )
                 .await
             {
@@ -429,9 +654,9 @@ impl AgentSessionHandle {
         delay_ms: u32,
         policy: RetryPolicy,
         abort_signal: &AbortSignal,
-        shared: &EventCallback,
+        turn: &LogicalTurn,
     ) -> Result<()> {
-        shared(AgentEvent::AutoRetryStart {
+        turn.emit(AgentEvent::AutoRetryStart {
             attempt,
             max_attempts: policy.max_retries,
             delay_ms: u64::from(delay_ms),
@@ -449,13 +674,14 @@ impl AgentSessionHandle {
                 .restore_retry_tail_with_admission(&cx, current.is_ok(), Some(&admission))
                 .await?;
             admission.ensure_allowed()?;
+            turn.restored_tail();
             // Do not race cancellation against a durability operation: let it
             // settle, then refuse provider re-entry when the signal was raised.
             ensure_not_aborted(abort_signal)
         }
         .await;
         if let Err(error) = &result {
-            shared(AgentEvent::AutoRetryEnd {
+            turn.emit(AgentEvent::AutoRetryEnd {
                 success: false,
                 attempt,
                 final_error: Some(error.to_string()),
