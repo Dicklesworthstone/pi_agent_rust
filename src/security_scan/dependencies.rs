@@ -447,6 +447,8 @@ impl Root {
             "confined dependency lockfile reads require a supported Unix descriptor backend",
         ))
     }
+    // Same signature as the Unix reader, which does use `self`.
+    #[allow(clippy::unused_self)]
     fn read(&self, _path: &str) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

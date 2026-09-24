@@ -131,7 +131,10 @@ fn native_path(authority: &str, bytes: Vec<u8>) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
 
+// Takes the bytes by value to share the signature of the Unix variant, which
+// consumes them.
 #[cfg(windows)]
+#[allow(clippy::needless_pass_by_value)]
 fn native_path(authority: &str, bytes: Vec<u8>) -> Option<PathBuf> {
     windows_path(authority, &bytes).map(PathBuf::from)
 }

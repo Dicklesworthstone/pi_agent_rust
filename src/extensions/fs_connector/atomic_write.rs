@@ -224,6 +224,16 @@ impl Parent {
         }
     }
 
+    // Only the Unix arm has a directory handle to sync; elsewhere this reports
+    // `false` without touching `self`, but keeps the shared signature.
+    #[cfg_attr(
+        not(unix),
+        allow(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            clippy::missing_const_for_fn
+        )
+    )]
     fn sync(&self) -> io::Result<bool> {
         #[cfg(unix)]
         {

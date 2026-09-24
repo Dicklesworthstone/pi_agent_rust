@@ -866,14 +866,17 @@ fn fs_op_delete(params: &Value, path: &Path) -> std::result::Result<Value, HostC
     Ok(json!({ "deleted": true, "kind": "file" }))
 }
 
-fn remove_file_or_link(path: &Path, _meta: &fs::Metadata) -> std::io::Result<()> {
+fn remove_file_or_link(path: &Path, meta: &fs::Metadata) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileTypeExt as _;
-        if _meta.file_type().is_symlink_dir() {
+        if meta.file_type().is_symlink_dir() {
             return fs::remove_dir(path);
         }
     }
+    // Only Windows distinguishes directory symlinks, which need remove_dir.
+    #[cfg(not(windows))]
+    let _ = meta;
     fs::remove_file(path)
 }
 
