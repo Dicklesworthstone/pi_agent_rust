@@ -303,3 +303,194 @@ fn known_model_capacity_blocks_silent_overflow_recovery_on_every_entrypoint() {
         );
     }
 }
+
+fn saving_recovery_handle(dir: &Path) -> (AgentSessionHandle, Arc<AtomicUsize>) {
+    let mut handle = saving_handle(dir);
+    let calls = Arc::new(AtomicUsize::new(0));
+    handle.session.agent.set_provider(Arc::new(FlakyThenOkProvider {
+        failures: usize::MAX,
+        calls: Arc::clone(&calls),
+        name: "anthropic".to_string(),
+        model: "claude-3-5-haiku-latest".to_string(),
+        input_tokens: 0,
+    }));
+    (handle, calls)
+}
+
+fn assert_quarantined_entrypoints(handle: &mut AgentSessionHandle, calls: &AtomicUsize) {
+    let before = calls.load(Ordering::SeqCst);
+    for entrypoint in ENTRYPOINTS {
+        let result = run_async(invoke(handle, entrypoint, Arc::new(|_| {})));
+        assert!(
+            result.as_ref().is_err_and(|error| error.is_session_persistence()),
+            "{entrypoint:?}: uncertain durability must remain quarantined: {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before, "{entrypoint:?}");
+    }
+}
+
+#[test]
+fn retry_save_failure_quarantines_later_calls_even_after_the_path_is_repaired() {
+    let dir = tempdir().unwrap();
+    let blocked = dir.path().join("cannot-replace-a-directory.jsonl");
+    std::fs::create_dir(&blocked).unwrap();
+    let (handle, calls) = saving_recovery_handle(dir.path());
+    let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+    let store = handle.session_store();
+    let injected = Arc::new(Mutex::new(None::<(PathBuf, Value)>));
+    let recorded = Arc::clone(&injected);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let observed = Arc::clone(&events);
+    let result = run_async(handle.prompt("keep this input", move |event| {
+        if matches!(&event, AgentEvent::AutoRetryStart { .. }) {
+            // The failed attempt has already persisted. Only the subsequent
+            // private retry candidate sees the injected filesystem failure.
+            let mut session = store.try_lock().expect("between-attempt lock");
+            *recorded.lock().unwrap() = Some((
+                session.path.clone().expect("first attempt persisted"),
+                serde_json::to_value(session.to_messages_for_current_path()).unwrap(),
+            ));
+            session.path = Some(blocked.clone());
+        }
+        observed.lock().unwrap().push(serde_json::to_value(event).unwrap());
+    }));
+    assert!(result.as_ref().is_err_and(|error| error.is_session_persistence()));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let (original_path, expected) = injected.lock().unwrap().clone().expect("fault injected");
+    assert_eq!(
+        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+        expected
+    );
+    let reopened = run_async(Session::open(&original_path.display().to_string())).unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "auto_retry_end")
+            .count(),
+        1
+    );
+    handle.session_store().try_lock().unwrap().path = Some(original_path);
+    assert_quarantined_entrypoints(&mut handle, &calls);
+}
+
+#[test]
+fn failover_save_failure_preserves_source_state_and_quarantines_reentry() {
+    let dir = tempdir().unwrap();
+    let blocked = dir.path().join("blocked.jsonl");
+    std::fs::create_dir(&blocked).unwrap();
+    let (mut handle, calls) = saving_recovery_handle(dir.path());
+    let first = run_async(handle.prompt("source input", |_| {})).unwrap();
+    assert_eq!(first.stop_reason, StopReason::Error);
+    let original_path = handle.session_store().try_lock().unwrap().path.clone().unwrap();
+    let expected = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+    let mut fallback = crate::models::ad_hoc_model_entry("openai", "gpt-4o-mini").unwrap();
+    // This test calls the real candidate/commit path, not the target provider.
+    fallback.model.base_url = "http://127.0.0.1:1/v1".to_string();
+    handle = handle.with_failover(Some(FailoverOptions {
+        chains: HashMap::from([(
+            "default".to_string(),
+            vec!["openai/gpt-4o-mini".to_string()],
+        )]),
+        available_models: vec![fallback],
+        auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+        cli_api_key: Some("test-key".to_string()),
+        cooldown_secs: 300,
+    }));
+    handle.session_store().try_lock().unwrap().path = Some(blocked);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let observed = Arc::clone(&events);
+    let callback: EventSubscriber = Arc::new(move |event| {
+        observed.lock().unwrap().push(serde_json::to_value(event).unwrap());
+    });
+    let result = run_async(handle.try_chain_failover(&Ok(first), true, None, &callback));
+    assert!(result.as_ref().is_err_and(|error| error.is_session_persistence()));
+    assert_eq!(handle.model().1, "claude-3-5-haiku-latest");
+    assert!(handle.failover_state.primary().is_none());
+    assert!(handle.failover_state.lifecycle_id().is_none());
+    assert_eq!(handle.failover_state.chain_position(), 0);
+    assert!(events.lock().unwrap().is_empty(), "no successful swap was published");
+    assert_eq!(
+        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+        expected
+    );
+    let reopened = run_async(Session::open(&original_path.display().to_string())).unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+        expected
+    );
+    handle.session_store().try_lock().unwrap().path = Some(original_path);
+    assert_quarantined_entrypoints(&mut handle, &calls);
+}
+
+fn saving_handle_after_failover(dir: &Path) -> (AgentSessionHandle, Arc<AtomicUsize>) {
+    let (handle, calls) = saving_recovery_handle(dir);
+    let mut handle = with_chain_cooldown(
+        handle.with_retry(Some(crate::failover::RetryPolicy {
+            max_retries: 0,
+            max_failovers_per_turn: 1,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        })),
+        "openai/gpt-4o-mini",
+        0,
+    );
+    let _ = run_async(handle.prompt("fail over once", |_| {}));
+    assert_eq!(handle.model().1, "gpt-4o-mini");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    (handle, calls)
+}
+
+#[test]
+fn first_failover_uses_one_lifecycle_identity_in_memory_and_on_reopen() {
+    let dir = tempdir().unwrap();
+    let (handle, _) = saving_handle_after_failover(dir.path());
+    let path = handle.session_store().try_lock().unwrap().path.clone().unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    let provenance = reopened.active_failover_provenance_for_current_path().unwrap();
+    assert!(provenance.lifecycle_id.is_some());
+    assert_eq!(provenance.lifecycle_id.as_deref(), handle.failover_state.lifecycle_id());
+    let reconstructed = crate::failover::FailoverState::reconstruct_from_session(
+        &reopened,
+        0,
+        chrono::Utc::now(),
+    );
+    assert_eq!(reconstructed.lifecycle_id(), handle.failover_state.lifecycle_id());
+    assert_eq!(reconstructed.chain_position(), handle.failover_state.chain_position());
+}
+
+#[test]
+fn lenient_primary_restore_cannot_hide_indeterminate_persistence() {
+    let dir = tempdir().unwrap();
+    let (mut handle, calls) = saving_handle_after_failover(dir.path());
+    let blocked = dir.path().join("blocked-primary-restore.jsonl");
+    std::fs::create_dir(&blocked).unwrap();
+    let original_path = handle.session_store().try_lock().unwrap().path.clone().unwrap();
+    let expected = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+    handle.session_store().try_lock().unwrap().path = Some(blocked);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let observed = Arc::clone(&events);
+    let result = run_async(handle.prompt("must not reach the fallback", move |event| {
+        observed.lock().unwrap().push(serde_json::to_value(event).unwrap());
+    }));
+    assert!(result.as_ref().is_err_and(|error| error.is_session_persistence()));
+    assert_eq!(handle.model().1, "gpt-4o-mini");
+    assert!(handle.failover_state.primary().is_some());
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "neither restoration nor a new turn committed"
+    );
+    assert_eq!(
+        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+        expected
+    );
+    let reopened = run_async(Session::open(&original_path.display().to_string())).unwrap();
+    assert!(reopened.active_failover_provenance_for_current_path().is_some());
+    handle.session_store().try_lock().unwrap().path = Some(original_path);
+    assert_quarantined_entrypoints(&mut handle, &calls);
+}

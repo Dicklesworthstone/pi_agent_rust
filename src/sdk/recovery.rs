@@ -67,8 +67,10 @@ impl AgentSessionHandle {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         ensure_not_aborted(&abort_signal)?;
+        self.session.ensure_provider_reentry_allowed()?;
         self.sync_extension_mcp_registrations().await;
         ensure_not_aborted(&abort_signal)?;
+        self.session.ensure_provider_reentry_allowed()?;
 
         // Construct this once for the entire call. Recovery events must reach
         // subscribers too, and a resumed attempt must not fan out a second time.
@@ -117,7 +119,7 @@ impl AgentSessionHandle {
     /// A chain belongs to its original primary, not the currently installed
     /// fallback. Candidate preparation and durable installation remain shared
     /// with print and RPC in `AgentSession::try_failover`.
-    async fn try_chain_failover(
+    pub(super) async fn try_chain_failover(
         &mut self,
         current: &Result<AssistantMessage>,
         require_incomplete_tail: bool,
@@ -156,6 +158,15 @@ impl AgentSessionHandle {
             return Ok(false);
         };
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        admission.ensure_allowed()?;
+        // The first durable record and the in-memory state must carry the
+        // same identity. Generating this after persistence gives them two
+        // different UUIDs because the session candidate supplies its own.
+        let lifecycle_id = self
+            .failover_state
+            .lifecycle_id()
+            .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
         let attempt = crate::agent::FailoverSwapAttempt {
             chain: &chain,
             start_position: self.failover_state.chain_position(),
@@ -167,18 +178,19 @@ impl AgentSessionHandle {
             require_incomplete_tail,
             primary: Some(&primary),
             cooldown_secs: Some(options.cooldown_secs),
-            lifecycle_id: self.failover_state.lifecycle_id(),
+            lifecycle_id: Some(&lifecycle_id),
         };
-        let outcome = self.session.try_failover(&cx, &attempt).await?;
+        let outcome = self
+            .session
+            .try_failover_swap(&cx, &attempt, Some(&admission))
+            .await?;
+        admission.ensure_allowed()?;
         let Some(committed) = outcome.committed else {
             // An uncredentialed candidate may become usable on a later turn.
             // Exhaustion alone must not permanently advance the stored cursor.
             return Ok(false);
         };
-        if self.failover_state.lifecycle_id().is_none() {
-            self.failover_state
-                .set_lifecycle_id(Some(uuid::Uuid::new_v4().to_string()));
-        }
+        self.failover_state.set_lifecycle_id(Some(lifecycle_id));
         self.failover_state.set_chain_position(outcome.next_position);
         self.failover_state.record_swap(
             primary,
@@ -245,7 +257,17 @@ impl AgentSessionHandle {
             invalidate_background_compaction: true,
         };
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let Some(restored) = self.session.restore_primary(&cx, &request).await? else {
+        let admission = self.session.provider_admission_gate();
+        admission.ensure_allowed()?;
+        let restored = self
+            .session
+            .restore_primary_swap(&cx, &request, Some(&admission))
+            .await?;
+        // Lenient restoration may decline an unavailable primary, but it may
+        // never turn an indeterminate save into permission to keep issuing.
+        // The transition guard quarantines interrupted saves as well.
+        admission.ensure_allowed()?;
+        let Some(restored) = restored else {
             return Ok(());
         };
         self.failover_state.clear();
@@ -421,7 +443,12 @@ impl AgentSessionHandle {
                 return Err(Error::Aborted);
             }
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
-            self.session.restore_retry_tail(&cx, current.is_ok()).await?;
+            let admission = self.session.provider_admission_gate();
+            admission.ensure_allowed()?;
+            self.session
+                .restore_retry_tail_with_admission(&cx, current.is_ok(), Some(&admission))
+                .await?;
+            admission.ensure_allowed()?;
             // Do not race cancellation against a durability operation: let it
             // settle, then refuse provider re-entry when the signal was raised.
             ensure_not_aborted(abort_signal)
