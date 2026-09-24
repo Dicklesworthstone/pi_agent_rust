@@ -14,6 +14,20 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+## [v0.6.1] — 2026-09-24 — Release
+
+### Fixed
+
+- **`pi self-update` works again.** It failed on every published release with
+  `SHA256SUMS download failed with HTTP status 302`, because GitHub serves
+  release assets through a redirect to a signed download host and the updater
+  did not follow redirects. `SHA256SUMS`, the binary and the release lookup
+  now follow up to five redirects. A redirect from `https` to plain `http`,
+  to any other scheme, or without a host is refused. Checksum verification is
+  unchanged. Because the bug is in the updater that is already installed,
+  getting to v0.6.1 still needs the install script or a manual download.
+  Later updates can use `pi self-update`.
+
 ## [v0.6.0] — 2026-09-24 — Release
 
 The Windows fixes below are why this release exists: **v0.5.0 and v0.5.1 are
