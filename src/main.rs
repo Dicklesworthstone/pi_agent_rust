@@ -2205,6 +2205,14 @@ async fn run(
                 // the classic stack does: the `task` role, falling back to
                 // `smol`.
                 subagent_role_spec: pi::app::subagent_role_spec(&config),
+                // ctrl+p cycles the same resolved scope the classic stack
+                // cycles; empty falls back to every available model.
+                cycle_models: scoped_models
+                    .iter()
+                    .map(|scoped| {
+                        format!("{}/{}", scoped.model.model.provider, scoped.model.model.id)
+                    })
+                    .collect(),
             },
             pi::interactive_ftui::AutocompleteLaunch {
                 catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),

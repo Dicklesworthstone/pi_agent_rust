@@ -1072,6 +1072,10 @@ pub enum UiCommand {
     /// owns the decision because only it can see the model's catalog entry;
     /// the UI has no model state to cycle through.
     CycleThinking,
+    /// Switch to the next (`forward`) or previous model in the cycle list
+    /// (`AppAction::CycleModelForward`/`Backward`, ctrl+p / shift+ctrl+p by
+    /// default). The driver owns it: only it knows the running model.
+    CycleModel { forward: bool },
     /// Set the session display name (`/name <name>`).
     SetName(String),
     /// Grant access to an additional workspace root
@@ -3169,6 +3173,8 @@ impl PiFtuiModel {
                     // tab before this, above, which is why it stays correct
                     // while the popup is open.
                     .or_else(|| pick(AppAction::CycleThinkingLevel))
+                    .or_else(|| pick(AppAction::CycleModelForward))
+                    .or_else(|| pick(AppAction::CycleModelBackward))
                     // Editor-native actions come last so nothing above changes
                     // meaning. They are routed at all because the ftui editor
                     // handles only ctrl+a/k/z/y, arrows, Home/End, Backspace,
@@ -3273,6 +3279,14 @@ impl PiFtuiModel {
                     }
                     Some(AppAction::CycleThinkingLevel) => {
                         self.send_command(UiCommand::CycleThinking);
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CycleModelForward) => {
+                        self.send_command(UiCommand::CycleModel { forward: true });
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CycleModelBackward) => {
+                        self.send_command(UiCommand::CycleModel { forward: false });
                         return Cmd::none();
                     }
                     // Editor-native actions, routed from pi's keybinding
@@ -5160,6 +5174,56 @@ async fn run_set_thinking_command(
     let _ = agent_tx.send(msg);
 }
 
+/// The model ctrl+p (`forward`) or its reverse moves to from `current`
+/// (`provider/id`), over `models` in the classic stack's order: sorted,
+/// duplicates dropped, case-insensitive matching, wrapping at both ends. A
+/// running model outside the list starts at the first (or last) entry.
+/// `None` when there is nowhere to go.
+fn next_cycle_model(models: &[String], current: &str, forward: bool) -> Option<String> {
+    let mut ordered = models.to_vec();
+    // Case-insensitive, so spellings of one model sit together for dedup.
+    ordered.sort_by_key(|model| model.to_ascii_lowercase());
+    ordered.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let position = ordered
+        .iter()
+        .position(|model| model.eq_ignore_ascii_case(current));
+    let next = match (position, forward) {
+        (Some(index), true) => ordered.get((index + 1) % ordered.len())?,
+        (Some(index), false) => ordered.get((index + ordered.len() - 1) % ordered.len())?,
+        (None, true) => ordered.first()?,
+        (None, false) => ordered.last()?,
+    };
+    (!next.eq_ignore_ascii_case(current)).then(|| next.clone())
+}
+
+/// Handle `AppAction::CycleModelForward`/`Backward` (ctrl+p): switch to the
+/// neighbouring model in the cycle list through the `/model` path.
+async fn run_cycle_model_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    models: &[String],
+    forward: bool,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let (provider, model_id) = handle.model();
+    let current = format!("{provider}/{model_id}");
+    let Some(next) = next_cycle_model(models, &current, forward) else {
+        let message = if models.is_empty() {
+            "No models available"
+        } else {
+            "Only one model available"
+        };
+        let _ = agent_tx.send(PiMsg::System(String::from(message)));
+        return;
+    };
+    let Some((provider, model)) = next.split_once('/') else {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "model cycle: {next} is not provider/model"
+        )));
+        return;
+    };
+    run_set_model_command(handle, provider, model, agent_tx).await;
+}
+
 /// Handle `AppAction::CycleThinkingLevel` (shift+tab): step to the next
 /// thinking level this model offers.
 ///
@@ -5824,6 +5888,10 @@ pub struct FtuiSettings {
     /// back to `smol` (`app::subagent_role_spec`). `None` lets the child pick
     /// its own default.
     pub subagent_role_spec: Option<String>,
+    /// `provider/id` models ctrl+p cycles through: the resolved scope
+    /// (`--models`, path overrides, `enabledModels`) when one is configured.
+    /// Empty means the whole available list, as on the classic stack.
+    pub cycle_models: Vec<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5842,7 +5910,13 @@ pub fn run(
         gh_path,
         disable_mouse_capture,
         subagent_role_spec,
+        cycle_models,
     } = settings;
+    let cycle_models = if cycle_models.is_empty() {
+        available_models.clone()
+    } else {
+        cycle_models
+    };
     // Issue #208: the driver re-sends the catalog with extension commands
     // once its session exists; the model starts from the resource catalog.
     let driver_catalog = autocomplete.catalog.clone();
@@ -6023,6 +6097,10 @@ pub fn run(
                         }
                         Ok(UiCommand::CycleThinking) => {
                             run_cycle_thinking_command(&mut handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::CycleModel { forward }) => {
+                            run_cycle_model_command(&mut handle, &cycle_models, forward, &agent_tx)
+                                .await;
                         }
                         Ok(UiCommand::Export { path }) => {
                             run_export_command(&handle, &bash_cwd, &path, &agent_tx).await;
@@ -6682,6 +6760,74 @@ mod tests {
             sim.model().transcript.is_empty(),
             "shift+tab should report through the driver, not locally: {:?}",
             sim.model().transcript
+        );
+    }
+
+    /// ctrl+p / shift+ctrl+p were listed by `/hotkeys` on the classic stack
+    /// only; here they did nothing. They route to the driver, which owns the
+    /// running model.
+    #[test]
+    fn ctrl_p_routes_model_cycling_to_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('p'), Modifiers::CTRL));
+        assert_eq!(
+            submit_rx.try_recv().expect("ctrl+p routed"),
+            UiCommand::CycleModel { forward: true }
+        );
+        sim.inject_event(key(KeyCode::Char('p'), Modifiers::CTRL | Modifiers::SHIFT));
+        assert_eq!(
+            submit_rx.try_recv().expect("shift+ctrl+p routed"),
+            UiCommand::CycleModel { forward: false }
+        );
+        assert!(
+            sim.model().input.text().is_empty(),
+            "no 'p' may reach the editor"
+        );
+    }
+
+    #[test]
+    fn model_cycle_order_matches_the_classic_stack() {
+        let models = [
+            "openai/gpt-4o",
+            "anthropic/claude-a",
+            "google/gemini-a",
+            "OpenAI/GPT-4o",
+        ]
+        .map(String::from);
+        // Sorted case-insensitively with the two spellings of gpt-4o
+        // collapsed: anthropic/claude-a, google/gemini-a, openai/gpt-4o.
+        assert_eq!(
+            next_cycle_model(&models, "anthropic/claude-a", true).as_deref(),
+            Some("google/gemini-a")
+        );
+        assert_eq!(
+            next_cycle_model(&models, "google/gemini-a", false).as_deref(),
+            Some("anthropic/claude-a")
+        );
+        assert_eq!(
+            next_cycle_model(&models, "anthropic/claude-a", false).as_deref(),
+            Some("openai/gpt-4o"),
+            "backward from the first wraps to the last"
+        );
+        assert_eq!(
+            next_cycle_model(&models, "OPENAI/gpt-4o", true).as_deref(),
+            Some("anthropic/claude-a"),
+            "the running model matches case-insensitively and forward wraps"
+        );
+        // A model outside the scope starts at the ends.
+        assert_eq!(
+            next_cycle_model(&models, "xai/grok", true).as_deref(),
+            Some("anthropic/claude-a")
+        );
+        // Nowhere to go: empty list, or only the running model.
+        assert_eq!(next_cycle_model(&[], "openai/gpt-4o", true), None);
+        assert_eq!(
+            next_cycle_model(&[String::from("openai/gpt-4o")], "OPENAI/gpt-4o", true),
+            None
         );
     }
 

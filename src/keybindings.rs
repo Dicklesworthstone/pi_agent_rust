@@ -842,12 +842,15 @@ impl KeyBinding {
         let key_name: String = match key.code {
             F::Char(' ') => "space".to_string(),
             F::Char(c) => {
-                // Match the bubbletea Runes path: chars are lowercased and
-                // shift is not reported as a separate modifier.
+                // Match the bubbletea Runes path: chars are lowercased and a
+                // plain shift is not reported as a separate modifier (shift+p
+                // is just typing "P"). With ctrl or alt held, a reported
+                // shift is a deliberate chord: keep it, or ctrl+shift+p (the
+                // default for cycling models backward) collapses into ctrl+p.
                 return Some(Self {
                     key: c.to_lowercase().to_string(),
                     modifiers: KeyModifiers {
-                        shift: false,
+                        shift: base.shift && (base.ctrl || base.alt),
                         ..base
                     },
                 });
@@ -1219,9 +1222,7 @@ pub fn format_hotkeys_for_ftui(keybindings: &KeyBindings) -> String {
 pub const fn is_inert_on_ftui(action: AppAction) -> bool {
     matches!(
         action,
-        AppAction::CycleModelForward
-            | AppAction::CycleModelBackward
-            | AppAction::ExpandTools
+        AppAction::ExpandTools
             | AppAction::ToggleThinking
             | AppAction::OpenSettings
             | AppAction::ExternalEditor
@@ -2883,6 +2884,17 @@ mod tests {
         }
 
         #[test]
+        fn ctrl_shift_char_keeps_shift_so_it_is_not_plain_ctrl() {
+            let b = KeyBinding::from_ftui_key(&fkey(
+                ftui::KeyCode::Char('P'),
+                ftui::Modifiers::CTRL | ftui::Modifiers::SHIFT,
+            ))
+            .unwrap();
+            assert_eq!(b, KeyBinding::ctrl_shift("p"));
+            assert_ne!(b, KeyBinding::ctrl("p"));
+        }
+
+        #[test]
         fn ctrl_char_and_named_keys() {
             let b =
                 KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Char('r'), ftui::Modifiers::CTRL))
@@ -3045,10 +3057,11 @@ mod tests {
             assert!(ftui_hotkeys.contains("Cycle thinking level"));
             assert!(ftui_hotkeys.contains("Submit input"));
             assert!(ftui_hotkeys.contains("Insert new line"));
+            // Routed on FTUI since ctrl+p model cycling was wired in.
+            assert!(ftui_hotkeys.contains("Cycle to next model"));
+            assert!(ftui_hotkeys.contains("Cycle to previous model"));
 
             // Inert actions on FTUI are omitted:
-            assert!(!ftui_hotkeys.contains("Cycle to next model"));
-            assert!(!ftui_hotkeys.contains("Cycle to previous model"));
             assert!(!ftui_hotkeys.contains("Collapse/expand tool output"));
             assert!(!ftui_hotkeys.contains("Collapse/expand thinking blocks"));
             assert!(!ftui_hotkeys.contains("Open settings"));
