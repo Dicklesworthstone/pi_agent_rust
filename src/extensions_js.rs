@@ -9845,10 +9845,25 @@ export function rawKeyHint(key, description = "") {
 // extension-composed request cross the bridge for host-side sanitization
 // and a host-credentialed POST to the provider's native compact endpoint.
 // A legacy Model object in that position (no `strategy` key) keeps the
-// original summary-compaction path. An AbortSignal in `options.signal` is
-// accepted but not propagated -- the host's dedicated compact event budget
-// (gh #178) bounds the round-trip instead.
+// original summary-compaction path.
+//
+// Cancellation (gh #178): a signal (`options.signal`, or the legacy fifth
+// argument) that has already aborted rejects before any host work starts.
+// An abort that fires mid-call is NOT propagated: hostcalls are serialized on
+// the extension runtime thread, so no JS abort handler can run until the
+// compact hostcall returns. The host's dedicated compact event budget bounds
+// that round-trip instead.
 export async function compact(preparation, modelOrOptions, _apiKey, _customInstructions, _signal) {
+  const signal =
+    (modelOrOptions && typeof modelOrOptions === "object" && modelOrOptions.signal) || _signal;
+  if (signal && signal.aborted) {
+    if (signal.reason !== undefined) {
+      throw signal.reason;
+    }
+    const aborted = new Error("This operation was aborted");
+    aborted.name = "AbortError";
+    throw aborted;
+  }
   if (!globalThis.pi || typeof globalThis.pi.events !== "function") {
     throw new Error("compact() host bridge is unavailable in this runtime");
   }
@@ -25896,6 +25911,63 @@ mod tests {
             // The explicit host payload model wins over sessionState.model;
             // with neither present, ctx.model is undefined (upstream parity).
             assert_eq!(probe["modelAbsent"], json!("undefined"));
+        });
+    }
+
+    /// gh #178: a signal that has already aborted, in either the options form
+    /// or the legacy fifth argument, rejects `compact()` with the abort reason
+    /// before any host compaction is requested.
+    #[test]
+    fn pi_coding_agent_compact_rejects_a_pre_aborted_signal_without_host_work() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.abortProbe = { done: 0, errors: [] };
+                    const record = (promise) => promise
+                        .then(() => { globalThis.abortProbe.errors.push('resolved'); })
+                        .catch((error) => {
+                            globalThis.abortProbe.errors.push(String((error && error.message) || error));
+                        })
+                        .finally(() => { globalThis.abortProbe.done += 1; });
+                    import('@mariozechner/pi-coding-agent').then((mod) => {
+                        const controller = new AbortController();
+                        controller.abort(new Error('stopped by caller'));
+                        record(mod.compact(
+                            { firstKeptEntryId: 'entry-1', tokensBefore: 10 },
+                            { strategy: 'openai-responses-native', request: {}, signal: controller.signal }));
+                        record(mod.compact(
+                            { firstKeptEntryId: 'entry-1', tokensBefore: 10 },
+                            undefined, undefined, undefined, AbortSignal.abort()));
+                    });
+                    ",
+                )
+                .await
+                .expect("invoke compact with aborted signals");
+
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                assert!(
+                    runtime.drain_hostcall_requests().is_empty(),
+                    "an aborted compact() must not reach the host"
+                );
+                let probe = get_global_json(&runtime, "abortProbe").await;
+                if probe["done"] == json!(2) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "abortProbe").await;
+            assert_eq!(probe["done"], json!(2), "probe incomplete: {probe}");
+            assert_eq!(
+                probe["errors"],
+                json!(["stopped by caller", "This operation was aborted"]),
+                "probe: {probe}"
+            );
         });
     }
 
