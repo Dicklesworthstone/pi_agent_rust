@@ -1046,6 +1046,8 @@ pub enum UiCommand {
     Logout { args: String },
     /// `/fork [list|index|id]`: branch a new session from a user message.
     Fork { args: String },
+    /// `/reload`: rebuild the session from its file with resources re-read.
+    Reload,
     /// Show session info (`/session`): file, id, name, model, thinking
     /// level, and message count — a read-only snapshot of the live session.
     SessionInfo,
@@ -2605,7 +2607,7 @@ impl PiFtuiModel {
                      /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking [level], /theme, /changelog, /clear, /hotkeys, \
-                     /login [provider], /logout [provider], /fork [n|id|list], /help, \
+                     /login [provider], /logout [provider], /fork [n|id|list], /reload, /help, \
                      /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
                 ),
@@ -2661,6 +2663,11 @@ impl PiFtuiModel {
                 self.send_command(UiCommand::Logout {
                     args: cmd_args.trim().to_string(),
                 });
+                return true;
+            }
+            "/reload" => {
+                self.begin_busy("reloading resources ...");
+                self.send_command(UiCommand::Reload);
                 return true;
             }
             "/fork" => {
@@ -5510,6 +5517,70 @@ async fn fork_session_command(
     Ok(())
 }
 
+/// Handle `/reload` in the driver: rebuild the session from its own file so
+/// extensions, skills, prompt templates, themes and context files are read
+/// afresh, keeping the conversation. A session with nothing saved yet reloads
+/// as a fresh session, which loses nothing. An unsaved in-memory conversation
+/// is refused rather than dropped.
+async fn reload_session_command(
+    template: &crate::sdk::SessionOptions,
+    handle: &mut crate::sdk::AgentSessionHandle,
+    current_ask: &CurrentAsk,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> std::result::Result<(), String> {
+    let snapshot = handle
+        .with_session(|session| {
+            let saved = session.path.clone().filter(|path| path.exists());
+            (saved, session.entries.is_empty())
+        })
+        .await;
+    let (saved, empty) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("reload: {err}")));
+            return Ok(());
+        }
+    };
+    match saved {
+        Some(path) => {
+            Box::pin(resume_session_command(
+                &path.to_string_lossy(),
+                template,
+                handle,
+                current_ask,
+                ext_handler,
+                agent_tx,
+                runtime_handle,
+            ))
+            .await?;
+        }
+        None if empty => {
+            Box::pin(new_session_command(
+                template,
+                handle,
+                current_ask,
+                ext_handler,
+                agent_tx,
+                runtime_handle,
+            ))
+            .await?;
+        }
+        None => {
+            let _ = agent_tx.send(PiMsg::AgentError(String::from(
+                "reload: this conversation is not saved to a session file, so reloading would \
+                 lose it. Start a saved session (/new) to reload resources.",
+            )));
+            return Ok(());
+        }
+    }
+    let _ = agent_tx.send(PiMsg::System(String::from(
+        "Reloaded extensions, skills, prompt templates, themes and context files.",
+    )));
+    Ok(())
+}
+
 /// Handle `/resume` in the driver: open the chosen session file with the
 /// launch selection preserved, await the previous handle's shutdown before
 /// starting the replacement's MCP servers, rewire the ask bridge, and replay
@@ -5969,6 +6040,22 @@ pub fn run(
                         }
                         Ok(UiCommand::Logout { args }) => {
                             run_logout_command(&mut handle, &args, &agent_tx);
+                        }
+                        Ok(UiCommand::Reload) => {
+                            // Boxed: clippy::large_futures.
+                            if let Err(err) = Box::pin(reload_session_command(
+                                &resume_template,
+                                &mut handle,
+                                &current_ask,
+                                &ext_handler,
+                                &agent_tx,
+                                &runtime_handle,
+                            ))
+                            .await
+                            {
+                                replacement_failure = Some(err);
+                                break;
+                            }
                         }
                         Ok(UiCommand::Fork { args }) => {
                             // Boxed: clippy::large_futures.
@@ -9030,6 +9117,164 @@ mod tests {
                 args: String::new()
             }
         );
+    }
+
+    /// `/reload` re-reads resources and keeps the conversation: an extension
+    /// edited on disk after launch is replaced by its new version, and the
+    /// session (id and messages) is the same one. An unsaved in-memory
+    /// conversation is refused, not dropped.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reload_picks_up_an_edited_extension_and_keeps_the_conversation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let extension = cwd.path().join("reload-probe.mjs");
+        let write_extension = |command: &str| {
+            std::fs::write(
+                &extension,
+                format!(
+                    "export default function init(pi) {{\n\
+                     pi.registerCommand(\"{command}\", {{ description: \"probe\", handler: async () => {{}} }});\n\
+                     }}\n"
+                ),
+            )
+            .expect("write extension");
+        };
+        write_extension("v1-cmd");
+
+        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+        let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+        let template = resume_template_from(&crate::sdk::SessionOptions {
+            provider: Some(String::from("openai")),
+            model: Some(String::from("gpt-4o")),
+            api_key: Some(String::from("dummy-key")),
+            working_directory: Some(cwd.path().to_path_buf()),
+            workspace_trusted: true,
+            session_dir: Some(sessions.path().to_path_buf()),
+            extension_paths: vec![extension.clone()],
+            ..crate::sdk::SessionOptions::default()
+        });
+        let current_ask: CurrentAsk = Arc::new(Mutex::new(None));
+
+        runtime.block_on(async move {
+            let mut handle = crate::sdk::create_agent_session_deferred_mcp(replacement_options(
+                &template,
+                &ext_handler,
+                &runtime_handle,
+            ))
+            .await
+            .expect("create session");
+            assert!(
+                handle
+                    .extension_manager()
+                    .is_some_and(|manager| manager.has_command("v1-cmd"))
+            );
+
+            // A saved conversation to keep across the reload.
+            let session_id = {
+                let store = handle.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.expect("session lock");
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(String::from("keep me")),
+                    timestamp: Some(0),
+                });
+                session.save().await.expect("save session");
+                session.header.id.clone()
+            };
+
+            write_extension("v2-cmd");
+            reload_session_command(
+                &template,
+                &mut handle,
+                &current_ask,
+                &ext_handler,
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await
+            .expect("reload");
+
+            let manager = handle.extension_manager().expect("extensions after reload");
+            assert!(manager.has_command("v2-cmd"), "the edited extension must load");
+            assert!(!manager.has_command("v1-cmd"), "the old version must be gone");
+            let (id, kept) = handle
+                .with_session(|session| {
+                    let kept = session
+                        .to_messages_for_current_path()
+                        .iter()
+                        .any(|message| matches!(
+                            message,
+                            crate::model::Message::User(user)
+                                if matches!(&user.content, crate::model::UserContent::Text(text) if text == "keep me")
+                        ));
+                    (session.header.id.clone(), kept)
+                })
+                .await
+                .expect("session snapshot");
+            assert_eq!(id, session_id, "reload keeps the same session");
+            assert!(kept, "reload keeps the conversation");
+            let replies = agent_rx.try_iter().collect::<Vec<_>>();
+            assert!(
+                replies
+                    .iter()
+                    .any(|msg| matches!(msg, PiMsg::System(text) if text.starts_with("Reloaded"))),
+                "the user is told the reload happened"
+            );
+
+            // The planted negative: an unsaved in-memory conversation.
+            let mut unsaved = crate::sdk::create_agent_session_deferred_mcp({
+                let mut options = replacement_options(&template, &ext_handler, &runtime_handle);
+                options.no_session = true;
+                options
+            })
+            .await
+            .expect("in-memory session");
+            {
+                let store = unsaved.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.expect("session lock");
+                session.path = None;
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(String::from("unsaved")),
+                    timestamp: Some(0),
+                });
+            }
+            let unsaved_id = unsaved
+                .with_session(|session| session.header.id.clone())
+                .await
+                .expect("id");
+            reload_session_command(
+                &template,
+                &mut unsaved,
+                &current_ask,
+                &ext_handler,
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await
+            .expect("refusal is not a driver failure");
+            assert_eq!(
+                unsaved
+                    .with_session(|session| session.header.id.clone())
+                    .await
+                    .expect("id"),
+                unsaved_id,
+                "an unsaved conversation must not be replaced"
+            );
+            assert!(
+                agent_rx
+                    .try_iter()
+                    .any(|msg| matches!(msg, PiMsg::AgentError(text) if text.contains("not saved"))),
+                "the refusal is reported"
+            );
+            let _ = unsaved.shutdown_owned_resources().await;
+            let _ = handle.shutdown_owned_resources().await;
+        });
     }
 
     /// `/fork` existed only on the classic stack. It routes to the driver, and
