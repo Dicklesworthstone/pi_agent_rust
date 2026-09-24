@@ -1,7 +1,14 @@
 //! Integration tests for verified in-place self-updater (`pi self-update`) (bd-cv653.7.10).
 
+mod common;
+
+use sha2::{Digest as _, Sha256};
 use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::tempdir;
 
 use pi::self_update::{
@@ -147,4 +154,208 @@ fn test_check_mode_reports_current_and_latest() {
             );
         }
     }
+}
+
+/// A tiny HTTP/1.1 server that mimics GitHub's release downloads: every
+/// `/download/<tag>/<asset>` answers `302 Found` and points somewhere else,
+/// the way github.com hands out signed `release-assets.githubusercontent.com`
+/// URLs. Serves until the test process exits and records each request path.
+struct RedirectingReleaseServer {
+    port: u16,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+type Route = Box<dyn Fn(&str, u16) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + Sync>;
+
+impl RedirectingReleaseServer {
+    fn start(route: Route) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                serve_one(stream, &route, port, &seen);
+            }
+        });
+        Self { port, requests }
+    }
+
+    fn base(&self) -> String {
+        format!("http://127.0.0.1:{}/download", self.port)
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("requests lock").clone()
+    }
+}
+
+fn serve_one(mut stream: TcpStream, route: &Route, port: u16, seen: &Mutex<Vec<String>>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let path = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("")
+        .to_string();
+    seen.lock().expect("requests lock").push(path.clone());
+    let (status, headers, body) = route(&path, port);
+    let reason = match status {
+        200 => "OK",
+        302 => "Found",
+        _ => "Not Found",
+    };
+    let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
+    for (name, value) in headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    ));
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(&body);
+    let _ = stream.flush();
+}
+
+fn found(location: String) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    (302, vec![("Location".to_string(), location)], Vec::new())
+}
+
+fn ok(body: Vec<u8>) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    (200, Vec::new(), body)
+}
+
+fn not_found() -> (u16, Vec<(String, String)>, Vec<u8>) {
+    (404, Vec::new(), Vec::new())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+/// The server for the redirect tests: tag `v9.9.9` carries a good binary,
+/// `v8.8.8` a binary whose bytes do not match its `SHA256SUMS` line, and
+/// `vloop` redirects `SHA256SUMS` to itself forever.
+fn release_server(asset: &str, payload: &'static [u8]) -> RedirectingReleaseServer {
+    let asset = asset.to_string();
+    let good_sums = format!("{}  {asset}\n", sha256_hex(payload));
+    let bad_sums = format!("{}  {asset}\n", sha256_hex(b"what the checksum promised"));
+    let good_asset = format!("/download/v9.9.9/{asset}");
+    let bad_asset = format!("/download/v8.8.8/{asset}");
+    RedirectingReleaseServer::start(Box::new(move |path, port| {
+        let objects = format!("http://127.0.0.1:{port}/objects");
+        match path {
+            // Absolute Location with a signed-URL style query string.
+            "/download/v9.9.9/SHA256SUMS" => found(format!("{objects}/good-sums?sig=a%2Fb&se=1")),
+            "/download/v8.8.8/SHA256SUMS" => found(format!("{objects}/bad-sums?sig=c")),
+            "/objects/good-sums?sig=a%2Fb&se=1" => ok(good_sums.clone().into_bytes()),
+            "/objects/bad-sums?sig=c" => ok(bad_sums.clone().into_bytes()),
+            // Path-only Location, then a second hop.
+            p if p == good_asset || p == bad_asset => found("/objects/hop".to_string()),
+            "/objects/hop" => found(format!("{objects}/binary?sig=d")),
+            "/objects/binary?sig=d" => ok(payload.to_vec()),
+            "/download/vloop/SHA256SUMS" => found("/download/vloop/SHA256SUMS".to_string()),
+            _ => not_found(),
+        }
+    }))
+}
+
+#[test]
+fn self_update_follows_release_asset_redirects_and_still_verifies_checksums() {
+    let Some(platform) = PlatformInfo::current() else {
+        eprintln!("Skipping: unsupported platform for self-update");
+        return;
+    };
+    let asset = platform
+        .candidate_asset_names("9.9.9")
+        .into_iter()
+        .next()
+        .expect("at least one candidate asset name");
+    let payload: &'static [u8] = b"pretend this is pi 9.9.9";
+    let server = release_server(&asset, payload);
+    let base = server.base();
+
+    let (name, bytes, bad) = common::run_async(async move {
+        let updater = SelfUpdater::new();
+        let sums = updater
+            .fetch_checksums("9.9.9", Some(&base))
+            .await
+            .expect("SHA256SUMS behind a 302 must be fetched");
+        let (name, bytes) = updater
+            .download_and_verify(&platform, "9.9.9", &sums, Some(&base))
+            .await
+            .expect("binary behind two redirects must download and verify");
+
+        let bad_sums = updater
+            .fetch_checksums("8.8.8", Some(&base))
+            .await
+            .expect("mismatching SHA256SUMS is still fetched");
+        let bad = updater
+            .download_and_verify(&platform, "8.8.8", &bad_sums, Some(&base))
+            .await
+            .map(|(name, _)| name);
+        (name, bytes, bad)
+    });
+
+    assert_eq!(name, asset);
+    assert_eq!(bytes, payload);
+    let err = bad.expect_err("a redirected binary that fails its checksum must be rejected");
+    assert!(
+        err.to_string().to_ascii_lowercase().contains("checksum")
+            || err.to_string().to_ascii_lowercase().contains("mismatch"),
+        "unexpected error: {err}"
+    );
+
+    let requests = server.requests();
+    for expected in [
+        "/download/v9.9.9/SHA256SUMS".to_string(),
+        "/objects/good-sums?sig=a%2Fb&se=1".to_string(),
+        format!("/download/v9.9.9/{asset}"),
+        "/objects/hop".to_string(),
+        "/objects/binary?sig=d".to_string(),
+    ] {
+        assert!(
+            requests.contains(&expected),
+            "missing request {expected}: {requests:?}"
+        );
+    }
+}
+
+#[test]
+fn self_update_gives_up_on_a_redirect_loop() {
+    let server = release_server("pi_unused", b"unused");
+    let base = server.base();
+    let err = common::run_async(async move {
+        SelfUpdater::new()
+            .fetch_checksums("loop", Some(&base))
+            .await
+            .expect_err("an endless redirect chain must fail")
+    });
+    assert!(
+        err.to_string().contains("too many redirects"),
+        "unexpected error: {err}"
+    );
+    let hops = server
+        .requests()
+        .iter()
+        .filter(|path| path.as_str() == "/download/vloop/SHA256SUMS")
+        .count();
+    assert!(hops <= 6, "redirects must be bounded, saw {hops} requests");
 }
