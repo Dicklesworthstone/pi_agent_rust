@@ -2364,6 +2364,40 @@ impl PiFtuiModel {
         }
     }
 
+    /// alt+up: pull steering and follow-up messages the running turn has not
+    /// picked up yet back into the editor, in the order they were sent, ahead
+    /// of anything already typed. Messages the agent already received cannot
+    /// be recalled; the lane guarantees each one is either here or there.
+    fn restore_queued_input(&mut self) {
+        let Some(control) = self.live_turn_control() else {
+            return;
+        };
+        let pending = control.take_pending();
+        if pending.is_empty() {
+            self.push_entry(
+                EntryRole::System,
+                String::from("No queued messages to restore."),
+            );
+            return;
+        }
+        let count = pending.len();
+        let mut text = pending
+            .into_iter()
+            .map(|input| input.text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let typed = self.input.text();
+        if !typed.trim().is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&typed);
+        }
+        self.input.set_text(&text);
+        self.push_entry(
+            EntryRole::System,
+            format!("Restored {count} queued message(s) to the editor."),
+        );
+    }
+
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
     fn submit_input(&mut self) {
@@ -3258,6 +3292,7 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::CycleThinkingLevel))
                     .or_else(|| pick(AppAction::CycleModelForward))
                     .or_else(|| pick(AppAction::CycleModelBackward))
+                    .or_else(|| pick(AppAction::Dequeue))
                     // Editor-native actions come last so nothing above changes
                     // meaning. They are routed at all because the ftui editor
                     // handles only ctrl+a/k/z/y, arrows, Home/End, Backspace,
@@ -3389,6 +3424,10 @@ impl PiFtuiModel {
                     }
                     Some(AppAction::CycleModelBackward) => {
                         self.send_command(UiCommand::CycleModel { forward: false });
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Dequeue) => {
+                        self.restore_queued_input();
                         return Cmd::none();
                     }
                     // Editor-native actions, routed from pi's keybinding
@@ -6852,8 +6891,8 @@ mod tests {
             "the listing should reflect the user's own override: {text:?}"
         );
         assert!(
-            !text.contains("Restore queued messages to editor"),
-            "unsupported actions like Dequeue must not be advertised on FTUI: {text:?}"
+            !text.contains("Collapse/expand tool output"),
+            "unsupported actions like ExpandTools must not be advertised on FTUI: {text:?}"
         );
         assert!(
             !text.contains("Open settings"),
@@ -6944,8 +6983,9 @@ mod tests {
     }
 
     /// Mid-turn input on the default stack: Enter steers the running turn,
-    /// alt+enter queues a follow-up, commands are refused (text kept), and
-    /// Escape aborts. Everything goes through the turn's real control lane.
+    /// alt+enter queues a follow-up, commands are refused (text kept), Escape
+    /// aborts, and alt+up restores unsent messages. Everything goes through
+    /// the turn's real control lane.
     #[test]
     fn mid_turn_enter_steers_alt_enter_queues_and_escape_aborts() {
         let provider = Arc::new(
@@ -7028,6 +7068,20 @@ mod tests {
                 .iter()
                 .any(|entry| entry.text == "Aborting..."),
             "the abort is acknowledged"
+        );
+
+        // alt+up pulls the unsent messages back, in order, ahead of what is
+        // still in the editor; the lane is empty afterwards.
+        sim.inject_event(key(KeyCode::Up, Modifiers::ALT));
+        assert_eq!(
+            sim.model().input.text(),
+            "focus on tests\n\nthen summarize\n\n/model"
+        );
+        let snapshot = control.snapshot();
+        assert_eq!(
+            (snapshot.pending_steering, snapshot.pending_follow_up),
+            (0, 0),
+            "{snapshot:?}"
         );
         drop(turn);
     }

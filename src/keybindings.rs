@@ -1226,7 +1226,6 @@ pub const fn is_inert_on_ftui(action: AppAction) -> bool {
             | AppAction::ToggleThinking
             | AppAction::OpenSettings
             | AppAction::ExternalEditor
-            | AppAction::Dequeue
             | AppAction::Copy
             | AppAction::Clear
             | AppAction::Yank
@@ -3061,13 +3060,13 @@ mod tests {
             assert!(ftui_hotkeys.contains("Cycle to previous model"));
             // Routed since mid-turn input goes through session_control.
             assert!(ftui_hotkeys.contains("Queue follow-up message"));
+            assert!(ftui_hotkeys.contains("Restore queued messages to editor"));
 
             // Inert actions on FTUI are omitted:
             assert!(!ftui_hotkeys.contains("Collapse/expand tool output"));
             assert!(!ftui_hotkeys.contains("Collapse/expand thinking blocks"));
             assert!(!ftui_hotkeys.contains("Open settings"));
             assert!(!ftui_hotkeys.contains("Open in external editor"));
-            assert!(!ftui_hotkeys.contains("Restore queued messages to editor"));
         }
     }
 }
