@@ -3474,9 +3474,9 @@ fn tui_state_slash_export_writes_html_and_reports_path() {
 /// as soon as its predicate holds, and the file loops exit as soon as the file
 /// appears or disappears, so the budget is only ever spent on the way to a
 /// failure.
-// Every `/share` test that spends these budgets drives a real `gh` fork, so
-// they are all Unix-gated and these constants follow that gate.
-#[cfg(unix)]
+// The `/share` tests that drive a real `gh` fork are Unix-gated, and the file
+// budget follows that gate. The event budget is also spent by the gh-missing
+// test, which runs everywhere.
 const SHARE_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const SHARE_FILE_TIMEOUT: Duration = Duration::from_secs(10);

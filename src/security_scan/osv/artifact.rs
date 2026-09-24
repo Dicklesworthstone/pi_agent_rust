@@ -1,6 +1,12 @@
 //! Publish dependency SARIF to a new root-level file without overwrite races.
 
 use super::{AgentCx, Path, Result, Value, tool_error};
+// Used by the Unix publisher and by the tests; the non-Unix publisher is a
+// refusal and writes nothing.
+#[cfg_attr(
+    not(all(unix, not(any(target_os = "espidf", target_os = "redox")))),
+    allow(unused_imports)
+)]
 use std::io::Write as _;
 use std::time::Instant;
 

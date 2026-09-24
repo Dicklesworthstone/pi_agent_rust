@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read as _;
 use std::path::{Component, Path};
 
 pub const INVENTORY_SCHEMA: &str = "pi.security-dependency-inventory/v1";
@@ -404,6 +403,7 @@ impl Root {
     }
     fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
         use rustix::fs::{Mode, OFlags};
+        use std::io::Read as _;
         let mut parent = None;
         let mut parts = path.split('/').peekable();
         while let Some(part) = parts.next() {

@@ -129,6 +129,7 @@ impl Scratch {
         // must never be staged into the very tree they are recording.
         let root = repository_path(repo, "--absolute-git-dir")?
             .join(format!("pi-iso-index-{}", uuid::Uuid::new_v4().simple()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
