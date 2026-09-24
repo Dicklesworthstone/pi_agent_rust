@@ -161,7 +161,9 @@ fn read_completed(directory: &Path, progress: &DownloadRecord) -> Result<Vec<u8>
         .into_iter()
         .any(|value| !value.is_finite() || !(0.0..=MAX_DOWNLOAD_BYTES_F64).contains(&value))
     {
-        return Err(error("download progress is outside the 100 MiB capture budget"));
+        return Err(error(
+            "download progress is outside the 100 MiB capture budget",
+        ));
     }
     let mut file = open_completed(directory, &progress.guid)?;
     // Validate the object actually opened, not a pathname checked before open.
@@ -435,7 +437,12 @@ mod tests {
             assert!(read_completed(dir.path(), &record).is_err(), "{guid:?}");
         }
         assert!(validate_download_guid(&"x".repeat(129)).is_err());
-        for guid in ["guid", "opaque-id_42", "opaque.name", "12345678-abcd-1234-abcd-123456789abc"] {
+        for guid in [
+            "guid",
+            "opaque-id_42",
+            "opaque.name",
+            "12345678-abcd-1234-abcd-123456789abc",
+        ] {
             assert!(validate_download_guid(guid).is_ok(), "{guid}");
         }
     }

@@ -171,12 +171,8 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
         .map_err(|_| error(tool, "cannot retain pinned workspace directory"))?;
     let pinned_root = rustix::fs::fstat(&directory)
         .map_err(|_| error(tool, "cannot inspect pinned workspace directory"))?;
-    let current_root = rustix::fs::statat(
-        rustix::fs::CWD,
-        &target.root,
-        AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .map_err(|_| error(tool, "workspace root changed before artifact publication"))?;
+    let current_root = rustix::fs::statat(rustix::fs::CWD, &target.root, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| error(tool, "workspace root changed before artifact publication"))?;
     if pinned_root.st_dev != current_root.st_dev || pinned_root.st_ino != current_root.st_ino {
         return Err(error(
             tool,
@@ -425,17 +421,12 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let target = resolve_new(root.path(), "result.bin", "test").unwrap();
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            target.path(),
-            Mode::RUSR | Mode::WUSR,
-        )
-        .unwrap();
+        rustix::fs::mkfifoat(rustix::fs::CWD, target.path(), Mode::RUSR | Mode::WUSR).unwrap();
         let worker_target = target.clone();
         let (send, receive) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = publish(&worker_target, b"payload", "test")
-                .map_err(|failure| failure.to_string());
+            let result =
+                publish(&worker_target, b"payload", "test").map_err(|failure| failure.to_string());
             let _ = send.send(result);
         });
         let result = receive.recv_timeout(Duration::from_secs(5));
@@ -455,7 +446,12 @@ mod tests {
         worker.join().unwrap();
         let failure = result.unwrap().unwrap_err();
         assert!(failure.contains("output_path already exists"));
-        assert!(std::fs::symlink_metadata(target.path()).unwrap().file_type().is_fifo());
+        assert!(
+            std::fs::symlink_metadata(target.path())
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }
