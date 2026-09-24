@@ -123,16 +123,17 @@ const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 /// update after this point, while the snapshot reports truncation explicitly.
 const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Refuse new jobs before the dedicated directory can exceed this aggregate
-/// budget. Automatic rotation is opt-in through
-/// `PI_JOBS_ARTIFACT_RETENTION=rotate`; the default preserves every artifact.
+/// The dedicated directory never exceeds this aggregate budget. By default the
+/// oldest unlocked artifacts rotate out to admit a new job;
+/// `PI_JOBS_ARTIFACT_RETENTION=preserve` keeps every artifact and refuses the
+/// job instead.
 const MAX_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Bound inode consumption independently from bytes (for example, jobs that
 /// produce no output still create an artifact).
 const MAX_ARTIFACT_FILES: usize = 4096;
 
-/// Opt-in rotation always preserves this many newest settled artifacts in
+/// Rotation always preserves this many newest settled artifacts in
 /// addition to every active artifact whose exclusive file lock is held.
 const MIN_RETAINED_ARTIFACT_FILES: usize = 8;
 
@@ -891,8 +892,12 @@ enum ArtifactRetentionPolicy {
 
 impl ArtifactRetentionPolicy {
     fn from_value(value: Option<&OsStr>) -> Result<Self> {
+        // Rotate by default: preserve eventually refuses every background job
+        // once the budget fills, and nothing but a manual cleanup recovers it.
+        // Rotation removes only the oldest unlocked logs, and only as many as
+        // the next job needs (bd-y84fr).
         let Some(value) = value else {
-            return Ok(Self::Preserve);
+            return Ok(Self::Rotate);
         };
         let value = value.to_str().ok_or_else(|| {
             Error::tool(
@@ -901,8 +906,8 @@ impl ArtifactRetentionPolicy {
             )
         })?;
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "preserve" => Ok(Self::Preserve),
-            "rotate" => Ok(Self::Rotate),
+            "preserve" => Ok(Self::Preserve),
+            "" | "rotate" => Ok(Self::Rotate),
             _ => Err(Error::tool(
                 "bash",
                 format!(
@@ -3383,10 +3388,14 @@ mod tests {
     }
 
     #[test]
-    fn artifact_retention_policy_requires_an_explicit_rotate_opt_in() {
+    fn artifact_retention_policy_defaults_to_rotate_and_preserve_is_opt_in() {
         assert_eq!(
             ArtifactRetentionPolicy::from_value(None).expect("default policy"),
-            ArtifactRetentionPolicy::Preserve
+            ArtifactRetentionPolicy::Rotate
+        );
+        assert_eq!(
+            ArtifactRetentionPolicy::from_value(Some(OsStr::new(""))).expect("empty policy"),
+            ArtifactRetentionPolicy::Rotate
         );
         assert_eq!(
             ArtifactRetentionPolicy::from_value(Some(OsStr::new(" preserve ")))

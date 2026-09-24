@@ -446,13 +446,13 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
 
 All tools include automatic truncation for large outputs (2000 lines /
 1MB), detailed metadata in responses, and process-tree cleanup for bash.
-Background-job logs are preserved by default; when their dedicated directory
-cannot admit another 16 MiB artifact within its 256 MiB / 4096-entry budget,
-Pi refuses the new job instead of deleting history. Set
-`PI_JOBS_ARTIFACT_RETENTION=rotate` to opt into deleting the oldest unlocked
-artifacts while preserving active logs and at least eight recent logs. Job
-snapshots report the applied policy, removed-file count, and reclaimed bytes in
-`artifactCleanup`.
+Background-job logs live in a dedicated directory with a 256 MiB / 4096-entry
+budget. When it cannot admit another 16 MiB artifact, Pi deletes the oldest
+unlocked logs, only as many as needed, and always keeps active logs and at
+least eight recent ones. Set `PI_JOBS_ARTIFACT_RETENTION=preserve` to keep
+every log instead; Pi then refuses new background jobs once the budget is
+full. Job snapshots report the applied policy, removed-file count, and
+reclaimed bytes in `artifactCleanup`.
 Per-tool exposure is configurable via `tools.loadMode.<name>` set to
 `essential`, `discoverable`, or `off`; an explicit `--tools` list always
 wins:
@@ -1096,7 +1096,7 @@ Project context files are a separate switch. By default pi appends `AGENTS.md` /
 | `PI_CONFIG_PATH` | Custom config file path |
 | `PI_CODING_AGENT_DIR` | Override the global config directory |
 | `PI_SUBAGENT_PI_BINARY` | Explicit Rust Pi executable for native child agents; defaults to the current executable |
-| `PI_JOBS_ARTIFACT_RETENTION` | Background-job artifact policy: `preserve` (default) or explicit opt-in `rotate` |
+| `PI_JOBS_ARTIFACT_RETENTION` | Background-job artifact policy: `rotate` (default, deletes the oldest unlocked logs when the budget is full) or `preserve` (keeps every log, refuses new jobs when full) |
 | `PI_PACKAGE_DIR` | Override the packages directory |
 | `PI_SESSIONS_DIR` | Custom sessions directory |
 
