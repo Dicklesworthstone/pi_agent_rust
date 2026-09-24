@@ -333,9 +333,8 @@ impl CooldownTracker {
     #[must_use]
     pub fn should_use_primary(&self, now: Instant) -> bool {
         self.failed_at.is_none_or(|failed| {
-            now.checked_duration_since(failed).is_some_and(|elapsed| {
-                elapsed >= self.restored_remaining.unwrap_or(self.cooldown)
-            })
+            now.checked_duration_since(failed)
+                .is_some_and(|elapsed| elapsed >= self.restored_remaining.unwrap_or(self.cooldown))
         })
     }
 
@@ -1147,7 +1146,10 @@ pub fn decide(
                 return TurnDecision::Finish { success: false };
             }
             let retryable = error_result_is_retryable(message, context_window);
-            (retryable, retryable || classify_failover(error_text).is_some())
+            (
+                retryable,
+                retryable || classify_failover(error_text).is_some(),
+            )
         }
         TurnOutcome::Failed(error) => {
             if matches!(error, crate::error::Error::Aborted) {
@@ -1166,7 +1168,10 @@ pub fn decide(
                 return TurnDecision::Finish { success: false };
             }
             let retryable = call_error_is_retryable(error);
-            (retryable, retryable || classify_failover(&error_text).is_some())
+            (
+                retryable,
+                retryable || classify_failover(&error_text).is_some(),
+            )
         }
     };
 
@@ -2505,14 +2510,13 @@ mod tests {
                 Duration::from_secs(120),
             ] {
                 let deadline = wall + chrono::Duration::from_std(remaining).unwrap();
-                let tracker = CooldownTracker::from_deadline_at(
-                    configured_secs,
-                    deadline,
-                    wall,
-                    anchor,
-                );
+                let tracker =
+                    CooldownTracker::from_deadline_at(configured_secs, deadline, wall, anchor);
                 assert!(!tracker.should_use_primary(anchor));
-                assert!(!tracker.should_use_primary(anchor + remaining - Duration::from_nanos(1)));
+                let just_before = (anchor + remaining)
+                    .checked_sub(Duration::from_nanos(1))
+                    .expect("deadline is after the anchor");
+                assert!(!tracker.should_use_primary(just_before));
                 assert!(tracker.should_use_primary(anchor + remaining));
             }
         }
@@ -2524,12 +2528,8 @@ mod tests {
         let anchor = Instant::now();
         for configured_secs in [0, 60, u64::MAX] {
             for deadline in [wall, wall - chrono::Duration::nanoseconds(1)] {
-                let tracker = CooldownTracker::from_deadline_at(
-                    configured_secs,
-                    deadline,
-                    wall,
-                    anchor,
-                );
+                let tracker =
+                    CooldownTracker::from_deadline_at(configured_secs, deadline, wall, anchor);
                 assert!(tracker.should_use_primary(anchor));
             }
         }
@@ -2597,7 +2597,10 @@ mod tests {
                 assert_eq!(state.lifecycle_id(), Some("restart-lifecycle"));
                 if !interval.is_zero() {
                     assert!(!state.should_restore_primary(anchor));
-                    assert!(!state.should_restore_primary(anchor + interval - Duration::from_nanos(1)));
+                    let just_before = (anchor + interval)
+                        .checked_sub(Duration::from_nanos(1))
+                        .expect("interval is non-zero");
+                    assert!(!state.should_restore_primary(just_before));
                 }
                 assert!(state.should_restore_primary(anchor + interval));
             }

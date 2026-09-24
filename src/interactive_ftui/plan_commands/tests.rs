@@ -56,15 +56,27 @@ fn fixture(stored: Session) -> (AgentSessionHandle, Arc<AtomicUsize>) {
 }
 
 fn submit(handle: &AgentSessionHandle, text: &str) {
+    submit_input(
+        handle,
+        json!({"plan": text, "files": ["src/hello world.rs"]}),
+    );
+}
+
+/// Submit without a `files` scope. A plan that leaves a code fence open
+/// cannot also carry an appended `Files:` declaration (the scope check
+/// rejects it as ambiguous), so hostile-display plans go through here.
+fn submit_unscoped(handle: &AgentSessionHandle, text: &str) {
+    submit_input(handle, json!({"plan": text}));
+}
+
+fn submit_input(handle: &AgentSessionHandle, input: serde_json::Value) {
     let state = handle.session().agent.plan_state();
     let tool = crate::plan::SubmitPlanTool::new(state, false);
-    let output = run(tool.execute(
-        "proposal",
-        json!({"plan": text, "files": ["src/hello world.rs"]}),
-        None,
-    ))
-    .unwrap();
-    assert!(!output.is_error);
+    let output = run(tool.execute("proposal", input, None)).unwrap();
+    assert!(
+        !output.is_error,
+        "submit_plan refused the fixture: {output:?}"
+    );
 }
 
 fn pending() -> (AgentSessionHandle, PlanController, Arc<AtomicUsize>) {
@@ -98,8 +110,14 @@ fn command_admission_is_exact_and_case_insensitive() {
         assert_eq!(parse(args).unwrap(), expected);
     }
     let id = Uuid::new_v4();
-    assert_eq!(parse(&format!("ApPrOvE {id}")).unwrap(), PlanCommand::Approve(id));
-    assert_eq!(parse(&format!("REJECT {id}")).unwrap(), PlanCommand::Reject(id));
+    assert_eq!(
+        parse(&format!("ApPrOvE {id}")).unwrap(),
+        PlanCommand::Approve(id)
+    );
+    assert_eq!(
+        parse(&format!("REJECT {id}")).unwrap(),
+        PlanCommand::Reject(id)
+    );
 }
 
 #[test]
@@ -132,14 +150,19 @@ fn default_ftui_routes_plan_and_preserves_extension_prefixes() {
     assert!(model.route_slash_command("/PlAn review"));
     assert_eq!(
         submit_rx.try_recv().unwrap(),
-        UiCommand::Plan { action: "review".to_string() },
+        UiCommand::Plan {
+            action: "review".to_string()
+        },
     );
     assert!(model.route_slash_command("/plan approve"));
     assert!(submit_rx.try_recv().is_err());
     assert!(model.route_slash_command("/planet status"));
     assert_eq!(
         submit_rx.try_recv().unwrap(),
-        UiCommand::ExtensionCommand { name: "planet".to_string(), args: "status".to_string() },
+        UiCommand::ExtensionCommand {
+            name: "planet".to_string(),
+            args: "status".to_string()
+        },
     );
 }
 
@@ -150,22 +173,46 @@ fn workflow_uses_native_review_pins_context_and_never_starts_a_turn() {
     assert!(!state.allows_effects(ToolEffects::write()));
     assert!(!state.allows_effects(ToolEffects::process()));
     let id = display(&mut controller, &mut handle);
-    let reviewed = controller.displayed.as_ref().unwrap().review.text().to_string();
+    let reviewed = controller
+        .displayed
+        .as_ref()
+        .unwrap()
+        .review
+        .text()
+        .to_string();
     let output = run(controller.execute(&mut handle, &format!("approve {id}"))).unwrap();
     assert!(output.contains("No execution turn was started"));
     assert!(output.contains("Memory-only"));
     assert_eq!(state.mode(), PlanMode::Approved);
-    assert!(handle.session().agent.system_prompt().unwrap().contains(&reviewed));
+    assert!(
+        handle
+            .session()
+            .agent
+            .system_prompt()
+            .unwrap()
+            .contains(&reviewed)
+    );
     let policy = handle.session().agent.approval_state().unwrap();
     assert_eq!(policy.mode(), ApprovalMode::AlwaysAsk);
-    assert!(!policy.evaluate(
-        "write", &json!({"path": "src/hello world.rs"}), ToolEffects::write(), Some(&state), None,
-    ).is_auto_approved());
+    assert!(
+        !policy
+            .evaluate(
+                "write",
+                &json!({"path": "src/hello world.rs"}),
+                ToolEffects::write(),
+                Some(&state),
+                None,
+            )
+            .is_auto_approved()
+    );
     assert!(controller.displayed.is_none());
     assert!(run(controller.execute(&mut handle, &format!("approve {id}"))).is_err());
     run(controller.execute(&mut handle, "off")).unwrap();
     assert_eq!(state.mode(), PlanMode::Off);
-    assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
     assert_eq!(events.load(Ordering::SeqCst), 0);
 }
 
@@ -177,7 +224,10 @@ fn status_is_not_review_and_cannot_authorize_approval() {
     assert!(!output.contains(PLAN));
     assert!(controller.displayed.is_none());
     assert!(run(controller.execute(&mut handle, &format!("approve {}", Uuid::new_v4()))).is_err());
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
 }
 
 #[test]
@@ -217,7 +267,10 @@ fn identical_external_resubmission_cannot_retarget_a_displayed_decision() {
         assert!(run(controller.execute(&mut handle, &format!("{verb} {old}"))).is_err());
         assert_eq!(state.mode(), PlanMode::PendingApproval);
         assert!(controller.displayed.is_none());
-        assert_eq!(handle.session().agent.system_prompt(), Some("original instructions"));
+        assert_eq!(
+            handle.session().agent.system_prompt(),
+            Some("original instructions")
+        );
     }
 }
 
@@ -228,11 +281,17 @@ fn replacing_the_session_store_rejects_even_matching_session_ids_and_text() {
     let mut stored = Session::in_memory();
     stored.header.id = first.session_store().try_lock().unwrap().header.id.clone();
     let (mut second, _) = fixture(stored);
-    run(second.enter_plan_mode(&AgentCx::for_request())).unwrap();
+    let _ = run(second.enter_plan_mode(&AgentCx::for_request())).unwrap();
     submit(&second, PLAN);
     assert!(run(controller.execute(&mut second, &format!("approve {id}"))).is_err());
-    assert_eq!(second.session().agent.plan_state().mode(), PlanMode::PendingApproval);
-    assert_eq!(first.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        second.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
+    assert_eq!(
+        first.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
 }
 
 #[test]
@@ -253,7 +312,10 @@ fn clearing_review_does_not_change_the_pending_plan() {
     let id = display(&mut controller, &mut handle);
     controller.clear_review();
     assert!(run(controller.execute(&mut handle, &format!("approve {id}"))).is_err());
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
 }
 
 #[test]
@@ -266,7 +328,7 @@ fn review_display_is_complete_quoted_and_control_safe() {
          \\u{{202e}} is literal; \u{202e} is a bidi control; é and 文 and \t and \r and \x1b.\n{}\nEND-OF-FULL-PLAN",
         "x".repeat(64 * 1024),
     );
-    submit(&handle, &text);
+    submit_unscoped(&handle, &text);
     let output = run(controller.execute(&mut handle, "review")).unwrap();
     assert!(output.is_ascii());
     assert!(!output.contains('\r'));
@@ -276,7 +338,15 @@ fn review_display_is_complete_quoted_and_control_safe() {
     assert!(output.contains("\\\\u{202e} is literal; \\u{202e} is a bidi control"));
     assert!(output.contains(&"x".repeat(64 * 1024)));
     assert!(output.contains("END-OF-FULL-PLAN"));
-    assert!(controller.displayed.as_ref().unwrap().review.text().contains(&text));
+    assert!(
+        controller
+            .displayed
+            .as_ref()
+            .unwrap()
+            .review
+            .text()
+            .contains(&text)
+    );
 }
 
 #[test]
@@ -284,7 +354,9 @@ fn failed_persistence_is_not_described_as_a_rollback_or_a_saved_transition() {
     let output = render_change(&PlanChange {
         mode: PlanMode::Approved,
         changed: true,
-        persistence: PlanPersistence::Unconfirmed { reason: "disk full\r\x1b".to_string() },
+        persistence: PlanPersistence::Unconfirmed {
+            reason: "disk full\r\x1b".to_string(),
+        },
     });
     assert!(output.contains("Live plan state was not rolled back"));
     assert!(output.contains("Saving was NOT confirmed"));
@@ -311,7 +383,10 @@ fn disconnected_ui_retires_the_review_capability() {
     drop(receive);
     run(controller.run(&mut handle, "review", &send));
     assert!(controller.displayed.is_none());
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
 }
 
 #[test]
@@ -320,7 +395,10 @@ fn driver_reports_invalid_commands_without_changing_live_state() {
     let (send, receive) = std::sync::mpsc::channel();
     run(controller.run(&mut handle, "approve", &send));
     assert!(matches!(receive.try_recv().unwrap(), PiMsg::AgentError(_)));
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
 }
 
 #[test]
@@ -330,7 +408,10 @@ fn checkpoint_save_keeps_the_displayed_proposal_and_does_not_execute() {
     let output = run(controller.execute(&mut handle, "save")).unwrap();
     assert!(output.contains("Memory-only"));
     assert_eq!(controller.displayed.as_ref().unwrap().id, id);
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::PendingApproval);
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::PendingApproval
+    );
     assert_eq!(events.load(Ordering::SeqCst), 0);
 }
 
@@ -352,8 +433,17 @@ fn restore_requires_fresh_review_for_both_pending_and_approved_checkpoints() {
         let output = run(controller.execute(&mut reopened, "restore")).unwrap();
         assert!(output.contains("pending_approval"));
         assert!(controller.displayed.is_none());
-        assert!(!reopened.session().agent.plan_state().allows_effects(ToolEffects::write()));
-        assert_eq!(reopened.session().agent.system_prompt(), Some("original instructions"));
+        assert!(
+            !reopened
+                .session()
+                .agent
+                .plan_state()
+                .allows_effects(ToolEffects::write())
+        );
+        assert_eq!(
+            reopened.session().agent.system_prompt(),
+            Some("original instructions")
+        );
         assert!(run(controller.execute(&mut reopened, &format!("approve {old_id}"))).is_err());
         let new_id = display(&mut controller, &mut reopened);
         assert_ne!(new_id, old_id);

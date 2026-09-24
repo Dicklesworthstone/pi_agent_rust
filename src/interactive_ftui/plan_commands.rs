@@ -122,7 +122,10 @@ impl PlanController {
             }
             PlanCommand::Save => {
                 let persistence = handle.checkpoint_plan(&owner).await?;
-                return Ok(format!("Plan checkpoint. {}", render_persistence(&persistence)));
+                return Ok(format!(
+                    "Plan checkpoint. {}",
+                    render_persistence(&persistence)
+                ));
             }
             PlanCommand::Enter => handle.enter_plan_mode(&owner).await?,
             PlanCommand::Exit => handle.exit_plan_mode(&owner).await?,
@@ -143,7 +146,9 @@ impl PlanController {
                     Error::validation("Review unavailable; run /plan review again.".to_string())
                 })?;
                 if matches!(command, PlanCommand::Approve(_)) {
-                    handle.approve_plan_review(&owner, &displayed.review).await?
+                    handle
+                        .approve_plan_review(&owner, &displayed.review)
+                        .await?
                 } else {
                     handle.reject_plan_review(&owner, &displayed.review).await?
                 }
@@ -154,7 +159,7 @@ impl PlanController {
     }
 }
 
-fn mode_hint(mode: PlanMode) -> &'static str {
+const fn mode_hint(mode: PlanMode) -> &'static str {
     match mode {
         PlanMode::Off => "Normal tool policy remains in effect.",
         PlanMode::Planning => {
@@ -172,9 +177,7 @@ fn mode_hint(mode: PlanMode) -> &'static str {
 fn render_persistence(persistence: &PlanPersistence) -> String {
     match persistence {
         PlanPersistence::Saved => "Saved to the session.".to_string(),
-        PlanPersistence::MemoryOnly => {
-            "Memory-only session; this state was not saved.".to_string()
-        }
+        PlanPersistence::MemoryOnly => "Memory-only session; this state was not saved.".to_string(),
         PlanPersistence::Unchanged => "No live transition or save was needed.".to_string(),
         PlanPersistence::Unconfirmed { reason } => format!(
             "Saving was NOT confirmed: {}. Live plan state was not rolled back. \
