@@ -193,6 +193,10 @@ fn model_specs_match(left: &str, right: &str) -> bool {
 pub struct CooldownTracker {
     failed_at: Option<Instant>,
     cooldown: Duration,
+    /// A restored deadline may be farther away than the configured interval
+    /// after a wall-clock adjustment. Keep that interval without changing the
+    /// duration a subsequent, newly observed failure will use.
+    restored_remaining: Option<Duration>,
 }
 
 impl CooldownTracker {
@@ -201,52 +205,60 @@ impl CooldownTracker {
         Self {
             failed_at: None,
             cooldown: Duration::from_secs(cooldown_secs),
+            restored_remaining: None,
         }
     }
 
     /// Record that the primary failed at `now`.
     pub const fn record_primary_failure(&mut self, now: Instant) {
         self.failed_at = Some(now);
+        self.restored_remaining = None;
     }
 
     /// Whether the primary may be used again at `now`.
     #[must_use]
     pub fn should_use_primary(&self, now: Instant) -> bool {
-        self.failed_at
-            .is_none_or(|failed| now.duration_since(failed) >= self.cooldown)
+        self.failed_at.is_none_or(|failed| {
+            now.checked_duration_since(failed).is_some_and(|elapsed| {
+                elapsed >= self.restored_remaining.unwrap_or(self.cooldown)
+            })
+        })
     }
 
     /// Clear the tracker (primary succeeded).
     pub const fn reset(&mut self) {
         self.failed_at = None;
+        self.restored_remaining = None;
     }
 
     /// Create a cooldown tracker restored from a restart-safe deadline (bd-gm481.2).
-    /// If `now < deadline`, the remaining cooldown is tracked. If `now >= deadline`,
-    /// the cooldown has elapsed.
+    /// If `now < deadline`, the exact remaining cooldown is tracked against a
+    /// monotonic clock. If `now >= deadline`, the cooldown has elapsed.
     #[must_use]
     pub fn from_deadline(
         cooldown_secs: u64,
         deadline: chrono::DateTime<chrono::Utc>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let mut tracker = Self::new(cooldown_secs);
-        if now < deadline {
-            let remaining_millis =
-                u64::try_from((deadline - now).num_milliseconds().max(0)).unwrap_or(0);
-            let total_millis = cooldown_secs.saturating_mul(1000);
-            let elapsed_millis = total_millis.saturating_sub(remaining_millis);
-            let failed_at = Instant::now()
-                .checked_sub(Duration::from_millis(elapsed_millis))
-                .unwrap_or_else(Instant::now);
-            tracker.record_primary_failure(failed_at);
-        } else {
-            let past = Instant::now()
-                .checked_sub(Duration::from_secs(cooldown_secs.saturating_add(1)))
-                .unwrap_or_else(Instant::now);
-            tracker.record_primary_failure(past);
+        Self::from_deadline_at(cooldown_secs, deadline, now, Instant::now())
+    }
+
+    fn from_deadline_at(
+        cooldown_secs: u64,
+        deadline: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+        monotonic_now: Instant,
+    ) -> Self {
+        // Do not round to milliseconds or synthesize a historical Instant:
+        // rounding releases sub-millisecond deadlines early, clamping to the
+        // configured duration loses clock-rollback time, and checked_sub can
+        // fail for large durations even when the deadline has already passed.
+        let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
+        Self {
+            failed_at: Some(monotonic_now),
+            cooldown: Duration::from_secs(cooldown_secs),
+            restored_remaining: Some(remaining),
         }
-        tracker
     }
 
     /// Deterministic test view of the failure timestamp.
@@ -533,7 +545,14 @@ impl FailoverState {
             .as_deref()
             .and_then(|dl| chrono::DateTime::parse_from_rfc3339(dl).ok())
             .map_or_else(
-                || CooldownTracker::new(cooldown_secs),
+                || {
+                    // An active failover without a usable deadline is not
+                    // evidence that the failed primary has recovered. Older
+                    // records and malformed timestamps restart the interval.
+                    let mut tracker = CooldownTracker::new(cooldown_secs);
+                    tracker.record_primary_failure(Instant::now());
+                    tracker
+                },
                 |deadline| {
                     CooldownTracker::from_deadline(
                         cooldown_secs,
@@ -2349,5 +2368,116 @@ mod tests {
 
         let loud = crate::error::Error::Api("401 unauthorized: invalid api key".to_string());
         assert!(!call_error_is_retryable(&loud));
+    }
+
+    #[test]
+    fn restored_cooldown_preserves_exact_deadlines_without_clamping() {
+        let wall = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let anchor = Instant::now();
+        for configured_secs in [0, 60, u64::MAX] {
+            for remaining in [
+                Duration::from_nanos(1),
+                Duration::from_micros(500),
+                Duration::from_secs(40),
+                Duration::from_secs(120),
+            ] {
+                let deadline = wall + chrono::Duration::from_std(remaining).unwrap();
+                let tracker = CooldownTracker::from_deadline_at(
+                    configured_secs,
+                    deadline,
+                    wall,
+                    anchor,
+                );
+                assert!(!tracker.should_use_primary(anchor));
+                assert!(!tracker.should_use_primary(anchor + remaining - Duration::from_nanos(1)));
+                assert!(tracker.should_use_primary(anchor + remaining));
+            }
+        }
+    }
+
+    #[test]
+    fn elapsed_restored_deadlines_do_not_depend_on_instant_subtraction() {
+        let wall = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let anchor = Instant::now();
+        for configured_secs in [0, 60, u64::MAX] {
+            for deadline in [wall, wall - chrono::Duration::nanoseconds(1)] {
+                let tracker = CooldownTracker::from_deadline_at(
+                    configured_secs,
+                    deadline,
+                    wall,
+                    anchor,
+                );
+                assert!(tracker.should_use_primary(anchor));
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_failure_uses_the_configured_not_the_restored_interval() {
+        let wall = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let anchor = Instant::now();
+        for reset_first in [false, true] {
+            let mut tracker = CooldownTracker::from_deadline_at(
+                60,
+                wall + chrono::Duration::seconds(120),
+                wall,
+                anchor,
+            );
+            if reset_first {
+                tracker.reset();
+                assert!(tracker.should_use_primary(anchor));
+            }
+            tracker.record_primary_failure(anchor);
+            assert!(!tracker.should_use_primary(anchor + Duration::from_secs(59)));
+            assert!(tracker.should_use_primary(anchor + Duration::from_secs(60)));
+        }
+    }
+
+    #[test]
+    fn a_clock_sample_before_the_failure_cannot_expire_a_zero_cooldown() {
+        let anchor = Instant::now();
+        let mut tracker = CooldownTracker::new(0);
+        tracker.record_primary_failure(anchor + Duration::from_secs(1));
+        assert!(!tracker.should_use_primary(anchor));
+        assert!(tracker.should_use_primary(anchor + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn missing_or_invalid_persisted_deadlines_restart_the_effective_cooldown() {
+        use crate::session::{ModelChangeFailover, Session};
+
+        let wall = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        for deadline in [None, Some(""), Some("not-a-timestamp")] {
+            for persisted_secs in [None, Some(45), Some(0)] {
+                let mut session = Session::in_memory();
+                session.append_model_change_with_role_and_failover(
+                    "openai".to_string(),
+                    "gpt-y".to_string(),
+                    Some("failover".to_string()),
+                    Some(ModelChangeFailover {
+                        primary_provider: "anthropic".to_string(),
+                        primary_model_id: "claude-x".to_string(),
+                        primary_thinking_level: Some("high".to_string()),
+                        fallback_provider: "openai".to_string(),
+                        fallback_model_id: "gpt-y".to_string(),
+                        chain_position: Some(2),
+                        cooldown_deadline: deadline.map(str::to_string),
+                        cooldown_secs: persisted_secs,
+                        lifecycle_id: Some("restart-lifecycle".to_string()),
+                    }),
+                );
+                let state = FailoverState::reconstruct_from_session(&session, 75, wall);
+                let anchor = state.cooldown().unwrap().failed_at().unwrap();
+                let interval = Duration::from_secs(persisted_secs.unwrap_or(75));
+                assert_eq!(state.primary(), Some(&primary("anthropic", "claude-x")));
+                assert_eq!(state.chain_position(), 2);
+                assert_eq!(state.lifecycle_id(), Some("restart-lifecycle"));
+                if !interval.is_zero() {
+                    assert!(!state.should_restore_primary(anchor));
+                    assert!(!state.should_restore_primary(anchor + interval - Duration::from_nanos(1)));
+                }
+                assert!(state.should_restore_primary(anchor + interval));
+            }
+        }
     }
 }
