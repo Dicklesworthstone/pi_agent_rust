@@ -20,6 +20,7 @@
 //! ```
 
 mod extension_bootstrap;
+mod recovery;
 
 use crate::app;
 use crate::auth::AuthStorage;
@@ -386,15 +387,12 @@ pub struct SessionOptions {
     /// Provider retry for turns driven through this session.
     ///
     /// `None` — the default — returns a transient provider failure to the
-    /// caller unchanged. That is what every embedder got before this existed,
-    /// and what both interactive stacks still do: a 500 or a 529 mid-session is
-    /// a hard error there, while the identical request in print mode or over
-    /// RPC retries and completes (bd-u2qv4).
+    /// caller unchanged. `Some(policy)` applies to ordinary and abort-aware
+    /// prompts and continuations alike, including `SessionTransport::InProcess`.
     ///
-    /// `Some(policy)` applies the shared policy in [`crate::failover`] — the
-    /// same one print mode and the RPC server decide with, so the surfaces
-    /// cannot drift. [`crate::failover::RetryPolicy::from_config`] reads it out
-    /// of configuration, and yields `None` when the user has turned retry off.
+    /// The shared policy in [`crate::failover`] is also used by print mode and
+    /// RPC. [`crate::failover::RetryPolicy::from_config`] reads it from
+    /// configuration and yields `None` when the user has turned retry off.
     ///
     /// Retry alone. Walking a configured fallback CHAIN additionally needs
     /// [`SessionOptions::failover`].
@@ -1939,113 +1937,6 @@ impl AgentSessionHandle {
             .await
     }
 
-    /// Send one user prompt through the agent loop.
-    ///
-    /// The `on_event` callback receives events for this prompt only.
-    /// Session-level listeners registered via [`Self::subscribe`] or
-    /// [`SessionOptions`] callbacks also fire for every event.
-    pub async fn prompt(
-        &mut self,
-        input: impl Into<String>,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        self.sync_extension_mcp_registrations().await;
-        let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(on_event);
-        // This path applies no retry policy, but an earlier
-        // [`Self::prompt_with_abort`] may still have left a fallback installed,
-        // and a session that never goes back to its primary is the failure this
-        // prevents.
-        self.maybe_restore_primary(&shared).await;
-        let forwarded = Arc::clone(&shared);
-        let combined = self.make_combined_callback(move |event| forwarded(event));
-        self.session.run_text(input.into(), combined).await
-    }
-
-    /// Send one user prompt through the agent loop with an explicit abort signal.
-    ///
-    /// Applies [`SessionOptions::retry`] when one is configured; with none, the
-    /// first outcome is returned unchanged.
-    pub async fn prompt_with_abort(
-        &mut self,
-        input: impl Into<String>,
-        abort_signal: AbortSignal,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        self.sync_extension_mcp_registrations().await;
-        let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(on_event);
-        // Between-prompt lifecycle (bd-gm481.1): the previous prompt's turn has
-        // finished and its own `FailoverEnd { restoredPrimary: false }` already
-        // closed, so this can open and close its own without interleaving.
-        self.maybe_restore_primary(&shared).await;
-        let first_attempt = Arc::clone(&shared);
-        let combined = self.make_combined_callback(move |event| first_attempt(event));
-        let first = self
-            .session
-            .run_text_with_abort(input.into(), Some(abort_signal.clone()), combined)
-            .await;
-        self.apply_retry_policy(first, &abort_signal, &shared).await
-    }
-
-    /// Continue the current agent loop without adding a new user prompt.
-    ///
-    /// This is useful for retry/continuation flows where session history or
-    /// injected messages should drive the next turn without synthesizing a new
-    /// user message through [`Self::prompt`].
-    ///
-    /// The turn is persisted, and it will not issue against a provider the
-    /// admission gate has quarantined. Both come from routing through
-    /// [`AgentSession::run_continue_with_abort`] rather than the inner `Agent`
-    /// (bd-9o9i2); the raw loop does neither, so this used to run a full turn,
-    /// stream its events, return its assistant message, and write nothing.
-    pub async fn continue_turn(
-        &mut self,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        let combined = self.make_combined_callback(on_event);
-        self.session.run_continue_with_abort(None, combined).await
-    }
-
-    /// Continue the current agent loop with an explicit abort signal.
-    ///
-    /// Applies [`SessionOptions::retry`] when one is configured; with none, the
-    /// first outcome is returned unchanged.
-    ///
-    /// The first attempt persists and respects the admission gate, like every
-    /// retry after it. It did neither until bd-9o9i2: the retry attempts went
-    /// through [`AgentSession`] while the attempt they were retrying went
-    /// through the inner `Agent`, so a turn that succeeded first time wrote
-    /// nothing while the same turn on its second try wrote correctly.
-    pub async fn continue_turn_with_abort(
-        &mut self,
-        abort_signal: AbortSignal,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(on_event);
-        let first_attempt = Arc::clone(&shared);
-        let combined = self.make_combined_callback(move |event| first_attempt(event));
-        let first = self
-            .session
-            .run_continue_with_abort(Some(abort_signal.clone()), combined)
-            .await;
-        self.apply_retry_policy(first, &abort_signal, &shared).await
-    }
-
-    /// Install (or clear) this handle's fallback-chain configuration.
-    ///
-    /// [`create_agent_session`] takes it from [`SessionOptions::failover`];
-    /// this is for a handle built through [`Self::from_session_with_listeners`],
-    /// which reads no options.
-    #[must_use]
-    pub fn with_failover(mut self, options: Option<FailoverOptions>) -> Self {
-        self.failover_state = options
-            .as_ref()
-            .map_or_else(crate::failover::FailoverState::new_empty, |options| {
-                crate::failover::FailoverState::with_cooldown_secs(options.cooldown_secs)
-            });
-        self.failover = options.map(Arc::new);
-        self
-    }
-
     /// The session store this handle drives, for the rare caller that needs
     /// NON-BLOCKING access to it.
     ///
@@ -2067,418 +1958,6 @@ impl AgentSessionHandle {
     #[must_use]
     pub fn has_tool(&self, name: &str) -> bool {
         self.session.agent.has_tool(name)
-    }
-
-    /// Install (or clear) this handle's provider retry policy.
-    ///
-    /// [`create_agent_session`] takes it from [`SessionOptions::retry`]; this is
-    /// for a handle built through [`Self::from_session_with_listeners`], which
-    /// reads no options and would otherwise have no way to opt in.
-    #[must_use]
-    pub const fn with_retry(mut self, policy: Option<crate::failover::RetryPolicy>) -> Self {
-        self.retry = policy;
-        self
-    }
-
-    /// Walk the configured fallback chain and install the next usable entry,
-    /// reporting whether anything committed.
-    ///
-    /// The chain belongs to the identity the chain STARTED from, not to the
-    /// fallback currently installed: resolving from the live model would make
-    /// an exact primary chain disappear after the first hop and prevent later
-    /// entries from ever running. The walk itself, the credential check, the
-    /// provider construction and the persisted transition are
-    /// `AgentSession::try_failover`, shared with print mode and RPC (bd-u2qv4).
-    /// `retry_attempt_to_end` is the retry lifecycle this swap supersedes, if
-    /// one is open. It is closed HERE, immediately before `FailoverStart`, so a
-    /// host never sees the two lifecycles interleaved (bd-2vmu6). Passing it in
-    /// rather than closing it at the call site is what print mode and RPC both
-    /// do, and it is the only ordering that works: the caller cannot know
-    /// whether the chain had anything installable until this returns, so
-    /// closing the retry before calling would emit an `AutoRetryEnd` for a
-    /// failover that never happened.
-    async fn try_chain_failover(
-        &mut self,
-        current: &Result<AssistantMessage>,
-        require_incomplete_tail: bool,
-        retry_attempt_to_end: Option<u32>,
-        shared: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
-    ) -> Result<bool> {
-        let Some(options) = self.failover.clone() else {
-            return Ok(false);
-        };
-        let Some(error_text) = Self::turn_error_text_for(current) else {
-            return Ok(false);
-        };
-        // Auth and other loud errors never fail over; another provider would
-        // only reject the same credentials.
-        let Some(class) = crate::failover::classify_failover(&error_text) else {
-            return Ok(false);
-        };
-
-        let live = {
-            let provider = self.session.agent.provider();
-            crate::failover::FailoverPrimary {
-                provider: provider.name().to_string(),
-                model_id: provider.model_id().to_string(),
-                requested_thinking_level: self
-                    .session
-                    .agent
-                    .stream_options()
-                    .thinking_level
-                    .unwrap_or_default(),
-            }
-        };
-        let primary = self.failover_state.primary_for_swap(live);
-        let Some(chain) = crate::failover::chain_for(
-            &options.chains,
-            "default",
-            &primary.provider,
-            &primary.model_id,
-        ) else {
-            return Ok(false);
-        };
-
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let attempt = crate::agent::FailoverSwapAttempt {
-            chain: &chain,
-            start_position: self.failover_state.chain_position(),
-            available_models: &options.available_models,
-            auth: &options.auth,
-            cli_api_key: options.cli_api_key.as_deref(),
-            class,
-            // The level originally requested, before any swap, which is RPC's
-            // choice: clamping against the LIVE level ratchets it down through
-            // whatever the previous fallback allowed and never recovers it
-            // (bd-jk057).
-            thinking_level_to_clamp: primary.requested_thinking_level,
-            require_incomplete_tail,
-            primary: Some(&primary),
-            cooldown_secs: Some(options.cooldown_secs),
-            lifecycle_id: self.failover_state.lifecycle_id(),
-        };
-        let outcome = self.session.try_failover(&cx, &attempt).await?;
-        let Some(committed) = outcome.committed else {
-            // Nothing recorded on an exhausted chain, which is RPC's behaviour
-            // and the better of the two: an entry rejected only because its
-            // credential was missing gets another look once that credential
-            // appears, rather than being skipped for the life of the process
-            // (bd-gr6fk).
-            return Ok(false);
-        };
-        if self.failover_state.lifecycle_id().is_none() {
-            self.failover_state
-                .set_lifecycle_id(Some(uuid::Uuid::new_v4().to_string()));
-        }
-        self.failover_state
-            .set_chain_position(outcome.next_position);
-        self.failover_state.record_swap(
-            primary,
-            (committed.to_provider.clone(), committed.to_model.clone()),
-            std::time::Instant::now(),
-        );
-        // Close the retry lifecycle before opening the failover one. Both are
-        // now certain: the swap has committed, so this cannot close a retry for
-        // a failover that did not happen.
-        // Close the retry lifecycle before opening the failover one. Both are
-        // now certain: the swap has committed, so this cannot close a retry for
-        // a failover that did not happen.
-        if let Some(attempt) = retry_attempt_to_end {
-            shared(AgentEvent::AutoRetryEnd {
-                success: false,
-                attempt,
-                final_error: Some(error_text),
-            });
-        }
-        shared(AgentEvent::FailoverStart {
-            from_provider: committed.from_provider,
-            from_model: committed.from_model,
-            to_provider: committed.to_provider,
-            to_model: committed.to_model,
-            class: format!("{class:?}").to_ascii_lowercase(),
-            // Budget position, not chain position (bd-oqo03).
-            attempt: 0,
-            chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
-        });
-        Ok(true)
-    }
-
-    /// Close a failover lifecycle opened this turn, so a host never sees a
-    /// `FailoverStart` without its `FailoverEnd`.
-    fn close_failover_lifecycle(
-        &self,
-        failed_over: bool,
-        success: bool,
-        shared: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
-    ) {
-        if !failed_over {
-            return;
-        }
-        let provider = self.session.agent.provider();
-        shared(AgentEvent::FailoverEnd {
-            success,
-            provider: provider.name().to_string(),
-            model: provider.model_id().to_string(),
-            restored_primary: false,
-        });
-    }
-
-    /// Reinstall the primary captured at the first swap, once its cooldown has
-    /// elapsed.
-    ///
-    /// A failover is only half a policy if nothing ever goes back. Print mode
-    /// and RPC both restore; without this an interactive session that took one
-    /// 429 would stay pinned to the fallback for as long as it runs, which here
-    /// means hours rather than the lifetime of a script (bd-gm481).
-    ///
-    /// Called BETWEEN prompts, never inside a turn: restoring mid-turn would
-    /// undo the swap the turn in progress is depending on. Every refusal leaves
-    /// the working fallback installed and the prompt simply runs on it, which
-    /// is the correct outcome and not something this can improve on.
-    async fn maybe_restore_primary(&mut self, shared: &Arc<dyn Fn(AgentEvent) + Send + Sync>) {
-        let Some(options) = self.failover.clone() else {
-            return;
-        };
-        let Some(active) = self.failover_state.active().cloned() else {
-            return;
-        };
-        let Some(primary) = self.failover_state.primary().cloned() else {
-            return;
-        };
-
-        let request = crate::agent::PrimaryRestoreRequest {
-            primary: &primary,
-            active: &active,
-            cooldown_elapsed: self
-                .failover_state
-                .should_restore_primary(std::time::Instant::now()),
-            available_models: &options.available_models,
-            auth: &options.auth,
-            cli_api_key: options.cli_api_key.as_deref(),
-            // Like print mode: no admission gate and no cross-process record to
-            // corrupt, so a stale record declines rather than failing the call.
-            strict_invariants: false,
-            // Unlike print mode: the restoration changes the context window in
-            // the same transition, so a background compaction computed against
-            // the fallback's window is stale by construction. This path is new,
-            // so there is no prior behaviour to preserve and it takes the one
-            // RPC takes.
-            invalidate_background_compaction: true,
-        };
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let Ok(Some(restored)) = self.session.restore_primary(&cx, &request).await else {
-            return;
-        };
-        self.failover_state.clear();
-        shared(AgentEvent::FailoverEnd {
-            success: true,
-            provider: restored.provider,
-            model: restored.model,
-            restored_primary: true,
-        });
-    }
-
-    /// The error text a turn outcome carries, whichever shape it arrived in.
-    fn turn_error_text_for(outcome: &Result<AssistantMessage>) -> Option<String> {
-        match outcome {
-            Ok(message) => message.error_message.clone(),
-            Err(error) => Some(error.to_string()),
-        }
-    }
-
-    /// Wait out a retry backoff, reporting `false` if the turn was aborted.
-    ///
-    /// Polled rather than slept in one go so an abort lands promptly instead of
-    /// after the full delay. It deliberately does NOT consult context
-    /// cancellation: a task whose context is cancel-requested stops being
-    /// scheduled at all and never reaches another checkpoint (bd-todkd), so the
-    /// abort signal is the only channel that actually works here.
-    async fn await_retry_backoff(delay_ms: u32, abort_signal: &AbortSignal) -> bool {
-        const POLL: std::time::Duration = std::time::Duration::from_millis(25);
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay_ms));
-        while std::time::Instant::now() < deadline {
-            if abort_signal.is_aborted() {
-                return false;
-            }
-            asupersync::time::sleep(asupersync::time::wall_now(), POLL).await;
-        }
-        !abort_signal.is_aborted()
-    }
-
-    /// Apply this session's retry policy to a turn that has already run once.
-    ///
-    /// Retries RESUME the turn rather than replaying it: only the failed
-    /// request's incomplete output is stripped, so completed tool cycles are
-    /// neither re-run nor re-billed (pi_agent_rust#125), which is what print
-    /// mode and RPC do. `AutoRetryStart`/`AutoRetryEnd` go through the same
-    /// callback as the turn's own events, so a host that renders them — the
-    /// default FTUI already does — shows the retry without any further wiring.
-    ///
-    /// With no policy configured this hands `first` straight back, which is the
-    /// behaviour every embedder had before [`SessionOptions::retry`] existed.
-    async fn apply_retry_policy(
-        &mut self,
-        first: Result<AssistantMessage>,
-        abort_signal: &AbortSignal,
-        shared: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
-    ) -> Result<AssistantMessage> {
-        let Some(policy) = self.retry else {
-            return first;
-        };
-        let mut progress = crate::failover::TurnProgress {
-            retry_count: 0,
-            failovers_this_turn: 0,
-            stream_can_retry: true,
-        };
-        let mut failed_over = false;
-        let mut current = first;
-        loop {
-            // No context window: resolving the active model's window on this
-            // path is a behaviour change of its own, and print mode passes
-            // `None` here too. The cost is that a SILENT context overflow —
-            // transient-looking prose with input tokens over the window — is
-            // retried rather than refused.
-            let decision = match &current {
-                Ok(message) => crate::failover::decide(
-                    crate::failover::TurnOutcome::Completed(message),
-                    &progress,
-                    &policy,
-                    None,
-                ),
-                Err(error) => crate::failover::decide(
-                    crate::failover::TurnOutcome::Failed(error),
-                    &progress,
-                    &policy,
-                    None,
-                ),
-            };
-            // A classified transient failure with the retry budget spent walks
-            // the configured fallback chain, when one was supplied. A swap
-            // resets the retry budget and RESUMES the turn on the new provider,
-            // which is what print mode and RPC do (bd-cv653.3.2).
-            if decision == crate::failover::TurnDecision::FailOver
-                && progress.failovers_this_turn < policy.max_failovers_per_turn
-                && self
-                    .try_chain_failover(
-                        &current,
-                        current.is_ok(),
-                        // The open retry lifecycle this swap supersedes, closed
-                        // inside the swap so it lands before `FailoverStart`.
-                        (progress.retry_count > 0).then_some(progress.retry_count),
-                        shared,
-                    )
-                    .await?
-            {
-                failed_over = true;
-                progress.failovers_this_turn += 1;
-                progress.retry_count = 0;
-                let per_attempt = Arc::clone(shared);
-                let combined = self.make_combined_callback(move |event| per_attempt(event));
-                current = self
-                    .session
-                    .run_continue_with_abort(Some(abort_signal.clone()), combined)
-                    .await;
-                continue;
-            }
-
-            let crate::failover::TurnDecision::Retry { attempt, delay_ms } = decision else {
-                let success = matches!(&current, Ok(message) if !matches!(
-                    message.stop_reason,
-                    crate::model::StopReason::Error
-                ));
-                if progress.retry_count > 0 {
-                    shared(AgentEvent::AutoRetryEnd {
-                        success,
-                        attempt: progress.retry_count,
-                        final_error: Self::turn_error_text_for(&current),
-                    });
-                }
-                self.close_failover_lifecycle(failed_over, success, shared);
-                return current;
-            };
-
-            match self
-                .prepare_same_provider_retry(
-                    &current,
-                    attempt,
-                    delay_ms,
-                    policy,
-                    abort_signal,
-                    shared,
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => return current,
-                Err(restore_error) => return Err(restore_error),
-            }
-
-            progress.retry_count = attempt;
-            let per_attempt = Arc::clone(shared);
-            let combined = self.make_combined_callback(move |event| per_attempt(event));
-            // AgentSession's resume, not the bare Agent's: it rehydrates the
-            // transcript from the session path the revert above just moved, so
-            // the retry continues from the last COMPLETED state and the next
-            // failure leaves a tail for the next revert. Print mode and RPC
-            // resume the same way, and since bd-9o9i2 so does the first
-            // attempt in `continue_turn_with_abort` — that asymmetry, where a
-            // turn persisted only if it had to be retried, is what the bead
-            // was about.
-            current = self
-                .session
-                .run_continue_with_abort(Some(abort_signal.clone()), combined)
-                .await;
-        }
-    }
-
-    /// Announce a retry, wait out its backoff, and strip the failed request's
-    /// incomplete output so the resume continues the turn rather than replaying
-    /// it (pi_agent_rust#125).
-    ///
-    /// `Ok(false)` means the turn was aborted during the backoff and the caller
-    /// should hand back what it already has.
-    async fn prepare_same_provider_retry(
-        &mut self,
-        current: &Result<AssistantMessage>,
-        attempt: u32,
-        delay_ms: u32,
-        policy: crate::failover::RetryPolicy,
-        abort_signal: &AbortSignal,
-        shared: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
-    ) -> Result<bool> {
-        let require_incomplete_tail = current.is_ok();
-        shared(AgentEvent::AutoRetryStart {
-            attempt,
-            max_attempts: policy.max_retries,
-            delay_ms: u64::from(delay_ms),
-            error_message: Self::turn_error_text_for(current)
-                .unwrap_or_else(|| "Request error".to_string()),
-        });
-
-        if !Self::await_retry_backoff(delay_ms, abort_signal).await {
-            shared(AgentEvent::AutoRetryEnd {
-                success: false,
-                attempt,
-                final_error: Some("Aborted".to_string()),
-            });
-            return Ok(false);
-        }
-
-        let cx = crate::agent_cx::AgentCx::for_request();
-        if let Err(restore_error) = self
-            .session
-            .restore_retry_tail(&cx, require_incomplete_tail)
-            .await
-        {
-            shared(AgentEvent::AutoRetryEnd {
-                success: false,
-                attempt,
-                final_error: Some(restore_error.to_string()),
-            });
-            return Err(restore_error);
-        }
-        Ok(true)
     }
 
     /// Create a new abort handle/signal pair for prompt cancellation.
@@ -3519,6 +2998,8 @@ pub(crate) async fn create_agent_session_deferred_mcp(
 
 #[cfg(test)]
 mod tests {
+    mod recovery;
+
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::runtime::reactor::create_reactor;
@@ -3572,6 +3053,8 @@ mod tests {
         /// synthetic id has no route to reconstruct.
         name: String,
         model: String,
+        /// Provider-reported usage for silent context-overflow regressions.
+        input_tokens: u64,
     }
 
     #[async_trait::async_trait]
@@ -3607,7 +3090,10 @@ mod tests {
                 api: self.api().to_string(),
                 provider: self.name().to_string(),
                 model: self.model_id().to_string(),
-                usage: crate::model::Usage::default(),
+                usage: crate::model::Usage {
+                    input: self.input_tokens,
+                    ..crate::model::Usage::default()
+                },
                 stop_reason: crate::model::StopReason::Error,
                 stop_details: None,
                 error_message: Some("503 service unavailable".to_string()),
@@ -3654,6 +3140,7 @@ mod tests {
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             name: "test-provider".to_string(),
             model: "test-model".to_string(),
+            input_tokens: 0,
         });
         let agent = crate::agent::Agent::new(
             provider,
@@ -3682,6 +3169,7 @@ mod tests {
             calls: Arc::clone(&calls),
             name: name.to_string(),
             model: model.to_string(),
+            input_tokens: 0,
         });
         let agent = crate::agent::Agent::new(
             provider,
@@ -4049,7 +3537,7 @@ mod tests {
         assert_eq!(captured.model_id, "claude-3-5-haiku-latest");
 
         let (seen, shared) = restore_recorder();
-        run_async(handle.maybe_restore_primary(&shared));
+        run_async(handle.maybe_restore_primary(&shared)).expect("restore primary");
 
         assert_eq!(
             handle.session.agent.provider().model_id(),
@@ -4081,7 +3569,7 @@ mod tests {
         let mut handle = handle_after_one_failover(300);
 
         let (seen, shared) = restore_recorder();
-        run_async(handle.maybe_restore_primary(&shared));
+        run_async(handle.maybe_restore_primary(&shared)).expect("cooldown check");
 
         assert_eq!(
             handle.session.agent.provider().model_id(),
