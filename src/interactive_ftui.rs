@@ -62,6 +62,8 @@ use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use std::collections::VecDeque;
 
+mod plan_commands;
+
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
 /// `Model::Message` must be `From<Event>`, so terminal input arrives through
@@ -999,6 +1001,9 @@ pub enum UiCommand {
     /// Compact the conversation (`/compact`): the driver runs compaction and
     /// replays the rewritten history into the transcript.
     Compact,
+    /// Control read-only planning and session-bound review (`/plan`).
+    /// The driver retains the exact displayed proposal, not the UI command.
+    Plan { action: String },
     /// Roll back (`/undo`) or re-apply (`/redo`) recorded agent file edits
     /// (bd-cv653.3.13).
     Undo {
@@ -2366,6 +2371,17 @@ impl PiFtuiModel {
             self.pending_quit = true;
             return true;
         }
+        if let Some(rest) = strip_command(clean, "/plan") {
+            if plan_commands::parse(rest).is_ok() {
+                self.begin_busy("updating plan ...");
+                self.send_command(UiCommand::Plan {
+                    action: rest.trim().to_string(),
+                });
+            } else {
+                self.push_entry(EntryRole::Error, plan_commands::USAGE.to_string());
+            }
+            return true;
+        }
         if let Some(rest) = strip_command(clean, "/add-dir") {
             self.push_entry(
                 EntryRole::System,
@@ -2517,7 +2533,7 @@ impl PiFtuiModel {
                 EntryRole::System,
                 String::from(
                     "pi commands: /model [provider/model], /resume, /new, \
-                     /session, /name <name>, /compact, /tree, /undo [n], /redo [n], \
+                     /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
                      /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking [level], /theme, /changelog, /clear, /hotkeys, /help, \
@@ -5440,6 +5456,7 @@ pub fn run(
                 {
                     let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
                 }
+                let mut plans = plan_commands::PlanController::default();
                 let mut replacement_failure = None;
                 loop {
                     match submit_rx.try_recv() {
@@ -5463,6 +5480,9 @@ pub fn run(
                         }
                         Ok(UiCommand::Compact) => {
                             run_compact_command(&mut handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Plan { action }) => {
+                            plans.run(&mut handle, &action, &agent_tx).await;
                         }
                         Ok(UiCommand::AddDir { dir }) => {
                             run_add_dir_command(&mut handle, &dir, &agent_tx).await;
@@ -5488,6 +5508,7 @@ pub fn run(
                                 .await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
+                            plans.clear_review();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(resume_session_command(
                                 &path,
@@ -5505,6 +5526,7 @@ pub fn run(
                             }
                         }
                         Ok(UiCommand::NewSession) => {
+                            plans.clear_review();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(new_session_command(
                                 &resume_template,
