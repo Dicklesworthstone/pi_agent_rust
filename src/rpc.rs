@@ -11555,6 +11555,48 @@ mod retry_tests {
         temp: &tempfile::TempDir,
         hook_body: &str,
     ) -> (Value, Arc<asupersync::sync::Mutex<Session>>, String, String) {
+        let fixture = real_js_switch_fixture(runtime_handle, temp, hook_body).await;
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+
+        // Boxed: clippy::large_futures.
+        Box::pin(run(
+            fixture.agent_session,
+            fixture.options,
+            fixture.in_rx,
+            out_tx,
+        ))
+        .await
+        .expect("rpc server loop");
+        let response = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+            .find(|value| value["type"] == "response" && value["command"] == "switch_session")
+            .expect("switch_session response");
+        (
+            response,
+            fixture.inner_session,
+            fixture.source_id,
+            fixture.target_id,
+        )
+    }
+
+    struct RealJsSwitchFixture {
+        agent_session: AgentSession,
+        options: RpcOptions,
+        in_rx: asupersync::channel::mpsc::Receiver<String>,
+        inner_session: Arc<asupersync::sync::Mutex<Session>>,
+        source_id: String,
+        target_id: String,
+    }
+
+    /// An RPC server input with one queued switch_session to a saved target,
+    /// and a source session whose extension runs `hook_body` as its
+    /// session_before_switch handler.
+    async fn real_js_switch_fixture(
+        runtime_handle: &asupersync::runtime::RuntimeHandle,
+        temp: &tempfile::TempDir,
+        hook_body: &str,
+    ) -> RealJsSwitchFixture {
         let extension_path = temp.path().join("switch-hook.mjs");
         std::fs::write(
             &extension_path,
@@ -11613,18 +11655,14 @@ mod retry_tests {
             .await
             .expect("send switch_session");
         drop(in_tx);
-        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
-
-        // Boxed: clippy::large_futures.
-        Box::pin(run(agent_session, options, in_rx, out_tx))
-            .await
-            .expect("rpc server loop");
-        let response = out_rx
-            .try_iter()
-            .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
-            .find(|value| value["type"] == "response" && value["command"] == "switch_session")
-            .expect("switch_session response");
-        (response, inner_session, source_id, target_id)
+        RealJsSwitchFixture {
+            agent_session,
+            options,
+            in_rx,
+            inner_session,
+            source_id,
+            target_id,
+        }
     }
 
     /// Hook statement that writes an entry into the session it runs against.
@@ -11667,6 +11705,78 @@ mod retry_tests {
             assert!(
                 has_switch_hook_entry(&inner),
                 "the hook's write belongs to the source session it ran against"
+            );
+        });
+    }
+
+    /// bd-dexy7: cancellation mid-transition. The hook writes to the source and
+    /// then never settles, so the server parks inside switch_session. Dropping
+    /// the server there must leave the source installed, still holding the
+    /// hook's write: nothing of the target may have been committed before the
+    /// hook resolved.
+    #[test]
+    fn rpc_switch_session_dropped_while_hook_pends_keeps_the_source_session() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let fixture = real_js_switch_fixture(
+                &runtime_handle,
+                &temp,
+                &format!("{SWITCH_HOOK_SOURCE_WRITE}\nawait new Promise(() => {{}});"),
+            )
+            .await;
+            let inner_session = Arc::clone(&fixture.inner_session);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+            {
+                // Boxed: clippy::large_futures.
+                let mut server = Box::pin(run(
+                    fixture.agent_session,
+                    fixture.options,
+                    fixture.in_rx,
+                    out_tx,
+                ));
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    assert!(
+                        futures::poll!(server.as_mut()).is_pending(),
+                        "the server must still be parked in the pending hook"
+                    );
+                    if inner_session
+                        .try_lock()
+                        .is_ok_and(|inner| has_switch_hook_entry(&inner))
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the switch hook never ran"
+                    );
+                    sleep(wall_now(), Duration::from_millis(10)).await;
+                }
+            }
+
+            assert!(
+                out_rx
+                    .try_iter()
+                    .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                    .all(|value| value["command"] != "switch_session"),
+                "an abandoned switch must not have answered"
+            );
+            let inner = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("session lock after the server was dropped");
+            assert_eq!(
+                inner.header.id, fixture.source_id,
+                "nothing of the target may be installed before the hook resolves"
+            );
+            assert_ne!(inner.header.id, fixture.target_id);
+            assert!(
+                has_switch_hook_entry(&inner),
+                "the hook's write stays on the source session"
             );
         });
     }
