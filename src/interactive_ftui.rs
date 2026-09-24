@@ -1228,6 +1228,9 @@ pub struct PiFtuiModel {
     /// accepts_empty_input)`. The next submitted line goes to the driver as
     /// login input and is never echoed into the transcript.
     login_pending: Option<(String, bool)>,
+    /// What the powerline status line shows; sent by the driver after every
+    /// command. `None` until the session exists.
+    status_snapshot: Option<crate::interactive::FtuiStatusSnapshot>,
     /// Sanitized in-flight thinking text (drives the `thinking…` status).
     thinking: String,
     /// Spinner animation state; advanced by `Event::Tick` while working.
@@ -1485,6 +1488,7 @@ impl PiFtuiModel {
             todo_summary: None,
             error_banner: None,
             login_pending: None,
+            status_snapshot: None,
             thinking: String::new(),
             spinner: SpinnerState::default(),
             usage_line: None,
@@ -2223,6 +2227,9 @@ impl PiFtuiModel {
                 accepts_empty_input,
             } => {
                 self.login_pending = provider.map(|provider| (provider, accepts_empty_input));
+            }
+            PiMsg::StatusSnapshot(snapshot) => {
+                self.status_snapshot = Some(snapshot);
             }
             // `/fork` hands the selected message back for rewording; a stale
             // reply for a session no longer shown is dropped.
@@ -4040,17 +4047,43 @@ impl PiFtuiModel {
                 .as_ref()
                 .map_or_else(String::new, |todo| format!("todo {todo}"))
         };
-        if !status_line.is_empty() {
+        // The powerline (OMP-ADOPT bd-cv653.9.4) fills the rest of the row:
+        // model, thinking, mode, path, VCS, context, cost.
+        let powerline = self
+            .status_snapshot
+            .as_ref()
+            .map_or_else(String::new, |snapshot| {
+                let used = if status_line.is_empty() {
+                    0
+                } else {
+                    display_width(&status_line) + 2
+                };
+                render_powerline(
+                    snapshot,
+                    usize::from(regions.status.width).saturating_sub(used),
+                )
+            });
+        if !status_line.is_empty() || !powerline.is_empty() {
             let status_style = if self.state == AgentUiState::Working || self.busy.is_some() {
                 ftui::Style::new().fg(self.palette.warning)
             } else {
                 ftui::Style::new().dim().fg(self.palette.muted)
             };
-            Paragraph::new(Text::from_lines([ftui::text::Line::styled(
-                status_line,
-                status_style,
-            )]))
-            .render(regions.status, frame);
+            let mut spans = Vec::new();
+            if !status_line.is_empty() {
+                spans.push(ftui::text::Span::styled(status_line, status_style));
+            }
+            if !powerline.is_empty() {
+                if !spans.is_empty() {
+                    spans.push(ftui::text::Span::raw(String::from("  ")));
+                }
+                spans.push(ftui::text::Span::styled(
+                    powerline,
+                    ftui::Style::new().fg(self.palette.accent),
+                ));
+            }
+            Paragraph::new(Text::from_lines([ftui::text::Line::from_spans(spans)]))
+                .render(regions.status, frame);
         }
 
         // Slash-command completion popup (issue #208), pinned to the editor.
@@ -5383,6 +5416,113 @@ async fn run_set_thinking_command(
     let _ = agent_tx.send(msg);
 }
 
+/// Capture what the status line shows from the live session and send it to
+/// the UI. The model is labelled the OMP way (display name, else id); the
+/// context figure is the last prompt's size against the model's window.
+async fn send_status_snapshot(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let entry = handle.session().current_model_entry();
+    let (_, model_id) = handle.model();
+    let model = entry
+        .as_ref()
+        .map_or(model_id, |entry| entry.model.status_label());
+    let context_window = entry.as_ref().map(|entry| entry.model.context_window);
+    let mode = match handle.session().agent.plan_state().mode() {
+        crate::plan::PlanMode::Off => String::from("act"),
+        other => other.as_str().to_string(),
+    };
+    let totals = handle
+        .with_session(|session| {
+            let (_, usage) = crate::interactive::conversation_from_session(session);
+            let last_prompt = session
+                .to_messages_for_current_path()
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    crate::model::Message::Assistant(assistant) => Some(
+                        assistant.usage.input
+                            + assistant.usage.cache_read
+                            + assistant.usage.cache_write,
+                    ),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            (usage, last_prompt, session.get_name().unwrap_or_default())
+        })
+        .await;
+    let Ok((usage, last_prompt, session_name)) = totals else {
+        return;
+    };
+    let _ = agent_tx.send(PiMsg::StatusSnapshot(
+        crate::interactive::FtuiStatusSnapshot {
+            model,
+            thinking: handle.thinking_level().map(|level| level.to_string()),
+            mode,
+            cwd: home_relative(cwd),
+            vcs: crate::interactive::read_vcs_info(cwd),
+            context_pct: context_percent(last_prompt, context_window),
+            cost_usd: usage.cost.total,
+            tokens: usage.input + usage.output,
+            session_name,
+        },
+    ));
+}
+
+/// The powerline for the FTUI status row, fitted to `width` cells; segments
+/// drop by priority as the row narrows.
+fn render_powerline(snapshot: &crate::interactive::FtuiStatusSnapshot, width: usize) -> String {
+    let ctx = crate::status_line::StatusContext {
+        model: &snapshot.model,
+        thinking_level: snapshot.thinking.as_deref(),
+        mode: &snapshot.mode,
+        cwd: &snapshot.cwd,
+        git_branch: snapshot.vcs.as_deref(),
+        git_dirty: false,
+        context_pct: snapshot.context_pct,
+        cost_usd: snapshot.cost_usd,
+        tokens_used: snapshot.tokens,
+        subagent_count: 0,
+        session_name: &snapshot.session_name,
+        timestamp_str: "",
+    };
+    crate::status_line::PowerlineStatusLine::with_preset(
+        crate::status_line::StatusLinePreset::Default,
+    )
+    .render(&ctx, width)
+}
+
+/// `cwd` with the home directory shown as `~`.
+fn home_relative(cwd: &std::path::Path) -> String {
+    dirs::home_dir()
+        .and_then(|home| {
+            cwd.strip_prefix(&home)
+                .ok()
+                .map(std::path::Path::to_path_buf)
+        })
+        .map_or_else(
+            || cwd.display().to_string(),
+            |relative| {
+                if relative.as_os_str().is_empty() {
+                    String::from("~")
+                } else {
+                    format!("~{}{}", std::path::MAIN_SEPARATOR, relative.display())
+                }
+            },
+        )
+}
+
+/// `used` prompt tokens as a whole percentage of `window`, capped at 100.
+/// Unknown or zero windows read as 0.
+fn context_percent(used: u64, window: Option<u32>) -> u8 {
+    let Some(window) = window.filter(|window| *window > 0) else {
+        return 0;
+    };
+    u8::try_from((used.saturating_mul(100) / u64::from(window)).min(100)).unwrap_or(100)
+}
+
 /// The model ctrl+p (`forward`) or its reverse moves to from `current`
 /// (`provider/id`), over `models` in the classic stack's order: sorted,
 /// duplicates dropped, case-insensitive matching, wrapping at both ends. A
@@ -6176,6 +6316,7 @@ pub fn run(
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
                 send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
+                Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                 // Issue #208: extension-contributed slash commands become
                 // completable now that the extension runtime is up.
                 if let Some(manager) = handle.extension_manager() {
@@ -6195,7 +6336,11 @@ pub fn run(
                 // future sits near clippy's large_futures threshold).
                 let mut login: Option<Box<DriverLogin>> = None;
                 loop {
-                    match submit_rx.try_recv() {
+                    let received = submit_rx.try_recv();
+                    // Every handled command may change what the status line
+                    // shows (model, thinking, mode, session, usage).
+                    let refresh_status = received.is_ok();
+                    match received {
                         Ok(UiCommand::Prompt(prompt)) => {
                             run_prompt_turn(&mut handle, prompt, &agent_tx, &driver_turn_control)
                                 .await;
@@ -6393,6 +6538,9 @@ pub fn run(
                                 .await;
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                    if refresh_status {
+                        Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                     }
                 }
                 let shutdown = if replacement_failure.is_some() {
@@ -6980,6 +7128,100 @@ mod tests {
             "shift+tab should report through the driver, not locally: {:?}",
             sim.model().transcript
         );
+    }
+
+    /// gh #214 under OMP direction: the default stack's status row carries the
+    /// powerline, and its model segment is the display name, not provider/id.
+    #[test]
+    fn status_row_shows_the_powerline_with_the_model_display_name() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::StatusSnapshot(
+            crate::interactive::FtuiStatusSnapshot {
+                model: String::from("DeepSeek V4 Pro"),
+                thinking: Some(String::from("high")),
+                mode: String::from("act"),
+                cwd: String::from("~/proj"),
+                vcs: Some(String::from("main")),
+                context_pct: 42,
+                ..crate::interactive::FtuiStatusSnapshot::default()
+            },
+        )));
+        let rendered = buffer_text(sim.capture_frame(100, 8), 100, 8);
+        assert!(rendered.contains("DeepSeek V4 Pro"), "{rendered}");
+        assert!(!rendered.contains("deepseek/"), "{rendered}");
+        assert!(rendered.contains("ACT"), "{rendered}");
+        assert!(rendered.contains("ctx: 42%"), "{rendered}");
+    }
+
+    #[test]
+    fn context_percent_is_capped_and_zero_without_a_window() {
+        assert_eq!(context_percent(64_000, Some(128_000)), 50);
+        assert_eq!(context_percent(500_000, Some(128_000)), 100);
+        assert_eq!(context_percent(10, Some(0)), 0);
+        assert_eq!(context_percent(10, None), 0);
+    }
+
+    /// The driver builds the snapshot from the live session: the catalog
+    /// entry's display name, the last prompt's share of the context window,
+    /// and plan mode.
+    #[test]
+    fn status_snapshot_uses_the_catalog_name_and_last_prompt_context() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = crate::auth::AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        let registry = crate::models::ModelRegistry::load(&auth, None);
+        let entry = registry
+            .find("openai", "gpt-4o")
+            .expect("gpt-4o in catalog");
+        let provider = Arc::new(crate::providers::openai::OpenAIProvider::new("gpt-4o"));
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let mut stored = crate::session::Session::in_memory();
+        let window = u64::from(entry.model.context_window);
+        stored.append_message(crate::session::SessionMessage::Assistant {
+            message: crate::model::AssistantMessage {
+                content: Vec::new(),
+                api: String::from("openai-responses"),
+                provider: String::from("openai"),
+                model: String::from("gpt-4o"),
+                usage: crate::model::Usage {
+                    input: window / 4,
+                    cache_read: window / 4,
+                    ..crate::model::Usage::default()
+                },
+                stop_reason: crate::model::StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            },
+        });
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(stored)),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        );
+        handle.session_mut().set_model_registry(registry);
+        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+        runtime.block_on(send_status_snapshot(&handle, dir.path(), &agent_tx));
+        let Ok(PiMsg::StatusSnapshot(snapshot)) = agent_rx.try_recv() else {
+            panic!("no status snapshot sent");
+        };
+        assert_eq!(snapshot.model, entry.model.status_label());
+        assert_ne!(snapshot.model, "openai/gpt-4o");
+        assert_eq!(snapshot.context_pct, 50);
+        assert_eq!(snapshot.mode, "act");
     }
 
     /// Mid-turn input on the default stack: Enter steers the running turn,

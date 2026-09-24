@@ -394,6 +394,19 @@ impl Model {
         }
     }
 
+    /// The model as the status line shows it, following OMP's model segment:
+    /// the catalog/`models.json` name, else the id, with a leading "Claude "
+    /// dropped because the provider is already evident ("Opus 4.6").
+    pub fn status_label(&self) -> String {
+        let name = self.name.trim();
+        let label = if name.is_empty() {
+            self.id.as_str()
+        } else {
+            name
+        };
+        label.strip_prefix("Claude ").unwrap_or(label).to_string()
+    }
+
     /// Calculate cost for usage.
     #[allow(clippy::cast_precision_loss)] // Token counts within practical range won't lose precision
     pub fn calculate_cost(
@@ -734,6 +747,20 @@ mod tests {
         assert_eq!(model.display_label(), "anthropic/test-model");
         model.name = "anthropic/test-model".to_string();
         assert_eq!(model.display_label(), "anthropic/test-model");
+    }
+
+    /// gh #214 under the OMP rule: the name wins, the id is the fallback, and
+    /// only a leading "Claude " is trimmed.
+    #[test]
+    fn status_label_prefers_the_name_like_omp() {
+        let mut model = test_model();
+        assert_eq!(model.status_label(), "Test Model");
+        model.name = "Claude Opus 4.6".to_string();
+        assert_eq!(model.status_label(), "Opus 4.6");
+        model.name = "Not Claude Opus".to_string();
+        assert_eq!(model.status_label(), "Not Claude Opus");
+        model.name = "  ".to_string();
+        assert_eq!(model.status_label(), "test-model");
     }
 
     /// gh #221: usage pricing fills every cost component from catalog rates.

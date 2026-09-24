@@ -1979,6 +1979,24 @@ pub(crate) enum InputCardKind {
 }
 
 /// Custom message types for async agent events.
+/// What the FTUI powerline status line shows (OMP-style: display name, not
+/// the provider/id identity), captured by the driver after every command.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FtuiStatusSnapshot {
+    /// The model's display label: catalog/`models.json` name, else the id.
+    pub model: String,
+    pub thinking: Option<String>,
+    /// Plan mode (`act` when off).
+    pub mode: String,
+    pub cwd: String,
+    pub vcs: Option<String>,
+    /// Last prompt's context use as a percentage of the model's window.
+    pub context_pct: u8,
+    pub cost_usd: f64,
+    pub tokens: u64,
+    pub session_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum PiMsg {
     /// Agent started processing.
@@ -2007,6 +2025,10 @@ pub enum PiMsg {
         provider: Option<String>,
         accepts_empty_input: bool,
     },
+    /// FTUI status-line snapshot from the driver, which owns the session
+    /// state the line shows. The charmed stack renders its own and ignores
+    /// this.
+    StatusSnapshot(FtuiStatusSnapshot),
     /// Periodic autocomplete refresh tick (background file index).
     AutocompleteRefresh,
     /// Replacement completion catalog (issue #208). The ftui driver sends it
@@ -2243,7 +2265,7 @@ fn read_jj_change(cwd: &Path) -> Option<String> {
 /// the VCS the user is actually driving, and falls back to the git
 /// branch name in pure-git repos. Returns `None` when neither is
 /// detectable.
-fn read_vcs_info(cwd: &Path) -> Option<String> {
+pub(crate) fn read_vcs_info(cwd: &Path) -> Option<String> {
     read_jj_change(cwd).or_else(|| read_git_branch(cwd))
 }
 
