@@ -25,6 +25,112 @@ pub enum FailoverClass {
     Transient,
 }
 
+/// Recognize response status evidence, never a numeric substring in an id.
+/// A leading status belongs to the response even when the body quotes another
+/// HTTP code. The diagnostic parser handles the normal HTTP/status wrappers.
+fn recovery_http_status(lower: &str) -> Option<u16> {
+    let mut headline = lower.trim();
+    if let Some(rest) = headline.strip_prefix("provider error: ") {
+        headline = rest.split_once(": ").map_or(rest, |(_, message)| message);
+    }
+    if let Some(rest) = headline
+        .strip_prefix("api error:")
+        .or_else(|| headline.strip_prefix("error:"))
+    {
+        headline = rest.trim_start();
+    }
+    if let Some(status) = leading_http_status(headline) {
+        return Some(status);
+    }
+    if let Some(status) =
+        crate::error::ProviderErrorSummary::from_error_text(None, lower).http_status
+    {
+        return Some(status);
+    }
+    // Providers also use `Name API error (503): ...` and JSON status fields.
+    if let Some((_, rest)) = headline.split_once("api error (")
+        && let Some(status) = leading_http_status(rest)
+    {
+        return Some(status);
+    }
+    for key in ["\"status\"", "\"status_code\"", "\"statuscode\""] {
+        for (index, _) in lower.match_indices(key) {
+            let rest = lower[index + key.len()..].trim_start();
+            if let Some(value) = rest.strip_prefix(':') {
+                let value = value.trim_start();
+                let value = value.strip_prefix('"').unwrap_or(value);
+                if let Some(status) = leading_http_status(value) {
+                    return Some(status);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn leading_http_status(text: &str) -> Option<u16> {
+    let digits = text.get(..3)?;
+    if !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || text[3..].starts_with(|ch: char| ch.is_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    digits
+        .parse::<u16>()
+        .ok()
+        .filter(|status| (100..=599).contains(status))
+}
+
+/// Some providers report exhausted credits as a 400/402 instead of a 429.
+/// These specific capacity errors may change providers, but a generic mention
+/// of billing/quota in an invalid request must not override its response status.
+fn is_quota_exhaustion(lower: &str) -> bool {
+    [
+        "insufficient_quota",
+        "quota exceeded",
+        "quota_exceeded",
+        "quota has been exceeded",
+        "billing hard limit",
+        "billing_not_active",
+        "not enough credits",
+        "credit balance is too low",
+        "spending limit",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+}
+
+fn response_refuses_retry(lower: &str) -> bool {
+    recovery_http_status(lower)
+        .is_some_and(|status| (400..=499).contains(&status) && !matches!(status, 408 | 429))
+}
+
+/// Text-only recovery after the caller has ruled out authentication and
+/// durability failures. Keep the old prose matcher, but do not feed it numeric
+/// request ids, durations or token counts as if they were HTTP status codes.
+fn provider_text_is_retryable(
+    error_text: &str,
+    usage_input_tokens: Option<u64>,
+    context_window: Option<u32>,
+) -> bool {
+    if crate::error::is_context_overflow(error_text, usage_input_tokens, context_window) {
+        return false;
+    }
+    let lower = error_text.to_ascii_lowercase();
+    if let Some(status) = recovery_http_status(&lower)
+        && (400..=599).contains(&status)
+    {
+        return matches!(status, 408 | 429 | 500..=599);
+    }
+    let prose: String = lower
+        .chars()
+        .map(|ch| if ch.is_ascii_digit() { '#' } else { ch })
+        .collect();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || crate::error::is_retryable_error(&prose, usage_input_tokens, context_window)
+}
+
 /// Refusal shared by same-provider retry and failover. The input is lowercase.
 /// Authentication wins even when the provider also mentions a transient status.
 fn is_auth_failure(lower: &str) -> bool {
@@ -51,12 +157,11 @@ fn is_auth_failure(lower: &str) -> bool {
         return true;
     }
 
-    // Prefer an explicit response status to unrelated numbers inside the body.
-    // Reuse the existing parser rather than making recovery and diagnostics
-    // disagree about HTTP/status markers. Credential wording above still wins.
-    if let Some(status) =
-        crate::error::ProviderErrorSummary::from_error_text(None, lower).http_status
-    {
+    // The response status outranks unrelated numbers inside its body. Use the
+    // same evidence for authentication and capacity classification, including
+    // bare leading statuses and JSON wire spellings. Credential wording above
+    // still wins over an outer transient status.
+    if let Some(status) = recovery_http_status(lower) {
         return matches!(status, 401 | 403);
     }
 
@@ -72,7 +177,6 @@ fn is_auth_failure(lower: &str) -> bool {
 /// patterns so a "401 ... quota" message never fails over.
 pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     const QUOTA_PATTERNS: &[&str] = &[
-        "429",
         "rate limit",
         "rate_limit",
         "too many requests",
@@ -82,10 +186,6 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
         "spending limit",
     ];
     const OVERLOAD_PATTERNS: &[&str] = &[
-        "529",
-        "503",
-        "502",
-        "500",
         "overloaded",
         "service unavailable",
         "service_unavailable",
@@ -108,6 +208,20 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     if is_auth_failure(&text) {
         return None;
     }
+    if is_quota_exhaustion(&text) {
+        return Some(FailoverClass::Quota);
+    }
+    if let Some(status) = recovery_http_status(&text) {
+        match status {
+            408 | 504 => return Some(FailoverClass::Transient),
+            429 => return Some(FailoverClass::Quota),
+            500..=599 => return Some(FailoverClass::Overload),
+            // An invalid request cannot be repaired by another provider call,
+            // even when its body quotes a transient status or retry wording.
+            400..=499 => return None,
+            _ => {}
+        }
+    }
 
     if QUOTA_PATTERNS.iter().any(|p| text.contains(p)) {
         return Some(FailoverClass::Quota);
@@ -117,7 +231,7 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
         return Some(FailoverClass::Overload);
     }
 
-    if crate::error::is_retryable_error(&text, None, None) {
+    if provider_text_is_retryable(&text, None, None) {
         return Some(FailoverClass::Transient);
     }
     None
@@ -832,7 +946,7 @@ pub fn error_result_is_retryable(
     if marks_session_persistence(error_text) || is_auth_failure(&error_text.to_ascii_lowercase()) {
         return false;
     }
-    crate::error::is_retryable_error(error_text, Some(message.usage.input), context_window)
+    provider_text_is_retryable(error_text, Some(message.usage.input), context_window)
 }
 
 /// Only provider/transport failures can justify another provider call.
@@ -861,10 +975,15 @@ pub fn call_error_is_retryable(error: &crate::error::Error) -> bool {
         return false;
     }
     let error_text = error.to_string();
-    if marks_session_persistence(&error_text) || is_auth_failure(&error_text.to_ascii_lowercase()) {
+    let lower = error_text.to_ascii_lowercase();
+    if marks_session_persistence(&error_text)
+        || is_auth_failure(&lower)
+        || crate::error::is_context_overflow(&error_text, None, None)
+        || response_refuses_retry(&lower)
+    {
         return false;
     }
-    error.is_transient() || crate::error::is_retryable_error(&error_text, None, None)
+    error.is_transient() || provider_text_is_retryable(&error_text, None, None)
 }
 
 /// The outcome of one provider attempt, borrowed for classification.
@@ -1001,7 +1120,7 @@ pub fn decide(
     // is terminal, and whether its failure is retryable. The budget arithmetic
     // that follows is the same for both, and keeping it in one place is what
     // stops the two from drifting again.
-    let same_provider_is_worth_another_try = match outcome {
+    let (same_provider_is_worth_another_try, failure_can_fail_over) = match outcome {
         TurnOutcome::Completed(message) => {
             match message.stop_reason {
                 crate::model::StopReason::Aborted => {
@@ -1027,7 +1146,8 @@ pub fn decide(
             ) {
                 return TurnDecision::Finish { success: false };
             }
-            error_result_is_retryable(message, context_window)
+            let retryable = error_result_is_retryable(message, context_window);
+            (retryable, retryable || classify_failover(error_text).is_some())
         }
         TurnOutcome::Failed(error) => {
             if matches!(error, crate::error::Error::Aborted) {
@@ -1045,14 +1165,17 @@ pub fn decide(
             {
                 return TurnDecision::Finish { success: false };
             }
-            call_error_is_retryable(error)
+            let retryable = call_error_is_retryable(error);
+            (retryable, retryable || classify_failover(&error_text).is_some())
         }
     };
 
     if budget_left && same_provider_is_worth_another_try {
         return retry();
     }
-    if may_fail_over {
+    // An unclassified failure is not evidence that another provider can fix
+    // the request. Do not open a recovery lifecycle just because budget remains.
+    if may_fail_over && failure_can_fail_over {
         return TurnDecision::FailOver;
     }
     TurnDecision::Finish { success: false }
@@ -2478,6 +2601,243 @@ mod tests {
                 }
                 assert!(state.should_restore_primary(anchor + interval));
             }
+        }
+    }
+
+    #[test]
+    fn permanent_client_responses_block_both_recovery_paths() {
+        for status in [400, 404, 405, 410, 413, 415, 422] {
+            for prefix in [
+                format!("HTTP {status}"),
+                format!("status code = {status}"),
+                format!("{status}"),
+                format!("{{\"status\":{status}}}"),
+            ] {
+                let text = format!("{prefix}: invalid request; retry delay; request=req503429abc");
+                let message = errored_message(Some(&text), 0);
+                let error = crate::error::Error::api(text.clone());
+                assert_eq!(classify_failover(&text), None, "{text}");
+                assert!(!error_result_is_retryable(&message, None), "{text}");
+                assert!(!call_error_is_retryable(&error), "{text}");
+                for state in [progress(0, 0), progress(2, 0), progress(2, 1)] {
+                    for outcome in [
+                        TurnOutcome::Completed(&message),
+                        TurnOutcome::Failed(&error),
+                    ] {
+                        assert_eq!(
+                            decide(outcome, &state, &policy(), None),
+                            TurnDecision::Finish { success: false },
+                            "{text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_numbers_do_not_invent_retry_or_failover_evidence() {
+        for text in [
+            "invalid schema: request=req429abcdef",
+            "invalid response: request_id=503",
+            "bad payload: elapsed=5000ms; tokens=1504",
+            "unexpected reply: trace=req_529_z",
+            "5000 bytes in an invalid response",
+            "503abc is an unknown model",
+        ] {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            assert_eq!(classify_failover(text), None, "{text}");
+            assert!(!error_result_is_retryable(&message, None), "{text}");
+            assert!(!call_error_is_retryable(&error), "{text}");
+            for outcome in [
+                TurnOutcome::Completed(&message),
+                TurnOutcome::Failed(&error),
+            ] {
+                assert_eq!(
+                    decide(outcome, &progress(0, 0), &policy(), None),
+                    TurnDecision::Finish { success: false },
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn response_status_not_body_numbers_selects_the_capacity_class() {
+        for (text, expected) in [
+            ("HTTP 503: request_id=429", FailoverClass::Overload),
+            ("HTTP 500: attempt=429", FailoverClass::Overload),
+            ("HTTP 504: quota_counter=429", FailoverClass::Transient),
+            ("HTTP 429: request_id=503", FailoverClass::Quota),
+        ] {
+            assert_eq!(classify_failover(text), Some(expected), "{text}");
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            assert!(error_result_is_retryable(&message, None), "{text}");
+            assert!(call_error_is_retryable(&error), "{text}");
+        }
+    }
+
+    #[test]
+    fn terse_transient_statuses_retry_then_fail_over_within_budgets() {
+        for status in [408, 429, 500, 502, 503, 504, 507, 529, 599] {
+            for text in [
+                format!("HTTP {status}"),
+                format!("status code: {status}"),
+                format!("{status}"),
+                format!("Vendor API error ({status}): opaque"),
+                format!("{{\"status\":{status}}}"),
+                format!("{{\"statusCode\":\"{status}\"}}"),
+            ] {
+                let message = errored_message(Some(&text), 0);
+                let error = crate::error::Error::provider("test", text.clone());
+                assert!(classify_failover(&text).is_some(), "{text}");
+                assert!(error_result_is_retryable(&message, None), "{text}");
+                assert!(call_error_is_retryable(&error), "{text}");
+                for outcome in [
+                    TurnOutcome::Completed(&message),
+                    TurnOutcome::Failed(&error),
+                ] {
+                    assert_eq!(
+                        decide(outcome, &progress(0, 0), &policy(), None),
+                        TurnDecision::Retry {
+                            attempt: 1,
+                            delay_ms: 500,
+                        },
+                        "{text}"
+                    );
+                    assert_eq!(
+                        decide(outcome, &progress(2, 0), &policy(), None),
+                        TurnDecision::FailOver,
+                        "{text}"
+                    );
+                    assert_eq!(
+                        decide(outcome, &progress(2, 1), &policy(), None),
+                        TurnDecision::Finish { success: false },
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_credits_can_switch_providers_without_retrying_the_same_key() {
+        for text in [
+            "HTTP 400: credit balance is too low",
+            "HTTP 402: not enough credits",
+            "HTTP 400: insufficient_quota",
+            "HTTP 402: billing_not_active",
+        ] {
+            assert_eq!(classify_failover(text), Some(FailoverClass::Quota));
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            assert!(!error_result_is_retryable(&message, None), "{text}");
+            assert!(!call_error_is_retryable(&error), "{text}");
+            for outcome in [
+                TurnOutcome::Completed(&message),
+                TurnOutcome::Failed(&error),
+            ] {
+                assert_eq!(
+                    decide(outcome, &progress(0, 0), &policy(), None),
+                    TurnDecision::FailOver,
+                    "{text}"
+                );
+            }
+        }
+        assert_eq!(classify_failover("HTTP 401: insufficient_quota"), None);
+        assert_eq!(classify_failover("HTTP 400: invalid billing field"), None);
+    }
+
+    #[test]
+    fn a_leading_permanent_status_cannot_be_overridden_by_a_quoted_status() {
+        for text in [
+            "400 invalid request; body mentions HTTP 503",
+            "401 rejected; body mentions HTTP 503",
+            "403 rejected; body mentions HTTP 429",
+        ] {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::provider("test", text);
+            assert_eq!(classify_failover(text), None, "{text}");
+            assert!(!error_result_is_retryable(&message, None), "{text}");
+            assert!(!call_error_is_retryable(&error), "{text}");
+            assert_eq!(
+                decide(
+                    TurnOutcome::Failed(&error),
+                    &progress(0, 0),
+                    &policy(),
+                    None
+                ),
+                TurnDecision::Finish { success: false },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_provider_errors_do_not_open_a_failover_lifecycle() {
+        for text in ["invalid schema", "unrecognized response", ""] {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            for outcome in [
+                TurnOutcome::Completed(&message),
+                TurnOutcome::Failed(&error),
+            ] {
+                for state in [progress(0, 0), progress(2, 0)] {
+                    assert_eq!(
+                        decide(outcome, &state, &policy(), None),
+                        TurnDecision::Finish { success: false },
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_transport_causes_do_not_override_explicit_recovery_refusals() {
+        for text in [
+            "HTTP 400: invalid request; request_id=503",
+            "HTTP 403: retry delay",
+            "HTTP 503: prompt is too long",
+        ] {
+            let error = crate::error::Error::Io(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                text,
+            )));
+            assert!(error.is_transient());
+            assert!(!call_error_is_retryable(&error), "{text}");
+            assert_eq!(
+                decide(
+                    TurnOutcome::Failed(&error),
+                    &progress(0, 0),
+                    &policy(),
+                    None
+                ),
+                TurnDecision::Finish { success: false },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_timeouts_are_recoverable_without_an_http_status() {
+        for text in ["request timed out", "upstream timeout"] {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            assert_eq!(classify_failover(text), Some(FailoverClass::Transient));
+            assert!(error_result_is_retryable(&message, None));
+            assert!(call_error_is_retryable(&error));
+            assert!(matches!(
+                decide(
+                    TurnOutcome::Failed(&error),
+                    &progress(0, 0),
+                    &policy(),
+                    None
+                ),
+                TurnDecision::Retry { .. }
+            ));
         }
     }
 }
