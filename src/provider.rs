@@ -378,6 +378,22 @@ impl ModelCost {
 }
 
 impl Model {
+    /// Human-facing label for status messages: the `provider/id` identity,
+    /// followed by the catalog/`models.json` `name` when it says something the
+    /// id does not (`deepseek/deepseek-v4-pro (DeepSeek V4 Pro)`). The identity
+    /// stays first so anything matching on `provider/id` keeps working;
+    /// selection and lookup never read this (gh #214; upstream shows
+    /// `name || id` in its model-switch status).
+    pub fn display_label(&self) -> String {
+        let identity = format!("{}/{}", self.provider, self.id);
+        let name = self.name.trim();
+        if name.is_empty() || name == self.id || name == identity {
+            identity
+        } else {
+            format!("{identity} ({name})")
+        }
+    }
+
     /// Calculate cost for usage.
     #[allow(clippy::cast_precision_loss)] // Token counts within practical range won't lose precision
     pub fn calculate_cost(
@@ -704,6 +720,20 @@ mod tests {
             max_tokens: 8192,
             headers: HashMap::new(),
         }
+    }
+
+    /// gh #214: a distinct name leads the label and the identity follows; a
+    /// name that is empty or just repeats the id adds nothing.
+    #[test]
+    fn display_label_shows_a_distinct_name_and_keeps_the_identity() {
+        let mut model = test_model();
+        assert_eq!(model.display_label(), "anthropic/test-model (Test Model)");
+        model.name = "test-model".to_string();
+        assert_eq!(model.display_label(), "anthropic/test-model");
+        model.name = "  ".to_string();
+        assert_eq!(model.display_label(), "anthropic/test-model");
+        model.name = "anthropic/test-model".to_string();
+        assert_eq!(model.display_label(), "anthropic/test-model");
     }
 
     /// gh #221: usage pricing fills every cost component from catalog rates.

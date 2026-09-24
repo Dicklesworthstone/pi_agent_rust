@@ -696,6 +696,27 @@ fn cycle_model_backward_wraps_to_end() {
     );
 }
 
+/// gh #214: a models.json `name` shows up in the switch message after the
+/// identity, and the identity is what the app actually switched to.
+#[test]
+fn cycle_model_status_names_a_models_json_display_name() {
+    let harness = TestHarness::new("cycle_display_name");
+    let current = make_model_entry("anthropic", "claude-sonnet-4");
+    // A models.json custom entry on a provider this harness can construct.
+    let mut named = make_model_entry("openai", "deepseek-v4-pro");
+    named.model.name = "DeepSeek V4 Pro".to_string();
+    let available = vec![make_model_entry("anthropic", "claude-sonnet-4"), named];
+    let mut app = build_app_with_models(&harness, current, vec![], available);
+
+    app.cycle_model(1);
+
+    let status = get_status(&app).unwrap_or("");
+    assert_eq!(
+        status, "Switched model: openai/deepseek-v4-pro (DeepSeek V4 Pro)",
+        "the display name must follow the provider/id identity"
+    );
+}
+
 #[test]
 fn cycle_model_single_model_shows_status() {
     let harness = TestHarness::new("cycle_single");

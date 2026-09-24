@@ -429,13 +429,13 @@ impl PiApp {
             self.status_message = Some(message);
             return;
         }
+        let label = next.model.display_label();
         self.status_message = Some(if fell_back_to_available {
             format!(
-                "No scoped models matched; cycling all available models. Switched model: {}",
-                self.model
+                "No scoped models matched; cycling all available models. Switched model: {label}"
             )
         } else {
-            format!("Switched model: {}", self.model)
+            format!("Switched model: {label}")
         });
     }
 

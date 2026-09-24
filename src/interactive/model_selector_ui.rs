@@ -175,7 +175,7 @@ impl PiApp {
             self.status_message = Some(message);
             return;
         }
-        self.status_message = Some(format!("Switched model: {}", self.model));
+        self.status_message = Some(format!("Switched model: {}", next.model.display_label()));
     }
 
     /// Render the model selector overlay.

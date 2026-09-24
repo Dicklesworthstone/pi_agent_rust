@@ -3203,7 +3203,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.available_models.push(next.clone());
         }
 
-        self.status_message = Some(format!("Switched model: {}", self.model));
+        self.status_message = Some(format!("Switched model: {}", next.model.display_label()));
         None
     }
 

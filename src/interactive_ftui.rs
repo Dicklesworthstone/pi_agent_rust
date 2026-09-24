@@ -4664,7 +4664,15 @@ async fn run_set_model_command(
     agent_tx: &Sender<PiMsg>,
 ) {
     let msg = match handle.set_model(provider, model).await {
-        Ok(()) => PiMsg::System(format!("model set to {provider}/{model}")),
+        Ok(()) => {
+            // The registry resolves the canonical entry, whose name the
+            // label adds when it differs from the id (gh #214).
+            let label = handle.session().current_model_entry().map_or_else(
+                || format!("{provider}/{model}"),
+                |entry| entry.model.display_label(),
+            );
+            PiMsg::System(format!("model set to {label}"))
+        }
         Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
     };
     let _ = agent_tx.send(msg);
