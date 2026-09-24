@@ -1001,7 +1001,10 @@ impl PiApp {
             // it defensively. TerminalTitle: driver-pushed title updates are
             // an ftui affordance (issue #200) — the charmed stack re-emits
             // the terminal title from render_header every frame.
-            PiMsg::UiShutdown | PiMsg::TerminalTitle(_) | PiMsg::AutocompleteCatalog(_) => {}
+            PiMsg::UiShutdown
+            | PiMsg::TerminalTitle(_)
+            | PiMsg::AutocompleteCatalog(_)
+            | PiMsg::LoginPending { .. } => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();

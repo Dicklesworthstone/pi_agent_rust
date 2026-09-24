@@ -980,6 +980,17 @@ enum PickerKind {
     Session,
 }
 
+/// Text the user typed in answer to a `/login` prompt. It may be an API key
+/// or an OAuth code, so `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoginInput(pub String);
+
+impl std::fmt::Debug for LoginInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoginInput(<redacted>)")
+    }
+}
+
 /// Command from the UI to the agent driver.
 ///
 /// The seed of the bubbletea stack's input-routing chain: prompts run agent
@@ -1025,6 +1036,16 @@ pub enum UiCommand {
     /// the launch template with the current provider/model selection and a
     /// reset thinking level, swaps it in, and replays the (empty) history.
     NewSession,
+    /// `/login [provider]`: list providers, or start that provider's flow.
+    Login { args: String },
+    /// The user's answer to a pending `/login`: an authorization code,
+    /// callback URL, API key, or (device flow) a bare confirmation.
+    LoginSubmit(LoginInput),
+    /// `/logout [provider]`: remove stored credentials (default: active
+    /// provider).
+    Logout { args: String },
+    /// `/fork [list|index|id]`: branch a new session from a user message.
+    Fork { args: String },
     /// Show session info (`/session`): file, id, name, model, thinking
     /// level, and message count — a read-only snapshot of the live session.
     SessionInfo,
@@ -1197,6 +1218,10 @@ pub struct PiFtuiModel {
     /// Pinned error banner above the editor (bd-cv653.9.2): set by
     /// AgentError, dismissed on the next sent input.
     error_banner: Option<String>,
+    /// A `/login` waiting for the user's code or key: `(provider,
+    /// accepts_empty_input)`. The next submitted line goes to the driver as
+    /// login input and is never echoed into the transcript.
+    login_pending: Option<(String, bool)>,
     /// Sanitized in-flight thinking text (drives the `thinking…` status).
     thinking: String,
     /// Spinner animation state; advanced by `Event::Tick` while working.
@@ -1449,6 +1474,7 @@ impl PiFtuiModel {
             current_tool: None,
             todo_summary: None,
             error_banner: None,
+            login_pending: None,
             thinking: String::new(),
             spinner: SpinnerState::default(),
             usage_line: None,
@@ -2164,6 +2190,24 @@ impl PiFtuiModel {
                 let _ = out.write_all(sequence.as_bytes());
                 let _ = out.flush();
             }
+            PiMsg::LoginPending {
+                provider,
+                accepts_empty_input,
+            } => {
+                self.login_pending = provider.map(|provider| (provider, accepts_empty_input));
+            }
+            // `/fork` hands the selected message back for rewording; a stale
+            // reply for a session no longer shown is dropped.
+            PiMsg::SetEditorText {
+                owner_session_id,
+                text,
+            } if self
+                .displayed_session_id
+                .as_deref()
+                .is_none_or(|shown| shown == owner_session_id) =>
+            {
+                self.input.set_text(&text);
+            }
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
             _ => {}
@@ -2250,6 +2294,30 @@ impl PiFtuiModel {
     fn submit_input(&mut self) {
         let text = self.input.text();
         let trimmed = text.trim();
+        if let Some((provider, accepts_empty_input)) = self.login_pending.clone() {
+            if trimmed.starts_with('/') {
+                // A slash command abandons the login prompt and runs as usual.
+                self.login_pending = None;
+                self.push_entry(EntryRole::System, format!("{provider} login cancelled."));
+            } else {
+                if trimmed.is_empty() && !accepts_empty_input {
+                    return;
+                }
+                // Never echoed: the line may be an API key or an OAuth code.
+                let secret = trimmed.to_string();
+                self.input.set_text("");
+                self.autocomplete.close();
+                self.error_banner = None;
+                self.scroll_from_tail = 0;
+                self.push_entry(
+                    EntryRole::System,
+                    format!("(login input for {provider} submitted)"),
+                );
+                self.begin_busy(format!("completing {provider} login ..."));
+                self.send_command(UiCommand::LoginSubmit(LoginInput(secret)));
+                return;
+            }
+        }
         if trimmed.is_empty() {
             return;
         }
@@ -2536,7 +2604,8 @@ impl PiFtuiModel {
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
                      /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
-                     /thinking [level], /theme, /changelog, /clear, /hotkeys, /help, \
+                     /thinking [level], /theme, /changelog, /clear, /hotkeys, \
+                     /login [provider], /logout [provider], /fork [n|id|list], /help, \
                      /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
                 ),
@@ -2579,6 +2648,29 @@ impl PiFtuiModel {
                 // arrives as a system entry at the next turn boundary.
                 self.push_entry(EntryRole::System, format!("(/tan started) {work}"));
                 self.send_command(UiCommand::Tan(work.to_string()));
+                return true;
+            }
+            "/login" => {
+                self.begin_busy("starting login ...");
+                self.send_command(UiCommand::Login {
+                    args: cmd_args.trim().to_string(),
+                });
+                return true;
+            }
+            "/logout" => {
+                self.send_command(UiCommand::Logout {
+                    args: cmd_args.trim().to_string(),
+                });
+                return true;
+            }
+            "/fork" => {
+                let args = cmd_args.trim();
+                if !(args.eq_ignore_ascii_case("list") || args.eq_ignore_ascii_case("ls")) {
+                    self.begin_busy("forking session ...");
+                }
+                self.send_command(UiCommand::Fork {
+                    args: args.to_string(),
+                });
                 return true;
             }
             "/share" => {
@@ -4672,6 +4764,130 @@ async fn run_mcp_command(
     let _ = agent_tx.send(PiMsg::System(message));
 }
 
+/// A `/login` waiting for the user's input, with the localhost callback
+/// server that can complete it on its own.
+type DriverLogin = (
+    crate::interactive::login_flow::PendingLogin,
+    Option<crate::auth::OAuthCallbackServer>,
+);
+
+fn send_login_pending(agent_tx: &Sender<PiMsg>, pending: Option<&DriverLogin>) {
+    let _ = agent_tx.send(PiMsg::LoginPending {
+        provider: pending.map(|(login, _)| login.provider().to_string()),
+        accepts_empty_input: pending.is_some_and(|(login, _)| login.accepts_empty_input()),
+    });
+}
+
+/// `/login [provider]` in the driver: the shared flow the classic stack
+/// runs (login_flow), with this stack's transcript as its display.
+async fn run_login_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    args: &str,
+    login: &mut Option<Box<DriverLogin>>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    use crate::interactive::login_flow::{LoginStart, start_login};
+
+    let auth_path = crate::config::Config::auth_path();
+    let models = handle
+        .session()
+        .model_registry()
+        .map(|registry| registry.models().to_vec())
+        .unwrap_or_default();
+    match start_login(args, &auth_path, &models, handle.extension_manager()).await {
+        Ok(LoginStart::Listing(listing)) => {
+            let _ = agent_tx.send(PiMsg::System(listing));
+        }
+        Ok(LoginStart::Pending {
+            pending,
+            message,
+            callback,
+        }) => {
+            let pending = Box::new((pending, callback));
+            let _ = agent_tx.send(PiMsg::System(message));
+            send_login_pending(agent_tx, Some(&pending));
+            *login = Some(pending);
+        }
+        Err(message) => {
+            *login = None;
+            let _ = agent_tx.send(PiMsg::AgentError(message));
+            send_login_pending(agent_tx, None);
+        }
+    }
+}
+
+/// Complete the pending `/login` with the user's input (or the callback
+/// URL), save the credential, and switch the live session onto it.
+async fn run_login_submit(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    input: &str,
+    login: &mut Option<Box<DriverLogin>>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    use crate::interactive::login_flow::{LoginFailure, complete_login};
+
+    let Some(pending) = login.take() else {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "No login in progress; run /login <provider>",
+        )));
+        send_login_pending(agent_tx, None);
+        return;
+    };
+    let (pending, callback) = *pending;
+    let auth_path = crate::config::Config::auth_path();
+    match complete_login(pending, input, &auth_path).await {
+        Ok((_provider, status)) => {
+            adopt_stored_credentials(handle, &auth_path);
+            let _ = agent_tx.send(PiMsg::System(status));
+            send_login_pending(agent_tx, None);
+        }
+        Err(LoginFailure::StillPending(pending, message)) => {
+            // Device flow not approved yet: the same prompt stays armed.
+            *login = Some(Box::new((pending, callback)));
+            let _ = agent_tx.send(PiMsg::System(message));
+        }
+        Err(LoginFailure::Failed(message)) => {
+            let _ = agent_tx.send(PiMsg::AgentError(message));
+            send_login_pending(agent_tx, None);
+        }
+    }
+}
+
+/// `/logout [provider]` in the driver.
+fn run_logout_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    args: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let (active_provider, _) = handle.model();
+    let auth_path = crate::config::Config::auth_path();
+    match crate::interactive::login_flow::logout(args, &active_provider, &auth_path) {
+        Ok((_provider, status)) => {
+            adopt_stored_credentials(handle, &auth_path);
+            let _ = agent_tx.send(PiMsg::System(status));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("logout: {err}")));
+        }
+    }
+}
+
+/// Re-read `auth.json` into the live session so the running model uses the
+/// credential `/login` or `/logout` just changed.
+fn adopt_stored_credentials(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    auth_path: &std::path::Path,
+) {
+    match crate::auth::AuthStorage::load(auth_path.to_path_buf()) {
+        Ok(auth) => handle.session_mut().adopt_auth_storage(auth),
+        Err(err) => tracing::warn!(
+            event = "ftui.login.adopt_credentials_failed",
+            error = %err,
+            "credentials were saved but could not be reloaded into the live session"
+        ),
+    }
+}
+
 /// Handle a model switch in the driver, reporting the outcome to the UI.
 async fn run_set_model_command(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -5135,6 +5351,165 @@ async fn run_usage_command(refresh: bool, agent_tx: &Sender<PiMsg>) {
     let _ = agent_tx.send(PiMsg::System(message));
 }
 
+/// Build the forked session `/fork` switches to: the source's path up to (not
+/// including) the selected user message, in the same session directory,
+/// recording where it branched from. Returns it with the selected message's
+/// text, which goes back into the editor. Same construction as the classic
+/// stack's `/fork`.
+fn build_fork_session(
+    source: &crate::session::Session,
+    entry_id: &str,
+    provider: String,
+    model_id: String,
+) -> crate::error::Result<(crate::session::Session, String)> {
+    let plan = source.plan_fork_from_user_message(entry_id)?;
+    let selected_text = plan.selected_text.clone();
+    let mut forked = crate::session::Session::create_with_dir(source.session_dir.clone());
+    forked.header.provider = Some(provider);
+    forked.header.model_id = Some(model_id);
+    forked
+        .header
+        .thinking_level
+        .clone_from(&source.header.thinking_level);
+    if let Some(parent) = source.path.as_ref() {
+        forked.set_branched_from(Some(parent.display().to_string()));
+    }
+    forked.init_from_fork_plan(plan);
+    Ok((forked, selected_text))
+}
+
+/// Handle `/fork [list|index|id]` in the driver: pick a user message, let
+/// extensions veto (`session_before_fork`), save the forked session, and
+/// switch to it through the `/resume` path. The selected message returns to
+/// the editor for rewording, as upstream does.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn fork_session_command(
+    args: &str,
+    template: &crate::sdk::SessionOptions,
+    handle: &mut crate::sdk::AgentSessionHandle,
+    current_ask: &CurrentAsk,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> std::result::Result<(), String> {
+    use crate::extensions::{EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName};
+
+    let args = args.trim();
+    let snapshot = handle
+        .with_session(|session| {
+            // Ids are backfilled on a copy so the candidates and the fork
+            // plan below agree on them.
+            let mut source = session.clone();
+            source.ensure_entry_ids();
+            let candidates = crate::interactive::fork_candidates(&source);
+            (source, candidates)
+        })
+        .await;
+    let (source, candidates) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("fork: {err}")));
+            return Ok(());
+        }
+    };
+    if args.eq_ignore_ascii_case("list") || args.eq_ignore_ascii_case("ls") {
+        let text = if candidates.is_empty() {
+            String::from("No user messages to fork from")
+        } else {
+            crate::interactive::format_fork_candidates(&candidates)
+        };
+        let _ = agent_tx.send(PiMsg::System(text));
+        return Ok(());
+    }
+    let selection = match crate::interactive::select_fork_candidate(&candidates, args) {
+        Ok(selection) => selection,
+        Err(message) => {
+            let _ = agent_tx.send(PiMsg::AgentError(message));
+            return Ok(());
+        }
+    };
+    let session_id = source.header.id.clone();
+    if let Some(manager) = handle.extension_manager() {
+        let cancelled = manager
+            .dispatch_cancellable_event(
+                ExtensionEventName::SessionBeforeFork,
+                Some(serde_json::json!({
+                    "entryId": selection.id,
+                    "summary": selection.summary,
+                    "sessionId": session_id,
+                })),
+                EXTENSION_EVENT_TIMEOUT_MS,
+            )
+            .await
+            .unwrap_or(false);
+        if cancelled {
+            let _ = agent_tx.send(PiMsg::System(String::from("Fork cancelled by extension")));
+            return Ok(());
+        }
+    }
+
+    let (provider, model_id) = handle.model();
+    let (mut forked, selected_text) =
+        match build_fork_session(&source, &selection.id, provider, model_id) {
+            Ok(built) => built,
+            Err(err) => {
+                let _ = agent_tx.send(PiMsg::AgentError(format!("Failed to build fork: {err}")));
+                return Ok(());
+            }
+        };
+    let new_session_id = forked.header.id.clone();
+    if let Err(err) = forked.save().await {
+        let _ = agent_tx.send(PiMsg::AgentError(format!("Failed to save fork: {err}")));
+        return Ok(());
+    }
+    let Some(path) = forked.path.clone() else {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "Failed to save fork: the session has no file",
+        )));
+        return Ok(());
+    };
+    Box::pin(resume_session_command(
+        &path.to_string_lossy(),
+        template,
+        handle,
+        current_ask,
+        ext_handler,
+        agent_tx,
+        runtime_handle,
+    ))
+    .await?;
+    // The resume path reports its own failures and keeps the old session;
+    // only a completed switch gets the editor text and the fork event.
+    let switched = handle
+        .with_session(|session| session.header.id == new_session_id)
+        .await
+        .unwrap_or(false);
+    if switched {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Forked new session from {}",
+            selection.summary
+        )));
+        let _ = agent_tx.send(PiMsg::SetEditorText {
+            owner_session_id: new_session_id.clone(),
+            text: selected_text,
+        });
+        if let Some(manager) = handle.extension_manager() {
+            let _ = manager
+                .dispatch_event(
+                    ExtensionEventName::SessionFork,
+                    Some(serde_json::json!({
+                        "entryId": selection.id,
+                        "summary": selection.summary,
+                        "sessionId": session_id,
+                        "newSessionId": new_session_id,
+                    })),
+                )
+                .await;
+        }
+    }
+    Ok(())
+}
+
 /// Handle `/resume` in the driver: open the chosen session file with the
 /// launch selection preserved, await the previous handle's shutdown before
 /// starting the replacement's MCP servers, rewire the ask bridge, and replay
@@ -5458,6 +5833,9 @@ pub fn run(
                 }
                 let mut plans = plan_commands::PlanController::default();
                 let mut replacement_failure = None;
+                // The `/login` waiting for input, if any (boxed: the driver
+                // future sits near clippy's large_futures threshold).
+                let mut login: Option<Box<DriverLogin>> = None;
                 loop {
                     match submit_rx.try_recv() {
                         Ok(UiCommand::Prompt(prompt)) => {
@@ -5581,7 +5959,53 @@ pub fn run(
                         Ok(UiCommand::SetName(name)) => {
                             run_set_name_command(&mut handle, &name, &agent_tx).await;
                         }
+                        Ok(UiCommand::Login { args }) => {
+                            Box::pin(run_login_command(&handle, &args, &mut login, &agent_tx))
+                                .await;
+                        }
+                        Ok(UiCommand::LoginSubmit(LoginInput(input))) => {
+                            Box::pin(run_login_submit(&mut handle, &input, &mut login, &agent_tx))
+                                .await;
+                        }
+                        Ok(UiCommand::Logout { args }) => {
+                            run_logout_command(&mut handle, &args, &agent_tx);
+                        }
+                        Ok(UiCommand::Fork { args }) => {
+                            // Boxed: clippy::large_futures.
+                            if let Err(err) = Box::pin(fork_session_command(
+                                &args,
+                                &resume_template,
+                                &mut handle,
+                                &current_ask,
+                                &ext_handler,
+                                &agent_tx,
+                                &runtime_handle,
+                            ))
+                            .await
+                            {
+                                replacement_failure = Some(err);
+                                break;
+                            }
+                        }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // A browser redirect caught by the login's
+                            // localhost callback server completes it without
+                            // the user pasting anything.
+                            let redirect = login
+                                .as_ref()
+                                .and_then(|pending| pending.1.as_ref())
+                                .and_then(|server| server.rx.try_recv().ok());
+                            if let Some(path) = redirect {
+                                let url = format!("http://localhost{path}");
+                                Box::pin(run_login_submit(
+                                    &mut handle,
+                                    &url,
+                                    &mut login,
+                                    &agent_tx,
+                                ))
+                                .await;
+                                continue;
+                            }
                             asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
                                 .await;
                         }
@@ -8577,6 +9001,181 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("Sharing session")),
             "share note missing"
+        );
+    }
+
+    /// `/login` and `/logout` existed only on the classic stack; on the default
+    /// stack they fell through to extension dispatch as unknown commands, so
+    /// an OAuth provider could not be logged into at all.
+    #[test]
+    fn slash_login_and_logout_route_to_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/login anthropic");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("login routed"),
+            UiCommand::Login {
+                args: String::from("anthropic")
+            }
+        );
+        type_str(&mut sim, "/logout");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("logout routed"),
+            UiCommand::Logout {
+                args: String::new()
+            }
+        );
+    }
+
+    /// `/fork` existed only on the classic stack. It routes to the driver, and
+    /// the selected message the driver hands back lands in the editor only
+    /// for the session on screen.
+    #[test]
+    fn slash_fork_routes_and_the_selected_text_returns_to_the_editor() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/fork 2");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("fork routed"),
+            UiCommand::Fork {
+                args: String::from("2")
+            }
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: String::from("forked"),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+            owner_session_id: String::from("some-other-session"),
+            text: String::from("stale"),
+        }));
+        assert_eq!(sim.model().input.text(), "", "a stale hand-back is dropped");
+        sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+            owner_session_id: String::from("forked"),
+            text: String::from("reword me"),
+        }));
+        assert_eq!(sim.model().input.text(), "reword me");
+    }
+
+    /// The fork keeps everything before the selected user message, drops that
+    /// message and what followed, and returns its text for the editor.
+    #[test]
+    fn build_fork_session_branches_before_the_selected_message() {
+        use crate::model::UserContent;
+        use crate::session::{Session, SessionMessage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut source = Session::create_with_dir(Some(dir.path().to_path_buf()));
+        source.header.thinking_level = Some(String::from("high"));
+        for text in ["first question", "second question"] {
+            source.append_message(SessionMessage::User {
+                content: UserContent::Text(text.to_string()),
+                timestamp: Some(0),
+            });
+        }
+        source.ensure_entry_ids();
+        let candidates = crate::interactive::fork_candidates(&source);
+        assert_eq!(candidates.len(), 2);
+        let second = crate::interactive::select_fork_candidate(&candidates, "2").expect("select");
+
+        let (forked, selected_text) = build_fork_session(
+            &source,
+            &second.id,
+            String::from("anthropic"),
+            String::from("claude-test"),
+        )
+        .expect("build fork");
+        assert_eq!(selected_text, "second question");
+        let texts = forked
+            .to_messages_for_current_path()
+            .iter()
+            .filter_map(|message| match message {
+                crate::model::Message::User(user) => match &user.content {
+                    UserContent::Text(text) => Some(text.clone()),
+                    UserContent::Blocks(_) => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec![String::from("first question")]);
+        assert_ne!(forked.header.id, source.header.id);
+        assert_eq!(forked.header.provider.as_deref(), Some("anthropic"));
+        assert_eq!(forked.header.model_id.as_deref(), Some("claude-test"));
+        assert_eq!(forked.header.thinking_level.as_deref(), Some("high"));
+        assert_eq!(forked.session_dir.as_deref(), Some(dir.path()));
+    }
+
+    /// While a login waits for input, the next line is the secret: it goes to
+    /// the driver and never into the transcript. A slash command abandons the
+    /// prompt and runs normally.
+    #[test]
+    fn pending_login_input_reaches_the_driver_without_being_echoed() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+            provider: Some(String::from("openai")),
+            accepts_empty_input: false,
+        }));
+
+        // A bare Enter is not an API key; nothing is sent.
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "an empty line must not submit"
+        );
+
+        type_str(&mut sim, "sk-very-secret");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("login input routed"),
+            UiCommand::LoginSubmit(LoginInput(String::from("sk-very-secret")))
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .all(|entry| !entry.text.contains("sk-very-secret")),
+            "the key must never be echoed"
+        );
+        assert!(
+            format!(
+                "{:?}",
+                UiCommand::LoginSubmit(LoginInput(String::from("sk-very-secret")))
+            )
+            .contains("<redacted>"),
+            "Debug must not print the key"
+        );
+
+        // The driver keeps the prompt armed until it says otherwise; a slash
+        // command abandons it and routes as a command.
+        type_str(&mut sim, "/session");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("slash command routed"),
+            UiCommand::SessionInfo
+        );
+        assert!(sim.model().login_pending.is_none());
+        type_str(&mut sim, "hello");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("prompt routed"),
+            UiCommand::Prompt(String::from("hello")),
+            "after cancelling, input is an ordinary prompt again"
         );
     }
 

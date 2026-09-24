@@ -233,13 +233,55 @@ pub(super) fn resolve_tree_selector_initial_id(session: &Session, args: &str) ->
     None
 }
 
+/// A user message `/fork` can branch from. Shared with the FTUI stack.
 #[derive(Debug, Clone)]
-struct ForkCandidate {
-    id: String,
-    summary: String,
+pub struct ForkCandidate {
+    pub id: String,
+    pub summary: String,
 }
 
-fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
+/// `/fork list`: the numbered candidates, as both stacks print them.
+pub fn format_fork_candidates(candidates: &[ForkCandidate]) -> String {
+    let list = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("  {}. {} - {}", i + 1, c.id, c.summary))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Forkable user messages (use /fork <id|index>):\n{list}")
+}
+
+/// Resolve `/fork [args]` against the candidates: empty picks the latest user
+/// message, a number is a 1-based index, anything else is an id or unique id
+/// prefix. The error is the message to show.
+pub fn select_fork_candidate(
+    candidates: &[ForkCandidate],
+    args: &str,
+) -> Result<ForkCandidate, String> {
+    let Some(last) = candidates.last() else {
+        return Err("No user messages to fork from".to_string());
+    };
+    if args.is_empty() {
+        return Ok(last.clone());
+    }
+    if let Ok(index) = args.parse::<usize>() {
+        if index == 0 || index > candidates.len() {
+            return Err(format!("Invalid index: {index} (1-{})", candidates.len()));
+        }
+        return Ok(candidates[index - 1].clone());
+    }
+    let matches = candidates
+        .iter()
+        .filter(|c| c.id == args || c.id.starts_with(args))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(format!("No user message id matches \"{args}\"")),
+        [only] => Ok((*only).clone()),
+        many => Err(format!("Ambiguous id \"{args}\" (matches {})", many.len())),
+    }
+}
+
+pub fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
     let mut out = Vec::new();
 
     for entry in session.entries_for_current_path() {
@@ -297,15 +339,9 @@ impl PiApp {
         }
 
         if args.eq_ignore_ascii_case("list") || args.eq_ignore_ascii_case("ls") {
-            let list = candidates
-                .iter()
-                .enumerate()
-                .map(|(i, c)| format!("  {}. {} - {}", i + 1, c.id, c.summary))
-                .collect::<Vec<_>>()
-                .join("\n");
             self.messages.push(ConversationMessage {
                 role: MessageRole::System,
-                content: format!("Forkable user messages (use /fork <id|index>):\n{list}"),
+                content: format_fork_candidates(&candidates),
                 thinking: None,
                 collapsed: false,
             });
@@ -313,33 +349,12 @@ impl PiApp {
             return None;
         }
 
-        let selection = if args.is_empty() {
-            candidates.last().expect("candidates is non-empty").clone()
-        } else if let Ok(index) = args.parse::<usize>() {
-            if index == 0 || index > candidates.len() {
-                self.status_message =
-                    Some(format!("Invalid index: {index} (1-{})", candidates.len()));
+        let selection = match select_fork_candidate(&candidates, args) {
+            Ok(selection) => selection,
+            Err(message) => {
+                self.status_message = Some(message);
                 return None;
             }
-            candidates[index - 1].clone()
-        } else {
-            let matches = candidates
-                .iter()
-                .filter(|c| c.id == args || c.id.starts_with(args))
-                .cloned()
-                .collect::<Vec<_>>();
-            if matches.is_empty() {
-                self.status_message = Some(format!("No user message id matches \"{args}\""));
-                return None;
-            }
-            if matches.len() > 1 {
-                self.status_message = Some(format!(
-                    "Ambiguous id \"{args}\" (matches {})",
-                    matches.len()
-                ));
-                return None;
-            }
-            matches[0].clone()
         };
 
         let event_tx = self.event_tx.clone();
@@ -986,4 +1001,58 @@ fn view_tree_custom_prompt(state: &TreeCustomPromptState, styles: &TuiStyles) ->
     };
     let _ = writeln!(out, "  {}", styles.accent.render(&shown));
     out
+}
+
+#[cfg(test)]
+mod fork_selection_tests {
+    use super::{ForkCandidate, select_fork_candidate};
+
+    fn candidates() -> Vec<ForkCandidate> {
+        ["abc123", "abd456", "zzz789"]
+            .into_iter()
+            .map(|id| ForkCandidate {
+                id: id.to_string(),
+                summary: format!("message {id}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_args_pick_the_latest_and_indices_are_one_based() {
+        let candidates = candidates();
+        assert_eq!(select_fork_candidate(&candidates, "").unwrap().id, "zzz789");
+        assert_eq!(
+            select_fork_candidate(&candidates, "1").unwrap().id,
+            "abc123"
+        );
+        assert_eq!(
+            select_fork_candidate(&candidates, "0").unwrap_err(),
+            "Invalid index: 0 (1-3)"
+        );
+        assert_eq!(
+            select_fork_candidate(&candidates, "4").unwrap_err(),
+            "Invalid index: 4 (1-3)"
+        );
+    }
+
+    #[test]
+    fn id_prefixes_must_be_unique() {
+        let candidates = candidates();
+        assert_eq!(
+            select_fork_candidate(&candidates, "abd").unwrap().id,
+            "abd456"
+        );
+        assert_eq!(
+            select_fork_candidate(&candidates, "ab").unwrap_err(),
+            "Ambiguous id \"ab\" (matches 2)"
+        );
+        assert_eq!(
+            select_fork_candidate(&candidates, "nope").unwrap_err(),
+            "No user message id matches \"nope\""
+        );
+        assert_eq!(
+            select_fork_candidate(&[], "").unwrap_err(),
+            "No user messages to fork from"
+        );
+    }
 }

@@ -12393,6 +12393,31 @@ impl AgentSession {
         self.auth_storage = Some(auth);
     }
 
+    /// Adopt credentials changed outside this session (`/login`, `/logout`)
+    /// and re-resolve the running model's key with the usual precedence:
+    /// CLI override, then stored credential, then the catalog entry's key.
+    pub(crate) fn adopt_auth_storage(&mut self, auth: AuthStorage) {
+        self.auth_storage = Some(auth);
+        let entry = self.current_model_entry();
+        let key = entry.as_ref().map_or_else(
+            || {
+                let provider = self.agent.provider();
+                normalize_api_key_opt(self.api_key_override.clone()).or_else(|| {
+                    self.auth_storage.as_ref().and_then(|auth| {
+                        normalize_api_key_opt(auth.resolve_api_key(provider.name(), None))
+                    })
+                })
+            },
+            |entry| self.resolve_stream_api_key_for_model(entry),
+        );
+        self.agent.stream_options_mut().api_key = key;
+        self.refresh_extension_completion_host_state();
+    }
+
+    pub(crate) const fn model_registry(&self) -> Option<&ModelRegistry> {
+        self.model_registry.as_ref()
+    }
+
     #[must_use]
     pub fn with_api_key_override(mut self, api_key: Option<String>) -> Self {
         self.set_api_key_override(api_key);

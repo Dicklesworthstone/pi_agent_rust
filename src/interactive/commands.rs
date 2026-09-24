@@ -523,7 +523,7 @@ fn provider_has_dedicated_login_flow(provider: &str) -> bool {
 /// flows now succeed out of the box (#97). We still prefer the device flow when
 /// no client id is explicitly configured, since that path is the most robust on
 /// headless/SSH sessions where a localhost OAuth redirect can't be reached.
-fn should_use_copilot_device_flow() -> bool {
+pub(super) fn should_use_copilot_device_flow() -> bool {
     if std::env::var("PI_COPILOT_FORCE_DEVICE_FLOW")
         .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
     {
@@ -725,7 +725,7 @@ fn collect_extension_oauth_providers(
     providers
 }
 
-fn extension_oauth_config_for_provider(
+pub(super) fn extension_oauth_config_for_provider(
     available_models: &[ModelEntry],
     registered_extension_bindings: &[ExtensionProviderBinding],
     provider: &str,
@@ -756,7 +756,7 @@ fn extension_oauth_config_for_provider(
         })
 }
 
-fn registered_extension_provider_bindings(
+pub(super) fn registered_extension_provider_bindings(
     extensions: Option<&ExtensionManager>,
 ) -> crate::error::Result<Vec<ExtensionProviderBinding>> {
     extensions.map_or_else(
@@ -1656,159 +1656,18 @@ impl PiApp {
         self.scroll_to_bottom();
 
         let event_tx = self.event_tx.clone();
-        let PendingOAuth {
-            provider,
-            kind,
-            verifier,
-            oauth_config,
-            device_code,
-            redirect_uri,
-        } = pending;
         let code_input = code_input.to_string();
 
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
             let auth_path = crate::config::Config::auth_path();
-            let mut auth = match crate::auth::AuthStorage::load_async(auth_path).await {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::AgentError(e.to_string()),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            let credential = match kind {
-                PendingLoginKind::ApiKey => normalize_api_key_input(&code_input)
-                    .map(|key| crate::auth::AuthCredential::ApiKey { key })
-                    .map_err(crate::error::Error::auth),
-                PendingLoginKind::OAuth => {
-                    if provider == "anthropic" {
-                        Box::pin(crate::auth::complete_anthropic_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "openai-codex" {
-                        Box::pin(crate::auth::complete_openai_codex_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "google-gemini-cli" {
-                        Box::pin(crate::auth::complete_google_gemini_cli_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "google-antigravity" {
-                        Box::pin(crate::auth::complete_google_antigravity_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "github-copilot" || provider == "copilot" {
-                        let client_id =
-                            crate::auth::resolved_copilot_client_id();
-                        let copilot_config = crate::auth::CopilotOAuthConfig {
-                            client_id,
-                            ..crate::auth::CopilotOAuthConfig::default()
-                        };
-                        Box::pin(crate::auth::complete_copilot_browser_oauth(
-                            &copilot_config,
-                            &code_input,
-                            &verifier,
-                            redirect_uri.as_deref(),
-                        ))
-                        .await
-                    } else if provider == "gitlab" || provider == "gitlab-duo" {
-                        let client_id = std::env::var("GITLAB_CLIENT_ID").unwrap_or_default();
-                        let base_url = std::env::var("GITLAB_BASE_URL")
-                            .unwrap_or_else(|_| "https://gitlab.com".to_string());
-                        let gitlab_config = crate::auth::GitLabOAuthConfig {
-                            client_id,
-                            base_url,
-                            ..crate::auth::GitLabOAuthConfig::default()
-                        };
-                        let gitlab_redirect_uri = redirect_uri
-                            .clone()
-                            .or_else(|| oauth_config.as_ref().and_then(|c| c.redirect_uri.clone()));
-                        Box::pin(crate::auth::complete_gitlab_oauth(
-                            &gitlab_config,
-                            &code_input,
-                            &verifier,
-                            gitlab_redirect_uri.as_deref(),
-                        ))
-                        .await
-                    } else if let Some(config) = &oauth_config {
-                        Box::pin(crate::auth::complete_extension_oauth(
-                            config,
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else {
-                        Err(crate::error::Error::auth(format!(
-                            "OAuth provider not supported: {provider}"
-                        )))
-                    }
-                }
-                PendingLoginKind::DeviceFlow => match device_code {
-                    Some(dc) => {
-                        let poll_result = if provider == "kimi-for-coding" {
-                            Box::pin(crate::auth::poll_kimi_code_device_flow(&dc)).await
-                        } else if provider == "github-copilot" || provider == "copilot" {
-                            let client_id =
-                                crate::auth::resolved_copilot_client_id();
-                            let copilot_config = crate::auth::CopilotOAuthConfig {
-                                client_id,
-                                ..crate::auth::CopilotOAuthConfig::default()
-                            };
-                            Box::pin(crate::auth::poll_copilot_device_flow(&copilot_config, &dc))
-                                .await
-                        } else {
-                            crate::auth::DeviceFlowPollResult::Error(format!(
-                                "Device flow polling not supported for {provider}"
-                            ))
-                        };
-                        match poll_result {
-                            crate::auth::DeviceFlowPollResult::Success(cred) => Ok(cred),
-                            crate::auth::DeviceFlowPollResult::Error(e) => {
-                                Err(crate::error::Error::auth(e))
-                            }
-                            crate::auth::DeviceFlowPollResult::Expired => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Device code expired for {provider}. Run /login {provider} again."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::AccessDenied => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Access denied for {provider}."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::Pending => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Authorization for {provider} is still pending. Complete the browser step and submit again."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::SlowDown => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Authorization server asked to slow down for {provider}. Wait a few seconds and submit again."
-                                )))
-                            }
-                        }
-                    }
-                    None => Err(crate::error::Error::auth(
-                        "Device flow missing device_code".to_string(),
-                    )),
-                },
-            };
-
+            let provider = pending.provider.clone();
+            // The exchange and the save are shared with the FTUI stack
+            // (login_flow); this stack keeps only its display and input.
+            let credential = super::login_flow::obtain_credential(&pending, &code_input)
+                .await
+                .map_err(|(_, err)| err);
             let credential = match credential {
                 Ok(c) => c,
                 Err(e) => {
@@ -1822,8 +1681,9 @@ impl PiApp {
                 }
             };
 
-            save_provider_credential(&mut auth, &provider, credential);
-            if let Err(e) = auth.save_async().await {
+            if let Err(e) =
+                super::login_flow::save_credential(&auth_path, &provider, credential).await
+            {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &task_cx,
@@ -1841,22 +1701,10 @@ impl PiApp {
             )
             .await;
 
-            let status = match kind {
-                PendingLoginKind::ApiKey => {
-                    format!("API key saved for {provider}. Credentials saved to auth.json.")
-                }
-                PendingLoginKind::OAuth | PendingLoginKind::DeviceFlow => {
-                    format!(
-                        "OAuth login successful for {provider}. Credentials saved to auth.json."
-                    )
-                }
-            };
-            let _ = crate::interactive::enqueue_pi_event(
-                &event_tx,
-                &task_cx,
-                PiMsg::System(status),
-            )
-            .await;
+            let status = super::login_flow::success_status(&provider, pending.kind);
+            let _ =
+                crate::interactive::enqueue_pi_event(&event_tx, &task_cx, PiMsg::System(status))
+                    .await;
         });
 
         None

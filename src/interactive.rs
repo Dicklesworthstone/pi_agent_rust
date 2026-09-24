@@ -75,11 +75,12 @@ mod conversation;
 mod ext_session;
 mod file_refs;
 mod keybindings;
-mod model_selector_ui;
-mod perf;
 /// Crate-visible because the ftui stack drives the same `/share` implementation
 /// rather than growing a second copy of it (bd-ydz1t.1). Only `run_share` and
 /// `ShareOutcome` are exported; everything else stays private to this stack.
+pub(crate) mod login_flow;
+mod model_selector_ui;
+mod perf;
 pub(crate) mod share;
 mod state;
 mod text_utils;
@@ -104,6 +105,7 @@ use self::commands::{
 // Session→conversation snapshot; re-exported for the ftui migration stack
 // (bd-cv653.9.1) to rebuild its transcript after /resume.
 pub use self::conversation::conversation_from_session;
+pub(crate) use self::tree::{fork_candidates, format_fork_candidates, select_fork_candidate};
 
 /// Where `/export` writes when it is given no argument.
 ///
@@ -1996,6 +1998,15 @@ pub enum PiMsg {
     /// charmed stack ignores it because its header re-emits the title every
     /// frame.
     TerminalTitle(String),
+    /// FTUI `/login` state (the charmed stack keeps its own pending login and
+    /// ignores this). `Some(provider)` routes the next submitted line to the
+    /// login as a code or key, never echoed into the transcript; `None` ends
+    /// that. `accepts_empty_input` is true for device flows, where a bare
+    /// Enter polls.
+    LoginPending {
+        provider: Option<String>,
+        accepts_empty_input: bool,
+    },
     /// Periodic autocomplete refresh tick (background file index).
     AutocompleteRefresh,
     /// Replacement completion catalog (issue #208). The ftui driver sends it
