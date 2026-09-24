@@ -14,6 +14,30 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+## [v0.6.0] — 2026-09-24 — Release
+
+The Windows fixes below are why this release exists: **v0.5.0 and v0.5.1 are
+unusable on Windows**, because every message fails with `Access is denied.
+(os error 5)` when the session is saved. Anyone on Windows should update.
+
+It is a minor rather than a patch release because it also carries everything
+merged since v0.5.1 (about 680 commits), including one breaking change to the
+library API (see **Changed**). The CLI's flags and settings stay compatible.
+
+Linux release binaries are now built against a glibc 2.28 floor. The v0.5.1
+Linux binaries needed glibc 2.43, so they would not start on Ubuntu 24.04,
+Debian 12, RHEL 9 or anything else older than Ubuntu 26.04.
+
+### Changed
+
+- **Breaking (library API): MCP discovery and bootstrap need an explicit
+  project-trust decision.** `pi::mcp::config::discover` and
+  `pi::mcp::McpManager::bootstrap` now take a trailing `project_trusted: bool`.
+  The old three-argument forms assumed the project was trusted, so omitting
+  the argument read the project's MCP configuration. The
+  `*_with_project_trust` variants are gone because the canonical functions now
+  do what they did. CLI users are unaffected.
+
 ### Fixed
 
 - **Every message failed on Windows with `IO error: Access is denied. (os
@@ -32,6 +56,89 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   was treated as the home directory, so `read ~\notes\todo.txt` looked for a
   directory literally named `~` under the working directory. On Windows `~\`
   now expands like `~/`; on Unix `~\x` stays a literal file name.
+
+- **The unit-test suite builds for Windows again.** A misplaced `#[cfg(unix)]`
+  left a Unix-only MCP test compiled everywhere, so `cargo test --lib` did not
+  build for `x86_64-pc-windows-msvc`.
+
+- **Provider streaming fails closed instead of guessing.** Anthropic, Bedrock,
+  Azure, OpenAI and the shared SSE decoder check that a streamed tool call is
+  complete and well-formed before it can run. Oversized frames, corrupt UTF-8
+  and silently dropped frames are now errors; before, some of them were
+  truncated or skipped. Stalled keepalive-only streams yield and can be
+  cancelled.
+
+- **Print mode honours `--session`, `--session-dir`, `--continue` and
+  `--resume`.** `--session` pointing at a missing file creates it instead of
+  failing, and `--continue` works on the default TUI.
+
+- **Extension filesystem writes are staged and published atomically.** They
+  keep Linux ACLs and xattrs, and can no longer escape their scope through
+  create paths or unlink races. An ancestor `package.json` grants authority
+  only if it declares the entry.
+
+- **Failover and retry share one implementation across print mode, RPC and
+  the default TUI.** The primary model comes back after a cooldown on every
+  surface, fallback chains are deduplicated by model identity, and failover
+  provenance survives reopening a session.
+
+- **A closed stdout pipe is no longer reported as a crash**, on any surface.
+
+- **The default TUI no longer hides or mislabels commands.** `/help` lists
+  every command the stack runs, real commands are no longer reported as
+  "Unknown command", `keybindings.json` is read, and `/hotkeys` shows only
+  bindings that do something.
+
+- **HTTP proxy credentials are kept out of logs and errors**, and proxy
+  authorities are validated.
+
+### Added
+
+- **Default TUI:** `/copy`, `/changelog`, `/export`, `/share`, `/hotkeys` and
+  `/tan`; shift+tab cycles the thinking level, ctrl+l opens the model picker,
+  f1 shows help, ctrl+u deletes to line start; transient provider failures are
+  retried; the session picker can sort and browse named sessions; extension UI
+  requests are answered in the TUI.
+- **Providers:** Gemini thinking controls, signed reasoning state and Files API
+  staging for reusable media (#225); Bedrock ConverseStream with reasoning and
+  prompt caching; Claude on Vertex AI; Cohere multimodal input, reasoning and
+  indexed streaming; Copilot recovers rejected session tokens without
+  replaying the stream.
+- **LSP tools:** completion with auto-imports, signature help, inferred-type and
+  parameter hints, call and type hierarchies, pull diagnostics and workspace
+  diagnostic scans, document and range formatting, and code actions and
+  refactors (renames, file moves with import updates) that are previewed and
+  approved before anything is applied.
+- **MCP:** resources and resource templates, prompts, argument completion,
+  paginated tool catalogs with live refresh, tool-argument and
+  structured-output validation, audience annotations on tool results, and
+  owner-scoped cancellation and deadlines.
+- **Browser, desktop and media tools** now do the real work that was
+  previously simulated: native Chromium/CDP sessions with accessibility
+  snapshots, input, dialogs, uploads and bounded downloads; X11 input and
+  AT-SPI inspection; and OpenAI, Gemini and xAI image generation, editing,
+  vision and speech. All outputs stay inside the workspace.
+- **Debugger (DAP):** Delve for Go, thread-specific stops, exception
+  inspection, and editing variables while stopped.
+- **Plan mode:** proposals are bound to a branch and persisted. Execution is
+  limited to explicit file scopes, and a recovered session needs fresh
+  approval.
+- **Sub-agents and memory:** verified child completion, isolated
+  snapshots of dirty workspaces, a shared delegation budget and deadlines;
+  durable session-shared memory keys with revision-checked writes, atomic
+  transactions and authenticated reflection.
+- **SDK:** live steering, follow-up and abort within a turn; turn-wide
+  deadlines; a shared retry policy; failover on the SDK path; a concurrent
+  write-only RPC control lane; and live event streaming from an RPC
+  subprocess.
+- **Sessions:** resume history is searchable and paged; SQLite sessions page
+  history reads, stream writes and deduplicate media.
+- **Config:** misspelled settings keys are reported, including keys inside
+  nested objects. `PI_SKIP_VERSION_CHECK` is honoured.
+- **Import:** Claude and Codex conversations keep their complete tool
+  exchanges and can be resumed safely.
+- **Security:** a locked-dependency inventory for Cargo and npm, and an OSV
+  audit that writes SARIF.
 
 ## [v0.5.1] — 2026-09-12 — Release
 
