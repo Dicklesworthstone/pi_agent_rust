@@ -99,24 +99,78 @@ fn first_new(cdp: &Cdp, before: &BTreeSet<String>) -> Result<Option<DownloadReco
     Ok(fresh.into_iter().next())
 }
 
-#[expect(clippy::cast_precision_loss)]
-fn read_completed(path: &Path, progress: &DownloadRecord) -> Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|failure| error(format!("completed download file is unavailable: {failure}")))?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > MAX_DOWNLOAD_BYTES
+fn validate_download_guid(guid: &str) -> Result<()> {
+    // CDP is a protocol boundary, not a source of trusted filesystem paths.
+    // In particular, Path::join would discard the private directory for an
+    // absolute GUID, and allowAndName does not make a received string safe.
+    let mut components = Path::new(guid).components();
+    if guid.is_empty()
+        || guid.len() > 128
+        || guid.contains('/')
+        || guid.contains('\\')
+        || guid.chars().any(char::is_control)
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
     {
+        return Err(error("download GUID must be a single bounded filename"));
+    }
+    Ok(())
+}
+
+fn open_completed(directory: &Path, guid: &str) -> Result<std::fs::File> {
+    validate_download_guid(guid)?;
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    {
+        use rustix::fs::{Mode, OFlags};
+        let directory = rustix::fs::open(
+            directory,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|failure| error(format!("cannot pin private download directory: {failure}")))?;
+        // NONBLOCK prevents a raced-in FIFO from hanging before we can inspect
+        // the descriptor. NOFOLLOW rejects a substituted symlink atomically.
+        let file = rustix::fs::openat(
+            &directory,
+            guid,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|failure| error(format!("cannot safely open completed download: {failure}")))?;
+        Ok(std::fs::File::from(file))
+    }
+    #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
+    {
+        let path = directory.join(guid);
+        let metadata = std::fs::symlink_metadata(&path).map_err(|failure| {
+            error(format!("completed download file is unavailable: {failure}"))
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(error("download result must be a regular file"));
+        }
+        Ok(std::fs::File::open(path)?)
+    }
+}
+
+#[expect(clippy::cast_precision_loss)]
+fn read_completed(directory: &Path, progress: &DownloadRecord) -> Result<Vec<u8>> {
+    if progress.state != "completed" {
+        return Err(error("download has not completed"));
+    }
+    if [progress.received_bytes, progress.total_bytes]
+        .into_iter()
+        .any(|value| !value.is_finite() || !(0.0..=MAX_DOWNLOAD_BYTES_F64).contains(&value))
+    {
+        return Err(error("download progress is outside the 100 MiB capture budget"));
+    }
+    let mut file = open_completed(directory, &progress.guid)?;
+    // Validate the object actually opened, not a pathname checked before open.
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_DOWNLOAD_BYTES {
         return Err(error(
             "download result must be a regular file no larger than 100 MiB",
         ));
     }
-    if progress.received_bytes > MAX_DOWNLOAD_BYTES_F64
-        || progress.total_bytes > MAX_DOWNLOAD_BYTES_F64
-    {
-        return Err(error("download exceeded the 100 MiB capture budget"));
-    }
-    let mut file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
     file.by_ref()
         .take(MAX_DOWNLOAD_BYTES + 1)
@@ -124,7 +178,9 @@ fn read_completed(path: &Path, progress: &DownloadRecord) -> Result<Vec<u8>> {
     if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
         return Err(error("download grew beyond the 100 MiB capture budget"));
     }
-    if progress.received_bytes > 0.0 && (progress.received_bytes - bytes.len() as f64).abs() > 0.5 {
+    // All allowed byte counts are exactly representable in f64. Zero is a
+    // real completed byte count, not permission to skip the integrity check.
+    if (progress.received_bytes - bytes.len() as f64).abs() > 0.0 {
         return Err(error(
             "completed download byte count did not match Chromium progress",
         ));
@@ -165,6 +221,7 @@ async fn capture_download(
         cdp.pump_event(owner).await?;
     }
     let start = start.ok_or_else(|| error("click produced no download event"))?;
+    validate_download_guid(&start.guid)?;
     if let Err(failure) = policy::check_navigation(&start.url, req.allowlist) {
         let _ = cdp
             .browser_command(owner, "Browser.cancelDownload", json!({"guid":start.guid}))
@@ -200,7 +257,7 @@ async fn capture_download(
     owner
         .checkpoint()
         .map_err(|_| error("download cancelled before reading completed bytes"))?;
-    let bytes = read_completed(&directory.join(&start.guid), &final_record)?;
+    let bytes = read_completed(directory, &final_record)?;
     let target = if let Some(target) = req.explicit {
         (*target).clone()
     } else {
@@ -297,6 +354,17 @@ pub(super) async fn execute(
 mod tests {
     use super::*;
 
+    fn completed_record(guid: &str, received_bytes: f64) -> DownloadRecord {
+        DownloadRecord {
+            guid: guid.into(),
+            url: "https://example.com/file".into(),
+            suggested_filename: "file".into(),
+            state: "completed".into(),
+            received_bytes,
+            total_bytes: received_bytes,
+        }
+    }
+
     #[test]
     fn parameters_and_filenames_fail_closed() {
         assert!(validate(&json!({"action":"download","selector":"#link"})).is_ok());
@@ -318,19 +386,97 @@ mod tests {
     #[test]
     fn completed_file_must_match_progress_and_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("guid");
-        std::fs::write(&path, b"payload").unwrap();
-        let record = DownloadRecord {
-            guid: "guid".into(),
-            url: "https://example.com/file".into(),
-            suggested_filename: "file".into(),
-            state: "completed".into(),
-            received_bytes: 7.0,
-            total_bytes: 7.0,
-        };
-        assert_eq!(read_completed(&path, &record).unwrap(), b"payload");
-        let mut wrong = record;
-        wrong.received_bytes = 8.0;
-        assert!(read_completed(&path, &wrong).is_err());
+        std::fs::write(dir.path().join("guid"), b"payload").unwrap();
+        let record = completed_record("guid", 7.0);
+        assert_eq!(read_completed(dir.path(), &record).unwrap(), b"payload");
+        for received in [
+            0.0,
+            7.5,
+            8.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            MAX_DOWNLOAD_BYTES_F64 + 1.0,
+        ] {
+            let mut wrong = record.clone();
+            wrong.received_bytes = received;
+            assert!(read_completed(dir.path(), &wrong).is_err(), "{received}");
+        }
+        let mut pending = record.clone();
+        pending.state = "inProgress".into();
+        assert!(read_completed(dir.path(), &pending).is_err());
+        let mut invalid_total = record;
+        invalid_total.total_bytes = f64::NAN;
+        assert!(read_completed(dir.path(), &invalid_total).is_err());
+    }
+
+    #[test]
+    fn download_guids_cannot_escape_private_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.bin");
+        std::fs::write(&secret, b"secret").unwrap();
+        let record = completed_record(secret.to_str().unwrap(), 6.0);
+        assert!(read_completed(dir.path(), &record).is_err());
+        for guid in [
+            "",
+            ".",
+            "..",
+            "../secret.bin",
+            "nested/../../secret.bin",
+            "nested/file",
+            "file/",
+            "nested\\file",
+            "C:\\secret.bin",
+            "bad\0guid",
+            "bad\nguid",
+        ] {
+            let record = completed_record(guid, 6.0);
+            assert!(read_completed(dir.path(), &record).is_err(), "{guid:?}");
+        }
+        assert!(validate_download_guid(&"x".repeat(129)).is_err());
+        for guid in ["guid", "opaque-id_42", "opaque.name", "12345678-abcd-1234-abcd-123456789abc"] {
+            assert!(validate_download_guid(guid).is_ok(), "{guid}");
+        }
+    }
+
+    #[test]
+    fn genuinely_empty_completed_file_is_read_without_bypassing_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("guid"), b"").unwrap();
+        let record = completed_record("guid", 0.0);
+        assert!(read_completed(dir.path(), &record).unwrap().is_empty());
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn completed_file_rejects_linked_private_directory() {
+        use std::os::unix::fs::symlink;
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("guid"), b"secret").unwrap();
+        let linked = parent.path().join("staging");
+        symlink(outside.path(), &linked).unwrap();
+        assert!(read_completed(&linked, &completed_record("guid", 6.0)).is_err());
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn completed_file_rejects_symlink_and_fifo_leaves() {
+        use rustix::fs::Mode;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.bin");
+        std::fs::write(&secret, b"secret").unwrap();
+        symlink(&secret, dir.path().join("linked")).unwrap();
+        assert!(read_completed(dir.path(), &completed_record("linked", 6.0)).is_err());
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            dir.path().join("fifo"),
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        assert!(read_completed(dir.path(), &completed_record("fifo", 0.0)).is_err());
     }
 }
