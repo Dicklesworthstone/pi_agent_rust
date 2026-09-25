@@ -842,6 +842,40 @@ fn ssh_host_allowed_with(
     })
 }
 
+/// The hosts `ssh://` writes are allowed to (what [`ssh_host_allowed`]
+/// accepts), sorted and deduplicated, for `/ssh`.
+#[must_use]
+pub fn ssh_write_allowed_hosts() -> Vec<String> {
+    let config_path = std::env::var_os("HOME").map_or_else(
+        || PathBuf::from(".ssh").join("config"),
+        |home| PathBuf::from(home).join(".ssh").join("config"),
+    );
+    let config = std::fs::read_to_string(config_path).ok();
+    let env = std::env::var("PI_SSH_ALLOWED_HOSTS").ok();
+    ssh_write_allowed_hosts_with(config.as_deref(), env.as_deref())
+}
+
+fn ssh_write_allowed_hosts_with(
+    config_text: Option<&str>,
+    env_allowlist: Option<&str>,
+) -> Vec<String> {
+    let mut hosts: Vec<String> = env_allowlist
+        .into_iter()
+        .flat_map(|env| env.split(','))
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+        .chain(
+            config_text
+                .map(ssh_config_literal_hosts)
+                .unwrap_or_default(),
+        )
+        .collect();
+    hosts.sort_by_key(|host| host.to_ascii_lowercase());
+    hosts.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    hosts
+}
+
 /// Reads are open (any reachable host); **writes** require the host to be
 /// listed literally in `~/.ssh/config` or in `PI_SSH_ALLOWED_HOSTS`.
 pub fn ssh_host_allowed(host: &str) -> bool {
@@ -1596,6 +1630,19 @@ mod tests {
         assert!(!ssh_host_allowed_with("evil", config, None));
         assert!(ssh_host_allowed_with("csd", None, Some("a, csd ,b")));
         assert!(!ssh_host_allowed_with("x", Some("Host *\n"), None));
+    }
+
+    /// `/ssh` lists exactly what the write gate accepts: env entries and
+    /// literal config hosts, sorted, case-insensitively deduplicated (the
+    /// first spelling seen, env before config, is the one shown).
+    #[test]
+    fn ssh_write_allowed_hosts_merges_sources() {
+        let hosts = ssh_write_allowed_hosts_with(
+            Some("Host yto build\nHost *\nHost !blocked\n"),
+            Some(" csd, YTO ,,"),
+        );
+        assert_eq!(hosts, ["build", "csd", "YTO"]); // ubs:ignore length asserted
+        assert!(ssh_write_allowed_hosts_with(None, None).is_empty());
     }
 
     #[test]

@@ -3171,7 +3171,7 @@ impl PiFtuiModel {
                      /commit [--dry-run], /review [target], /handoff, /approval [mode], \
                      /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
-                     /scoped-models [patterns|clear], \
+                     /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
                      /context, /todo, /jobs, /stats, /help, \
                      /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
@@ -3216,6 +3216,22 @@ impl PiFtuiModel {
             "/retry" => {
                 self.begin_busy("retrying last turn ...");
                 self.send_command(UiCommand::Retry);
+                return true;
+            }
+            "/template" => {
+                // Bare: list them. With a name: run it, as `/<name> [args]`.
+                let rest = cmd_args.trim();
+                if rest.is_empty() {
+                    self.send_command(UiCommand::Info(info_commands::InfoCommand::Templates));
+                } else {
+                    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    let name = name.trim_start_matches('/');
+                    self.begin_busy(format!("running /{name} ..."));
+                    self.send_command(UiCommand::ExtensionCommand {
+                        name: name.to_string(),
+                        args: args.trim().to_string(),
+                    });
+                }
                 return true;
             }
             "/scoped-models" => {
@@ -11285,6 +11301,17 @@ mod tests {
         assert_eq!(send("/fresh"), UiCommand::Fresh);
         assert_eq!(send("/retry"), UiCommand::Retry);
         assert_eq!(send("/shake"), UiCommand::Shake);
+        assert_eq!(
+            send("/template"),
+            UiCommand::Info(info_commands::InfoCommand::Templates)
+        );
+        assert_eq!(
+            send("/template fix src/a.rs"),
+            UiCommand::ExtensionCommand {
+                name: String::from("fix"),
+                args: String::from("src/a.rs")
+            }
+        );
         assert_eq!(send("/compact shake"), UiCommand::Shake);
         assert_eq!(
             send("/checkpoint before-refactor risky part"),

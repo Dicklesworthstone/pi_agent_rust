@@ -1,6 +1,6 @@
 //! Read-only OMP info commands on the default stack (`/tools`,
-//! `/extensions`, `/skills`, `/dirs`, `/context`, `/todo`, `/jobs`,
-//! `/stats`). Each reads state the session already has and answers with one
+//! `/extensions`, `/skills`, `/templates`, `/dirs`, `/context`, `/todo`,
+//! `/jobs`, `/stats`, `/ssh`). Each reads state the session already has and answers with one
 //! system entry; none changes the session or starts a provider turn.
 
 use std::fmt::Write as _;
@@ -24,6 +24,8 @@ pub enum InfoCommand {
     Todo,
     Jobs,
     Stats,
+    Templates,
+    Ssh,
 }
 
 impl InfoCommand {
@@ -38,6 +40,8 @@ impl InfoCommand {
             "/todo" | "/todos" => Self::Todo,
             "/jobs" => Self::Jobs,
             "/stats" => Self::Stats,
+            "/templates" => Self::Templates,
+            "/ssh" => Self::Ssh,
             _ => return None,
         })
     }
@@ -102,6 +106,26 @@ pub fn format_extensions(commands: &[String], tools: &[String], hooks: usize) ->
     let _ = write!(out, "\n  commands ({}): {}", commands.len(), list(commands));
     let _ = write!(out, "\n  tools ({}): {}", tools.len(), list(tools));
     let _ = write!(out, "\n  event hooks: {hooks}");
+    out
+}
+
+/// `/ssh`: how `ssh://` paths work here and which hosts accept writes.
+pub fn format_ssh(write_hosts: &[String]) -> String {
+    let mut out =
+        String::from("SSH workspaces: tools read any reachable host through ssh://host/path.");
+    if write_hosts.is_empty() {
+        out.push_str(
+            "\n  writes: no host allowed yet — add a `Host <name>` entry to ~/.ssh/config \
+             or list it in PI_SSH_ALLOWED_HOSTS",
+        );
+    } else {
+        let _ = write!(
+            out,
+            "\n  writes allowed to ({}): {}",
+            write_hosts.len(),
+            write_hosts.join(", ")
+        );
+    }
     out
 }
 
@@ -230,6 +254,12 @@ pub async fn run(
             &catalog.skills,
             "No skills available (add SKILL.md files under .pi/skills or ~/.pi/agent/skills).",
         ),
+        InfoCommand::Templates => format_named(
+            "Prompt templates (run one as /<name> [args])",
+            &catalog.prompt_templates,
+            "No prompt templates (add .md files under .pi/prompts or ~/.pi/agent/prompts).",
+        ),
+        InfoCommand::Ssh => format_ssh(&crate::url_router::ssh_write_allowed_hosts()),
         InfoCommand::Dirs => {
             let roots = handle
                 .workspace()
@@ -311,8 +341,21 @@ mod tests {
         assert_eq!(InfoCommand::parse("/tools"), Some(InfoCommand::Tools));
         assert_eq!(InfoCommand::parse("/TODO"), Some(InfoCommand::Todo));
         assert_eq!(InfoCommand::parse("/status"), Some(InfoCommand::Extensions));
+        assert_eq!(
+            InfoCommand::parse("/templates"),
+            Some(InfoCommand::Templates)
+        );
+        assert_eq!(InfoCommand::parse("/ssh"), Some(InfoCommand::Ssh));
         assert_eq!(InfoCommand::parse("/toolsx"), None);
         assert_eq!(InfoCommand::parse("/model"), None);
+    }
+
+    #[test]
+    fn ssh_listing_names_write_hosts_or_says_how_to_add_one() {
+        let none = format_ssh(&[]);
+        assert!(none.contains("no host allowed yet"), "{none}");
+        let some = format_ssh(&[String::from("build"), String::from("yto")]);
+        assert!(some.contains("writes allowed to (2): build, yto"), "{some}");
     }
 
     #[test]
