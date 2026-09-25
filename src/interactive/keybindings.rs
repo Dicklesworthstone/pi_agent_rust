@@ -171,6 +171,13 @@ impl PiApp {
 
     #[allow(clippy::missing_const_for_fn)]
     pub(super) fn paste_image_from_clipboard() -> Option<PathBuf> {
+        // GH #242: WSL has no display for arboard; ask Windows for the image.
+        if super::commands::running_under_wsl()
+            && let Some(path) = paste_image_via_powershell()
+        {
+            return Some(path);
+        }
+
         #[cfg(all(feature = "clipboard", feature = "image-resize"))]
         {
             use image::ImageEncoder;
@@ -1029,6 +1036,47 @@ fn encode_custom_ui_key(key: &KeyMsg) -> Option<String> {
     }
 }
 
+/// The PowerShell that saves Windows' clipboard image as a PNG at
+/// `windows_path` (exit 1 when the clipboard holds no image).
+fn powershell_save_clipboard_png(windows_path: &str) -> String {
+    let quoted = windows_path.replace('\'', "''");
+    format!(
+        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
+         $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+         if ($null -eq $img) {{ exit 1 }}; \
+         $img.Save('{quoted}', [System.Drawing.Imaging.ImageFormat]::Png)"
+    )
+}
+
+/// GH #242: under WSL, have `powershell.exe` save the Windows clipboard's
+/// image into the agent dir (where `@file` may read it), through the path
+/// `wslpath -w` gives for it. `None` when there is no image or either
+/// interop binary is missing. Interop output is discarded so it cannot
+/// reach the TUI.
+fn paste_image_via_powershell() -> Option<PathBuf> {
+    use std::process::{Command, Stdio};
+    let dir = crate::config::Config::global_dir().join("pastes");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("pi-paste-{}.png", uuid::Uuid::new_v4().simple()));
+    let windows_path = Command::new("wslpath")
+        .arg("-w")
+        .arg(&path)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())?;
+    let saved = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(powershell_save_clipboard_png(windows_path.trim()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    (saved && std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0)).then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,6 +1228,19 @@ mod tests {
     fn build_test_app(current: ModelEntry, available: Vec<ModelEntry>) -> PiApp {
         let (app, _event_rx) = build_test_app_with_event_rx(current, available);
         app
+    }
+
+    /// GH #242: the PowerShell that saves a WSL paste targets the given
+    /// Windows path, single-quoted with embedded quotes doubled, and exits
+    /// non-zero when the clipboard holds no image.
+    #[test]
+    fn powershell_paste_script_quotes_the_target_path() {
+        let script = super::powershell_save_clipboard_png(
+            r"\\wsl.localhost\Ubuntu\home\o'neil\.pi\agent\pastes\p.png",
+        );
+        assert!(script.contains(r"$img.Save('\\wsl.localhost\Ubuntu\home\o''neil\"));
+        assert!(script.contains("[System.Drawing.Imaging.ImageFormat]::Png"));
+        assert!(script.contains("if ($null -eq $img) { exit 1 }"));
     }
 
     #[test]
