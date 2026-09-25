@@ -12,7 +12,7 @@ Each playbook is symptom-first and ends with a concrete fix verification checkli
 | `Custom artifact download failed; cannot fall back to source` | Synthetic custom artifact flow | `rg -n "custom-artifact|artifact-url|fall back to source" install.sh tests/installer_regression.sh` |
 | `Skills:    partial (...)` | Mixed skill-install outcome logic | `rg -n "install_agent_skills|AGENT_SKILL_STATUS|failed_writes|skipped_custom" install.sh` |
 | `Skipping unexpected skill directory path:` | Uninstall path guard triggered | `rg -n "is_expected_skill_directory|remove_installed_skills" uninstall.sh` |
-| Streaming/tool-call mismatch in provider tests | Provider streaming/event normalization | `cargo test provider_streaming -- --nocapture` |
+| Streaming/tool-call mismatch in provider tests | Provider streaming/event normalization | `cargo test --test provider_streaming -- --nocapture` |
 | Session replay/index drift | Session persistence/index metadata logic | `cargo test session -- --nocapture` |
 | Extension hostcall/capability denial mismatch | Extension policy + QuickJS bridge | `cargo test extension -- --nocapture` |
 
@@ -26,16 +26,21 @@ Each playbook is symptom-first and ends with a concrete fix verification checkli
 ### First 3 Commands
 
 ```bash
-cargo test provider_streaming -- --nocapture
+cargo test --test provider_streaming -- --nocapture
 rg -n "stream|tool|delta|event|SSE|responses|completions" src/providers src/provider.rs src/sse.rs
 cargo test conformance
 ```
 
+`--test provider_streaming` replays the VCR cassettes for every provider (one module per provider:
+`anthropic::`, `openai::`, `gemini::` ...). `--test e2e_provider_streaming` adds the Anthropic
+end-to-end scenarios. Under rch, set `PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)"`, because
+rch omits repository metadata.
+
 ### Minimal Repro Template
 
 ```bash
-# Replace with the narrowest failing test name from provider_streaming output.
-cargo test provider_streaming::<failing_case> -- --nocapture
+# Replace with the narrowest failing test path from the output, e.g. anthropic::<case>.
+cargo test --test provider_streaming <failing_case> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -70,8 +75,9 @@ cargo test conformance
 ### Minimal Repro Template
 
 ```bash
-# Replace with specific failing session test from output.
-cargo test session::<failing_case> -- --nocapture
+# Replace with the full failing test path printed in the output
+# (lib tests look like session::tests::<case>).
+cargo test <failing_test_path> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -105,8 +111,9 @@ cargo test conformance
 ### Minimal Repro Template
 
 ```bash
-# Replace with specific failing extension test from output.
-cargo test extension::<failing_case> -- --nocapture
+# Replace with the full failing test path printed in the output
+# (the lib module is `extensions`, so `extension::<case>` matches nothing).
+cargo test <failing_test_path> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -172,7 +179,7 @@ rg -n "remove_installed_skills|is_expected_skill_directory|is_managed_skill_file
 ### First 3 Commands
 
 ```bash
-cargo test e2e_rpc -- --nocapture
+cargo test --test e2e_rpc -- --nocapture
 rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs
 cargo test conformance
 ```
@@ -181,7 +188,7 @@ cargo test conformance
 
 ```bash
 # Replace with specific failing RPC test from output.
-cargo test e2e_rpc::<failing_case> -- --nocapture
+cargo test --test e2e_rpc <failing_case> -- --nocapture
 ```
 
 ### Fix Verification Checklist

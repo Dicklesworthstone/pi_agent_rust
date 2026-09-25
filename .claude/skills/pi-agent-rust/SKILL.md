@@ -33,11 +33,11 @@ bash tests/installer_regression.sh
 
 | Symptom | First 3 Commands |
 |---|---|
-| Provider stream/tool-call regression | `cargo test provider_streaming -- --nocapture` ; `rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs` ; `cargo test conformance` |
+| Provider stream/tool-call regression | `cargo test --test provider_streaming -- --nocapture` ; `rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs` ; `cargo test conformance` |
 | Session replay/index drift | `cargo test session -- --nocapture` ; `rg -n "Session|save|open|index|jsonl|sqlite" src/session.rs src/session_index.rs` ; `cargo test conformance` |
 | Extension policy/runtime failure | `cargo test extension -- --nocapture` ; `rg -n "policy|hostcall|capability|quickjs|deny|allow" src/extensions.rs src/extensions_js.rs` ; `cargo test conformance` |
 | Installer/uninstaller/skill issue | `bash tests/installer_regression.sh` ; `rg -n "AGENT_SKILL_STATUS|CHECKSUM_STATUS|SIGSTORE_STATUS|COMPLETIONS_STATUS" install.sh` ; `rg -n "managed skill|expected skill directory|PIAR_AGENT_SKILL" uninstall.sh` |
-| Interactive vs RPC divergence | `cargo test e2e_rpc -- --nocapture` ; `rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance` |
+| Interactive vs RPC divergence | `cargo test --test e2e_rpc -- --nocapture` ; `rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance` |
 
 For deeper diagnosis, use `references/DEBUGGING-PLAYBOOKS.md`.
 
@@ -64,11 +64,11 @@ For deeper diagnosis, use `references/DEBUGGING-PLAYBOOKS.md`.
 | Changed Files (examples) | Minimum Required Tests |
 |---|---|
 | `install.sh`, `uninstall.sh`, `.claude/skills/pi-agent-rust/**` | `bash -n install.sh uninstall.sh tests/installer_regression.sh` ; `shellcheck -x install.sh uninstall.sh tests/installer_regression.sh` ; `bash tests/installer_regression.sh` ; `bash scripts/skill-smoke.sh` |
-| `src/providers/**`, `src/provider.rs`, `src/sse.rs` | `cargo test provider_streaming` ; `cargo test conformance` |
+| `src/providers/**`, `src/provider.rs`, `src/sse.rs` | `cargo test --test provider_streaming` ; `cargo test --test e2e_provider_streaming` ; `cargo test conformance` |
 | `src/session.rs`, `src/session_index.rs`, `src/session_test.rs` | `cargo test session` ; `cargo test conformance` |
 | `src/extensions.rs`, `src/extensions_js.rs` | `cargo test extension` ; `cargo test conformance` |
 | `src/tools.rs` | `cargo test tools` ; `cargo test conformance` |
-| `src/interactive.rs`, `src/rpc.rs`, `src/main.rs` | `cargo test e2e_rpc` ; `cargo test conformance` |
+| `src/interactive.rs`, `src/rpc.rs`, `src/main.rs` | `cargo test --test e2e_rpc` ; `cargo test conformance` |
 
 ## Do Not Run Yet
 

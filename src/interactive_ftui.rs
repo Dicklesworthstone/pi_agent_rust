@@ -5783,6 +5783,46 @@ fn prepare_prompt(
     Ok((text, processed.images))
 }
 
+/// Run what the user typed as a turn: `@file` references, `/skill:name`
+/// and prompt templates are resolved first (see [`prepare_prompt`]). When
+/// that fails nothing is sent, and the text goes back to the editor (the UI
+/// already cleared it), as the classic stack keeps it.
+#[allow(clippy::too_many_arguments)]
+async fn run_typed_prompt(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    prompt: String,
+    resources: Option<&crate::resources::ResourceLoader>,
+    cwd: &std::path::Path,
+    auto_resize_images: bool,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) {
+    let workspace = handle.workspace();
+    match prepare_prompt(
+        &prompt,
+        resources,
+        cwd,
+        workspace.as_ref(),
+        auto_resize_images,
+    ) {
+        Ok((text, images)) => {
+            run_prompt_turn(handle, text, images, agent_tx, turn_control).await;
+        }
+        Err(err) => {
+            if let Ok(owner_session_id) = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+            {
+                let _ = agent_tx.send(PiMsg::SetEditorText {
+                    owner_session_id,
+                    text: prompt,
+                });
+            }
+            let _ = agent_tx.send(PiMsg::AgentError(format!("Not sent: {err}")));
+        }
+    }
+}
+
 /// `/name args` as a prompt-template turn: the expanded text when `name` is
 /// a loaded prompt template and no extension command claims it.
 fn template_prompt(
@@ -7464,45 +7504,16 @@ pub fn run(
                     let refresh_status = received.is_ok();
                     match received {
                         Ok(UiCommand::Prompt(prompt)) => {
-                            // `@file` references, `/skill:name` and prompt
-                            // templates are resolved here; the model used to
-                            // receive them verbatim.
-                            let workspace = handle.workspace();
-                            match prepare_prompt(
-                                &prompt,
+                            run_typed_prompt(
+                                &mut handle,
+                                prompt,
                                 driver_resources.as_ref(),
                                 &bash_cwd,
-                                workspace.as_ref(),
                                 auto_resize_images,
-                            ) {
-                                Ok((text, images)) => {
-                                    run_prompt_turn(
-                                        &mut handle,
-                                        text,
-                                        images,
-                                        &agent_tx,
-                                        &driver_turn_control,
-                                    )
-                                    .await;
-                                }
-                                Err(err) => {
-                                    // Nothing was sent: hand the prompt back to
-                                    // the editor (the UI already cleared it),
-                                    // as the classic stack keeps it.
-                                    if let Ok(owner_session_id) = handle
-                                        .with_session(|session| session.header.id.clone())
-                                        .await
-                                    {
-                                        let _ = agent_tx.send(PiMsg::SetEditorText {
-                                            owner_session_id,
-                                            text: prompt,
-                                        });
-                                    }
-                                    let _ = agent_tx.send(PiMsg::AgentError(format!(
-                                        "Not sent: {err}"
-                                    )));
-                                }
-                            }
+                                &agent_tx,
+                                &driver_turn_control,
+                            )
+                            .await;
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
@@ -7565,13 +7576,22 @@ pub fn run(
                             let claimed = handle
                                 .extension_manager()
                                 .is_some_and(|manager| manager.has_command(&name));
-                            if let Some(text) =
-                                template_prompt(driver_resources.as_ref(), claimed, &name, &args)
+                            if template_prompt(driver_resources.as_ref(), claimed, &name, &args)
+                                .is_some()
                             {
-                                run_prompt_turn(
+                                // Through the typed-prompt path, so `@file`
+                                // references in the arguments attach too.
+                                let input = if args.is_empty() {
+                                    format!("/{name}")
+                                } else {
+                                    format!("/{name} {args}")
+                                };
+                                run_typed_prompt(
                                     &mut handle,
-                                    text,
-                                    Vec::new(),
+                                    input,
+                                    driver_resources.as_ref(),
+                                    &bash_cwd,
+                                    auto_resize_images,
                                     &agent_tx,
                                     &driver_turn_control,
                                 )
@@ -13012,6 +13032,33 @@ mod tests {
                 .expect("prepared");
         assert_eq!(plain, "no refs, @missing.txt stays");
         assert!(none.is_empty());
+    }
+
+    /// A template invoked with an `@file` argument gets both: the file read
+    /// in and the template expanded (the template path used to skip files).
+    #[test]
+    fn prepare_prompt_expands_a_template_and_reads_its_file_argument() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("bug.txt"), "stack trace here\n").expect("write");
+        let mut resources = crate::resources::ResourceLoader::empty(true);
+        resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+            name: "triage".to_string(),
+            description: String::new(),
+            content: "Triage the attached report.".to_string(),
+            source: "user".to_string(),
+            file_path: std::path::PathBuf::from("/tmp/triage.md"),
+        });
+        let (text, images) = prepare_prompt(
+            "/triage @bug.txt",
+            Some(&resources),
+            dir.path(),
+            None,
+            false,
+        )
+        .expect("prepared");
+        assert!(text.contains("stack trace here"), "{text}");
+        assert!(text.contains("Triage the attached report."), "{text}");
+        assert!(images.is_empty());
     }
 
     /// `/scoped-models` resolves globs and exact ids (full or bare, with a

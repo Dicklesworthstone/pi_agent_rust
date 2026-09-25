@@ -47,8 +47,12 @@ cargo fmt --check
 # Tool behavior
 cargo test tools
 
-# Provider streaming/protocol
-cargo test provider_streaming
+# Provider streaming/protocol: VCR playback for every provider (tests/provider_streaming.rs
+# and tests/provider_streaming/*.rs). A bare `cargo test provider_streaming` is a
+# name filter, and no test path contains that string, so it runs nothing.
+cargo test --test provider_streaming
+# Anthropic end-to-end scenarios (tests/e2e_provider_streaming.rs)
+cargo test --test e2e_provider_streaming
 
 # Session persistence/index
 cargo test session
@@ -56,8 +60,8 @@ cargo test session
 # Extension runtime/policy
 cargo test extension
 
-# RPC surface
-cargo test e2e_rpc
+# RPC surface (tests/e2e_rpc.rs target)
+cargo test --test e2e_rpc
 
 # Broader safety net after targeted slices
 cargo test conformance

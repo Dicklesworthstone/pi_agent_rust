@@ -2829,11 +2829,11 @@ bash tests/installer_regression.sh
 
 | Symptom | First 3 Commands |
 |---|---|
-| Provider stream/tool-call regression | `cargo test provider_streaming -- --nocapture` ; `rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs` ; `cargo test conformance` |
+| Provider stream/tool-call regression | `cargo test --test provider_streaming -- --nocapture` ; `rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs` ; `cargo test conformance` |
 | Session replay/index drift | `cargo test session -- --nocapture` ; `rg -n "Session|save|open|index|jsonl|sqlite" src/session.rs src/session_index.rs` ; `cargo test conformance` |
 | Extension policy/runtime failure | `cargo test extension -- --nocapture` ; `rg -n "policy|hostcall|capability|quickjs|deny|allow" src/extensions.rs src/extensions_js.rs` ; `cargo test conformance` |
 | Installer/uninstaller/skill issue | `bash tests/installer_regression.sh` ; `rg -n "AGENT_SKILL_STATUS|CHECKSUM_STATUS|SIGSTORE_STATUS|COMPLETIONS_STATUS" install.sh` ; `rg -n "managed skill|expected skill directory|PIAR_AGENT_SKILL" uninstall.sh` |
-| Interactive vs RPC divergence | `cargo test e2e_rpc -- --nocapture` ; `rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance` |
+| Interactive vs RPC divergence | `cargo test --test e2e_rpc -- --nocapture` ; `rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance` |
 
 For deeper diagnosis, use `references/DEBUGGING-PLAYBOOKS.md`.
 
@@ -2860,11 +2860,11 @@ For deeper diagnosis, use `references/DEBUGGING-PLAYBOOKS.md`.
 | Changed Files (examples) | Minimum Required Tests |
 |---|---|
 | `install.sh`, `uninstall.sh`, `.claude/skills/pi-agent-rust/**` | `bash -n install.sh uninstall.sh tests/installer_regression.sh` ; `shellcheck -x install.sh uninstall.sh tests/installer_regression.sh` ; `bash tests/installer_regression.sh` ; `bash scripts/skill-smoke.sh` |
-| `src/providers/**`, `src/provider.rs`, `src/sse.rs` | `cargo test provider_streaming` ; `cargo test conformance` |
+| `src/providers/**`, `src/provider.rs`, `src/sse.rs` | `cargo test --test provider_streaming` ; `cargo test --test e2e_provider_streaming` ; `cargo test conformance` |
 | `src/session.rs`, `src/session_index.rs`, `src/session_test.rs` | `cargo test session` ; `cargo test conformance` |
 | `src/extensions.rs`, `src/extensions_js.rs` | `cargo test extension` ; `cargo test conformance` |
 | `src/tools.rs` | `cargo test tools` ; `cargo test conformance` |
-| `src/interactive.rs`, `src/rpc.rs`, `src/main.rs` | `cargo test e2e_rpc` ; `cargo test conformance` |
+| `src/interactive.rs`, `src/rpc.rs`, `src/main.rs` | `cargo test --test e2e_rpc` ; `cargo test conformance` |
 
 ## Do Not Run Yet
 
@@ -3023,8 +3023,12 @@ cargo fmt --check
 # Tool behavior
 cargo test tools
 
-# Provider streaming/protocol
-cargo test provider_streaming
+# Provider streaming/protocol: VCR playback for every provider (tests/provider_streaming.rs
+# and tests/provider_streaming/*.rs). A bare `cargo test provider_streaming` is a
+# name filter, and no test path contains that string, so it runs nothing.
+cargo test --test provider_streaming
+# Anthropic end-to-end scenarios (tests/e2e_provider_streaming.rs)
+cargo test --test e2e_provider_streaming
 
 # Session persistence/index
 cargo test session
@@ -3032,8 +3036,8 @@ cargo test session
 # Extension runtime/policy
 cargo test extension
 
-# RPC surface
-cargo test e2e_rpc
+# RPC surface (tests/e2e_rpc.rs target)
+cargo test --test e2e_rpc
 
 # Broader safety net after targeted slices
 cargo test conformance
@@ -3094,7 +3098,7 @@ Each playbook is symptom-first and ends with a concrete fix verification checkli
 | `Custom artifact download failed; cannot fall back to source` | Synthetic custom artifact flow | `rg -n "custom-artifact|artifact-url|fall back to source" install.sh tests/installer_regression.sh` |
 | `Skills:    partial (...)` | Mixed skill-install outcome logic | `rg -n "install_agent_skills|AGENT_SKILL_STATUS|failed_writes|skipped_custom" install.sh` |
 | `Skipping unexpected skill directory path:` | Uninstall path guard triggered | `rg -n "is_expected_skill_directory|remove_installed_skills" uninstall.sh` |
-| Streaming/tool-call mismatch in provider tests | Provider streaming/event normalization | `cargo test provider_streaming -- --nocapture` |
+| Streaming/tool-call mismatch in provider tests | Provider streaming/event normalization | `cargo test --test provider_streaming -- --nocapture` |
 | Session replay/index drift | Session persistence/index metadata logic | `cargo test session -- --nocapture` |
 | Extension hostcall/capability denial mismatch | Extension policy + QuickJS bridge | `cargo test extension -- --nocapture` |
 
@@ -3108,16 +3112,21 @@ Each playbook is symptom-first and ends with a concrete fix verification checkli
 ### First 3 Commands
 
 ```bash
-cargo test provider_streaming -- --nocapture
+cargo test --test provider_streaming -- --nocapture
 rg -n "stream|tool|delta|event|SSE|responses|completions" src/providers src/provider.rs src/sse.rs
 cargo test conformance
 ```
 
+`--test provider_streaming` replays the VCR cassettes for every provider (one module per provider:
+`anthropic::`, `openai::`, `gemini::` ...). `--test e2e_provider_streaming` adds the Anthropic
+end-to-end scenarios. Under rch, set `PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)"`, because
+rch omits repository metadata.
+
 ### Minimal Repro Template
 
 ```bash
-# Replace with the narrowest failing test name from provider_streaming output.
-cargo test provider_streaming::<failing_case> -- --nocapture
+# Replace with the narrowest failing test path from the output, e.g. anthropic::<case>.
+cargo test --test provider_streaming <failing_case> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -3152,8 +3161,9 @@ cargo test conformance
 ### Minimal Repro Template
 
 ```bash
-# Replace with specific failing session test from output.
-cargo test session::<failing_case> -- --nocapture
+# Replace with the full failing test path printed in the output
+# (lib tests look like session::tests::<case>).
+cargo test <failing_test_path> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -3187,8 +3197,9 @@ cargo test conformance
 ### Minimal Repro Template
 
 ```bash
-# Replace with specific failing extension test from output.
-cargo test extension::<failing_case> -- --nocapture
+# Replace with the full failing test path printed in the output
+# (the lib module is `extensions`, so `extension::<case>` matches nothing).
+cargo test <failing_test_path> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -3254,7 +3265,7 @@ rg -n "remove_installed_skills|is_expected_skill_directory|is_managed_skill_file
 ### First 3 Commands
 
 ```bash
-cargo test e2e_rpc -- --nocapture
+cargo test --test e2e_rpc -- --nocapture
 rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs
 cargo test conformance
 ```
@@ -3263,7 +3274,7 @@ cargo test conformance
 
 ```bash
 # Replace with specific failing RPC test from output.
-cargo test e2e_rpc::<failing_case> -- --nocapture
+cargo test --test e2e_rpc <failing_case> -- --nocapture
 ```
 
 ### Fix Verification Checklist

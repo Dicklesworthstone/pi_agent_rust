@@ -3,13 +3,13 @@
 //! Recording (run locally with real API keys):
 //! ```bash
 //! ANTHROPIC_API_KEY=sk-ant-... VCR_MODE=record \
-//!   cargo test provider_streaming::anthropic_
+//!   cargo test --test provider_streaming anthropic::
 //! ```
 //!
 //! Playback (default in CI):
 //! ```bash
 //! VCR_MODE=playback VCR_CASSETTE_DIR=tests/fixtures/vcr \
-//!   cargo test provider_streaming::anthropic_
+//!   cargo test --test provider_streaming anthropic::
 //! ```
 //!
 //! RCH omits repository metadata, so full replay-lineage runs must pass the

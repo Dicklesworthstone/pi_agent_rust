@@ -384,7 +384,7 @@ cargo test gemini
 cargo test provider_native_contract
 
 # Streaming conformance
-cargo test provider_streaming
+cargo test --test provider_streaming
 ```
 
 ---

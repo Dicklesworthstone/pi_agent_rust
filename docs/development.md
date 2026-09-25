@@ -253,7 +253,7 @@ VCR_MODE=playback cargo test
 
 # Record new cassettes (requires API keys)
 export ANTHROPIC_API_KEY=...
-VCR_MODE=record cargo test provider_streaming
+VCR_MODE=record cargo test --test provider_streaming
 ```
 
 ## Quality Gates
