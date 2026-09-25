@@ -1648,6 +1648,10 @@ pub struct PiFtuiModel {
     history_cursor: Option<usize>,
     /// The draft set aside when recall began, restored past the newest entry.
     history_draft: String,
+    /// Where `@file` references in mid-turn messages resolve, and the loader
+    /// that expands them (the driver does this for idle prompts).
+    file_ref_cwd: std::path::PathBuf,
+    steer_resources: Option<crate::resources::ResourceLoader>,
     /// Loop-lag probe with render/input/agent-event attribution. Inert unless
     /// `PI_PERF_TELEMETRY=1`.
     watchdog: LoopWatchdog,
@@ -1891,6 +1895,8 @@ impl PiFtuiModel {
             input_history: Vec::new(),
             history_cursor: None,
             history_draft: String::new(),
+            file_ref_cwd: std::path::PathBuf::from("."),
+            steer_resources: None,
             input: TextArea::new()
                 .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
                 .with_focus(true)
@@ -1913,6 +1919,8 @@ impl PiFtuiModel {
     /// driver's session exists.
     #[must_use]
     pub fn with_autocomplete(mut self, launch: AutocompleteLaunch) -> Self {
+        self.file_ref_cwd.clone_from(&launch.cwd);
+        self.steer_resources = launch.resources;
         self.autocomplete.provider.set_cwd(launch.cwd);
         self.autocomplete.provider.set_catalog(launch.catalog);
         self.autocomplete.max_visible = launch.max_visible.clamp(1, 20);
@@ -2826,6 +2834,31 @@ impl PiFtuiModel {
             );
             return;
         }
+        // `@file` references are read in here, as the driver does for idle
+        // prompts; they used to reach the model as literal `@path` text.
+        let steer_text = match prepare_prompt(
+            &clean,
+            self.steer_resources.as_ref(),
+            &self.file_ref_cwd,
+            None,
+            true,
+        ) {
+            Ok((_, images)) if !images.is_empty() => {
+                // The text stays in the editor for after the turn.
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from(
+                        "Images attach once the agent finishes; the message is kept in the editor.",
+                    ),
+                );
+                return;
+            }
+            Ok((text, _)) => text,
+            Err(err) => {
+                self.push_entry(EntryRole::Error, format!("Not sent: {err}"));
+                return;
+            }
+        };
         self.record_history(&clean);
         self.input.set_text("");
         self.autocomplete.close();
@@ -2836,9 +2869,9 @@ impl PiFtuiModel {
             return;
         };
         let queued = if follow_up {
-            control.follow_up(&clean)
+            control.follow_up(&steer_text)
         } else {
-            control.steer(&clean)
+            control.steer(&steer_text)
         };
         match queued {
             Ok(_) => {
@@ -8687,6 +8720,84 @@ mod tests {
     /// alt+enter queues a follow-up, commands are refused (text kept), Escape
     /// aborts, and alt+up restores unsent messages. Everything goes through
     /// the turn's real control lane.
+    /// A steered message's `@file` is read in before it joins the turn (it
+    /// used to arrive as literal `@path`), and an image mid-turn keeps the
+    /// draft instead of being dropped.
+    #[test]
+    fn mid_turn_steering_reads_file_references() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "the secret is 42\n").expect("write");
+        std::fs::write(
+            dir.path().join("shot.png"),
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
+                0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
+        )
+        .expect("write png");
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("ftui-steer-fixture")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        );
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx)
+            .with_turn_control(slot)
+            .with_autocomplete(AutocompleteLaunch {
+                catalog: AutocompleteCatalog::default(),
+                cwd: dir.path().to_path_buf(),
+                max_visible: 5,
+                resources: None,
+                resource_source: None,
+            });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+
+        type_str(&mut sim, "also check @shot.png");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "also check @shot.png");
+        assert_eq!(control.snapshot().pending_steering, 0, "nothing queued");
+
+        sim.model_mut().input.set_text("");
+        type_str(&mut sim, "use @notes.txt");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let pending = control.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].text.contains("the secret is 42"),
+            "{}",
+            pending[0].text
+        );
+        assert!(
+            !pending[0].text.contains("@notes.txt"),
+            "{}",
+            pending[0].text
+        );
+    }
+
     #[test]
     fn mid_turn_enter_steers_alt_enter_queues_and_escape_aborts() {
         let provider = Arc::new(
