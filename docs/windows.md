@@ -31,6 +31,7 @@ Pi attempts to use the system clipboard for `/copy` and image pasting.
 
 - Ensure you are running in a terminal that supports clipboard access if using remote sessions (e.g. via SSH).
 - If clipboard operations fail, Pi will typically fall back to printing the content or ignoring the paste.
+- **WSL**: the Linux `pi` binary has no X11/Wayland display inside WSL (unless WSLg is active), so the usual clipboard backend can't open a clipboard there. Pi detects WSL and bridges `/copy` and image pasting through the Windows interop binaries (`clip.exe`, `powershell.exe`) that WSL already puts on `PATH`, so no extra setup is needed.
 
 ## Paths
 

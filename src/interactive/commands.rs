@@ -893,6 +893,105 @@ pub fn strip_thinking_level_suffix(pattern: &str) -> &str {
     }
 }
 
+/// True when running inside WSL (Windows Subsystem for Linux).
+///
+/// WSL without WSLg has no X11/Wayland display, so arboard's Linux backend
+/// can never open a clipboard there — every `/copy` and image paste fails
+/// silently on an otherwise completely normal setup. WSL always ships
+/// `clip.exe` and `powershell.exe` on `PATH` via interop, so that's the
+/// fallback below instead of asking users to install an X server.
+pub fn is_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some()
+        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+}
+
+/// Best-effort copy of `text` to the Windows clipboard via WSL interop
+/// (`clip.exe`). Returns `false` on anything other than WSL or a clean copy.
+pub fn wsl_copy_text(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    if !is_wsl() {
+        return false;
+    }
+    let Ok(mut child) = Command::new("clip.exe")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return false;
+    };
+    if stdin.write_all(text.as_bytes()).is_err() {
+        return false;
+    }
+    drop(stdin);
+    child.wait().is_ok_and(|status| status.success())
+}
+
+/// Best-effort fetch of an image off the Windows clipboard via WSL interop
+/// (`powershell.exe` + `wslpath`), saved as a PNG at a fresh temp path.
+/// Returns `None` on anything other than WSL or a clipboard image being
+/// present — same "just don't attach anything" contract as the arboard path.
+pub fn wsl_paste_image_png() -> Option<std::path::PathBuf> {
+    use std::process::{Command, Stdio};
+
+    if !is_wsl() {
+        return None;
+    }
+    let (_file, path) = tempfile::Builder::new()
+        .prefix("pi-paste-")
+        .suffix(".png")
+        .tempfile()
+        .ok()?
+        .keep()
+        .ok()?;
+
+    // Any early return past this point must remove the empty temp file it
+    // `keep()`-ed above, or a failed paste leaves a stray 0-byte PNG behind.
+    let cleanup = |path: &std::path::Path| {
+        let _ = std::fs::remove_file(path);
+    };
+
+    let Ok(win_path_output) = Command::new("wslpath").arg("-w").arg(&path).output() else {
+        cleanup(&path);
+        return None;
+    };
+    let Ok(win_path) = String::from_utf8(win_path_output.stdout) else {
+        cleanup(&path);
+        return None;
+    };
+    let win_path = win_path.trim();
+    if win_path.is_empty() {
+        cleanup(&path);
+        return None;
+    }
+    // ubs:ignore win_path comes from wslpath on our own temp file, not external input
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         Add-Type -AssemblyName System.Drawing; \
+         if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{ \
+         [System.Windows.Forms.Clipboard]::GetImage().Save('{win_path}', \
+         [System.Drawing.Imaging.ImageFormat]::Png) }} else {{ exit 1 }}"
+    );
+    let status = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stderr(Stdio::null())
+        .status();
+    let ok = status.is_ok_and(|s| s.success())
+        && std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0);
+    if !ok {
+        cleanup(&path);
+        return None;
+    }
+    Some(path)
+}
+
 /// Put `text` on the system clipboard, falling back to a private temp file,
 /// and return the sentence describing what happened.
 ///
@@ -927,6 +1026,10 @@ pub fn copy_text_to_clipboard(text: &str) -> String {
         match ArboardClipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
         {
             Ok(()) => String::from("Copied to clipboard"),
+            Err(err) if wsl_copy_text(text) => {
+                let _ = err;
+                String::from("Copied to clipboard")
+            }
             Err(err) => match write_fallback(text) {
                 Ok(path) => format!(
                     "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
@@ -941,6 +1044,9 @@ pub fn copy_text_to_clipboard(text: &str) -> String {
 
     #[cfg(not(feature = "clipboard"))]
     {
+        if wsl_copy_text(text) {
+            return String::from("Copied to clipboard");
+        }
         match write_fallback(text) {
             Ok(path) => format!("Clipboard support is disabled. Wrote to {}", path.display()),
             Err(err) => {

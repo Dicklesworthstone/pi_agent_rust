@@ -1047,9 +1047,16 @@ pub async fn run_share(
     // Copy viewer URL to clipboard (best-effort).
     #[cfg(feature = "clipboard")]
     {
-        if let Ok(mut clipboard) = ArboardClipboard::new() {
-            let _ = clipboard.set_text(share_url.clone());
+        let copied = ArboardClipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(share_url.clone()))
+            .is_ok();
+        if !copied {
+            super::commands::wsl_copy_text(&share_url);
         }
+    }
+    #[cfg(not(feature = "clipboard"))]
+    {
+        super::commands::wsl_copy_text(&share_url);
     }
 
     // Paragraph breaks: the TUI renders this as markdown, and a single newline

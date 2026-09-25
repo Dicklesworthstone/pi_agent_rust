@@ -175,8 +175,12 @@ impl PiApp {
         {
             use image::ImageEncoder;
 
-            let mut clipboard = ArboardClipboard::new().ok()?;
-            let image = clipboard.get_image().ok()?;
+            let Ok(mut clipboard) = ArboardClipboard::new() else {
+                return super::commands::wsl_paste_image_png();
+            };
+            let Ok(image) = clipboard.get_image() else {
+                return super::commands::wsl_paste_image_png();
+            };
 
             let width = u32::try_from(image.width).ok()?;
             let height = u32::try_from(image.height).ok()?;
@@ -206,7 +210,7 @@ impl PiApp {
 
         #[cfg(not(all(feature = "clipboard", feature = "image-resize")))]
         {
-            None
+            super::commands::wsl_paste_image_png()
         }
     }
 
