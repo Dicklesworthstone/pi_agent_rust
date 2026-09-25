@@ -2228,18 +2228,29 @@ async fn run(
         // /resume picker entries: this cwd's saved sessions, newest first
         // (same index the session picker uses). Failures degrade to an
         // empty list — /resume then reports "no saved sessions".
-        let ftui_sessions = pi::session_index::SessionIndex::new()
-            .list_sessions(Some(&cwd.display().to_string()))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|meta| {
-                let label = match &meta.name {
-                    Some(name) => format!("{name} · {} msgs", meta.message_count),
-                    None => format!("{} · {} msgs", meta.id, meta.message_count),
-                };
-                (label, meta.path)
-            })
-            .collect::<Vec<_>>();
+        // Sessions pinned with /pin come first, marked (OMP).
+        let pinned = pi::interactive_ftui::session_pins::load_pinned(&Config::global_dir());
+        let ftui_sessions = pi::interactive_ftui::session_pins::sort_pinned_first(
+            pi::session_index::SessionIndex::new()
+                .list_sessions(Some(&cwd.display().to_string()))
+                .unwrap_or_default(),
+            &pinned,
+            |meta| meta.id.as_str(),
+        )
+        .into_iter()
+        .map(|meta| {
+            let pin = if pinned.contains(&meta.id) {
+                "📌 "
+            } else {
+                ""
+            };
+            let label = match &meta.name {
+                Some(name) => format!("{pin}{name} · {} msgs", meta.message_count),
+                None => format!("{pin}{} · {} msgs", meta.id, meta.message_count),
+            };
+            (label, meta.path)
+        })
+        .collect::<Vec<_>>();
         return pi::interactive_ftui::run(
             options,
             &theme,

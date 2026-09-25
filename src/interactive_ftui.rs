@@ -64,6 +64,7 @@ use std::collections::{HashMap, VecDeque};
 
 mod info_commands;
 mod plan_commands;
+pub mod session_pins;
 mod workspace_commands;
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
@@ -1636,6 +1637,8 @@ pub struct PiFtuiModel {
     /// Session identity represented by the transcript. Owner-tagged async
     /// notes are accepted only when they match this reset-installed value.
     displayed_session_id: Option<String>,
+    /// Where `/pin` keeps pinned session ids (the agent dir).
+    pins_dir: std::path::PathBuf,
     /// Sanitized in-flight assistant text (streaming deltas accumulate here).
     streaming: String,
     /// Running tool (name shown in the status region while active).
@@ -1984,6 +1987,7 @@ impl PiFtuiModel {
             state: AgentUiState::Ready,
             transcript: Vec::new(),
             displayed_session_id: None,
+            pins_dir: crate::config::Config::global_dir(),
             deferred_notes: Vec::new(),
             streaming: String::new(),
             current_tool: None,
@@ -2159,6 +2163,13 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_models(mut self, models: Vec<String>) -> Self {
         self.available_models = models;
+        self
+    }
+
+    /// Where `/pin` keeps pinned session ids (default: the agent dir).
+    #[must_use]
+    pub fn with_pins_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.pins_dir = dir;
         self
     }
 
@@ -3570,7 +3581,7 @@ impl PiFtuiModel {
                 String::from(
                     "pi commands: /model [provider/model], /resume, /new, \
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
-                     /export [path], /copy [code|cmd|link], /dump, /share, /tan <task>, /usage, /mcp, \
+                     /export [path], /copy [code|cmd|link], /dump, /pin, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking [level], /fast [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
@@ -3763,6 +3774,24 @@ impl PiFtuiModel {
             }
             "/dump" => {
                 self.send_command(UiCommand::Dump);
+                return true;
+            }
+            // OMP /pin: pin or unpin this session at the top of /resume.
+            "/pin" => {
+                let Some(id) = self.displayed_session_id.clone() else {
+                    self.push_entry(EntryRole::Error, String::from("No active session to pin."));
+                    return true;
+                };
+                match session_pins::toggle_pin(&self.pins_dir, &id) {
+                    Ok(true) => self.push_entry(
+                        EntryRole::System,
+                        String::from(
+                            "Pinned: /resume lists this session first from the next launch.",
+                        ),
+                    ),
+                    Ok(false) => self.push_entry(EntryRole::System, String::from("Unpinned.")),
+                    Err(err) => self.push_entry(EntryRole::Error, format!("pin: {err}")),
+                }
                 return true;
             }
             "/fast" => {
@@ -10059,6 +10088,48 @@ mod tests {
             let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "request dumps may hold secrets");
         }
+    }
+
+    #[test]
+    fn slash_pin_toggles_the_shown_session() {
+        let pins = tempfile::tempdir().expect("tempdir");
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx).with_pins_dir(pins.path().to_path_buf());
+        let mut sim_without = ProgramSimulator::new(
+            PiFtuiModel::new(mpsc::channel().1).with_pins_dir(pins.path().to_path_buf()),
+        );
+        sim_without.init();
+        type_str(&mut sim_without, "/pin");
+        sim_without.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim_without
+                .model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "No active session to pin.")
+        );
+
+        model.displayed_session_id = Some(String::from("sess-1"));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/pin");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(session_pins::load_pinned(pins.path()).contains("sess-1"));
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text.starts_with("Pinned"))
+        );
+        type_str(&mut sim, "/pin");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(session_pins::load_pinned(pins.path()).is_empty());
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "Unpinned.")
+        );
     }
 
     #[test]
