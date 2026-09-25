@@ -470,15 +470,20 @@ async fn run(
                             },
                         ];
 
+                        let config_options = config_options_for(&state, &options.available_models);
                         let state_arc = Arc::new(Mutex::new(state));
                         if let Ok(mut guard) = sessions.lock(&cx).await {
                             guard.insert(session_id.clone(), state_arc);
                         }
 
+                        // `configOptions` is the ACP-standard surface (model +
+                        // thought_level selects); `models`/`modes` stay for
+                        // clients built against the earlier shape.
                         let _ = out_tx.send(json_rpc_ok(
                             id,
                             json!({
                                 "sessionId": session_id,
+                                "configOptions": config_options,
                                 "models": models,
                                 "modes": modes,
                             }),
@@ -646,15 +651,26 @@ async fn run(
             }
 
             "session/list" => {
-                let session_list: Vec<Value> = sessions.lock(&cx).await.map_or_else(
-                    |_| Vec::new(),
-                    |guard| {
-                        guard
-                            .keys()
-                            .map(|sid| json!({ "sessionId": sid }))
-                            .collect()
-                    },
-                );
+                let entries: Vec<(String, Arc<Mutex<AcpSessionState>>)> =
+                    sessions.lock(&cx).await.map_or_else(
+                        |_| Vec::new(),
+                        |guard| {
+                            guard
+                                .iter()
+                                .map(|(sid, state)| (sid.clone(), Arc::clone(state)))
+                                .collect()
+                        },
+                    );
+                // ACP SessionInfo requires `cwd` alongside `sessionId`.
+                let mut session_list: Vec<Value> = Vec::with_capacity(entries.len());
+                for (sid, state) in entries {
+                    let cwd = state
+                        .lock(&cx)
+                        .await
+                        .map(|guard| guard.cwd.display().to_string())
+                        .unwrap_or_default();
+                    session_list.push(json!({ "sessionId": sid, "cwd": cwd }));
+                }
 
                 let _ = out_tx.send(json_rpc_ok(id, json!({ "sessions": session_list })));
             }
@@ -822,28 +838,59 @@ async fn run(
                     continue;
                 };
 
-                // Accept `name` or `key` for the option identifier; the value
-                // lives under `value`.
-                let name = request
-                    .params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .or_else(|| request.params.get("key").and_then(Value::as_str));
-                let Some(name) = name else {
+                // ACP's `configId` names the option (`name`/`key` accepted
+                // too); the value lives under `value`.
+                let Some(name) = config_option_id(&request.params) else {
                     let _ = out_tx.send(json_rpc_error(
                         id,
                         INVALID_PARAMS,
-                        "Missing required parameter: name (or key)",
+                        "Missing required parameter: configId",
                     ));
                     continue;
                 };
                 let value = request.params.get("value").cloned().unwrap_or(Value::Null);
 
-                let option = match parse_config_option(name, &value) {
-                    Ok(option) => option,
-                    Err(msg) => {
-                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                        continue;
+                // `model` is the ACP model selector: same switch as
+                // session/set_model, with the value as `provider/id` or an id.
+                let model_target = if name.eq_ignore_ascii_case("model") {
+                    let target = value.as_str().map(str::trim).map(|raw| {
+                        let params = match raw.split_once('/') {
+                            Some((provider, model))
+                                if options.model_registry.find(provider, model).is_some() =>
+                            {
+                                json!({ "provider": provider, "model": model })
+                            }
+                            _ => json!({ "model": raw }),
+                        };
+                        resolve_set_model_target(&params, &options.model_registry)
+                    });
+                    match target {
+                        Some(Ok(pair)) => Some(pair),
+                        Some(Err(msg)) => {
+                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                            continue;
+                        }
+                        None => {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_PARAMS,
+                                "Invalid value for config option 'model': expected a model id or provider/id string",
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let option = if model_target.is_some() {
+                    None
+                } else {
+                    match parse_config_option(name, &value) {
+                        Ok(option) => Some(option),
+                        Err(msg) => {
+                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                            continue;
+                        }
                     }
                 };
 
@@ -862,11 +909,27 @@ async fn run(
                     continue;
                 };
 
-                match apply_set_config_option(&session_state, option, &cx).await {
+                let applied = match (model_target, option) {
+                    (Some((provider, model)), _) => {
+                        apply_set_model(&session_state, &provider, &model, &cx)
+                            .await
+                            .map(drop)
+                    }
+                    (None, Some(option)) => {
+                        apply_set_config_option(&session_state, option, &cx).await
+                    }
+                    (None, None) => Ok(()),
+                };
+                match applied {
                     Ok(()) => {
+                        // ACP answers with the complete config state.
+                        let config_options = session_state.lock(&cx).await.ok().and_then(|guard| {
+                            config_options_for(&guard, &options.available_models)
+                        });
                         let _ = out_tx.send(json_rpc_ok(
                             id,
                             json!({
+                                "configOptions": config_options,
                                 "sessionId": session_id,
                                 "name": name,
                                 "applied": true,
@@ -1191,7 +1254,10 @@ fn handle_initialize() -> Value {
                 "embeddedContext": false,
                 "image": false,
             },
-            "sessionCapabilities": {},
+            // `session/list` is implemented (GH #245). `loadSession` stays
+            // false: ACP's `session/load` must replay the whole conversation
+            // as `session/update`s, and ours only re-attaches a live session.
+            "sessionCapabilities": { "list": {} },
             "_meta": {
                 "pi.dev": {
                     "toolApproval": true,
@@ -1445,6 +1511,84 @@ fn handle_session_new(
 // handling) is fixed at `session/new` time and requires a new session to
 // change — `session/set_config_option` returns a structured `INVALID_PARAMS`
 // error naming the option and the settable set rather than silently succeeding.
+
+/// Thinking levels offered by the `thought_level` config option, in order.
+const THOUGHT_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The session's ACP `configOptions` (GH #245): a `model` select (values are
+/// `provider/id`) and a `thought_level` select, each with its current value.
+/// `current_model` is `(provider, id)`; `thinking` the current level name.
+fn session_config_options(
+    current_model: (&str, &str),
+    thinking: &str,
+    available_models: &[ModelEntry],
+) -> Value {
+    let (provider, model_id) = current_model;
+    let current = format!("{provider}/{model_id}");
+    let mut model_options: Vec<Value> = available_models
+        .iter()
+        .map(|entry| {
+            json!({
+                "value": format!("{}/{}", entry.model.provider, entry.model.id),
+                "name": entry.model.name,
+            })
+        })
+        .collect();
+    if !model_options
+        .iter()
+        .any(|option| option["value"].as_str() == Some(current.as_str()))
+    {
+        model_options.insert(0, json!({ "value": current, "name": model_id }));
+    }
+    let thought_options: Vec<Value> = THOUGHT_LEVELS
+        .iter()
+        .map(|level| json!({ "value": level, "name": level }))
+        .collect();
+    json!([
+        {
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": current,
+            "options": model_options,
+        },
+        {
+            "id": "thought_level",
+            "name": "Thinking",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": thinking,
+            "options": thought_options,
+        },
+    ])
+}
+
+/// [`session_config_options`] for a live session, or `None` while a prompt
+/// holds the agent session.
+fn config_options_for(state: &AcpSessionState, available_models: &[ModelEntry]) -> Option<Value> {
+    let agent_session = state.agent_session.as_ref()?;
+    let provider = agent_session.agent.provider();
+    let thinking = agent_session
+        .agent
+        .stream_options()
+        .thinking_level
+        .unwrap_or_default()
+        .to_string();
+    Some(session_config_options(
+        (provider.name(), provider.model_id()),
+        &thinking,
+        available_models,
+    ))
+}
+
+/// The option id of a `session/set_config_option` request: ACP's `configId`,
+/// or the older `name`/`key` this server accepted first.
+fn config_option_id(params: &Value) -> Option<&str> {
+    ["configId", "name", "key"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(Value::as_str))
+}
 
 /// A configuration option recognized by `session/set_config_option`.
 #[derive(Debug)]
@@ -1990,6 +2134,44 @@ mod tests {
         assert!(parsed.get("id").is_none());
     }
 
+    /// GH #245: configOptions carry ACP's reserved `model` and
+    /// `thought_level` selects with current values; a current model missing
+    /// from the available list is still offered.
+    #[test]
+    fn session_config_options_follow_the_acp_shape() {
+        let mut entry = crate::models::ad_hoc_model_entry("openai", "gpt-5").expect("entry");
+        entry.model.name = "GPT-5".to_string();
+        let options = session_config_options(("openai", "gpt-5"), "high", &[entry]);
+        let model = &options[0];
+        assert_eq!(model["id"], "model");
+        assert_eq!(model["category"], "model");
+        assert_eq!(model["type"], "select");
+        assert_eq!(model["currentValue"], "openai/gpt-5");
+        assert_eq!(model["options"][0]["value"], "openai/gpt-5");
+        assert_eq!(model["options"][0]["name"], "GPT-5");
+        let thought = &options[1];
+        assert_eq!(thought["id"], "thought_level");
+        assert_eq!(thought["category"], "thought_level");
+        assert_eq!(thought["currentValue"], "high");
+        assert_eq!(thought["options"].as_array().map(Vec::len), Some(7));
+
+        let unlisted = session_config_options(("local", "llama"), "off", &[]);
+        assert_eq!(unlisted[0]["options"][0]["value"], "local/llama");
+    }
+
+    #[test]
+    fn set_config_option_reads_the_acp_config_id() {
+        assert_eq!(
+            config_option_id(&json!({ "configId": "model", "value": "x" })),
+            Some("model")
+        );
+        assert_eq!(
+            config_option_id(&json!({ "name": "thinking" })),
+            Some("thinking")
+        );
+        assert_eq!(config_option_id(&json!({ "value": "x" })), None);
+    }
+
     #[test]
     fn handle_initialize_returns_correct_shape() {
         let result = handle_initialize();
@@ -2000,6 +2182,8 @@ mod tests {
         assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
         // Sessions are in-process only — we never advertise loadSession.
         assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        // GH #245: session/list is implemented, so it is advertised.
+        assert!(result["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
         // promptCapabilities advertise text/resource_link baseline only.
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["audio"],
