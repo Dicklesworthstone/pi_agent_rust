@@ -22,6 +22,9 @@ use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
 
+mod structured;
+pub use structured::transform_outbound_json;
+
 /// Tool-result schema tag for secrets operations.
 pub const SECRETS_SCHEMA: &str = "pi.secrets.v1";
 
@@ -314,7 +317,7 @@ pub fn contains_secret(text: &str, extra_patterns: &[regex::Regex]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Session-scoped placeholder map. Lives in memory; dies with the session.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SecretVault {
     /// real value → placeholder (stable per session).
     by_value: std::collections::HashMap<String, String>,
