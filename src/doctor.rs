@@ -461,7 +461,7 @@ pub fn run_doctor(opts: &DoctorOptions<'_>) -> Result<DoctorReport> {
         check_auth(opts.fix, &mut findings);
     }
     if should_run(CheckCategory::Shell) {
-        check_shell(&mut findings);
+        check_shell(opts.cwd, &mut findings);
     }
     if should_run(CheckCategory::Sessions) {
         check_sessions(&mut findings);
@@ -794,18 +794,25 @@ fn check_auth_env_vars(cat: CheckCategory, findings: &mut Vec<Finding>) {
 
 // ── Check: Shell ────────────────────────────────────────────────────
 
-fn check_shell(findings: &mut Vec<Finding>) {
+fn check_shell(cwd: &Path, findings: &mut Vec<Finding>) {
     let cat = CheckCategory::Shell;
+    let config_path = Config::config_path_override_from_env(cwd);
+    let config = Config::load_with_roots(config_path.as_deref(), &Config::global_dir(), cwd).ok();
 
-    // Required tools (Fail if missing)
-    check_tool(
-        cat,
-        "bash",
-        &["--version"],
-        Severity::Fail,
-        ToolCheckMode::PresenceOnly,
-        findings,
-    );
+    // The shell the bash tool actually runs (GH #182): `shell_path`, else
+    // what `default_bash_shell` resolves. Probing `bash` on PATH passed on
+    // Windows even when the tool could not find a shell at all.
+    let configured = config
+        .as_ref()
+        .and_then(|config| config.shell_path.clone())
+        .filter(|path| !path.trim().is_empty());
+    findings.push(bash_shell_finding(
+        configured.as_deref(),
+        crate::tools::default_bash_shell().map_err(|err| err.to_string()),
+        Path::exists,
+    ));
+    // `sh` is only the Unix fallback when no bash exists; Windows never uses it.
+    #[cfg(unix)]
     check_tool(
         cat,
         "sh",
@@ -824,11 +831,20 @@ fn check_shell(findings: &mut Vec<Finding>) {
         ToolCheckMode::PresenceOnly,
         findings,
     );
+    // grep and find search in-process by default; rg and fd matter only
+    // with `search_backend: "external"`.
+    let external_search = crate::tools::search_backend_from_config(config.as_ref())
+        == crate::tools::SearchBackend::External;
+    let search_severity = if external_search {
+        Severity::Warn
+    } else {
+        Severity::Info
+    };
     check_tool(
         cat,
         "rg",
         &["--version"],
-        Severity::Warn,
+        search_severity,
         ToolCheckMode::PresenceOnly,
         findings,
     );
@@ -842,7 +858,7 @@ fn check_shell(findings: &mut Vec<Finding>) {
         cat,
         fd_bin,
         &["--version"],
-        Severity::Warn,
+        search_severity,
         ToolCheckMode::PresenceOnly,
         findings,
     );
@@ -856,6 +872,51 @@ fn check_shell(findings: &mut Vec<Finding>) {
         ToolCheckMode::PresenceOnly,
         findings,
     );
+}
+
+/// The finding for the shell the bash tool will run. `configured` is
+/// `shell_path`; `resolved` is `default_bash_shell()`; `exists` checks a
+/// path (injected so tests stay off the real filesystem).
+fn bash_shell_finding(
+    configured: Option<&str>,
+    resolved: std::result::Result<String, String>,
+    exists: impl Fn(&Path) -> bool,
+) -> Finding {
+    let cat = CheckCategory::Shell;
+    if let Some(path) = configured {
+        let looks_like_path = path.contains('/') || path.contains('\\');
+        if looks_like_path && !exists(Path::new(path)) {
+            return Finding::fail(cat, format!("bash: shell_path not found ({path})"))
+                .with_remediation("Point shell_path in settings.json at an existing bash");
+        }
+        return shell_path_finding(path, "shell_path");
+    }
+    match resolved {
+        Ok(path) if path == "sh" => Finding::warn(cat, "bash: not found; commands run with sh")
+            .with_remediation("Install bash, or set shell_path in settings.json"),
+        Ok(path) => shell_path_finding(&path, "auto-detected"),
+        Err(err) => Finding::fail(cat, "bash: no shell found for the bash tool")
+            .with_detail(err)
+            .with_remediation(
+                "Install Git for Windows (Git Bash), or set shell_path in settings.json",
+            ),
+    }
+}
+
+fn shell_path_finding(path: &str, source: &str) -> Finding {
+    let cat = CheckCategory::Shell;
+    if crate::tools::is_wsl_bash_launcher(Path::new(path)) {
+        Finding::warn(cat, format!("bash: {path} ({source}, WSL)"))
+            .with_detail(
+                "Commands run inside the WSL Linux distro: Windows paths appear as /mnt/c/... \
+                 and Windows tools are not on its PATH",
+            )
+            .with_remediation(
+                "Install Git for Windows for a native bash, or set shell_path to the one you want",
+            )
+    } else {
+        Finding::pass(cat, format!("bash ({path}, {source})"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13944,6 +14005,67 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
         assert_eq!(findings[0].severity, Severity::Warn);
         assert_eq!(findings[0].fixability, Fixability::AutoFixable);
         assert!(!missing.exists());
+    }
+
+    /// GH #182: the bash finding reflects the shell the tool will run, not
+    /// whether some `bash` is on PATH.
+    #[test]
+    fn bash_shell_finding_reports_the_shell_the_tool_runs() {
+        let none = |_: &Path| false;
+        let all = |_: &Path| true;
+
+        let found = bash_shell_finding(None, Ok("/bin/bash".to_string()), none);
+        assert_eq!(found.severity, Severity::Pass);
+        assert!(found.title.contains("/bin/bash") && found.title.contains("auto-detected"));
+
+        let missing = bash_shell_finding(None, Err("no bash".to_string()), none);
+        assert_eq!(missing.severity, Severity::Fail);
+
+        let sh = bash_shell_finding(None, Ok("sh".to_string()), none);
+        assert_eq!(sh.severity, Severity::Warn);
+
+        // Joined, not a `\` literal: backslashes only separate paths on Windows.
+        let wsl_launcher = Path::new("C:")
+            .join("Windows")
+            .join("System32")
+            .join("bash.exe")
+            .display()
+            .to_string();
+        let wsl = bash_shell_finding(None, Ok(wsl_launcher), none);
+        assert_eq!(wsl.severity, Severity::Warn, "{}", wsl.title);
+
+        let bad_config = bash_shell_finding(
+            Some(r"C:\Program Files\Git\bin\bash.exe"),
+            Ok("/bin/bash".to_string()),
+            none,
+        );
+        assert_eq!(bad_config.severity, Severity::Fail);
+        assert!(bad_config.title.contains("shell_path not found"));
+
+        let good_config = bash_shell_finding(
+            Some(r"C:\Program Files\Git\bin\bash.exe"),
+            Err("unused".to_string()),
+            all,
+        );
+        assert_eq!(good_config.severity, Severity::Pass);
+        assert!(good_config.title.contains("shell_path"));
+    }
+
+    /// grep and find search in-process by default, so missing rg/fd is
+    /// informational, never a warning, without `search_backend: "external"`.
+    #[test]
+    fn missing_search_binaries_are_informational_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut findings = Vec::new();
+        check_shell(dir.path(), &mut findings);
+        for finding in &findings {
+            let about_search = ["rg", "fd", "fdfind"]
+                .iter()
+                .any(|tool| finding.title.starts_with(*tool));
+            if about_search {
+                assert_ne!(finding.severity, Severity::Warn, "{}", finding.title);
+            }
+        }
     }
 
     #[test]

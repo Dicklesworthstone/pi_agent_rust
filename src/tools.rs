@@ -7092,8 +7092,7 @@ fn absolute_path_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
 /// Whether `path` is WSL's `bash.exe` launcher (`System32\bash.exe`, or the
 /// Store app alias under `WindowsApps`), which runs the command inside the
 /// default Linux distro rather than on Windows.
-#[cfg(any(windows, test))]
-fn is_wsl_bash_launcher(path: &Path) -> bool {
+pub(crate) fn is_wsl_bash_launcher(path: &Path) -> bool {
     let in_system32 = path.parent().and_then(Path::file_name).is_some_and(|dir| {
         dir.eq_ignore_ascii_case("system32") || dir.eq_ignore_ascii_case("sysnative")
     });
