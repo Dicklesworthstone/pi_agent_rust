@@ -1044,13 +1044,16 @@ pub async fn run_share(
     let share_url = share_viewer_url.to_string();
     drop(temp_path);
 
-    // Copy viewer URL to clipboard (best-effort).
+    // Copy viewer URL to clipboard (best-effort); under WSL through clip.exe,
+    // since arboard has no display there (GH #242).
+    let copied_via_wsl = super::commands::running_under_wsl()
+        && super::commands::copy_via_clip_exe(&share_url).is_ok();
     #[cfg(feature = "clipboard")]
-    {
-        if let Ok(mut clipboard) = ArboardClipboard::new() {
-            let _ = clipboard.set_text(share_url.clone());
-        }
+    if !copied_via_wsl && let Ok(mut clipboard) = ArboardClipboard::new() {
+        let _ = clipboard.set_text(share_url.clone());
     }
+    #[cfg(not(feature = "clipboard"))]
+    let _ = copied_via_wsl;
 
     // Paragraph breaks: the TUI renders this as markdown, and a single newline
     // soft-wraps into the warning sentence, which can split "Share URL:" or the

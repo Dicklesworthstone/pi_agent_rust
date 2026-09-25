@@ -922,6 +922,12 @@ pub fn copy_text_to_clipboard(text: &str) -> String {
         Ok(path)
     }
 
+    // GH #242: under WSL without WSLg there is no display for arboard, but
+    // WSL puts Windows' clip.exe on PATH.
+    if running_under_wsl() && copy_via_clip_exe(text).is_ok() {
+        return String::from("Copied to clipboard");
+    }
+
     #[cfg(feature = "clipboard")]
     {
         match ArboardClipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
@@ -947,6 +953,53 @@ pub fn copy_text_to_clipboard(text: &str) -> String {
                 format!("Clipboard support is disabled; failed to write fallback file: {err}")
             }
         }
+    }
+}
+
+/// Whether this process runs inside WSL (GH #242).
+pub fn running_under_wsl() -> bool {
+    wsl_detected(
+        std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some(),
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn wsl_detected(wsl_env: bool, kernel_release: Option<&str>) -> bool {
+    wsl_env
+        || kernel_release.is_some_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+}
+
+/// What `clip.exe` is fed: UTF-16LE with a byte-order mark. Plain UTF-8 is
+/// read in the console code page and garbles anything non-ASCII.
+fn clip_exe_payload(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// Put `text` on the Windows clipboard from inside WSL.
+pub fn copy_via_clip_exe(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("clip.exe")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&clip_exe_payload(text))?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "clip.exe exited with {status}"
+        )))
     }
 }
 
@@ -4450,6 +4503,27 @@ mod tests {
                 serde_json::Value::Bool(true),
             )])
         );
+    }
+
+    /// GH #242: WSL is recognized by its env vars or by the kernel release
+    /// string; a plain Linux or macOS host is not.
+    #[test]
+    fn wsl_is_detected_from_env_or_kernel_release() {
+        use super::wsl_detected;
+        assert!(wsl_detected(true, None));
+        assert!(wsl_detected(
+            false,
+            Some("5.15.153.1-microsoft-standard-WSL2\n")
+        ));
+        assert!(!wsl_detected(false, Some("6.8.0-45-generic\n")));
+        assert!(!wsl_detected(false, None));
+    }
+
+    /// clip.exe gets UTF-16LE with a BOM, so non-ASCII text survives.
+    #[test]
+    fn clip_exe_payload_is_utf16le_with_bom() {
+        let payload = super::clip_exe_payload("é!");
+        assert_eq!(payload, vec![0xFF, 0xFE, 0xE9, 0x00, 0x21, 0x00]);
     }
 
     #[test]
