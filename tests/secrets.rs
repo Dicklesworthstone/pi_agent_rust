@@ -547,3 +547,144 @@ fn overlapping_custom_rules_cover_the_full_secret_in_real_agent_context() {
     drop(capture);
     finish_case(&harness, case);
 }
+
+const OPAQUE_SECRET: &str = "hunter2hunter2hunter2";
+
+#[test]
+fn json_credentials_stay_protected_after_the_assignment_leaves_history() {
+    let case = "remembered_credential_after_history_change";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    let input = json!({"password": OPAQUE_SECRET}).to_string();
+    block_on_local(agent.run(input, |_| {})).expect("first turn");
+    // Keep the session's vault, but remove the original KEY=value hint.
+    // This tests the loss of context, not a synthetic second detector call.
+    agent.clear_messages();
+    block_on_local(agent.run(format!("echoed value: {OPAQUE_SECRET}"), |_| {})).expect("later turn");
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 2);
+    for payload in &capture.payloads {
+        assert!(!payload.contains(OPAQUE_SECRET));
+        assert!(payload.contains("<pi-secret:000001>"));
+    }
+    drop(capture);
+    let side_context = agent
+        .secrets_transform_outbound_text(&format!("side question quotes {OPAQUE_SECRET}"))
+        .expect("auxiliary outbound screening");
+    assert_eq!(side_context, "side question quotes <pi-secret:000001>");
+    let call = agent.restore_secrets_inbound(pi::model::ToolCall {
+        id: "remembered-value".to_string(),
+        name: "write".to_string(),
+        arguments: json!({"path": "key.txt", "content": "<pi-secret:000001>"}),
+        thought_signature: None,
+    });
+    assert_eq!(call.arguments["content"], OPAQUE_SECRET);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn a_bare_echo_before_its_first_assignment_does_not_leak_to_the_provider() {
+    let case = "same_prompt_bare_echo_screening";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    block_on_local(agent.run(
+        format!("earlier {OPAQUE_SECRET}; password={OPAQUE_SECRET}; later {OPAQUE_SECRET}"),
+        |_| {},
+    ))
+    .expect("run");
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 1);
+    assert!(!capture.payloads[0].contains(OPAQUE_SECRET));
+    assert_eq!(capture.payloads[0].matches("<pi-secret:000001>").count(), 3);
+    drop(capture);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn multiline_credentials_are_masked_inside_nested_tool_result_details() {
+    let case = "multiline_tool_result_details";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, _) = build_agent(&root, None);
+    let key = private_key_fixture();
+    block_on_local(agent.run(key.clone(), |_| {})).expect("establish vault");
+    let mut output = ToolOutput {
+        content: vec![pi::model::ContentBlock::Text(pi::model::TextContent::new(
+            format!("copied:\n{key}"),
+        ))],
+        details: Some(json!({
+            "credential": key,
+            "nested": [{"echo": key, "safe": true}],
+            "count": 7,
+        })),
+        is_error: false,
+    };
+    agent.mask_secrets_in_output(&mut output);
+    assert_eq!(first_text(&output), "copied:\n<pi-secret:000001>");
+    let details = output.details.as_ref().expect("details retained");
+    assert_eq!(details["credential"], "<pi-secret:000001>");
+    assert_eq!(details["nested"][0]["echo"], "<pi-secret:000001>");
+    assert_eq!(details["nested"][0]["safe"], true);
+    assert_eq!(details["count"], 7);
+    assert!(!serde_json::to_string(details).unwrap().contains(PEM_BODY));
+    finish_case(&harness, case);
+}
+
+#[test]
+fn serialized_transcript_export_masks_multiline_keys_without_breaking_jsonl() {
+    let case = "multiline_transcript_export";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, _) = build_agent(&root, None);
+    block_on_local(agent.run(private_key_fixture(), |_| {})).expect("establish vault");
+    let records = agent.messages().iter().map(|message| {
+        serde_json::to_string(message).expect("serialize local transcript")
+    }).collect::<Vec<_>>();
+    let original = format!("{}\r\n", records.join("\r\n"));
+    assert!(original.contains(PEM_BODY), "local input is deliberately not an export");
+    let exported = agent.mask_secrets_text(&original);
+    assert!(!exported.contains(PEM_BODY));
+    assert!(exported.contains("<pi-secret:000001>"));
+    assert!(exported.ends_with("\r\n"));
+    let decoded = exported.lines().map(|line| {
+        serde_json::from_str::<serde_json::Value>(line).expect("screened record remains valid JSON")
+    }).collect::<Vec<_>>();
+    assert_eq!(decoded.len(), records.len());
+    for (before, after) in records.iter().zip(&decoded) {
+        let before: serde_json::Value = serde_json::from_str(before).unwrap();
+        assert_eq!(before["role"], after["role"]);
+    }
+    assert_eq!(agent.mask_secrets_text(&exported), exported);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn quoted_generic_credentials_obey_block_and_off_modes_at_provider_entry() {
+    let case = "quoted_credential_mode_boundaries";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    for mode in ["block", "off"] {
+        let (mut agent, capture) = build_agent(&root, Some(SecretsSettings {
+            mode: Some(mode.to_string()),
+            extra_patterns: None,
+        }));
+        let result = block_on_local(agent.run(
+            json!({"password": OPAQUE_SECRET}).to_string(),
+            |_| {},
+        ));
+        let capture = capture.lock().expect("capture");
+        if mode == "block" {
+            let error = result.expect_err("quoted keys must not bypass block mode").to_string();
+            assert!(error.contains("PI_SECRET_BLOCK"));
+            assert!(!error.contains(OPAQUE_SECRET));
+            assert!(capture.payloads.is_empty());
+        } else {
+            result.expect("off mode retains ordinary provider behavior");
+            assert_eq!(capture.payloads.len(), 1);
+            assert!(capture.payloads[0].contains(OPAQUE_SECRET));
+        }
+    }
+    finish_case(&harness, case);
+}
