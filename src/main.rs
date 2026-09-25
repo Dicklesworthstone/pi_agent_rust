@@ -2211,7 +2211,22 @@ async fn run(
                     &entry.model.provider,
                 )
             })
-            .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+            .map(|entry| {
+                (
+                    format!("{}/{}", entry.model.provider, entry.model.id),
+                    entry.model.name,
+                )
+            })
+            .collect::<Vec<_>>();
+        // The picker shows each model's display name beside its identity
+        // (GH #214); switching still uses the identity.
+        let ftui_model_names = ftui_models
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let ftui_models = ftui_models
+            .into_iter()
+            .map(|(id, _)| id)
             .collect::<Vec<_>>();
         // /resume picker entries: this cwd's saved sessions, newest first
         // (same index the session picker uses). Failures degrade to an
@@ -2246,6 +2261,7 @@ async fn run(
                 // the classic stack does, so it reads the same setting.
                 gh_path: config.gh_path.clone(),
                 hide_thinking_block: config.hide_thinking_block.unwrap_or(false),
+                model_names: ftui_model_names,
                 double_escape_action: pi::interactive_ftui::DoubleEscapeAction::from_setting(
                     config.double_escape_action.as_deref(),
                 ),

@@ -60,7 +60,7 @@ use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
 use crate::interactive::{AutocompleteState, PiMsg, extension_commands_for_catalog};
 use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 mod info_commands;
 mod plan_commands;
@@ -1179,8 +1179,13 @@ impl PickerOverlay {
         let item = &self.items[index];
         match self.kind {
             // Same matching as the classic stack's model selector, provider
-            // aliases included ("grok" finds xai models).
-            PickerKind::Model => crate::model_selector::full_id_matches_query(query, item),
+            // aliases included ("grok" finds xai models), on the identity;
+            // a display name shown beside it (GH #214) also finds the row.
+            PickerKind::Model => {
+                let id = self.values.get(index).unwrap_or(item);
+                crate::model_selector::full_id_matches_query(query, id)
+                    || (item != id && crate::model_selector::fuzzy_match(query, item))
+            }
             PickerKind::Theme | PickerKind::Session | PickerKind::Rewind | PickerKind::ForkFrom => {
                 crate::model_selector::fuzzy_match(query, item)
             }
@@ -1577,6 +1582,9 @@ pub struct PiFtuiModel {
     /// `provider/model-id` entries for the `/model` picker (from the launch
     /// path's model registry; empty when unset).
     available_models: Vec<String>,
+    /// Display names (`models.json`/catalog `name`) by `provider/model-id`,
+    /// shown beside the identity in the `/model` picker (GH #214).
+    model_names: HashMap<String, String>,
     /// Set by `/exit`//`/quit`; the update loop turns it into `Cmd::quit()`.
     pending_quit: bool,
     /// `(display label, session path)` entries for the `/resume` picker.
@@ -1903,6 +1911,7 @@ impl PiFtuiModel {
             palette: FtuiPalette::default(),
             picker: None,
             available_models: Vec::new(),
+            model_names: HashMap::new(),
             pending_quit: false,
             available_sessions: Vec::new(),
             keybindings: KeyBindings::default(),
@@ -2063,6 +2072,14 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_models(mut self, models: Vec<String>) -> Self {
         self.available_models = models;
+        self
+    }
+
+    /// Display names by `provider/model-id` for the `/model` picker rows.
+    /// Selection still routes the identity.
+    #[must_use]
+    pub fn with_model_names(mut self, names: HashMap<String, String>) -> Self {
+        self.model_names = names;
         self
     }
 
@@ -3147,10 +3164,23 @@ impl PiFtuiModel {
                         String::from("no models available; use /model <provider>/<model>"),
                     );
                 } else {
+                    // Rows show the display name beside the identity (GH
+                    // #214); the value, which is what switching parses,
+                    // stays `provider/model-id`.
+                    let rows = self
+                        .available_models
+                        .iter()
+                        .map(|id| match self.model_names.get(id) {
+                            Some(name) if !name.trim().is_empty() && name != id => {
+                                format!("{id} · {}", sanitize(name.trim()))
+                            }
+                            _ => id.clone(),
+                        })
+                        .collect();
                     self.picker = Some(PickerOverlay::new(
                         "Model (Enter to switch, Esc to close)",
+                        rows,
                         self.available_models.clone(),
-                        Vec::new(),
                         PickerKind::Model,
                     ));
                 }
@@ -7722,6 +7752,8 @@ pub struct FtuiSettings {
     pub hide_thinking_block: bool,
     /// The `doubleEscapeAction` setting.
     pub double_escape_action: DoubleEscapeAction,
+    /// Model display names by `provider/model-id`, for the `/model` picker.
+    pub model_names: HashMap<String, String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7744,6 +7776,7 @@ pub fn run(
         btw_client,
         hide_thinking_block,
         double_escape_action,
+        model_names,
     } = settings;
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
@@ -8279,6 +8312,7 @@ pub fn run(
         .with_ask_reply_channel(ask_reply_tx)
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
+        .with_model_names(model_names)
         .with_available_sessions(available_sessions)
         .with_alt_screen(!inline)
         .with_mouse_enabled(!disable_mouse_capture)
@@ -11373,6 +11407,49 @@ mod tests {
         // PageUp jumps back toward top
         sim.inject_event(key(KeyCode::PageUp, Modifiers::empty()));
         assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+    }
+
+    /// GH #214: the picker row shows a model's display name, but what the
+    /// pick routes is still `provider/id`, even for a name with a slash.
+    #[test]
+    fn model_picker_shows_display_names_and_routes_the_identity() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_models(vec![
+                String::from("openai/gpt-5"),
+                String::from("deepseek/deepseek-v4-pro"),
+            ])
+            .with_model_names(HashMap::from([
+                (String::from("openai/gpt-5"), String::from("openai/gpt-5")),
+                (
+                    String::from("deepseek/deepseek-v4-pro"),
+                    String::from("DeepSeek V4/Pro"),
+                ),
+            ]));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/model");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let rendered = buffer_text(sim.capture_frame(80, 10), 80, 10);
+        assert!(
+            rendered.contains("deepseek/deepseek-v4-pro · DeepSeek V4/Pro"),
+            "{rendered:?}"
+        );
+        // A name equal to the id is not repeated.
+        assert!(!rendered.contains("gpt-5 · "), "{rendered:?}");
+
+        // Filtering by the display name finds the row; the pick routes the id.
+        type_str(&mut sim, "V4/Pro");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetModel {
+                provider: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+            }
+        );
     }
 
     #[test]
