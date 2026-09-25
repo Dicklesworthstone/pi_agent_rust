@@ -11,10 +11,10 @@
 //! 1. Fixture secret in context → the recorded provider payload contains
 //!    placeholders, zero raw secrets (canary assertions).
 //! 2. Model echoes a placeholder into a write → file on disk gets the REAL
-//!    value; a bash echo of the value is masked in the tool result.
+//!    value; a tool echo of the value is masked in outbound provider context.
 //! 3. Block mode refuses the send with a named `PI_SECRET_BLOCK` error.
-//! 4. Session content contains placeholders only (the vault never persists
-//!    raw values — nothing to leak on export/share).
+//! 4. Explicit export screening masks known secret values; the local user
+//!    transcript is not claimed to be a redacted export.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
 //! recorded as artifacts.
@@ -54,7 +54,7 @@ fn block_on_local<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("failed to build test runtime");
     // ubs:ignore-end
-    runtime.block_on(future)
+    runtime.block_on(Box::pin(future))
 }
 
 fn first_text(output: &pi::tools::ToolOutput) -> &str {
@@ -364,5 +364,186 @@ fn export_carries_placeholders_only() {
         "export must never carry the raw secret: {}",
         &exported[..exported.len().min(300)]
     );
+    finish_case(&harness, case);
+}
+
+const PEM_BODY: &str = "U1lOVEhFVElDLVBSSVZBVEUtS0VZLUJPRFktQ0FOQVJZ";
+
+fn private_key_fixture() -> String {
+    format!("-----BEGIN PRIVATE KEY-----\n{PEM_BODY}\n-----END PRIVATE KEY-----")
+}
+
+#[test]
+fn complete_and_truncated_private_keys_protect_the_body_at_the_provider_boundary() {
+    let case = "private_key_body_provider_boundary";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    for key in [
+        private_key_fixture(),
+        format!("-----BEGIN RSA PRIVATE KEY-----\n{PEM_BODY}"),
+        format!(
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\r\nProc-Type: 4,ENCRYPTED\r\n{PEM_BODY}\r\n-----END ENCRYPTED PRIVATE KEY-----"
+        ),
+    ] {
+        let (mut agent, capture) = build_agent(&root, None);
+        block_on_local(agent.run(format!("inspect this key:\n{key}"), |_| {})).expect("run");
+        let capture = capture.lock().expect("capture");
+        assert_eq!(capture.payloads.len(), 1);
+        assert!(capture.payloads[0].contains("<pi-secret:"));
+        assert!(!capture.payloads[0].contains(PEM_BODY));
+        assert!(!capture.payloads[0].contains("Proc-Type"));
+        assert!(!capture.payloads[0].contains("-----END"));
+    }
+    finish_case(&harness, case);
+}
+
+/// Only the remote model is replaced here. The Agent's outbound transform,
+/// inbound argument restoration, and actual write/read tools all execute.
+struct PrivateKeyToolProvider {
+    capture: Arc<Mutex<Capture>>,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl pi::provider::Provider for PrivateKeyToolProvider {
+    fn name(&self) -> &str {
+        "capture"
+    }
+
+    fn api(&self) -> &str {
+        "capture-api"
+    }
+
+    fn model_id(&self) -> &str {
+        "capture-model"
+    }
+
+    async fn stream(
+        &self,
+        context: &Context<'_>,
+        _options: &StreamOptions,
+    ) -> pi::error::Result<
+        Pin<Box<dyn futures::Stream<Item = pi::error::Result<StreamEvent>> + Send>>,
+    > {
+        use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, ToolCall};
+
+        let payload = serde_json::to_string(context.messages.as_ref()).expect("provider payload");
+        let step = {
+            let mut capture = self.capture.lock().expect("capture");
+            let step = capture.payloads.len();
+            capture.payloads.push(payload.clone());
+            step
+        };
+        let mut message = AssistantMessage {
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            ..AssistantMessage::default()
+        };
+        let call = match step {
+            0 => {
+                let start = payload.find("<pi-secret:").expect("outbound placeholder");
+                let end = start + payload[start..].find('>').expect("placeholder end") + 1;
+                Some((
+                    "write",
+                    json!({"path": "copied.pem", "content": &payload[start..end]}),
+                ))
+            }
+            1 => Some(("read", json!({"path": "copied.pem"}))),
+            2 => None,
+            _ => panic!("unexpected extra provider request"),
+        };
+        if let Some((name, arguments)) = call {
+            message.stop_reason = StopReason::ToolUse;
+            message.content.push(ContentBlock::ToolCall(ToolCall {
+                id: format!("key-tool-{step}"),
+                name: name.to_string(),
+                arguments,
+                thought_signature: None,
+            }));
+        } else {
+            message.content.push(ContentBlock::Text(TextContent::new("key copied")));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Done {
+            reason: message.stop_reason,
+            message,
+        })])))
+    }
+}
+
+#[test]
+fn private_key_placeholder_executes_real_write_and_read_without_cloud_disclosure() {
+    let case = "private_key_real_tool_round_trip";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let capture = Arc::new(Mutex::new(Capture::default()));
+    let provider = Arc::new(PrivateKeyToolProvider { capture: Arc::clone(&capture) });
+    let tools = ToolRegistry::new(&["write", "read"], &root, None);
+    let mut agent = Agent::new(provider, tools, AgentConfig::default());
+    let key = private_key_fixture();
+    let completed_tools = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&completed_tools);
+    let result = block_on_local(agent.run(
+        format!("Copy this private key, then read the copy:\n{key}"),
+        move |event| {
+            if let pi::agent::AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } = event {
+                recorded.lock().expect("tool events").push((tool_name, is_error));
+            }
+        },
+    ))
+    .expect("real tool round trip");
+    assert_eq!(result.stop_reason, pi::model::StopReason::Stop);
+    assert_eq!(std::fs::read_to_string(root.join("copied.pem")).expect("written key"), key);
+    assert_eq!(
+        *completed_tools.lock().expect("tool events"),
+        vec![("write".to_string(), false), ("read".to_string(), false)]
+    );
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 3);
+    for payload in &capture.payloads {
+        assert!(payload.contains("<pi-secret:"));
+        assert!(!payload.contains(PEM_BODY), "private body reached the provider");
+        assert!(!payload.contains("-----BEGIN"));
+        assert!(!payload.contains("-----END"));
+    }
+    drop(capture);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn truncated_private_key_block_mode_never_calls_the_provider() {
+    let case = "private_key_block_before_provider";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, Some(SecretsSettings {
+        mode: Some("block".to_string()),
+        extra_patterns: None,
+    }));
+    let result = block_on_local(agent.run(
+        format!("-----BEGIN PRIVATE KEY-----\n{PEM_BODY}"),
+        |_| {},
+    ));
+    let error = result.expect_err("block mode refuses before provider entry").to_string();
+    assert!(error.contains("PI_SECRET_BLOCK"));
+    assert!(!error.contains(PEM_BODY));
+    assert!(capture.lock().expect("capture").payloads.is_empty());
+    finish_case(&harness, case);
+}
+
+#[test]
+fn overlapping_custom_rules_cover_the_full_secret_in_real_agent_context() {
+    let case = "overlapping_rules_provider_boundary";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, Some(SecretsSettings {
+        mode: Some("obfuscate".to_string()),
+        extra_patterns: Some(vec!["abcde".to_string(), "defgh".to_string(), "ghij".to_string()]),
+    }));
+    block_on_local(agent.run("safe abcdefghij safe", |_| {})).expect("run");
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 1);
+    assert!(capture.payloads[0].contains("safe <pi-secret:000001> safe"));
+    assert!(!capture.payloads[0].contains("fghij"));
+    drop(capture);
     finish_case(&harness, case);
 }

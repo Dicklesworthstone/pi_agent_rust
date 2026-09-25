@@ -1,17 +1,16 @@
 //! Secrets obfuscation vault (bd-cv653.7.9).
 //!
 //! Credential-shaped values are replaced with stable placeholders before
-//! provider calls and restored on the way back: read .env → tool result →
-//! provider payload never flows raw. The vault map lives in memory for the
-//! session and dies with it — session files and compaction summaries carry
-//! placeholders only.
+//! provider calls and restored before local tool execution. The raw-value
+//! map lives in memory for the session and dies with it; callers must apply
+//! the appropriate outbound/export transform before publishing transcript
+//! text, since the local transcript may retain user-authored input.
 //!
 //! Detection: versioned pattern rules (sk-ant-*, sk-* including dotted
-//! BaiLian-style keys, gh?_*, AKIA*, AIza*, xox[bap]-*, JWTs, private-key
-//! headers, DSN/connection strings, generic KEY=value high-entropy
-//! assignments) with a measured false-positive budget. This module is the
-//! SINGLE detector for the whole program (bd-cv653.4.1's memory screener
-//! composes with it).
+//! BaiLian-style keys, gh?_*, AKIA*, AIza*, xox[bap]-*, JWTs, complete private
+//! key envelopes, DSN/connection strings, generic KEY=value high-entropy
+//! assignments). This module is the SINGLE detector for the whole program;
+//! memory and crash-report screening compose with it.
 //!
 //! Modes (`secrets.mode`): `off` | `obfuscate` (default) | `block`
 //! (refuse to send, loud named error). Audit events per transform are
@@ -68,7 +67,7 @@ impl SecretsMode {
 pub struct SecretsSettings {
     /// off | obfuscate | block (default obfuscate).
     pub mode: Option<String>,
-    /// User-added regex patterns (each match becomes a placeholder).
+    /// User-added regex patterns (each nonempty match becomes a placeholder).
     pub extra_patterns: Option<Vec<String>>,
 }
 
@@ -93,18 +92,15 @@ fn dotted_without_digit(value: &str) -> bool {
     value.contains('.') && !value.bytes().any(|b| b.is_ascii_digit())
 }
 
-/// Versioned in-tree rules (bump SECRETS_RULESET_VERSION when editing).
+/// Versioned in-tree rules (bump when detection semantics change).
 ///
-/// v2 (gh #211): provider keys may carry `.` inside the token (Alibaba
-/// BaiLian issues `sk-sp-H.EEDDM.…` keys through the OpenAI-compatible
-/// surface; JWTs are three dot-separated base64url segments). Dots are
-/// accepted only *between* token characters — never leading, trailing, or
-/// doubled — so a key at the end of a sentence does not swallow the period,
-/// and dots do not count toward the minimum length, so `sk-a.b.c` shapes
-/// stay below the bar. Rules are ordered most-specific first: overlapping
-/// hits are resolved by start offset and then rule order, so the audit
-/// label names the tightest rule.
-pub const SECRETS_RULESET_VERSION: u32 = 2;
+/// v2 added dotted provider keys without consuming trailing punctuation or
+/// treating dots as token characters for the minimum length.
+/// v3 protects the entire private-key envelope, including encrypted-key
+/// metadata and truncated bodies, and unions overlapping matches so a short
+/// match cannot expose the tail of a longer credential. The first rule in a
+/// merged region supplies its diagnostic label; rule order breaks start ties.
+pub const SECRETS_RULESET_VERSION: u32 = 3;
 
 /// Token body: `min` or more characters from `class`, with single dots
 /// permitted between characters, ending on a `tail_class` character (the
@@ -157,6 +153,8 @@ fn rules() -> &'static Vec<Rule> {
             },
             Rule {
                 name: "private-key",
+                // `scan` extends this marker through its matching footer.
+                // Masking only the header leaves the private material intact.
                 regex: regex::Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").expect("rule"),
                 label: "private_key",
                 reject: None,
@@ -223,42 +221,85 @@ pub struct Detection {
 }
 
 /// Scan text for credential shapes. User patterns compose on top.
+///
+/// Returns sorted, nonempty, nonoverlapping byte ranges. Every byte covered
+/// by any matching rule is covered by the result. Overlapping matches form
+/// one region; adjacent independent matches remain separate. Consumers can
+/// replace these ranges in order without exposing overlapping suffixes.
 #[must_use]
 pub fn scan(text: &str, extra_patterns: &[regex::Regex]) -> Vec<Detection> {
     let mut out = Vec::new();
     for rule in rules() {
+        let mut covered_until = 0;
         for caps in rule.regex.captures_iter(text) {
-            // When a rule isolates the value in group 1 (the KEY=value
-            // assignment shape), vault only the value: vaulting the whole
-            // `KEY=value` corrupts inbound restores (`export X=KEY=value`)
-            // and leaves a bare echo of the value unmasked.
+            // Group 1 isolates the value in KEY=value assignments. Keep the
+            // assignment key outside the vault so inbound restores remain values.
             let m = caps.get(1).or_else(|| caps.get(0)).expect("match group 0");
-            if rule.reject.is_some_and(|reject| reject(m.as_str())) {
+            if m.start() < covered_until
+                || rule.reject.is_some_and(|reject| reject(m.as_str()))
+            {
                 continue;
             }
+            let end = if rule.name == "private-key" {
+                private_key_end(text, m.start(), m.end())
+            } else {
+                m.end()
+            };
+            // A missing footer protects the remainder. Do not repeatedly
+            // search that same suffix for nested or malformed opening markers.
+            covered_until = end;
             out.push(Detection {
                 start: m.start(),
-                end: m.end(),
+                end,
                 rule: rule.name,
                 label: rule.label,
             });
         }
     }
-    for (index, pattern) in extra_patterns.iter().enumerate() {
+    for pattern in extra_patterns {
         for m in pattern.find_iter(text) {
-            out.push(Detection {
-                start: m.start(),
-                end: m.end(),
-                rule: "user",
-                label: USER_LABELS[index % USER_LABELS.len()],
-            });
+            if !m.is_empty() {
+                out.push(Detection {
+                    start: m.start(),
+                    end: m.end(),
+                    rule: "user",
+                    label: "user_pattern",
+                });
+            }
         }
     }
-    out.sort_by_key(|d| d.start);
-    out
+    merge_detections(out)
 }
 
-const USER_LABELS: &[&str] = &["user_pattern"];
+/// PEM labels are ASCII and the marker regex already validated the bounds.
+/// Match the exact label, not just the next END line: a mismatched footer
+/// cannot terminate a secret and expose the rest. A truncated envelope is
+/// ambiguous, so fail closed through the end of the supplied text.
+fn private_key_end(text: &str, start: usize, header_end: usize) -> usize {
+    const BEGIN: &str = "-----BEGIN ";
+    const DASHES: &str = "-----";
+    let label = &text[start + BEGIN.len()..header_end - DASHES.len()];
+    let footer = format!("-----END {label}-----");
+    text[header_end..].find(&footer).map_or(text.len(), |offset| {
+        header_end + offset + footer.len()
+    })
+}
+
+fn merge_detections(mut detections: Vec<Detection>) -> Vec<Detection> {
+    // Stable sort preserves specific-rule precedence for equal start offsets.
+    detections.sort_by_key(|detection| detection.start);
+    let mut merged: Vec<Detection> = Vec::with_capacity(detections.len());
+    for detection in detections {
+        if let Some(previous) = merged.last_mut()
+            && detection.start < previous.end
+        {
+            previous.end = previous.end.max(detection.end);
+        } else {
+            merged.push(detection);
+        }
+    }
+    merged
+}
 
 /// Does the text contain any credential shape?
 #[must_use]
@@ -336,6 +377,7 @@ impl SecretVault {
 pub struct TransformAudit {
     pub schema: String,
     pub direction: String,
+    /// Number of distinct redacted regions, not the number of overlapping rules.
     pub detections: usize,
     pub rules: Vec<String>,
 }
@@ -363,9 +405,6 @@ pub fn obfuscate(
     let mut cursor = 0;
     let mut rules_hit: Vec<String> = Vec::new();
     for detection in &detections {
-        if detection.start < cursor {
-            continue; // overlapping rule hit
-        }
         out.push_str(&text[cursor..detection.start]);
         let value = &text[detection.start..detection.end];
         let placeholder = vault.placeholder_for(value, detection.label);
@@ -673,9 +712,128 @@ mod tests {
     #[test]
     fn overlapping_hits_collapse_cleanly() {
         let mut vault = SecretVault::default();
-        // The generic rule overlaps the specific sk- rule: one placeholder.
         let (out, audit) = obfuscate("api_key=sk-aaaaaaaaaaaaaaaaaaaaaaaa", &mut vault, &[]);
-        assert!(out.contains("<pi-secret:"), "{out}");
-        assert!(audit.detections >= 1);
+        assert_eq!(out, "api_key=<pi-secret:000001>");
+        assert_eq!(audit.detections, 1);
+    }
+
+    #[test]
+    fn complete_private_keys_are_one_restorable_region() {
+        for label in [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+        ] {
+            for newline in ["\n", "\r\n", "\\n"] {
+                let key = format!(
+                    "-----BEGIN {label}-----{newline}Proc-Type: 4,ENCRYPTED{newline}DEK-Info: AES-256-CBC,0123456789ABCDEF{newline}U1lOVEhFVElDLUtFWS1CT0RZ{newline}-----END {label}-----"
+                );
+                let input = format!("before\n{key}\nafter");
+                let hits = scan(&input, &[]);
+                assert_eq!(hits.len(), 1, "{label}, {newline:?}");
+                assert_eq!(&input[hits[0].start..hits[0].end], key);
+                assert_eq!(hits[0].rule, "private-key");
+                let mut vault = SecretVault::default();
+                let (masked, audit) = obfuscate(&input, &mut vault, &[]);
+                assert_eq!(masked, "before\n<pi-secret:000001>\nafter");
+                assert_eq!(audit.detections, 1);
+                assert_eq!(vault.restore(&masked), input);
+                assert_eq!(vault.mask(&input), masked);
+                assert_eq!(obfuscate(&input, &mut vault, &[]).0, masked);
+                assert!(gate_outbound(&input, SecretsMode::Block, &[]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_or_mismatched_private_key_envelopes_fail_closed() {
+        for suffix in [
+            "",
+            "\n-----END PUBLIC KEY-----\nMORE-PRIVATE-MATERIAL",
+            "\n-----END EC PRIVATE KEY-----\nMORE-PRIVATE-MATERIAL",
+            "\n-----BEGIN PRIVATE KEY-----\nNESTED-PRIVATE-MATERIAL",
+        ] {
+            let input = format!(
+                "safe prefix\n-----BEGIN RSA PRIVATE KEY-----\nPRIVATE-BODY{suffix}"
+            );
+            let hits = scan(&input, &[]);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].end, input.len());
+            let mut vault = SecretVault::default();
+            let (masked, _) = obfuscate(&input, &mut vault, &[]);
+            assert_eq!(masked, "safe prefix\n<pi-secret:000001>");
+            assert_eq!(vault.restore(&masked), input);
+        }
+    }
+
+    #[test]
+    fn separate_pem_blocks_do_not_swallow_intervening_safe_text() {
+        let first = "-----BEGIN PRIVATE KEY-----\nFIRST-BODY\n-----END PRIVATE KEY-----";
+        let second = "-----BEGIN EC PRIVATE KEY-----\nSECOND-BODY\n-----END EC PRIVATE KEY-----";
+        let input = format!("{first}\nsafe separator\n{second}\nsafe tail");
+        let mut vault = SecretVault::default();
+        let (masked, audit) = obfuscate(&input, &mut vault, &[]);
+        assert_eq!(
+            masked,
+            "<pi-secret:000001>\nsafe separator\n<pi-secret:000002>\nsafe tail"
+        );
+        assert_eq!(audit.detections, 2);
+        assert_eq!(vault.restore(&masked), input);
+        for public in [
+            "-----BEGIN PUBLIC KEY-----\nPUBLIC-BODY\n-----END PUBLIC KEY-----",
+            "-----BEGIN CERTIFICATE-----\nPUBLIC-CERT\n-----END CERTIFICATE-----",
+        ] {
+            assert!(scan(public, &[]).is_empty());
+        }
+    }
+
+    #[test]
+    fn overlapping_user_patterns_redact_the_entire_transitive_union() {
+        let input = "prefix abcdefghij suffix";
+        for patterns in [["abcde", "defgh", "ghij"], ["ghij", "defgh", "abcde"]] {
+            let patterns: Vec<_> = patterns
+                .into_iter()
+                .map(|pattern| regex::Regex::new(pattern).unwrap())
+                .collect();
+            let hits = scan(input, &patterns);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(&input[hits[0].start..hits[0].end], "abcdefghij");
+            let mut vault = SecretVault::default();
+            let (masked, audit) = obfuscate(input, &mut vault, &patterns);
+            assert_eq!(masked, "prefix <pi-secret:000001> suffix");
+            assert_eq!(audit.detections, 1);
+            assert_eq!(vault.restore(&masked), input);
+        }
+    }
+
+    #[test]
+    fn same_start_short_matches_cannot_hide_longer_or_adjacent_matches() {
+        let patterns = ["abc", "abcdef", "bcde", "XYZ"]
+            .map(|pattern| regex::Regex::new(pattern).unwrap());
+        let input = "α abcdefXYZ ω";
+        let hits = scan(input, &patterns);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(&input[hits[0].start..hits[0].end], "abcdef");
+        assert_eq!(&input[hits[1].start..hits[1].end], "XYZ");
+        let mut vault = SecretVault::default();
+        let (masked, _) = obfuscate(input, &mut vault, &patterns);
+        assert_eq!(masked, "α <pi-secret:000001><pi-secret:000002> ω");
+        assert_eq!(vault.restore(&masked), input);
+    }
+
+    #[test]
+    fn zero_width_user_matches_are_not_credentials() {
+        let patterns = ["", "^", "$", "SENSITIVE"]
+            .map(|pattern| regex::Regex::new(pattern).unwrap());
+        assert!(scan("", &patterns).is_empty());
+        assert!(scan("ordinary text", &patterns).is_empty());
+        assert!(gate_outbound("ordinary text", SecretsMode::Block, &patterns).is_ok());
+        let mut vault = SecretVault::default();
+        let (masked, audit) = obfuscate("before SENSITIVE after", &mut vault, &patterns);
+        assert_eq!(masked, "before <pi-secret:000001> after");
+        assert_eq!(audit.detections, 1);
     }
 }
