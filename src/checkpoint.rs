@@ -576,6 +576,69 @@ pub fn prepare_retry_branch(session: &mut Session) -> Option<RetryPreparation> {
     })
 }
 
+/// What [`rewind_to_user_entry`] hands back for the editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindPreparation {
+    /// The rewound message's text.
+    pub text: String,
+    /// Images the message carried, which the editor can't hold.
+    pub dropped_images: usize,
+}
+
+/// Rewind to just before a user message (OMP `/branch`, double-Esc).
+///
+/// Moves the leaf to the parent of the user message `entry_id` on the current
+/// path, so whatever is sent next lands as its sibling while the old path
+/// stays in the tree. `None` when `entry_id` is not a user message on the
+/// current path. Does not persist.
+pub fn rewind_to_user_entry(session: &mut Session, entry_id: &str) -> Option<RewindPreparation> {
+    let (parent_id, prepared) =
+        session
+            .entries_for_current_path()
+            .into_iter()
+            .find_map(|entry| {
+                let SessionEntry::Message(message) = entry else {
+                    return None;
+                };
+                if message.base.id.as_deref() != Some(entry_id) {
+                    return None;
+                }
+                let SessionMessage::User { content, .. } = &message.message else {
+                    return None;
+                };
+                let prepared = match content {
+                    UserContent::Text(text) => RewindPreparation {
+                        text: text.clone(),
+                        dropped_images: 0,
+                    },
+                    UserContent::Blocks(blocks) => RewindPreparation {
+                        text: blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        dropped_images: blocks
+                            .iter()
+                            .filter(|block| matches!(block, crate::model::ContentBlock::Image(_)))
+                            .count(),
+                    },
+                };
+                Some((message.base.parent_id.clone(), prepared))
+            })?;
+    match parent_id {
+        Some(parent) => {
+            if !session.navigate_to(&parent) {
+                return None;
+            }
+        }
+        None => session.reset_leaf(),
+    }
+    Some(prepared)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +710,54 @@ mod tests {
         assert_eq!(session.leaf_id(), Some(first_answer.as_str()));
         assert!(session.get_entry(&first_user).is_some());
         assert!(session.get_entry(&abandoned).is_some());
+    }
+
+    #[test]
+    fn rewind_to_user_entry_branches_before_the_chosen_message() {
+        let mut session = Session::in_memory();
+        let first = session.append_message(session_user("first question"));
+        session.append_message(session_assistant("first answer"));
+        let second = session.append_message(session_user("second question"));
+        let second_answer = session.append_message(session_assistant("second answer"));
+
+        // The first message has no parent: the leaf resets to the root.
+        let mut from_root = session.clone();
+        let prepared = rewind_to_user_entry(&mut from_root, &first).expect("rewind");
+        assert_eq!(prepared.text, "first question");
+        assert_eq!(from_root.leaf_id(), None);
+
+        // A later message: the leaf moves to its parent, and sending again
+        // makes a sibling while the old path stays in the tree.
+        let prepared = rewind_to_user_entry(&mut session, &second).expect("rewind");
+        assert_eq!(prepared.text, "second question");
+        assert_eq!(prepared.dropped_images, 0);
+        assert_eq!(session.entries_for_current_path().len(), 2);
+        let sibling = session.append_message(session_user("second, reworded"));
+        assert_ne!(sibling, second);
+        assert!(session.get_entry(&second_answer).is_some());
+
+        // Not a user message, or not on the current path: refused.
+        assert!(rewind_to_user_entry(&mut session, &second_answer).is_none());
+        assert!(rewind_to_user_entry(&mut session, &second).is_none());
+        assert!(rewind_to_user_entry(&mut session, "no-such-id").is_none());
+    }
+
+    #[test]
+    fn rewind_to_user_entry_keeps_text_and_counts_images() {
+        let mut session = Session::in_memory();
+        let id = session.append_message(SessionMessage::from(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![
+                crate::model::ContentBlock::Text(crate::model::TextContent::new("look at this")),
+                crate::model::ContentBlock::Image(crate::model::ImageContent {
+                    data: String::from("aGk="),
+                    mime_type: String::from("image/png"),
+                }),
+            ]),
+            timestamp: 0,
+        })));
+        let prepared = rewind_to_user_entry(&mut session, &id).expect("rewind");
+        assert_eq!(prepared.text, "look at this");
+        assert_eq!(prepared.dropped_images, 1);
     }
 
     #[test]

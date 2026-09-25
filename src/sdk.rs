@@ -2281,6 +2281,34 @@ impl AgentSessionHandle {
         Ok(text)
     }
 
+    /// OMP `/branch` and double-Esc rewind: move the session leaf to just
+    /// before the user message `entry_id`, so the next prompt lands as its
+    /// sibling while the old path stays in the tree. Returns the message
+    /// for the editor. The agent's context is rebuilt from the new path and
+    /// the move persisted before this returns.
+    pub async fn rewind_to_user_message(
+        &mut self,
+        entry_id: &str,
+    ) -> Result<crate::checkpoint::RewindPreparation> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let (prepared, messages) = {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            let prepared = crate::checkpoint::rewind_to_user_entry(&mut guard, entry_id)
+                .ok_or_else(|| {
+                    Error::session(format!("No user message {entry_id} on this branch"))
+                })?;
+            (prepared, guard.to_messages_for_current_path())
+        };
+        self.session.agent.replace_messages(messages);
+        self.session.persist_session().await?;
+        Ok(prepared)
+    }
+
     /// Read the per-prompt `max_tokens` cap currently configured on the
     /// session's stream options.
     ///

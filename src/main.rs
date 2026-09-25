@@ -2246,6 +2246,9 @@ async fn run(
                 // the classic stack does, so it reads the same setting.
                 gh_path: config.gh_path.clone(),
                 hide_thinking_block: config.hide_thinking_block.unwrap_or(false),
+                double_escape_action: pi::interactive_ftui::DoubleEscapeAction::from_setting(
+                    config.double_escape_action.as_deref(),
+                ),
                 // `/tan` (bd-ydz1t.2) resolves its child model exactly as
                 // the classic stack does: the `task` role, falling back to
                 // `smol`.

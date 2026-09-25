@@ -1925,6 +1925,14 @@ pub enum PiMsg {
     /// state the line shows. The charmed stack renders its own and ignores
     /// this.
     StatusSnapshot(FtuiStatusSnapshot),
+    /// The user messages on the current path, oldest first, as
+    /// `(summary, entry id)`, for the FTUI's `/branch` and double-Esc picker.
+    /// `fork` means the pick forks a new session instead of rewinding in
+    /// place. The charmed stack ignores it.
+    MessagePicker {
+        fork: bool,
+        messages: Vec<(String, String)>,
+    },
     /// Periodic autocomplete refresh tick (background file index).
     AutocompleteRefresh,
     /// Replacement completion catalog (issue #208). The ftui driver sends it

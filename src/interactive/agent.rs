@@ -1005,7 +1005,8 @@ impl PiApp {
             | PiMsg::TerminalTitle(_)
             | PiMsg::AutocompleteCatalog(_)
             | PiMsg::LoginPending { .. }
-            | PiMsg::StatusSnapshot(_) => {}
+            | PiMsg::StatusSnapshot(_)
+            | PiMsg::MessagePicker { .. } => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();

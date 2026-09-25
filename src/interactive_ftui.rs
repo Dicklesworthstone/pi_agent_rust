@@ -1181,7 +1181,7 @@ impl PickerOverlay {
             // Same matching as the classic stack's model selector, provider
             // aliases included ("grok" finds xai models).
             PickerKind::Model => crate::model_selector::full_id_matches_query(query, item),
-            PickerKind::Theme | PickerKind::Session => {
+            PickerKind::Theme | PickerKind::Session | PickerKind::Rewind | PickerKind::ForkFrom => {
                 crate::model_selector::fuzzy_match(query, item)
             }
         }
@@ -1240,6 +1240,38 @@ enum PickerKind {
     /// Session picker (`/resume`): items are display labels, values are
     /// session file paths; selection routes `UiCommand::ResumeSession`.
     Session,
+    /// A user message to rewind to (`/branch`, double-Esc): values are
+    /// entry ids; selection routes `UiCommand::Rewind`.
+    Rewind,
+    /// A user message to fork a new session from (`doubleEscapeAction:
+    /// fork`); selection routes `UiCommand::Fork` with the entry id.
+    ForkFrom,
+}
+
+/// What double-Esc on an idle, empty editor does (`doubleEscapeAction`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoubleEscapeAction {
+    /// OMP's default: pick an earlier message to rewind to.
+    Rewind,
+    /// Pick an earlier message to fork a new session from.
+    Fork,
+    /// Show the session tree summary.
+    Tree,
+    /// Do nothing.
+    None,
+}
+
+impl DoubleEscapeAction {
+    /// Parse the setting. Unset or unrecognized means OMP's `rewind`;
+    /// OMP's legacy `branch` is its old name.
+    pub fn from_setting(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("fork") => Self::Fork,
+            Some("tree") => Self::Tree,
+            Some("none") => Self::None,
+            _ => Self::Rewind,
+        }
+    }
 }
 
 /// Text the user typed in answer to a `/login` prompt. It may be an API key
@@ -1362,6 +1394,12 @@ pub enum UiCommand {
     /// `/fast [on|off|status]`: toggle, set or report fast mode (the
     /// `priority` service tier; OMP `/fast`).
     Fast(FastRequest),
+    /// List the user messages on the current path for the rewind (or, with
+    /// `fork`, fork) picker; the driver answers `PiMsg::MessagePicker`.
+    MessagePicker { fork: bool },
+    /// Rewind the session to just before this user message (OMP `/branch`);
+    /// unrelated to the checkpoint `/rewind`.
+    RewindTo { entry_id: String },
     /// Step the thinking level to the next one this model offers
     /// (`AppAction::CycleThinkingLevel`, shift+tab by default). The driver
     /// owns the decision because only it can see the model's catalog entry;
@@ -1644,6 +1682,10 @@ pub struct PiFtuiModel {
     tools_expanded: bool,
     /// Thinking entries show in full rather than as one line (ctrl+t).
     show_thinking: bool,
+    /// What double-Esc on an idle, empty editor does.
+    double_escape_action: DoubleEscapeAction,
+    /// When Esc last hit an idle, empty editor (the first of a double-Esc).
+    last_idle_escape: Option<Instant>,
     /// Prompts sent this session, oldest first (up/down recall; `/history`).
     input_history: Vec<String>,
     /// Which history entry the editor shows while recalling; `None` when
@@ -1895,6 +1937,8 @@ impl PiFtuiModel {
             last_ctrl_c: None,
             tools_expanded: false,
             show_thinking: false,
+            double_escape_action: DoubleEscapeAction::Rewind,
+            last_idle_escape: None,
             input_history: Vec::new(),
             history_cursor: None,
             history_draft: String::new(),
@@ -1944,6 +1988,13 @@ impl PiFtuiModel {
     #[must_use]
     pub const fn with_thinking_visible(mut self, visible: bool) -> Self {
         self.show_thinking = visible;
+        self
+    }
+
+    /// What double-Esc on an idle, empty editor does (`doubleEscapeAction`).
+    #[must_use]
+    pub const fn with_double_escape_action(mut self, action: DoubleEscapeAction) -> Self {
+        self.double_escape_action = action;
         self
     }
 
@@ -2725,6 +2776,37 @@ impl PiFtuiModel {
             PiMsg::StatusSnapshot(snapshot) => {
                 self.status_snapshot = Some(snapshot);
             }
+            PiMsg::MessagePicker { fork, messages } => {
+                if messages.is_empty() {
+                    self.push_entry(
+                        EntryRole::System,
+                        String::from("No messages to branch from"),
+                    );
+                } else {
+                    // Newest first, so Enter right away takes the last turn;
+                    // numbered as `/fork list` numbers them.
+                    let (items, values) = messages
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .map(|(n, (summary, id))| {
+                            (format!("{}. {}", n + 1, sanitize(summary)), id.clone())
+                        })
+                        .unzip();
+                    let (title, kind) = if fork {
+                        (
+                            "Fork a new session from (Enter to fork, Esc to close)",
+                            PickerKind::ForkFrom,
+                        )
+                    } else {
+                        (
+                            "Rewind to before (Enter: edit and resend it; the old path stays as a branch)",
+                            PickerKind::Rewind,
+                        )
+                    };
+                    self.picker = Some(PickerOverlay::new(title, items, values, kind));
+                }
+            }
             // `/fork` hands the selected message back for rewording; a stale
             // reply for a session no longer shown is dropped.
             PiMsg::SetEditorText {
@@ -3314,7 +3396,7 @@ impl PiFtuiModel {
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
                      /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
-                     /thinking [level], /fast [on|off|status], /theme, /changelog, /clear, /hotkeys, \
+                     /thinking [level], /fast [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
@@ -3497,6 +3579,10 @@ impl PiFtuiModel {
             }
             "/tree" => {
                 self.send_command(UiCommand::TreeSummary);
+                return true;
+            }
+            "/branch" => {
+                self.request_message_picker(false);
                 return true;
             }
             "/fast" => {
@@ -3691,6 +3777,57 @@ impl PiFtuiModel {
                     path: choice.to_string(),
                 });
             }
+            PickerKind::Rewind => {
+                self.scroll_from_tail = 0;
+                self.begin_busy("rewinding ...");
+                self.send_command(UiCommand::RewindTo {
+                    entry_id: choice.to_string(),
+                });
+            }
+            PickerKind::ForkFrom => {
+                self.scroll_from_tail = 0;
+                self.begin_busy("forking session ...");
+                self.send_command(UiCommand::Fork {
+                    args: choice.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Ask the driver for the messages on the current path; the picker opens
+    /// when they arrive (`PiMsg::MessagePicker`). Refused mid-turn: the path
+    /// is still growing.
+    fn request_message_picker(&mut self, fork: bool) {
+        if self.state == AgentUiState::Working {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Wait for the turn to finish (or Esc to stop it) before rewinding"),
+            );
+            return;
+        }
+        self.send_command(UiCommand::MessagePicker { fork });
+    }
+
+    /// Double-Esc on an idle, empty editor runs `doubleEscapeAction`: two
+    /// presses within 500ms, as in OMP and classic.
+    fn note_idle_escape(&mut self) {
+        if self.double_escape_action == DoubleEscapeAction::None {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_idle_escape
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(500))
+        {
+            self.last_idle_escape = None;
+            match self.double_escape_action {
+                DoubleEscapeAction::Rewind => self.request_message_picker(false),
+                DoubleEscapeAction::Fork => self.request_message_picker(true),
+                DoubleEscapeAction::Tree => self.send_command(UiCommand::TreeSummary),
+                DoubleEscapeAction::None => {}
+            }
+        } else {
+            self.last_idle_escape = Some(now);
         }
     }
 
@@ -4103,6 +4240,10 @@ impl PiFtuiModel {
                         {
                             self.push_entry(EntryRole::System, String::from("Aborting..."));
                         }
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt) if self.input.is_empty() && self.busy.is_none() => {
+                        self.note_idle_escape();
                         return Cmd::none();
                     }
                     Some(AppAction::Submit) if self.input_active() => {
@@ -6450,6 +6591,64 @@ async fn run_tree_summary_command(
 
 /// Handle `/thinking`: bare shows the effective level, a parsed level sets
 /// it on the live session (`set_thinking_level` persists the header change).
+/// Send the user messages on the current path for the rewind/fork picker.
+async fn send_message_picker(
+    handle: &crate::sdk::AgentSessionHandle,
+    fork: bool,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let msg = match handle
+        .with_session(crate::interactive::fork_candidates)
+        .await
+    {
+        Ok(candidates) => PiMsg::MessagePicker {
+            fork,
+            messages: candidates
+                .into_iter()
+                .map(|candidate| (candidate.summary, candidate.id))
+                .collect(),
+        },
+        Err(err) => PiMsg::AgentError(format!("messages: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+}
+
+/// OMP `/branch`: rewind to just before a user message, show the shortened
+/// conversation, and hand the message back to the editor to edit and resend.
+/// The old path stays in the session tree.
+async fn run_rewind_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    entry_id: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let prepared = match handle.rewind_to_user_message(entry_id).await {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("rewind: {err}")));
+            return;
+        }
+    };
+    let status = if prepared.dropped_images == 0 {
+        String::from("Rewound; the old path is kept as a branch (/tree)")
+    } else {
+        format!(
+            "Rewound; the old path is kept as a branch (/tree). The message's {} image(s) \
+             were not restored: attach them again with @path",
+            prepared.dropped_images
+        )
+    };
+    send_conversation_reset(handle, agent_tx, &status).await;
+    if let Ok(session_id) = handle
+        .with_session(|session| session.header.id.clone())
+        .await
+    {
+        let _ = agent_tx.send(PiMsg::SetEditorText {
+            owner_session_id: session_id,
+            text: prepared.text,
+        });
+    }
+}
+
 /// What `/fast` was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastRequest {
@@ -7521,6 +7720,8 @@ pub struct FtuiSettings {
     /// one line (ctrl+t still shows it). Off, as in OMP and classic, shows
     /// thinking in full.
     pub hide_thinking_block: bool,
+    /// The `doubleEscapeAction` setting.
+    pub double_escape_action: DoubleEscapeAction,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7542,6 +7743,7 @@ pub fn run(
         cycle_models,
         btw_client,
         hide_thinking_block,
+        double_escape_action,
     } = settings;
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
@@ -7884,6 +8086,12 @@ pub fn run(
                         Ok(UiCommand::Fast(request)) => {
                             let _ = agent_tx.send(run_fast_command(&mut handle, request));
                         }
+                        Ok(UiCommand::MessagePicker { fork }) => {
+                            send_message_picker(&handle, fork, &agent_tx).await;
+                        }
+                        Ok(UiCommand::RewindTo { entry_id }) => {
+                            run_rewind_command(&mut handle, &entry_id, &agent_tx).await;
+                        }
                         Ok(UiCommand::SetThinking(level)) => {
                             run_set_thinking_command(&mut handle, level, &agent_tx).await;
                         }
@@ -8076,6 +8284,7 @@ pub fn run(
         .with_mouse_enabled(!disable_mouse_capture)
         .with_markdown_spacing(markdown_spacing)
         .with_thinking_visible(!hide_thinking_block)
+        .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
@@ -11409,6 +11618,191 @@ mod tests {
         // Providers without a priority tier refuse `on`, as OMP does.
         assert!(fast_mode_realization("groq").is_none());
         assert!(fast_mode_realization("anthropic").is_some());
+    }
+
+    #[test]
+    fn double_escape_on_an_idle_empty_editor_runs_the_configured_action() {
+        let esc_esc = |action: DoubleEscapeAction, typed: &str| {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let model = PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_double_escape_action(action);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, typed);
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            let after_one = submit_rx.try_recv().ok();
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            (after_one, submit_rx.try_recv().ok())
+        };
+        assert_eq!(
+            esc_esc(DoubleEscapeAction::Rewind, ""),
+            (None, Some(UiCommand::MessagePicker { fork: false }))
+        );
+        assert_eq!(
+            esc_esc(DoubleEscapeAction::Fork, ""),
+            (None, Some(UiCommand::MessagePicker { fork: true }))
+        );
+        assert_eq!(
+            esc_esc(DoubleEscapeAction::Tree, ""),
+            (None, Some(UiCommand::TreeSummary))
+        );
+        assert_eq!(esc_esc(DoubleEscapeAction::None, ""), (None, None));
+        // A draft in the editor is never thrown away by a stray double-Esc.
+        assert_eq!(esc_esc(DoubleEscapeAction::Rewind, "draft"), (None, None));
+
+        assert_eq!(
+            DoubleEscapeAction::from_setting(None),
+            DoubleEscapeAction::Rewind
+        );
+        assert_eq!(
+            DoubleEscapeAction::from_setting(Some("branch")),
+            DoubleEscapeAction::Rewind
+        );
+        assert_eq!(
+            DoubleEscapeAction::from_setting(Some(" Fork ")),
+            DoubleEscapeAction::Fork
+        );
+        assert_eq!(
+            DoubleEscapeAction::from_setting(Some("none")),
+            DoubleEscapeAction::None
+        );
+    }
+
+    #[test]
+    fn message_picker_lists_newest_first_and_routes_the_pick() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/branch");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::MessagePicker { fork: false }
+        );
+        let messages = vec![
+            (String::from("first question"), String::from("id-1")),
+            (String::from("second question"), String::from("id-2")),
+        ];
+        sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+            fork: false,
+            messages: messages.clone(),
+        }));
+        let frame = buffer_text(sim.capture_frame(100, 24), 100, 24);
+        let newest = frame.find("2. second question").expect("newest listed");
+        let oldest = frame.find("1. first question").expect("oldest listed");
+        assert!(newest < oldest, "{frame}");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::RewindTo {
+                entry_id: String::from("id-2")
+            }
+        );
+
+        // The fork flavour forks from the picked message instead.
+        sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+            fork: true,
+            messages,
+        }));
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Fork {
+                args: String::from("id-1")
+            }
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+            fork: false,
+            messages: Vec::new(),
+        }));
+        assert!(sim.model().picker.is_none());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text == "No messages to branch from")
+        );
+    }
+
+    #[test]
+    fn rewind_moves_the_leaf_back_and_returns_the_message_to_the_editor() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        runtime.block_on(async {
+            let mut handle = crate::sdk::create_agent_session(crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("dummy-key")),
+                working_directory: Some(cwd.path().to_path_buf()),
+                no_session: true,
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .expect("create session");
+            {
+                let store = handle.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.expect("session lock");
+                for text in ["first question", "second question"] {
+                    session.append_message(crate::session::SessionMessage::User {
+                        content: crate::model::UserContent::Text(String::from(text)),
+                        timestamp: Some(0),
+                    });
+                    session.append_message(crate::session::SessionMessage::from(
+                        crate::model::Message::Assistant(Arc::new(
+                            crate::model::AssistantMessage {
+                                content: vec![crate::model::ContentBlock::Text(
+                                    crate::model::TextContent::new("answer"),
+                                )],
+                                ..Default::default()
+                            },
+                        )),
+                    ));
+                }
+            }
+
+            let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+            send_message_picker(&handle, false, &agent_tx).await;
+            let Ok(PiMsg::MessagePicker { messages, .. }) = agent_rx.try_recv() else {
+                panic!("expected the message list");
+            };
+            let summaries: Vec<&str> = messages.iter().map(|(s, _)| s.as_str()).collect();
+            assert_eq!(summaries, ["first question", "second question"]);
+
+            run_rewind_command(&mut handle, &messages[1].1, &agent_tx).await;
+            let replies: Vec<PiMsg> = agent_rx.try_iter().collect();
+            let Some(PiMsg::ConversationReset {
+                messages: shown, ..
+            }) = replies.first()
+            else {
+                panic!("expected a conversation reset, got {replies:?}");
+            };
+            assert_eq!(shown.len(), 2, "first question and its answer remain");
+            assert!(
+                replies.iter().any(|msg| matches!(
+                    msg,
+                    PiMsg::SetEditorText { text, .. } if text == "second question"
+                )),
+                "{replies:?}"
+            );
+            // The agent's context was rebuilt from the shorter path.
+            assert_eq!(handle.session().agent.messages().len(), 2);
+
+            // A stale id is reported, not silently ignored.
+            run_rewind_command(&mut handle, "no-such-id", &agent_tx).await;
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::AgentError(text)) if text.starts_with("rewind:")
+            ));
+        });
     }
 
     #[test]
