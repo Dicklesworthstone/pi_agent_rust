@@ -326,6 +326,7 @@ pub mod swarm_progress_slo;
 pub mod swarm_replay;
 #[doc(hidden)]
 pub mod terminal_images;
+pub(crate) mod text_completion;
 #[doc(hidden)]
 pub mod theme;
 #[doc(hidden)]
@@ -369,8 +370,7 @@ pub mod fuzz_exports {
     //! Re-exports of internal parsing/deserialization functions for
     //! `cargo-fuzz` / `libFuzzer` harnesses.
     //!
-    //! Enabled only when the `fuzzing` Cargo feature is active.
-    //! The `fuzz/Cargo.toml` depends on this crate with
+    //! Enabled only when the `fuzz/Cargo.toml` depends on this crate with
     //! `features = ["fuzzing"]`.
 
     pub use crate::config::Config;

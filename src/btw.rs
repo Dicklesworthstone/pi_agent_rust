@@ -8,12 +8,12 @@
 //! `--btw` print-mode flag.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use futures::StreamExt;
-
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::{Message, UserContent, UserMessage};
 use crate::provider::Provider;
+use crate::text_completion::{MAX_TEXT_BYTES, collect_text, with_timeout};
 
 /// System contract for side questions (omp btw-user.md semantics).
 pub const BTW_SYSTEM_PROMPT: &str = "You are answering an ephemeral side question about the \
@@ -24,6 +24,8 @@ questions; if the context does not contain the answer, say so plainly.";
 /// cheap regardless of transcript size.
 const CONTEXT_BUDGET_CHARS: usize = 4_000;
 const ANSWER_MAX_TOKENS: u32 = 512;
+/// One deadline covers connection setup and the complete streamed response.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Builds `/btw` clients for resolved model entries (bd-9jgrt). Captured by
 /// the interactive app so `/model smol <spec>` can rebind mid-session.
 pub type BtwClientFactory = std::sync::Arc<
@@ -62,7 +64,8 @@ impl BtwClient {
     }
 
     /// Ask an ephemeral side question with compact context from the current
-    /// conversation tail. Returns only the answer text.
+    /// conversation tail. Returns only a clean, complete answer, never a
+    /// preview left behind by a failed or disconnected provider.
     pub async fn ask(&self, context_summary: &str, question: &str) -> Result<String> {
         let user_text = if context_summary.is_empty() {
             question.to_string()
@@ -83,24 +86,12 @@ impl BtwClient {
             api_key: self.api_key.clone(),
             ..Default::default()
         };
-        let mut stream = self.provider.stream(&context, &options).await?;
-        let mut answer = String::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(crate::model::StreamEvent::TextDelta { delta, .. }) => {
-                    answer.push_str(&delta);
-                }
-                Ok(crate::model::StreamEvent::Done { .. }) => break,
-                Ok(_) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        if answer.trim().is_empty() {
-            return Err(crate::error::Error::api(
-                "side question returned empty reply",
-            ));
-        }
-        Ok(answer)
+        with_timeout(ANSWER_TIMEOUT, async {
+            let stream = self.provider.stream(&context, &options).await?;
+            collect_text(stream, MAX_TEXT_BYTES).await
+        })
+        .await
+        .ok_or_else(|| Error::api("side question timed out"))?
     }
 }
 
@@ -234,13 +225,96 @@ mod tests {
         assert!(summary.len() <= CONTEXT_BUDGET_CHARS + 32);
     }
 
+    struct ScriptedProvider(Vec<crate::model::StreamEvent>);
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait::async_trait]
+    impl Provider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "btw-test"
+        }
+
+        fn api(&self) -> &str {
+            "btw-test"
+        }
+
+        fn model_id(&self) -> &str {
+            "btw-test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            options: &crate::provider::StreamOptions,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
+        > {
+            assert!(context.tools.is_empty());
+            assert_eq!(context.system_prompt.as_deref(), Some(BTW_SYSTEM_PROMPT));
+            assert_eq!(context.messages.len(), 1);
+            assert_eq!(options.max_tokens, Some(ANSWER_MAX_TOKENS));
+            assert_eq!(options.api_key.as_deref(), Some("test-key"));
+            Ok(Box::pin(futures::stream::iter(
+                self.0.clone().into_iter().map(Ok),
+            )))
+        }
+    }
+
+    fn scripted_client(events: Vec<crate::model::StreamEvent>) -> BtwClient {
+        BtwClient::new(Arc::new(ScriptedProvider(events)), Some("test-key".to_string()))
+    }
+
     #[test]
-    fn empty_reply_is_an_error_path() {
-        // Contract documented on BtwClient::ask; verified end-to-end via the
-        // advisor-shaped stub pattern (ScriptedProvider) in e2e lanes — here
-        // we pin the error string so callers can branch on it.
-        let expected = "side question returned empty reply";
-        assert_eq!(expected, "side question returned empty reply");
+    fn ask_accepts_terminal_only_response() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(vec![crate::model::StreamEvent::Done {
+                reason: crate::model::StopReason::Stop,
+                message: crate::model::AssistantMessage {
+                    content: vec![crate::model::ContentBlock::Text(
+                        crate::model::TextContent::new("the answer"),
+                    )],
+                    ..Default::default()
+                },
+            }]);
+            assert_eq!(client.ask("working context", "why?").await.unwrap(), "the answer");
+        });
+    }
+
+    #[test]
+    fn ask_rejects_disconnected_partial_response() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(vec![crate::model::StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "unfinished answer".to_string(),
+            }]);
+            assert!(client.ask("", "why?").await.is_err());
+        });
+    }
+
+    #[test]
+    fn ask_rejects_provider_error_after_partial_response() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(vec![
+                crate::model::StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "unfinished answer".to_string(),
+                },
+                crate::model::StreamEvent::Error {
+                    reason: crate::model::StopReason::Error,
+                    error: crate::model::AssistantMessage {
+                        stop_reason: crate::model::StopReason::Error,
+                        error_message: Some("provider unavailable".to_string()),
+                        ..Default::default()
+                    },
+                },
+            ]);
+            assert!(client
+                .ask("", "why?")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("provider unavailable"));
+        });
     }
 
     #[test]
