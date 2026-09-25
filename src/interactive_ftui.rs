@@ -135,7 +135,7 @@ const AGENT_EVENT_POLL: Duration = Duration::from_millis(50);
 const SPINNER_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Key hint shown in the footer while a picker overlay is open.
-const PICKER_HINT: &str = "↑/↓ j/k navigate · Enter apply · Esc close";
+const PICKER_HINT: &str = "type to filter · ↑/↓ navigate · Enter apply · Esc close";
 
 /// Loop-lag budget. A single `update()` or `view()` call that holds the event
 /// loop this long has stalled it: input sits unread, agent deltas queue, and
@@ -1121,8 +1121,9 @@ pub struct AskUiReply {
 
 /// Modal list picker rendered over the conversation body. All pickers of the
 /// bubbletea stack (theme, model, session, branch) share this shape; while
-/// open it captures every key (Up/Down/j/k navigate, Enter confirms, Esc
-/// closes), matching the modal-capture chain in `update_inner`.
+/// open it captures every key (Up/Down navigate, Enter confirms, Esc
+/// closes, typing filters; j/k navigate until a filter is typed), matching
+/// the modal-capture chain in `update_inner`.
 struct PickerOverlay {
     title: String,
     items: Vec<String>,
@@ -1130,8 +1131,80 @@ struct PickerOverlay {
     /// session picker shows names but selects paths). Empty → items are the
     /// values.
     values: Vec<String>,
+    /// Typed filter (gh #244). Empty shows every item.
+    query: String,
+    /// Indices into `items` that match `query`, in list order.
+    shown: Vec<usize>,
+    /// Position within `shown`, not within `items`.
     selected: usize,
     kind: PickerKind,
+}
+
+impl PickerOverlay {
+    fn new(
+        title: impl Into<String>,
+        items: Vec<String>,
+        values: Vec<String>,
+        kind: PickerKind,
+    ) -> Self {
+        let shown = (0..items.len()).collect();
+        Self {
+            title: title.into(),
+            items,
+            values,
+            query: String::new(),
+            shown,
+            selected: 0,
+            kind,
+        }
+    }
+
+    fn matches(&self, index: usize) -> bool {
+        let query = self.query.trim();
+        if query.is_empty() {
+            return true;
+        }
+        let item = &self.items[index];
+        match self.kind {
+            // Same matching as the classic stack's model selector, provider
+            // aliases included ("grok" finds xai models).
+            PickerKind::Model => crate::model_selector::full_id_matches_query(query, item),
+            PickerKind::Theme | PickerKind::Session => {
+                crate::model_selector::fuzzy_match(query, item)
+            }
+        }
+    }
+
+    /// Recompute `shown` after `query` changed; the selection returns to the
+    /// first match, as on the classic stack.
+    fn refilter(&mut self) {
+        self.shown = (0..self.items.len()).filter(|&i| self.matches(i)).collect();
+        self.selected = 0;
+    }
+
+    fn push_query_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        self.query.push(ch);
+        self.refilter();
+    }
+
+    fn pop_query_char(&mut self) {
+        if self.query.pop().is_some() {
+            self.refilter();
+        }
+    }
+
+    /// The selection value of the highlighted row, if any row is shown.
+    fn take_choice(mut self) -> Option<String> {
+        let index = *self.shown.get(self.selected)?;
+        if self.values.is_empty() {
+            (index < self.items.len()).then(|| self.items.swap_remove(index))
+        } else {
+            (index < self.values.len()).then(|| self.values.swap_remove(index))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2912,13 +2985,12 @@ impl PiFtuiModel {
                         String::from("no models available; use /model <provider>/<model>"),
                     );
                 } else {
-                    self.picker = Some(PickerOverlay {
-                        title: String::from("Model (Enter to switch, Esc to close)"),
-                        items: self.available_models.clone(),
-                        values: Vec::new(),
-                        selected: 0,
-                        kind: PickerKind::Model,
-                    });
+                    self.picker = Some(PickerOverlay::new(
+                        "Model (Enter to switch, Esc to close)",
+                        self.available_models.clone(),
+                        Vec::new(),
+                        PickerKind::Model,
+                    ));
                 }
             } else if let Some((provider, model)) = spec.split_once('/')
                 && !provider.is_empty()
@@ -3119,13 +3191,12 @@ impl PiFtuiModel {
             return true;
         }
         if canon == "/theme" {
-            self.picker = Some(PickerOverlay {
-                title: String::from("Theme (Enter to apply, Esc to close)"),
-                items: vec![String::from("dark"), String::from("light")],
-                values: Vec::new(),
-                selected: 0,
-                kind: PickerKind::Theme,
-            });
+            self.picker = Some(PickerOverlay::new(
+                "Theme (Enter to apply, Esc to close)",
+                vec![String::from("dark"), String::from("light")],
+                Vec::new(),
+                PickerKind::Theme,
+            ));
             return true;
         }
         if canon == "/resume" || canon == "/r" {
@@ -3137,13 +3208,12 @@ impl PiFtuiModel {
                     .iter()
                     .map(|(label, path)| (label.clone(), path.clone()))
                     .unzip();
-                self.picker = Some(PickerOverlay {
-                    title: String::from("Resume session (Enter to load, Esc to close)"),
+                self.picker = Some(PickerOverlay::new(
+                    "Resume session (Enter to load, Esc to close)",
                     items,
                     values,
-                    selected: 0,
-                    kind: PickerKind::Session,
-                });
+                    PickerKind::Session,
+                ));
             }
             return true;
         }
@@ -3397,6 +3467,17 @@ impl PiFtuiModel {
             return;
         }
         let Some(action) = self.picker_action(key) else {
+            // gh #244: anything that is not a picker action edits the
+            // filter. Shift is allowed so capitals and symbols type.
+            if let Some(picker) = self.picker.as_mut() {
+                match key.code {
+                    KeyCode::Backspace if key.modifiers.is_empty() => picker.pop_query_char(),
+                    KeyCode::Char(ch) if (key.modifiers - Modifiers::SHIFT).is_empty() => {
+                        picker.push_query_char(ch);
+                    }
+                    _ => {}
+                }
+            }
             return;
         };
         let page = self.body_height().saturating_sub(1).max(1);
@@ -3409,7 +3490,7 @@ impl PiFtuiModel {
             AppAction::SelectDown => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.selected =
-                        (picker.selected + 1).min(picker.items.len().saturating_sub(1));
+                        (picker.selected + 1).min(picker.shown.len().saturating_sub(1));
                 }
             }
             AppAction::SelectPageUp => {
@@ -3420,30 +3501,25 @@ impl PiFtuiModel {
             AppAction::SelectPageDown => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.selected =
-                        (picker.selected + page).min(picker.items.len().saturating_sub(1));
+                        (picker.selected + page).min(picker.shown.len().saturating_sub(1));
                 }
             }
             AppAction::SelectCancel => {
                 self.picker = None;
             }
             AppAction::SelectConfirm => {
-                let Some(mut picker) = self.picker.take() else {
-                    return;
-                };
-                let len = if picker.values.is_empty() {
-                    picker.items.len()
-                } else {
-                    picker.values.len()
-                };
-                if picker.selected >= len {
+                // Enter with nothing matching the filter keeps the picker
+                // open so the filter can be corrected.
+                if self.picker.as_ref().is_some_and(|p| p.shown.is_empty()) {
                     return;
                 }
-                let choice = if picker.values.is_empty() {
-                    picker.items.swap_remove(picker.selected)
-                } else {
-                    picker.values.swap_remove(picker.selected)
+                let Some(picker) = self.picker.take() else {
+                    return;
                 };
-                self.apply_picker_choice(picker.kind, &choice);
+                let kind = picker.kind;
+                if let Some(choice) = picker.take_choice() {
+                    self.apply_picker_choice(kind, &choice);
+                }
             }
             _ => {}
         }
@@ -3466,7 +3542,8 @@ impl PiFtuiModel {
     }
 
     fn picker_default_alias(&self, key: &ftui::KeyEvent) -> Option<AppAction> {
-        if !key.modifiers.is_empty() {
+        // Once a filter is typed, j and k are letters of it (gh #244).
+        if !key.modifiers.is_empty() || self.picker.as_ref().is_some_and(|p| !p.query.is_empty()) {
             return None;
         }
         let action = match key.code {
@@ -4553,35 +4630,52 @@ impl PiFtuiModel {
     /// rendered: the body used to draw every item from the top, so a `/model`
     /// list longer than the terminal never scrolled and the selection walked
     /// off the bottom edge (gh #228). The title carries the `selected/total`
-    /// position whenever the list is longer than the window.
+    /// position whenever the list is longer than the window, or, once a
+    /// filter is typed, the filter and its match count (gh #244). Only the
+    /// matching items are listed.
     fn render_picker(&self, picker: &PickerOverlay, regions: &Regions, frame: &mut Frame) {
         let title_style = ftui::Style::new().bold().fg(self.palette.accent);
         // One row belongs to the title; the rest show items.
         let visible = usize::from(regions.body.height).saturating_sub(1);
-        let window = picker_window(picker.selected, picker.items.len(), visible);
-        let position;
-        let title = if picker.items.len() > visible {
-            position = format!(
-                " ({}/{})",
-                picker.selected.saturating_add(1),
+        let shown = picker.shown.len();
+        let window = picker_window(picker.selected, shown, visible);
+        // Position when the list overflows the window; the filter and its
+        // match count whenever one is typed (gh #244).
+        let status = if !picker.query.is_empty() {
+            format!(
+                " · filter: {} ({shown}/{})",
+                sanitize(&picker.query),
                 picker.items.len()
-            );
+            )
+        } else if shown > visible {
+            format!(" ({}/{shown})", picker.selected.saturating_add(1))
+        } else {
+            String::new()
+        };
+        let title = if status.is_empty() {
+            ftui::text::Line::styled(picker.title.as_str(), title_style)
+        } else {
             ftui::text::Line::from_spans([
                 ftui::text::Span::styled(picker.title.as_str(), title_style),
-                ftui::text::Span::styled(position.as_str(), title_style.dim()),
+                ftui::text::Span::styled(status.as_str(), title_style.dim()),
             ])
-        } else {
-            ftui::text::Line::styled(picker.title.as_str(), title_style)
         };
         let mut lines = vec![title];
-        for (i, item) in picker
-            .items
+        if shown == 0 {
+            lines.push(ftui::text::Line::styled(
+                "  no matches (Backspace edits the filter)",
+                ftui::Style::new().dim().fg(self.palette.muted),
+            ));
+        }
+        for (pos, &index) in picker
+            .shown
             .iter()
             .enumerate()
             .skip(window.start)
             .take(window.len())
         {
-            let (marker, style) = if i == picker.selected {
+            let item = &picker.items[index];
+            let (marker, style) = if pos == picker.selected {
                 ("▸ ", ftui::Style::new().bold().fg(self.palette.accent))
             } else {
                 ("  ", ftui::Style::new())
@@ -10521,9 +10615,13 @@ mod tests {
         assert!(sim.model().picker.is_some(), "picker did not open");
         assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
 
-        // Plain 'j' and 'down' should not navigate because selectDown was overridden
+        // Plain 'j' and 'down' should not navigate because selectDown was
+        // overridden; the unbound 'j' types into the filter instead (gh #244).
         sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
         assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+        assert_eq!(sim.model().picker.as_ref().unwrap().query, "j");
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::empty()));
+        assert!(sim.model().picker.as_ref().unwrap().query.is_empty());
         sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
         assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
 
@@ -10531,10 +10629,14 @@ mod tests {
         sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
         assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
 
-        // Plain 'k' and 'up' should not navigate because selectUp was overridden
-        sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
-        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+        // 'up' should not navigate because selectUp was overridden, and
+        // plain 'k' is filter text rather than an alias for it.
         sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+        sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().query, "k");
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
         assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
 
         // Rebound 'ctrl+k' navigates up
@@ -10593,13 +10695,12 @@ mod tests {
     #[test]
     fn long_picker_scrolls_to_keep_the_selection_on_screen() {
         let (_tx, mut model) = new_model();
-        model.picker = Some(PickerOverlay {
-            title: String::from("Select model"),
-            items: (0..40).map(|i| format!("provider/model-{i:02}")).collect(),
-            values: Vec::new(),
-            selected: 0,
-            kind: PickerKind::Model,
-        });
+        model.picker = Some(PickerOverlay::new(
+            "Select model",
+            (0..40).map(|i| format!("provider/model-{i:02}")).collect(),
+            Vec::new(),
+            PickerKind::Model,
+        ));
         let mut sim = ProgramSimulator::new(model);
         sim.init();
 
@@ -10651,13 +10752,12 @@ mod tests {
     fn picker_supports_page_up_page_down() {
         let (_tx, mut model) = new_model();
         // Give the picker 20 items so paging has visible effect
-        model.picker = Some(PickerOverlay {
-            title: String::from("Long list"),
-            items: (0..20).map(|i| format!("item-{i}")).collect(),
-            values: Vec::new(),
-            selected: 0,
-            kind: PickerKind::Theme,
-        });
+        model.picker = Some(PickerOverlay::new(
+            "Long list",
+            (0..20).map(|i| format!("item-{i}")).collect(),
+            Vec::new(),
+            PickerKind::Theme,
+        ));
         let mut sim = ProgramSimulator::new(model);
         sim.init();
 
@@ -10704,6 +10804,141 @@ mod tests {
             }
         );
         assert!(sim.model().picker.is_none());
+    }
+
+    fn filter_test_model(
+        models: &[&str],
+    ) -> (ProgramSimulator<PiFtuiModel>, mpsc::Receiver<UiCommand>) {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_models(models.iter().map(|m| (*m).to_string()).collect());
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/model");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "picker did not open");
+        (sim, submit_rx)
+    }
+
+    const FILTER_MODELS: [&str; 4] = [
+        "openai/gpt-5",
+        "anthropic/claude-opus-5",
+        "google/gemini-3-pro",
+        "xai/grok-4",
+    ];
+
+    /// gh #244: typing in the `/model` picker narrows the list, the title
+    /// shows the filter and match count, and Enter picks the highlighted
+    /// match.
+    #[test]
+    fn typing_filters_the_model_picker() {
+        let (mut sim, submit_rx) = filter_test_model(&FILTER_MODELS);
+        type_str(&mut sim, "claude");
+        let rendered = buffer_text(sim.capture_frame(80, 10), 80, 10);
+        assert!(
+            rendered.contains("▸ anthropic/claude-opus-5"),
+            "match not selected: {rendered:?}"
+        );
+        assert!(rendered.contains("filter: claude (1/4)"), "{rendered:?}");
+        assert!(!rendered.contains("openai/gpt-5"), "{rendered:?}");
+        assert!(!rendered.contains("google/gemini"), "{rendered:?}");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetModel {
+                provider: "anthropic".into(),
+                model: "claude-opus-5".into(),
+            }
+        );
+        assert!(sim.model().picker.is_none());
+    }
+
+    /// gh #244: j/k navigate only until a filter is typed; after that they
+    /// are letters of it. Backspace widens the filter again, and provider
+    /// aliases match as on the classic stack ("grok" is an xai alias).
+    #[test]
+    fn model_picker_filter_takes_j_k_and_backspace() {
+        let (mut sim, _submit_rx) = filter_test_model(&FILTER_MODELS);
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+        assert!(sim.model().picker.as_ref().unwrap().query.is_empty());
+
+        type_str(&mut sim, "g");
+        let picker = sim.model().picker.as_ref().unwrap();
+        assert_eq!(picker.selected, 0, "filtering resets the selection");
+        assert_eq!(picker.shown, vec![0, 2, 3]);
+
+        sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
+        let picker = sim.model().picker.as_ref().unwrap();
+        assert_eq!(picker.query, "gk");
+        assert_eq!(picker.shown, vec![3]);
+
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::empty()));
+        let picker = sim.model().picker.as_ref().unwrap();
+        assert_eq!(picker.query, "g");
+        assert_eq!(picker.shown, vec![0, 2, 3]);
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(
+            sim.model().picker.as_ref().unwrap().selected,
+            2,
+            "Down stops at the last match"
+        );
+    }
+
+    /// gh #244: a filter that matches nothing says so, Enter leaves the
+    /// picker open without routing anything, and Esc still closes it.
+    #[test]
+    fn model_picker_with_no_matches_keeps_enter_inert() {
+        let (mut sim, submit_rx) = filter_test_model(&FILTER_MODELS);
+        type_str(&mut sim, "zzz");
+        let rendered = buffer_text(sim.capture_frame(80, 10), 80, 10);
+        assert!(rendered.contains("no matches"), "{rendered:?}");
+        assert!(rendered.contains("filter: zzz (0/4)"), "{rendered:?}");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "Enter closed an empty picker");
+        assert!(submit_rx.try_recv().is_err(), "Enter routed a command");
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(sim.model().picker.is_none());
+    }
+
+    /// gh #244: the `/resume` picker filters on its labels (shifted letters
+    /// type) and still selects the matching session's path.
+    #[test]
+    fn resume_picker_filters_on_labels() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_sessions(vec![
+                (
+                    String::from("fix parser · 12 msgs"),
+                    String::from("/tmp/sessions/a.jsonl"),
+                ),
+                (
+                    String::from("Older run · 3 msgs"),
+                    String::from("/tmp/sessions/b.jsonl"),
+                ),
+            ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/resume");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Char('O'), Modifiers::SHIFT));
+        type_str(&mut sim, "ld");
+        let rendered = buffer_text(sim.capture_frame(80, 10), 80, 10);
+        assert!(rendered.contains("▸ Older run"), "{rendered:?}");
+        assert!(!rendered.contains("fix parser"), "{rendered:?}");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::ResumeSession {
+                path: "/tmp/sessions/b.jsonl".into()
+            }
+        );
     }
 
     /// Deliver one keystroke the way a Windows console does: a Press

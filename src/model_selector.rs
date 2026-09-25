@@ -217,6 +217,21 @@ impl ModelSelectorOverlay {
     }
 }
 
+/// Whether a `provider/model-id` string matches `query` the way this
+/// selector filters: a fuzzy subsequence over the full id, the provider and
+/// the model id, plus the provider's aliases ("grok" finds xai models).
+/// A string without a `/` is treated as a bare model id.
+pub(crate) fn full_id_matches_query(query: &str, full_id: &str) -> bool {
+    let (provider, id) = full_id.split_once('/').unwrap_or(("", full_id));
+    matches_query(
+        query,
+        &ModelKey {
+            provider: provider.to_string(),
+            id: id.to_string(),
+        },
+    )
+}
+
 fn matches_query(query: &str, key: &ModelKey) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -243,7 +258,8 @@ fn matches_query(query: &str, key: &ModelKey) -> bool {
     false
 }
 
-fn fuzzy_match(pattern: &str, value: &str) -> bool {
+/// Case-insensitive subsequence match; whitespace in `pattern` is ignored.
+pub(crate) fn fuzzy_match(pattern: &str, value: &str) -> bool {
     let needle_str = pattern.to_lowercase();
     let haystack_str = value.to_lowercase();
     let mut needle = needle_str.chars().filter(|c| !c.is_whitespace());
@@ -502,6 +518,17 @@ mod tests {
     }
 
     // ── matches_query function ───────────────────────────────────────
+
+    #[test]
+    fn full_id_matches_query_uses_provider_id_and_aliases() {
+        assert!(full_id_matches_query("", "openai/gpt-4o"));
+        assert!(full_id_matches_query("gpt4o", "openai/gpt-4o"));
+        assert!(full_id_matches_query("OPENAI", "openai/gpt-4o"));
+        assert!(full_id_matches_query("grok", "xai/grok-4"));
+        assert!(full_id_matches_query("grok", "xai/some-model"));
+        assert!(!full_id_matches_query("claude", "openai/gpt-4o"));
+        assert!(full_id_matches_query("son", "claude-sonnet"));
+    }
 
     #[test]
     fn matches_query_by_provider() {
