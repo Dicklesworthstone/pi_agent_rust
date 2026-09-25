@@ -95,6 +95,7 @@ pub(crate) use self::agent::extension_commands_for_catalog;
 /// Shared with the ftui stack so `/copy` behaves and reports identically on
 /// both; see the function's own note.
 pub(crate) use self::commands::copy_text_to_clipboard;
+pub(crate) use self::commands::running_under_wsl;
 pub use self::commands::{
     SlashCommand, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
     strip_thinking_level_suffix,

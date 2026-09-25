@@ -88,6 +88,9 @@ pub enum PiFtuiMsg {
         width: u16,
         height: u16,
     },
+    /// A clipboard image paste finished off the loop thread (WSL): the
+    /// `@file` reference to insert, or `None` when there was no image.
+    PastedImage(Option<String>),
 }
 
 impl From<Event> for PiFtuiMsg {
@@ -486,18 +489,25 @@ fn external_editor_task(
     mouse: bool,
 ) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
     move || {
-        if let Err(err) = release_terminal(alt_screen) {
-            return PiFtuiMsg::Agent(PiMsg::AgentError(format!("external editor: {err}")));
-        }
-        let text = run_external_editor(&external_editor_command(), &draft)
-            .map_err(|err| format!("external editor: {err}"));
-        match reacquire_terminal(alt_screen, mouse) {
-            Ok((width, height)) => PiFtuiMsg::Edited {
-                text,
-                width,
-                height,
-            },
-            Err(err) => PiFtuiMsg::Agent(PiMsg::AgentError(format!("external editor: {err}"))),
+        // Always answer with `Edited` (errors in `text`): it is the message
+        // that clears `suspending` and repaints, whatever went wrong.
+        let text = release_terminal(alt_screen)
+            .map_err(|err| format!("external editor: {err}"))
+            .and_then(|()| {
+                run_external_editor(&external_editor_command(), &draft)
+                    .map_err(|err| format!("external editor: {err}"))
+            });
+        let (text, (width, height)) = match reacquire_terminal(alt_screen, mouse) {
+            Ok(size) => (text, size),
+            Err(err) => (
+                Err(format!("external editor: terminal not restored: {err}")),
+                crossterm::terminal::size().unwrap_or((80, 24)),
+            ),
+        };
+        PiFtuiMsg::Edited {
+            text,
+            width,
+            height,
         }
     }
 }
@@ -631,10 +641,12 @@ fn last_url(transcript: &[TranscriptEntry]) -> Option<String> {
 fn open_in_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = std::process::Command::new("open");
+    // Not `cmd /c start`: cmd re-parses the URL, so `&`, `|` or `^` in a link
+    // taken from model or tool output would run as commands.
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/c", "start", ""]);
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
         command
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -2216,6 +2228,17 @@ impl PiFtuiModel {
         });
     }
 
+    /// Put a pasted image's `@file` reference in the draft, or say there was
+    /// no image.
+    fn insert_pasted_image(&mut self, reference: Option<String>) {
+        match reference {
+            Some(reference) => self.input.insert_text(&format!("{reference} ")),
+            None => {
+                self.error_banner = Some(String::from("No image on the clipboard to paste."));
+            }
+        }
+    }
+
     /// Remember a sent prompt for recall (consecutive repeats collapse) and
     /// leave recall mode.
     fn record_history(&mut self, text: &str) {
@@ -2232,12 +2255,14 @@ impl PiFtuiModel {
         }
     }
 
-    /// Up/down recall applies to the plain editor with a one-line draft.
+    /// Up/down recall applies to the plain editor with a one-line draft, and
+    /// keeps applying once recall has begun (a recalled entry may itself be
+    /// multi-line; stopping there would strand the user mid-history).
     fn history_navigable(&self) -> bool {
         self.input_active()
             && self.active_ask.is_none()
             && self.active_ext.is_none()
-            && !self.input.text().contains('\n')
+            && (self.history_cursor.is_some() || !self.input.text().contains('\n'))
     }
 
     /// Show the next-older prompt (staying on the oldest).
@@ -3832,9 +3857,21 @@ impl PiFtuiModel {
                     .is_some_and(|at| at.elapsed() < CTRL_C_EXIT_WINDOW);
                 if ctrl_c && !double_tap {
                     self.last_ctrl_c = Some(std::time::Instant::now());
-                    self.input.set_text("");
-                    self.autocomplete.close();
-                    self.error_banner = Some(String::from("Press ctrl+c again to exit"));
+                    if self.picker.is_some() {
+                        // An open picker is what the first press dismisses;
+                        // the draft behind it is not touched.
+                        self.picker = None;
+                    } else {
+                        self.input.set_text("");
+                        self.autocomplete.close();
+                        self.history_cursor = None;
+                        self.history_draft.clear();
+                    }
+                    // A real error stays visible rather than being replaced
+                    // by the hint.
+                    if self.error_banner.is_none() {
+                        self.error_banner = Some(String::from("Press ctrl+c again to exit"));
+                    }
                     return Cmd::none();
                 }
                 if ctrl_c {
@@ -4075,8 +4112,11 @@ impl PiFtuiModel {
                             && self.active_ask.is_none()
                             && self.active_ext.is_none() =>
                     {
-                        // Frozen like a suspend: the terminal belongs to the
-                        // editor until the task reports back.
+                        // Run the editor right here, on the loop thread: as a
+                        // `Cmd::task` the loop kept polling the tty, so pi and
+                        // the editor raced for keystrokes and pi's renders
+                        // landed on the editor's screen. Blocking `update`
+                        // stops both until the editor exits.
                         self.suspending = true;
                         let draft = self.input.text();
                         #[cfg(test)]
@@ -4085,7 +4125,7 @@ impl PiFtuiModel {
                         });
                         #[cfg(not(test))]
                         let task = external_editor_task(draft, self.alt_screen, self.mouse);
-                        return Cmd::task(task);
+                        return self.update(task());
                     }
                     Some(AppAction::PasteImage)
                         if self.input_active()
@@ -4093,14 +4133,17 @@ impl PiFtuiModel {
                             && self.active_ext.is_none() =>
                     {
                         // The pasted screenshot is attached when the prompt
-                        // is sent, through its `@file` reference.
-                        match crate::interactive::paste_clipboard_image_ref() {
-                            Some(reference) => self.input.insert_text(&format!("{reference} ")),
-                            None => {
-                                self.error_banner =
-                                    Some(String::from("No image on the clipboard to paste."));
-                            }
+                        // is sent, through its `@file` reference. Under WSL
+                        // the paste starts powershell.exe (seconds), so it
+                        // runs off the loop thread there.
+                        if crate::interactive::running_under_wsl() {
+                            return Cmd::task(|| {
+                                PiFtuiMsg::PastedImage(
+                                    crate::interactive::paste_clipboard_image_ref(),
+                                )
+                            });
                         }
+                        self.insert_pasted_image(crate::interactive::paste_clipboard_image_ref());
                         return Cmd::none();
                     }
                     Some(AppAction::ExpandTools) => {
@@ -4520,7 +4563,9 @@ impl Model for PiFtuiModel {
     fn update(&mut self, msg: PiFtuiMsg) -> Cmd<PiFtuiMsg> {
         let probe = self.watchdog.start();
         let phase = match &msg {
-            PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } => LoopPhase::Input,
+            PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } | PiFtuiMsg::PastedImage(_) => {
+                LoopPhase::Input
+            }
             PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed => LoopPhase::AgentEvent,
         };
         let cmd = match msg {
@@ -4540,6 +4585,10 @@ impl Model for PiFtuiModel {
                     Err(err) => self.error_banner = Some(err),
                 }
                 cmd
+            }
+            PiFtuiMsg::PastedImage(reference) => {
+                self.insert_pasted_image(reference);
+                Cmd::none()
             }
             PiFtuiMsg::Agent(agent) => self.handle_agent(agent),
             // Back from a SIGTSTP stop: the suspend task already re-acquired
@@ -7437,7 +7486,21 @@ pub fn run(
                                     .await;
                                 }
                                 Err(err) => {
-                                    let _ = agent_tx.send(PiMsg::AgentError(err));
+                                    // Nothing was sent: hand the prompt back to
+                                    // the editor (the UI already cleared it),
+                                    // as the classic stack keeps it.
+                                    if let Ok(owner_session_id) = handle
+                                        .with_session(|session| session.header.id.clone())
+                                        .await
+                                    {
+                                        let _ = agent_tx.send(PiMsg::SetEditorText {
+                                            owner_session_id,
+                                            text: prompt,
+                                        });
+                                    }
+                                    let _ = agent_tx.send(PiMsg::AgentError(format!(
+                                        "Not sent: {err}"
+                                    )));
                                 }
                             }
                         }
@@ -8119,6 +8182,14 @@ mod tests {
         assert_eq!(sim.model().input.text(), "rewritten in vim");
         assert!(!sim.model().suspending, "the repaint path unfreezes");
         assert_eq!(sim.model().term, (100, 30));
+        // The editor runs inside `update`, not as a task: a task left the
+        // event loop polling the tty the editor was using.
+        assert!(
+            !sim.command_log()
+                .iter()
+                .any(|record| matches!(record, CmdRecord::Task)),
+            "ctrl+g must block the loop, not spawn a task"
+        );
     }
 
     /// A failed edit keeps the draft and says why.
@@ -8256,6 +8327,34 @@ mod tests {
         assert!(sim.model().input.is_empty(), "the draft is cleared");
         sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
         assert!(!sim.is_running());
+    }
+
+    /// With a picker open, the first ctrl+c closes the picker and leaves the
+    /// draft; a real error banner is not replaced by the hint.
+    #[test]
+    fn ctrl_c_closes_an_open_picker_before_touching_the_draft() {
+        let (_tx, model) = new_model();
+        let model = model.with_available_models(vec![
+            String::from("openai/gpt-5"),
+            String::from("anthropic/claude-x"),
+        ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "keep this draft");
+        sim.model_mut().error_banner = Some(String::from("provider said no"));
+        sim.inject_event(key(KeyCode::Char('l'), Modifiers::CTRL));
+        assert!(
+            sim.model().picker.is_some(),
+            "ctrl+l opens the model picker"
+        );
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        assert!(sim.is_running());
+        assert!(sim.model().picker.is_none(), "the picker is dismissed");
+        assert_eq!(sim.model().input.text(), "keep this draft");
+        assert_eq!(
+            sim.model().error_banner.as_deref(),
+            Some("provider said no")
+        );
     }
 
     /// Outside the window, a press only clears again.
@@ -13047,6 +13146,30 @@ mod tests {
         sim.model_mut().input.set_text("line one\nline two");
         sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
         assert_eq!(sim.model().input.text(), "line one\nline two");
+    }
+
+    /// Recall walks past a multi-line entry in both directions and back to
+    /// the draft; it used to stop dead on the first multi-line entry.
+    #[test]
+    fn recall_walks_through_a_multiline_entry() {
+        let (_tx, mut model) = new_model();
+        model.record_history("oldest");
+        model.record_history("two\nlines");
+        model.record_history("newest");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "draft");
+        let up = || key(KeyCode::Up, Modifiers::empty());
+        let down = || key(KeyCode::Down, Modifiers::empty());
+        sim.inject_event(up());
+        sim.inject_event(up());
+        assert_eq!(sim.model().input.text(), "two\nlines");
+        sim.inject_event(up());
+        assert_eq!(sim.model().input.text(), "oldest");
+        sim.inject_event(down());
+        sim.inject_event(down());
+        sim.inject_event(down());
+        assert_eq!(sim.model().input.text(), "draft");
     }
 
     /// A turn that thinks, speaks, calls a tool and speaks again reads in

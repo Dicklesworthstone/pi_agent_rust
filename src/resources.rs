@@ -2104,8 +2104,13 @@ fn block_scalar_folds(value: &str) -> Option<bool> {
         .then_some(folded)
 }
 
+/// Leading ASCII spaces and tabs, in bytes. Only those count as YAML
+/// indentation; `trim_start` would also eat Unicode spaces (NBSP, U+3000),
+/// and slicing a line at that width can land inside a multi-byte char.
 fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start().len()
+    line.bytes()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count()
 }
 
 /// Read a block scalar's lines (those indented deeper than its key) and
@@ -3629,6 +3634,23 @@ mod tests {
         );
         assert!(validate_frontmatter_fields(parsed.frontmatter.keys()).is_empty());
         assert_eq!(parsed.body, "body");
+    }
+
+    /// A Unicode space is not YAML indentation: a block line led by NBSP
+    /// must not be sliced mid-character (it used to panic skill loading).
+    #[test]
+    fn test_parse_frontmatter_block_scalar_survives_unicode_spaces() {
+        let parsed = parse_frontmatter(
+            "---\ndescription: >\n  one\n \u{a0}two\n\u{3000}three\nname: x\n---\n",
+        );
+        assert_eq!(
+            parsed.frontmatter.get("description").map(String::as_str),
+            Some("one")
+        );
+        assert_eq!(
+            parsed.frontmatter.get("name").map(String::as_str),
+            Some("x")
+        );
     }
 
     #[test]
