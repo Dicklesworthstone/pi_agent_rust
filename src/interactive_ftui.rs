@@ -1667,6 +1667,9 @@ pub struct PiFtuiModel {
     model_names: HashMap<String, String>,
     /// Set by `/exit`//`/quit`; the update loop turns it into `Cmd::quit()`.
     pending_quit: bool,
+    /// Raised by `/restart` before quitting; `run` relaunches once the
+    /// session is saved. `None` in tests and embedders without the hook.
+    restart_request: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// `(display label, session path)` entries for the `/resume` picker.
     available_sessions: Vec<(String, String)>,
     /// Keybinding catalog, loaded from the user's config by the launch path
@@ -1993,6 +1996,7 @@ impl PiFtuiModel {
             available_models: Vec::new(),
             model_names: HashMap::new(),
             pending_quit: false,
+            restart_request: None,
             available_sessions: Vec::new(),
             keybindings: KeyBindings::default(),
             ext_status: None,
@@ -2152,6 +2156,13 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_models(mut self, models: Vec<String>) -> Self {
         self.available_models = models;
+        self
+    }
+
+    /// The flag `/restart` raises before quitting (see `run`).
+    #[must_use]
+    pub fn with_restart_request(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.restart_request = Some(flag);
         self
     }
 
@@ -3308,6 +3319,27 @@ impl PiFtuiModel {
         // Case-insensitive tokens (SlashCommand::parse parity): compare on
         // an ASCII-lowercased copy; args keep their original case.
         let canon = clean.to_ascii_lowercase();
+        // OMP /restart: relaunch with the same flags, reopening this session
+        // (`run` does it once the session is saved and the terminal restored).
+        if canon == "/restart" {
+            if self.state == AgentUiState::Working {
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from(
+                        "Wait for the turn to finish (or Esc to stop it) before restarting",
+                    ),
+                );
+            } else if let Some(flag) = &self.restart_request {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.pending_quit = true;
+            } else {
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from("/restart is not available here"),
+                );
+            }
+            return true;
+        }
         if canon == "/exit" || canon == "/quit" || canon == "/q" {
             self.pending_quit = true;
             return true;
@@ -3546,7 +3578,7 @@ impl PiFtuiModel {
                      /security [paths], /plugins, /open, /reload-plugins, \
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
                      /context, /todo, /jobs, /stats, /help, \
-                     /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
+                     /restart, /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
                 ),
             );
@@ -7930,6 +7962,12 @@ pub fn run(
         cycle_models
     };
     let driver_available_models = available_models.clone();
+    // `/restart`: the UI raises the flag and quits; the driver, once it has
+    // saved and shut the session down, records the session file to reopen.
+    let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let restart_session: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+    let driver_restart_requested = Arc::clone(&restart_requested);
+    let driver_restart_session = Arc::clone(&restart_session);
     // Issue #208: the driver re-sends the catalog with extension commands
     // once its session exists; the model starts from the resource catalog.
     let driver_catalog = autocomplete.catalog.clone();
@@ -8401,11 +8439,22 @@ pub fn run(
                         Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                     }
                 }
+                let session_store = handle.session_store();
                 let shutdown = if replacement_failure.is_some() {
                     handle.discard_uncommitted_resources().await
                 } else {
                     handle.shutdown_owned_resources().await
                 };
+                if driver_restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let saved = match session_store.lock(cx.cx()).await {
+                        Ok(session) => session.path.clone().filter(|path| path.is_file()),
+                        Err(_) => None,
+                    };
+                    if let Ok(mut slot) = driver_restart_session.lock() {
+                        *slot = saved;
+                    }
+                }
                 Some((shutdown, replacement_failure))
             });
             let Some((shutdown, replacement_failure)) = shutdown else {
@@ -8468,6 +8517,7 @@ pub fn run(
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
         .with_model_names(model_names)
+        .with_restart_request(Arc::clone(&restart_requested))
         .with_available_sessions(available_sessions)
         .with_alt_screen(!inline)
         .with_mouse_enabled(!disable_mouse_capture)
@@ -8499,7 +8549,115 @@ pub fn run(
     // The UI (and with it the submit sender) is gone; the driver's next poll
     // sees Disconnected and unwinds. Await the teardown result so final save
     // or resource-shutdown failures cannot be reported as a successful exit.
-    finish_ftui_run(result, driver.join())
+    finish_ftui_run(result, driver.join())?;
+    // Restart only after a clean teardown: the session is saved and the
+    // terminal is the user's again.
+    if restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        let session = restart_session.lock().ok().and_then(|mut slot| slot.take());
+        return restart_process(&restart_argv(
+            std::env::args_os().skip(1),
+            session.as_deref(),
+        ));
+    }
+    Ok(())
+}
+
+/// argv for `/restart` (OMP `restartArgv`): the launch flags without the
+/// positional arguments (an initial prompt must not be sent again) or the
+/// session-source flags (`-c`, `-r`, `--session`), then `--session <file>`
+/// when this session was saved. Which flags take a value comes from the CLI
+/// definition itself; an unknown (extension) flag keeps a following
+/// non-flag argument as its value.
+fn restart_argv(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    session: Option<&std::path::Path>,
+) -> Vec<std::ffi::OsString> {
+    use clap::CommandFactory;
+    let command = crate::cli::Cli::command();
+    let mut valued: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for arg in command.get_arguments() {
+        let takes_value = arg.get_action().takes_values();
+        for name in arg
+            .get_long_and_visible_aliases()
+            .into_iter()
+            .flatten()
+            .map(|long| format!("--{long}"))
+            .chain(
+                arg.get_short_and_visible_aliases()
+                    .into_iter()
+                    .flatten()
+                    .map(|short| format!("-{short}")),
+            )
+        {
+            if takes_value {
+                valued.insert(name.clone());
+            }
+            known.insert(name);
+        }
+    }
+    let session_source = ["-c", "--continue", "-r", "--resume", "--session"];
+
+    let args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let text = arg.to_string_lossy();
+        if text == "--" {
+            break;
+        }
+        if !text.starts_with('-') || text == "-" {
+            i += 1;
+            continue;
+        }
+        let (flag, inline_value) = match text.split_once('=') {
+            Some((flag, _)) if text.starts_with("--") => (flag.to_string(), true),
+            _ => (text.to_string(), false),
+        };
+        let next_is_value = args
+            .get(i + 1)
+            .is_some_and(|next| !next.to_string_lossy().starts_with('-'));
+        let consumes_next = !inline_value
+            && if known.contains(&flag) {
+                valued.contains(&flag)
+            } else {
+                next_is_value
+            };
+        if !session_source.contains(&flag.as_str()) {
+            kept.push(arg.clone());
+            if consumes_next {
+                kept.push(args[i + 1].clone());
+            }
+        }
+        i += if consumes_next { 2 } else { 1 };
+    }
+    if let Some(session) = session {
+        kept.push("--session".into());
+        kept.push(session.as_os_str().to_owned());
+    }
+    kept
+}
+
+/// Replace this process with a fresh `pi` run with `args` (Unix exec); on
+/// Windows, run it and exit with its status.
+fn restart_process(args: &[std::ffi::OsString]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let exe = std::env::current_exe()?;
+    let _ = std::io::stdout().flush();
+    let mut command = std::process::Command::new(exe);
+    command.args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Only returns on failure.
+        Err(command.exec())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 /// Whether a key event is user input. Release events are reported by
@@ -9675,6 +9833,89 @@ mod tests {
         assert!(
             outcome.contains("lipboard"),
             "unexpected copy outcome: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn restart_argv_keeps_launch_flags_and_reopens_this_session() {
+        let argv = |args: &[&str]| {
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        let kept = restart_argv(
+            argv(&[
+                "--provider",
+                "openai",
+                "-c",
+                "--model",
+                "gpt-5",
+                "fix the bug", // the initial prompt: never sent twice
+                "--session",
+                "/old/session.jsonl",
+                "--trust",
+                "also positional",
+                "--thinking=high",
+                "--session=/older.jsonl",
+                "--extension",
+                "ext.js",
+                "--my-ext-flag", // unknown: keeps its value
+                "on",
+                "-r",
+                "--",
+                "--literal prompt",
+            ]),
+            Some(std::path::Path::new("/saved/now.jsonl")),
+        );
+        assert_eq!(
+            kept,
+            argv(&[
+                "--provider",
+                "openai",
+                "--model",
+                "gpt-5",
+                "--trust",
+                "--thinking=high",
+                "--extension",
+                "ext.js",
+                "--my-ext-flag",
+                "on",
+                "--session",
+                "/saved/now.jsonl",
+            ])
+        );
+        // Nothing saved yet (or --no-session): the same flags, fresh session.
+        assert_eq!(
+            restart_argv(argv(&["--no-session", "-c", "hi"]), None),
+            argv(&["--no-session"])
+        );
+    }
+
+    #[test]
+    fn slash_restart_raises_the_flag_and_quits_when_idle() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim =
+            ProgramSimulator::new(PiFtuiModel::new(rx).with_restart_request(Arc::clone(&flag)));
+        sim.init();
+        type_str(&mut sim, "/restart");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(sim.model().pending_quit, "quits so run() can relaunch");
+
+        // Without the launch hook (tests, embedders) it says so instead of
+        // quitting.
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+        sim.init();
+        type_str(&mut sim, "/restart");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(!sim.model().pending_quit);
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "/restart is not available here")
         );
     }
 

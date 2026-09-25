@@ -1380,6 +1380,89 @@ fn e2e_ftui_continue_reopens_the_previous_session() {
     session.write_artifacts();
 }
 
+const FTUI_RESTART_TEST_NAME: &str = "e2e_ftui_restart";
+
+/// OMP `/restart`: after a real turn, `/restart` tears the UI down, saves
+/// the session, and re-execs pi with the launch flags plus `--session
+/// <file>`. The relaunch shows the earlier turn from history, followed by the
+/// startup banner, while the first launch showed the banner BEFORE the turn:
+/// that ordering is what proves a new process drew the screen rather than
+/// the old frame surviving.
+#[test]
+fn e2e_ftui_restart_relaunches_into_the_same_session() {
+    let Some((_lock, session)) = new_locked_session(FTUI_RESTART_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let args = ftui_vcr_args_with_session(true, false);
+    let system_prompt = ftui_vcr_system_prompt_for(&args, session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_RESTART_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
+    let stderr_log = session.harness.temp_path("pi-stderr-restart.log");
+    let script_path = session.harness.temp_path("restart.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_RESTART_TEST_NAME,
+        &args,
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    let before = session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    let banner_first = |pane: &str| {
+        pane.find("pi interactive stack")
+            .zip(pane.find("ftui-vcr-response-marker"))
+            .map(|(banner, marker)| banner < marker)
+    };
+    assert_eq!(banner_first(&before), Some(true), "first launch:\n{before}");
+    // The reply text lands before the turn ends; commands typed mid-turn are
+    // refused, so wait for the turn's usage footer.
+    session
+        .tmux
+        .wait_for_pane_contains("tokens ", COMMAND_TIMEOUT);
+
+    session.tmux.send_literal("/restart");
+    session.tmux.send_key("Enter");
+    let start = std::time::Instant::now();
+    let after = loop {
+        let pane = session.tmux.capture_pane();
+        if banner_first(&pane) == Some(false) {
+            break pane;
+        }
+        assert!(
+            start.elapsed() < STARTUP_TIMEOUT,
+            "no relaunch into the saved session; pane:\n{pane}\nstderr tail:\n{}",
+            std::fs::read_to_string(&stderr_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        after.contains(FTUI_VCR_PROMPT),
+        "the relaunch shows the earlier user turn from history:\n{after}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
 /// Every `*.jsonl` under the harness sessions root, at any depth: sessions are
 /// filed under an encoded-cwd subdirectory.
 fn walk_session_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
