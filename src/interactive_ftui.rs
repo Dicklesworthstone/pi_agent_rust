@@ -1190,6 +1190,17 @@ impl PickerOverlay {
         self.refilter();
     }
 
+    /// Pasted text joins the filter (the classic selector takes pastes the
+    /// same way). Line breaks and other control characters are dropped.
+    fn push_query_str(&mut self, text: &str) {
+        let before = self.query.len();
+        self.query
+            .extend(text.chars().filter(|ch| !ch.is_control()));
+        if self.query.len() != before {
+            self.refilter();
+        }
+    }
+
     fn pop_query_char(&mut self) {
         if self.query.pop().is_some() {
             self.refilter();
@@ -4155,6 +4166,13 @@ impl PiFtuiModel {
                 // Re-clamp: a taller window may make the old offset overshoot.
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
             }
+            // gh #244: an open picker is modal, so a paste edits its filter
+            // instead of landing unseen in the editor behind it.
+            Event::Paste(paste) if self.picker.is_some() => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.push_query_str(&paste.text);
+                }
+            }
             _ => {
                 if self.input_active() && self.input.handle_event(event) {
                     // Paste and other editor-relevant events flow through.
@@ -7090,12 +7108,32 @@ async fn send_conversation_reset(
     }
 }
 
+/// `shell_path` and `shell_command_prefix` from settings, for `!command`.
+/// The classic stack always passed them; this stack ran the default shell
+/// regardless, so a configured `shell_path` (the documented fix on Windows
+/// when no bash is found, GH #182) had no effect on `!command`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BashUiShell {
+    path: Option<String>,
+    command_prefix: Option<String>,
+}
+
+impl BashUiShell {
+    fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            path: config.shell_path.clone(),
+            command_prefix: config.shell_command_prefix.clone(),
+        }
+    }
+}
+
 /// Run a `!command` for the driver loop: tool-status blips around the shared
 /// bash runner, result rendered via the session display formatter. Returns
 /// the display text on success so the caller can submit it as a turn
 /// (`!` context-inclusion); `!!` gets the exclusion note appended.
 async fn run_bash_ui_command(
     cwd: &std::path::Path,
+    shell: &BashUiShell,
     command: &str,
     exclude: bool,
     agent_tx: &Sender<PiMsg>,
@@ -7109,7 +7147,15 @@ async fn run_bash_ui_command(
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
     });
-    let result = crate::tools::run_bash_command(cwd, None, None, command, None, None).await;
+    let result = crate::tools::run_bash_command(
+        cwd,
+        shell.path.as_deref(),
+        shell.command_prefix.as_deref(),
+        command,
+        None,
+        None,
+    )
+    .await;
     let output = match result {
         Ok(result) => {
             let display = crate::session::bash_execution_to_text(
@@ -7294,6 +7340,10 @@ pub fn run(
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
     let bash_cwd = driver_bash_cwd(&session_options);
+    let bash_shell = resource_source
+        .as_ref()
+        .map(|source| BashUiShell::from_config(&source.config))
+        .unwrap_or_default();
     let resume_template = resume_template_from(&session_options);
     // Issue #205: shared slot so Ctrl-C on the UI thread can abort the
     // driver's in-flight prompt turn instead of waiting it out.
@@ -7397,8 +7447,14 @@ pub fn run(
                         Ok(UiCommand::Bash { command, exclude }) => {
                             // `!` semantics: the output becomes the next
                             // turn's user content (submit_content parity).
-                            if let Some(output) =
-                                run_bash_ui_command(&bash_cwd, &command, exclude, &agent_tx).await
+                            if let Some(output) = run_bash_ui_command(
+                                &bash_cwd,
+                                &bash_shell,
+                                &command,
+                                exclude,
+                                &agent_tx,
+                            )
+                            .await
                                 && !exclude
                             {
                                 run_prompt_turn(
@@ -10938,6 +10994,80 @@ mod tests {
             UiCommand::ResumeSession {
                 path: "/tmp/sessions/b.jsonl".into()
             }
+        );
+    }
+
+    /// gh #244: a paste while a picker is open edits its filter (line
+    /// breaks dropped) rather than landing in the hidden editor.
+    #[test]
+    fn paste_into_open_picker_edits_the_filter() {
+        let (mut sim, _submit_rx) = filter_test_model(&FILTER_MODELS);
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new("claude\r\n", true)));
+        let picker = sim.model().picker.as_ref().expect("picker stays open");
+        assert_eq!(picker.query, "claude");
+        assert_eq!(picker.shown, vec![1]);
+        assert!(
+            sim.model().input.is_empty(),
+            "paste leaked into the editor: {:?}",
+            sim.model().input.text()
+        );
+        // A paste of only control characters leaves the filter alone.
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new("\n", true)));
+        assert_eq!(sim.model().picker.as_ref().unwrap().query, "claude");
+    }
+
+    /// GH #182: `!command` on this stack honors `shell_path` and
+    /// `shell_command_prefix` from settings, as the classic stack does.
+    #[cfg(unix)]
+    #[test]
+    fn bash_ui_command_uses_configured_shell_and_prefix() {
+        let config = crate::config::Config {
+            shell_path: Some(String::from("/bin/sh")),
+            shell_command_prefix: Some(String::from("PI_GH182=prefixed")),
+            ..crate::config::Config::default()
+        };
+        let shell = BashUiShell::from_config(&config);
+        assert_eq!(shell.path.as_deref(), Some("/bin/sh"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (agent_tx, _agent_rx) = mpsc::channel();
+        let output = runtime.block_on(run_bash_ui_command(
+            dir.path(),
+            &shell,
+            "echo \"value=$PI_GH182\"",
+            false,
+            &agent_tx,
+        ));
+        let output = output.expect("command ran");
+        assert!(output.contains("value=prefixed"), "{output}");
+
+        // A configured shell that does not exist is used, not silently
+        // replaced by the default: the run fails and names it.
+        let missing = BashUiShell {
+            path: Some(String::from("/nonexistent/pi-gh182-shell")),
+            command_prefix: None,
+        };
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let output = runtime.block_on(run_bash_ui_command(
+            dir.path(),
+            &missing,
+            "true",
+            false,
+            &agent_tx,
+        ));
+        assert!(output.is_none());
+        let errors: Vec<String> = agent_rx
+            .try_iter()
+            .filter_map(|msg| match msg {
+                PiMsg::AgentError(err) => Some(err),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            errors.iter().any(|err| err.contains("pi-gh182-shell")),
+            "{errors:?}"
         );
     }
 

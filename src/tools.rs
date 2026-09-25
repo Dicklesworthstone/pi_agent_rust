@@ -7072,10 +7072,21 @@ impl WindowsShellEnv {
             local_app_data: var("LOCALAPPDATA"),
             system_root: var("SystemRoot"),
             path_dirs: std::env::var_os("PATH")
-                .map(|path| std::env::split_paths(&path).collect())
+                .map(|path| absolute_path_dirs(&path))
                 .unwrap_or_default(),
         }
     }
+}
+
+/// The absolute directories of a `PATH` value. An empty entry (a stray or
+/// trailing `;` is common on Windows) or a relative one such as `.` would
+/// otherwise make a `bash.exe` in the current directory, e.g. one committed
+/// to the repository being worked on, the shell every command runs through.
+#[cfg(any(windows, test))]
+fn absolute_path_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .collect()
 }
 
 /// Whether `path` is WSL's `bash.exe` launcher (`System32\bash.exe`, or the
@@ -7171,7 +7182,7 @@ pub(crate) async fn run_bash_command(
     let shell = shell.as_str();
 
     let mut cmd = command_with_default_sigpipe_in_dir(shell, cwd)
-        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell {shell}: {e}")))?;
     cmd.arg("-c")
         .arg(&command)
         .current_dir(cwd)
@@ -15068,6 +15079,20 @@ mod tests {
                 .join("bin")
                 .join("bash.exe")
         ));
+    }
+
+    /// Empty and relative `PATH` entries are never searched for bash.exe.
+    #[test]
+    fn windows_bash_path_skips_empty_and_relative_entries() {
+        let absolute = std::env::temp_dir();
+        let path = std::env::join_paths([
+            PathBuf::new(),
+            PathBuf::from("."),
+            PathBuf::from("relative").join("bin"),
+            absolute.clone(),
+        ])
+        .expect("joinable PATH");
+        assert_eq!(absolute_path_dirs(&path), vec![absolute]);
     }
 
     /// The process environment reader runs on every OS; `PATH` is always

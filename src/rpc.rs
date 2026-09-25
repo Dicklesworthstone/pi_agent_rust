@@ -13074,7 +13074,7 @@ async fn run_bash_rpc(
     crate::tools::isolate_command_process_group(&mut child);
     let mut child = child
         .spawn()
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
     crate::tools::attach_child_job_discipline(&child);
 
     let Some(stdout) = child.stdout.take() else {

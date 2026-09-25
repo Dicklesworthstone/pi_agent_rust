@@ -1514,7 +1514,7 @@ pub fn spawn_background(
     let shell = shell.as_str();
 
     let mut cmd = crate::tools::command_with_default_sigpipe_in_dir(shell, cwd)
-        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell {shell}: {e}")))?;
     cmd.arg("-c")
         .arg(&shell_command)
         .current_dir(cwd)
@@ -1568,7 +1568,7 @@ pub fn spawn_background(
     let mut child = cmd.spawn().map_err(|e| {
         Error::tool(
             "bash",
-            format!("Failed to spawn shell: {e}{cleanup_failure_context}"),
+            format!("Failed to spawn shell {shell}: {e}{cleanup_failure_context}"),
         )
     })?;
     if !crate::tools::attach_child_job_discipline(&child) {
