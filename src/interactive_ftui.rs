@@ -637,6 +637,79 @@ fn last_url(transcript: &[TranscriptEntry]) -> Option<String> {
     })
 }
 
+/// The fenced code blocks in markdown `text`, in order, as `(language,
+/// code)`. An unterminated fence runs to the end, as a streaming renderer
+/// would show it.
+fn fenced_code_blocks(text: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(String, String, Vec<&str>)> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        match open.take() {
+            None => {
+                if let Some(rest) = trimmed.strip_prefix("```") {
+                    open = Some(("```".to_string(), rest.trim().to_string(), Vec::new()));
+                } else if let Some(rest) = trimmed.strip_prefix("~~~") {
+                    open = Some(("~~~".to_string(), rest.trim().to_string(), Vec::new()));
+                }
+            }
+            Some((fence, lang, mut lines)) => {
+                if trimmed.starts_with(fence.as_str())
+                    && trimmed.trim_start_matches(['`', '~']).trim().is_empty()
+                {
+                    blocks.push((lang, lines.join("\n")));
+                } else {
+                    lines.push(line);
+                    open = Some((fence, lang, lines));
+                }
+            }
+        }
+    }
+    if let Some((_, lang, lines)) = open
+        && !lines.is_empty()
+    {
+        blocks.push((lang, lines.join("\n")));
+    }
+    blocks
+}
+
+/// What `/copy` offers, newest first: each reply, and each code block in
+/// it, as `(picker row, text to copy)` (OMP's copy selector).
+fn copy_choices(transcript: &[TranscriptEntry]) -> Vec<(String, String)> {
+    fn first_line(text: &str) -> String {
+        let line = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let clipped: String = line.chars().take(70).collect();
+        if clipped.len() < line.len() {
+            format!("{clipped}…")
+        } else {
+            clipped
+        }
+    }
+    let mut choices = Vec::new();
+    for entry in transcript.iter().rev() {
+        if entry.role != EntryRole::Assistant || entry.text.trim().is_empty() {
+            continue;
+        }
+        for (lang, code) in fenced_code_blocks(&entry.text).into_iter().rev() {
+            let label = if lang.is_empty() {
+                String::from("code")
+            } else {
+                format!("code ({lang})")
+            };
+            choices.push((format!("{label}: {}", first_line(&code)), code));
+        }
+        choices.push((
+            format!("reply: {}", first_line(&entry.text)),
+            entry.text.clone(),
+        ));
+    }
+    choices
+}
+
 /// Hand a URL to the platform's opener, detached.
 fn open_in_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
@@ -1186,9 +1259,11 @@ impl PickerOverlay {
                 crate::model_selector::full_id_matches_query(query, id)
                     || (item != id && crate::model_selector::fuzzy_match(query, item))
             }
-            PickerKind::Theme | PickerKind::Session | PickerKind::Rewind | PickerKind::ForkFrom => {
-                crate::model_selector::fuzzy_match(query, item)
-            }
+            PickerKind::Theme
+            | PickerKind::Session
+            | PickerKind::Rewind
+            | PickerKind::ForkFrom
+            | PickerKind::Copy => crate::model_selector::fuzzy_match(query, item),
         }
     }
 
@@ -1251,6 +1326,8 @@ enum PickerKind {
     /// A user message to fork a new session from (`doubleEscapeAction:
     /// fork`); selection routes `UiCommand::Fork` with the entry id.
     ForkFrom,
+    /// A reply or code block to copy (`/copy`): values are the text.
+    Copy,
 }
 
 /// What double-Esc on an idle, empty editor does (`doubleEscapeAction`).
@@ -1402,6 +1479,9 @@ pub enum UiCommand {
     /// List the user messages on the current path for the rewind (or, with
     /// `fork`, fork) picker; the driver answers `PiMsg::MessagePicker`.
     MessagePicker { fork: bool },
+    /// `/copy cmd`: copy the newest shell command, the agent's (bash tool) or
+    /// the user's (`!cmd`), in full.
+    CopyLastCommand,
     /// Rewind the session to just before this user message (OMP `/branch`);
     /// unrelated to the checkpoint `/rewind`.
     RewindTo { entry_id: String },
@@ -3297,26 +3377,57 @@ impl PiFtuiModel {
             self.scroll_from_tail = 0;
             return true;
         }
-        if canon == "/copy" {
-            // The last assistant turn with something in it, which is what a
-            // user means by "copy that".
-            let text = self
-                .transcript
-                .iter()
-                .rev()
-                .find(|entry| entry.role == EntryRole::Assistant && !entry.text.trim().is_empty())
-                .map(|entry| entry.text.clone());
-            match text {
+        if let Some(arg) = strip_command(clean, "/copy") {
+            // OMP `/copy [code|cmd|link]`: bare opens a picker of replies and
+            // their code blocks; the subcommands take the newest one.
+            self.scroll_from_tail = 0;
+            let copy = |this: &mut Self, text: Option<String>, missing: &str| match text {
                 Some(text) => {
                     let outcome = crate::interactive::copy_text_to_clipboard(&text);
-                    self.push_entry(EntryRole::System, outcome);
+                    this.push_entry(EntryRole::System, outcome);
                 }
-                None => self.push_entry(
+                None => this.push_entry(EntryRole::Error, missing.to_string()),
+            };
+            match arg.trim().to_ascii_lowercase().as_str() {
+                "" => {
+                    let (items, values): (Vec<_>, Vec<_>) =
+                        copy_choices(&self.transcript).into_iter().take(100).unzip();
+                    if items.is_empty() {
+                        self.push_entry(
+                            EntryRole::Error,
+                            String::from("No agent messages to copy yet."),
+                        );
+                    } else {
+                        self.picker = Some(PickerOverlay::new(
+                            "Copy (Enter to copy, Esc to close)",
+                            items,
+                            values,
+                            PickerKind::Copy,
+                        ));
+                    }
+                }
+                "code" => {
+                    let code = self
+                        .transcript
+                        .iter()
+                        .rev()
+                        .filter(|entry| entry.role == EntryRole::Assistant)
+                        .find_map(|entry| fenced_code_blocks(&entry.text).pop())
+                        .map(|(_, code)| code);
+                    copy(self, code, "No code block to copy.");
+                }
+                "link" | "url" => {
+                    let link = last_url(&self.transcript);
+                    copy(self, link, "No link to copy.");
+                }
+                // The full command lives in the session (tool cards show a
+                // clipped first line), so the driver finds and copies it.
+                "cmd" | "command" => self.send_command(UiCommand::CopyLastCommand),
+                _ => self.push_entry(
                     EntryRole::Error,
-                    String::from("No agent messages to copy yet."),
+                    String::from("Usage: /copy [code|cmd|link]"),
                 ),
             }
-            self.scroll_from_tail = 0;
             return true;
         }
         if let Some(rest) = strip_command(clean, "/export") {
@@ -3424,7 +3535,7 @@ impl PiFtuiModel {
                 String::from(
                     "pi commands: /model [provider/model], /resume, /new, \
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
-                     /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
+                     /export [path], /copy [code|cmd|link], /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking [level], /fast [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
@@ -3820,6 +3931,11 @@ impl PiFtuiModel {
                 self.send_command(UiCommand::Fork {
                     args: choice.to_string(),
                 });
+            }
+            PickerKind::Copy => {
+                let outcome = crate::interactive::copy_text_to_clipboard(choice);
+                self.push_entry(EntryRole::System, outcome);
+                self.scroll_from_tail = 0;
             }
         }
     }
@@ -6621,6 +6737,35 @@ async fn run_tree_summary_command(
 
 /// Handle `/thinking`: bare shows the effective level, a parsed level sets
 /// it on the live session (`set_thinking_level` persists the header change).
+/// The newest shell command on the current path, in full: a bash tool call's
+/// `command` or a user `!cmd` run (OMP `/copy cmd`).
+fn last_shell_command(session: &crate::session::Session) -> Option<String> {
+    use crate::session::{SessionEntry, SessionMessage};
+    session
+        .entries_for_current_path()
+        .into_iter()
+        .rev()
+        .find_map(|entry| {
+            let SessionEntry::Message(message) = entry else {
+                return None;
+            };
+            match &message.message {
+                SessionMessage::BashExecution { command, .. } => Some(command.clone()),
+                SessionMessage::Assistant { message } => {
+                    message.content.iter().rev().find_map(|block| match block {
+                        crate::model::ContentBlock::ToolCall(call) if call.name == "bash" => call
+                            .arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }
+        })
+}
+
 /// Send the user messages on the current path for the rewind/fork picker.
 async fn send_message_picker(
     handle: &crate::sdk::AgentSessionHandle,
@@ -8119,6 +8264,16 @@ pub fn run(
                         Ok(UiCommand::Fast(request)) => {
                             let _ = agent_tx.send(run_fast_command(&mut handle, request));
                         }
+                        Ok(UiCommand::CopyLastCommand) => {
+                            let found = handle.with_session(last_shell_command).await;
+                            let _ = agent_tx.send(match found {
+                                Ok(Some(command)) => PiMsg::System(
+                                    crate::interactive::copy_text_to_clipboard(&command),
+                                ),
+                                Ok(None) => PiMsg::AgentError(String::from("No command to copy.")),
+                                Err(err) => PiMsg::AgentError(format!("copy: {err}")),
+                            });
+                        }
                         Ok(UiCommand::MessagePicker { fork }) => {
                             send_message_picker(&handle, fork, &agent_tx).await;
                         }
@@ -9460,18 +9615,42 @@ mod tests {
     }
 
     #[test]
-    fn slash_copy_takes_the_last_non_empty_assistant_turn() {
+    fn slash_copy_picks_a_reply_or_one_of_its_code_blocks() {
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
         let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
         model.push_entry(EntryRole::Assistant, String::from("first answer"));
         model.push_entry(EntryRole::User, String::from("a follow-up question"));
+        model.push_entry(
+            EntryRole::Assistant,
+            String::from("Run this:\n```sh\ncargo test\n```\nthen\n```\nls\n```"),
+        );
         model.push_entry(EntryRole::Assistant, String::from("   "));
         let mut sim = ProgramSimulator::new(model);
         sim.init();
-        let before = sim.model().transcript.len();
+
+        // Newest first: the last reply's code blocks (last first), the
+        // reply itself, then the older reply. Blank replies are skipped.
+        let rows: Vec<String> = copy_choices(&sim.model().transcript)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "code: ls",
+                "code (sh): cargo test",
+                "reply: Run this:",
+                "reply: first answer",
+            ]
+        );
 
         type_str(&mut sim, "/copy");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "bare /copy opens the picker");
+        let before = sim.model().transcript.len();
+        // Filter to the older reply and copy it.
+        type_str(&mut sim, "first");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
 
         assert!(
@@ -9482,10 +9661,11 @@ mod tests {
             .iter()
             .map(|entry| (entry.role, entry.text.clone()))
             .collect();
-        assert_eq!(added.len(), 2, "expected the echo and one reply: {added:?}");
-        assert_eq!(added[0].0, EntryRole::User);
+        let [(role, outcome)] = added.as_slice() else {
+            panic!("expected exactly one outcome: {added:?}");
+        };
         assert_eq!(
-            added[1].0,
+            *role,
             EntryRole::System,
             "a successful copy is not an error: {added:?}"
         );
@@ -9493,10 +9673,87 @@ mod tests {
         // copied, or disabled/unavailable with where it wrote instead — so
         // this holds whether or not the host running the suite has one.
         assert!(
-            added[1].1.contains("lipboard"),
-            "unexpected copy outcome: {:?}",
-            added[1].1
+            outcome.contains("lipboard"),
+            "unexpected copy outcome: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn copy_subcommands_find_the_newest_code_block_and_link() {
+        assert_eq!(
+            fenced_code_blocks("a\n```rust\nfn x() {}\n```\nb\n~~~\n```not a fence```\n~~~"),
+            [
+                (String::from("rust"), String::from("fn x() {}")),
+                (String::new(), String::from("```not a fence```")),
+            ]
+        );
+        // A block still streaming (no closing fence) counts.
+        assert_eq!(
+            fenced_code_blocks("```py\nprint(1)"),
+            [(String::from("py"), String::from("print(1)"))]
+        );
+        assert!(fenced_code_blocks("no code here").is_empty());
+
+        // Unknown subcommands get the usage line and copy nothing; `cmd`
+        // goes to the driver, which holds the full command.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        type_str(&mut sim, "/copy everything");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "Usage: /copy [code|cmd|link]")
+        );
+        type_str(&mut sim, "/copy cmd");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().ok(), Some(UiCommand::CopyLastCommand));
+        type_str(&mut sim, "/copy code");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.role == EntryRole::Error && e.text == "No code block to copy.")
+        );
+    }
+
+    #[test]
+    fn last_shell_command_is_the_newest_bash_call_or_user_run_in_full() {
+        let mut session = crate::session::Session::in_memory();
+        assert_eq!(last_shell_command(&session), None);
+        session.append_message(crate::session::SessionMessage::from(
+            crate::model::Message::Assistant(Arc::new(crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::ToolCall(
+                    crate::model::ToolCall {
+                        id: String::from("t1"),
+                        name: String::from("bash"),
+                        arguments: serde_json::json!({"command": "cargo build\ncargo test --all"}),
+                        thought_signature: None,
+                    },
+                )],
+                ..Default::default()
+            })),
+        ));
+        assert_eq!(
+            last_shell_command(&session).as_deref(),
+            Some("cargo build\ncargo test --all"),
+            "the whole multi-line command, not the card's clipped first line"
+        );
+        session.append_message(crate::session::SessionMessage::BashExecution {
+            command: String::from("git status"),
+            output: String::new(),
+            exit_code: 0,
+            cancelled: None,
+            truncated: None,
+            full_output_path: None,
+            timestamp: None,
+            extra: std::collections::HashMap::new(),
+        });
+        assert_eq!(last_shell_command(&session).as_deref(), Some("git status"));
     }
 
     #[test]
