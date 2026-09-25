@@ -1359,6 +1359,9 @@ pub enum UiCommand {
     /// The UI validates the level against `ThinkingLevel::from_str` before
     /// sending; invalid levels never reach the driver.
     SetThinking(Option<crate::model::ThinkingLevel>),
+    /// `/fast [on|off|status]`: toggle, set or report fast mode (the
+    /// `priority` service tier; OMP `/fast`).
+    Fast(FastRequest),
     /// Step the thinking level to the next one this model offers
     /// (`AppAction::CycleThinkingLevel`, shift+tab by default). The driver
     /// owns the decision because only it can see the model's catalog entry;
@@ -3303,7 +3306,7 @@ impl PiFtuiModel {
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
                      /export [path], /copy, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
-                     /thinking [level], /theme, /changelog, /clear, /hotkeys, \
+                     /thinking [level], /fast [on|off|status], /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
@@ -3486,6 +3489,23 @@ impl PiFtuiModel {
             }
             "/tree" => {
                 self.send_command(UiCommand::TreeSummary);
+                return true;
+            }
+            "/fast" => {
+                let request = match cmd_args.trim().to_ascii_lowercase().as_str() {
+                    "" | "toggle" => FastRequest::Toggle,
+                    "on" => FastRequest::On,
+                    "off" => FastRequest::Off,
+                    "status" => FastRequest::Status,
+                    _ => {
+                        self.push_entry(
+                            EntryRole::Error,
+                            String::from("Usage: /fast [on|off|status]"),
+                        );
+                        return true;
+                    }
+                };
+                self.send_command(UiCommand::Fast(request));
                 return true;
             }
             "/thinking" | "/think" | "/t" => {
@@ -6407,6 +6427,61 @@ async fn run_tree_summary_command(
 
 /// Handle `/thinking`: bare shows the effective level, a parsed level sets
 /// it on the live session (`set_thinking_level` persists the header change).
+/// What `/fast` was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastRequest {
+    Toggle,
+    On,
+    Off,
+    Status,
+}
+
+/// How the current model's provider realizes fast mode, or `None` when it
+/// has no priority tier to ask for.
+fn fast_mode_realization(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" | "openai-codex" | "openrouter" => Some("service_tier=priority"),
+        "anthropic" => Some("speed=fast, on models that offer it"),
+        _ => None,
+    }
+}
+
+/// Apply `/fast`. The tier lives in the session's stream options, so it
+/// survives model switches and simply goes unused on providers without one.
+/// Like OMP, turning it on is refused when the current model can't use it.
+fn run_fast_command(handle: &mut crate::sdk::AgentSessionHandle, request: FastRequest) -> PiMsg {
+    let (provider, _) = handle.model();
+    let realization = fast_mode_realization(&provider);
+    let options = handle.session_mut().agent.stream_options_mut();
+    let enabled = options.service_tier.as_deref() == Some("priority");
+    let enable = match request {
+        FastRequest::Toggle => !enabled,
+        FastRequest::On => true,
+        FastRequest::Off => false,
+        FastRequest::Status => {
+            return PiMsg::System(match (enabled, realization) {
+                (true, Some(how)) => format!("Fast mode is on ({provider}: {how})."),
+                (true, None) => format!("Fast mode is on, but {provider} has no priority tier."),
+                (false, _) => String::from("Fast mode is off."),
+            });
+        }
+    };
+    if !enable {
+        options.service_tier = None;
+        return PiMsg::System(String::from("Fast mode disabled."));
+    }
+    let Some(how) = realization else {
+        return PiMsg::System(format!(
+            "Fast mode is unavailable for {provider}: only OpenAI, Codex, OpenRouter and \
+             Anthropic models have a priority tier."
+        ));
+    };
+    options.service_tier = Some(String::from("priority"));
+    PiMsg::System(format!(
+        "Fast mode enabled ({provider}: {how}). Priority processing costs more."
+    ))
+}
+
 async fn run_set_thinking_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     level: Option<crate::model::ThinkingLevel>,
@@ -7777,6 +7852,9 @@ pub fn run(
                         }
                         Ok(UiCommand::TreeSummary) => {
                             run_tree_summary_command(&handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Fast(request)) => {
+                            let _ = agent_tx.send(run_fast_command(&mut handle, request));
                         }
                         Ok(UiCommand::SetThinking(level)) => {
                             run_set_thinking_command(&mut handle, level, &agent_tx).await;
@@ -11249,6 +11327,93 @@ mod tests {
     /// GH #182: `!command` on this stack honors `shell_path` and
     /// `shell_command_prefix` from settings, as the classic stack does.
     #[cfg(unix)]
+    #[test]
+    fn fast_command_sets_the_priority_tier_the_provider_sends() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        runtime.block_on(async {
+            let mut handle = crate::sdk::create_agent_session(crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("dummy-key")),
+                working_directory: Some(cwd.path().to_path_buf()),
+                no_session: true,
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .expect("create session");
+            let tier = |handle: &crate::sdk::AgentSessionHandle| {
+                handle.session().agent.stream_options().service_tier.clone()
+            };
+            let text = |msg: PiMsg| match msg {
+                PiMsg::System(text) => text,
+                other => panic!("unexpected reply {other:?}"),
+            };
+
+            assert_eq!(
+                text(run_fast_command(&mut handle, FastRequest::Status)),
+                "Fast mode is off."
+            );
+            assert!(
+                text(run_fast_command(&mut handle, FastRequest::On))
+                    .starts_with("Fast mode enabled")
+            );
+            assert_eq!(tier(&handle).as_deref(), Some("priority"));
+            assert!(
+                text(run_fast_command(&mut handle, FastRequest::Status))
+                    .contains("service_tier=priority")
+            );
+            // Bare /fast toggles.
+            assert_eq!(
+                text(run_fast_command(&mut handle, FastRequest::Toggle)),
+                "Fast mode disabled."
+            );
+            assert_eq!(tier(&handle), None);
+            run_fast_command(&mut handle, FastRequest::Toggle);
+            assert_eq!(tier(&handle).as_deref(), Some("priority"));
+            run_fast_command(&mut handle, FastRequest::Off);
+            assert_eq!(tier(&handle), None);
+        });
+
+        // Providers without a priority tier refuse `on`, as OMP does.
+        assert!(fast_mode_realization("groq").is_none());
+        assert!(fast_mode_realization("anthropic").is_some());
+    }
+
+    #[test]
+    fn fast_slash_command_routes_to_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for (typed, request) in [
+            ("/fast", FastRequest::Toggle),
+            ("/fast on", FastRequest::On),
+            ("/fast OFF", FastRequest::Off),
+            ("/fast status", FastRequest::Status),
+        ] {
+            type_str(&mut sim, typed);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().expect("routed"),
+                UiCommand::Fast(request),
+                "{typed}"
+            );
+        }
+        type_str(&mut sim, "/fast turbo");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text.contains("Usage: /fast"))
+        );
+    }
+
     #[test]
     fn bash_ui_command_uses_configured_shell_and_prefix() {
         let config = crate::config::Config {

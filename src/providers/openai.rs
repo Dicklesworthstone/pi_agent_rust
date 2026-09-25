@@ -397,6 +397,10 @@ impl OpenAIProvider {
             reasoning_effort,
             reasoning,
             prompt_cache_key: options.prompt_cache_key.clone(),
+            service_tier: crate::provider::openai_service_tier(
+                &self.provider,
+                options.service_tier.as_deref(),
+            ),
         }
     }
 
@@ -1534,6 +1538,10 @@ pub struct OpenAIRequest<'a> {
     /// `StreamOptions::prompt_cache_key`.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
+    /// Processing tier (`/fast` → `priority`). Set only for backends that
+    /// honor it; see `provider::openai_service_tier`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2106,6 +2114,68 @@ mod tests {
             serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
                 .expect("serialize request");
         assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn test_build_request_service_tier_only_for_backends_that_honor_it() {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let fast = StreamOptions {
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        };
+        let tier_for = |provider: OpenAIProvider, options: &StreamOptions| {
+            serde_json::to_value(provider.build_request(&context, options))
+                .expect("serialize request")
+                .get("service_tier")
+                .cloned()
+        };
+
+        assert_eq!(
+            tier_for(OpenAIProvider::new("gpt-5"), &fast),
+            Some(json!("priority"))
+        );
+        assert_eq!(
+            tier_for(
+                OpenAIProvider::new("x").with_provider_name("openrouter"),
+                &fast
+            ),
+            Some(json!("priority"))
+        );
+        // OpenAI-compatible backends that never documented the field don't
+        // get it: many reject unknown parameters with a 400.
+        assert_eq!(
+            tier_for(OpenAIProvider::new("x").with_provider_name("groq"), &fast),
+            None
+        );
+        // `auto` is OpenAI's default, and OpenRouter forwards no `default`.
+        let auto = StreamOptions {
+            service_tier: Some("auto".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tier_for(OpenAIProvider::new("gpt-5"), &auto), None);
+        let default = StreamOptions {
+            service_tier: Some("default".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            tier_for(
+                OpenAIProvider::new("x").with_provider_name("openrouter"),
+                &default
+            ),
+            None
+        );
+        assert_eq!(
+            tier_for(OpenAIProvider::new("gpt-5"), &StreamOptions::default()),
+            None
+        );
     }
 
     #[test]

@@ -230,11 +230,34 @@ pub struct StreamOptions {
     /// `app::resolve_prompt_cache_key`); `None` omits the field so the wire
     /// format is unchanged for backends that reject unknown params.
     pub prompt_cache_key: Option<String>,
+    /// Requested service tier (`/fast` sets `"priority"`). Only backends that
+    /// honor a tier receive it: OpenAI, Codex and OpenRouter as
+    /// `service_tier` (see [`openai_service_tier`]), and direct Anthropic,
+    /// which realizes only `priority`, as `speed: "fast"`. Every other
+    /// provider ignores it, so the request is unchanged there.
+    pub service_tier: Option<String>,
     pub headers: HashMap<String, String>,
     pub thinking_level: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
     /// Optional `before_provider_request` interceptor (gh #167 / bd-1q31s).
     pub before_provider_request: Option<BeforeProviderRequestHook>,
+}
+
+/// The `service_tier` value an OpenAI-shaped request to `provider` should
+/// carry, or `None` to omit the field.
+///
+/// Mirrors OMP's `shouldSendServiceTier`. OpenAI and Codex accept every tier
+/// except `auto` (their default, so sending it is pointless). OpenRouter
+/// forwards only `flex`, `scale` and `priority`. Every other OpenAI-compatible
+/// backend gets nothing, because many of them reject unknown parameters.
+pub fn openai_service_tier(provider: &str, tier: Option<&str>) -> Option<String> {
+    let tier = tier.filter(|tier| !tier.is_empty() && *tier != "auto")?;
+    let sends = match provider {
+        "openai" | "openai-codex" => true,
+        "openrouter" => matches!(tier, "flex" | "scale" | "priority"),
+        _ => false,
+    };
+    sends.then(|| tier.to_string())
 }
 
 /// Cache retention policy.

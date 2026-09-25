@@ -206,6 +206,14 @@ impl OpenAIResponsesProvider {
             include,
             reasoning,
             prompt_cache_key: options.prompt_cache_key.clone(),
+            service_tier: crate::provider::openai_service_tier(
+                if self.codex_mode {
+                    "openai-codex"
+                } else {
+                    &self.provider
+                },
+                options.service_tier.as_deref(),
+            ),
         }
     }
 }
@@ -1671,6 +1679,10 @@ pub struct OpenAIResponsesRequest {
     /// `StreamOptions::prompt_cache_key`.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
+    /// Processing tier (`/fast` → `priority`); OpenAI and Codex only. See
+    /// `provider::openai_service_tier`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2340,6 +2352,40 @@ mod tests {
                 "codex_mode={codex_mode}"
             );
         }
+    }
+
+    #[test]
+    fn test_build_request_service_tier_for_openai_and_codex_only() {
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let fast = StreamOptions {
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        };
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-5.2").with_codex_mode(codex_mode);
+            let value = serde_json::to_value(provider.build_request(&context, &fast))
+                .expect("serialize request");
+            assert_eq!(value["service_tier"], "priority", "codex_mode={codex_mode}");
+            let value =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .expect("serialize request");
+            assert!(
+                value.get("service_tier").is_none(),
+                "codex_mode={codex_mode}"
+            );
+        }
+        // A third-party Responses backend never sees the field.
+        let provider = OpenAIResponsesProvider::new("m").with_provider_name("my-proxy");
+        let value = serde_json::to_value(provider.build_request(&context, &fast))
+            .expect("serialize request");
+        assert!(value.get("service_tier").is_none());
     }
 
     #[test]

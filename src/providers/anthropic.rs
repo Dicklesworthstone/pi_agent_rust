@@ -42,6 +42,8 @@ const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
 /// actually carries a `ttl: "1h"` cache breakpoint (first-party API + `Long`
 /// retention); relays commonly reject both the flag and the `ttl` field.
 const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG: &str = "extended-cache-ttl-2025-04-11";
+/// Beta flag that accompanies `speed: "fast"` (fast mode, `/fast`).
+const ANTHROPIC_FAST_MODE_BETA_FLAG: &str = "fast-mode-2026-02-01";
 const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 fn anthropic_oauth_beta_flags() -> String {
@@ -345,6 +347,21 @@ pub struct AnthropicProvider {
     base_url: String,
     provider: String,
     compat: Option<CompatConfig>,
+    /// Set once the API rejects fast mode for this model or account, so later
+    /// turns stop asking for it instead of paying a failed request each time.
+    fast_mode_rejected: std::sync::atomic::AtomicBool,
+}
+
+/// Whether an error response means the model or account can't use fast mode:
+/// a 400 saying `speed` is not supported, or a 429 because the account lacks
+/// the fast-mode entitlement (same rule as OMP's `FastModeUnsupported`).
+fn fast_mode_unsupported(status: u16, body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    match status {
+        400 => body.contains("speed") && body.contains("not support"),
+        429 => body.contains("rate_limit_error") && body.contains("fast mode"),
+        _ => false,
+    }
 }
 
 /// Whether an Anthropic(-compatible) model on the `anthropic-messages`
@@ -447,7 +464,20 @@ impl AnthropicProvider {
             base_url: ANTHROPIC_API_URL.to_string(),
             provider: "anthropic".to_string(),
             compat: None,
+            fast_mode_rejected: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether this request asks for fast mode (`speed: "fast"`): a
+    /// `priority` service tier on the first-party Anthropic provider that
+    /// hasn't already been rejected. Relays and Anthropic-compatible
+    /// backends never get it.
+    fn fast_mode(&self, options: &StreamOptions) -> bool {
+        self.provider == "anthropic"
+            && options.service_tier.as_deref() == Some("priority")
+            && !self
+                .fast_mode_rejected
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Override the provider name reported in streamed events.
@@ -615,6 +645,7 @@ impl AnthropicProvider {
             stream: true,
             thinking,
             output_config,
+            speed: self.fast_mode(options).then_some("fast"),
         }
     }
 }
@@ -731,6 +762,9 @@ impl Provider for AnthropicProvider {
                 beta_flags.push(ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG.to_string());
             }
         }
+        if request_body.speed.is_some() {
+            beta_flags.push(ANTHROPIC_FAST_MODE_BETA_FLAG.to_string());
+        }
         if !beta_flags.is_empty() {
             request = request.header("anthropic-beta", beta_flags.join(","));
         }
@@ -782,6 +816,18 @@ impl Provider for AnthropicProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+            // Fast mode exists only on some models and accounts. When the API
+            // refuses it, run the turn at standard speed rather than failing
+            // it, and stop asking for the rest of this model's use.
+            if request_body.speed.is_some() && fast_mode_unsupported(status, &body) {
+                self.fast_mode_rejected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    model = %self.model,
+                    "Anthropic rejected fast mode; continuing at standard speed: {body}"
+                );
+                return self.stream(context, options).await;
+            }
             return Err(Error::provider(
                 self.name(),
                 format!("Anthropic API error (HTTP {status}): {body}"),
@@ -1143,6 +1189,9 @@ pub struct AnthropicRequest<'a> {
     thinking: Option<AnthropicThinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<AnthropicOutputConfig>,
+    /// `"fast"` requests fast mode (`/fast`); sent with the fast-mode beta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<&'static str>,
 }
 
 /// Thinking configuration. Two shapes share this struct:
@@ -2927,6 +2976,120 @@ mod tests {
         assert_eq!(provider.name(), "kimi-for-coding");
     }
 
+    fn fast_stream_setup(base_url: String) -> (AnthropicProvider, Context<'static>, StreamOptions) {
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        };
+        (provider, context, options)
+    }
+
+    fn drain_stream(provider: &AnthropicProvider, context: &Context<'_>, options: &StreamOptions) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(context, options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn fast_mode_sends_speed_and_beta_to_first_party_anthropic_only() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let (provider, context, options) = fast_stream_setup(base_url);
+        drain_stream(&provider, &context, &options);
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("request");
+        let body: Value = serde_json::from_str(&captured.body).expect("request json");
+        assert_eq!(body["speed"], "fast");
+        let betas = captured.headers.get("anthropic-beta").expect("beta header");
+        assert!(
+            betas
+                .split(',')
+                .any(|flag| flag == ANTHROPIC_FAST_MODE_BETA_FLAG),
+            "{betas}"
+        );
+
+        // Anthropic-compatible relays and a request without the tier get
+        // neither the field nor (via speed) the beta.
+        let relay = AnthropicProvider::new("m").with_provider_name("minimax");
+        let request = serde_json::to_value(relay.build_request(&context, &options)).unwrap();
+        assert!(request.get("speed").is_none());
+        let plain = StreamOptions {
+            service_tier: None,
+            ..options.clone()
+        };
+        let request = serde_json::to_value(provider.build_request(&context, &plain)).unwrap();
+        assert!(request.get("speed").is_none());
+    }
+
+    #[test]
+    fn rejected_fast_mode_retries_at_standard_speed_and_stops_asking() {
+        let rejection = r#"{"type":"error","error":{"type":"invalid_request_error","message":"speed: fast mode is not supported for this model"}}"#;
+        let ok = success_sse_body();
+        let (base_url, rx) = spawn_test_server_sequence(vec![
+            (400, "application/json", rejection),
+            (200, "text/event-stream", &ok),
+            (200, "text/event-stream", &ok),
+        ]);
+        let (provider, context, options) = fast_stream_setup(base_url);
+
+        // The turn succeeds: the rejected request is retried without speed.
+        drain_stream(&provider, &context, &options);
+        let first = rx.recv_timeout(Duration::from_secs(2)).expect("first");
+        let retry = rx.recv_timeout(Duration::from_secs(2)).expect("retry");
+        assert!(first.body.contains(r#""speed":"fast""#), "{}", first.body);
+        assert!(!retry.body.contains("speed"), "{}", retry.body);
+        assert!(
+            !retry
+                .headers
+                .get("anthropic-beta")
+                .is_some_and(|betas| betas.contains(ANTHROPIC_FAST_MODE_BETA_FLAG))
+        );
+
+        // The next turn doesn't ask again.
+        drain_stream(&provider, &context, &options);
+        let next = rx.recv_timeout(Duration::from_secs(2)).expect("next");
+        assert!(!next.body.contains("speed"), "{}", next.body);
+    }
+
+    #[test]
+    fn fast_mode_rejection_is_recognized_narrowly() {
+        assert!(fast_mode_unsupported(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"`speed` is not supported on this model"}}"#
+        ));
+        assert!(fast_mode_unsupported(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"Fast mode requires extra usage"}}"#
+        ));
+        // Unrelated 400s and ordinary rate limits stay errors.
+        assert!(!fast_mode_unsupported(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"max_tokens: 99999999 is too large"}}"#
+        ));
+        assert!(!fast_mode_unsupported(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your rate limit"}}"#
+        ));
+        assert!(!fast_mode_unsupported(500, "speed not supported"));
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         headers: HashMap<String, String>,
@@ -3106,96 +3269,110 @@ mod tests {
         content_type: &str,
         body: &str,
     ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        spawn_test_server_sequence(vec![(status_code, content_type, body)])
+    }
+
+    /// Serve one response per connection, in order, then stop accepting.
+    fn spawn_test_server_sequence(
+        responses: Vec<(u16, &str, &str)>,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
         let (tx, rx) = mpsc::channel();
-        let body = body.to_string();
-        let content_type = content_type.to_string();
+        let responses: Vec<(u16, String, String)> = responses
+            .into_iter()
+            .map(|(status, content_type, body)| {
+                (status, content_type.to_string(), body.to_string())
+            })
+            .collect();
 
         std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
-            // 250ms is the POLLING interval; the deadline below is the budget.
-            // Treating a timed-out read as end-of-request truncated `bytes` and
-            // the header scan then failed as "request header boundary", which
-            // reads as a malformed request rather than a slow one — the reason
-            // this shape is worse than an outright panic (bd-eg6ng).
-            socket
-                .set_read_timeout(Some(Duration::from_millis(250)))
-                .expect("set read timeout");
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            for (status_code, content_type, body) in responses {
+                let (mut socket, _) = listener.accept().expect("accept");
+                // 250ms is the POLLING interval; the deadline below is the budget.
+                // Treating a timed-out read as end-of-request truncated `bytes` and
+                // the header scan then failed as "request header boundary", which
+                // reads as a malformed request rather than a slow one — the reason
+                // this shape is worse than an outright panic (bd-eg6ng).
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(250)))
+                    .expect("set read timeout");
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
-            let mut bytes = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            loop {
-                match socket.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        bytes.extend_from_slice(&chunk[..n]);
-                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    match socket.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            bytes.extend_from_slice(&chunk[..n]);
+                            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
                         }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for request headers"
+                            );
+                        }
+                        Err(err) => panic!(),
                     }
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "fixture timed out waiting for request headers"
-                        );
-                    }
-                    Err(err) => panic!(),
                 }
-            }
 
-            let header_end = bytes
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .expect("request header boundary");
-            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-            let headers = parse_headers(&header_text);
-            let mut request_body = bytes[header_end + 4..].to_vec();
+                let header_end = bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("request header boundary");
+                let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+                let headers = parse_headers(&header_text);
+                let mut request_body = bytes[header_end + 4..].to_vec();
 
-            let content_length = headers
-                .get("content-length")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            while request_body.len() < content_length {
-                match socket.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "fixture timed out waiting for the request body"
-                        );
+                let content_length = headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request_body.len() < content_length {
+                    match socket.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for the request body"
+                            );
+                        }
+                        Err(err) => panic!(),
                     }
-                    Err(err) => panic!(),
                 }
+
+                let captured = CapturedRequest {
+                    headers,
+                    body: String::from_utf8_lossy(&request_body).to_string(),
+                };
+                tx.send(captured).expect("send captured request");
+
+                let reason = match status_code {
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    500 => "Internal Server Error",
+                    _ => "OK",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                socket.flush().expect("flush response");
             }
-
-            let captured = CapturedRequest {
-                headers,
-                body: String::from_utf8_lossy(&request_body).to_string(),
-            };
-            tx.send(captured).expect("send captured request");
-
-            let reason = match status_code {
-                401 => "Unauthorized",
-                500 => "Internal Server Error",
-                _ => "OK",
-            };
-            let response = format!(
-                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .expect("write response");
-            socket.flush().expect("flush response");
         });
 
         (format!("http://{addr}/messages"), rx)
