@@ -1074,7 +1074,12 @@ fn paste_image_via_powershell() -> Option<PathBuf> {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success());
-    (saved && std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0)).then_some(path)
+    if saved && std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0) {
+        return Some(path);
+    }
+    // A save that failed part-way can leave an empty or partial PNG behind.
+    let _ = std::fs::remove_file(&path);
+    None
 }
 
 #[cfg(test)]

@@ -7012,6 +7012,131 @@ async fn execute_bash_spawn(
     }
 }
 
+/// What the bash tool says on Windows when no bash can be found (GH #182).
+#[cfg(any(windows, test))]
+const NO_WINDOWS_BASH: &str = "No bash found to run the command. Install Git for Windows \
+(https://git-scm.com/download/win), put a bash.exe (Git Bash, MSYS2, Cygwin) on PATH, \
+or set \"shell_path\" in settings.json to a bash executable.";
+
+/// The shell the bash tool, `!command` and background jobs run when
+/// `shell_path` is not configured.
+///
+/// Unix: the first of `/bin/bash`, `/usr/bin/bash`, `/usr/local/bin/bash`,
+/// else `sh`. Windows has neither those paths nor an `sh` on `PATH`, so the
+/// old `sh` fallback failed every call with "program not found" (GH #182);
+/// see [`find_windows_bash`] for the Windows order.
+// Only the Windows arm can fail.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+pub(crate) fn default_bash_shell() -> Result<String> {
+    #[cfg(windows)]
+    {
+        find_windows_bash(&WindowsShellEnv::from_process(), Path::is_file)
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| Error::tool("bash", NO_WINDOWS_BASH))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .unwrap_or("sh")
+            .to_string())
+    }
+}
+
+/// Where [`find_windows_bash`] looks, read from the environment.
+#[cfg(any(windows, test))]
+struct WindowsShellEnv {
+    /// `%ProgramFiles%`, `%ProgramW6432%`, `%ProgramFiles(x86)%`.
+    program_files: Vec<PathBuf>,
+    /// `%LOCALAPPDATA%` (per-user Git for Windows installs).
+    local_app_data: Option<PathBuf>,
+    /// `%SystemRoot%`, for the WSL launcher.
+    system_root: Option<PathBuf>,
+    path_dirs: Vec<PathBuf>,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsShellEnv {
+    fn from_process() -> Self {
+        let var = |name: &str| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        Self {
+            program_files: ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+                .into_iter()
+                .filter_map(var)
+                .collect(),
+            local_app_data: var("LOCALAPPDATA"),
+            system_root: var("SystemRoot"),
+            path_dirs: std::env::var_os("PATH")
+                .map(|path| std::env::split_paths(&path).collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Whether `path` is WSL's `bash.exe` launcher (`System32\bash.exe`, or the
+/// Store app alias under `WindowsApps`), which runs the command inside the
+/// default Linux distro rather than on Windows.
+#[cfg(any(windows, test))]
+fn is_wsl_bash_launcher(path: &Path) -> bool {
+    let in_system32 = path.parent().and_then(Path::file_name).is_some_and(|dir| {
+        dir.eq_ignore_ascii_case("system32") || dir.eq_ignore_ascii_case("sysnative")
+    });
+    in_system32
+        || path
+            .components()
+            .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+}
+
+/// Pick a bash on Windows (GH #182), in this order:
+///
+/// 1. Git for Windows in its standard install locations
+///    (`<ProgramFiles>\Git\bin\bash.exe`,
+///    `%LOCALAPPDATA%\Programs\Git\bin\bash.exe`).
+/// 2. `PATH`, in order: a `bash.exe` (Git Bash, MSYS2, Cygwin, Scoop shims),
+///    or the `bin\bash.exe` next to a Git install whose `cmd\git.exe` is on
+///    `PATH` (Git's default PATH option adds only `Git\cmd`).
+/// 3. WSL's `bash.exe` launcher, last: it works, but the command runs inside
+///    Linux, where Windows paths appear under `/mnt/<drive>`.
+#[cfg(any(windows, test))]
+fn find_windows_bash(env: &WindowsShellEnv, is_file: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let git_bash = |git_root: &Path| git_root.join("bin").join("bash.exe");
+    let installed = env
+        .program_files
+        .iter()
+        .map(|dir| git_bash(&dir.join("Git")))
+        .chain(
+            env.local_app_data
+                .iter()
+                .map(|dir| git_bash(&dir.join("Programs").join("Git"))),
+        );
+    let on_path = env.path_dirs.iter().flat_map(|dir| {
+        let beside_git = is_file(&dir.join("git.exe"))
+            .then(|| dir.parent().map(git_bash))
+            .flatten();
+        std::iter::once(dir.join("bash.exe")).chain(beside_git)
+    });
+    if let Some(found) = installed
+        .chain(on_path)
+        .find(|candidate| !is_wsl_bash_launcher(candidate) && is_file(candidate))
+    {
+        return Some(found);
+    }
+    env.path_dirs
+        .iter()
+        .map(|dir| dir.join("bash.exe"))
+        .chain(
+            env.system_root
+                .iter()
+                .map(|root| root.join("System32").join("bash.exe")),
+        )
+        .find(|candidate| is_wsl_bash_launcher(candidate) && is_file(candidate))
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_bash_command(
     cwd: &Path,
@@ -7042,14 +7167,8 @@ pub(crate) async fn run_bash_command(
         ));
     }
 
-    let shell = shell_path.unwrap_or_else(|| {
-        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            if Path::new(path).exists() {
-                return path;
-            }
-        }
-        "sh"
-    });
+    let shell = shell_path.map_or_else(default_bash_shell, |path| Ok(path.to_string()))?;
+    let shell = shell.as_str();
 
     let mut cmd = command_with_default_sigpipe_in_dir(shell, cwd)
         .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
@@ -7073,7 +7192,7 @@ pub(crate) async fn run_bash_command(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
     attach_child_job_discipline(&child);
 
     let stdout = child
@@ -7411,14 +7530,8 @@ pub(crate) async fn run_bash_command_pty(
         ));
     }
 
-    let shell = shell_path.unwrap_or_else(|| {
-        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            if Path::new(path).exists() {
-                return path;
-            }
-        }
-        "sh"
-    });
+    let shell = shell_path.map_or_else(default_bash_shell, |path| Ok(path.to_string()))?;
+    let shell = shell.as_str();
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -7445,7 +7558,7 @@ pub(crate) async fn run_bash_command_pty(
     let mut child = pair
         .slave
         .spawn_command(pty_cmd)
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell on PTY: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell} on PTY: {e}")))?;
     // Drop our handle to the slave side so the master sees EOF when the child
     // exits; otherwise the pump thread would block forever.
     drop(pair.slave);
@@ -14820,6 +14933,158 @@ mod tests {
     use proptest::prelude::*;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    /// A Windows-shaped environment for [`find_windows_bash`] with the given
+    /// `PATH`. Which files exist is up to each test. Paths are built with
+    /// `join`, so the tests run on any OS.
+    fn windows_shell_env(path_dirs: Vec<PathBuf>) -> WindowsShellEnv {
+        WindowsShellEnv {
+            program_files: vec![PathBuf::from("C:").join("Program Files")],
+            local_app_data: Some(
+                PathBuf::from("C:")
+                    .join("Users")
+                    .join("me")
+                    .join("AppData")
+                    .join("Local"),
+            ),
+            system_root: Some(PathBuf::from("C:").join("Windows")),
+            path_dirs,
+        }
+    }
+
+    fn system32() -> PathBuf {
+        PathBuf::from("C:").join("Windows").join("System32")
+    }
+
+    fn pick(env: &WindowsShellEnv, existing: &[PathBuf]) -> Option<PathBuf> {
+        find_windows_bash(env, |path| existing.iter().any(|file| file == path))
+    }
+
+    /// GH #182: with WSL's System32\bash.exe first on PATH, Git for
+    /// Windows in Program Files still wins.
+    #[test]
+    fn windows_bash_prefers_git_for_windows_over_the_wsl_launcher() {
+        let git_bash = PathBuf::from("C:")
+            .join("Program Files")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        let wsl = system32().join("bash.exe");
+        let env = windows_shell_env(vec![system32()]);
+        assert_eq!(pick(&env, &[wsl, git_bash.clone()]), Some(git_bash));
+    }
+
+    /// Per-user Git installs live under %LOCALAPPDATA%\Programs\Git.
+    #[test]
+    fn windows_bash_finds_a_per_user_git_install() {
+        let git_bash = PathBuf::from("C:")
+            .join("Users")
+            .join("me")
+            .join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        let env = windows_shell_env(Vec::new());
+        assert_eq!(pick(&env, std::slice::from_ref(&git_bash)), Some(git_bash));
+    }
+
+    /// A bash.exe on PATH (MSYS2 here) beats WSL's launcher even when the
+    /// launcher's directory comes first on PATH.
+    #[test]
+    fn windows_bash_takes_a_path_bash_before_the_wsl_launcher() {
+        let msys = PathBuf::from("C:").join("msys64").join("usr").join("bin");
+        let env = windows_shell_env(vec![system32(), msys.clone()]);
+        let existing = [system32().join("bash.exe"), msys.join("bash.exe")];
+        assert_eq!(pick(&env, &existing), Some(msys.join("bash.exe")));
+    }
+
+    /// Git's default PATH option adds only `Git\cmd`; its bash is found
+    /// next to it, wherever Git was installed.
+    #[test]
+    fn windows_bash_derives_git_bash_from_git_cmd_on_path() {
+        let git = PathBuf::from("D:").join("Tools").join("Git");
+        let env = windows_shell_env(vec![system32(), git.join("cmd")]);
+        let existing = [
+            system32().join("bash.exe"),
+            git.join("cmd").join("git.exe"),
+            git.join("bin").join("bash.exe"),
+        ];
+        assert_eq!(
+            pick(&env, &existing),
+            Some(git.join("bin").join("bash.exe"))
+        );
+    }
+
+    /// GH #182's setup: only WSL's launcher exists. It is used as the last
+    /// resort, from PATH or from %SystemRoot%\System32.
+    #[test]
+    fn windows_bash_falls_back_to_the_wsl_launcher() {
+        let wsl = system32().join("bash.exe");
+        assert_eq!(
+            pick(
+                &windows_shell_env(vec![system32()]),
+                std::slice::from_ref(&wsl)
+            ),
+            Some(wsl.clone())
+        );
+        assert_eq!(
+            pick(&windows_shell_env(Vec::new()), std::slice::from_ref(&wsl)),
+            Some(wsl)
+        );
+    }
+
+    #[test]
+    fn windows_bash_is_none_without_any_bash() {
+        let env = windows_shell_env(vec![system32()]);
+        assert_eq!(pick(&env, &[]), None);
+        assert!(NO_WINDOWS_BASH.contains("shell_path"));
+    }
+
+    #[test]
+    fn wsl_launcher_detection() {
+        assert!(is_wsl_bash_launcher(&system32().join("bash.exe")));
+        assert!(is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("WINDOWS")
+                .join("SYSTEM32")
+                .join("bash.exe")
+        ));
+        assert!(is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("Users")
+                .join("me")
+                .join("AppData")
+                .join("Local")
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("bash.exe")
+        ));
+        assert!(!is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("Program Files")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe")
+        ));
+    }
+
+    /// The process environment reader runs on every OS; `PATH` is always
+    /// set for the test process.
+    #[test]
+    fn windows_shell_env_reads_path_from_the_process() {
+        let env = WindowsShellEnv::from_process();
+        assert!(!env.path_dirs.is_empty());
+        let _ = find_windows_bash(&env, Path::is_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_bash_shell_on_unix_is_an_absolute_bash_or_sh() {
+        let shell = default_bash_shell().expect("unix always has a default");
+        assert!(shell == "sh" || shell.ends_with("/bash"), "{shell}");
+    }
 
     #[cfg(unix)]
     struct UnixModeGuard {

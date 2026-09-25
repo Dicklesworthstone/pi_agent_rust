@@ -13059,14 +13059,11 @@ async fn run_bash_rpc(
     command: &str,
     mut abort_rx: oneshot::Receiver<()>,
 ) -> Result<BashRpcResult> {
-    let shell = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or("sh");
+    let shell = crate::tools::default_bash_shell()?;
 
     let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
 
-    let mut child = std::process::Command::new(shell);
+    let mut child = std::process::Command::new(&shell);
     child
         .arg("-c")
         .arg(&command)

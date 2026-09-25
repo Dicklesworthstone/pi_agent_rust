@@ -1506,14 +1506,12 @@ pub fn spawn_background(
     );
     let shell_command = format!("trap 'code=$?; wait; exit $code' EXIT\n{shell_command}");
 
-    let shell = shell_path.unwrap_or_else(|| {
-        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            if Path::new(path).exists() {
-                return path;
-            }
-        }
-        "sh"
-    });
+    let shell =
+        shell_path.map_or_else(
+            crate::tools::default_bash_shell,
+            |path| Ok(path.to_string()),
+        )?;
+    let shell = shell.as_str();
 
     let mut cmd = crate::tools::command_with_default_sigpipe_in_dir(shell, cwd)
         .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
