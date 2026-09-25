@@ -2058,7 +2058,10 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
 
 fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for line in lines {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -2070,10 +2073,89 @@ fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
         if key.is_empty() {
             continue;
         }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
+        let value = value.trim();
+        // gh #240: `key: >` / `key: |` is a YAML block scalar whose value is
+        // the following, more-indented lines. Parsed line by line, each of
+        // those became its own entry, and any containing a colon surfaced as
+        // an "unknown frontmatter field" warning.
+        if let Some(folded) = block_scalar_folds(value) {
+            let (text, consumed) = read_block_scalar(&lines[i..], indent_of(line), folded);
+            i += consumed;
+            map.insert(key.to_string(), text);
+            continue;
+        }
+        let value = value.trim_matches('"').trim_matches('\'');
         map.insert(key.to_string(), value.to_string());
     }
     map
+}
+
+/// `Some(true)` for a folded (`>`) block scalar header, `Some(false)` for a
+/// literal (`|`) one, with optional chomping/indentation indicators.
+fn block_scalar_folds(value: &str) -> Option<bool> {
+    let mut chars = value.chars();
+    let folded = match chars.next()? {
+        '>' => true,
+        '|' => false,
+        _ => return None,
+    };
+    chars
+        .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+        .then_some(folded)
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Read a block scalar's lines (those indented deeper than its key) and
+/// return its text plus how many lines it used. Folded blocks join lines
+/// with spaces (a blank line is a newline); literal blocks keep newlines.
+/// Trailing blank lines are dropped, as frontmatter values never want them.
+fn read_block_scalar(lines: &[&str], key_indent: usize, folded: bool) -> (String, usize) {
+    let mut body: Vec<&str> = Vec::new();
+    let mut block_indent = None;
+    let mut consumed = 0;
+    for line in lines {
+        if line.trim().is_empty() {
+            body.push("");
+            consumed += 1;
+            continue;
+        }
+        let indent = indent_of(line);
+        let block = *block_indent.get_or_insert(indent);
+        if indent <= key_indent || indent < block {
+            break;
+        }
+        // The first `block` bytes are ASCII whitespace, so this is a char
+        // boundary.
+        body.push(line[block..].trim_end());
+        consumed += 1;
+    }
+    while body.last() == Some(&"") {
+        body.pop();
+        consumed -= 1;
+    }
+    let text = if folded {
+        let mut out = String::new();
+        let mut after_break = true;
+        for line in body {
+            if line.is_empty() {
+                out.push('\n');
+                after_break = true;
+            } else {
+                if !after_break {
+                    out.push(' ');
+                }
+                out.push_str(line);
+                after_break = false;
+            }
+        }
+        out
+    } else {
+        body.join("\n")
+    };
+    (text, consumed)
 }
 
 fn strip_frontmatter(raw: &str) -> String {
@@ -3513,6 +3595,60 @@ mod tests {
     fn test_escape_xml_replaces_all_special_chars() {
         let escaped = escape_xml("& < > \" '");
         assert_eq!(escaped, "&amp; &lt; &gt; &quot; &apos;");
+    }
+
+    /// gh #240: the reporter's folded description. Its continuation lines
+    /// (one contains a colon) belong to `description`, so no bogus field is
+    /// parsed and validation stays clean.
+    #[test]
+    fn test_parse_frontmatter_folded_block_scalar() {
+        let parsed = parse_frontmatter(
+            "---\n\
+             name: ponytail\n\
+             description: >\n  \
+               Forces the laziest solution that actually works.\n  \
+               Use on ANY coding task: writing, adding, refactoring.\n\
+             disable-model-invocation: true\n\
+             ---\n\
+             body",
+        );
+        assert_eq!(
+            parsed.frontmatter.get("description").map(String::as_str),
+            Some(
+                "Forces the laziest solution that actually works. \
+                 Use on ANY coding task: writing, adding, refactoring."
+            )
+        );
+        assert_eq!(
+            parsed
+                .frontmatter
+                .get("disable-model-invocation")
+                .map(String::as_str),
+            Some("true"),
+            "the key after the block still parses"
+        );
+        assert!(validate_frontmatter_fields(parsed.frontmatter.keys()).is_empty());
+        assert_eq!(parsed.body, "body");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_literal_block_scalar_keeps_lines() {
+        let parsed =
+            parse_frontmatter("---\ndescription: |-\n  line one: a\n\n  line two\nname: x\n---\n");
+        assert_eq!(
+            parsed.frontmatter.get("description").map(String::as_str),
+            Some("line one: a\n\nline two")
+        );
+        assert_eq!(
+            parsed.frontmatter.get("name").map(String::as_str),
+            Some("x")
+        );
+        // A value that merely starts with `>` text is not a block header.
+        let plain = parse_frontmatter("---\ndescription: >not a block\n---\n");
+        assert_eq!(
+            plain.frontmatter.get("description").map(String::as_str),
+            Some(">not a block")
+        );
     }
 
     #[test]
