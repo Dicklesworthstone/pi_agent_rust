@@ -12,6 +12,7 @@
 
 use crate::model::Message;
 use crate::provider::Provider;
+use crate::text_completion::{MAX_TEXT_BYTES, collect_text, with_timeout};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -330,7 +331,7 @@ pub struct AdvisorRuntime {
     /// Resolved credential for the advisor's provider; forwarded on every
     /// review call so keyed providers authenticate exactly like the doer.
     api_key: Option<String>,
-    /// Set when disabled after repeated failures (user notice rides once).
+    /// One-shot user notice. Consuming it does not clear the disabled state.
     pub disabled_notice: Option<String>,
 }
 
@@ -381,7 +382,7 @@ impl AdvisorRuntime {
 
     #[must_use]
     pub const fn is_disabled(&self) -> bool {
-        self.disabled_notice.is_some()
+        self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
     }
 
     /// Review one turn. Never fails the caller.
@@ -415,7 +416,6 @@ impl AdvisorRuntime {
     }
 
     async fn call_advisor(&self, digest: &TurnDigest) -> crate::error::Result<String> {
-        use futures::StreamExt;
         let context = crate::provider::Context {
             system_prompt: Some(REVIEW_SYSTEM_PROMPT.to_string().into()),
             messages: vec![crate::model::Message::User(crate::model::UserMessage {
@@ -430,43 +430,9 @@ impl AdvisorRuntime {
             api_key: self.api_key.clone(),
             ..Default::default()
         };
-        let mut stream = self.provider.stream(&context, &options).await?;
-        let mut text = String::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(crate::model::StreamEvent::TextDelta { delta, .. }) => text.push_str(&delta),
-                Ok(crate::model::StreamEvent::Done { .. }) => break,
-                Ok(_) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        if text.trim().is_empty() {
-            return Err(crate::error::Error::api("advisor returned empty reply"));
-        }
-        Ok(text)
+        let stream = self.provider.stream(&context, &options).await?;
+        collect_text(stream, MAX_TEXT_BYTES).await
     }
-}
-
-/// Minimal wall-clock timeout that works with any future (no runtime driver
-/// dependency: it polls the future against a millisecond sleep loop).
-async fn with_timeout<F>(timeout: Duration, future: F) -> Option<F::Output>
-where
-    F: std::future::Future,
-{
-    use std::pin::pin;
-    let mut future = pin!(future);
-    let start = std::time::Instant::now();
-    std::future::poll_fn(move |cx| {
-        if let std::task::Poll::Ready(output) = future.as_mut().poll(cx) {
-            return std::task::Poll::Ready(Some(output));
-        }
-        if start.elapsed() >= timeout {
-            return std::task::Poll::Ready(None);
-        }
-        cx.waker().wake_by_ref();
-        std::task::Poll::Pending
-    })
-    .await
 }
 
 #[cfg(test)]
@@ -604,6 +570,205 @@ mod tests {
             })
             .await;
             assert!(outcome.is_none(), "slow advisor call must time out");
+        });
+    }
+
+    struct ScriptedProvider {
+        responses: std::sync::Mutex<std::collections::VecDeque<Vec<crate::model::StreamEvent>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait::async_trait]
+    impl Provider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "advisor-test"
+        }
+
+        fn api(&self) -> &str {
+            "advisor-test"
+        }
+
+        fn model_id(&self) -> &str {
+            "advisor-test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>,
+            >,
+        > {
+            assert!(context.tools.is_empty());
+            assert_eq!(context.system_prompt.as_deref(), Some(REVIEW_SYSTEM_PROMPT));
+            assert_eq!(options.api_key.as_deref(), Some("test-key"));
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected advisor provider call");
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    fn scripted_runtime(
+        responses: Vec<Vec<crate::model::StreamEvent>>,
+    ) -> (AdvisorRuntime, Arc<ScriptedProvider>) {
+        let provider = Arc::new(ScriptedProvider {
+            responses: std::sync::Mutex::new(responses.into()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = AdvisorRuntime::new(provider.clone(), "test".to_string())
+            .with_api_key(Some("test-key".to_string()));
+        (runtime, provider)
+    }
+
+    fn review_digest() -> TurnDigest {
+        TurnDigest {
+            tool_call_count: 1,
+            final_text: "edited src/example.rs".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn completed_reply(text: &str) -> Vec<crate::model::StreamEvent> {
+        vec![crate::model::StreamEvent::Done {
+            reason: crate::model::StopReason::Stop,
+            message: crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(text),
+                )],
+                stop_reason: crate::model::StopReason::Stop,
+                ..Default::default()
+            },
+        }]
+    }
+
+    fn disconnected_reply() -> Vec<crate::model::StreamEvent> {
+        vec![crate::model::StreamEvent::TextDelta {
+            content_index: 0,
+            delta: "BLOCKER\nThis is only an unfinished review".to_string(),
+        }]
+    }
+
+    #[test]
+    fn terminal_only_review_produces_a_verdict() {
+        asupersync::test_utils::run_test(|| async {
+            let (mut runtime, _) = scripted_runtime(vec![completed_reply(
+                "CONCERN\nCheck the error path in src/example.rs.",
+            )]);
+            let AdvisorOutcome::Inject(verdict) = runtime.review_turn(&review_digest(), 0).await
+            else {
+                panic!("a completed terminal-only review must be usable");
+            };
+            assert_eq!(verdict.level, VerdictLevel::Concern);
+            assert!(verdict.rationale.contains("src/example.rs"));
+        });
+    }
+
+    #[test]
+    fn disconnected_blocker_is_a_failure_not_an_injection() {
+        asupersync::test_utils::run_test(|| async {
+            let (mut runtime, _) = scripted_runtime(vec![disconnected_reply()]);
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 0).await,
+                AdvisorOutcome::Failed
+            ));
+            assert_eq!(runtime.consecutive_failures, 1);
+        });
+    }
+
+    #[test]
+    fn truncated_terminal_review_is_not_injected() {
+        asupersync::test_utils::run_test(|| async {
+            let mut events = completed_reply("BLOCKER\nIncomplete review");
+            if let crate::model::StreamEvent::Done { reason, message } = &mut events[0] {
+                *reason = crate::model::StopReason::Length;
+                message.stop_reason = crate::model::StopReason::Length;
+            }
+            let (mut runtime, _) = scripted_runtime(vec![events]);
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 0).await,
+                AdvisorOutcome::Failed
+            ));
+        });
+    }
+
+    #[test]
+    fn disable_survives_consumption_of_one_shot_notice() {
+        asupersync::test_utils::run_test(|| async {
+            let (mut runtime, provider) = scripted_runtime(vec![
+                disconnected_reply(),
+                disconnected_reply(),
+                disconnected_reply(),
+            ]);
+            for turn in 0..3 {
+                assert!(matches!(
+                    runtime.review_turn(&review_digest(), turn).await,
+                    AdvisorOutcome::Failed
+                ));
+            }
+            assert!(runtime.is_disabled());
+            assert!(runtime.disabled_notice.take().is_some());
+            assert!(runtime.is_disabled(), "delivering a notice must not resume billing");
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 3).await,
+                AdvisorOutcome::Quiet
+            ));
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+            assert!(runtime.disabled_notice.is_none());
+        });
+    }
+
+    #[test]
+    fn completed_review_resets_only_consecutive_failure_count() {
+        asupersync::test_utils::run_test(|| async {
+            let (mut runtime, _) = scripted_runtime(vec![
+                disconnected_reply(),
+                completed_reply("NOTE\nThe edit preserves the existing error handling."),
+                disconnected_reply(),
+                disconnected_reply(),
+                disconnected_reply(),
+            ]);
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 0).await,
+                AdvisorOutcome::Failed
+            ));
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 1).await,
+                AdvisorOutcome::Inject(_)
+            ));
+            assert_eq!(runtime.consecutive_failures, 0);
+            for turn in 2..4 {
+                assert!(matches!(
+                    runtime.review_turn(&review_digest(), turn).await,
+                    AdvisorOutcome::Failed
+                ));
+                assert!(!runtime.is_disabled());
+            }
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 4).await,
+                AdvisorOutcome::Failed
+            ));
+            assert!(runtime.is_disabled());
+        });
+    }
+
+    #[test]
+    fn zero_deadline_does_not_admit_provider_request() {
+        asupersync::test_utils::run_test(|| async {
+            let (runtime, provider) = scripted_runtime(Vec::new());
+            let mut runtime = runtime.with_timeout(Duration::ZERO);
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 0).await,
+                AdvisorOutcome::Failed
+            ));
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         });
     }
 }
