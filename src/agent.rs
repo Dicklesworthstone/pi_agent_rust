@@ -2324,6 +2324,29 @@ impl Agent {
         self.config.system_prompt = system_prompt;
     }
 
+    /// What the next completion request would carry: the system prompt,
+    /// tool definitions and messages after the same filtering a real request
+    /// applies. OMP `/dump` writes this beside the transcript.
+    pub fn request_context_json(&mut self) -> serde_json::Value {
+        let context = self.build_context();
+        let tools: Vec<serde_json::Value> = context
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "systemPrompt": context.system_prompt,
+            "tools": tools,
+            "messages": context.messages,
+        })
+    }
+
     /// Build context for a completion request.
     fn build_context(&mut self) -> Context<'_> {
         // `display` governs TUI rendering only: a hidden custom message still

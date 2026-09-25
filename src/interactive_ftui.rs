@@ -1479,6 +1479,9 @@ pub enum UiCommand {
     /// List the user messages on the current path for the rewind (or, with
     /// `fork`, fork) picker; the driver answers `PiMsg::MessagePicker`.
     MessagePicker { fork: bool },
+    /// `/dump`: copy the session as plain text and write the next request's
+    /// context as JSON (OMP `/dump`).
+    Dump,
     /// `/copy cmd`: copy the newest shell command, the agent's (bash tool) or
     /// the user's (`!cmd`), in full.
     CopyLastCommand,
@@ -3567,7 +3570,7 @@ impl PiFtuiModel {
                 String::from(
                     "pi commands: /model [provider/model], /resume, /new, \
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
-                     /export [path], /copy [code|cmd|link], /share, /tan <task>, /usage, /mcp, \
+                     /export [path], /copy [code|cmd|link], /dump, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking [level], /fast [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
@@ -3756,6 +3759,10 @@ impl PiFtuiModel {
             }
             "/branch" => {
                 self.request_message_picker(false);
+                return true;
+            }
+            "/dump" => {
+                self.send_command(UiCommand::Dump);
                 return true;
             }
             "/fast" => {
@@ -6798,6 +6805,138 @@ fn last_shell_command(session: &crate::session::Session) -> Option<String> {
         })
 }
 
+/// The conversation as plain text (OMP `/dump`): each message under a role
+/// heading, tool calls with their arguments, tool results with their output.
+fn transcript_text(messages: &[crate::model::Message]) -> String {
+    use crate::model::{ContentBlock, Message, UserContent};
+    use std::fmt::Write as _;
+    fn blocks(out: &mut String, content: &[ContentBlock]) {
+        for block in content {
+            match block {
+                ContentBlock::Text(text) => {
+                    let _ = writeln!(out, "{}", text.text);
+                }
+                ContentBlock::Thinking(thinking) => {
+                    let _ = writeln!(out, "[thinking]\n{}", thinking.thinking);
+                }
+                ContentBlock::ToolCall(call) => {
+                    let _ = writeln!(out, "[tool call] {} {}", call.name, call.arguments);
+                }
+                ContentBlock::Image(image) => {
+                    let _ = writeln!(out, "[image {}]", image.mime_type);
+                }
+                ContentBlock::Media(_) => out.push_str("[media]\n"),
+                ContentBlock::RedactedThinking(_) => out.push_str("[redacted thinking]\n"),
+            }
+        }
+    }
+    let mut out = String::new();
+    for message in messages {
+        match message {
+            Message::User(user) => {
+                out.push_str("## User\n");
+                match &user.content {
+                    UserContent::Text(text) => {
+                        let _ = writeln!(out, "{text}");
+                    }
+                    UserContent::Blocks(content) => blocks(&mut out, content),
+                }
+            }
+            Message::Assistant(assistant) => {
+                out.push_str("## Assistant\n");
+                blocks(&mut out, &assistant.content);
+            }
+            Message::ToolResult(result) => {
+                let error = if result.is_error { " (error)" } else { "" };
+                let _ = writeln!(out, "## Tool result: {}{error}", result.tool_name);
+                blocks(&mut out, &result.content);
+            }
+            Message::Custom(custom) => {
+                let _ = writeln!(out, "## {}\n{}", custom.custom_type, custom.content);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Write `contents` to a new file in `dir` that only the user can read.
+fn write_private_file(
+    dir: &std::path::Path,
+    stem: &str,
+    contents: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let path = dir.join(format!(
+        "{stem}_{}.json",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(&path)?.write_all(contents.as_bytes())?;
+    Ok(path)
+}
+
+/// OMP `/dump`: copy the session as plain text (model, thinking level,
+/// system prompt, tools, then the conversation) and write what the next
+/// request would carry as JSON to a private temp file.
+fn run_dump_command(handle: &mut crate::sdk::AgentSessionHandle) -> PiMsg {
+    let (provider, model_id) = handle.model();
+    let agent = &mut handle.session_mut().agent;
+    if agent.messages().is_empty() {
+        return PiMsg::System(String::from("No messages to dump yet."));
+    }
+    let thinking = agent
+        .stream_options()
+        .thinking_level
+        .map_or_else(|| String::from("off"), |level| level.to_string());
+    let service_tier = agent.stream_options().service_tier.clone();
+    let mut request = agent.request_context_json();
+    let tool_names: Vec<String> = request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut text = format!(
+        "Model: {provider}/{model_id}\nThinking: {thinking}\n{}Tools: {}\n\n",
+        service_tier
+            .as_deref()
+            .map_or_else(String::new, |tier| format!("Service tier: {tier}\n")),
+        tool_names.join(", ")
+    );
+    if let Some(system) = request["systemPrompt"].as_str() {
+        text.push_str("## System prompt\n");
+        text.push_str(system);
+        text.push_str("\n\n");
+    }
+    text.push_str(&transcript_text(agent.messages()));
+    let outcome = crate::interactive::copy_text_to_clipboard(&text);
+
+    request["model"] = serde_json::json!(format!("{provider}/{model_id}"));
+    request["thinkingLevel"] = serde_json::json!(thinking);
+    request["serviceTier"] = serde_json::json!(service_tier);
+    let sidecar = serde_json::to_string_pretty(&request)
+        .map_err(std::io::Error::other)
+        .and_then(|json| write_private_file(&std::env::temp_dir(), "pi_dump_request", &json));
+    PiMsg::System(match sidecar {
+        Ok(path) => format!(
+            "{outcome}\nLLM request JSON: {}\nThat file stays on disk and may contain raw \
+             context or secrets; treat it accordingly.",
+            path.display()
+        ),
+        Err(err) => format!("{outcome}\n(Could not write the LLM request JSON: {err})"),
+    })
+}
+
 /// Send the user messages on the current path for the rewind/fork picker.
 async fn send_message_picker(
     handle: &crate::sdk::AgentSessionHandle,
@@ -8301,6 +8440,9 @@ pub fn run(
                         }
                         Ok(UiCommand::Fast(request)) => {
                             let _ = agent_tx.send(run_fast_command(&mut handle, request));
+                        }
+                        Ok(UiCommand::Dump) => {
+                            let _ = agent_tx.send(run_dump_command(&mut handle));
                         }
                         Ok(UiCommand::CopyLastCommand) => {
                             let found = handle.with_session(last_shell_command).await;
@@ -9834,6 +9976,89 @@ mod tests {
             outcome.contains("lipboard"),
             "unexpected copy outcome: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn dump_renders_the_conversation_and_the_request_context() {
+        use crate::model::{
+            ContentBlock, Message, TextContent, ToolCall, UserContent, UserMessage,
+        };
+        let messages = vec![
+            Message::User(UserMessage {
+                content: UserContent::Text(String::from("list the files")),
+                timestamp: 0,
+            }),
+            Message::Assistant(Arc::new(crate::model::AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new("Looking.")),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: String::from("t1"),
+                        name: String::from("bash"),
+                        arguments: serde_json::json!({"command": "ls"}),
+                        thought_signature: None,
+                    }),
+                ],
+                ..Default::default()
+            })),
+            Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+                tool_call_id: String::from("t1"),
+                tool_name: String::from("bash"),
+                content: vec![ContentBlock::Text(TextContent::new("no such dir"))],
+                details: None,
+                is_error: true,
+                timestamp: 0,
+            })),
+        ];
+        assert_eq!(
+            transcript_text(&messages),
+            "## User\nlist the files\n\n## Assistant\nLooking.\n[tool call] bash \
+             {\"command\":\"ls\"}\n\n## Tool result: bash (error)\nno such dir\n\n"
+        );
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        runtime.block_on(async {
+            let mut handle = crate::sdk::create_agent_session(crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("dummy-key")),
+                working_directory: Some(cwd.path().to_path_buf()),
+                no_session: true,
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .expect("create session");
+            // Nothing said yet: nothing is copied or written.
+            assert!(matches!(
+                run_dump_command(&mut handle),
+                PiMsg::System(text) if text == "No messages to dump yet."
+            ));
+            let agent = &mut handle.session_mut().agent;
+            agent.replace_messages(messages[..1].to_vec());
+            let request = agent.request_context_json();
+            assert!(
+                request["systemPrompt"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+            );
+            let tools = request["tools"].as_array().expect("tools");
+            assert!(tools.iter().any(|tool| tool["name"] == "bash"
+                && tool["parameters"].is_object()
+                && tool["description"].is_string()));
+            assert_eq!(request["messages"].as_array().map(Vec::len), Some(1));
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_private_file(dir.path(), "pi_dump_request", "{}").expect("write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "{}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "request dumps may hold secrets");
+        }
     }
 
     #[test]
