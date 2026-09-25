@@ -2965,6 +2965,11 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     if let Some(handle) = options.runtime_handle.clone() {
         agent_session = agent_session.with_runtime_handle(handle);
     }
+    // settings.json `steeringMode` / `followUpMode`. The classic UI and RPC
+    // apply them to their own agents; without this every SDK-built session,
+    // the default FTUI included, delivered queued messages one at a time
+    // whatever was configured. Extensions enabled below copy these modes.
+    agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
     agent_session.advisor = options
         .advisor
@@ -4088,6 +4093,28 @@ mod tests {
         let trusted =
             load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn sessions_use_the_configured_queue_modes() {
+        let modes_for = |mode: &str| {
+            let tmp = tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join(".pi")).expect("create project config dir");
+            std::fs::write(
+                tmp.path().join(".pi/settings.json"),
+                format!(r#"{{"steeringMode":"{mode}","followUpMode":"{mode}"}}"#),
+            )
+            .expect("write project settings");
+            let mut options = hermetic_session_options(tmp.path());
+            options.workspace_trusted = true;
+            let handle = run_async(create_agent_session(options)).expect("create session");
+            handle.session().agent.queue_modes()
+        };
+        assert_eq!(modes_for("all"), (QueueMode::All, QueueMode::All));
+        assert_eq!(
+            modes_for("one-at-a-time"),
+            (QueueMode::OneAtATime, QueueMode::OneAtATime)
+        );
     }
 
     /// A fixture extension that observes and does nothing else.

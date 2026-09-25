@@ -3032,7 +3032,7 @@ mod tests {
         assert!(request.get("speed").is_none());
         let plain = StreamOptions {
             service_tier: None,
-            ..options.clone()
+            ..options
         };
         let request = serde_json::to_value(provider.build_request(&context, &plain)).unwrap();
         assert!(request.get("speed").is_none());

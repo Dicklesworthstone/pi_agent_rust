@@ -1939,6 +1939,14 @@ impl PiFtuiModel {
         self
     }
 
+    /// Whether thinking starts shown in full (`hideThinkingBlock` off) or
+    /// collapsed to one line. ctrl+t flips it either way.
+    #[must_use]
+    pub const fn with_thinking_visible(mut self, visible: bool) -> Self {
+        self.show_thinking = visible;
+        self
+    }
+
     /// Set the transcript markdown spacing policy (issue #202).
     #[must_use]
     pub const fn with_markdown_spacing(mut self, spacing: crate::config::MarkdownSpacing) -> Self {
@@ -4593,6 +4601,21 @@ impl PiFtuiModel {
             });
         }
         self.render_stats.set((rendered_blocks, reused_blocks));
+        // In-flight thinking shows live, as OMP streams it, and shown or
+        // collapsed like the entry it becomes at the next flush. It used to
+        // stay invisible until the turn's text or a tool card flushed it.
+        let thinking = self.thinking.trim();
+        if !thinking.is_empty() {
+            let text = if self.show_thinking {
+                thinking.to_string()
+            } else {
+                collapsed_thinking(thinking)
+            };
+            let mut block = Vec::new();
+            push_role_block(&mut block, EntryRole::Thinking, &text, &palette, &md);
+            wrap_body_block(&mut block, wrap_width, &theme);
+            lines.extend(block);
+        }
         if !self.streaming.is_empty() {
             // Streaming fragments may end mid-construct; the streaming
             // renderer is tolerant of unterminated markdown. The in-flight
@@ -7494,6 +7517,10 @@ pub struct FtuiSettings {
     /// `/btw` side-question client for the smol role model, when it resolves
     /// with credentials.
     pub btw_client: Option<Arc<crate::btw::BtwClient>>,
+    /// The `hideThinkingBlock` setting: start with thinking collapsed to
+    /// one line (ctrl+t still shows it). Off, as in OMP and classic, shows
+    /// thinking in full.
+    pub hide_thinking_block: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7514,6 +7541,7 @@ pub fn run(
         subagent_role_spec,
         cycle_models,
         btw_client,
+        hide_thinking_block,
     } = settings;
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
@@ -8047,6 +8075,7 @@ pub fn run(
         .with_alt_screen(!inline)
         .with_mouse_enabled(!disable_mouse_capture)
         .with_markdown_spacing(markdown_spacing)
+        .with_thinking_visible(!hide_thinking_block)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
@@ -13566,6 +13595,45 @@ mod tests {
         sim.inject_event(key(KeyCode::Char('t'), Modifiers::CTRL));
         let again = buffer_text(sim.capture_frame(80, 24), 80, 24);
         assert!(!again.contains("option beta"), "{again}");
+    }
+
+    /// With `hideThinkingBlock` off (the launch default, as in OMP) thinking
+    /// shows in full from the start, and ctrl+t collapses it.
+    #[test]
+    fn thinking_starts_visible_when_the_setting_allows() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_thinking_visible(true));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ThinkingDelta(
+            "weigh option alpha\nweigh option beta".into(),
+        )));
+        // Live, while the model is still thinking...
+        let live = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(live.contains("weigh option beta"), "{live}");
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("beta.".into())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+        // ...and once the turn ends.
+        let shown = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(shown.contains("weigh option beta"), "{shown}");
+        sim.inject_event(key(KeyCode::Char('t'), Modifiers::CTRL));
+        let hidden = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(!hidden.contains("option beta"), "{hidden}");
+
+        // Collapsed, in-flight thinking still shows its one-line summary
+        // rather than nothing.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ThinkingDelta("one\ntwo".into())));
+        let live = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(live.contains("thinking · 2 lines (ctrl+t"), "{live}");
+        assert!(!live.contains("two"), "{live}");
     }
 
     /// A `/name` that is a prompt template expands into its text for a turn;
