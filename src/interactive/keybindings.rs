@@ -188,10 +188,15 @@ impl PiApp {
                 return None;
             }
 
+            // Under the agent dir, not the system temp dir: `@file` reading
+            // is confined to the cwd and the agent dir, so a pasted image
+            // saved to /tmp could never be attached.
+            let dir = crate::config::Config::global_dir().join("pastes");
+            std::fs::create_dir_all(&dir).ok()?;
             let mut temp_file = tempfile::Builder::new()
                 .prefix("pi-paste-")
                 .suffix(".png")
-                .tempfile()
+                .tempfile_in(&dir)
                 .ok()?;
             let encoder = image::codecs::png::PngEncoder::new(&mut temp_file);
             if encoder

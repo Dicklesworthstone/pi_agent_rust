@@ -173,6 +173,113 @@ pub(super) fn is_file_ref_boundary(text: &str, at: usize) -> bool {
     prev.is_whitespace() || matches!(prev, '(' | '[' | '{' | '<' | '"' | '\'')
 }
 
+const fn is_linebreak(ch: char) -> bool {
+    matches!(ch, '\n' | '\r')
+}
+
+const fn is_horizontal_whitespace(ch: char) -> bool {
+    matches!(ch, ' ' | '\t')
+}
+
+fn trim_trailing_horizontal_whitespace(text: &mut String) {
+    while text.chars().last().is_some_and(is_horizontal_whitespace) {
+        text.pop();
+    }
+}
+
+fn trailing_line_is_blank(text: &str) -> bool {
+    if let Some((line_start, linebreak)) =
+        text.char_indices().rev().find(|(_, ch)| is_linebreak(*ch))
+    {
+        let start = line_start + linebreak.len_utf8();
+        return text[start..].chars().all(is_horizontal_whitespace);
+    }
+
+    text.chars().all(is_horizontal_whitespace)
+}
+
+fn consume_single_linebreak(text: &str, start: usize) -> usize {
+    if start >= text.len() {
+        return 0;
+    }
+
+    let Some(first) = text[start..].chars().next() else {
+        return 0;
+    };
+    if !is_linebreak(first) {
+        return 0;
+    }
+
+    let first_len = first.len_utf8();
+    if first == '\r' && text[start + first_len..].starts_with('\n') {
+        return first_len + '\n'.len_utf8();
+    }
+
+    first_len
+}
+
+/// Split `@file` references out of a message: returns the message with each
+/// resolved reference removed (and its surrounding whitespace tidied) plus
+/// the resolved paths, in order. `resolve` maps a written path to the path
+/// to attach, or `None` to leave the `@token` in the text untouched. Shared
+/// by both interactive stacks.
+pub fn extract_file_references(
+    message: &str,
+    mut resolve: impl FnMut(&str) -> Option<String>,
+) -> (String, Vec<String>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut file_args = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < message.len() {
+        let ch = message[idx..].chars().next().unwrap_or(' ');
+        if ch == '@' && is_file_ref_boundary(message, idx) {
+            let token_start = idx + ch.len_utf8();
+            let parsed = parse_quoted_file_ref(message, token_start);
+            let (path, trailing, token_end) = parsed.unwrap_or_else(|| {
+                let (token, token_end) = next_non_whitespace_token(message, token_start);
+                let (path, trailing) = split_trailing_punct(token);
+                (path.to_string(), trailing.to_string(), token_end)
+            });
+
+            if !path.is_empty()
+                && let Some(resolved) = resolve(&path)
+            {
+                file_args.push(resolved);
+                let mut next_idx = token_end;
+                if !trailing.is_empty() {
+                    trim_trailing_horizontal_whitespace(&mut cleaned);
+                } else if message[next_idx..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_horizontal_whitespace)
+                {
+                    while message[next_idx..]
+                        .chars()
+                        .next()
+                        .is_some_and(is_horizontal_whitespace)
+                    {
+                        next_idx += message[next_idx..].chars().next().map_or(0, char::len_utf8);
+                    }
+                } else if trailing_line_is_blank(&cleaned)
+                    && message[next_idx..].chars().next().is_some_and(is_linebreak)
+                {
+                    trim_trailing_horizontal_whitespace(&mut cleaned);
+                    next_idx += consume_single_linebreak(message, next_idx);
+                }
+                cleaned.push_str(&trailing);
+                idx = next_idx;
+                continue;
+            }
+        }
+
+        cleaned.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    (cleaned, file_args)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

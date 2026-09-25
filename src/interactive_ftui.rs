@@ -1227,6 +1227,9 @@ pub enum UiCommand {
     /// `/retry`: re-send the last user turn as a sibling branch of the
     /// abandoned one; the driver replays the history before the turn runs.
     Retry,
+    /// `/scoped-models [patterns|clear]`: show or set the models ctrl+p
+    /// cycles through.
+    ScopedModels { args: String },
     /// `/checkpoint [name] [note]`: mark the active context.
     Checkpoint { args: String },
     /// `/rewind [name]`: collapse the context since a checkpoint into a
@@ -3168,6 +3171,7 @@ impl PiFtuiModel {
                      /commit [--dry-run], /review [target], /handoff, /approval [mode], \
                      /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
+                     /scoped-models [patterns|clear], \
                      /context, /todo, /jobs, /stats, /help, \
                      /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
@@ -3212,6 +3216,12 @@ impl PiFtuiModel {
             "/retry" => {
                 self.begin_busy("retrying last turn ...");
                 self.send_command(UiCommand::Retry);
+                return true;
+            }
+            "/scoped-models" => {
+                self.send_command(UiCommand::ScopedModels {
+                    args: cmd_args.trim().to_string(),
+                });
                 return true;
             }
             "/checkpoint" => {
@@ -3835,6 +3845,7 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::ExpandTools))
                     .or_else(|| pick(AppAction::ToggleThinking))
                     .or_else(|| pick(AppAction::ExternalEditor))
+                    .or_else(|| pick(AppAction::PasteImage))
                     .or_else(|| pick(AppAction::CursorUp))
                     .or_else(|| pick(AppAction::CursorDown));
                 let page = self.body_height().saturating_sub(1).max(1);
@@ -3971,6 +3982,22 @@ impl PiFtuiModel {
                         #[cfg(not(test))]
                         let task = external_editor_task(draft, self.alt_screen, self.mouse);
                         return Cmd::task(task);
+                    }
+                    Some(AppAction::PasteImage)
+                        if self.input_active()
+                            && self.active_ask.is_none()
+                            && self.active_ext.is_none() =>
+                    {
+                        // The pasted screenshot is attached when the prompt
+                        // is sent, through its `@file` reference.
+                        match crate::interactive::paste_clipboard_image_ref() {
+                            Some(reference) => self.input.insert_text(&format!("{reference} ")),
+                            None => {
+                                self.error_banner =
+                                    Some(String::from("No image on the clipboard to paste."));
+                            }
+                        }
+                        return Cmd::none();
                     }
                     Some(AppAction::ExpandTools) => {
                         self.tools_expanded = !self.tools_expanded;
@@ -5366,12 +5393,14 @@ async fn run_tan_command(
 async fn run_prompt_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
+    images: Vec<crate::model::ImageContent>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) {
-    let mut next = Some(prompt);
-    while let Some(prompt) = next.take() {
-        let (leftover, stopped) = run_controlled_turn(handle, prompt, agent_tx, turn_control).await;
+    let mut next = Some((prompt, images));
+    while let Some((prompt, images)) = next.take() {
+        let (leftover, stopped) =
+            run_controlled_turn(handle, prompt, images, agent_tx, turn_control).await;
         if leftover.is_empty() {
             continue;
         }
@@ -5397,7 +5426,7 @@ async fn run_prompt_turn(
                 "Running {} message(s) sent as the last turn ended.",
                 leftover.len()
             )));
-            next = Some(text);
+            next = Some((text, Vec::new()));
         }
     }
 }
@@ -5407,12 +5436,13 @@ async fn run_prompt_turn(
 async fn run_controlled_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
+    images: Vec<crate::model::ImageContent>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) -> (Vec<String>, bool) {
     // ubs:ignore Sender clone per turn — the event callback must own its sender
     let tx = agent_tx.clone();
-    let turn = handle.prompt_controlled(prompt, move |event| {
+    let turn = handle.prompt_controlled_with_images(prompt, images, move |event| {
         for msg in agent_event_to_pi_msgs(&event) {
             let _ = tx.send(msg);
         }
@@ -5539,6 +5569,43 @@ fn unrouted_command_message(name: &str, extensions_enabled: bool) -> String {
 
 /// Dispatch a slash command to the extension runtime (bd-1eoh4): unknown or
 /// unavailable commands report the same way the bubbletea stack does.
+/// A typed prompt as the agent receives it, the classic stack's submit path:
+/// `@file` references are read in (text files inlined ahead of the message,
+/// images attached), then templates and `/skill:` commands expand. The
+/// default stack used to send `@path` to the model as literal text.
+fn prepare_prompt(
+    prompt: &str,
+    resources: Option<&crate::resources::ResourceLoader>,
+    cwd: &std::path::Path,
+    workspace: Option<&crate::workspace::WorkspaceHandle>,
+    auto_resize_images: bool,
+) -> std::result::Result<(String, Vec<crate::model::ImageContent>), String> {
+    let expand = |text: &str| resources.map_or_else(|| text.to_string(), |r| r.expand_input(text));
+    let (without_refs, refs) = crate::interactive::extract_file_references(prompt, |path| {
+        crate::tools::resolve_read_path(path, cwd)
+            .exists()
+            .then(|| path.to_string())
+    });
+    if refs.is_empty() {
+        return Ok((expand(prompt), Vec::new()));
+    }
+    let single;
+    let workspace = if let Some(workspace) = workspace {
+        workspace
+    } else {
+        single = crate::workspace::WorkspaceHandle::single(cwd);
+        &single
+    };
+    let processed = crate::tools::process_file_arguments(&refs, cwd, auto_resize_images, workspace)
+        .map_err(|err| err.to_string())?;
+    let mut text = processed.text;
+    let message = expand(without_refs.trim());
+    if !message.trim().is_empty() {
+        text.push_str(&message);
+    }
+    Ok((text, processed.images))
+}
+
 /// `/name args` as a prompt-template turn: the expanded text when `name` is
 /// a loaded prompt template and no extension command claims it.
 fn template_prompt(
@@ -6245,6 +6312,100 @@ fn next_cycle_model(models: &[String], current: &str, forward: bool) -> Option<S
 
 /// Handle `AppAction::CycleModelForward`/`Backward` (ctrl+p): switch to the
 /// neighbouring model in the cycle list through the `/model` path.
+/// `/scoped-models` patterns (glob or exact; `provider/id` or a bare id; a
+/// `:thinking` suffix ignored) resolved against the available `provider/id`
+/// list, in pattern order without duplicates.
+fn scope_models(patterns: &[String], available: &[String]) -> Result<Vec<String>, String> {
+    let mut resolved: Vec<String> = Vec::new();
+    for pattern in patterns {
+        let raw = crate::interactive::strip_thinking_level_suffix(pattern).to_ascii_lowercase();
+        let glob = if raw.contains(['*', '?', '[']) {
+            Some(
+                glob::Pattern::new(&raw)
+                    .map_err(|err| format!("Invalid model pattern \"{pattern}\": {err}"))?,
+            )
+        } else {
+            None
+        };
+        for model in available {
+            let full = model.to_ascii_lowercase();
+            let id = full.split_once('/').map_or(full.as_str(), |(_, id)| id);
+            let hit = glob.as_ref().map_or_else(
+                || raw == full || raw == id,
+                |glob| glob.matches(&full) || glob.matches(id),
+            );
+            if hit && !resolved.iter().any(|m| m.eq_ignore_ascii_case(model)) {
+                resolved.push(model.clone());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `/scoped-models [patterns|clear]`: show or set the ctrl+p cycle, saved to
+/// the project's `enabled_models` as on the classic stack.
+fn run_scoped_models_command(
+    args: &str,
+    available: &[String],
+    cycle: &mut Vec<String>,
+    cwd: &std::path::Path,
+) -> PiMsg {
+    const USAGE: &str = "Usage: /scoped-models [patterns|clear] (e.g. gpt-5*,claude-sonnet*)";
+    let args = args.trim();
+    if args.is_empty() {
+        return PiMsg::System(format!(
+            "Scoped models: ctrl+p cycles {} model(s): {}",
+            cycle.len(),
+            cycle.join(", ")
+        ));
+    }
+    let patterns = if args.eq_ignore_ascii_case("clear") {
+        Vec::new()
+    } else {
+        let patterns = crate::interactive::parse_scoped_model_patterns(args);
+        if patterns.is_empty() {
+            return PiMsg::System(String::from(USAGE));
+        }
+        patterns
+    };
+    let next = if patterns.is_empty() {
+        available.to_vec()
+    } else {
+        match scope_models(&patterns, available) {
+            Ok(models) if models.is_empty() => {
+                return PiMsg::System(format!(
+                    "No models matched {}; the ctrl+p cycle is unchanged.",
+                    patterns.join(", ")
+                ));
+            }
+            Ok(models) => models,
+            Err(err) => return PiMsg::AgentError(err),
+        }
+    };
+    *cycle = next;
+    let mut message = if patterns.is_empty() {
+        format!(
+            "Scoped models cleared: ctrl+p cycles all {} models.",
+            cycle.len()
+        )
+    } else {
+        format!(
+            "Scoped models: ctrl+p cycles {} model(s): {}",
+            cycle.len(),
+            cycle.join(", ")
+        )
+    };
+    if let Err(err) = crate::config::Config::patch_settings_with_roots(
+        crate::config::SettingsScope::Project,
+        &crate::config::Config::global_dir(),
+        cwd,
+        serde_json::json!({ "enabled_models": patterns }),
+    ) {
+        let _ = write!(message, " (not saved: {err})");
+    }
+    PiMsg::System(message)
+}
+
 async fn run_cycle_model_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     models: &[String],
@@ -7002,16 +7163,21 @@ pub fn run(
         btw_client,
     } = settings;
     let driver_btw_client = btw_client.clone();
-    let cycle_models = if cycle_models.is_empty() {
+    let mut cycle_models = if cycle_models.is_empty() {
         available_models.clone()
     } else {
         cycle_models
     };
+    let driver_available_models = available_models.clone();
     // Issue #208: the driver re-sends the catalog with extension commands
     // once its session exists; the model starts from the resource catalog.
     let driver_catalog = autocomplete.catalog.clone();
     let mut driver_resources = autocomplete.resources.clone();
     let resource_source = autocomplete.resource_source.clone();
+    // `images.autoResize` from settings; default on, as on the classic stack.
+    let auto_resize_images = resource_source
+        .as_ref()
+        .is_none_or(|source| source.config.image_auto_resize());
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
@@ -7089,14 +7255,31 @@ pub fn run(
                     let refresh_status = received.is_ok();
                     match received {
                         Ok(UiCommand::Prompt(prompt)) => {
-                            // `/skill:name` and prompt templates expand here;
-                            // the model used to receive them verbatim.
-                            let prompt = match &driver_resources {
-                                Some(resources) => resources.expand_input(&prompt),
-                                None => prompt,
-                            };
-                            run_prompt_turn(&mut handle, prompt, &agent_tx, &driver_turn_control)
-                                .await;
+                            // `@file` references, `/skill:name` and prompt
+                            // templates are resolved here; the model used to
+                            // receive them verbatim.
+                            let workspace = handle.workspace();
+                            match prepare_prompt(
+                                &prompt,
+                                driver_resources.as_ref(),
+                                &bash_cwd,
+                                workspace.as_ref(),
+                                auto_resize_images,
+                            ) {
+                                Ok((text, images)) => {
+                                    run_prompt_turn(
+                                        &mut handle,
+                                        text,
+                                        images,
+                                        &agent_tx,
+                                        &driver_turn_control,
+                                    )
+                                    .await;
+                                }
+                                Err(err) => {
+                                    let _ = agent_tx.send(PiMsg::AgentError(err));
+                                }
+                            }
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
@@ -7111,6 +7294,7 @@ pub fn run(
                                 run_prompt_turn(
                                     &mut handle,
                                     output,
+                                    Vec::new(),
                                     &agent_tx,
                                     &driver_turn_control,
                                 )
@@ -7158,6 +7342,7 @@ pub fn run(
                                 run_prompt_turn(
                                     &mut handle,
                                     text,
+                                    Vec::new(),
                                     &agent_tx,
                                     &driver_turn_control,
                                 )
@@ -7267,8 +7452,14 @@ pub fn run(
                         }
                         Ok(UiCommand::Retry) => {
                             if let Some(text) = prepare_retry_turn(&mut handle, &agent_tx).await {
-                                run_prompt_turn(&mut handle, text, &agent_tx, &driver_turn_control)
-                                    .await;
+                                run_prompt_turn(
+                                    &mut handle,
+                                    text,
+                                    Vec::new(),
+                                    &agent_tx,
+                                    &driver_turn_control,
+                                )
+                                .await;
                             }
                         }
                         Ok(UiCommand::Btw(question)) => {
@@ -7310,6 +7501,14 @@ pub fn run(
                         }
                         Ok(UiCommand::CycleThinking) => {
                             run_cycle_thinking_command(&mut handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::ScopedModels { args }) => {
+                            let _ = agent_tx.send(run_scoped_models_command(
+                                &args,
+                                &driver_available_models,
+                                &mut cycle_models,
+                                &bash_cwd,
+                            ));
                         }
                         Ok(UiCommand::CycleModel { forward }) => {
                             run_cycle_model_command(&mut handle, &cycle_models, forward, &agent_tx)
@@ -12287,6 +12486,102 @@ mod tests {
             "group counter missing: {rendered:?}"
         );
     }
+    /// `@file` references are read in: a text file is inlined ahead of the
+    /// message, an image is attached, and the reference leaves the text. A
+    /// prompt without references still expands templates.
+    #[test]
+    fn prepare_prompt_reads_file_references_and_attaches_images() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "remember the milk\n").expect("write");
+        // A 1x1 PNG.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
+            0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(dir.path().join("shot.png"), png).expect("write png");
+
+        let (text, images) = prepare_prompt(
+            "summarize @notes.txt and look at @shot.png please",
+            None,
+            dir.path(),
+            None,
+            false,
+        )
+        .expect("prepared");
+        assert!(text.contains("remember the milk"), "{text}");
+        assert!(text.contains("summarize and look at please"), "{text}");
+        assert!(!text.contains("@notes.txt"), "{text}");
+        assert_eq!(images.len(), 1, "the image is attached");
+
+        let (plain, none) =
+            prepare_prompt("no refs, @missing.txt stays", None, dir.path(), None, false)
+                .expect("prepared");
+        assert_eq!(plain, "no refs, @missing.txt stays");
+        assert!(none.is_empty());
+    }
+
+    /// `/scoped-models` resolves globs and exact ids (full or bare, with a
+    /// thinking suffix), keeps pattern order, and rejects a bad glob.
+    #[test]
+    fn scope_models_matches_globs_and_exact_ids() {
+        let available: Vec<String> = [
+            "openai/gpt-4o",
+            "openai/gpt-5",
+            "anthropic/claude-sonnet-4-5",
+            "google/gemini-2.5-pro",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let pats = |p: &[&str]| p.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            scope_models(&pats(&["gpt-*"]), &available).unwrap(),
+            vec!["openai/gpt-4o", "openai/gpt-5"]
+        );
+        assert_eq!(
+            scope_models(
+                &pats(&["claude-sonnet-4-5:high", "google/gemini-2.5-pro"]),
+                &available
+            )
+            .unwrap(),
+            vec!["anthropic/claude-sonnet-4-5", "google/gemini-2.5-pro"]
+        );
+        assert!(
+            scope_models(&pats(&["nothing-like-it"]), &available)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(scope_models(&pats(&["[bad"]), &available).is_err());
+    }
+
+    /// Setting a scope narrows the live cycle and saves the patterns to the
+    /// project settings; a pattern that matches nothing leaves it alone.
+    #[test]
+    fn scoped_models_command_sets_the_cycle_and_saves_the_patterns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let available = vec![
+            String::from("openai/gpt-5"),
+            String::from("anthropic/claude-x"),
+        ];
+        let mut cycle = available.clone();
+        let reply = run_scoped_models_command("gpt-*", &available, &mut cycle, dir.path());
+        assert!(matches!(reply, PiMsg::System(ref text) if text.contains("1 model(s)")));
+        assert_eq!(cycle, vec![String::from("openai/gpt-5")]);
+        let saved = std::fs::read_to_string(dir.path().join(".pi").join("settings.json"))
+            .expect("project settings written");
+        assert!(saved.contains("gpt-*"), "{saved}");
+
+        let unchanged = run_scoped_models_command("zzz-*", &available, &mut cycle, dir.path());
+        assert!(matches!(unchanged, PiMsg::System(ref text) if text.contains("unchanged")));
+        assert_eq!(cycle, vec![String::from("openai/gpt-5")]);
+
+        run_scoped_models_command("clear", &available, &mut cycle, dir.path());
+        assert_eq!(cycle, available);
+    }
+
     /// `/open` finds the newest link, in text or tool output, without the
     /// punctuation that follows it in prose.
     #[test]

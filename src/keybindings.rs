@@ -3063,6 +3063,8 @@ mod tests {
             // Inert actions on FTUI are omitted:
             assert!(!ftui_hotkeys.contains("Open settings"));
             assert!(!ftui_hotkeys.contains("Copy selection"));
+            // Routed: the pasted image becomes an `@file` attachment.
+            assert!(ftui_hotkeys.contains("Paste image from clipboard"));
         }
     }
 }

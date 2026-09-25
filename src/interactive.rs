@@ -141,9 +141,9 @@ pub(crate) fn resolve_output_path(cwd: &Path, raw: &str) -> PathBuf {
 }
 use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
 pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
+pub(crate) use self::file_refs::extract_file_references;
 use self::file_refs::{
-    file_url_to_path, format_file_ref, is_file_ref_boundary, next_non_whitespace_token,
-    parse_quoted_file_ref, path_for_display, split_trailing_punct, strip_wrapping_quotes,
+    file_url_to_path, format_file_ref, path_for_display, strip_wrapping_quotes,
     unescape_dragged_path,
 };
 use self::perf::{
@@ -1503,121 +1503,15 @@ impl PiApp {
     }
 
     fn extract_file_references(&mut self, message: &str) -> (String, Vec<String>) {
-        let mut cleaned = String::with_capacity(message.len());
-        let mut file_args = Vec::new();
-        let mut idx = 0usize;
-
-        while idx < message.len() {
-            let ch = message[idx..].chars().next().unwrap_or(' ');
-            if ch == '@' && is_file_ref_boundary(message, idx) {
-                let token_start = idx + ch.len_utf8();
-                let parsed = parse_quoted_file_ref(message, token_start);
-                let (path, trailing, token_end) = parsed.unwrap_or_else(|| {
-                    let (token, token_end) = next_non_whitespace_token(message, token_start);
-                    let (path, trailing) = split_trailing_punct(token);
-                    (path.to_string(), trailing.to_string(), token_end)
-                });
-
-                if !path.is_empty() {
-                    let resolved =
-                        self.autocomplete
-                            .provider
-                            .resolve_file_ref(&path)
-                            .or_else(|| {
-                                let resolved_path = resolve_read_path(&path, &self.cwd);
-                                resolved_path.exists().then(|| path.clone())
-                            });
-
-                    if let Some(resolved) = resolved {
-                        file_args.push(resolved);
-                        let mut next_idx = token_end;
-                        if !trailing.is_empty() {
-                            Self::trim_trailing_horizontal_whitespace(&mut cleaned);
-                        } else if message[next_idx..]
-                            .chars()
-                            .next()
-                            .is_some_and(Self::is_horizontal_whitespace)
-                        {
-                            while message[next_idx..]
-                                .chars()
-                                .next()
-                                .is_some_and(Self::is_horizontal_whitespace)
-                            {
-                                next_idx +=
-                                    message[next_idx..].chars().next().map_or(0, char::len_utf8);
-                            }
-                        } else if Self::trailing_line_is_blank(&cleaned)
-                            && message[next_idx..]
-                                .chars()
-                                .next()
-                                .is_some_and(Self::is_linebreak)
-                        {
-                            Self::trim_trailing_horizontal_whitespace(&mut cleaned);
-                            next_idx += Self::consume_single_linebreak(message, next_idx);
-                        }
-                        cleaned.push_str(&trailing);
-                        idx = next_idx;
-                        continue;
-                    }
-                }
-            }
-
-            cleaned.push(ch);
-            idx += ch.len_utf8();
-        }
-
-        (cleaned, file_args)
-    }
-
-    const fn is_linebreak(ch: char) -> bool {
-        matches!(ch, '\n' | '\r')
-    }
-
-    const fn is_horizontal_whitespace(ch: char) -> bool {
-        matches!(ch, ' ' | '\t')
-    }
-
-    fn trim_trailing_horizontal_whitespace(text: &mut String) {
-        while text
-            .chars()
-            .last()
-            .is_some_and(Self::is_horizontal_whitespace)
-        {
-            text.pop();
-        }
-    }
-
-    fn trailing_line_is_blank(text: &str) -> bool {
-        if let Some((line_start, linebreak)) = text
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| Self::is_linebreak(*ch))
-        {
-            let start = line_start + linebreak.len_utf8();
-            return text[start..].chars().all(Self::is_horizontal_whitespace);
-        }
-
-        text.chars().all(Self::is_horizontal_whitespace)
-    }
-
-    fn consume_single_linebreak(text: &str, start: usize) -> usize {
-        if start >= text.len() {
-            return 0;
-        }
-
-        let Some(first) = text[start..].chars().next() else {
-            return 0;
-        };
-        if !Self::is_linebreak(first) {
-            return 0;
-        }
-
-        let first_len = first.len_utf8();
-        if first == '\r' && text[start + first_len..].starts_with('\n') {
-            return first_len + '\n'.len_utf8();
-        }
-
-        first_len
+        let cwd = &self.cwd;
+        let provider = &mut self.autocomplete.provider;
+        file_refs::extract_file_references(message, |path| {
+            provider.resolve_file_ref(path).or_else(|| {
+                resolve_read_path(path, cwd)
+                    .exists()
+                    .then(|| path.to_string())
+            })
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2259,6 +2153,14 @@ fn read_jj_change(cwd: &Path) -> Option<String> {
     // Prefix so jj context is visually distinct from a bare git branch
     // name in the status bar (useful in colocated repos).
     Some(format!("jj:{line}"))
+}
+
+/// Save the clipboard's image as a temporary PNG and return an `@file`
+/// reference to it for the editor, as ctrl+v does on the classic stack.
+/// `None` when the clipboard holds no image (or clipboard support is off).
+pub(crate) fn paste_clipboard_image_ref() -> Option<String> {
+    let path = PiApp::paste_image_from_clipboard()?;
+    Some(format_file_ref(&path.display().to_string()))
 }
 
 /// What to show for a model (gh #214): its models.json `name` when one is set
