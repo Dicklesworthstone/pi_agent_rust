@@ -638,6 +638,67 @@ fn last_url(transcript: &[TranscriptEntry]) -> Option<String> {
     })
 }
 
+/// Resolve a `/model` or `/switch` selector (OMP) against the available
+/// `provider/id` list: an optional `:level` suffix sets thinking; then an
+/// exact `provider/id`, an exact id, or a unique substring match. A
+/// `provider/id` not in the list passes through, as `/model` always allowed
+/// (the driver reports an unknown model). Ambiguity lists the candidates.
+fn resolve_model_selector(
+    available: &[String],
+    selector: &str,
+) -> Result<(String, String, Option<crate::model::ThinkingLevel>), String> {
+    let selector = selector.trim();
+    let (spec, level) = match selector.rsplit_once(':') {
+        Some((spec, level)) if !spec.is_empty() => match level.parse() {
+            Ok(level) => (spec, Some(level)),
+            Err(_) => (selector, None),
+        },
+        _ => (selector, None),
+    };
+    let lower = spec.to_ascii_lowercase();
+    let id_of = |full: &str| {
+        full.split_once('/')
+            .map_or(full, |(_, id)| id)
+            .to_ascii_lowercase()
+    };
+    let mut matches: Vec<&String> = available
+        .iter()
+        .filter(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
+        .collect();
+    if matches.is_empty() {
+        matches = available
+            .iter()
+            .filter(|full| full.to_ascii_lowercase().contains(&lower))
+            .collect();
+    }
+    let split = |full: &str| {
+        full.split_once('/')
+            .map(|(provider, id)| (provider.to_string(), id.to_string()))
+    };
+    match matches.as_slice() {
+        [one] => split(one)
+            .map(|(provider, id)| (provider, id, level))
+            .ok_or_else(|| format!("malformed model entry: {one}")),
+        [] => match split(spec) {
+            Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
+                Ok((provider, id, level))
+            }
+            _ => Err(format!("Model not found: {spec}")),
+        },
+        many => {
+            let preview = many
+                .iter()
+                .take(8)
+                .map(|m| format!("  - {m}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "Ambiguous model \"{spec}\". Matches:\n{preview}\nUse provider/id for an exact match."
+            ))
+        }
+    }
+}
+
 /// The fenced code blocks in markdown `text`, in order, as `(language,
 /// code)`. An unterminated fence runs to the end, as a streaming renderer
 /// would show it.
@@ -3041,6 +3102,18 @@ impl PiFtuiModel {
             self.queue_btw_mid_turn(&question);
             return;
         }
+        // OMP /queue <message>: a follow-up for after the agent yields, the
+        // command form of Alt+Enter.
+        if let Some(message) = strip_command(&clean, "/queue") {
+            let message = message.trim().to_string();
+            if message.is_empty() {
+                self.push_entry(EntryRole::Error, String::from("Usage: /queue <message>"));
+                return;
+            }
+            self.input.set_text(&message);
+            self.submit_mid_turn(true);
+            return;
+        }
         if clean.starts_with('/') || clean.starts_with('!') {
             // The text stays in the editor for after the turn.
             self.push_entry(
@@ -3251,7 +3324,11 @@ impl PiFtuiModel {
         // Token-exact: /model and /m route here; /mode or /modelx fall
         // through to the tail (extension dispatch), matching bubbletea.
         let (token, rest) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
-        if token.eq_ignore_ascii_case("/model") || token.eq_ignore_ascii_case("/m") {
+        // OMP `/switch` is `/model` with a selector.
+        if token.eq_ignore_ascii_case("/model")
+            || token.eq_ignore_ascii_case("/m")
+            || token.eq_ignore_ascii_case("/switch")
+        {
             self.route_model_command(rest.trim());
             return true;
         }
@@ -3289,21 +3366,24 @@ impl PiFtuiModel {
                         PickerKind::Model,
                     ));
                 }
-            } else if let Some((provider, model)) = spec.split_once('/')
-                && !provider.is_empty()
-                && !model.is_empty()
-            {
-                self.push_entry(EntryRole::System, format!("switching model to {spec} ..."));
-                self.begin_busy(format!("switching model to {spec} ..."));
-                self.send_command(UiCommand::SetModel {
-                    provider: provider.to_string(),
-                    model: model.to_string(),
-                });
             } else {
-                self.push_entry(
-                    EntryRole::Error,
-                    String::from("usage: /model <provider>/<model>"),
-                );
+                match resolve_model_selector(&self.available_models, spec) {
+                    Ok((provider, model, level)) => {
+                        let target = format!("{provider}/{model}");
+                        self.push_entry(
+                            EntryRole::System,
+                            format!("switching model to {target} ..."),
+                        );
+                        self.begin_busy(format!("switching model to {target} ..."));
+                        self.send_command(UiCommand::SetModel { provider, model });
+                        // The driver runs commands in order: the level
+                        // applies to the model just selected.
+                        if let Some(level) = level {
+                            self.send_command(UiCommand::SetThinking(Some(level)));
+                        }
+                    }
+                    Err(message) => self.push_entry(EntryRole::Error, message),
+                }
             }
         }
     }
@@ -3579,7 +3659,7 @@ impl PiFtuiModel {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "pi commands: /model [provider/model], /resume, /new, \
+                    "pi commands: /model or /switch [model[:level]], /queue <message>, /resume, /new, \
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
@@ -3774,6 +3854,16 @@ impl PiFtuiModel {
             }
             "/dump" => {
                 self.send_command(UiCommand::Dump);
+                return true;
+            }
+            // Idle, a queued message has nothing to wait for: it is a prompt.
+            "/queue" => {
+                let message = cmd_args.trim();
+                if message.is_empty() {
+                    self.push_entry(EntryRole::Error, String::from("Usage: /queue <message>"));
+                } else {
+                    self.send_command(UiCommand::Prompt(message.to_string()));
+                }
                 return true;
             }
             // OMP /pin: pin or unpin this session at the top of /resume.
@@ -10638,8 +10728,122 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|e| e.role == EntryRole::Error && e.text.contains("usage: /model")),
-            "usage error missing"
+                .any(|e| e.role == EntryRole::Error && e.text == "Model not found: nonsense"),
+            "not-found error missing"
+        );
+    }
+
+    /// OMP selectors on /model and /switch: exact id, unique substring,
+    /// `:level`, and ambiguity reported instead of guessed.
+    #[test]
+    fn model_selectors_resolve_like_omp() {
+        let available = vec![
+            String::from("anthropic/claude-opus-5"),
+            String::from("anthropic/claude-sonnet-5"),
+            String::from("openai/gpt-5"),
+        ];
+        let resolve = |s: &str| resolve_model_selector(&available, s);
+        assert_eq!(
+            resolve("gpt-5"),
+            Ok((String::from("openai"), String::from("gpt-5"), None))
+        );
+        assert_eq!(
+            resolve("opus:high"),
+            Ok((
+                String::from("anthropic"),
+                String::from("claude-opus-5"),
+                Some(crate::model::ThinkingLevel::High)
+            ))
+        );
+        assert!(
+            resolve("claude").is_err_and(|e| e.starts_with("Ambiguous") && e.contains("sonnet"))
+        );
+        assert_eq!(resolve("nope"), Err(String::from("Model not found: nope")));
+        // Unlisted provider/id still passes through (the driver judges it).
+        assert_eq!(
+            resolve("ollama/llama3.2:latest"),
+            Ok((
+                String::from("ollama"),
+                String::from("llama3.2:latest"),
+                None
+            ))
+        );
+
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(
+            PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_available_models(available.clone()),
+        );
+        sim.init();
+        type_str(&mut sim, "/switch sonnet:low");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_iter().collect::<Vec<_>>(),
+            [
+                UiCommand::SetModel {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-5".into(),
+                },
+                UiCommand::SetThinking(Some(crate::model::ThinkingLevel::Low)),
+            ]
+        );
+    }
+
+    /// OMP /queue: idle it is just a prompt; mid-turn it is a follow-up,
+    /// which a bare slash command never used to be.
+    #[test]
+    fn slash_queue_sends_idle_and_follows_up_mid_turn() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        // An empty turn-control slot: the launch path always installs one,
+        // and between turns (or while one starts) it holds no live lane.
+        let slot: TurnControlSlot = Arc::new(Mutex::new(None));
+        let mut sim = ProgramSimulator::new(
+            PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_turn_control(slot),
+        );
+        sim.init();
+        type_str(&mut sim, "/queue run the tests");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().ok(),
+            Some(UiCommand::Prompt(String::from("run the tests")))
+        );
+        type_str(&mut sim, "/queue");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "Usage: /queue <message>")
+        );
+
+        // Mid-turn with no live lane, the follow-up becomes the next prompt
+        // (the same fallback Alt+Enter takes) rather than a refusal.
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        type_str(&mut sim, "/queue and then lint");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().ok(),
+            Some(UiCommand::Prompt(String::from("and then lint"))),
+            "transcript: {:?}; editor: {:?}",
+            sim.model()
+                .transcript
+                .iter()
+                .map(|e| e.text.clone())
+                .collect::<Vec<_>>(),
+            sim.model().input.text()
+        );
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.starts_with("Commands wait")),
+            "/queue is not refused mid-turn"
         );
     }
 
