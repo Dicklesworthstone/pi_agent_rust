@@ -9,7 +9,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 const MAX_EVENT_DATA_BYTES: usize = 100 * 1024 * 1024;
+const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 const MAX_CHUNKS_PER_POLL: usize = 64;
+const MAX_PARSE_STEPS_PER_POLL: usize = 128;
+// Yield between lines after this much input. A complete line is indivisible:
+// splitting it here would change the parser's existing large-data behavior.
+const TARGET_BYTES_PER_POLL: usize = 64 * 1024;
 
 /// Local parser failures must not masquerade as an upstream `event: error`.
 /// The byte-stream adapter turns these into terminal I/O errors; the direct
@@ -202,6 +207,14 @@ impl SseParser {
         has_data: &mut bool,
         max_event_data_bytes: usize,
     ) -> Result<(), SseParseError> {
+        // Complete metadata lines must not bypass the incomplete-line cap.
+        // Check before allocating an event name or a replay ID, which is also
+        // carried forward to subsequent events. Data has its own event budget.
+        if line.len() > MAX_BUFFER_SIZE
+            && (line.starts_with("id:") || line.starts_with("event:"))
+        {
+            return Err(SseParseError::BufferLimit);
+        }
         if let Some(rest) = line.strip_prefix(':') {
             // Comment line - ignore (but could be used for keep-alive)
             let _ = rest;
@@ -366,7 +379,6 @@ impl SseParser {
     where
         F: FnMut(SseEvent),
     {
-        const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
         if self.buffer.is_empty() {
             // Fast path: process data directly without copying to buffer.
             let consumed = Self::process_source(
@@ -478,7 +490,9 @@ impl SseParser {
 
 /// Stream wrapper for SSE events.
 ///
-/// Converts a byte stream into an SSE event stream.
+/// Converts a byte stream into an SSE event stream. Decoding stops after the
+/// next event instead of eagerly expanding an entire transport chunk into
+/// queued events (and cloning an inherited replay ID for each of them).
 pub struct SseStream<S> {
     inner: S,
     parser: SseParser,
@@ -486,6 +500,8 @@ pub struct SseStream<S> {
     pending_error: Option<std::io::Error>,
     terminated: bool,
     utf8_buffer: Vec<u8>,
+    buffered_input: Vec<u8>,
+    buffered_input_offset: usize,
 }
 
 impl<S> SseStream<S> {
@@ -498,6 +514,8 @@ impl<S> SseStream<S> {
             pending_error: None,
             terminated: false,
             utf8_buffer: Vec::new(),
+            buffered_input: Vec::new(),
+            buffered_input_offset: 0,
         }
     }
 }
@@ -591,6 +609,35 @@ where
         }
     }
 
+    /// Consume one line or the remaining partial line without copying the
+    /// transport chunk. The parser handles CRLF and split UTF-8 as before.
+    fn process_buffered_line(&mut self) -> Result<usize, std::io::Error> {
+        let bytes = std::mem::take(&mut self.buffered_input);
+        let start = self.buffered_input_offset;
+        let mut end = memchr::memchr2(b'\r', b'\n', &bytes[start..])
+            .map_or(bytes.len(), |offset| start + offset + 1);
+        // A trailing CR is deliberately deferred by SseParser. Preserve its
+        // lookahead when available, including CRLF or one following UTF-8
+        // code point, rather than making a complete large line look partial.
+        if end > start && bytes[end - 1] == b'\r' && end < bytes.len() {
+            end += 1;
+            for _ in 0..3 {
+                if end == bytes.len() || bytes[end] & 0xc0 != 0x80 {
+                    break;
+                }
+                end += 1;
+            }
+        }
+        let result = self.process_chunk(&bytes[start..end]);
+        if end < bytes.len() {
+            self.buffered_input = bytes;
+            self.buffered_input_offset = end;
+        } else {
+            self.buffered_input_offset = 0;
+        }
+        result.map(|()| end - start)
+    }
+
     fn finish_with_error(
         &mut self,
         error: std::io::Error,
@@ -600,6 +647,8 @@ where
         // partial frame after observing its error.
         self.parser = SseParser::new();
         self.utf8_buffer = Vec::new();
+        self.buffered_input = Vec::new();
+        self.buffered_input_offset = 0;
         self.terminated = true;
         if let Some(event) = self.pending_events.pop_front() {
             self.pending_error = Some(error);
@@ -641,28 +690,40 @@ where
             return Poll::Ready(None);
         }
 
-        // An always-ready source of comments or empty chunks must yield so
+        // Bound both source polls and parsing within a coalesced chunk. Stop
+        // as soon as an event is available, retaining only raw unread input.
+        // Comments, metadata-only blocks and empty chunks must all yield so
         // the executor can poll cancellation, deadlines, and other agents.
-        for _ in 0..MAX_CHUNKS_PER_POLL {
-            match Pin::new(&mut self.inner).poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    if let Err(err) = self.process_chunk(&bytes) {
-                        return self.finish_with_error(err);
+        let mut chunks = 0;
+        let mut steps = 0;
+        let mut bytes_processed = 0usize;
+        while steps < MAX_PARSE_STEPS_PER_POLL && bytes_processed < TARGET_BYTES_PER_POLL {
+            if self.buffered_input.is_empty() {
+                if chunks == MAX_CHUNKS_PER_POLL {
+                    break;
+                }
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(bytes))) => {
+                        chunks += 1;
+                        self.buffered_input = bytes;
+                        self.buffered_input_offset = 0;
+                        if self.buffered_input.is_empty() {
+                            continue;
+                        }
                     }
+                    Poll::Ready(Some(Err(error))) => return self.finish_with_error(error),
+                    Poll::Ready(None) => return self.poll_stream_end(),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
 
-                    if let Some(event) = self.pending_events.pop_front() {
-                        return Poll::Ready(Some(Ok(event)));
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return self.finish_with_error(e);
-                }
-                Poll::Ready(None) => {
-                    return self.poll_stream_end();
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
+            match self.process_buffered_line() {
+                Ok(consumed) => bytes_processed = bytes_processed.saturating_add(consumed),
+                Err(error) => return self.finish_with_error(error),
+            }
+            steps += 1;
+            if let Some(event) = self.pending_events.pop_front() {
+                return Poll::Ready(Some(Ok(event)));
             }
         }
         cx.waker().wake_by_ref();
@@ -2223,6 +2284,198 @@ data: {"type":"message_stop"}
                 Pin::new(&mut stream).poll_next_event(&mut cx),
                 Poll::Ready(None)
             ));
+        }
+    }
+
+    #[test]
+    fn complete_metadata_limits_are_terminal_in_both_parser_paths() {
+        for field in ["id: ", "event: "] {
+            let payload = "x".repeat(MAX_BUFFER_SIZE + 1 - field.len());
+            let input = format!(
+                "id: safe\ndata: before\n\n{field}{payload}\ndata: bad\n\ndata: [DONE]\n\n"
+            );
+            for split in [0, 26, 32, input.len() - 1] {
+                let mut parser = SseParser::new();
+                let mut events = parser.feed(&input[..split]);
+                events.extend(parser.feed(&input[split..]));
+                assert_eq!(events.len(), 2, "field={field}, split={split}");
+                assert_eq!(events[0].data, "before");
+                assert_eq!(events[0].id.as_deref(), Some("safe"));
+                assert_eq!(events[1].event, "error");
+                assert_eq!(events[1].data, "SSE buffer limit exceeded");
+                assert!(events[1].id.is_none());
+                assert!(parser.failed);
+                assert!(!parser.has_pending());
+                assert_eq!(parser.buffer.capacity(), 0);
+                assert!(parser.current.id.is_none());
+                assert!(parser.feed("data: forbidden\n\n").is_empty());
+                assert!(parser.flush().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_at_the_byte_limit_is_accepted() {
+        for field in ["id: ", "event: "] {
+            let payload = "x".repeat(MAX_BUFFER_SIZE - field.len());
+            let mut parser = SseParser::new();
+            let events = parser.feed(&format!("{field}{payload}\ndata: ok\n\n"));
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].data, "ok");
+            if field == "id: " {
+                assert_eq!(events[0].id.as_deref(), Some(payload.as_str()));
+                assert!(events[0].id_was_explicit);
+            } else {
+                assert_eq!(events[0].event.as_ref(), payload);
+            }
+            assert!(!parser.failed);
+        }
+    }
+
+    #[test]
+    fn oversized_stream_metadata_discards_unread_completion_and_releases_input() {
+        use futures::stream::FusedStream;
+
+        for field in ["id: ", "event: "] {
+            let payload = "x".repeat(MAX_BUFFER_SIZE + 1);
+            let input = format!(
+                "data: before\n\n{field}{payload}\ndata: bad\n\ndata: [DONE]\n\n"
+            );
+            let mut stream = SseStream::new(stream::iter(vec![Ok(input.into_bytes())]));
+            futures::executor::block_on(async {
+                assert_eq!(stream.next().await.unwrap().unwrap().data, "before");
+                let error = stream.next().await.unwrap().unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::InvalidData);
+                assert_eq!(error.to_string(), "SSE buffer limit exceeded");
+                assert!(stream.is_terminated());
+                assert_eq!(stream.buffered_input.capacity(), 0);
+                assert_eq!(stream.buffered_input_offset, 0);
+                assert!(stream.next().await.is_none());
+                assert!(stream.next().await.is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn coalesced_events_are_decoded_on_demand_without_replay_id_amplification() {
+        let id = "checkpoint".repeat(1024);
+        let mut input = format!("id: {id}\n");
+        for index in 0..512 {
+            let _ = writeln!(&mut input, "data: {index}\n");
+        }
+        let mut polls = 0;
+        let mut input = Some(input.into_bytes());
+        let inner = stream::poll_fn(move |_| {
+            polls += 1;
+            assert!(polls <= 2, "the source must stay fused after EOF");
+            Poll::Ready(input.take().map(Ok::<_, std::io::Error>))
+        });
+        let mut stream = SseStream::new(inner);
+        futures::executor::block_on(async {
+            for index in 0..512 {
+                let event = stream.next().await.unwrap().unwrap();
+                assert_eq!(event.data, index.to_string());
+                assert_eq!(event.id.as_deref(), Some(id.as_str()));
+                assert_eq!(event.id_was_explicit, index == 0);
+                assert!(stream.pending_events.is_empty(), "no eagerly cloned IDs");
+                if index < 511 {
+                    assert!(!stream.buffered_input.is_empty());
+                }
+            }
+            assert_eq!(stream.buffered_input.capacity(), 0);
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn coalesced_non_data_lines_yield_and_self_wake() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        #[derive(Default)]
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for line in [": keepalive\n", "id: checkpoint\n", "event: ping\n"] {
+            let input = format!(
+                "{}data: complete\n\n",
+                line.repeat(MAX_PARSE_STEPS_PER_POLL * 2)
+            );
+            let mut stream = SseStream::new(stream::iter(vec![Ok(input.into_bytes())]));
+            let count = Arc::new(WakeCount::default());
+            let waker = Waker::from(Arc::clone(&count));
+            let mut cx = Context::from_waker(&waker);
+            for expected_wakes in 1..=2 {
+                assert!(Pin::new(&mut stream).poll_next_event(&mut cx).is_pending());
+                assert_eq!(count.0.load(Ordering::SeqCst), expected_wakes);
+                assert!(stream.pending_events.is_empty());
+                assert!(!stream.buffered_input.is_empty());
+            }
+            let Poll::Ready(Some(Ok(event))) = Pin::new(&mut stream).poll_next_event(&mut cx)
+            else {
+                panic!("the event must remain available after cooperative yields");
+            };
+            assert_eq!(event.data, "complete");
+            assert_eq!(stream.buffered_input.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn byte_budget_yields_between_large_comment_lines() {
+        let line = format!(": {}\n", "x".repeat(4096));
+        let input = format!("{}data: complete\n\n", line.repeat(32));
+        let mut stream = SseStream::new(stream::iter(vec![Ok(input.into_bytes())]));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_next_event(&mut cx).is_pending());
+        assert!(stream.buffered_input_offset >= TARGET_BYTES_PER_POLL);
+        assert!(stream.buffered_input_offset < TARGET_BYTES_PER_POLL + line.len());
+        futures::executor::block_on(async {
+            assert_eq!(stream.next().await.unwrap().unwrap().data, "complete");
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn demand_driven_decoding_preserves_cr_and_utf8_at_every_transport_split() {
+        for ending in ["\n", "\r", "\r\n"] {
+            let input = format!(
+                "\u{feff}id: one{ending}data: ☃{ending}{ending}\
+                 id: two{ending}data: 😀{ending}{ending}"
+            );
+            let expected = parse_all(&input);
+            let bytes = input.as_bytes();
+            for split in 0..=bytes.len() {
+                let (events, errors) =
+                    parse_stream_chunks(vec![bytes[..split].to_vec(), bytes[split..].to_vec()]);
+                assert!(errors.is_empty(), "ending={ending:?}, split={split}");
+                assert_eq!(events, expected, "ending={ending:?}, split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn demand_driven_decoding_keeps_complete_large_lines_complete() {
+        let payload = "x".repeat(MAX_BUFFER_SIZE + 1);
+        for ending in ["\n", "\r", "\r\n"] {
+            // A complete CR line needs lookahead, including a non-ASCII
+            // unknown field. Internal scheduling must not turn it into an
+            // oversized incomplete line or split that lookahead code point.
+            let input = format!(
+                "data: {payload}{ending}😀: ignored{ending}{ending}data: last{ending}{ending}"
+            );
+            let mut stream = SseStream::new(stream::iter(vec![Ok(input.into_bytes())]));
+            futures::executor::block_on(async {
+                assert_eq!(stream.next().await.unwrap().unwrap().data, payload);
+                assert_eq!(stream.next().await.unwrap().unwrap().data, "last");
+                assert!(stream.next().await.is_none());
+            });
         }
     }
 }
