@@ -1501,6 +1501,13 @@ pub struct PiFtuiModel {
     tools_expanded: bool,
     /// Thinking entries show in full rather than as one line (ctrl+t).
     show_thinking: bool,
+    /// Prompts sent this session, oldest first (up/down recall; `/history`).
+    input_history: Vec<String>,
+    /// Which history entry the editor shows while recalling; `None` when
+    /// the editor holds the user's own draft.
+    history_cursor: Option<usize>,
+    /// The draft set aside when recall began, restored past the newest entry.
+    history_draft: String,
     /// Loop-lag probe with render/input/agent-event attribution. Inert unless
     /// `PI_PERF_TELEMETRY=1`.
     watchdog: LoopWatchdog,
@@ -1585,6 +1592,50 @@ pub struct AutocompleteLaunch {
     /// The loader the catalog came from: the driver expands `/template` and
     /// `/skill:name` input with it before a turn, as the classic stack does.
     pub resources: Option<crate::resources::ResourceLoader>,
+    /// What the loader was built from, so `/reload` can build it again.
+    pub resource_source: Option<ResourceSource>,
+}
+
+/// The inputs of [`crate::resources::ResourceLoader::load`] at launch.
+#[derive(Debug, Clone)]
+pub struct ResourceSource {
+    pub package_manager: crate::package_manager::PackageManager,
+    pub config: crate::config::Config,
+    pub cli: crate::resources::ResourceCliOptions,
+}
+
+/// After `/reload`: read skills and prompt templates again, then refresh the
+/// completion catalog (with the reloaded session's extension commands) and
+/// the resources the driver expands input with.
+async fn reload_driver_resources(
+    source: &ResourceSource,
+    cwd: &std::path::Path,
+    extension_commands: Vec<crate::autocomplete::NamedEntry>,
+    resources: &mut Option<crate::resources::ResourceLoader>,
+    catalog: &mut AutocompleteCatalog,
+    agent_tx: &Sender<PiMsg>,
+) {
+    match crate::resources::ResourceLoader::load(
+        &source.package_manager,
+        cwd,
+        &source.config,
+        &source.cli,
+    )
+    .await
+    {
+        Ok(loader) => {
+            *catalog = AutocompleteCatalog::from_resources(&loader);
+            *resources = Some(loader);
+            let mut completion = catalog.clone();
+            completion.extension_commands = extension_commands;
+            let _ = agent_tx.send(PiMsg::AutocompleteCatalog(completion));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::System(format!(
+                "reload: skills and prompt templates were not re-read: {err}"
+            )));
+        }
+    }
 }
 
 /// Default popup height when settings don't override it (matches the
@@ -1697,6 +1748,9 @@ impl PiFtuiModel {
             last_ctrl_c: None,
             tools_expanded: false,
             show_thinking: false,
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
             input: TextArea::new()
                 .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
                 .with_focus(true)
@@ -2037,6 +2091,74 @@ impl PiFtuiModel {
     /// Push a pending tool-execution card keyed by the sanitized tool_id
     /// (stable across head-text replacement by invocation summaries);
     /// `display` is the sanitized initial head (the tool name).
+    /// Remember a sent prompt for recall (consecutive repeats collapse) and
+    /// leave recall mode.
+    fn record_history(&mut self, text: &str) {
+        const MAX_INPUT_HISTORY: usize = 500;
+        self.history_cursor = None;
+        self.history_draft.clear();
+        let text = text.trim();
+        if text.is_empty() || self.input_history.last().is_some_and(|last| last == text) {
+            return;
+        }
+        self.input_history.push(text.to_string());
+        if self.input_history.len() > MAX_INPUT_HISTORY {
+            self.input_history.remove(0);
+        }
+    }
+
+    /// Up/down recall applies to the plain editor with a one-line draft.
+    fn history_navigable(&self) -> bool {
+        self.input_active()
+            && self.active_ask.is_none()
+            && self.active_ext.is_none()
+            && !self.input.text().contains('\n')
+    }
+
+    /// Show the next-older prompt (staying on the oldest).
+    fn history_back(&mut self) {
+        let Some(newest) = self.input_history.len().checked_sub(1) else {
+            return;
+        };
+        let index = match self.history_cursor {
+            None => {
+                self.history_draft = self.input.text();
+                newest
+            }
+            Some(index) => index.saturating_sub(1),
+        };
+        self.history_cursor = Some(index);
+        self.input.set_text(&self.input_history[index]);
+    }
+
+    /// Show the next-newer prompt; past the newest, the set-aside draft.
+    fn history_forward(&mut self) {
+        let Some(index) = self.history_cursor else {
+            return;
+        };
+        if index + 1 < self.input_history.len() {
+            self.history_cursor = Some(index + 1);
+            self.input.set_text(&self.input_history[index + 1]);
+        } else {
+            self.history_cursor = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.input.set_text(&draft);
+        }
+    }
+
+    /// `/history`: the prompts sent this session, most recent first.
+    fn format_input_history(&self) -> String {
+        if self.input_history.is_empty() {
+            return String::from("No input history yet.");
+        }
+        let mut out = String::from("Input history (most recent first):");
+        for (n, entry) in self.input_history.iter().rev().take(50).enumerate() {
+            let preview: String = entry.replace('\n', "\\n").chars().take(120).collect();
+            let _ = write!(out, "\n  {}. {preview}", n + 1);
+        }
+        out
+    }
+
     /// Move in-flight thinking, then text, into transcript entries (OMP
     /// order: thinking, answer, tool). Called before a tool card and when
     /// the turn ends, so each lands where it happened in the turn.
@@ -2551,6 +2673,7 @@ impl PiFtuiModel {
             );
             return;
         }
+        self.record_history(&clean);
         self.input.set_text("");
         self.autocomplete.close();
         self.scroll_from_tail = 0;
@@ -2688,6 +2811,7 @@ impl PiFtuiModel {
         // User input is the one text source the user typed themself, but it
         // still goes through sanitize: paste can smuggle control sequences.
         let clean = sanitize(trimmed).into_owned();
+        self.record_history(&clean);
         self.input.set_text("");
         self.autocomplete.close();
         self.scroll_from_tail = 0;
@@ -2999,7 +3123,7 @@ impl PiFtuiModel {
                      /thinking [level], /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
-                     /skills, /dirs, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
+                     /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
                      /commit [--dry-run], /review [target], /handoff, /approval [mode], \
                      /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
                      /context, /todo, /jobs, /stats, /help, \
@@ -3032,6 +3156,11 @@ impl PiFtuiModel {
             }
             "/session" | "/info" => {
                 self.send_command(UiCommand::SessionInfo);
+                return true;
+            }
+            "/history" | "/hist" => {
+                let listing = self.format_input_history();
+                self.push_entry(EntryRole::System, listing);
                 return true;
             }
             "/fresh" => {
@@ -3648,7 +3777,9 @@ impl PiFtuiModel {
                     // their binding wins over our default.
                     .or_else(|| pick(AppAction::ExpandTools))
                     .or_else(|| pick(AppAction::ToggleThinking))
-                    .or_else(|| pick(AppAction::ExternalEditor));
+                    .or_else(|| pick(AppAction::ExternalEditor))
+                    .or_else(|| pick(AppAction::CursorUp))
+                    .or_else(|| pick(AppAction::CursorDown));
                 let page = self.body_height().saturating_sub(1).max(1);
                 match action {
                     Some(AppAction::Suspend) => {
@@ -3804,6 +3935,19 @@ impl PiFtuiModel {
                         self.maybe_trigger_autocomplete();
                         return Cmd::none();
                     }
+                    // Input history: up/down recall earlier prompts while the
+                    // draft is one line (a multi-line draft keeps up/down for
+                    // moving between its lines).
+                    Some(AppAction::CursorUp) if self.history_navigable() => {
+                        self.history_back();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CursorDown)
+                        if self.history_navigable() && self.history_cursor.is_some() =>
+                    {
+                        self.history_forward();
+                        return Cmd::none();
+                    }
                     _ => {}
                 }
                 if self.input_active() && self.input.handle_event(event) {
@@ -3927,6 +4071,16 @@ impl PiFtuiModel {
         self.transcript.clear();
         self.render_cache.borrow_mut().clear();
         self.streaming.clear();
+        // A resumed conversation's prompts become recallable (up arrow) when
+        // nothing has been typed yet this run.
+        if self.input_history.is_empty() {
+            for message in &messages {
+                if message.role == crate::interactive::MessageRole::User {
+                    let text = sanitize(&message.content).into_owned();
+                    self.record_history(&text);
+                }
+            }
+        }
         for message in messages {
             let role = match message.role {
                 crate::interactive::MessageRole::User => EntryRole::User,
@@ -6799,7 +6953,8 @@ pub fn run(
     // Issue #208: the driver re-sends the catalog with extension commands
     // once its session exists; the model starts from the resource catalog.
     let driver_catalog = autocomplete.catalog.clone();
-    let driver_resources = autocomplete.resources.clone();
+    let mut driver_resources = autocomplete.resources.clone();
+    let resource_source = autocomplete.resource_source.clone();
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
@@ -6853,7 +7008,7 @@ pub fn run(
                 // Issue #208: extension-contributed slash commands become
                 // completable now that the extension runtime is up.
                 // Resource catalog for the info commands (/skills).
-                let info_catalog = driver_catalog.clone();
+                let mut info_catalog = driver_catalog.clone();
                 if let Some(manager) = handle.extension_manager() {
                     let mut catalog = driver_catalog;
                     catalog.extension_commands = extension_commands_for_catalog(manager);
@@ -7141,6 +7296,21 @@ pub fn run(
                             {
                                 replacement_failure = Some(err);
                                 break;
+                            }
+                            if let Some(source) = &resource_source {
+                                let extension_commands = handle
+                                    .extension_manager()
+                                    .map(extension_commands_for_catalog)
+                                    .unwrap_or_default();
+                                Box::pin(reload_driver_resources(
+                                    source,
+                                    &bash_cwd,
+                                    extension_commands,
+                                    &mut driver_resources,
+                                    &mut info_catalog,
+                                    &agent_tx,
+                                ))
+                                .await;
                             }
                         }
                         Ok(UiCommand::Fork { args }) => {
@@ -11702,6 +11872,7 @@ mod tests {
             cwd: std::path::PathBuf::from("."),
             max_visible: 3,
             resources: None,
+            resource_source: None,
         });
         let mut sim = ProgramSimulator::new(model);
         sim.init();
@@ -12056,6 +12227,60 @@ mod tests {
             "group counter missing: {rendered:?}"
         );
     }
+    /// Up recalls earlier prompts newest first, down walks forward and ends
+    /// on the draft that was set aside; `/history` lists them.
+    #[test]
+    fn up_and_down_recall_sent_prompts_and_restore_the_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, _submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        for prompt in ["first prompt", "second prompt"] {
+            type_str(&mut sim, prompt);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            // The driver never answers here; let the next prompt submit idle.
+            sim.model_mut().state = AgentUiState::Ready;
+        }
+        type_str(&mut sim, "half a draft");
+        let up = || key(KeyCode::Up, Modifiers::empty());
+        let down = || key(KeyCode::Down, Modifiers::empty());
+        sim.inject_event(up());
+        assert_eq!(sim.model().input.text(), "second prompt");
+        sim.inject_event(up());
+        assert_eq!(sim.model().input.text(), "first prompt");
+        sim.inject_event(up());
+        assert_eq!(
+            sim.model().input.text(),
+            "first prompt",
+            "stays on the oldest"
+        );
+        sim.inject_event(down());
+        assert_eq!(sim.model().input.text(), "second prompt");
+        sim.inject_event(down());
+        assert_eq!(sim.model().input.text(), "half a draft");
+
+        sim.model_mut().input.set_text("");
+        type_str(&mut sim, "/history");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let listing = &sim.model().transcript.last().expect("listing").text;
+        assert!(
+            listing.contains("2. second prompt") && listing.contains("3. first prompt"),
+            "{listing}"
+        );
+    }
+
+    /// A multi-line draft keeps up/down for moving between its own lines.
+    #[test]
+    fn up_in_a_multiline_draft_does_not_recall() {
+        let (_tx, mut model) = new_model();
+        model.record_history("an old prompt");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.model_mut().input.set_text("line one\nline two");
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "line one\nline two");
+    }
+
     /// A turn that thinks, speaks, calls a tool and speaks again reads in
     /// that order. Text streamed before the tool used to be held back and
     /// glued onto the post-tool text after every card.
@@ -12149,6 +12374,65 @@ mod tests {
         assert_eq!(template_prompt(Some(&resources), true, "fix", "x"), None);
         assert_eq!(template_prompt(Some(&resources), false, "nope", ""), None);
         assert_eq!(template_prompt(None, false, "fix", ""), None);
+    }
+
+    /// `/reload` re-reads prompt templates: one added after launch expands
+    /// afterwards, and the completion catalog lists it next to the session's
+    /// extension commands.
+    #[test]
+    fn reload_picks_up_a_prompt_template_added_after_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = ResourceSource {
+            package_manager: crate::package_manager::PackageManager::new(dir.path().to_path_buf()),
+            config: crate::config::Config::default(),
+            cli: crate::resources::ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: false,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            },
+        };
+        let prompts = dir.path().join(".pi").join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        std::fs::write(
+            prompts.join("triage.md"),
+            "---\ndescription: Triage an issue\n---\nTriage issue $1",
+        )
+        .expect("write template");
+
+        let (tx, rx) = mpsc::channel();
+        let mut resources = None;
+        let mut catalog = AutocompleteCatalog::default();
+        let ext = vec![crate::autocomplete::NamedEntry {
+            name: String::from("ext-cmd"),
+            description: None,
+        }];
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(reload_driver_resources(
+            &source,
+            dir.path(),
+            ext,
+            &mut resources,
+            &mut catalog,
+            &tx,
+        ));
+
+        assert_eq!(
+            template_prompt(resources.as_ref(), false, "triage", "#12").as_deref(),
+            Some("Triage issue #12")
+        );
+        assert!(catalog.prompt_templates.iter().any(|t| t.name == "triage"));
+        let Ok(PiMsg::AutocompleteCatalog(sent)) = rx.try_recv() else {
+            panic!("the refreshed catalog goes to the UI");
+        };
+        assert!(sent.prompt_templates.iter().any(|t| t.name == "triage"));
+        assert!(sent.extension_commands.iter().any(|c| c.name == "ext-cmd"));
     }
 
     /// ctrl+o expands a long tool result the card keeps and collapses it

@@ -2276,6 +2276,11 @@ async fn run(
             pi::interactive_ftui::AutocompleteLaunch {
                 catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
                 resources: Some(resources.clone()),
+                resource_source: Some(pi::interactive_ftui::ResourceSource {
+                    package_manager: package_manager.clone(),
+                    config: config.clone(),
+                    cli: resource_cli.clone(),
+                }),
                 cwd: cwd.clone(),
                 max_visible: config
                     .autocomplete_max_visible
