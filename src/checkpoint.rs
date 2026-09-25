@@ -269,7 +269,9 @@ pub fn fresh_stream_state(agent: &mut crate::agent::Agent, session: &mut Session
     // A millisecond stamp alone can collide across rapid calls; the uuid
     // suffix keeps every /fresh a genuinely new provider session id.
     let new_id = format!("fresh-{}-{}", now_ms(), uuid::Uuid::new_v4().simple());
-    agent.stream_options_mut().session_id = Some(new_id.clone());
+    // Rebinding (not just setting session_id) re-derives the session-scoped
+    // prompt cache key too, which is what actually resets provider caching.
+    crate::app::rebind_stream_options_session(agent.stream_options_mut(), &new_id);
     session.append_custom_entry(
         "fresh".to_string(),
         Some(serde_json::json!({

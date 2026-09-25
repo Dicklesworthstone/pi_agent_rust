@@ -13662,7 +13662,17 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event)).await
+        self.compact_synchronous(Arc::new(on_event), false).await
+    }
+
+    /// OMP `/shake` (bd-cv653.3.18): compact by dropping bulky tool output
+    /// from the older span instead of asking the model for a summary.
+    /// Instant, and no provider request is made.
+    pub async fn shake_now(
+        &mut self,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.compact_synchronous(Arc::new(on_event), true).await
     }
 
     pub async fn execute_extension_command(
@@ -14292,7 +14302,11 @@ impl AgentSession {
 
     /// Run compaction synchronously (inline), blocking until completion.
     #[allow(clippy::too_many_lines)]
-    async fn compact_synchronous(&mut self, on_event: AgentEventHandler) -> Result<()> {
+    async fn compact_synchronous(
+        &mut self,
+        on_event: AgentEventHandler,
+        shake: bool,
+    ) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
         }
@@ -14414,7 +14428,11 @@ impl AgentSession {
                 });
                 return Err(err);
             }
-            let compaction_result = compaction::compact(prep, provider, &credential, None).await;
+            let compaction_result = if shake {
+                Ok(compaction::compact_shake(prep))
+            } else {
+                compaction::compact(prep, provider, &credential, None).await
+            };
 
             match compaction_result {
                 Ok(result) => {

@@ -88,6 +88,7 @@ mod tool_render;
 mod tree;
 mod tree_ui;
 mod view;
+pub(crate) mod workspace_reports;
 
 use self::agent::build_user_message;
 pub(crate) use self::agent::extension_commands_for_catalog;
@@ -1050,7 +1051,7 @@ impl PiApp {
             "  theme: {} (config: {})",
             self.theme.name, theme_setting
         );
-        let _ = writeln!(output, "  model: {}", self.model);
+        let _ = writeln!(output, "  model: {}", session_model_line(&self.model_entry));
         let _ = writeln!(
             output,
             "  compaction: {compaction_enabled} (reserve={reserve_tokens}, keepRecent={keep_recent})"
@@ -2258,6 +2259,31 @@ fn read_jj_change(cwd: &Path) -> Option<String> {
     // Prefix so jj context is visually distinct from a bare git branch
     // name in the status bar (useful in colocated repos).
     Some(format!("jj:{line}"))
+}
+
+/// What to show for a model (gh #214): its models.json `name` when one is set
+/// and differs from the id, else `provider/id`. Display only: selection,
+/// cycling, and lookups keep using `provider/id`.
+pub(crate) fn model_display_label(entry: &ModelEntry) -> String {
+    let name = entry.model.name.trim();
+    if name.is_empty() || name == entry.model.id {
+        format!("{}/{}", entry.model.provider, entry.model.id)
+    } else {
+        name.to_string()
+    }
+}
+
+/// A model for `/session`-style listings: the display name with the
+/// `provider/id` it resolves to, or just `provider/id` when there is no
+/// distinct name.
+pub(crate) fn session_model_line(entry: &ModelEntry) -> String {
+    let identity = format!("{}/{}", entry.model.provider, entry.model.id);
+    let display = model_display_label(entry);
+    if display == identity {
+        identity
+    } else {
+        format!("{display} ({identity})")
+    }
 }
 
 /// Read VCS info for the interactive status bar: prefers jj in colocated

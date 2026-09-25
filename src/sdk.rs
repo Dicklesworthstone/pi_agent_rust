@@ -417,6 +417,10 @@ pub struct SessionOptions {
     /// the single connect-and-mount pass. This avoids cross-wiring tools from
     /// a different, already-dropped session (bd-vjfol).
     pub mcp: Option<McpSessionOptions>,
+    /// The advisor (bd-cv653.3.3): a second model that reviews each turn.
+    /// `None` — the default — runs no advisor. Each session built from these
+    /// options gets its own runtime (fresh guard and failure count).
+    pub advisor: Option<crate::advisor::AdvisorOptions>,
     /// Runtime this session dispatches background work on.
     ///
     /// Required for extension observation events to reach extensions at all:
@@ -560,6 +564,7 @@ impl Default for SessionOptions {
             retry: None,
             failover: None,
             mcp: None,
+            advisor: None,
             runtime_handle: None,
             on_event: None,
             on_tool_start: None,
@@ -2124,6 +2129,158 @@ impl AgentSessionHandle {
         self.session.persist_session().await
     }
 
+    /// OMP `/fresh`: reset provider stream state without touching the
+    /// transcript. Stream options are rebound to a new session id (which
+    /// re-derives the prompt cache key), and a `fresh` custom entry records
+    /// the reset. Returns the new id.
+    pub async fn fresh_stream_state(&mut self) -> Result<String> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let new_id = {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            crate::checkpoint::fresh_stream_state(&mut self.session.agent, &mut guard)
+        };
+        self.session.persist_session().await?;
+        Ok(new_id)
+    }
+
+    /// Record an approval-mode change (`/approval`) in the session, as the
+    /// classic stack does, so the transition is auditable after the fact.
+    pub async fn record_approval_mode(
+        &mut self,
+        mode: crate::approval::ApprovalMode,
+    ) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.append_custom_entry(
+                "approval_mode".to_string(),
+                Some(serde_json::json!({"mode": mode.as_str()})),
+            );
+        }
+        self.session.persist_session().await
+    }
+
+    /// `/checkpoint [name] [note]` (bd-cv653.3.7): mark the active context so
+    /// a later [`Self::rewind_to_checkpoint`] can collapse everything after it.
+    pub async fn mark_checkpoint(
+        &mut self,
+        name: &str,
+        note: Option<&str>,
+    ) -> Result<crate::checkpoint::Checkpoint> {
+        let messages = self.session.agent.messages().to_vec();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let checkpoint = {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            crate::checkpoint::mark_checkpoint(&mut guard, name, note, &messages)
+        };
+        self.session.persist_session().await?;
+        Ok(checkpoint)
+    }
+
+    /// `/rewind [name]` (bd-cv653.3.7): collapse the active context since the
+    /// named (default: latest) checkpoint into one summarized report. The
+    /// session tree keeps every original entry; the rewind is recorded in it.
+    pub async fn rewind_to_checkpoint(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<crate::checkpoint::RewindOutcome> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let checkpoint = {
+            let guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            crate::checkpoint::find_checkpoint(&guard, name)
+        }
+        .ok_or_else(|| {
+            Error::session(name.map_or_else(
+                || String::from("No checkpoints yet — mark one with /checkpoint"),
+                |name| format!("No checkpoint named '{name}'"),
+            ))
+        })?;
+        let agent = &self.session.agent;
+        let span =
+            agent.messages()[checkpoint.message_count.min(agent.messages().len())..].to_vec();
+        if span.is_empty() {
+            return Err(Error::session(format!(
+                "Nothing to rewind — the active context is already at '{}'.",
+                checkpoint.name
+            )));
+        }
+        // Keyless providers (replay/test/local) summarize fine without a key.
+        let api_key = agent.stream_options().api_key.clone().unwrap_or_default();
+        let settings = crate::compaction::ResolvedCompactionSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let summary =
+            crate::checkpoint::summarize_span(&span, agent.provider(), &api_key, &settings)
+                .await
+                .unwrap_or_else(|err| {
+                    format!(
+                        "(summarization failed: {err}; the span was collapsed without a report)"
+                    )
+                });
+        let outcome = crate::checkpoint::apply_rewind_to_active(
+            &mut self.session.agent,
+            &checkpoint,
+            summary,
+        );
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.append_custom_entry(
+                "rewind".to_string(),
+                Some(serde_json::to_value(&outcome).unwrap_or_default()),
+            );
+        }
+        self.session.persist_session().await?;
+        Ok(outcome)
+    }
+
+    /// OMP `/retry`: move the session leaf to the parent of the last
+    /// retryable user turn, so re-sending its text (returned) lands as a
+    /// SIBLING branch. The abandoned turn stays in the tree for `/tree`. The
+    /// agent's context is rebuilt from the new path before this returns.
+    pub async fn prepare_retry(&mut self) -> Result<String> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let (text, messages) = {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            let prepared = crate::checkpoint::prepare_retry_branch(&mut guard)
+                .ok_or_else(|| Error::session("No user turn to retry".to_string()))?;
+            (prepared.text, guard.to_messages_for_current_path())
+        };
+        self.session.agent.replace_messages(messages);
+        self.session.persist_session().await?;
+        Ok(text)
+    }
+
     /// Read the per-prompt `max_tokens` cap currently configured on the
     /// session's stream options.
     ///
@@ -2270,6 +2427,15 @@ impl AgentSessionHandle {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
         self.session.compact_now(on_event).await
+    }
+
+    /// OMP `/shake`: compaction that drops bulky tool output from the older
+    /// span instead of summarizing it with the model (no provider request).
+    pub async fn shake(
+        &mut self,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.session.shake_now(on_event).await
     }
 
     /// Access the underlying `AgentSession`.
@@ -2800,6 +2966,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         agent_session = agent_session.with_runtime_handle(handle);
     }
     agent_session.set_api_key_override(options.api_key.clone());
+    agent_session.advisor = options
+        .advisor
+        .as_ref()
+        .map(crate::advisor::AdvisorOptions::runtime);
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
             .agent
@@ -3488,6 +3658,234 @@ mod tests {
             "a continuation must write its turn to the session file; the raw \
              Agent loop persists nothing (bd-9o9i2)"
         );
+    }
+
+    /// OMP `/fresh`: the stream is rebound to a new id each time (two calls
+    /// never share one) and the reset is recorded in the session FILE, while
+    /// the conversation itself is left alone.
+    #[test]
+    fn fresh_stream_state_rebinds_the_stream_and_records_the_reset_on_disk() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        let before = handle.session.agent.stream_options().session_id.clone();
+
+        let first = run_async(handle.fresh_stream_state()).expect("fresh");
+        let second = run_async(handle.fresh_stream_state()).expect("fresh again");
+        assert_ne!(first, second, "each /fresh gets its own id");
+        assert_ne!(before.as_deref(), Some(second.as_str()));
+        assert_eq!(
+            handle.session.agent.stream_options().session_id.as_deref(),
+            Some(second.as_str()),
+            "the live stream options carry the newest id"
+        );
+        assert!(
+            handle.session.agent.messages().is_empty(),
+            "no transcript change"
+        );
+
+        let path = run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = store.lock(cx.cx()).await.expect("session lock");
+            inner.path.clone()
+        })
+        .expect("the reset is persisted");
+        let reopened = run_async(crate::session::Session::open(&path.display().to_string()))
+            .expect("reopen the session file");
+        let recorded: Vec<String> = reopened
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(custom) if custom.custom_type == "fresh" => {
+                    custom
+                        .data
+                        .as_ref()
+                        .and_then(|data| data["newSessionId"].as_str())
+                        .map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, vec![first, second]);
+    }
+
+    /// OMP `/shake`: the older span is compacted by dropping bulky content,
+    /// recorded as a `shake` compaction, and the provider is never called.
+    #[test]
+    fn shake_compacts_without_a_provider_request() {
+        let dir = tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures: 0,
+            calls: Arc::clone(&calls),
+            name: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 0,
+        });
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        // A small window so ~3k tokens of history crosses the threshold.
+        let settings = crate::compaction::ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 2_000,
+            reserve_tokens: 1_000,
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(crate::session::Session::create_with_dir(
+                Some(dir.path().to_path_buf()),
+            ))),
+            true,
+            settings,
+        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
+        let bulky = "history ".repeat(200);
+        run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut session = store.lock(cx.cx()).await.expect("session lock");
+            for i in 0..4 {
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(format!("user-{i} {bulky}")),
+                    timestamp: Some(i),
+                });
+                session.append_message(crate::session::SessionMessage::Assistant {
+                    message: crate::model::AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new(format!("assistant-{i} {bulky}")),
+                        )],
+                        ..Default::default()
+                    },
+                });
+            }
+        });
+
+        run_async(handle.shake(|_| {})).expect("shake");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "shake must not reach the provider"
+        );
+        let mode = run_async(handle.with_session(|session| {
+            session.entries.iter().find_map(|entry| match entry {
+                crate::session::SessionEntry::Compaction(compaction) => compaction
+                    .details
+                    .as_ref()
+                    .and_then(|details| details["mode"].as_str().map(str::to_string)),
+                _ => None,
+            })
+        }))
+        .expect("session");
+        assert_eq!(mode.as_deref(), Some("shake"));
+    }
+
+    /// `/checkpoint` then `/rewind`: the turn after the checkpoint collapses
+    /// out of the agent's context, and the rewind is recorded in the file.
+    /// Planted negatives: no checkpoint, a wrong name, and nothing to rewind.
+    #[test]
+    fn rewind_collapses_the_span_after_a_checkpoint() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        let no_checkpoint = run_async(handle.rewind_to_checkpoint(None)).unwrap_err();
+        assert!(no_checkpoint.to_string().contains("No checkpoints yet"));
+
+        let checkpoint = run_async(handle.mark_checkpoint("start", None)).expect("mark");
+        assert_eq!(
+            (checkpoint.name.as_str(), checkpoint.message_count),
+            ("start", 0)
+        );
+        let nothing = run_async(handle.rewind_to_checkpoint(None)).unwrap_err();
+        assert!(
+            nothing.to_string().contains("Nothing to rewind"),
+            "{nothing}"
+        );
+
+        let (_abort, signal) = AgentSessionHandle::new_abort_handle();
+        run_async(handle.prompt_with_abort("explore something", signal, |_| {})).expect("turn");
+        let turn_len = handle.session.agent.messages().len();
+        assert!(turn_len >= 2, "user + assistant");
+        let wrong = run_async(handle.rewind_to_checkpoint(Some("nope"))).unwrap_err();
+        assert!(wrong.to_string().contains("No checkpoint named 'nope'"));
+
+        let outcome = run_async(handle.rewind_to_checkpoint(Some("start"))).expect("rewind");
+        assert_eq!(outcome.collapsed_messages, turn_len);
+        assert!(
+            handle.session.agent.messages().len() <= 1,
+            "at most the rewind report remains in context"
+        );
+
+        let path = run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = store.lock(cx.cx()).await.expect("session lock");
+            inner.path.clone()
+        })
+        .expect("persisted");
+        let reopened = run_async(crate::session::Session::open(&path.display().to_string()))
+            .expect("reopen the session file");
+        assert!(reopened.entries.iter().any(|entry| matches!(
+            entry,
+            crate::session::SessionEntry::Custom(custom) if custom.custom_type == "rewind"
+        )));
+    }
+
+    /// OMP `/retry`: the re-sent turn is a sibling of the abandoned one. On
+    /// disk both user entries exist; the active path holds only the retry.
+    /// Planted negative: an empty session has nothing to retry.
+    #[test]
+    fn prepare_retry_branches_the_last_turn_and_the_file_keeps_both() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        assert!(
+            run_async(handle.prepare_retry()).is_err(),
+            "nothing to retry yet"
+        );
+
+        let (_abort, signal) = AgentSessionHandle::new_abort_handle();
+        run_async(handle.prompt_with_abort("hello", signal, |_| {})).expect("first turn");
+        let text = run_async(handle.prepare_retry()).expect("retry plan");
+        assert_eq!(text, "hello");
+        assert!(
+            handle.session.agent.messages().is_empty(),
+            "the agent's context no longer holds the abandoned turn"
+        );
+        let (_abort, signal) = AgentSessionHandle::new_abort_handle();
+        run_async(handle.prompt_with_abort(text, signal, |_| {})).expect("retried turn");
+
+        let path = run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = store.lock(cx.cx()).await.expect("session lock");
+            inner.path.clone()
+        })
+        .expect("persisted");
+        let reopened = run_async(crate::session::Session::open(&path.display().to_string()))
+            .expect("reopen the session file");
+        let users_in_file = reopened
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    crate::session::SessionEntry::Message(message)
+                        if matches!(message.message, crate::session::SessionMessage::User { .. })
+                )
+            })
+            .count();
+        assert_eq!(users_in_file, 2, "the abandoned turn stays in the tree");
+        let users_on_path = reopened
+            .to_messages_for_current_path()
+            .iter()
+            .filter(|message| matches!(message, crate::model::Message::User(_)))
+            .count();
+        assert_eq!(users_on_path, 1, "the active path holds only the retry");
     }
 
     /// bd-9o9i2 criterion 3, and the half that matters for safety rather than

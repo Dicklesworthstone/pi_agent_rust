@@ -309,6 +309,29 @@ fn render_header_titles_terminal_after_session_name() {
     );
 }
 
+/// gh #214: a models.json `name` shows in the header, the terminal title and
+/// the powerline, while the identity string used for selection stays
+/// provider/id. An entry without a distinct name still shows provider/id.
+#[test]
+fn a_model_display_name_renders_but_identity_stays_provider_id() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    app.startup_welcome.clear();
+    assert_eq!(model_display_label(&app.model_entry), "openai/gpt-5.2");
+    assert_eq!(session_model_line(&app.model_entry), "openai/gpt-5.2");
+
+    app.model_entry.model.name = "GPT Five Two".to_string();
+    let view = app.view();
+    assert!(view.contains("(GPT Five Two)"), "header: {view}");
+    assert!(view.contains("Pi · GPT Five Two"), "terminal title: {view}");
+    assert_eq!(app.model, "openai/gpt-5.2", "identity is untouched");
+    assert_eq!(
+        session_model_line(&app.model_entry),
+        "GPT Five Two (openai/gpt-5.2)"
+    );
+}
+
 #[test]
 fn live_view_renders_default_welcome_and_powerline_status() {
     let dir = tempdir();

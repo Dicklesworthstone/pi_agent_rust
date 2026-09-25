@@ -299,6 +299,26 @@ pub fn format_injection(verdict: &AdvisorVerdict) -> String {
 pub static ADVISOR_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// What a session needs to build its own [`AdvisorRuntime`]: hosts that
+/// replace sessions (`/new`, `/resume`, `/fork`) keep this and build a fresh
+/// runtime per session.
+#[derive(Clone)]
+pub struct AdvisorOptions {
+    pub provider: Arc<dyn Provider>,
+    pub label: String,
+    pub timeout: Duration,
+    pub api_key: Option<String>,
+}
+
+impl AdvisorOptions {
+    #[must_use]
+    pub fn runtime(&self) -> AdvisorRuntime {
+        AdvisorRuntime::new(Arc::clone(&self.provider), self.label.clone())
+            .with_timeout(self.timeout)
+            .with_api_key(self.api_key.clone())
+    }
+}
+
 /// The advisor runtime: owns the second provider, the guard, and failure
 /// isolation state.
 pub struct AdvisorRuntime {

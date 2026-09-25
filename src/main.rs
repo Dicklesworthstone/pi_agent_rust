@@ -1387,6 +1387,47 @@ fn print_resolved_repair_policy(resolved: &pi::config::ResolvedRepairPolicy) -> 
     Ok(())
 }
 
+/// The advisor (bd-cv653.3.3), for either interactive stack: only when the
+/// advisor role resolves a model AND its credentials exist. Otherwise `None`,
+/// and the turn hook never runs (zero-overhead rule).
+fn advisor_options(
+    cli: &cli::Cli,
+    config: &Config,
+    model_registry: &ModelRegistry,
+    auth: &AuthStorage,
+) -> Option<pi::advisor::AdvisorOptions> {
+    if !config.advisor_enabled() {
+        return None;
+    }
+    let entry =
+        pi::app::resolve_role_model(pi::models::ModelRole::Advisor, cli, config, model_registry)?
+            .model_entry;
+    let key = pi::models::resolve_model_key(cli.api_key.as_deref(), auth, &entry);
+    if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
+        tracing::info!(
+            event = "pi.advisor.no_credentials",
+            "advisor role configured but credentials missing; advisor disabled"
+        );
+        return None;
+    }
+    match pi::providers::create_provider(&entry, None) {
+        Ok(provider) => Some(pi::advisor::AdvisorOptions {
+            provider,
+            label: format!("{}/{}", entry.model.provider, entry.model.id),
+            timeout: Duration::from_secs(config.advisor_timeout_secs()),
+            api_key: key,
+        }),
+        Err(err) => {
+            tracing::warn!(
+                event = "pi.advisor.provider_failed",
+                error = %err,
+                "advisor provider construction failed; advisor disabled"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -2128,6 +2169,9 @@ async fn run(
             // the classic stack uses so `ask`/`write` modes gate here
             // too, prompting through the ask-card bridge.
             approval_state: Some(approval_state.clone()),
+            // The advisor was built only on the classic stack; the role
+            // the user configured never reviewed a turn on this one.
+            advisor: advisor_options(&cli, &config, &model_registry, &auth),
             // Provider retry (bd-u2qv4). Until now a 429 or a 529 was a
             // hard error on this stack while the same request in print
             // mode or over RPC retried and completed, and this is the
@@ -2205,6 +2249,21 @@ async fn run(
                 // the classic stack does: the `task` role, falling back to
                 // `smol`.
                 subagent_role_spec: pi::app::subagent_role_spec(&config),
+                // /btw answers with the smol role model, resolved exactly as
+                // the classic stack resolves it; `None` without credentials.
+                btw_client: pi::app::resolve_role_model(
+                    pi::models::ModelRole::Smol,
+                    &cli,
+                    &config,
+                    &model_registry,
+                )
+                .and_then(|resolution| {
+                    pi::btw::BtwClient::for_model_entry(
+                        &resolution.model_entry,
+                        cli.api_key.as_deref(),
+                        &auth,
+                    )
+                }),
                 // ctrl+p cycles the same resolved scope the classic stack
                 // cycles; empty falls back to every available model.
                 cycle_models: scoped_models
@@ -2216,6 +2275,7 @@ async fn run(
             },
             pi::interactive_ftui::AutocompleteLaunch {
                 catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
+                resources: Some(resources.clone()),
                 cwd: cwd.clone(),
                 max_visible: config
                     .autocomplete_max_visible
@@ -2336,48 +2396,9 @@ async fn run(
             }
         }
     }
-    // The advisor (bd-cv653.3.3): build the runtime only when the advisor
-    // role resolves a model AND its credentials exist — otherwise the session
-    // carries None and the hook never runs (zero-overhead rule).
-    if let Some(resolution) = pi::app::resolve_role_model(
-        pi::models::ModelRole::Advisor,
-        &cli,
-        &config,
-        &model_registry,
-    )
-    .filter(|_| config.advisor_enabled())
-    {
-        let entry = resolution.model_entry;
-        let key = pi::models::resolve_model_key(cli.api_key.as_deref(), &auth, &entry);
-        let credentialed =
-            !pi::models::model_requires_configured_credential(&entry) || key.is_some();
-        if credentialed {
-            let label = format!("{}/{}", entry.model.provider, entry.model.id);
-            match pi::providers::create_provider(&entry, None) {
-                Ok(advisor_provider) => {
-                    agent_session.advisor = Some(
-                        pi::advisor::AdvisorRuntime::new(advisor_provider, label)
-                            .with_timeout(std::time::Duration::from_secs(
-                                config.advisor_timeout_secs(),
-                            ))
-                            .with_api_key(key),
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        event = "pi.advisor.provider_failed",
-                        error = %err,
-                        "advisor provider construction failed; advisor disabled"
-                    );
-                }
-            }
-        } else {
-            tracing::info!(
-                event = "pi.advisor.no_credentials",
-                "advisor role configured but credentials missing; advisor disabled"
-            );
-        }
-    }
+    agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)
+        .as_ref()
+        .map(pi::advisor::AdvisorOptions::runtime);
     // Host authorization must not depend on granting the model the ask tool.
     // The registry picker is always handed to interactive/RPC hosts; only this
     // conditional extend adds ask to the provider-visible schema.

@@ -641,7 +641,7 @@ impl PiApp {
     /// PERF-7: Render the header directly into `output`, avoiding an
     /// intermediate `String` allocation on the hot path.
     fn render_header_into(&self, output: &mut String) {
-        let model_label = format!("({})", self.model);
+        let model_label = format!("({})", model_display_label(&self.model_entry));
 
         // Branch indicator: show "Branch N/M" when session has multiple leaves.
         let branch_indicator = self
@@ -704,7 +704,12 @@ impl PiApp {
             .ok()
             .and_then(|session| session.get_name());
         let terminal_title = session_name.map_or_else(
-            || format!("Pi · {} · {activity}", self.model),
+            || {
+                format!(
+                    "Pi · {} · {activity}",
+                    model_display_label(&self.model_entry)
+                )
+            },
             |name| format!("Pi · {name} · {activity}"),
         );
         output.push_str(&crate::delight::format_terminal_title(&terminal_title));
@@ -933,8 +938,10 @@ impl PiApp {
             }
         });
         let cwd = self.cwd.to_string_lossy();
+        // gh #214: the same display label the default stack's powerline uses.
+        let model_label = self.model_entry.model.status_label();
         let status_ctx = crate::status_line::StatusContext {
-            model: self.model.as_str(),
+            model: model_label.as_str(),
             thinking_level: thinking_level.as_deref(),
             mode,
             cwd: cwd.as_ref(),

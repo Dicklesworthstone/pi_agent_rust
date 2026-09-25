@@ -99,6 +99,9 @@ fn ftui_args() -> Vec<&'static str> {
 }
 
 fn quit_and_assert_clean(session: &TuiSession) {
+    // OMP semantics: the first ctrl+c clears the editor, a second one within
+    // 500ms quits.
+    session.tmux.send_key("C-c");
     session.tmux.send_key("C-c");
     let start = std::time::Instant::now();
     while session.tmux.session_exists() {

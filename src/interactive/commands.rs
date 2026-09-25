@@ -1964,7 +1964,7 @@ impl PiApp {
         let mut info = format!(
             "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {model}\n  thinking: {thinking}\n  messageCount: {message_count}\n  tokens: {total_tokens}\n  cost: {cost_str}",
             id = session.header.id,
-            model = self.model,
+            model = session_model_line(&self.model_entry),
         );
         info.push_str("\n\n");
         info.push_str(&self.frame_timing.summary());
@@ -3024,7 +3024,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         if model_entry_matches(&next, &self.model_entry) {
-            self.status_message = Some(format!("Current model: {}", self.model));
+            self.status_message = Some(format!(
+                "Current model: {}",
+                session_model_line(&self.model_entry)
+            ));
             return None;
         }
 
@@ -3170,7 +3173,6 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     fn handle_slash_approval(&mut self, args: &str) -> Option<Cmd> {
-        let sub = args.trim().to_ascii_lowercase();
         let approval_state = {
             let Ok(agent_guard) = self.agent.try_lock() else {
                 self.status_message = Some("Agent is busy".to_string());
@@ -3184,53 +3186,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         };
 
-        match sub.as_str() {
-            "" | "status" => {
-                let mode = state.mode();
-                let dual_classes = state.dual_confirm_classes();
-                let dual_str = if dual_classes.is_empty() {
-                    "none".to_string()
-                } else {
-                    dual_classes
-                        .iter()
-                        .map(|c| c.label())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                self.status_message = Some(format!(
-                    "Approval mode: {} | Dual-confirm classes: {}",
-                    mode.as_str(),
-                    dual_str
-                ));
-            }
-            "always-ask" | "always_ask" | "always" | "ask" => {
-                state.set_mode(crate::approval::ApprovalMode::AlwaysAsk);
-                Self::log_approval_transition(
-                    &self.session,
-                    crate::approval::ApprovalMode::AlwaysAsk,
-                );
-                self.status_message = Some("Approval mode set to always-ask".to_string());
-            }
-            "write" | "files" => {
-                state.set_mode(crate::approval::ApprovalMode::Write);
-                Self::log_approval_transition(&self.session, crate::approval::ApprovalMode::Write);
-                self.status_message =
-                    Some("Approval mode set to write (file mutations auto-approved)".to_string());
-            }
-            "yolo" | "auto-approve" | "auto" | "all" => {
-                state.set_mode(crate::approval::ApprovalMode::Yolo);
-                Self::log_approval_transition(&self.session, crate::approval::ApprovalMode::Yolo);
-                self.status_message = Some(
-                    "Approval mode set to yolo (all auto-approved except hard policy gates)"
-                        .to_string(),
-                );
-            }
-            other => {
-                self.status_message = Some(format!(
-                    "Unknown /approval mode {other:?}: use /approval [always-ask|write|yolo|status]"
-                ));
-            }
+        let (report, changed) = super::workspace_reports::approval(&state, args);
+        if let Some(mode) = changed {
+            Self::log_approval_transition(&self.session, mode);
         }
+        self.show_workspace_report(report);
         None
     }
 
@@ -3247,112 +3207,36 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_handoff(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        let (to_target, out_path) = if args.is_empty() {
-            (crate::handoff::HandoffTarget::Human, None)
-        } else {
-            let mut parts = args.split_whitespace();
-            let target_str = parts.next().unwrap_or("human");
-            let path_str = parts.next().map(std::path::PathBuf::from);
-            (crate::handoff::HandoffTarget::parse(target_str), path_str)
+        let report = {
+            let Ok(session_guard) = self.session.try_lock() else {
+                self.status_message = Some("Session busy; try again".to_string());
+                return None;
+            };
+            super::workspace_reports::handoff(&session_guard, args)
         };
-
-        let Ok(session_guard) = self.session.try_lock() else {
-            self.status_message = Some("Session busy; try again".to_string());
-            return None;
-        };
-
-        let doc = crate::handoff::HandoffGenerator::generate_from_session(&session_guard);
-        drop(session_guard);
-
-        match crate::handoff::HandoffGenerator::deliver(&doc, &to_target, out_path.as_deref()) {
-            Ok(report) => {
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: format!(
-                        "### 📋 Handoff Brief Generated\n\n{}\n\n*{}*",
-                        doc.to_markdown(),
-                        report.status
-                    ),
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                self.status_message = Some("Handoff brief generated successfully".to_string());
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Failed to generate handoff: {e}"));
-            }
-        }
-
+        self.show_workspace_report(report);
         None
     }
 
     pub(super) fn handle_slash_rules(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        let project_root = self.cwd.clone();
-        let mut store = crate::stream_rules::StreamRuleStore::load_for_project(&project_root);
+        let report = super::workspace_reports::rules(&self.cwd, args);
+        self.show_workspace_report(report);
+        None
+    }
 
-        if args.is_empty() || args == "list" {
-            let rules = store.list_all_rules();
-            let mut text = format!("### 🛡️ Active Stream Rules ({})\n\n", rules.len());
-            if rules.is_empty() {
-                text.push_str("No stream rules configured. Use `/rules add <id> <pattern> <body>` or `/omfg <complaint>` to create one.\n");
-            } else {
-                for r in &rules {
-                    let status = if r.enabled {
-                        "✅ enabled"
-                    } else {
-                        "⏸️ disabled"
-                    };
-                    let _ = writeln!(
-                        text,
-                        "- **{}** [{status}]: `/{}/`\n  {}",
-                        r.name, r.pattern, r.body
-                    );
-                }
-            }
+    /// Show a shared workspace command's result: its card (if any) in the
+    /// transcript, its status line in the footer.
+    fn show_workspace_report(&mut self, report: super::workspace_reports::Report) {
+        if let Some(card) = report.card {
             self.messages.push(ConversationMessage {
                 role: MessageRole::System,
-                content: text,
+                content: card,
                 thinking: None,
                 collapsed: false,
             });
             self.scroll_to_bottom();
-        } else if let Some(rest) = args.strip_prefix("remove ") {
-            let id = rest.trim();
-            match store.remove_rule(id) {
-                Ok(true) => {
-                    self.status_message = Some(format!("Removed stream rule '{id}'"));
-                }
-                Ok(false) => {
-                    self.status_message = Some(format!("Stream rule '{id}' not found"));
-                }
-                Err(e) => {
-                    self.status_message = Some(format!("Error removing rule: {e}"));
-                }
-            }
-        } else if let Some(rest) = args.strip_prefix("toggle ") {
-            let id = rest.trim();
-            let current = store
-                .list_all_rules()
-                .into_iter()
-                .find(|r| r.id == id)
-                .is_none_or(|r| r.enabled);
-            match store.toggle_rule(id, !current) {
-                Ok(true) => {
-                    let st = if current { "disabled" } else { "enabled" };
-                    self.status_message = Some(format!("Stream rule '{id}' is now {st}"));
-                }
-                _ => {
-                    self.status_message = Some(format!("Stream rule '{id}' not found"));
-                }
-            }
-        } else {
-            self.status_message = Some("Usage: /rules [list|remove <id>|toggle <id>]".to_string());
         }
-
-        None
+        self.status_message = Some(report.status);
     }
 
     /// /add-dir <dir> — grant access to an additional workspace root
@@ -3702,217 +3586,20 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_omfg(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        if args.is_empty() {
-            self.status_message = Some("Usage: /omfg <complaint about model behavior>".to_string());
-            return None;
-        }
-
-        let project_root = self.cwd.clone();
-        match crate::stream_rules::GrievancesLedger::record_complaint(&project_root, args, None) {
-            Ok(g) => {
-                let candidate = crate::stream_rules::GrievancesLedger::forge_candidate_rule(&g);
-                let mut store =
-                    crate::stream_rules::StreamRuleStore::load_for_project(&project_root);
-                let _ = store.add_rule(candidate.clone(), false);
-
-                let content = format!(
-                    "### 📝 Grievance Logged & Stream Rule Forged\n\n\
-                     - **Grievance ID:** `{gid}`\n\
-                     - **Complaint:** {complaint}\n\n\
-                     **Generated TTSR Stream Rule (`{rid}`):**\n\
-                     - **Name:** {name}\n\
-                     - **Pattern:** `/{pattern}/`\n\
-                     - **Directive:** {body}\n\n\
-                     *Rule is now active for this project and will abort & retry if this pattern occurs mid-stream.*",
-                    gid = g.id,
-                    complaint = g.complaint,
-                    rid = candidate.id,
-                    name = candidate.name,
-                    pattern = candidate.pattern,
-                    body = candidate.body,
-                );
-
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content,
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                self.status_message = Some(format!(
-                    "Forged and activated stream rule '{}'",
-                    candidate.id
-                ));
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Failed to record grievance: {e}"));
-            }
-        }
-
+        let report = super::workspace_reports::omfg(&self.cwd, args);
+        self.show_workspace_report(report);
         None
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_commit(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        let dry_run = args.contains("--dry-run")
-            || args.contains("-n")
-            || args == "dry-run"
-            || args == "plan";
-        let include_lockfiles = args.contains("--include-lockfiles");
-
-        let status_out = match std::process::Command::new("git")
-            .arg("status")
-            .arg("--porcelain")
-            .current_dir(&self.cwd)
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                self.status_message = Some(format!("Failed to run git status: {e}"));
-                return None;
-            }
-        };
-
-        let status_str = String::from_utf8_lossy(&status_out.stdout);
-        let mut changed_files = Vec::new();
-        for line in status_str.lines() {
-            let trimmed = line.trim();
-            if trimmed.len() > 3 {
-                let file_path = &trimmed[3..].trim();
-                let actual_path = if let Some((_, new_p)) = file_path.split_once(" -> ") {
-                    new_p.trim()
-                } else {
-                    file_path
-                };
-                changed_files.push(actual_path.to_string());
-            }
-        }
-
-        if changed_files.is_empty() {
-            self.status_message = Some("Working tree clean; nothing to commit.".to_string());
-            return None;
-        }
-
-        let diff_out = std::process::Command::new("git")
-            .arg("diff")
-            .arg("HEAD")
-            .current_dir(&self.cwd)
-            .output()
-            .ok();
-
-        let hunks = if let Some(out) = diff_out {
-            let diff_str = String::from_utf8_lossy(&out.stdout);
-            crate::commit_split::DiffParser::parse_unified_diff(&diff_str).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let options = crate::commit_split::CommitOptions {
-            dry_run,
-            include_lockfiles,
-            all_untracked: false,
-            bead_reference: None,
-            custom_prefix: None,
-        };
-
-        match crate::commit_split::CommitPlanner::plan(&hunks, &changed_files, &options) {
-            Ok(plan) => {
-                if plan.units.is_empty() {
-                    self.status_message = Some("No eligible files to commit.".to_string());
-                    return None;
-                }
-
-                let mut card = format!("### 📦 Planned Atomic Commits ({})\n\n", plan.units.len());
-                for (idx, unit) in plan.units.iter().enumerate() {
-                    let msg = unit.formatted_message(None);
-                    let _ = writeln!(card, "{}. **{}** (`{}`)", idx + 1, msg, unit.scope);
-                    for f in &unit.files {
-                        let _ = writeln!(card, "   - `{f}`");
-                    }
-                }
-
-                if dry_run {
-                    card.push_str("\n*Dry run: no commits were created.*");
-                } else {
-                    match crate::commit_split::CommitExecutor::execute(&self.cwd, &plan, &options) {
-                        Ok(results) => {
-                            let successful = results.iter().filter(|r| r.success).count();
-                            let _ = writeln!(
-                                card,
-                                "\n\n**Committed {successful}/{} units successfully.**",
-                                plan.units.len()
-                            );
-                            for res in results {
-                                if let Some(ref sha) = res.commit_sha {
-                                    let _ = writeln!(card, "- `[{sha}]` {}", res.message);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = write!(card, "\n\n**Error executing commits:** {e}");
-                        }
-                    }
-                }
-
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: card,
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                self.status_message = Some(format!(
-                    "Generated commit plan with {} units",
-                    plan.units.len()
-                ));
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Failed to plan commits: {e}"));
-            }
-        }
-
+        let report = super::workspace_reports::commit(&self.cwd, args);
+        self.show_workspace_report(report);
         None
     }
 
     pub(super) fn handle_slash_review(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        let target = if args.is_empty() {
-            None
-        } else {
-            Some(args.to_string())
-        };
-
-        let options = crate::review::ReviewOptions {
-            target,
-            fail_on: None,
-            confidence_threshold: 0.70,
-            format: "markdown".to_string(),
-            max_findings: 15,
-            out_file: None,
-        };
-
-        match crate::review::CodeReviewer::review(&self.cwd, &options) {
-            Ok(report) => {
-                let badge = report.verdict.badge();
-                let summary = report.summary.clone();
-                let markdown = report.format_markdown();
-
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: markdown,
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                self.status_message = Some(format!("{badge}: {summary}"));
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Review failed: {e}"));
-            }
-        }
-
+        let report = super::workspace_reports::review(&self.cwd, args);
+        self.show_workspace_report(report);
         None
     }
 
@@ -4000,38 +3687,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// `/advisor` (bd-cv653.3.3): status + pause/resume for the turn-review
     /// second model.
     fn handle_slash_advisor(&mut self, args: &str) -> Option<Cmd> {
-        let sub = args.trim().to_ascii_lowercase();
         let configured = self
             .config
             .model_roles
             .as_ref()
-            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Advisor))
-            .map(str::to_string);
-        match sub.as_str() {
-            "" | "status" => {
-                let paused =
-                    crate::advisor::ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst);
-                let state = match (&configured, paused) {
-                    (Some(spec), false) => format!("active on {spec}"),
-                    (Some(spec), true) => format!("configured ({spec}) but paused"),
-                    (None, _) => "not configured (set modelRoles.advisor or --advisor)".to_string(),
-                };
-                self.status_message = Some(format!("Advisor: {state}"));
-            }
-            "pause" => {
-                crate::advisor::ADVISOR_PAUSED.store(true, std::sync::atomic::Ordering::SeqCst);
-                self.status_message = Some("Advisor paused".to_string());
-            }
-            "resume" => {
-                crate::advisor::ADVISOR_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
-                self.status_message = Some("Advisor resumed".to_string());
-            }
-            other => {
-                self.status_message = Some(format!(
-                    "Unknown /advisor subcommand {other:?}: use /advisor [status|pause|resume]"
-                ));
-            }
-        }
+            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Advisor));
+        let report = super::workspace_reports::advisor(configured, args);
+        self.show_workspace_report(report);
         None
     }
 

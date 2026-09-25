@@ -1222,14 +1222,7 @@ pub fn format_hotkeys_for_ftui(keybindings: &KeyBindings) -> String {
 pub const fn is_inert_on_ftui(action: AppAction) -> bool {
     matches!(
         action,
-        AppAction::ExpandTools
-            | AppAction::ToggleThinking
-            | AppAction::OpenSettings
-            | AppAction::ExternalEditor
-            | AppAction::Copy
-            | AppAction::Clear
-            | AppAction::Yank
-            | AppAction::YankPop
+        AppAction::OpenSettings | AppAction::Copy | AppAction::Yank | AppAction::YankPop
     )
 }
 
@@ -3061,12 +3054,15 @@ mod tests {
             // Routed since mid-turn input goes through session_control.
             assert!(ftui_hotkeys.contains("Queue follow-up message"));
             assert!(ftui_hotkeys.contains("Restore queued messages to editor"));
+            // Routed with ctrl+o/ctrl+t/ctrl+g and OMP's ctrl+c clear.
+            assert!(ftui_hotkeys.contains("Collapse/expand tool output"));
+            assert!(ftui_hotkeys.contains("Collapse/expand thinking blocks"));
+            assert!(ftui_hotkeys.contains("Open in external editor"));
+            assert!(ftui_hotkeys.contains("Clear editor"));
 
             // Inert actions on FTUI are omitted:
-            assert!(!ftui_hotkeys.contains("Collapse/expand tool output"));
-            assert!(!ftui_hotkeys.contains("Collapse/expand thinking blocks"));
             assert!(!ftui_hotkeys.contains("Open settings"));
-            assert!(!ftui_hotkeys.contains("Open in external editor"));
+            assert!(!ftui_hotkeys.contains("Copy selection"));
         }
     }
 }
