@@ -324,13 +324,13 @@ cargo test openai
 cargo test gemini
 
 # Unit checklist only
-cargo test provider_unit_checklist
+cargo test --test provider_unit_checklist
 
 # Contract tests only
-cargo test provider_native_contract
+cargo test --test provider_native_contract
 
 # Error path tests only
-cargo test provider_error_paths
+cargo test --test provider_error_paths
 
 # Streaming conformance (VCR playback)
 cargo test --test provider_streaming
