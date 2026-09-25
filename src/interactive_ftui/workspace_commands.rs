@@ -1,6 +1,6 @@
 //! OMP workspace commands on the default stack: `/rules`, `/omfg`,
 //! `/commit`, `/review`, `/handoff`, `/approval`, `/advisor`, `/memory`,
-//! `/hub` (alias `/agents`). The work is
+//! `/hub` (alias `/agents`), `/security`, `/plugins`. The work is
 //! shared with the classic stack (`interactive::workspace_reports`); this
 //! module routes them through the driver and renders the result.
 
@@ -23,6 +23,8 @@ pub enum WorkspaceCommand {
     Advisor,
     Memory,
     Hub,
+    Security,
+    Plugins,
 }
 
 impl WorkspaceCommand {
@@ -38,6 +40,8 @@ impl WorkspaceCommand {
             "/advisor" => Self::Advisor,
             "/memory" => Self::Memory,
             "/hub" | "/agents" => Self::Hub,
+            "/security" => Self::Security,
+            "/plugins" | "/packages" => Self::Plugins,
             _ => return None,
         })
     }
@@ -49,13 +53,15 @@ fn render(report: Report) -> PiMsg {
 }
 
 /// Run `command` with `args` against the live session; `advisor` is the
-/// label of the advisor this session was built with, if any.
+/// label of the advisor this session was built with, if any, and
+/// `packages` the launch package manager.
 pub async fn run(
     command: WorkspaceCommand,
     args: &str,
     handle: &mut AgentSessionHandle,
     cwd: &Path,
     advisor: Option<&str>,
+    packages: Option<&crate::package_manager::PackageManager>,
     agent_tx: &Sender<PiMsg>,
 ) {
     let msg = match command {
@@ -66,6 +72,11 @@ pub async fn run(
         WorkspaceCommand::Advisor => render(workspace_reports::advisor(advisor, args)),
         WorkspaceCommand::Memory => render(workspace_reports::memory(cwd, args)),
         WorkspaceCommand::Hub => render(workspace_reports::hub(args)),
+        WorkspaceCommand::Security => render(workspace_reports::security(cwd, args)),
+        WorkspaceCommand::Plugins => packages.map_or_else(
+            || PiMsg::System(String::from("The package manager is not available here.")),
+            |manager| render(workspace_reports::plugins(manager)),
+        ),
         WorkspaceCommand::Handoff => {
             match handle
                 .with_session(|session| workspace_reports::handoff(session, args))
@@ -113,6 +124,9 @@ mod tests {
             ("/memory", WorkspaceCommand::Memory),
             ("/hub", WorkspaceCommand::Hub),
             ("/agents", WorkspaceCommand::Hub),
+            ("/security", WorkspaceCommand::Security),
+            ("/plugins", WorkspaceCommand::Plugins),
+            ("/packages", WorkspaceCommand::Plugins),
         ] {
             assert_eq!(WorkspaceCommand::parse(token), Some(expected), "{token}");
         }

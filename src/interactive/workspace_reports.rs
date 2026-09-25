@@ -1,7 +1,9 @@
-//! Workspace slash commands shared by both interactive stacks: `/rules`,
-//! `/omfg`, `/commit`, `/review`, and `/handoff`. Each takes the working
-//! directory (and, for `/handoff`, the session) and returns what to show;
-//! the stacks only differ in where they put it.
+//! Workspace slash commands shared by the interactive stacks: `/rules`,
+//! `/omfg`, `/commit`, `/review`, `/handoff`, `/approval`, `/advisor`, and
+//! (default stack) `/memory`, `/hub`, `/security`, `/plugins`. Each takes
+//! what it reads (working directory, session, approval state, package
+//! manager) and returns what to show; the stacks differ only in where they
+//! put it.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -327,6 +329,72 @@ fn memory_in(store: &crate::memory::MemoryStore, args: &str) -> Report {
     }
 }
 
+/// `/security [paths...]`: the native source scan (bd-cv653.2.6) over the
+/// workspace or the given paths, with recorded dispositions applied, as the
+/// `security_scan` tool reports it.
+pub fn security(cwd: &Path, args: &str) -> Report {
+    const SHOWN: usize = 30;
+    let paths: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+    let findings = match crate::security_scan::run_scan(cwd, &paths) {
+        Ok(findings) => findings,
+        Err(e) => return Report::status(format!("Security scan failed: {e}")),
+    };
+    let dispositions = match crate::security_scan::load_dispositions(cwd) {
+        Ok(dispositions) => dispositions,
+        Err(e) => return Report::status(format!("Security dispositions unreadable: {e}")),
+    };
+    let (active, suppressed) =
+        crate::security_scan::partition_by_disposition(findings, &dispositions);
+    if active.is_empty() {
+        return Report::status(format!(
+            "Security scan: no findings ({} suppressed by dispositions).",
+            suppressed.len()
+        ));
+    }
+    let mut card = format!("### 🔒 Security scan: {} finding(s)", active.len());
+    if !suppressed.is_empty() {
+        let _ = write!(card, ", {} suppressed", suppressed.len());
+    }
+    card.push_str("\n\n");
+    for finding in active.iter().take(SHOWN) {
+        let _ = writeln!(
+            card,
+            "- [{}] `{}:{}` {} (`{}`)",
+            finding.severity, finding.path, finding.line, finding.message, finding.rule_id
+        );
+    }
+    if active.len() > SHOWN {
+        let _ = writeln!(card, "- … {} more", active.len() - SHOWN);
+    }
+    Report::card(card, format!("{} security finding(s)", active.len()))
+}
+
+/// `/plugins`: the packages (extensions, skills, prompts, themes) installed
+/// at user and project scope.
+pub fn plugins(manager: &crate::package_manager::PackageManager) -> Report {
+    use crate::package_manager::PackageScope;
+    let packages = match manager.list_packages_blocking() {
+        Ok(packages) => packages,
+        Err(e) => return Report::status(format!("Could not list packages: {e}")),
+    };
+    if packages.is_empty() {
+        return Report::status("No packages installed. `pi install <source>` adds one.");
+    }
+    let mut card = format!("### 📦 Installed packages ({})\n\n", packages.len());
+    for package in &packages {
+        let scope = match package.scope {
+            PackageScope::User => "user",
+            PackageScope::Project => "project",
+            PackageScope::Temporary => "temporary",
+        };
+        let _ = writeln!(card, "- `{}` ({scope})", package.source);
+    }
+    card.push_str(
+        "\n`pi install <source>` / `pi remove <source>` manage them; `/reload` applies changes.",
+    );
+    Report::card(card, format!("{} package(s)", packages.len()))
+}
+
 /// `/hub [id]`: this session's subagent children (bd-cv653.5.3), or one
 /// child's transcript tail.
 pub fn hub(args: &str) -> Report {
@@ -502,6 +570,48 @@ mod tests {
             format!("Forgot memory #{}", kept.id)
         );
         assert_eq!(memory_in(&store, "list").status, "Recent memories: none");
+    }
+
+    /// A planted secret-shaped line is reported with its location; a clean
+    /// tree reports no findings.
+    #[test]
+    fn security_reports_findings_with_their_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("clean.rs"), "fn main() {}\n").expect("write");
+        let clean = security(dir.path(), "");
+        assert!(
+            clean.status.starts_with("Security scan: no findings"),
+            "{clean:?}"
+        );
+
+        std::fs::write(
+            dir.path().join("leak.py"),
+            // ubs:ignore planted fake key for the scanner under test
+            "import os\napi_key = \"abcdefghijklmnopqrstuvwxyz0123\"\n",
+        )
+        .expect("write");
+        let found = security(dir.path(), "");
+        assert!(
+            found.status.ends_with("security finding(s)"),
+            "{}",
+            found.status
+        );
+        let card = found.card.expect("a findings card");
+        assert!(card.contains("`leak.py:2`"), "{card}");
+        assert!(card.contains("secret.generic-api-key"), "{card}");
+    }
+
+    #[test]
+    fn plugins_lists_nothing_for_an_empty_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = crate::package_manager::PackageManager::new(dir.path().to_path_buf());
+        let report = plugins(&manager);
+        // The user's own global packages may be listed; the call must not
+        // fail, and an empty result says how to add one.
+        assert!(
+            report.card.is_some() || report.status.starts_with("No packages installed"),
+            "{report:?}"
+        );
     }
 
     #[test]

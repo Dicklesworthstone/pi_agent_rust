@@ -607,6 +607,47 @@ impl EntryRole {
     }
 }
 
+/// The newest http(s) link in the transcript (OMP `/open`), without the
+/// sentence punctuation or closing bracket that tends to follow one.
+fn last_url(transcript: &[TranscriptEntry]) -> Option<String> {
+    transcript.iter().rev().find_map(|entry| {
+        [entry.detail.as_deref(), Some(entry.text.as_str())]
+            .into_iter()
+            .flatten()
+            .find_map(|text| {
+                text.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '`'))
+                    .rev()
+                    .map(|word| word.trim_start_matches(['(', '[', '\'']))
+                    .find(|word| word.starts_with("https://") || word.starts_with("http://"))
+                    .map(|word| {
+                        word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '\''])
+                            .to_string()
+                    })
+            })
+    })
+}
+
+/// Hand a URL to the platform's opener, detached.
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/c", "start", ""]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+}
+
 /// A thinking entry while thinking is hidden: one line saying how much.
 fn collapsed_thinking(text: &str) -> String {
     let lines = text.lines().count();
@@ -2088,9 +2129,6 @@ impl PiFtuiModel {
         });
     }
 
-    /// Push a pending tool-execution card keyed by the sanitized tool_id
-    /// (stable across head-text replacement by invocation summaries);
-    /// `display` is the sanitized initial head (the tool name).
     /// Remember a sent prompt for recall (consecutive repeats collapse) and
     /// leave recall mode.
     fn record_history(&mut self, text: &str) {
@@ -2174,6 +2212,9 @@ impl PiFtuiModel {
         }
     }
 
+    /// Push a pending tool-execution card keyed by the sanitized tool_id
+    /// (stable across head-text replacement by invocation summaries);
+    /// `display` is the sanitized initial head (the tool name).
     fn push_tool_card(&mut self, pair_id: &str, display: &str, sanitized_name: &str) {
         let revision = self.next_revision();
         self.transcript.push(TranscriptEntry {
@@ -3126,6 +3167,7 @@ impl PiFtuiModel {
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
                      /commit [--dry-run], /review [target], /handoff, /approval [mode], \
                      /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
+                     /security [paths], /plugins, /open, /reload-plugins, \
                      /context, /todo, /jobs, /stats, /help, \
                      /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
@@ -3223,9 +3265,24 @@ impl PiFtuiModel {
                 });
                 return true;
             }
-            "/reload" => {
+            "/reload" | "/reload-plugins" => {
                 self.begin_busy("reloading resources ...");
                 self.send_command(UiCommand::Reload);
+                return true;
+            }
+            "/open" => {
+                match last_url(&self.transcript) {
+                    Some(url) => match open_in_browser(&url) {
+                        Ok(()) => self.push_entry(EntryRole::System, format!("Opening {url}")),
+                        Err(err) => {
+                            self.push_entry(EntryRole::Error, format!("open {url}: {err}"));
+                        }
+                    },
+                    None => self.push_entry(
+                        EntryRole::System,
+                        String::from("No link in the conversation yet."),
+                    ),
+                }
                 return true;
             }
             "/fork" => {
@@ -7168,6 +7225,9 @@ pub fn run(
                                 &mut handle,
                                 &bash_cwd,
                                 advisor.as_deref(),
+                                resource_source
+                                    .as_ref()
+                                    .map(|source| &source.package_manager),
                                 &agent_tx,
                             ))
                             .await;
@@ -12227,6 +12287,27 @@ mod tests {
             "group counter missing: {rendered:?}"
         );
     }
+    /// `/open` finds the newest link, in text or tool output, without the
+    /// punctuation that follows it in prose.
+    #[test]
+    fn last_url_finds_the_newest_link_without_trailing_punctuation() {
+        let (_tx, mut model) = new_model();
+        assert_eq!(last_url(&model.transcript), None);
+        model.push_entry(
+            EntryRole::Assistant,
+            String::from("Docs are at https://example.com/old."),
+        );
+        model.push_entry(
+            EntryRole::Assistant,
+            String::from("See (https://example.com/new?q=1), then rerun."),
+        );
+        model.push_entry(EntryRole::System, String::from("no link here"));
+        assert_eq!(
+            last_url(&model.transcript).as_deref(),
+            Some("https://example.com/new?q=1")
+        );
+    }
+
     /// Up recalls earlier prompts newest first, down walks forward and ends
     /// on the draft that was set aside; `/history` lists them.
     #[test]
