@@ -157,6 +157,70 @@ fn e2e_ftui_launch_help_bash_quit() {
     session.write_artifacts();
 }
 
+/// bd-2crrf: a default (FTUI) launch initializes ONE extension runtime and
+/// one agent session. main used to build a classic `AgentSession`, boot the
+/// extension runtime on it and drop it, before the FTUI driver built its own
+/// SDK session, so every extension loaded, and ran its startup hooks, twice.
+///
+/// The extension records each load and each `session_start` by running a
+/// shell command (its `node:fs` is a virtual overlay, so a file write from JS
+/// would never reach the host). Exactly one of each must appear.
+#[test]
+fn e2e_ftui_launch_initializes_extensions_once() {
+    let Some((_lock, mut session)) =
+        new_locked_session("e2e_ftui_launch_initializes_extensions_once")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let log = session.harness.temp_path("init-count.log");
+    let ext = session.harness.temp_path("count-init.mjs");
+    let record = |what: &str| {
+        format!(
+            "pi.exec(\"sh\", [\"-c\", \"echo {what} >> '{}'\"])",
+            log.display()
+        )
+    };
+    std::fs::write(
+        &ext,
+        format!(
+            "export default function (pi) {{\n  void {load};\n  pi.on(\"session_start\", async () => {{ await {start}; }});\n}}\n",
+            load = record("load"),
+            start = record("session_start"),
+        ),
+    )
+    .expect("write counting extension"); // ubs:ignore test setup expect
+    let ext_arg = ext.display().to_string();
+    let mut args = ftui_args();
+    args.extend([
+        "--extension",
+        ext_arg.as_str(),
+        "--extension-policy",
+        "permissive",
+        "--trust",
+    ]);
+    session.launch(&args);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+
+    // Both records land shortly after startup; then give a duplicate runtime
+    // time to show itself before counting.
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let start = std::time::Instant::now();
+    while !(read().contains("load") && read().contains("session_start"))
+        && start.elapsed() < COMMAND_TIMEOUT
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+
+    let records = read();
+    let count = |what: &str| records.lines().filter(|line| line.trim() == what).count();
+    assert_eq!(count("load"), 1, "extension loaded {records:?}");
+    assert_eq!(count("session_start"), 1, "session_start ran {records:?}");
+}
+
 /// Signal-teardown terminal-state proofs (acceptance #1 hard part).
 ///
 /// SIGTERM: ftui's runtime intercepts termination signals, drops the program

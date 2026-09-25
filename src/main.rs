@@ -2139,14 +2139,11 @@ async fn run(
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
             workspace: Some(workspace.clone()),
             // Extensions load with UI prompts bridged (bd-1eoh4): the
-            // ResourceLoader's discovered set (workspace/package/global)
-            // — which already folds in explicit -e paths and honors
-            // trust/policy filtering — plus nothing else.
-            extension_paths: if cli.no_extensions {
-                Vec::new()
-            } else {
-                resources.extensions().to_vec()
-            },
+            // ResourceLoader's set, which already folds in explicit -e
+            // paths and honors trust/policy filtering. `--no-extensions`
+            // only turns off discovery there, so `-e` still loads (as on
+            // the classic stack); emptying the list here dropped `-e` too.
+            extension_paths: resources.extensions().to_vec(),
             extension_policy: cli.extension_policy.clone(),
             repair_policy: cli.repair_policy.clone(),
             extension_flags: extension_flags.clone(),
