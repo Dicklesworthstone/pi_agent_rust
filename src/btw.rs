@@ -14,7 +14,8 @@ use crate::error::{Error, Result};
 use crate::model::{Message, UserContent, UserMessage};
 use crate::provider::Provider;
 use crate::text_completion::{
-    MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, collect_text, redact_inputs, with_timeout,
+    MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, RequestStop, collect_text, redact_inputs,
+    with_timeout,
 };
 
 /// System contract for side questions (omp btw-user.md semantics).
@@ -73,6 +74,8 @@ impl BtwClient {
     /// This tool-free projection always redacts built-in credential shapes,
     /// including when a library caller supplies its own context summary. It
     /// never exports reversible IDs from a disposable secret vault.
+    /// Owner cancellation and missing timer authority are reported separately
+    /// from timeout, and neither admits a new provider request.
     pub async fn ask(&self, context_summary: &str, question: &str) -> Result<String> {
         let [system_prompt, context_summary, question]: [String; 3] =
             redact_inputs(&[BTW_SYSTEM_PROMPT, context_summary, question])?
@@ -102,7 +105,15 @@ impl BtwClient {
             collect_text(stream, MAX_TEXT_BYTES).await
         })
         .await
-        .ok_or_else(|| Error::api("side question timed out"))?
+        .map_err(|stop| match stop {
+            RequestStop::TimedOut => Error::api("side question timed out"),
+            RequestStop::Cancelled => Error::api(
+                "PI_AUXILIARY_CANCELLED: side question cancelled by its request owner",
+            ),
+            RequestStop::TimeUnavailable => Error::config(
+                "PI_AUXILIARY_TIME_DENIED: side question requires timer authority",
+            ),
+        })?
     }
 }
 
@@ -505,5 +516,44 @@ mod tests {
             let error = client.ask("", &"x".repeat(MAX_INPUT_BYTES + 1)).await.unwrap_err();
             assert!(error.to_string().contains("PI_AUXILIARY_INPUT_LIMIT"));
         });
+    }
+
+    #[test]
+    fn cancelled_side_question_is_not_reported_as_timeout_or_sent_to_provider() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = crate::agent_cx::AgentCx::for_request();
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel side question"));
+        let client = BtwClient::new(
+            Arc::new(ScriptedProvider(Vec::new(), Some("must not be invoked".to_string()))),
+            Some("test-key".to_string()),
+        );
+        let error = runtime
+            .block_on(owner.with_current(client.ask("", "why?")))
+            .unwrap_err();
+        assert!(error.to_string().contains("PI_AUXILIARY_CANCELLED"));
+        assert!(!error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn timerless_side_question_is_refused_before_provider_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = {
+            let _guard = asupersync::Cx::for_request()
+                .restrict::<asupersync::cx::cap::None>()
+                .set_current_restricted();
+            crate::agent_cx::AgentCx::for_current_or_request()
+        };
+        let client = BtwClient::new(
+            Arc::new(ScriptedProvider(Vec::new(), Some("must not be invoked".to_string()))),
+            Some("test-key".to_string()),
+        );
+        let error = runtime
+            .block_on(owner.with_current(client.ask("", "why?")))
+            .unwrap_err();
+        assert!(error.to_string().contains("PI_AUXILIARY_TIME_DENIED"));
     }
 }

@@ -13,7 +13,8 @@
 use crate::model::Message;
 use crate::provider::Provider;
 use crate::text_completion::{
-    MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, collect_text, redact_inputs, with_timeout,
+    MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, RequestStop, collect_text, redact_inputs,
+    with_timeout,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -451,7 +452,7 @@ pub struct AdvisorRuntime {
 pub enum AdvisorOutcome {
     /// A verdict worth injecting.
     Inject(AdvisorVerdict),
-    /// Suppressed (trivial turn, guard, or advisor found nothing).
+    /// Suppressed (trivial turn, guard, owner cancellation, or no useful note).
     Quiet,
     /// The advisor failed (isolated; counted toward the disable threshold).
     Failed,
@@ -499,6 +500,8 @@ impl AdvisorRuntime {
     /// Review one turn. Never fails the caller. Built-in credential shapes
     /// are always redacted for this tool-free secondary model, independently
     /// of the primary agent's configurable reversible secret mode.
+    /// Owner cancellation suppresses the verdict without changing the failure
+    /// streak or emission guard; it is not evidence of a broken provider.
     pub async fn review_turn(&mut self, digest: &TurnDigest, turn_index: u64) -> AdvisorOutcome {
         if self.is_disabled() || ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
             return AdvisorOutcome::Quiet;
@@ -507,15 +510,19 @@ impl AdvisorRuntime {
             return AdvisorOutcome::Quiet;
         }
         let call = self.call_advisor(digest);
-        let Some(Ok(reply)) = with_timeout(self.timeout, call).await else {
-            self.consecutive_failures += 1;
-            if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                self.disabled_notice = Some(format!(
-                    "advisor ({}) disabled after {} consecutive failures",
-                    self.label, self.consecutive_failures
-                ));
+        let reply = match with_timeout(self.timeout, call).await {
+            Ok(Ok(reply)) => reply,
+            Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
+            Ok(Err(_)) | Err(RequestStop::TimedOut | RequestStop::TimeUnavailable) => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    self.disabled_notice = Some(format!(
+                        "advisor ({}) disabled after {} consecutive failures",
+                        self.label, self.consecutive_failures
+                    ));
+                }
+                return AdvisorOutcome::Failed;
             }
-            return AdvisorOutcome::Failed;
         };
         self.consecutive_failures = 0;
         let verdict = parse_verdict(&reply);
@@ -675,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_returns_none_on_slow_future() {
+    fn timeout_reports_deadline_on_slow_future() {
         asupersync::test_utils::run_test(|| async {
             let outcome = with_timeout(Duration::from_millis(30), async {
                 asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_secs(60))
@@ -683,7 +690,7 @@ mod tests {
                 42
             })
             .await;
-            assert!(outcome.is_none(), "slow advisor call must time out");
+            assert_eq!(outcome, Err(RequestStop::TimedOut));
         });
     }
 
@@ -691,6 +698,7 @@ mod tests {
         responses: std::sync::Mutex<std::collections::VecDeque<Vec<crate::model::StreamEvent>>>,
         calls: std::sync::atomic::AtomicUsize,
         prompts: std::sync::Mutex<Vec<String>>,
+        cancel_on_call: Option<asupersync::Cx>,
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
@@ -734,6 +742,9 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("unexpected advisor provider call");
+            if let Some(owner) = &self.cancel_on_call {
+                owner.cancel_with(asupersync::types::CancelKind::User, Some("review cancelled"));
+            }
             Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
         }
     }
@@ -745,6 +756,7 @@ mod tests {
             responses: std::sync::Mutex::new(responses.into()),
             calls: std::sync::atomic::AtomicUsize::new(0),
             prompts: std::sync::Mutex::new(Vec::new()),
+            cancel_on_call: None,
         });
         let runtime = AdvisorRuntime::new(provider.clone(), "test".to_string())
             .with_api_key(Some("test-key".to_string()));
@@ -1042,5 +1054,84 @@ mod tests {
         };
         let error = screen_digest(&digest).unwrap_err();
         assert!(error.to_string().contains("PI_ADVISOR_DIGEST_LIMIT"));
+    }
+
+    #[test]
+    fn cancelled_reviews_preserve_failure_streak_and_do_not_disable_the_advisor() {
+        asupersync::test_utils::run_test(|| async {
+            let (mut runtime, provider) = scripted_runtime(vec![completed_reply(
+                "CONCERN\nCheck the preserved error path before continuing.",
+            )]);
+            runtime.consecutive_failures = 2;
+            let owner = crate::agent_cx::AgentCx::for_request();
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("review cancelled"));
+            for turn in 0..4 {
+                assert!(matches!(
+                    owner.with_current(runtime.review_turn(&review_digest(), turn)).await,
+                    AdvisorOutcome::Quiet
+                ));
+            }
+            assert_eq!(runtime.consecutive_failures, 2);
+            assert!(!runtime.is_disabled());
+            assert!(runtime.disabled_notice.is_none());
+            assert_eq!(runtime.guard.notes_in_window, 0);
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 4).await,
+                AdvisorOutcome::Inject(_)
+            ));
+            assert_eq!(runtime.consecutive_failures, 0);
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn cancellation_racing_ready_blocker_does_not_inject_or_count_a_failure() {
+        let executor = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            executor.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        let provider = Arc::new(ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![completed_reply(
+                "BLOCKER\nThis completed review belongs to cancelled work.",
+            )].into()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+            cancel_on_call: Some(owner.cx().clone()),
+        });
+        let mut runtime = AdvisorRuntime::new(provider.clone(), "test".to_string())
+            .with_api_key(Some("test-key".to_string()));
+        runtime.consecutive_failures = 2;
+        let outcome = executor.block_on(owner.with_current(
+            runtime.review_turn(&review_digest(), 0),
+        ));
+        assert!(matches!(outcome, AdvisorOutcome::Quiet));
+        assert_eq!(runtime.consecutive_failures, 2);
+        assert!(!runtime.is_disabled());
+        assert!(runtime.disabled_notice.is_none());
+        assert_eq!(runtime.guard.notes_in_window, 0);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn timerless_review_is_isolated_without_admitting_the_provider() {
+        let executor = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = {
+            let _guard = asupersync::Cx::for_request()
+                .restrict::<asupersync::cx::cap::None>()
+                .set_current_restricted();
+            crate::agent_cx::AgentCx::for_current_or_request()
+        };
+        let (mut runtime, provider) = scripted_runtime(Vec::new());
+        let outcome = executor.block_on(owner.with_current(
+            runtime.review_turn(&review_digest(), 0),
+        ));
+        assert!(matches!(outcome, AdvisorOutcome::Failed));
+        assert_eq!(runtime.consecutive_failures, 1);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

@@ -4,13 +4,13 @@
 //! message may become a side answer or an advisor verdict. The terminal
 //! message is authoritative, including for providers that emit no deltas.
 
-use std::future::Future;
-use std::time::Duration;
-
 use futures::{Stream, StreamExt};
 
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, StopReason, StreamEvent};
+
+mod request;
+pub(crate) use request::{RequestStop, with_timeout};
 
 /// Auxiliary calls request only a few hundred tokens. Bound host-side output
 /// too: a provider or extension is not obliged to honor max_tokens.
@@ -160,33 +160,12 @@ async fn yield_ready_batch() {
     .await;
 }
 
-/// Bound a complete auxiliary request without spawning a detached task or
-/// self-waking while the provider is idle. Dropping the losing future also
-/// drops its stream; setup and response draining share the same deadline.
-pub(crate) async fn with_timeout<F>(timeout: Duration, future: F) -> Option<F::Output>
-where
-    F: Future,
-{
-    if timeout.is_zero() {
-        return None;
-    }
-    let cx = crate::agent_cx::AgentCx::for_current_or_request();
-    let now = cx
-        .cx()
-        .timer_driver()
-        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-    let timer = asupersync::time::sleep(now, timeout);
-    futures::pin_mut!(timer, future);
-    match futures::future::select(timer, future).await {
-        futures::future::Either::Left(((), _)) => None,
-        futures::future::Either::Right((output, _)) => Some(output),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{AssistantMessage, TextContent, ToolCall};
+    use std::future::Future;
+    use std::time::Duration;
 
     fn done(text: &str) -> StreamEvent {
         StreamEvent::Done {
@@ -429,7 +408,7 @@ mod tests {
                 42
             })
             .await;
-            assert!(result.is_none());
+            assert_eq!(result, Err(RequestStop::TimedOut));
             assert!(!polled.load(Ordering::SeqCst));
         });
     }
@@ -451,7 +430,10 @@ mod tests {
                 let _guard = guard;
                 futures::future::pending::<()>().await;
             };
-            assert!(with_timeout(Duration::from_millis(10), request).await.is_none());
+            assert_eq!(
+                with_timeout(Duration::from_millis(10), request).await,
+                Err(RequestStop::TimedOut)
+            );
             assert!(dropped.load(Ordering::SeqCst));
         });
     }
@@ -512,5 +494,33 @@ mod tests {
             request.as_mut().poll(&mut cx),
             std::task::Poll::Ready(Ok(answer)) if answer == "complete"
         ));
+    }
+
+    #[test]
+    fn cancelling_after_a_ready_batch_stops_the_live_collector() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        runtime.block_on(async {
+            let seen = AtomicUsize::new(0);
+            let stream = futures::stream::iter((0..MAX_STREAM_EVENTS).map(|_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(delta(""))
+            }));
+            let mut request = std::pin::pin!(owner.with_current(with_timeout(
+                Duration::from_secs(30),
+                collect_text(stream, 64),
+            )));
+            assert!(futures::poll!(&mut request).is_pending());
+            assert_eq!(seen.load(Ordering::SeqCst), READY_EVENT_BATCH);
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("stream cancelled"));
+            assert!(matches!(request.await, Err(RequestStop::Cancelled)));
+            assert_eq!(seen.load(Ordering::SeqCst), READY_EVENT_BATCH);
+            assert!(!asupersync::Cx::current().unwrap().is_cancel_requested());
+        });
     }
 }
