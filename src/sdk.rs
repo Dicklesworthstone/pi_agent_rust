@@ -382,6 +382,11 @@ pub struct SessionOptions {
     /// after extension registration and before dependent startup bridges.
     pub extension_flags: Vec<crate::cli::ExtensionCliFlag>,
     pub include_cwd_in_prompt: bool,
+    /// The "available skills" block for the system prompt, as the CLI host
+    /// renders it from its resource loader (`--no-skills`, trust and the
+    /// read-tool rule applied). `None` lists no skills, which is what an
+    /// embedder that loads no skills gets.
+    pub skills_prompt: Option<String>,
     pub max_tool_iterations: usize,
 
     /// Provider retry for turns driven through this session.
@@ -560,6 +565,7 @@ impl Default for SessionOptions {
             workspace: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
+            skills_prompt: None,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             retry: None,
             failover: None,
@@ -2895,7 +2901,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         &cli,
         &cwd,
         &enabled_tools,
-        None,
+        options
+            .skills_prompt
+            .as_deref()
+            .filter(|block| !block.is_empty()),
         &global_dir,
         &package_dir,
         sdk_test_mode,
@@ -4121,6 +4130,28 @@ mod tests {
         let trusted =
             load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
+    }
+
+    /// The host's skills block reaches the session's system prompt; without
+    /// one (an embedder that loads no skills) nothing is listed.
+    #[test]
+    fn sessions_list_the_host_provided_skills() {
+        let block =
+            "\n\n<available_skills>\n  <skill><name>demo-skill</name></skill>\n</available_skills>";
+        let prompt_with = |skills_prompt: Option<String>| {
+            let tmp = tempdir().expect("tempdir");
+            let mut options = hermetic_session_options(tmp.path());
+            options.skills_prompt = skills_prompt;
+            let handle = run_async(create_agent_session(options)).expect("create session");
+            handle
+                .session()
+                .agent
+                .system_prompt()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(prompt_with(Some(block.to_string())).contains("demo-skill"));
+        assert!(!prompt_with(None).contains("available_skills"));
     }
 
     #[test]

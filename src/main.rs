@@ -2155,6 +2155,13 @@ async fn run(
             enabled_tools: Some(ftui_enabled_tools),
             thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
             include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
+            // The model learns which skills exist from this block, as on
+            // the classic stack (listed only when it can `read` them). The
+            // SDK loads no resources itself, so without it the default
+            // stack never told the model about any skill.
+            skills_prompt: enabled_tools
+                .contains(&"read")
+                .then(|| resources.format_skills_for_prompt()),
             max_tool_iterations,
             package_dir: Some(package_dir.clone()),
             mcp: Some(pi::sdk::McpSessionOptions {
