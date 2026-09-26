@@ -1450,7 +1450,8 @@ fn handle_session_new(
         turn_recovery: options.config.turn_recovery_mode(),
         approval_state: None,
         bash_settings: options.config.bash.clone(),
-        secrets: None,
+        // Configured vault mode and patterns, as the CLI and SDK apply them.
+        secrets: options.config.secrets.clone(),
     };
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);

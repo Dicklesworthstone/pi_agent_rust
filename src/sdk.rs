@@ -2953,7 +2953,11 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         turn_recovery: config.turn_recovery_mode(),
         approval_state: options.approval_state.clone(),
         bash_settings: config.bash.clone(),
-        secrets: None,
+        // The configured vault mode and patterns. `None` meant the built-in
+        // obfuscate default whatever was set, so on the default (SDK-built)
+        // stack `block` quietly became `obfuscate`, `off` was ignored and
+        // user `extra_patterns` never applied.
+        secrets: config.secrets.clone(),
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
@@ -4130,6 +4134,45 @@ mod tests {
         let trusted =
             load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
+    }
+
+    /// Configured secrets settings govern an SDK-built session (the default
+    /// FTUI stack): user patterns are obfuscated and block mode refuses,
+    /// where the session used to run the built-in default regardless.
+    #[test]
+    fn sessions_apply_the_configured_secrets_settings() {
+        let session_with = |settings: &str| {
+            let tmp = tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join(".pi")).expect("create project config dir");
+            std::fs::write(tmp.path().join(".pi/settings.json"), settings)
+                .expect("write project settings");
+            let mut options = hermetic_session_options(tmp.path());
+            options.workspace_trusted = true;
+            (
+                tmp,
+                run_async(create_agent_session(options)).expect("create session"),
+            )
+        };
+
+        let (_tmp, mut handle) =
+            session_with(r#"{"secrets":{"extra_patterns":["ACME-[0-9]{6}"]}}"#);
+        let out = handle
+            .session_mut()
+            .agent
+            .secrets_transform_outbound_text("token ACME-123456 here")
+            .expect("obfuscate mode");
+        assert!(!out.contains("ACME-123456"), "user pattern applied: {out}");
+
+        let (_tmp, mut handle) =
+            session_with(r#"{"secrets":{"mode":"block","extra_patterns":["ACME-[0-9]{6}"]}}"#);
+        assert!(
+            handle
+                .session_mut()
+                .agent
+                .secrets_transform_outbound_text("token ACME-123456 here")
+                .is_err(),
+            "block mode refuses"
+        );
     }
 
     /// The host's skills block reaches the session's system prompt; without
