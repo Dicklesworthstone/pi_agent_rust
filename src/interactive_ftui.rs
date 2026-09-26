@@ -1742,6 +1742,8 @@ pub struct PiFtuiModel {
     restart_request: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// `(display label, session path)` entries for the `/resume` picker.
     available_sessions: Vec<(String, String)>,
+    /// The session-index cwd `/resume` re-reads (`None`: keep the launch list).
+    resume_cwd: Option<String>,
     /// Keybinding catalog, loaded from the user's config by the launch path
     /// via [`Self::with_keybindings`] and defaulting to the shipped bindings
     /// otherwise. Shared naming with the bubbletea stack via
@@ -2069,6 +2071,7 @@ impl PiFtuiModel {
             pending_quit: false,
             restart_request: None,
             available_sessions: Vec::new(),
+            resume_cwd: None,
             keybindings: KeyBindings::default(),
             ext_status: None,
             active_ask: None,
@@ -2256,6 +2259,14 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_sessions(mut self, sessions: Vec<(String, String)>) -> Self {
         self.available_sessions = sessions;
+        self
+    }
+
+    /// Refresh the `/resume` list from the session index for `cwd` each
+    /// time the picker opens (otherwise the launch list is used as is).
+    #[must_use]
+    pub fn with_resume_cwd(mut self, cwd: String) -> Self {
+        self.resume_cwd = Some(cwd);
         self
     }
 
@@ -3632,6 +3643,11 @@ impl PiFtuiModel {
             return true;
         }
         if canon == "/resume" || canon == "/r" {
+            // Re-read the index: sessions saved (and pins set) since launch
+            // belong in the list, as in OMP's picker.
+            if let Some(cwd) = &self.resume_cwd {
+                self.available_sessions = session_pins::resume_entries(cwd, &self.pins_dir);
+            }
             if self.available_sessions.is_empty() {
                 self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
             } else {
@@ -8271,6 +8287,7 @@ pub fn run(
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
     let bash_cwd = driver_bash_cwd(&session_options);
+    let resume_cwd = bash_cwd.display().to_string();
     let bash_shell = resource_source
         .as_ref()
         .map(|source| BashUiShell::from_config(&source.config))
@@ -8852,6 +8869,7 @@ pub fn run(
         .with_model_names(model_names)
         .with_restart_request(Arc::clone(&restart_requested))
         .with_available_sessions(available_sessions)
+        .with_resume_cwd(resume_cwd)
         .with_alt_screen(!inline)
         .with_mouse_enabled(!disable_mouse_capture)
         .with_markdown_spacing(markdown_spacing)

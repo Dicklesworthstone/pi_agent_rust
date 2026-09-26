@@ -1488,6 +1488,72 @@ fn e2e_ftui_restart_relaunches_into_the_same_session() {
     session.write_artifacts();
 }
 
+const FTUI_RESUME_LIST_TEST_NAME: &str = "e2e_ftui_resume_list";
+
+/// `/resume` lists sessions saved during this run: the list used to be
+/// built once at launch, so after a turn and `/new` the session just left
+/// was missing (a fresh launch had "no saved sessions found").
+#[test]
+fn e2e_ftui_resume_lists_a_session_saved_this_run() {
+    let Some((_lock, session)) = new_locked_session(FTUI_RESUME_LIST_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let args = ftui_vcr_args_with_session(true, false);
+    let system_prompt = ftui_vcr_system_prompt_for(&args, session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_RESUME_LIST_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
+    let stderr_log = session.harness.temp_path("pi-stderr-resume-list.log");
+    let script_path = session.harness.temp_path("resume-list.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_RESUME_LIST_TEST_NAME,
+        &args,
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    session
+        .tmux
+        .wait_for_pane_contains("tokens ", COMMAND_TIMEOUT);
+
+    session.tmux.send_literal("/new");
+    session.tmux.send_key("Enter");
+    std::thread::sleep(Duration::from_secs(2));
+    session.tmux.send_literal("/resume");
+    session.tmux.send_key("Enter");
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("Resume session", COMMAND_TIMEOUT);
+    assert!(
+        pane.contains("msgs") && !pane.contains("no saved sessions found"),
+        "the session saved this run is listed:\n{pane}"
+    );
+
+    session.tmux.send_key("Escape");
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
 const FTUI_DELETE_TEST_NAME: &str = "e2e_ftui_delete";
 
 /// OMP `/delete`: after a saved turn, `/delete yes` moves to a new session

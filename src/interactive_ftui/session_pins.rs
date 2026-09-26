@@ -65,6 +65,35 @@ pub fn sort_pinned_first<T, S: std::hash::BuildHasher>(
     top
 }
 
+/// The `/resume` picker rows for `cwd`, newest first with pinned sessions
+/// on top and marked, as `(label, session path)`. Read from the session
+/// index each time, so sessions saved and pins set during this run show up.
+/// Index failures degrade to an empty list.
+pub fn resume_entries(cwd: &str, pins_dir: &Path) -> Vec<(String, String)> {
+    let pinned = load_pinned(pins_dir);
+    sort_pinned_first(
+        crate::session_index::SessionIndex::new()
+            .list_sessions(Some(cwd))
+            .unwrap_or_default(),
+        &pinned,
+        |meta| meta.id.as_str(),
+    )
+    .into_iter()
+    .map(|meta| {
+        let pin = if pinned.contains(&meta.id) {
+            "📌 "
+        } else {
+            ""
+        };
+        let label = match &meta.name {
+            Some(name) => format!("{pin}{name} · {} msgs", meta.message_count),
+            None => format!("{pin}{} · {} msgs", meta.id, meta.message_count),
+        };
+        (label, meta.path)
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
