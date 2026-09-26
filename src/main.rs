@@ -1894,6 +1894,9 @@ async fn run(
             auth: auth.clone(),
             runtime_handle: runtime_handle.clone(),
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
+            // ACP sessions always carry the read tool, so skills are listed
+            // as on the terminal stacks.
+            skills_prompt: Some(resources.format_skills_for_prompt()),
         };
         return run_acp_mode(acp_options).await;
     }

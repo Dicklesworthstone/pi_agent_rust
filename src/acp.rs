@@ -209,6 +209,10 @@ pub struct AcpOptions {
     /// `pi --session`/`--resume` (#102). When `None`, ACP keeps its in-memory,
     /// non-persisted behavior.
     pub session_dir: Option<PathBuf>,
+    /// The "available skills" system-prompt block, rendered by the host from
+    /// its resource loader (`--no-skills` and trust applied), so the model
+    /// in an editor session knows which skills it can load.
+    pub skills_prompt: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1322,6 +1326,7 @@ fn build_acp_system_prompt(
     cwd: &std::path::Path,
     enabled_tools: &[&str],
     config: &Config,
+    skills_prompt: Option<&str>,
 ) -> String {
     use clap::Parser as _;
     let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
@@ -1338,7 +1343,7 @@ fn build_acp_system_prompt(
                 &cli,
                 cwd,
                 enabled_tools,
-                None,
+                skills_prompt.filter(|block| !block.is_empty()),
                 &Config::global_dir(),
                 &package_dir,
                 test_mode,
@@ -1461,7 +1466,12 @@ fn handle_session_new(
     let provider = providers::create_provider(&model_entry, None)
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
-    let system_prompt = build_acp_system_prompt(&cwd, &enabled_tools, &options.config);
+    let system_prompt = build_acp_system_prompt(
+        &cwd,
+        &enabled_tools,
+        &options.config,
+        options.skills_prompt.as_deref(),
+    );
 
     // Resolve API key from auth storage and model entry.
     let api_key = options
@@ -2079,7 +2089,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("CLAUDE.md"), "acp-claude-md-marker").expect("write");
         let tools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-        let prompt = build_acp_system_prompt(dir.path(), &tools, &Config::default());
+        let prompt = build_acp_system_prompt(
+            dir.path(),
+            &tools,
+            &Config::default(),
+            Some("\n\n<available_skills>acp-skill-marker</available_skills>"),
+        );
+        assert!(prompt.contains("acp-skill-marker"), "skills are listed");
         assert!(
             prompt.contains("Make surgical edits to files (find exact text and replace)"),
             "pi's own tool guidance: {prompt}"
