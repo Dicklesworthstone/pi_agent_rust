@@ -1,9 +1,9 @@
-//! Outbound HTTP proxy resolution for every request Pi makes (#210).
+//! Outbound proxy resolution for every request Pi makes (#210).
 //!
 //! Pi's HTTP client is hand-rolled, so proxy support has to be explicit: this
-//! module owns *which* proxy a given request URL should go through, and
-//! [`crate::http::client`] owns the wire mechanics (CONNECT tunnel for
-//! `https://`, absolute-form request line for `http://`).
+//! module owns *which* proxy a given request URL should go through. HTTP proxies
+//! use CONNECT for HTTPS origins and absolute-form requests for HTTP origins.
+//! SOCKS5 proxies use CONNECT for both, with origin TLS layered over the tunnel.
 //!
 //! # Precedence
 //!
@@ -25,30 +25,32 @@
 //! `"http": { "ignoreEnvProxy": true }` or `PI_HTTP_PROXY=off`, which leaves
 //! only the explicit settings above in play.
 //!
-//! Lowercase variants are accepted for every standard name. `ALL_PROXY` is
-//! frequently pointed at a SOCKS endpoint; unsupported schemes coming from the
-//! environment are ignored (with a warning) rather than failing the request,
-//! while an unsupported scheme written explicitly into settings.json is
-//! reported as a configuration warning at startup.
+//! Lowercase variants are accepted for every standard name. `socks5://` resolves
+//! destination hostnames locally; `socks5h://` sends them to the proxy without a
+//! local destination DNS lookup. Unsupported schemes are ignored with a warning,
+//! retaining the existing settings/environment precedence.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
+mod socks5;
+
 /// A resolved proxy endpoint for one request.
 ///
-/// Always a plain-HTTP hop: the origin's TLS runs end-to-end inside a CONNECT
-/// tunnel, so the hop to the proxy itself is never TLS. A `https://` proxy URL
-/// is rejected by [`parse_proxy_url`] rather than silently downgraded.
+/// The hop to the proxy is plain TCP; HTTPS origin TLS remains end-to-end
+/// inside the HTTP or SOCKS5 tunnel. A `https://` proxy URL is rejected rather
+/// than silently downgraded.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyEndpoint {
     /// Proxy host (no brackets for IPv6 — ready for `TcpStream::connect`).
     pub host: String,
     /// Proxy port.
     pub port: u16,
-    /// `Proxy-Authorization` header value derived from the URL's userinfo.
+    /// HTTP `Proxy-Authorization` value; always absent for SOCKS5 endpoints.
     pub authorization: Option<String>,
+    socks5: Option<socks5::Socks5Config>,
 }
 
 impl fmt::Debug for ProxyEndpoint {
@@ -60,6 +62,7 @@ impl fmt::Debug for ProxyEndpoint {
                 "authorization",
                 &self.authorization.as_ref().map(|_| "<redacted>"),
             )
+            .field("socks5", &self.socks5)
             .finish()
     }
 }
@@ -75,10 +78,34 @@ impl ProxyEndpoint {
         }
     }
 
+    /// Whether this endpoint uses the HTTP proxy protocol rather than SOCKS5.
+    #[must_use]
+    pub const fn is_http(&self) -> bool {
+        self.socks5.is_none()
+    }
+
     /// The proxy URL with any credentials removed — safe to log.
     #[must_use]
     pub fn redacted_url(&self) -> String {
-        format!("http://{}", self.authority())
+        let scheme = self.socks5.as_ref().map_or("http", socks5::Socks5Config::scheme);
+        format!("{scheme}://{}", self.authority())
+    }
+
+    /// Complete SOCKS5 negotiation inside the caller's connection deadline.
+    /// A failed or cancelled negotiation drops this owned socket; it never
+    /// retries the origin directly or sends HTTP authentication to it.
+    pub(crate) async fn connect_socks5(
+        &self,
+        mut stream: asupersync::net::tcp::stream::TcpStream,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<asupersync::net::tcp::stream::TcpStream> {
+        let config = self.socks5.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a SOCKS5 proxy endpoint")
+        })?;
+        let request = socks5::connect_request(host, port, config.remote_dns).await?;
+        socks5::handshake(&mut stream, config, &request).await?;
+        Ok(stream)
     }
 }
 
@@ -303,9 +330,8 @@ fn pick_proxy_endpoint(
         match parse_proxy_url(&value) {
             Ok(endpoint) => return Some(endpoint),
             Err(err) => {
-                // An unusable ambient value must not fail requests:
-                // `ALL_PROXY` is routinely a SOCKS endpoint meant for
-                // other tools. Warn once and keep looking.
+                // Preserve startup diagnostics and fallback precedence for
+                // unsupported or malformed ambient proxy settings.
                 warnings.push(format!("ignoring {name}: {err}"));
             }
         }
@@ -475,17 +501,18 @@ impl ProxyConfig {
     }
 }
 
-/// Parse a proxy URL. Accepts `host:port` shorthand (assumed `http://`), which
-/// is what people usually put in `HTTPS_PROXY`.
+/// Parse an HTTP, SOCKS5 (local DNS), or SOCKS5h (proxy DNS) endpoint.
+/// `host:port` shorthand still means `http://`, and HTTP defaults to port 80;
+/// both SOCKS5 forms default to 1080. Username/password SOCKS5 authentication
+/// requires 1..=255 octets in each field and is not encrypted on the proxy hop.
 ///
 /// Note that `HTTPS_PROXY=http://…` is the normal spelling: the variable names
 /// the traffic being proxied, not the hop to the proxy.
 ///
 /// # Errors
 ///
-/// Returns a human-readable message for an unsupported scheme (`https://`
-/// proxies would need TLS-in-TLS, and SOCKS is not implemented), a missing
-/// host, a malformed authority, an invalid port, or invalid Basic credentials.
+/// Rejects unsupported schemes, malformed authorities, invalid ports, and
+/// invalid credentials. HTTPS proxy hops still require unsupported TLS-in-TLS.
 /// Error messages never include input values, which may contain secrets even
 /// when the URL is malformed.
 pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> {
@@ -496,18 +523,18 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
     if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
         return Err("proxy URL contains unescaped whitespace or control characters".to_string());
     }
-    let rest = match raw.split_once("://") {
-        Some((scheme, rest)) => {
-            if !scheme.eq_ignore_ascii_case("http") {
-                return Err(
-                    "unsupported proxy scheme (only http:// proxy endpoints are supported; \
-                     https:// targets are proxied through an http:// proxy with CONNECT)"
-                        .to_string(),
-                );
-            }
-            rest
+    let (rest, remote_dns) = match raw.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => (rest, None),
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("socks5") => (rest, Some(false)),
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("socks5h") => (rest, Some(true)),
+        Some(_) => {
+            return Err(
+                "unsupported proxy scheme (supported endpoints: http://, socks5://, socks5h://; \
+                 https:// proxy endpoints are not supported)"
+                    .to_string(),
+            );
         }
-        None => raw,
+        None => (raw, None),
     };
     // Drop any path/query the value carries; a proxy is an authority.
     let authority = rest
@@ -556,32 +583,41 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
         return Err("invalid proxy host".to_string());
     }
 
-    let port = port.unwrap_or(80);
-
-    let authorization = userinfo
-        .filter(|info| !info.is_empty())
-        .map(|info| {
-            // Split before decoding: an escaped colon in a password is data,
-            // not the username/password delimiter. Basic usernames cannot
-            // contain a colon; a username alone implies an empty password.
+    let port = port.unwrap_or(if remote_dns.is_some() { 1080 } else { 80 });
+    let (authorization, socks5) = if let Some(remote_dns) = remote_dns {
+        let credentials = userinfo.map(|info| {
             let (username, password) = info.split_once(':').unwrap_or((info.as_str(), ""));
-            let mut decoded = percent_decode_userinfo(username);
-            if decoded.contains(&b':') {
-                return Err("proxy username must not contain a colon".to_string());
-            }
-            decoded.push(b':');
-            decoded.extend(percent_decode_userinfo(password));
-            if decoded.iter().any(u8::is_ascii_control) {
-                return Err("proxy credentials contain control characters".to_string());
-            }
-            Ok(format!("Basic {}", base64_encode(&decoded)))
-        })
-        .transpose()?;
+            (percent_decode_userinfo(username), percent_decode_userinfo(password))
+        });
+        (None, Some(socks5::Socks5Config::new(remote_dns, credentials)?))
+    } else {
+        let authorization = userinfo
+            .filter(|info| !info.is_empty())
+            .map(|info| {
+                // Split before decoding: an escaped colon in a password is data,
+                // not the username/password delimiter. Basic usernames cannot
+                // contain a colon; a username alone implies an empty password.
+                let (username, password) = info.split_once(':').unwrap_or((info.as_str(), ""));
+                let mut decoded = percent_decode_userinfo(username);
+                if decoded.contains(&b':') {
+                    return Err("proxy username must not contain a colon".to_string());
+                }
+                decoded.push(b':');
+                decoded.extend(percent_decode_userinfo(password));
+                if decoded.iter().any(u8::is_ascii_control) {
+                    return Err("proxy credentials contain control characters".to_string());
+                }
+                Ok(format!("Basic {}", base64_encode(&decoded)))
+            })
+            .transpose()?;
+        (authorization, None)
+    };
 
     Ok(ProxyEndpoint {
         host,
         port,
         authorization,
+        socks5,
     })
 }
 
@@ -758,7 +794,7 @@ mod tests {
     #[test]
     fn https_proxy_endpoints_are_rejected_at_parse_time() {
         let err = parse_proxy_url("https://proxy:8443").expect_err("https hop unsupported");
-        assert!(err.contains("only http:// proxy endpoints"), "{err}");
+        assert!(err.contains("https:// proxy endpoints are not supported"), "{err}");
     }
 
     #[test]
@@ -794,7 +830,7 @@ mod tests {
 
     #[test]
     fn unsupported_scheme_and_bad_port_are_errors() {
-        let err = parse_proxy_url("socks5://127.0.0.1:1080").expect_err("socks unsupported");
+        let err = parse_proxy_url("socks4://127.0.0.1:1080").expect_err("socks4 unsupported");
         assert!(err.contains("unsupported proxy scheme"), "{err}");
         assert!(parse_proxy_url("http://proxy:notaport").is_err());
         assert!(parse_proxy_url("   ").is_err());
@@ -851,7 +887,7 @@ mod tests {
     #[test]
     fn proxy_diagnostics_never_echo_malformed_values() {
         for raw in [
-            "socks5://sentinel-user:sentinel-secret@proxy:1080",
+            "socks4://sentinel-user:sentinel-secret@proxy:1080",
             "sentinel-scheme://proxy:8080",
             "http://user:sentinel-secret@proxy:sentinel-port",
             "http://user:sentinel-secret@[::1]sentinel-suffix",
@@ -1036,7 +1072,7 @@ mod tests {
         let (config, warnings) = ProxyConfig::resolve(
             None,
             &env_from(&[
-                ("ALL_PROXY", "socks5://127.0.0.1:1080"),
+                ("ALL_PROXY", "socks4://127.0.0.1:1080"),
                 ("HTTPS_PROXY", "http://good:8080"),
             ]),
         );
@@ -1046,11 +1082,11 @@ mod tests {
                 .map(ProxyEndpoint::redacted_url),
             Some("http://good:8080".to_string())
         );
-        // http:// targets fall through to ALL_PROXY, which is unusable here.
+        // http:// targets fall through to unsupported SOCKS4 in ALL_PROXY.
         assert_eq!(config.endpoint_for(false, "h", 80), None);
         assert!(
             warnings.iter().any(|w| w.contains("ALL_PROXY")),
-            "expected a warning about the SOCKS value: {warnings:?}"
+            "expected a warning about the SOCKS4 value: {warnings:?}"
         );
     }
 
@@ -1366,5 +1402,69 @@ mod tests {
         assert_eq!(settings.proxy.as_deref(), Some("http://127.0.0.1:2080"));
         assert_eq!(settings.no_proxy, Some(vec!["localhost".to_string()]));
         assert_eq!(settings.ignore_env_proxy, Some(true));
+    }
+
+    #[test]
+    fn socks_schemes_preserve_dns_mode_and_default_port() {
+        for (scheme, remote) in [("socks5", false), ("socks5h", true), ("SOCKS5H", true)] {
+            let endpoint = parse_proxy_url(&format!("{scheme}://proxy.example")).unwrap();
+            assert!(!endpoint.is_http());
+            assert_eq!(endpoint.port, 1080);
+            assert_eq!(endpoint.authorization, None);
+            assert_eq!(endpoint.socks5.as_ref().unwrap().remote_dns, remote);
+        }
+        assert!(parse_proxy_url("http://proxy").unwrap().is_http());
+        let endpoint = parse_proxy_url("socks5h://[::1]:1081").unwrap();
+        assert_eq!(endpoint.redacted_url(), "socks5h://[::1]:1081");
+    }
+
+    #[test]
+    fn socks_authentication_is_not_an_http_header_and_is_redacted() {
+        let endpoint = parse_proxy_url("socks5h://sentinel-user:sentinel-secret@proxy").unwrap();
+        assert!(endpoint.authorization.is_none());
+        assert_eq!(endpoint.redacted_url(), "socks5h://proxy:1080");
+        let debug = format!("{endpoint:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("sentinel"));
+        assert!(parse_proxy_url("socks5://u%3Ax:p%FF%3A%00@proxy").is_ok());
+    }
+
+    #[test]
+    fn socks_credentials_validate_decoded_byte_lengths() {
+        for userinfo in ["".to_string(), "user".to_string(), "user:".to_string(), ":password".to_string(), format!("{}:pass", "x".repeat(256))] {
+            let error = parse_proxy_url(&format!("socks5h://{userinfo}@proxy")).unwrap_err();
+            assert!(error.contains("1 to 255 bytes"));
+            assert!(!error.contains(&userinfo) || userinfo.is_empty());
+        }
+        assert!(parse_proxy_url(&format!("socks5h://{}:pass@proxy", "%41".repeat(255))).is_ok());
+        assert!(parse_proxy_url(&format!("socks5h://user:{}@proxy", "é".repeat(128))).is_err());
+    }
+
+    #[test]
+    fn socks_all_proxy_applies_to_both_schemes_and_respects_bypass() {
+        let (config, warnings) = ProxyConfig::resolve(None, &env_from(&[
+            ("ALL_PROXY", "socks5h://user:pass@127.0.0.1:1080"),
+            ("NO_PROXY", "localhost,127.0.0.0/8"),
+        ]));
+        assert!(warnings.is_empty());
+        for (https, port) in [(false, 80), (true, 443)] {
+            assert_eq!(config.endpoint_for(https, "remote.invalid", port).unwrap().redacted_url(), "socks5h://127.0.0.1:1080");
+            assert!(config.endpoint_for(https, "localhost", port).is_none());
+            assert!(config.endpoint_for(https, "127.2.3.4", port).is_none());
+            assert_eq!(config.redacted_url_for(https).as_deref(), Some("socks5h://127.0.0.1:1080"));
+        }
+    }
+
+    #[test]
+    fn socks_and_http_mix_without_changing_precedence_or_opt_out() {
+        let settings = HttpSettings {
+            proxy: Some("socks5h://settings:1080".to_string()),
+            https_proxy: Some("http://secure:8080".to_string()),
+            ..Default::default()
+        };
+        let config = resolve(Some(&settings), &[("ALL_PROXY", "socks5://ambient:1080")]);
+        assert!(config.endpoint_for(true, "origin", 443).unwrap().is_http());
+        assert_eq!(config.endpoint_for(false, "origin", 80).unwrap().redacted_url(), "socks5h://settings:1080");
+        assert!(resolve(None, &[("PI_HTTP_PROXY", "off"), ("ALL_PROXY", "socks5h://ambient")]).is_empty());
     }
 }
