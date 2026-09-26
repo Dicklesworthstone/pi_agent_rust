@@ -3911,9 +3911,7 @@ impl PiFtuiModel {
                 match session_pins::toggle_pin(&self.pins_dir, &id) {
                     Ok(true) => self.push_entry(
                         EntryRole::System,
-                        String::from(
-                            "Pinned: /resume lists this session first from the next launch.",
-                        ),
+                        String::from("Pinned: /resume lists this session first."),
                     ),
                     Ok(false) => self.push_entry(EntryRole::System, String::from("Unpinned.")),
                     Err(err) => self.push_entry(EntryRole::Error, format!("pin: {err}")),
