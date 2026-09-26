@@ -16,6 +16,48 @@ use crate::model::{ContentBlock, StopReason, StreamEvent};
 /// too: a provider or extension is not obliged to honor max_tokens.
 pub(crate) const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_STREAM_EVENTS: usize = 65_536;
+/// Bound the raw input before cloning or applying the detector. A projection
+/// that cannot inspect a field must omit it, never send an unscreened prefix.
+pub(crate) const MAX_INPUT_BYTES: usize = 256 * 1024;
+const MAX_INPUT_PARTS: usize = 256;
+pub(crate) const OMITTED_INPUT: &str = "[context omitted: auxiliary privacy scan budget]";
+
+/// Screen a complete set of text inputs before formatting or truncation.
+///
+/// Tool-free side requests never need executable credentials. These context
+/// projections always apply the built-in detector, independently of the main
+/// agent's configurable, reversible tool workflow. Discovery spans every part
+/// before any replacement, so a later assignment also protects earlier bare
+/// echoes. Disposable-vault IDs become non-restorable markers before a prompt
+/// reaches another model or a verdict is injected into the main conversation.
+/// Authentication headers and caller-owned text are not touched.
+pub(crate) fn redact_inputs(parts: &[&str]) -> Result<Vec<String>> {
+    let bytes = parts
+        .iter()
+        .try_fold(0usize, |total, part| total.checked_add(part.len()));
+    if parts.len() > MAX_INPUT_PARTS || !bytes.is_some_and(|total| total <= MAX_INPUT_BYTES) {
+        return Err(Error::validation(
+            "PI_AUXILIARY_INPUT_LIMIT: input exceeds the auxiliary privacy scan budget",
+        ));
+    }
+    let mut vault = crate::secrets::SecretVault::default();
+    let (protected, _) = crate::secrets::transform_outbound_json(
+        &serde_json::json!(parts),
+        &mut vault,
+        crate::secrets::SecretsMode::Obfuscate,
+        &[],
+    )?;
+    let serde_json::Value::Array(protected) = protected else {
+        return Err(Error::validation("auxiliary privacy projection changed input shape"));
+    };
+    protected
+        .into_iter()
+        .map(|part| match part {
+            serde_json::Value::String(text) => Ok(vault.redact_placeholders(&text)),
+            _ => Err(Error::validation("auxiliary privacy projection changed text type")),
+        })
+        .collect()
+}
 
 /// Drain one tool-free completion without retaining cumulative previews.
 ///
@@ -141,6 +183,42 @@ mod tests {
 
     async fn read(events: Vec<StreamEvent>, max_bytes: usize) -> Result<String> {
         collect_text(futures::stream::iter(events.into_iter().map(Ok)), max_bytes).await
+    }
+
+    #[test]
+    fn input_discovery_protects_echoes_across_parts_without_exporting_vault_ids() {
+        let secret = "r4nd0mCredentialValue123456";
+        let assignment = format!("API_KEY={secret}");
+        let parts = [secret, assignment.as_str(), "ordinary context"];
+        let protected = redact_inputs(&parts).unwrap();
+        assert_eq!(protected, [
+            "<pi-secret:redacted>",
+            "API_KEY=<pi-secret:redacted>",
+            "ordinary context",
+        ]);
+        assert_eq!(parts[0], secret, "source input is not mutated");
+        let mut other_vault = crate::secrets::SecretVault::default();
+        let _ = crate::secrets::obfuscate("sk-differentCredential123456789", &mut other_vault, &[]);
+        assert_eq!(other_vault.restore(&protected.join("\n")), protected.join("\n"));
+    }
+
+    #[test]
+    fn input_projection_handles_multiline_keys_and_preserves_clean_text_exactly() {
+        let key = "-----BEGIN PRIVATE KEY-----\nprivate\\material\"here\n-----END PRIVATE KEY-----";
+        let clean = "  α\r\n  code: C:\\work\\file\t\"quoted\"  ";
+        let protected = redact_inputs(&[clean, key]).unwrap();
+        assert_eq!(protected, [clean, "<pi-secret:redacted>"]);
+        assert!(redact_inputs(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn input_budget_refuses_without_exposing_or_slicing_the_input() {
+        let input = "x".repeat(MAX_INPUT_BYTES);
+        assert_eq!(redact_inputs(&[&input]).unwrap(), [input.clone()]);
+        let error = redact_inputs(&[&input, "SECRET-CANARY"]).unwrap_err();
+        assert!(error.to_string().contains("PI_AUXILIARY_INPUT_LIMIT"));
+        assert!(!error.to_string().contains("SECRET-CANARY"));
+        assert!(redact_inputs(&vec![""; MAX_INPUT_PARTS + 1]).is_err());
     }
 
     #[test]

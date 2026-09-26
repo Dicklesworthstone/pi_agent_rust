@@ -5,6 +5,30 @@ use super::{
 };
 use crate::error::{Error, Result};
 
+impl SecretVault {
+    /// Remove this vault's restoration capability from a text projection.
+    ///
+    /// Tool-free auxiliary requests must not export a disposable vault's IDs:
+    /// an advisor reply can enter a different session whose same-numbered ID
+    /// represents a different credential. Keep the omission visible, but make
+    /// it non-restorable. Unknown IDs are not interpreted using this vault.
+    pub(crate) fn redact_placeholders(&self, text: &str) -> String {
+        let mut output = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for found in super::placeholder_pattern().find_iter(text) {
+            output.push_str(&text[cursor..found.start()]);
+            output.push_str(if self.by_placeholder.contains_key(found.as_str()) {
+                super::OVERLAP_REDACTION
+            } else {
+                found.as_str()
+            });
+            cursor = found.end();
+        }
+        output.push_str(&text[cursor..]);
+        output
+    }
+}
+
 // Structured provider inputs must be screened before JSON serialization. A raw
 // replacement in serialized JSON loses assignment context, mishandles escaped
 // private keys, and can corrupt quotes or silently discard object members.
@@ -411,5 +435,30 @@ mod structured_outbound_tests {
         assert_eq!(output, input);
         assert_eq!(audit.detections, 0);
         assert_eq!(vault.len(), 0);
+    }
+
+    #[test]
+    fn auxiliary_projection_cannot_restore_a_disposable_vaults_credentials() {
+        let mut auxiliary = SecretVault::default();
+        let (protected, _) = obfuscate(KEY, &mut auxiliary, &[]);
+        let projection = auxiliary.redact_placeholders(&protected);
+        assert_eq!(projection, "<pi-secret:redacted>");
+        assert_eq!(auxiliary.restore(&projection), projection);
+        let mut session = SecretVault::default();
+        let _ = obfuscate("sk-otherCredential0123456789", &mut session, &[]);
+        assert_ne!(session.restore(&protected), KEY);
+        assert_eq!(session.restore(&projection), projection);
+        assert_eq!(auxiliary.restore(&protected), KEY, "projection is read-only");
+    }
+
+    #[test]
+    fn irreversible_projection_preserves_unknown_ids_and_is_idempotent() {
+        let mut vault = SecretVault::default();
+        let (protected, _) = obfuscate(KEY, &mut vault, &[]);
+        let text = format!("α {protected} ω <pi-secret:ffffff> <pi-secret:bad>");
+        let output = vault.redact_placeholders(&text);
+        assert_eq!(output, "α <pi-secret:redacted> ω <pi-secret:ffffff> <pi-secret:bad>");
+        assert_eq!(vault.redact_placeholders(&output), output);
+        assert!(!output.contains(KEY));
     }
 }

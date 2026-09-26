@@ -13,7 +13,9 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::model::{Message, UserContent, UserMessage};
 use crate::provider::Provider;
-use crate::text_completion::{MAX_TEXT_BYTES, collect_text, with_timeout};
+use crate::text_completion::{
+    MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, collect_text, redact_inputs, with_timeout,
+};
 
 /// System contract for side questions (omp btw-user.md semantics).
 pub const BTW_SYSTEM_PROMPT: &str = "You are answering an ephemeral side question about the \
@@ -21,8 +23,9 @@ current work. Rules: answer in at most a few sentences; NEVER use tools; NEVER a
 questions; if the context does not contain the answer, say so plainly.";
 
 /// Cap on recent-session text fed into the side question so /btw stays
-/// cheap regardless of transcript size.
+/// cheap regardless of transcript size. The final projection is byte-bounded.
 const CONTEXT_BUDGET_CHARS: usize = 4_000;
+const MAX_CONTEXT_PIECES: usize = 64;
 const ANSWER_MAX_TOKENS: u32 = 512;
 /// One deadline covers connection setup and the complete streamed response.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -66,14 +69,22 @@ impl BtwClient {
     /// Ask an ephemeral side question with compact context from the current
     /// conversation tail. Returns only a clean, complete answer, never a
     /// preview left behind by a failed or disconnected provider.
+    ///
+    /// This tool-free projection always redacts built-in credential shapes,
+    /// including when a library caller supplies its own context summary. It
+    /// never exports reversible IDs from a disposable secret vault.
     pub async fn ask(&self, context_summary: &str, question: &str) -> Result<String> {
+        let [system_prompt, context_summary, question]: [String; 3] =
+            redact_inputs(&[BTW_SYSTEM_PROMPT, context_summary, question])?
+                .try_into()
+                .map_err(|_| Error::validation("side-question privacy projection changed shape"))?;
         let user_text = if context_summary.is_empty() {
-            question.to_string()
+            question
         } else {
             format!("Current work context:\n{context_summary}\n\nSide question: {question}")
         };
         let context = crate::provider::Context {
-            system_prompt: Some(BTW_SYSTEM_PROMPT.to_string().into()),
+            system_prompt: Some(system_prompt.into()),
             messages: vec![Message::User(UserMessage {
                 content: UserContent::Text(user_text),
                 timestamp: chrono::Utc::now().timestamp_millis(),
@@ -95,71 +106,117 @@ impl BtwClient {
     }
 }
 
-/// Compact context summary from the live agent message list.
+/// Retain a complete candidate before screening, not a raw prefix that may
+/// cut a credential below its detector's minimum length. Stop at a bounded
+/// raw scan budget and report an omission instead of sending uninspected data.
+fn push_context_piece(
+    pieces: &mut Vec<(String, usize)>,
+    raw_bytes: &mut usize,
+    prefix: &[&str],
+    text: &str,
+    limit: usize,
+) -> bool {
+    if pieces.len() >= MAX_CONTEXT_PIECES {
+        return false;
+    }
+    let bytes = prefix
+        .iter()
+        .try_fold(text.len(), |total, part| total.checked_add(part.len()));
+    let next = bytes.and_then(|bytes| raw_bytes.checked_add(bytes));
+    let Some(next) = next.filter(|next| *next <= MAX_INPUT_BYTES) else {
+        if OMITTED_INPUT.len() <= MAX_INPUT_BYTES.saturating_sub(*raw_bytes) {
+            pieces.push((OMITTED_INPUT.to_string(), OMITTED_INPUT.len()));
+        }
+        return false;
+    };
+    *raw_bytes = next;
+    let mut piece = prefix.concat();
+    let prefix_chars = piece.chars().count();
+    piece.push_str(text);
+    pieces.push((piece, limit.saturating_add(prefix_chars)));
+    true
+}
+
+/// Compact, credential-redacted context from the live agent message list.
 ///
-/// The most recent exchanges, truncated to [`CONTEXT_BUDGET_CHARS`]. Tool
-/// noise (calls/results) is summarized as one-liners so the budget buys
-/// prose.
+/// The newest exchanges are selected first. Their complete selected text is
+/// screened together before clipping to the display budget, including text
+/// blocks accompanying attachments. Caller-owned transcript data is untouched;
+/// oversized source fields are omitted rather than partially disclosed.
 #[must_use]
 pub fn build_context_summary(messages: &[Message]) -> String {
-    // Pieces accumulate newest-first (walking backwards); each message's
-    // OWN pieces are appended in reverse so the final flip restores true
-    // chronological order within a message too. The budget drops the
-    // OLDEST content — the newest exchange is what a side question is
-    // usually about.
-    let mut pieces: Vec<String> = Vec::new();
-    let mut used = 0usize;
-    for message in messages.iter().rev() {
-        let mut message_pieces: Vec<String> = Vec::new();
+    let mut pieces = Vec::new();
+    let mut raw_bytes = 0usize;
+    'messages: for message in messages.iter().rev() {
         match message {
-            Message::User(user) => {
-                if let UserContent::Text(text) = &user.content {
-                    message_pieces.push(format!("user: {}", truncate(text, 400)));
+            Message::User(user) => match &user.content {
+                UserContent::Text(text) => {
+                    if !push_context_piece(&mut pieces, &mut raw_bytes, &["user: "], text, 400) {
+                        break;
+                    }
                 }
-            }
+                UserContent::Blocks(blocks) => {
+                    for block in blocks.iter().rev() {
+                        if let crate::model::ContentBlock::Text(text) = block
+                            && !push_context_piece(
+                                &mut pieces, &mut raw_bytes, &["user: "], &text.text, 400,
+                            )
+                        {
+                            break 'messages;
+                        }
+                    }
+                }
+            },
             Message::Assistant(assistant) => {
-                for block in &assistant.content {
-                    match block {
-                        crate::model::ContentBlock::Text(t) => {
-                            message_pieces.push(format!("assistant: {}", truncate(&t.text, 400)));
-                        }
-                        crate::model::ContentBlock::ToolCall(call) => {
-                            message_pieces.push(format!("assistant ran tool {}", call.name));
-                        }
-                        _ => {}
+                for block in assistant.content.iter().rev() {
+                    let retained = match block {
+                        crate::model::ContentBlock::Text(text) => push_context_piece(
+                            &mut pieces, &mut raw_bytes, &["assistant: "], &text.text, 400,
+                        ),
+                        crate::model::ContentBlock::ToolCall(call) => push_context_piece(
+                            &mut pieces, &mut raw_bytes, &["assistant ran tool "], &call.name, 400,
+                        ),
+                        _ => true,
+                    };
+                    if !retained {
+                        break 'messages;
                     }
                 }
             }
             Message::ToolResult(result) => {
                 let first = result.content.iter().find_map(|block| match block {
-                    crate::model::ContentBlock::Text(t) => Some(t.text.clone()),
+                    crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
                     _ => None,
                 });
-                message_pieces.push(format!(
-                    "tool {}: {}",
-                    result.tool_name,
-                    truncate(first.as_deref().unwrap_or(""), 160)
-                ));
+                if !push_context_piece(
+                    &mut pieces,
+                    &mut raw_bytes,
+                    &["tool ", &result.tool_name, ": "],
+                    first.unwrap_or(""),
+                    160,
+                ) {
+                    break;
+                }
             }
             Message::Custom(_) => {}
         }
-        let mut over_budget = false;
-        for piece in message_pieces.into_iter().rev() {
-            // +1 for the join separator; stop BEFORE exceeding the budget
-            // so the newest pieces are never tail-truncated later.
-            if used + piece.len() + 1 > CONTEXT_BUDGET_CHARS {
-                over_budget = true;
-                break;
-            }
-            used += piece.len() + 1;
-            pieces.push(piece);
-        }
-        if over_budget {
+    }
+    let inputs: Vec<&str> = pieces.iter().map(|(text, _)| text.as_str()).collect();
+    let Ok(protected) = redact_inputs(&inputs) else {
+        return OMITTED_INPUT.to_string();
+    };
+    let mut rendered = Vec::new();
+    let mut used = 0usize;
+    for (piece, (_, limit)) in protected.into_iter().zip(pieces) {
+        let piece = truncate(&piece, limit);
+        if used + piece.len() + 1 > CONTEXT_BUDGET_CHARS {
             break;
         }
+        used += piece.len() + 1;
+        rendered.push(piece.to_string());
     }
-    pieces.reverse();
-    pieces.join("\n")
+    rendered.reverse();
+    rendered.join("\n")
 }
 
 fn truncate(text: &str, limit: usize) -> &str {
@@ -225,7 +282,7 @@ mod tests {
         assert!(summary.len() <= CONTEXT_BUDGET_CHARS + 32);
     }
 
-    struct ScriptedProvider(Vec<crate::model::StreamEvent>);
+    struct ScriptedProvider(Vec<crate::model::StreamEvent>, Option<String>);
 
     #[allow(clippy::unnecessary_literal_bound)]
     #[async_trait::async_trait]
@@ -254,6 +311,15 @@ mod tests {
             assert_eq!(context.messages.len(), 1);
             assert_eq!(options.max_tokens, Some(ANSWER_MAX_TOKENS));
             assert_eq!(options.api_key.as_deref(), Some("test-key"));
+            if let Some(expected) = &self.1 {
+                let Message::User(user) = &context.messages[0] else {
+                    panic!("expected a user prompt");
+                };
+                let UserContent::Text(text) = &user.content else {
+                    panic!("expected a text prompt");
+                };
+                assert_eq!(text, expected);
+            }
             Ok(Box::pin(futures::stream::iter(
                 self.0.clone().into_iter().map(Ok),
             )))
@@ -261,7 +327,7 @@ mod tests {
     }
 
     fn scripted_client(events: Vec<crate::model::StreamEvent>) -> BtwClient {
-        BtwClient::new(Arc::new(ScriptedProvider(events)), Some("test-key".to_string()))
+        BtwClient::new(Arc::new(ScriptedProvider(events, None)), Some("test-key".to_string()))
     }
 
     #[test]
@@ -350,5 +416,94 @@ mod tests {
         )))
         .expect("empty auth storage loads");
         assert!(BtwClient::for_model_entry(&entry, None, &auth).is_none());
+    }
+
+    fn user(text: impl Into<String>) -> Message {
+        Message::User(UserMessage {
+            content: UserContent::Text(text.into()),
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn summary_screens_whole_fields_before_clipping_and_cross_message_discovery() {
+        let secret = "r4nd0mCredentialValue123456";
+        let assignment = format!("{} API_KEY={secret}", "x".repeat(500));
+        let messages = vec![user(assignment), user(format!("echo {secret}"))];
+        let summary = build_context_summary(&messages);
+        assert!(!summary.contains(secret));
+        assert!(summary.contains("echo <pi-secret:redacted>"));
+        let clipped = build_context_summary(&[user(format!(
+            "{}sk-abcdefghijklmnopqrstuvwxyz012345", "x".repeat(385),
+        ))]);
+        assert!(!clipped.contains("sk-"), "raw key prefix must not survive clipping");
+        assert!(clipped.len() <= CONTEXT_BUDGET_CHARS);
+    }
+
+    #[test]
+    fn summary_includes_attachment_text_blocks_in_chronological_order() {
+        let messages = vec![
+            user("older"),
+            Message::User(UserMessage {
+                content: UserContent::Blocks(vec![
+                    crate::model::ContentBlock::Text(crate::model::TextContent::new("first caption")),
+                    crate::model::ContentBlock::Text(crate::model::TextContent::new("second caption")),
+                ]),
+                timestamp: 0,
+            }),
+        ];
+        assert_eq!(
+            build_context_summary(&messages),
+            "user: older\nuser: first caption\nuser: second caption",
+        );
+    }
+
+    #[test]
+    fn oversized_context_is_omitted_without_discarding_newer_safe_context() {
+        let huge = format!("PRIVATE-PREFIX{}", "x".repeat(MAX_INPUT_BYTES));
+        let summary = build_context_summary(&[user(huge), user("newest context")]);
+        assert!(!summary.contains("PRIVATE-PREFIX"));
+        assert!(summary.contains(OMITTED_INPUT));
+        assert!(summary.ends_with("user: newest context"));
+        assert!(summary.len() <= CONTEXT_BUDGET_CHARS);
+        let unicode = vec![user("🦀".repeat(1000)); 100];
+        assert!(build_context_summary(&unicode).len() <= CONTEXT_BUDGET_CHARS);
+    }
+
+    #[test]
+    fn ask_screens_direct_context_and_question_but_preserves_authentication() {
+        asupersync::test_utils::run_test(|| async {
+            let secret = "r4nd0mCredentialValue123456";
+            let question = format!("Does API_KEY={secret} match?");
+            let expected = "Current work context:\necho <pi-secret:redacted>\n\nSide question: Does API_KEY=<pi-secret:redacted> match?";
+            let client = BtwClient::new(
+                Arc::new(ScriptedProvider(
+                    vec![crate::model::StreamEvent::Done {
+                        reason: crate::model::StopReason::Stop,
+                        message: crate::model::AssistantMessage {
+                            content: vec![crate::model::ContentBlock::Text(
+                                crate::model::TextContent::new("values omitted"),
+                            )],
+                            ..Default::default()
+                        },
+                    }],
+                    Some(expected.to_string()),
+                )),
+                Some("test-key".to_string()),
+            );
+            assert_eq!(client.ask(&format!("echo {secret}"), &question).await.unwrap(), "values omitted");
+        });
+    }
+
+    #[test]
+    fn oversized_direct_question_is_refused_before_provider_admission() {
+        asupersync::test_utils::run_test(|| async {
+            let client = BtwClient::new(
+                Arc::new(ScriptedProvider(Vec::new(), Some("must not be invoked".to_string()))),
+                Some("test-key".to_string()),
+            );
+            let error = client.ask("", &"x".repeat(MAX_INPUT_BYTES + 1)).await.unwrap_err();
+            assert!(error.to_string().contains("PI_AUXILIARY_INPUT_LIMIT"));
+        });
     }
 }
