@@ -7018,6 +7018,33 @@ const NO_WINDOWS_BASH: &str = "No bash found to run the command. Install Git for
 (https://git-scm.com/download/win), put a bash.exe (Git Bash, MSYS2, Cygwin) on PATH, \
 or set \"shell_path\" in settings.json to a bash executable.";
 
+/// Logged once per process when no native bash exists and the bash tool,
+/// `!command` or a background job falls back to WSL's launcher (GH #182).
+#[cfg(any(windows, test))]
+const WSL_BASH_NOTICE: &str = "No native bash (Git for Windows, MSYS2, Cygwin) was found, so \
+shell commands run through WSL's bash.exe, inside the default WSL Linux distro: Windows drives \
+appear under /mnt/<drive>, Windows programs and PATH entries may not be available, and a UNC \
+working directory (\\\\server\\share) may not translate, so commands can start in a different \
+directory. To choose the shell, install Git for Windows or set \"shell_path\" in settings.json, \
+e.g. \"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\".";
+
+/// Log [`WSL_BASH_NOTICE`] on the user-diagnostic channel (stderr, or the TUI
+/// log while the TUI owns the terminal; never tool output) the first time
+/// `shell` is WSL's launcher. `shown` makes it once per process. Returns
+/// whether the notice was emitted.
+#[cfg(any(windows, test))]
+fn notice_wsl_bash_once(shell: &Path, shown: &std::sync::atomic::AtomicBool) -> bool {
+    if !is_wsl_bash_launcher(shell) || shown.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return false;
+    }
+    tracing::warn!(
+        target: crate::config::USER_DIAGNOSTIC_TARGET,
+        shell = %shell.display(),
+        "{WSL_BASH_NOTICE}"
+    );
+    true
+}
+
 /// The shell the bash tool, `!command` and background jobs run when
 /// `shell_path` is not configured.
 ///
@@ -7025,9 +7052,26 @@ or set \"shell_path\" in settings.json to a bash executable.";
 /// else `sh`. Windows has neither those paths nor an `sh` on `PATH`, so the
 /// old `sh` fallback failed every call with "program not found" (GH #182);
 /// see [`find_windows_bash`] for the Windows order.
+///
+/// On Windows, the first time a process falls back to WSL's `bash.exe` it
+/// logs [`WSL_BASH_NOTICE`] once on the user-diagnostic channel; use
+/// [`resolve_default_bash_shell`] to look the shell up without that notice.
+pub(crate) fn default_bash_shell() -> Result<String> {
+    let shell = resolve_default_bash_shell()?;
+    #[cfg(windows)]
+    {
+        static WSL_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        notice_wsl_bash_once(Path::new(&shell), &WSL_NOTICE_SHOWN);
+    }
+    Ok(shell)
+}
+
+/// [`default_bash_shell`] without the one-time WSL notice, for callers such
+/// as `pi doctor` that report the resolved shell themselves.
 // Only the Windows arm can fail.
 #[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
-pub(crate) fn default_bash_shell() -> Result<String> {
+pub(crate) fn resolve_default_bash_shell() -> Result<String> {
     #[cfg(windows)]
     {
         find_windows_bash(&WindowsShellEnv::from_process(), Path::is_file)
@@ -15043,6 +15087,82 @@ mod tests {
             pick(&windows_shell_env(Vec::new()), std::slice::from_ref(&wsl)),
             Some(wsl)
         );
+    }
+
+    /// Logs at WARN on `target` while `emit` runs and returns what was written.
+    fn warnings_on_target(target: &str, emit: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(format!("{target}=warn")))
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = captured
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).expect("utf-8 log output")
+    }
+
+    /// Falling back to WSL's launcher explains itself once per process, on
+    /// the user-diagnostic channel: that commands run inside WSL, the UNC
+    /// working-directory caveat, and how to pick a shell with `shell_path`.
+    /// A native bash never triggers it.
+    #[test]
+    fn wsl_launcher_fallback_notices_once_on_the_user_channel() {
+        let shown = std::sync::atomic::AtomicBool::new(false);
+        let wsl = system32().join("bash.exe");
+        let git_bash = PathBuf::from("C:")
+            .join("Program Files")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+
+        let mut results = Vec::new();
+        let logged = warnings_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            results.push(notice_wsl_bash_once(&git_bash, &shown));
+            results.push(notice_wsl_bash_once(&wsl, &shown));
+            results.push(notice_wsl_bash_once(&wsl, &shown));
+        });
+        assert_eq!(results, [false, true, false]);
+        assert_eq!(logged.matches("WSL's bash.exe").count(), 1, "{logged}");
+        assert!(
+            logged.contains("inside the default WSL Linux distro"),
+            "{logged}"
+        );
+        assert!(logged.contains("UNC"), "{logged}");
+        assert!(logged.contains("\"shell_path\""), "{logged}");
+        assert!(logged.contains(&wsl.display().to_string()), "{logged}");
+
+        // Nothing is shown for a native bash even before any WSL notice.
+        let fresh = std::sync::atomic::AtomicBool::new(false);
+        let quiet = warnings_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            assert!(!notice_wsl_bash_once(&git_bash, &fresh));
+        });
+        assert!(quiet.is_empty(), "{quiet}");
     }
 
     #[test]

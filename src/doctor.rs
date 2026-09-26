@@ -808,7 +808,7 @@ fn check_shell(cwd: &Path, findings: &mut Vec<Finding>) {
         .filter(|path| !path.trim().is_empty());
     findings.push(bash_shell_finding(
         configured.as_deref(),
-        crate::tools::default_bash_shell().map_err(|err| err.to_string()),
+        crate::tools::resolve_default_bash_shell().map_err(|err| err.to_string()),
         Path::exists,
     ));
     // `sh` is only the Unix fallback when no bash exists; Windows never uses it.

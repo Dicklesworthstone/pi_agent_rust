@@ -20,7 +20,9 @@ When `shell_path` is not set, Pi looks for a bash in this order:
    only adds `Git\cmd`).
 3. WSL's launcher, `C:\Windows\System32\bash.exe`, as a last resort. It works,
    but commands then run inside your Linux distro, where Windows paths appear
-   under `/mnt/c/...` and Windows tools are not on the Linux `PATH`.
+   under `/mnt/c/...` and Windows tools are not on the Linux `PATH`. A UNC
+   working directory (`\\server\share`) may not translate there. Pi prints a
+   one-time warning (stderr, or the TUI log) the first time it falls back to it.
 
 If none is found, the `bash` tool fails with a message listing these options. You can also set a custom shell in settings:
 
