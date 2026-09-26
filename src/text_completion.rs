@@ -16,6 +16,10 @@ use crate::model::{ContentBlock, StopReason, StreamEvent};
 /// too: a provider or extension is not obliged to honor max_tokens.
 pub(crate) const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_STREAM_EVENTS: usize = 65_536;
+/// A ready stream must return control to its deadline/owner, not consume the
+/// entire event budget in one poll. This is a scheduling bound, independent
+/// of the request-wide event and output bounds.
+const READY_EVENT_BATCH: usize = 64;
 /// Bound the raw input before cloning or applying the detector. A projection
 /// that cannot inspect a field must omit it, never send an unscreened prefix.
 pub(crate) const MAX_INPUT_BYTES: usize = 256 * 1024;
@@ -64,6 +68,8 @@ pub(crate) fn redact_inputs(parts: &[&str]) -> Result<Vec<String>> {
 /// Reject missing terminal events, transport/provider errors, incomplete stop
 /// reasons, tool calls, empty answers, and oversized replies. A caller owns
 /// the wall-clock deadline around both stream creation and this drain.
+/// Ready streams yield after a bounded batch so that outer deadline and
+/// cancellation futures are polled even when the provider never returns Pending.
 pub(crate) async fn collect_text<S>(mut stream: S, max_bytes: usize) -> Result<String>
 where
     S: Stream<Item = Result<StreamEvent>> + Unpin,
@@ -131,8 +137,27 @@ where
             }
             _ => {}
         }
+        if event_count.is_multiple_of(READY_EVENT_BATCH) {
+            yield_ready_batch().await;
+        }
     }
     Err(Error::api("text completion stream ended without Done event"))
+}
+
+/// Yield exactly once after real progress. An idle provider is never
+/// self-woken: its next() future continues to own readiness notification.
+async fn yield_ready_batch() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// Bound a complete auxiliary request without spawning a detached task or
@@ -429,5 +454,63 @@ mod tests {
             assert!(with_timeout(Duration::from_millis(10), request).await.is_none());
             assert!(dropped.load(Ordering::SeqCst));
         });
+    }
+
+    #[test]
+    fn ready_stream_returns_pending_after_each_bounded_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let seen = AtomicUsize::new(0);
+        let stream = futures::stream::iter((0..MAX_STREAM_EVENTS).map(|_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(delta(""))
+        }));
+        let mut request = std::pin::pin!(collect_text(stream, 64));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for batch in 1..=3 {
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(seen.load(Ordering::SeqCst), batch * READY_EVENT_BATCH);
+        }
+    }
+
+    #[test]
+    fn terminal_response_survives_multiple_cooperative_batches() {
+        asupersync::test_utils::run_test(|| async {
+            let stream = futures::stream::iter(
+                (0..READY_EVENT_BATCH * 3).map(|_| Ok(delta(""))),
+            )
+            .chain(futures::stream::iter([Ok(done("complete"))]));
+            assert_eq!(collect_text(stream, 64).await.unwrap(), "complete");
+        });
+    }
+
+    #[test]
+    fn idle_stream_does_not_self_wake() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct WakeCount(AtomicUsize);
+        impl futures::task::ArcWake for WakeCount {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = futures::task::waker(Arc::clone(&wakes));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut request = std::pin::pin!(collect_text(futures::stream::pending(), 64));
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn short_terminal_response_does_not_need_a_scheduling_round_trip() {
+        let mut request = std::pin::pin!(collect_text(
+            futures::stream::iter([Ok(done("complete"))]),
+            64,
+        ));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            request.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(answer)) if answer == "complete"
+        ));
     }
 }
