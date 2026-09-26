@@ -1463,6 +1463,79 @@ fn e2e_ftui_restart_relaunches_into_the_same_session() {
     session.write_artifacts();
 }
 
+const FTUI_DELETE_TEST_NAME: &str = "e2e_ftui_delete";
+
+/// OMP `/delete`: after a saved turn, `/delete yes` moves to a new session
+/// and removes the old session's file from disk.
+#[test]
+fn e2e_ftui_delete_removes_the_saved_session_file() {
+    let Some((_lock, session)) = new_locked_session(FTUI_DELETE_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let args = ftui_vcr_args_with_session(true, false);
+    let system_prompt = ftui_vcr_system_prompt_for(&args, session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_DELETE_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
+    let stderr_log = session.harness.temp_path("pi-stderr-delete.log");
+    let script_path = session.harness.temp_path("delete.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_DELETE_TEST_NAME,
+        &args,
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    session
+        .tmux
+        .wait_for_pane_contains("tokens ", COMMAND_TIMEOUT);
+
+    let sessions_root = env_root.join("sessions");
+    let saved = walk_session_files(&sessions_root);
+    assert_eq!(
+        saved.len(),
+        1,
+        "one saved session before /delete: {saved:?}"
+    );
+
+    session.tmux.send_literal("/delete yes");
+    session.tmux.send_key("Enter");
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("this is a new session", COMMAND_TIMEOUT);
+    assert!(
+        !saved[0].exists(),
+        "the deleted session's file is gone; pane:\n{pane}"
+    );
+    assert!(
+        !pane.contains("ftui-vcr-response-marker"),
+        "the new session starts empty:\n{pane}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
 /// Every `*.jsonl` under the harness sessions root, at any depth: sessions are
 /// filed under an encoded-cwd subdirectory.
 fn walk_session_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {

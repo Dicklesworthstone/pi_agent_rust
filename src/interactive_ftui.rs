@@ -1477,6 +1477,9 @@ pub enum UiCommand {
     /// the launch template with the current provider/model selection and a
     /// reset thinking level, swaps it in, and replays the (empty) history.
     NewSession,
+    /// `/delete yes` (OMP `/delete`): start a new session, then delete the
+    /// previous session's file.
+    DeleteSession,
     /// `/login [provider]`: list providers, or start that provider's flow.
     Login { args: String },
     /// The user's answer to a pending `/login`: an authorization code,
@@ -3661,7 +3664,7 @@ impl PiFtuiModel {
                 String::from(
                     "pi commands: /model or /switch [model[:level]], /queue <message>, /resume, /new, \
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
-                     /export [path], /copy [code|cmd|link], /dump, /pin, /share, /tan <task>, /usage, /mcp, \
+                     /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking [level], /fast [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
@@ -3854,6 +3857,23 @@ impl PiFtuiModel {
             }
             "/dump" => {
                 self.send_command(UiCommand::Dump);
+                return true;
+            }
+            // OMP /delete asks before destroying anything; here the second
+            // step is typing `yes`.
+            "/delete" => {
+                if cmd_args.trim().eq_ignore_ascii_case("yes") {
+                    self.begin_busy("deleting session ...");
+                    self.send_command(UiCommand::DeleteSession);
+                } else {
+                    self.push_entry(
+                        EntryRole::System,
+                        String::from(
+                            "This permanently deletes this session's file and starts a new \
+                             session. Type /delete yes to confirm.",
+                        ),
+                    );
+                }
                 return true;
             }
             // Idle, a queued message has nothing to wait for: it is a prompt.
@@ -8431,6 +8451,48 @@ pub fn run(
                                 break;
                             }
                         }
+                        Ok(UiCommand::DeleteSession) => {
+                            // Only a file that exists: a new or in-memory
+                            // session has nothing to delete.
+                            let doomed = handle
+                                .with_session(|session| session.path.clone())
+                                .await
+                                .ok()
+                                .flatten()
+                                .filter(|path| path.is_file());
+                            let Some(doomed) = doomed else {
+                                let _ = agent_tx.send(PiMsg::AgentError(String::from(
+                                    "No saved session file to delete (the session is new or in-memory).",
+                                )));
+                                continue;
+                            };
+                            // Move to a fresh session first, so the old one is
+                            // saved and released before its file goes.
+                            plans.clear_review();
+                            if let Err(err) = Box::pin(new_session_command(
+                                &resume_template,
+                                &mut handle,
+                                &current_ask,
+                                &ext_handler,
+                                &agent_tx,
+                                &runtime_handle,
+                            ))
+                            .await
+                            {
+                                replacement_failure = Some(err);
+                                break;
+                            }
+                            let _ = agent_tx.send(match std::fs::remove_file(&doomed) {
+                                Ok(()) => PiMsg::System(format!(
+                                    "Deleted {}; this is a new session.",
+                                    doomed.display()
+                                )),
+                                Err(err) => PiMsg::AgentError(format!(
+                                    "Could not delete {}: {err}",
+                                    doomed.display()
+                                )),
+                            });
+                        }
                         Ok(UiCommand::NewSession) => {
                             plans.clear_review();
                             // Boxed: clippy::large_futures.
@@ -10178,6 +10240,29 @@ mod tests {
             let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "request dumps may hold secrets");
         }
+    }
+
+    #[test]
+    fn slash_delete_needs_yes_before_it_routes() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        type_str(&mut sim, "/delete");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "bare /delete deletes nothing"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text.contains("/delete yes"))
+        );
+        type_str(&mut sim, "/delete YES");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().ok(), Some(UiCommand::DeleteSession));
     }
 
     #[test]
