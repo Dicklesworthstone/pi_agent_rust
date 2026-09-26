@@ -1368,6 +1368,31 @@ fn build_acp_system_prompt(
     }
 }
 
+/// The tools an ACP session gets: the CLI's default set, minus the tools a
+/// terminal host joins after construction (`ask`, `todo`, `submit_plan`),
+/// which have no ACP surface. ACP used to offer only the seven basic file
+/// and shell tools. Every call still goes through the client's permission
+/// prompt (ACP sessions carry no approval state, so the approval hook sees
+/// all tools), so the wider set gives the editor nothing it cannot veto.
+fn acp_enabled_tools() -> Vec<String> {
+    use clap::Parser as _;
+    const HOST_COUPLED: [&str; 3] = ["ask", "todo", "submit_plan"];
+    crate::cli::Cli::try_parse_from(["pi"]).map_or_else(
+        |_| {
+            ["read", "bash", "edit", "write", "grep", "find", "ls"]
+                .map(String::from)
+                .to_vec()
+        },
+        |cli| {
+            cli.enabled_tools()
+                .into_iter()
+                .filter(|name| !HOST_COUPLED.contains(name))
+                .map(String::from)
+                .collect()
+        },
+    )
+}
+
 /// The original hand-written ACP prompt, kept as a fallback.
 fn minimal_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> String {
     use std::fmt::Write as _;
@@ -1454,8 +1479,8 @@ fn handle_session_new(
         new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
     let session_id = session.header.id.clone();
 
-    // Set up the enabled tools (all standard tools).
-    let enabled_tools: Vec<&str> = vec!["read", "bash", "edit", "write", "grep", "find", "ls"];
+    let enabled_tools = acp_enabled_tools();
+    let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config));
 
     // ACP should respect the same configured default provider/model preference
@@ -2081,6 +2106,30 @@ mod tests {
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;
     use std::collections::HashMap;
+
+    #[test]
+    fn acp_offers_the_cli_default_tools_without_host_coupled_ones() {
+        let tools = acp_enabled_tools();
+        for expected in [
+            "read",
+            "bash",
+            "edit",
+            "hashline_edit",
+            "ast_grep",
+            "web_search",
+        ] {
+            assert!(
+                tools.iter().any(|t| t == expected),
+                "{expected} in {tools:?}"
+            );
+        }
+        for host_only in ["ask", "todo", "submit_plan"] {
+            assert!(
+                !tools.iter().any(|t| t == host_only),
+                "{host_only} in {tools:?}"
+            );
+        }
+    }
 
     /// ACP sessions get pi's real system prompt (full tool guidance, every
     /// context file) plus the editor note, not the old hand-written one.
