@@ -221,6 +221,31 @@ fn e2e_ftui_launch_initializes_extensions_once() {
     assert_eq!(count("session_start"), 1, "session_start ran {records:?}");
 }
 
+/// `--plan-mode` starts the default stack in planning, as it always did on
+/// the classic stack; the FTUI launch used to ignore the flag.
+#[test]
+fn e2e_ftui_plan_mode_flag_starts_in_planning() {
+    let Some((_lock, mut session)) =
+        new_locked_session("e2e_ftui_plan_mode_flag_starts_in_planning")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let mut args = ftui_args();
+    args.push("--plan-mode");
+    session.launch(&args);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("planning", COMMAND_TIMEOUT);
+    assert!(
+        pane.contains("planning"),
+        "status line shows planning:\n{pane}"
+    );
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
 /// Signal-teardown terminal-state proofs (acceptance #1 hard part).
 ///
 /// SIGTERM: ftui's runtime intercepts termination signals, drops the program

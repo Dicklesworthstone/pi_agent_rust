@@ -8209,6 +8209,8 @@ pub struct FtuiSettings {
     pub double_escape_action: DoubleEscapeAction,
     /// Model display names by `provider/model-id`, for the `/model` picker.
     pub model_names: HashMap<String, String>,
+    /// `--plan-mode`: start in planning, as the classic stack does.
+    pub start_in_plan_mode: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8232,6 +8234,7 @@ pub fn run(
         hide_thinking_block,
         double_escape_action,
         model_names,
+        start_in_plan_mode,
     } = settings;
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
@@ -8257,6 +8260,13 @@ pub fn run(
         .is_none_or(|source| source.config.image_auto_resize());
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
+    // `--plan-mode` enters planning the way `/plan` does. Queued before the
+    // UI exists, the driver runs it as soon as its session is ready.
+    if start_in_plan_mode {
+        let _ = submit_tx.send(UiCommand::Plan {
+            action: String::from("enter"),
+        });
+    }
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
