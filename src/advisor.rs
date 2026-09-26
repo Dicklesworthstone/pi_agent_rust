@@ -12,7 +12,9 @@
 
 use crate::model::Message;
 use crate::provider::Provider;
-use crate::text_completion::{MAX_TEXT_BYTES, collect_text, with_timeout};
+use crate::text_completion::{
+    MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, collect_text, redact_inputs, with_timeout,
+};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -68,9 +70,108 @@ const MAX_DIGEST_FILES: usize = 25;
 const MAX_DIGEST_COMMANDS: usize = 15;
 const MAX_DIGEST_ERRORS: usize = 10;
 const MAX_FINAL_TEXT_CHARS: usize = 2_000;
+const MAX_DIGEST_PATH_CHARS: usize = 1_024;
+// Reserve enough room to name an omission in every field. The retained raw
+// fields plus those markers always fit the shared privacy scanner's budget.
+const MAX_RAW_DIGEST_BYTES: usize = MAX_INPUT_BYTES
+    - (MAX_DIGEST_FILES + MAX_DIGEST_COMMANDS + MAX_DIGEST_ERRORS + 1) * OMITTED_INPUT.len();
+
+fn retain_digest_text(text: &str, remaining: &mut usize) -> String {
+    if text.len() > *remaining {
+        return OMITTED_INPUT.to_string();
+    }
+    *remaining -= text.len();
+    text.to_string()
+}
+
+fn retain_error_text(result: &crate::model::ToolResultMessage, remaining: &mut usize) -> String {
+    let mut output = String::new();
+    let mut first = true;
+    for block in &result.content {
+        let crate::model::ContentBlock::Text(text) = block else {
+            continue;
+        };
+        let next = output
+            .len()
+            .checked_add(usize::from(!first))
+            .and_then(|bytes| bytes.checked_add(text.text.len()));
+        if !next.is_some_and(|bytes| bytes <= *remaining) {
+            // Never retain a partial private-key envelope or an uninspected
+            // prefix when a later block makes the whole field too large.
+            return OMITTED_INPUT.to_string();
+        }
+        if !first {
+            output.push(' ');
+        }
+        output.push_str(&text.text);
+        first = false;
+    }
+    *remaining -= output.len();
+    output
+}
+
+/// Screen all fields together before applying presentation limits. This is
+/// also the provider-admission boundary for SDK-supplied TurnDigest values;
+/// callers cannot bypass it by avoiding build_digest.
+fn screen_digest(digest: &TurnDigest) -> crate::error::Result<TurnDigest> {
+    if digest.files_touched.len() > MAX_DIGEST_FILES
+        || digest.commands_run.len() > MAX_DIGEST_COMMANDS
+        || digest.tool_errors.len() > MAX_DIGEST_ERRORS
+    {
+        return Err(crate::error::Error::validation(
+            "PI_ADVISOR_DIGEST_LIMIT: too many fields in advisor digest",
+        ));
+    }
+    let inputs: Vec<&str> = digest
+        .files_touched
+        .iter()
+        .chain(&digest.commands_run)
+        .chain(&digest.tool_errors)
+        .chain(std::iter::once(&digest.final_text))
+        .map(String::as_str)
+        .collect();
+    let protected = redact_inputs(&inputs)?;
+    if protected.len() != inputs.len() {
+        return Err(crate::error::Error::validation(
+            "advisor privacy projection changed field count",
+        ));
+    }
+    let mut protected = protected.into_iter();
+    let files_touched = protected
+        .by_ref()
+        .take(digest.files_touched.len())
+        .map(|text| text.chars().take(MAX_DIGEST_PATH_CHARS).collect())
+        .collect();
+    let commands_run = protected
+        .by_ref()
+        .take(digest.commands_run.len())
+        .map(|text| text.chars().take(200).collect())
+        .collect();
+    let tool_errors = protected
+        .by_ref()
+        .take(digest.tool_errors.len())
+        .map(|text| text.chars().take(200).collect())
+        .collect();
+    let final_text = protected
+        .next()
+        .ok_or_else(|| crate::error::Error::validation("advisor privacy projection lost final text"))?
+        .chars()
+        .take(MAX_FINAL_TEXT_CHARS)
+        .collect();
+    Ok(TurnDigest {
+        files_touched,
+        commands_run,
+        tool_errors,
+        final_text,
+        tool_call_count: digest.tool_call_count,
+        is_trivial: digest.is_trivial,
+    })
+}
 
 /// Build the digest from the tail of the conversation (last user message
-/// onward), budgeted.
+/// onward), budgeted. Complete selected fields are screened for built-in
+/// credential shapes before clipping; tool-free advisor projections never
+/// need reversible credentials. The source conversation is not modified.
 #[must_use]
 pub fn build_digest(messages: &[Message]) -> TurnDigest {
     // Start from the last user message (turn boundary).
@@ -81,21 +182,24 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
     let tail = &messages[boundary..];
 
     let mut digest = TurnDigest::default();
+    let mut remaining = MAX_RAW_DIGEST_BYTES;
+    let mut seen_files = HashSet::new();
+    let mut final_text = "";
     for message in tail {
         match message {
             Message::Assistant(assistant) => {
                 for block in &assistant.content {
                     match block {
                         crate::model::ContentBlock::ToolCall(call) => {
-                            digest.tool_call_count += 1;
+                            digest.tool_call_count = digest.tool_call_count.saturating_add(1);
                             match call.name.as_str() {
                                 "write" | "edit" | "hashline_edit" | "ast_edit" => {
                                     if let Some(path) =
                                         call.arguments.get("path").and_then(Value::as_str)
                                         && digest.files_touched.len() < MAX_DIGEST_FILES
-                                        && !digest.files_touched.iter().any(|p| p == path)
+                                        && seen_files.insert(path)
                                     {
-                                        digest.files_touched.push(path.to_string());
+                                        digest.files_touched.push(retain_digest_text(path, &mut remaining));
                                     }
                                 }
                                 "bash" => {
@@ -103,17 +207,16 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
                                         call.arguments.get("command").and_then(Value::as_str)
                                         && digest.commands_run.len() < MAX_DIGEST_COMMANDS
                                     {
-                                        digest
-                                            .commands_run
-                                            .push(command.chars().take(200).collect());
+                                        digest.commands_run.push(retain_digest_text(command, &mut remaining));
                                     }
                                 }
                                 _ => {}
                             }
                         }
                         crate::model::ContentBlock::Text(text) => {
-                            digest.final_text =
-                                text.text.chars().take(MAX_FINAL_TEXT_CHARS).collect();
+                            // Keep only a borrow until the final block is known;
+                            // discarded drafts must not consume the scan budget.
+                            final_text = &text.text;
                         }
                         _ => {}
                     }
@@ -122,22 +225,29 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
             Message::ToolResult(result)
                 if result.is_error && digest.tool_errors.len() < MAX_DIGEST_ERRORS =>
             {
-                let text = result
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        crate::model::ContentBlock::Text(t) => Some(t.text.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                digest.tool_errors.push(text.chars().take(200).collect());
+                digest.tool_errors.push(retain_error_text(result, &mut remaining));
             }
             _ => {}
         }
     }
-    digest.is_trivial = digest.tool_call_count == 0 && digest.final_text.len() < 400;
-    digest
+    // Classification describes the source turn, not a short redaction marker.
+    digest.is_trivial = digest.tool_call_count == 0 && final_text.len() < 400;
+    digest.final_text = retain_digest_text(final_text, &mut remaining);
+    match screen_digest(&digest) {
+        Ok(protected) => protected,
+        Err(_) => {
+            tracing::warn!(
+                event = "pi.advisor.privacy_projection_refused",
+                "Advisor digest omitted because its privacy projection failed"
+            );
+            TurnDigest {
+                final_text: OMITTED_INPUT.to_string(),
+                tool_call_count: digest.tool_call_count,
+                is_trivial: digest.is_trivial,
+                ..Default::default()
+            }
+        }
+    }
 }
 
 /// The review rubric prompt.
@@ -149,7 +259,8 @@ Line 1 must be one of: NOTE, CONCERN, BLOCKER.\n\
 - BLOCKER: a hard problem (data loss risk, broken build, wrong target) that must stop work until addressed.\n\
 Be terse. Cite file paths when relevant. No markdown, no headers.";
 
-/// Render the digest as the advisor's user prompt.
+/// Render the digest as the advisor's user prompt. This is formatting only;
+/// the runtime screens the typed fields before calling it.
 #[must_use]
 pub fn digest_prompt(digest: &TurnDigest) -> String {
     let mut out = String::from("Turn digest:\n");
@@ -385,7 +496,9 @@ impl AdvisorRuntime {
         self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
     }
 
-    /// Review one turn. Never fails the caller.
+    /// Review one turn. Never fails the caller. Built-in credential shapes
+    /// are always redacted for this tool-free secondary model, independently
+    /// of the primary agent's configurable reversible secret mode.
     pub async fn review_turn(&mut self, digest: &TurnDigest, turn_index: u64) -> AdvisorOutcome {
         if self.is_disabled() || ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
             return AdvisorOutcome::Quiet;
@@ -416,10 +529,11 @@ impl AdvisorRuntime {
     }
 
     async fn call_advisor(&self, digest: &TurnDigest) -> crate::error::Result<String> {
+        let digest = screen_digest(digest)?;
         let context = crate::provider::Context {
             system_prompt: Some(REVIEW_SYSTEM_PROMPT.to_string().into()),
             messages: vec![crate::model::Message::User(crate::model::UserMessage {
-                content: crate::model::UserContent::Text(digest_prompt(digest)),
+                content: crate::model::UserContent::Text(digest_prompt(&digest)),
                 timestamp: chrono::Utc::now().timestamp_millis(),
             })]
             .into(),
@@ -576,6 +690,7 @@ mod tests {
     struct ScriptedProvider {
         responses: std::sync::Mutex<std::collections::VecDeque<Vec<crate::model::StreamEvent>>>,
         calls: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::Mutex<Vec<String>>,
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
@@ -606,6 +721,13 @@ mod tests {
             assert_eq!(context.system_prompt.as_deref(), Some(REVIEW_SYSTEM_PROMPT));
             assert_eq!(options.api_key.as_deref(), Some("test-key"));
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let Some(Message::User(user)) = context.messages.first() else {
+                panic!("expected an advisor user prompt");
+            };
+            let crate::model::UserContent::Text(text) = &user.content else {
+                panic!("expected a text-only advisor prompt");
+            };
+            self.prompts.lock().unwrap().push(text.clone());
             let events = self
                 .responses
                 .lock()
@@ -622,6 +744,7 @@ mod tests {
         let provider = Arc::new(ScriptedProvider {
             responses: std::sync::Mutex::new(responses.into()),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         });
         let runtime = AdvisorRuntime::new(provider.clone(), "test".to_string())
             .with_api_key(Some("test-key".to_string()));
@@ -770,5 +893,154 @@ mod tests {
             ));
             assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         });
+    }
+
+    fn assistant(content: Vec<crate::model::ContentBlock>) -> Message {
+        Message::Assistant(Arc::new(crate::model::AssistantMessage {
+            content,
+            ..Default::default()
+        }))
+    }
+
+    fn call(name: &str, arguments: Value) -> crate::model::ContentBlock {
+        crate::model::ContentBlock::ToolCall(crate::model::ToolCall {
+            id: "digest-test".to_string(),
+            name: name.to_string(),
+            arguments,
+            thought_signature: None,
+        })
+    }
+
+    fn text(value: impl Into<String>) -> crate::model::ContentBlock {
+        crate::model::ContentBlock::Text(crate::model::TextContent::new(value))
+    }
+
+    fn tool_error(content: Vec<crate::model::ContentBlock>) -> Message {
+        Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+            tool_call_id: "digest-test".to_string(),
+            tool_name: "bash".to_string(),
+            content,
+            is_error: true,
+            details: None,
+            timestamp: 0,
+        }))
+    }
+
+    #[test]
+    fn digest_screens_commands_errors_and_final_text_before_clipping() {
+        let key = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let messages = vec![
+            assistant(vec![
+                call("bash", serde_json::json!({"command": format!("{} {key}", "x".repeat(190))})),
+                text(format!("{} {key}", "x".repeat(1_990))),
+            ]),
+            tool_error(vec![text(format!("{} {key}", "x".repeat(190)))]),
+        ];
+        let projection = build_digest(&messages);
+        let rendered = digest_prompt(&projection);
+        assert!(!rendered.contains("sk-"), "a clipped key prefix must never escape");
+        assert!(!rendered.contains("abcdef"));
+        assert!(projection.commands_run[0].chars().count() <= 200);
+        assert!(projection.tool_errors[0].chars().count() <= 200);
+        assert!(projection.final_text.chars().count() <= MAX_FINAL_TEXT_CHARS);
+        assert!(serde_json::to_string(&messages).unwrap().contains(key));
+    }
+
+    #[test]
+    fn discovery_beyond_final_text_limit_protects_an_earlier_command_echo() {
+        let secret = "r4nd0mCredentialValue123456";
+        let messages = vec![assistant(vec![
+            call("bash", serde_json::json!({"command": format!("echo {secret}")})),
+            text(format!("{} API_KEY={secret}", "x".repeat(2_100))),
+        ])];
+        let projection = build_digest(&messages);
+        assert_eq!(projection.commands_run, ["echo <pi-secret:redacted>"]);
+        assert!(!digest_prompt(&projection).contains(secret));
+    }
+
+    #[test]
+    fn error_blocks_are_screened_as_one_complete_private_key_envelope() {
+        let projection = build_digest(&[tool_error(vec![
+            text("-----BEGIN PRIVATE KEY-----"),
+            text("PRIVATE-MATERIAL-CANARY"),
+            text("-----END PRIVATE KEY-----"),
+        ])]);
+        assert_eq!(projection.tool_errors, ["<pi-secret:redacted>"]);
+        assert!(!digest_prompt(&projection).contains("PRIVATE-MATERIAL-CANARY"));
+    }
+
+    #[test]
+    fn oversized_fields_are_omitted_without_losing_safe_digest_fields() {
+        let huge = format!("PRIVATE-PREFIX{}", "x".repeat(MAX_INPUT_BYTES));
+        let messages = vec![
+            assistant(vec![
+                call("edit", serde_json::json!({"path": huge})),
+                call("bash", serde_json::json!({"command": "cargo test"})),
+                text("finished"),
+            ]),
+            tool_error(vec![text(&huge)]),
+        ];
+        let projection = build_digest(&messages);
+        assert_eq!(projection.files_touched, [OMITTED_INPUT]);
+        assert_eq!(projection.commands_run, ["cargo test"]);
+        assert_eq!(projection.tool_errors, [OMITTED_INPUT]);
+        assert_eq!(projection.final_text, "finished");
+        assert_eq!(projection.tool_call_count, 2);
+        assert!(!digest_prompt(&projection).contains("PRIVATE-PREFIX"));
+    }
+
+    #[test]
+    fn direct_digest_is_screened_at_provider_admission_without_mutating_the_caller() {
+        asupersync::test_utils::run_test(|| async {
+            let secret = "r4nd0mCredentialValue123456";
+            let digest = TurnDigest {
+                files_touched: vec![secret.to_string()],
+                commands_run: vec![format!("echo {secret}")],
+                tool_errors: vec![format!("API_KEY={secret}")],
+                final_text: "finished".to_string(),
+                tool_call_count: 2,
+                is_trivial: false,
+            };
+            let (mut runtime, provider) = scripted_runtime(vec![completed_reply(
+                "CONCERN\nAvoid placing credentials in command arguments.",
+            )]);
+            assert!(matches!(runtime.review_turn(&digest, 0).await, AdvisorOutcome::Inject(_)));
+            let prompts = provider.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert!(!prompts[0].contains(secret));
+            assert!(prompts[0].contains("<pi-secret:redacted>"));
+            assert!(!prompts[0].contains("<pi-secret:000001>"));
+            assert!(digest.commands_run[0].contains(secret));
+            assert_eq!(runtime.consecutive_failures, 0);
+        });
+    }
+
+    #[test]
+    fn oversized_direct_digest_is_isolated_and_never_admits_a_provider_request() {
+        asupersync::test_utils::run_test(|| async {
+            let (mut runtime, provider) = scripted_runtime(Vec::new());
+            let digest = TurnDigest {
+                final_text: format!("PRIVATE-CANARY{}", "x".repeat(MAX_INPUT_BYTES)),
+                tool_call_count: 1,
+                ..Default::default()
+            };
+            for turn in 0..3 {
+                assert!(matches!(runtime.review_turn(&digest, turn).await, AdvisorOutcome::Failed));
+            }
+            assert!(runtime.is_disabled());
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(provider.prompts.lock().unwrap().is_empty());
+            assert!(!runtime.disabled_notice.as_deref().unwrap().contains("PRIVATE-CANARY"));
+        });
+    }
+
+    #[test]
+    fn direct_digest_field_count_is_bounded_before_projection_allocation() {
+        let digest = TurnDigest {
+            files_touched: vec![String::new(); MAX_DIGEST_FILES + 1],
+            ..Default::default()
+        };
+        let error = screen_digest(&digest).unwrap_err();
+        assert!(error.to_string().contains("PI_ADVISOR_DIGEST_LIMIT"));
     }
 }
