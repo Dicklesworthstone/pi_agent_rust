@@ -387,6 +387,9 @@ pub struct SessionOptions {
     /// read-tool rule applied). `None` lists no skills, which is what an
     /// embedder that loads no skills gets.
     pub skills_prompt: Option<String>,
+    /// `--no-context-files` (gh #216): the host owns the whole prompt, so no
+    /// AGENTS.md / CLAUDE.md and no foreign workspace rules are loaded.
+    pub no_context_files: bool,
     pub max_tool_iterations: usize,
 
     /// Provider retry for turns driven through this session.
@@ -566,6 +569,7 @@ impl Default for SessionOptions {
             repair_policy: None,
             include_cwd_in_prompt: true,
             skills_prompt: None,
+            no_context_files: false,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             retry: None,
             failover: None,
@@ -2781,6 +2785,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     cli.system_prompt = options.system_prompt.clone();
     cli.append_system_prompt = options.append_system_prompt.clone();
     cli.hide_cwd_in_prompt = !options.include_cwd_in_prompt;
+    cli.no_context_files = options.no_context_files;
     cli.thinking = options.thinking.map(|t| t.to_string());
     cli.session = resolved_session_path
         .as_ref()
@@ -4173,6 +4178,34 @@ mod tests {
                 .is_err(),
             "block mode refuses"
         );
+    }
+
+    /// `--no-context-files` (gh #216) reaches SDK-built sessions: the
+    /// project's AGENTS.md is left out when it is set and read when not.
+    #[test]
+    fn no_context_files_keeps_agents_md_out_of_the_prompt() {
+        let prompt_with = |no_context_files: bool| {
+            let tmp = tempdir().expect("tempdir");
+            std::fs::write(
+                tmp.path().join("AGENTS.md"),
+                "gh216-context-marker: follow the house style",
+            )
+            .expect("write AGENTS.md");
+            let mut options = hermetic_session_options(tmp.path());
+            options.workspace_trusted = true;
+            options.no_context_files = no_context_files;
+            let handle = run_async(create_agent_session(options)).expect("create session");
+            handle
+                .session()
+                .agent
+                .system_prompt()
+                .unwrap_or_default()
+                .to_string()
+        };
+        if std::env::var_os("PI_TEST_MODE").is_none() {
+            assert!(prompt_with(false).contains("gh216-context-marker"));
+        }
+        assert!(!prompt_with(true).contains("gh216-context-marker"));
     }
 
     /// The host's skills block reaches the session's system prompt; without

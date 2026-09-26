@@ -2159,6 +2159,7 @@ async fn run(
             // the classic stack (listed only when it can `read` them). The
             // SDK loads no resources itself, so without it the default
             // stack never told the model about any skill.
+            no_context_files: cli.no_context_files,
             skills_prompt: enabled_tools
                 .contains(&"read")
                 .then(|| resources.format_skills_for_prompt()),
