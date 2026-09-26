@@ -1311,8 +1311,60 @@ fn resolve_acp_thinking_level(
     model_entry.clamp_thinking_level(requested)
 }
 
-/// Build a system prompt for ACP mode without requiring a `Cli` struct.
-fn build_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> String {
+/// The system prompt for an ACP session: pi's own prompt, as the CLI and
+/// the SDK build it (tool guidance, every context file including CLAUDE.md,
+/// the global AGENTS.md and ancestors, always-apply foreign workspace rules,
+/// the discoverable-tool index), plus a note that pi is running inside an
+/// editor. ACP used a short hand-written prompt of its own before, which
+/// left all of that out. The short prompt remains the fallback if the
+/// builder fails (e.g. an unreadable prompt file).
+fn build_acp_system_prompt(
+    cwd: &std::path::Path,
+    enabled_tools: &[&str],
+    config: &Config,
+) -> String {
+    use clap::Parser as _;
+    let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+    let full = crate::cli::Cli::try_parse_from(["pi"])
+        .map_err(|err| err.to_string())
+        .and_then(|cli| {
+            let foreign_rules = if config.foreign_rules_enabled() && !test_mode {
+                crate::context_files::discover_foreign_rules(cwd)
+            } else {
+                crate::context_files::ForeignRules::default()
+            };
+            let package_dir = crate::app::stable_package_dir(&Config::package_dir(), Some(cwd));
+            crate::app::build_system_prompt(
+                &cli,
+                cwd,
+                enabled_tools,
+                None,
+                &Config::global_dir(),
+                &package_dir,
+                test_mode,
+                true,
+                Some(&foreign_rules),
+                config,
+            )
+            .map_err(|err| err.to_string())
+        });
+    match full {
+        Ok(mut prompt) => {
+            prompt.push_str(
+                "\n\nYou are running inside the user's editor via ACP (Agent Client \
+                 Protocol). When making file changes, explain what you're doing.",
+            );
+            prompt
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "ACP: full system prompt unavailable; using the minimal one");
+            minimal_acp_system_prompt(cwd, enabled_tools)
+        }
+    }
+}
+
+/// The original hand-written ACP prompt, kept as a fallback.
+fn minimal_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> String {
     use std::fmt::Write as _;
 
     let tool_descriptions = [
@@ -1409,8 +1461,7 @@ fn handle_session_new(
     let provider = providers::create_provider(&model_entry, None)
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
-    // Build system prompt directly (avoids constructing a Cli struct).
-    let system_prompt = build_acp_system_prompt(&cwd, &enabled_tools);
+    let system_prompt = build_acp_system_prompt(&cwd, &enabled_tools, &options.config);
 
     // Resolve API key from auth storage and model entry.
     let api_key = options
@@ -2020,6 +2071,25 @@ mod tests {
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;
     use std::collections::HashMap;
+
+    /// ACP sessions get pi's real system prompt (full tool guidance, every
+    /// context file) plus the editor note, not the old hand-written one.
+    #[test]
+    fn acp_system_prompt_is_pi_prompt_with_context_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("CLAUDE.md"), "acp-claude-md-marker").expect("write");
+        let tools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+        let prompt = build_acp_system_prompt(dir.path(), &tools, &Config::default());
+        assert!(
+            prompt.contains("Make surgical edits to files (find exact text and replace)"),
+            "pi's own tool guidance: {prompt}"
+        );
+        assert!(prompt.contains("via ACP (Agent Client Protocol)"));
+        // Context files are skipped in PI_TEST_MODE by design.
+        if std::env::var_os("PI_TEST_MODE").is_none() {
+            assert!(prompt.contains("acp-claude-md-marker"), "CLAUDE.md is read");
+        }
+    }
 
     #[test]
     fn new_acp_session_in_memory_without_session_dir() {
