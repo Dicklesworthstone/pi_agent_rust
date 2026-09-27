@@ -87,6 +87,7 @@ pub const DEFAULT_CHAIN: &[&str] = &[
     "exa",
     "jina",
     "kagi",
+    "youcom",
     "duckduckgo",
     "startpage",
     "mojeek",
@@ -556,6 +557,77 @@ fn kagi_run<'a>(
     })
 }
 
+fn youcom_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    key: Option<&'a str>,
+) -> RungFuture<'a> {
+    let key = key.map(str::to_string);
+    let limit = filters.limit.min(20);
+    let body = json!({
+        "query": with_site(query, filters),
+        "num_web_results": limit,
+    });
+    Box::pin(async move {
+        let Some(key) = key else {
+            return Err(RungError::NoKey);
+        };
+        let url = format!(
+            "{}/v1/search",
+            base_url_for("youcom", "https://api.you.com")
+        );
+        let response = client
+            .post(&url)
+            .header("X-API-Key", key)
+            .json(&body)
+            .map_err(|e| RungError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| rung_http_error(&e))?;
+        if response.status() == 429 {
+            return Err(RungError::RateLimited);
+        }
+        if response.status() != 200 {
+            return Err(RungError::Http(format!("status {}", response.status())));
+        }
+        let text = response
+            .text_limited(1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
+        let mut results = Vec::new();
+        if let Some(items) = value.get("results").and_then(Value::as_array) {
+            for item in items {
+                let url = item.get("url").and_then(Value::as_str).unwrap_or_default();
+                if url.is_empty() {
+                    continue;
+                }
+                results.push(SearchResult {
+                    title: item
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    url: url.to_string(),
+                    snippet: item
+                        .get("snippet")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("description").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string(),
+                    source: "youcom".to_string(),
+                });
+            }
+        }
+        if results.is_empty() {
+            return Err(RungError::Parse("no results".to_string()));
+        }
+        Ok(results)
+    })
+}
+
 // === Keyless public rungs (HTML scrapers; defensive, parse-what-you-can) ===
 
 fn duckduckgo_run<'a>(
@@ -788,6 +860,12 @@ pub fn all_rungs() -> HashMap<&'static str, ProviderRung> {
         env_keys: &["KAGI_API_KEY"],
         keyless: false,
         run: kagi_run,
+    });
+    add(ProviderRung {
+        name: "youcom",
+        env_keys: &["YDC_API_KEY"],
+        keyless: false,
+        run: youcom_run,
     });
     add(ProviderRung {
         name: "duckduckgo",
@@ -1075,7 +1153,7 @@ impl crate::tools::Tool for WebSearchTool {
 
     fn description(&self) -> &str {
         "Search the web. One query walks a ranked provider chain (perplexity, \
-         brave, tavily, exa, jina, kagi, then keyless duckduckgo/startpage/\
+         brave, tavily, exa, jina, kagi, youcom, then keyless duckduckgo/startpage/\
          mojeek) with automatic fallback — the first rung with credentials and \
          a healthy circuit answers. Returns ranked results (title, url, \
          snippet, source provider). Optional: `provider` pins one rung, \
@@ -1090,7 +1168,7 @@ impl crate::tools::Tool for WebSearchTool {
                 "query": {"type": "string", "description": "The search query"},
                 "provider": {
                     "type": "string",
-                    "description": "Pin one provider (perplexity|brave|tavily|exa|jina|kagi|duckduckgo|startpage|mojeek); default 'auto' walks the chain"
+                    "description": "Pin one provider (perplexity|brave|tavily|exa|jina|kagi|youcom|duckduckgo|startpage|mojeek); default 'auto' walks the chain"
                 },
                 "site": {"type": "string", "description": "Restrict results to a host (site: filter)"},
                 "after": {"type": "string", "description": "YYYY-MM-DD recency filter where supported"},
