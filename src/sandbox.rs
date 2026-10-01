@@ -262,6 +262,15 @@ fn get_or_init_runtime(
     Ok(entry)
 }
 
+/// 通用丢弃设备(N-R2):无条件并入 allow_write
+const DEVICE_ALLOW_WRITE: [&str; 5] = [
+    "/dev/null",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/tty",
+    "/dev/zero",
+];
+
 /// Map picrab sandbox settings + exec cwd to the crate's runtime config.
 ///
 /// Relative `allowWrite` entries (e.g. the `.` default) are resolved against
@@ -287,7 +296,7 @@ pub fn to_srt_config(
     };
 
     let global_dir = crate::config::Config::global_dir();
-    let allow_write: Vec<String> = settings
+    let mut allow_write: Vec<String> = settings
         .allow_write
         .clone()
         .unwrap_or_else(|| {
@@ -300,6 +309,14 @@ pub fn to_srt_config(
         .into_iter()
         .map(|p| absolutize_allow_write(&p, cwd, &global_dir))
         .collect();
+    // N-R2:通用丢弃设备无条件 union(默认清单与显式 allowWrite 都放行)。
+    // 写入由内核消化、无落盘副作用,拒绝它只破坏 `2>/dev/null` 类惯用法。
+    // 用户否决权经 denyWrite 保留(Seatbelt profile 生成顺序:deny 后置覆盖 allow)。
+    for dev in DEVICE_ALLOW_WRITE {
+        if !allow_write.iter().any(|p| p == dev) {
+            allow_write.push(dev.to_string());
+        }
+    }
 
     sandbox_runtime::config::SandboxRuntimeConfig {
         network: sandbox_runtime::config::NetworkConfig {
@@ -400,9 +417,23 @@ mod tests {
             .iter()
             .any(|p| p == "/workspace/proj"));
         assert!(config.filesystem.allow_write.iter().any(|p| p == "/tmp"));
+        // N-R2: 显式 allowWrite 也 union 丢弃设备
+        assert!(config.filesystem.allow_write.iter().any(|p| p == "/dev/null"));
         // default deny_read applied
         assert!(config.filesystem.deny_read.iter().any(|p| p == "~/.ssh"));
         assert_eq!(config.allow_pty, Some(true));
+    }
+
+    #[test]
+    fn allow_write_defaults_include_devices() {
+        let s = settings(r#"{"mode": "auto"}"#);
+        let config = to_srt_config(&s, Path::new("/workspace/proj"));
+        for dev in DEVICE_ALLOW_WRITE {
+            assert!(
+                config.filesystem.allow_write.iter().any(|p| p == dev),
+                "missing {dev}"
+            );
+        }
     }
 
     #[test]
