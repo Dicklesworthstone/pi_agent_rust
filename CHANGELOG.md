@@ -19,8 +19,10 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 The first release of the 0.7 line. v0.7.0 was tagged but could not be built
 by the strict release builder: two vendored test-fixture documents had `&` in
 their names, which its source archive refuses, and release tags cannot be
-moved. v0.7.1 is v0.7.0 with those two files renamed. Everything below is new
-since v0.6.1.
+moved. v0.7.1 renames those two files and completes the release recipe: it
+preserves the raw binaries and aggregate checksums required by `pi update`,
+alongside installer archives, and pins the public key used to verify release
+signatures. Everything below is new since v0.6.1.
 
 A minor release because two library structs that `docs/sdk.md` marks Stable
 gained public fields (see **Changed**). The CLI's flags and settings stay
@@ -149,6 +151,19 @@ regressions of anything v0.6.1 shipped:
   an LSP request dropped before the outbound writer sends it is neither sent
   nor cancelled, rather than sent and then cancelled (bead
   `bd-lsp-cancel-ordering-nonblocking-queue-pr0qa`).
+
+Qualification also exposed two pre-existing limitations: opt-in SQLite
+session storage cannot read an existing WAL/SHM pair whose auxiliary files
+are readable but not writable
+([#250](https://github.com/Dicklesworthstone/pi_agent_rust/issues/250));
+parallel performance fixtures can race while creating a shared intermediate
+evidence directory
+([#251](https://github.com/Dicklesworthstone/pi_agent_rust/issues/251)).
+These failed checks remain open; the full test suite is not reported green.
+The retained performance-budget evidence has also exceeded its 168-hour
+freshness window
+([#252](https://github.com/Dicklesworthstone/pi_agent_rust/issues/252));
+performance claims remain unauthorized until fresh measurements qualify.
 
 Also tracked as beads: in a bash child, an authenticated SOCKS proxy is exported
 without credentials (`curl`/`git` then fail to authenticate); extension
