@@ -165,6 +165,15 @@ freshness window
 ([#252](https://github.com/Dicklesworthstone/pi_agent_rust/issues/252));
 performance claims remain unauthorized until fresh measurements qualify.
 
+Published installer qualification found a pre-existing latest-version parser
+bug: compact GitHub release JSON can make the installer select the release
+body instead of `tag_name`
+([#253](https://github.com/Dicklesworthstone/pi_agent_rust/issues/253)).
+The default installer and ACFS's `--yes --easy-mode` entrypoint failed this
+check; explicit-version installation and native self-update passed on Linux
+x86_64. Use
+`--version v0.7.1` until the installer fix and its ACFS checksum update land.
+
 Also tracked as beads: in a bash child, an authenticated SOCKS proxy is exported
 without credentials (`curl`/`git` then fail to authenticate); extension
 providers that end a turn with `stop` while returning tool calls are
