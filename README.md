@@ -65,6 +65,9 @@ Use `dsr quality --tool pi_agent_rust` for the registered quality recipe and
 the canonical DSR build/release commands documented in
 [docs/releasing.md](docs/releasing.md).
 
+For signed published payload verification and offline CLI smoke checks, see
+[Published release consumer checks](docs/published-release-checks.md).
+
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
 - **[rich_rust](https://github.com/Dicklesworthstone/rich_rust)**: A Rust port of [Rich](https://github.com/Textualize/rich) by [Will McGugan](https://github.com/willmcgugan), providing beautiful terminal output with markup syntax
