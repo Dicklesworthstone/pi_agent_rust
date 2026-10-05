@@ -16,6 +16,9 @@
 //! or explicitly selected source blocks all lower-precedence sources so a
 //! configuration error cannot revive an older trusted execution target.
 
+mod acp;
+pub(crate) use acp::parse_acp_servers;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read as _;
@@ -119,6 +122,8 @@ pub enum Provenance {
     Foreign,
     /// Contributed by an installed extension via `registerMcpServer`.
     Extension,
+    /// Client-supplied ACP session definition. Env/header values are literal.
+    Acp,
 }
 
 impl Provenance {
@@ -132,13 +137,14 @@ impl Provenance {
             Self::GlobalPi => "global",
             Self::Foreign => "foreign",
             Self::Extension => "extension",
+            Self::Acp => "acp",
         }
     }
 
     /// Whether this provenance is one of pi's native files.
     #[must_use]
     pub const fn is_native(self) -> bool {
-        !matches!(self, Self::Foreign | Self::Extension)
+        !matches!(self, Self::Foreign | Self::Extension | Self::Acp)
     }
 }
 

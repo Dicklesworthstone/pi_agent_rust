@@ -28,10 +28,11 @@ pub(super) fn check_transport_owner(
 
 fn transport_needs_spawn(config: &super::ConfiguredServer) -> bool {
     config.command.is_some()
-        || config
-            .headers
-            .iter()
-            .any(|(_, value)| value.trim().starts_with("$CMD:"))
+        || (config.provenance != super::Provenance::Acp
+            && config
+                .headers
+                .iter()
+                .any(|(_, value)| value.trim().starts_with("$CMD:")))
 }
 
 /// Armed only after trust and restart admission select a new construction.
