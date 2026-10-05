@@ -8,9 +8,10 @@
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -18,13 +19,60 @@ use super::{
     ACP_STOP_REASON_CANCELLED, ACP_STOP_REASON_END_TURN, ACP_STOP_REASON_ERROR,
     AcpSessionsMap, AbortSignal, AgentCx, AgentSession, history, json_rpc_notification,
 };
-use crate::mcp::{ConfiguredServer, McpDiscovery, McpManager};
+use crate::mcp::{ConfiguredServer, McpDiscovery, McpManager, ServerInfo};
+
+// Refresh before the native manager's five-minute tool-cache TTL expires.
+// Failed setup is eligible sooner, but the native restart budget still owns
+// whether any connection is attempted. No background task or timer is spawned.
+const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct CatalogRefresh {
+    completed_at: Option<Instant>,
+    acknowledged: Vec<String>,
+}
+
+fn acknowledged_servers(rows: &[ServerInfo]) -> Vec<String> {
+    let mut names: Vec<_> = rows.iter()
+        .filter(|row| row.trust == "acknowledged")
+        .map(|row| row.name.clone()).collect();
+    names.sort();
+    names
+}
+
+impl CatalogRefresh {
+    fn due(&self, rows: &[ServerInfo], now: Instant) -> bool {
+        let Some(completed_at) = self.completed_at else { return true };
+        if acknowledged_servers(rows) != self.acknowledged {
+            return true;
+        }
+        let trusted: Vec<_> = rows.iter()
+            .filter(|row| row.trust == "acknowledged").collect();
+        let retryable = trusted.iter().any(|row|
+            row.health == "not started" || row.health.starts_with("unhealthy"));
+        let ready = trusted.iter().any(|row| row.health.starts_with("ready"));
+        if !retryable && !ready {
+            // Pending/denied servers must not be contacted. A terminally
+            // failed server requires the explicit native /mcp test remedy.
+            return false;
+        }
+        let interval = if retryable { CATALOG_RETRY_INTERVAL } else { CATALOG_REFRESH_INTERVAL };
+        now.saturating_duration_since(completed_at) >= interval
+    }
+
+    fn complete(&mut self, acknowledged: Vec<String>, now: Instant) {
+        self.completed_at = Some(now);
+        self.acknowledged = acknowledged;
+    }
+}
 
 pub(super) struct SessionMcp {
     pub(super) manager: Arc<McpManager>,
     signatures: Vec<(String, String)>,
     descriptions: Vec<(String, String)>,
     started: AtomicBool,
+    refresh: StdMutex<CatalogRefresh>,
 }
 
 fn signatures(servers: &[ConfiguredServer], cwd: &Path) -> Vec<(String, String)> {
@@ -62,17 +110,19 @@ pub(super) fn prepare(
         signatures,
         descriptions,
         started: AtomicBool::new(false),
+        refresh: StdMutex::new(CatalogRefresh::default()),
     }))
 }
 
 pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
     // Use the same first-class wrappers as the terminal and SDK surfaces.
     // The manager remains owned by AcpSessionState, including during a turn.
-    // Existing wrappers recheck trust on every call, so a retained definition
-    // cannot bypass revocation. Never append duplicate provider schemas.
-    let mut wrappers = crate::mcp::mount_tools(&state.manager);
-    wrappers.retain(|tool| !agent.agent.has_tool(tool.name()));
-    agent.agent.extend_tools(wrappers);
+    // ToolRegistry::extend replaces a same-name entry and invalidates the
+    // agent's schema cache. Filtering existing names would permanently pin
+    // their old schemas/descriptions even after a successful tools/list.
+    // Retained wrappers for removed/denied tools still fail the native per-call
+    // catalog/trust check; this API does not remove registry entries.
+    agent.agent.extend_tools(crate::mcp::mount_tools(&state.manager));
 }
 
 /// Reattaching an existing live session must not silently swap out its tool
@@ -100,8 +150,8 @@ pub(super) fn commands_notification(id: &str) -> String {
             "sessionUpdate": "available_commands_update",
             "availableCommands": [{
                 "name": "mcp",
-                "description": "Inspect, trust, deny, or test this session's MCP servers",
-                "input": { "hint": "list | inspect NAME | trust NAME | deny NAME | test NAME" },
+                "description": "Inspect, refresh, trust, deny, or test this session's MCP servers",
+                "input": { "hint": "list | refresh | inspect NAME | trust NAME | deny NAME | test NAME" },
             }],
         },
     }))
@@ -125,7 +175,7 @@ fn status(state: &SessionMcp) -> String {
         };
         lines.push(format!("{}: {}, {}, {} tools", row.name, row.trust, health, row.tools));
     }
-    lines.push("Use /mcp inspect NAME, then /mcp trust NAME to approve a server. /mcp deny NAME revokes it.".into());
+    lines.push("Use /mcp inspect NAME, then /mcp trust NAME to approve a server. /mcp refresh reloads trusted tool catalogs; /mcp deny NAME revokes a server.".into());
     lines.join("\n")
 }
 
@@ -140,6 +190,7 @@ pub(super) async fn announce(
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Command {
     List,
+    Refresh,
     Inspect(String),
     Trust(String),
     Deny(String),
@@ -163,11 +214,12 @@ pub(super) fn command_from_prompt(blocks: &[Value]) -> Result<Option<Command>, S
     let words: Vec<_> = rest.split_whitespace().collect();
     let command = match words.as_slice() {
         [] | ["list"] => Command::List,
+        ["refresh"] => Command::Refresh,
         ["inspect", name] => Command::Inspect((*name).to_string()),
         ["trust", name] => Command::Trust((*name).to_string()),
         ["deny", name] => Command::Deny((*name).to_string()),
         ["test", name] => Command::Test((*name).to_string()),
-        _ => return Err("Usage: /mcp list | inspect NAME | trust NAME | deny NAME | test NAME".to_string()),
+        _ => return Err("Usage: /mcp list | refresh | inspect NAME | trust NAME | deny NAME | test NAME".to_string()),
     };
     Ok(Some(command))
 }
@@ -199,9 +251,23 @@ async fn cancellable<F: Future>(
     }
 }
 
+/// The native manager bounds the whole pass, validates complete catalogs,
+/// rechecks trust, and applies restart backoff. Only a completed pass advances
+/// this schedule; cancellation must leave the next prompt eligible to retry.
+async fn refresh_catalogs(state: &SessionMcp) {
+    let acknowledged = acknowledged_servers(&state.manager.list());
+    state.manager.connect_trusted().await;
+    state.refresh.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .complete(acknowledged, Instant::now());
+}
+
 async fn execute(state: &SessionMcp, command: Command) -> String {
     match command {
         Command::List => status(state),
+        Command::Refresh => {
+            refresh_catalogs(state).await;
+            status(state)
+        }
         Command::Inspect(name) => state.descriptions.iter()
             .find(|(candidate, _)| candidate == &name)
             .map(|(_, text)| text.clone())
@@ -211,7 +277,7 @@ async fn execute(state: &SessionMcp, command: Command) -> String {
             Err(_) => "MCP trust/connect did not complete. Any trust decision already persisted remains in effect; inspect the editor configuration, then use /mcp list or /mcp deny NAME.".to_string(),
         },
         Command::Deny(name) => match state.manager.deny(&name).await {
-            Ok(()) => format!("Denied MCP server {name}; its tools are no longer available"),
+            Ok(()) => format!("Denied MCP server {name}; further tool execution is blocked"),
             Err(_) => "MCP denial did not complete; use /mcp list and retry after checking the trust store.".to_string(),
         },
         Command::Test(name) => match state.manager.test(&name).await {
@@ -255,19 +321,22 @@ pub(super) async fn before_prompt(
         });
     }
     if let Some(state) = state {
-        if !state.started.load(Ordering::Acquire) {
-            if cancellable(signal, cx, state.manager.connect_trusted()).await.is_err() {
-                return Some(ACP_STOP_REASON_CANCELLED);
-            }
-            state.started.store(true, Ordering::Release);
-            mount(agent, state);
+        let first = !state.started.load(Ordering::Acquire);
+        let rows = state.manager.list();
+        let refresh_due = state.refresh.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .due(&rows, Instant::now());
+        if refresh_due && cancellable(signal, cx, refresh_catalogs(state)).await.is_err() {
+            return Some(ACP_STOP_REASON_CANCELLED);
+        }
+        mount(agent, state);
+        if first {
             match cancellable(signal, cx, emit_text(out, id, &status(state))).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Some(ACP_STOP_REASON_ERROR),
                 Err(()) => return Some(ACP_STOP_REASON_CANCELLED),
             }
-        } else {
-            mount(agent, state);
+            state.started.store(true, Ordering::Release);
         }
     }
     None
@@ -310,10 +379,286 @@ mod tests {
         }]}), cwd).expect("decode").expect("supplied")
     }
 
+    fn row(trust: &str, health: &str) -> ServerInfo {
+        ServerInfo {
+            name: "remote".into(), target: "<http>".into(), provenance: "acp".into(),
+            trust: trust.into(), health: health.into(), tools: 0,
+            source_file: std::path::PathBuf::from("unused"),
+        }
+    }
+
+    #[test]
+    fn catalog_refresh_is_bounded_and_notices_external_trust_changes() {
+        let now = Instant::now();
+        let mut refresh = CatalogRefresh::default();
+        let ready = [row("acknowledged", "ready (1 tools)")];
+        assert!(refresh.due(&ready, now));
+        refresh.complete(acknowledged_servers(&ready), now);
+        assert!(!refresh.due(&ready, now + CATALOG_REFRESH_INTERVAL - Duration::from_millis(1)));
+        assert!(refresh.due(&ready, now + CATALOG_REFRESH_INTERVAL));
+
+        let pending = [row("pending", "not started")];
+        assert!(refresh.due(&pending, now), "a revocation changes the acknowledged set");
+        refresh.complete(Vec::new(), now);
+        assert!(!refresh.due(&pending, now + Duration::from_secs(3600)));
+        assert!(!refresh.due(&[row("denied", "not started")], now));
+        assert!(refresh.due(&ready, now), "new external trust is not hidden by the refresh interval");
+    }
+
+    #[test]
+    fn failed_setup_is_retried_without_resetting_terminal_restart_failures() {
+        let now = Instant::now();
+        let mut refresh = CatalogRefresh::default();
+        for health in ["not started", "unhealthy (retry 1/3): unavailable"] {
+            let rows = [row("acknowledged", health)];
+            refresh.complete(acknowledged_servers(&rows), now);
+            assert!(!refresh.due(&rows, now + CATALOG_RETRY_INTERVAL - Duration::from_millis(1)));
+            assert!(refresh.due(&rows, now + CATALOG_RETRY_INTERVAL));
+        }
+        let failed = [row("acknowledged", "failed: exhausted 3 retries")];
+        refresh.complete(acknowledged_servers(&failed), now);
+        assert!(!refresh.due(&failed, now + Duration::from_secs(3600)));
+    }
+
+    /// Both MCP and provider traffic use real loopback HTTP. Mutable catalog
+    /// data is server state, not an injected manager or registry implementation.
+    struct CatalogServer {
+        url: String,
+        catalog: Arc<StdMutex<Value>>,
+        requests: Arc<StdMutex<Vec<Value>>>,
+        lists: Arc<std::sync::atomic::AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CatalogServer {
+        fn start() -> Self {
+            use std::io::{Read as _, Write as _};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let catalog = Arc::new(StdMutex::new(json!({"tools": [{
+                "name": "echo", "description": "original catalog description",
+                "inputSchema": {"type": "object", "properties": {"old_field": {"type": "string"}}},
+            }]})));
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_catalog = Arc::clone(&catalog);
+            let worker_requests = Arc::clone(&requests);
+            let worker_lists = Arc::clone(&lists);
+            let worker_stop = Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => panic!("catalog fixture accept: {error}"),
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0_u8; 1];
+                        stream.read_exact(&mut byte).unwrap();
+                        headers.push(byte[0]);
+                        assert!(headers.len() <= 32 * 1024, "bounded fixture headers");
+                    }
+                    let headers = String::from_utf8(headers).unwrap();
+                    let length = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    }).unwrap_or(0);
+                    assert!(length <= 2 * 1024 * 1024, "bounded fixture body");
+                    let mut body = vec![0_u8; length];
+                    stream.read_exact(&mut body).unwrap();
+                    if headers.starts_with("GET /mcp ") {
+                        // The real transport probes its optional receive
+                        // stream during activation, even without a session ID.
+                        // This fixture implements POST only, as MCP permits.
+                        stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        continue;
+                    }
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let (status, content_type, body) = if headers.starts_with("POST /mcp ") {
+                        let result = match request["method"].as_str().unwrap() {
+                            "initialize" => Some(json!({
+                                "protocolVersion": crate::mcp::transport::MCP_PROTOCOL_VERSION,
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "catalog-fixture", "version": "1"},
+                            })),
+                            "notifications/initialized" => None,
+                            "tools/list" => {
+                                worker_lists.fetch_add(1, Ordering::AcqRel);
+                                Some(worker_catalog.lock().unwrap().clone())
+                            }
+                            other => panic!("no tool should execute in the schema probe: {other}"),
+                        };
+                        result.map_or_else(
+                            || ("202 Accepted", "application/json", String::new()),
+                            |result| ("200 OK", "application/json", json!({
+                                "jsonrpc": "2.0", "id": request["id"], "result": result,
+                            }).to_string()),
+                        )
+                    } else {
+                        assert!(headers.starts_with("POST /v1/chat/completions "), "{headers}");
+                        worker_requests.lock().unwrap().push(request);
+                        let body = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            json!({"id":"probe","object":"chat.completion.chunk","model":"gpt-4o",
+                                "choices":[{"index":0,"delta":{"role":"assistant","content":"schema observed"},"finish_reason":null}]}),
+                            json!({"id":"probe","object":"chat.completion.chunk","model":"gpt-4o",
+                                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}));
+                        ("200 OK", "text/event-stream", body)
+                    };
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            Self { url, catalog, requests, lists, stop, worker: Some(worker) }
+        }
+    }
+
+    impl Drop for CatalogServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let result = worker.join();
+                if !std::thread::panicking() { result.expect("catalog fixture worker"); }
+            }
+        }
+    }
+
+    #[test]
+    fn refreshing_a_live_catalog_replaces_provider_schemas_without_duplicate_names() {
+        let root = tempfile::tempdir().unwrap();
+        let server = CatalogServer::start();
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .worker_threads(1).blocking_threads(1, 2).build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let cx = AgentCx::for_current_or_request();
+            let work = async {
+                let servers = crate::mcp::config::parse_acp_servers(&json!({"mcpServers":[{
+                    "type":"http", "name":"remote", "url":format!("{}/mcp", server.url),
+                }]}), root.path()).unwrap().unwrap();
+                let mcp = prepare(root.path(), root.path(), servers).unwrap();
+                let mut entry = crate::models::ad_hoc_model_entry("openai", "gpt-4o").unwrap();
+                entry.model.api = "openai-completions".into();
+                entry.model.base_url = format!("{}/v1", server.url);
+                let provider = crate::providers::create_provider(&entry, None).unwrap();
+                let agent = crate::agent::Agent::new(
+                    provider, crate::tools::ToolRegistry::new(&[], root.path(), None),
+                    crate::agent::AgentConfig {
+                        stream_options: crate::provider::StreamOptions {
+                            api_key: Some("local-fixture-only".into()),
+                            ..crate::provider::StreamOptions::default()
+                        },
+                        ..crate::agent::AgentConfig::default()
+                    },
+                );
+                let session = AgentSession::new(agent,
+                    Arc::new(asupersync::sync::Mutex::new(crate::session::Session::in_memory())), false,
+                    crate::compaction::ResolvedCompactionSettings { enabled: false,
+                        ..crate::compaction::ResolvedCompactionSettings::default() })
+                    .with_runtime_handle(handle);
+                let state = Arc::new(asupersync::sync::Mutex::new(super::super::AcpSessionState {
+                    agent_session: Some(session), cwd: root.path().into(), mcp: Some(Arc::clone(&mcp)),
+                }));
+                let (out, receiver) = std::sync::mpsc::sync_channel(128);
+                let run = |command| {
+                    let (_, signal) = super::super::AbortHandle::new();
+                    super::super::run_prompt(Arc::clone(&state), vec![crate::model::ContentBlock::Text(
+                        crate::model::TextContent::new("Observe the tool schema"))], command,
+                        signal, out.clone(), "schema-probe".into(), cx.clone())
+                };
+                assert_eq!(run(Some(Command::Trust("remote".into()))).await, ACP_STOP_REASON_END_TURN);
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN); // Warm the provider schema cache.
+                let name = crate::mcp::mounted_name("remote", "echo");
+                let first = server.requests.lock().unwrap()[0].clone();
+                let original = first["tools"].as_array().unwrap().iter()
+                    .find(|tool| tool["function"]["name"] == name).unwrap();
+                assert!(original["function"]["parameters"]["properties"].get("old_field").is_some());
+
+                *server.catalog.lock().unwrap() = json!({"tools": [
+                    {"name":"echo", "description":"revised catalog description",
+                     "inputSchema":{"type":"object", "required":["new_field"],
+                        "properties":{"new_field":{"type":"integer"}}}},
+                    {"name":"added", "inputSchema":{"type":"object"}},
+                ]});
+                assert_eq!(run(Some(Command::Refresh)).await, ACP_STOP_REASON_END_TURN);
+                let refreshed_lists = server.lists.load(Ordering::Acquire);
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                assert_eq!(server.lists.load(Ordering::Acquire), refreshed_lists,
+                    "ordinary prompts reuse a fresh catalog instead of issuing tools/list every turn");
+                let requests = server.requests.lock().unwrap().clone();
+                assert_eq!(requests.len(), 3, "operator commands must not start a provider turn");
+                for request in &requests[1..] {
+                    let tools = request["tools"].as_array().unwrap();
+                    let matches: Vec<_> = tools.iter().filter(|tool| tool["function"]["name"] == name).collect();
+                    assert_eq!(matches.len(), 1, "remounting must replace, not duplicate");
+                    let function = &matches[0]["function"];
+                    assert!(function["description"].as_str().unwrap().contains("revised catalog description"));
+                    assert!(function["parameters"]["properties"].get("old_field").is_none());
+                    assert_eq!(function["parameters"]["properties"]["new_field"]["type"], "integer");
+                    assert!(tools.iter().any(|tool| tool["function"]["name"] == crate::mcp::mounted_name("remote", "added")));
+                }
+
+                // Advance the controller's clock seam, not native transport
+                // state: the next ordinary prompt must perform a real list.
+                server.catalog.lock().unwrap()["tools"][0]["description"] = json!("periodically refreshed description");
+                mcp.refresh.lock().unwrap().completed_at = Instant::now().checked_sub(CATALOG_REFRESH_INTERVAL);
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                assert!(server.lists.load(Ordering::Acquire) > refreshed_lists);
+                let periodic = server.requests.lock().unwrap().last().unwrap().clone();
+                assert!(periodic["tools"].as_array().unwrap().iter().any(|tool|
+                    tool["function"]["name"] == name && tool["function"]["description"].as_str()
+                        .is_some_and(|description| description.contains("periodically refreshed description"))));
+
+                // An invalid catalog genuinely retires the native connection.
+                // A later prompt must retry after its real first backoff,
+                // instead of treating the original startup as permanently done.
+                *server.catalog.lock().unwrap() = json!({"tools": null});
+                assert_eq!(run(Some(Command::Refresh)).await, ACP_STOP_REASON_END_TURN);
+                assert!(mcp.manager.list()[0].health.starts_with("unhealthy"));
+                *server.catalog.lock().unwrap() = json!({"tools":[{
+                    "name":"recovered", "description":"recovered catalog", "inputSchema":{"type":"object"},
+                }]});
+                cx.time().sleep(CATALOG_RETRY_INTERVAL + Duration::from_millis(100)).await;
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                assert!(mcp.manager.list()[0].health.starts_with("ready"));
+                let recovered = server.requests.lock().unwrap().last().unwrap().clone();
+                assert!(recovered["tools"].as_array().unwrap().iter().any(|tool|
+                    tool["function"]["name"] == crate::mcp::mounted_name("remote", "recovered")));
+                let refreshed_lists = server.lists.load(Ordering::Acquire);
+                assert_eq!(run(Some(Command::Deny("remote".into()))).await, ACP_STOP_REASON_END_TURN);
+                assert_eq!(run(Some(Command::Refresh)).await, ACP_STOP_REASON_END_TURN);
+                assert_eq!(server.lists.load(Ordering::Acquire), refreshed_lists,
+                    "refresh must never contact denied servers");
+                assert!(mcp.manager.call_tool("remote", "echo", json!({"new_field":1})).await
+                    .unwrap_err().to_string().contains("MCP_TRUST_DENIED"));
+                assert!(receiver.try_iter().all(|line| !line.contains("local-fixture-only")));
+                mcp.manager.shutdown_all().await;
+            };
+            let time = cx.time();
+            match futures::future::select(Box::pin(work), Box::pin(time.sleep(Duration::from_secs(15)))).await {
+                futures::future::Either::Left(((), _)) => {}
+                futures::future::Either::Right(((), unfinished)) => {
+                    drop(unfinished);
+                    panic!("catalog refresh integration watchdog expired");
+                }
+            }
+        });
+    }
+
     #[test]
     fn commands_require_actual_standalone_user_text() {
         for (text, expected) in [
             ("/mcp", Command::List), ("/mcp list", Command::List),
+            ("/mcp refresh", Command::Refresh),
             ("/mcp trust remote", Command::Trust("remote".into())),
             ("/mcp deny remote", Command::Deny("remote".into())),
             ("/mcp test remote", Command::Test("remote".into())),

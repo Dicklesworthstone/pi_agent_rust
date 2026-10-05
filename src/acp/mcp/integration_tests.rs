@@ -89,6 +89,12 @@ impl HttpFixture {
                 let (headers, request) = read_request(&mut stream);
                 assert!(headers.lines().any(|line| line.split_once(':').is_some_and(|(name, value)|
                     name.eq_ignore_ascii_case("x-acp-literal") && value.trim() == LITERAL_HEADER)));
+                if headers.starts_with("GET /mcp ") {
+                    // Native activation probes the optional receive channel.
+                    // Decline it explicitly without inventing a JSON-RPC call.
+                    stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
                 worker_records.lock().unwrap().push(request.clone());
                 let method = request["method"].as_str().unwrap_or("");
                 if method == "initialize" {
@@ -135,7 +141,10 @@ impl Drop for HttpFixture {
     fn drop(&mut self) {
         self.release.store(true, Ordering::Release);
         self.running.store(false, Ordering::Release);
-        if let Some(worker) = self.worker.take() { worker.join().expect("fixture worker"); }
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !std::thread::panicking() { result.expect("fixture worker"); }
+        }
     }
 }
 
@@ -170,6 +179,7 @@ fn permission_client(out: &SyncSender<String>, cx: &AgentCx) -> AcpPermissionCli
 struct ProviderFixture {
     url: String,
     turns: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -180,9 +190,11 @@ impl ProviderFixture {
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let turns = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&turns);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(12);
-            while observed.load(Ordering::Acquire) < 2 {
+            while observed.load(Ordering::Acquire) < 2 && !worker_stop.load(Ordering::Acquire) {
                 assert!(std::time::Instant::now() < deadline, "provider fixture timed out");
                 let (mut stream, _) = match listener.accept() {
                     Ok(value) => value,
@@ -209,13 +221,17 @@ impl ProviderFixture {
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
-        Self { url, turns, worker: Some(worker) }
+        Self { url, turns, stop, worker: Some(worker) }
     }
 }
 
 impl Drop for ProviderFixture {
     fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() { worker.join().expect("provider worker"); }
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !std::thread::panicking() { result.expect("provider worker"); }
+        }
     }
 }
 
