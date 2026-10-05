@@ -67,7 +67,7 @@ pub(super) fn requested_session_id(params: &Value) -> HistoryResult<&str> {
     Ok(id)
 }
 
-fn requested_cwd(params: &Value) -> HistoryResult<PathBuf> {
+pub(super) fn requested_cwd(params: &Value) -> HistoryResult<PathBuf> {
     let raw = params.get("cwd").and_then(Value::as_str)
         .ok_or_else(|| HistoryError::invalid("Missing required parameter: cwd"))?;
     let path = Path::new(raw);
@@ -80,17 +80,6 @@ fn requested_cwd(params: &Value) -> HistoryResult<PathBuf> {
         return Err(HistoryError::invalid("cwd must name a directory"));
     }
     Ok(canonical)
-}
-
-fn validate_mcp_servers(params: &Value) -> HistoryResult<()> {
-    match params.get("mcpServers") {
-        None => Ok(()),
-        Some(Value::Array(servers)) if servers.is_empty() => Ok(()),
-        Some(Value::Array(_)) => Err(HistoryError::invalid(
-            "ACP client-supplied MCP servers are not supported; no servers were started",
-        )),
-        Some(_) => Err(HistoryError::invalid("mcpServers must be an array")),
-    }
 }
 
 fn same_workspace(stored: &Path, requested: &Path) -> bool {
@@ -178,21 +167,41 @@ pub(super) async fn load(
 ) -> HistoryResult<Value> {
     let id = requested_session_id(params)?;
     let cwd = requested_cwd(params)?;
-    validate_mcp_servers(params)?;
+    let supplied = crate::mcp::config::parse_acp_servers(params, &cwd)
+        .map_err(HistoryError::invalid)?;
     let live = {
         let guard = sessions.lock(cx).await
             .map_err(|_| HistoryError::internal("Session registry is unavailable"))?;
         guard.get(id).cloned()
     };
     let state = if let Some(state) = live {
+        {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&state), cx).await
+                .map_err(|_| HistoryError::internal("Session state is unavailable"))?;
+            if !same_workspace(&guard.cwd, &cwd) {
+                return Err(HistoryError::invalid("Session belongs to a different workspace"));
+            }
+            if guard.agent_session.is_none() {
+                return Err(HistoryError::busy());
+            }
+            super::mcp::check_reattach(guard.mcp.as_ref(), supplied.as_deref(), &cwd)
+                .map_err(HistoryError::invalid)?;
+        }
         state
     } else {
         let saved = open_saved_session(id, &cwd, options.session_dir.as_deref()).await?;
-        let (loaded_id, state) = build_acp_session(saved, true, cwd.clone(), options, Some(permission_client))
+        let (loaded_id, mut state) = build_acp_session(saved, true, cwd.clone(), options, Some(permission_client))
             .map_err(|error| HistoryError::internal(format!("Cannot restore agent session: {error}")))?;
         if loaded_id != id {
             return Err(HistoryError::internal("Restored session identity changed"));
         }
+        let mcp_state = super::mcp::prepare(
+            &cwd, &crate::config::Config::global_dir(), supplied.unwrap_or_default(),
+        );
+        if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
+            super::mcp::mount(agent, mcp_state);
+        }
+        state.mcp = mcp_state;
         let state = Arc::new(Mutex::new(state));
         let mut guard = sessions.lock(cx).await
             .map_err(|_| HistoryError::internal("Session registry is unavailable"))?;
@@ -212,6 +221,11 @@ pub(super) async fn load(
         let session = OwnedMutexGuard::lock(Arc::clone(&agent.session), cx).await
             .map_err(|_| HistoryError::internal("Session history is unavailable"))?;
         replay_session(&session, id, out).await?;
+    }
+    if guard.mcp.is_some() {
+        // This is configuration, not replayed conversation content; resume
+        // remains history-free. Servers connect only through native trust.
+        send_line(out, super::mcp::commands_notification(id)).await?;
     }
     Ok(json!({ "sessionId": id, "configOptions": configuration }))
 }
@@ -679,7 +693,7 @@ mod tests {
             options.session_dir = None;
             let sessions = Arc::new(Mutex::new(HashMap::from([(
                 "busy-session".to_string(), Arc::new(Mutex::new(super::super::AcpSessionState {
-                    agent_session: None, cwd: cwd.clone(),
+                    agent_session: None, cwd: cwd.clone(), mcp: None,
                 })),
             )])));
             let cx = AgentCx::for_testing();
@@ -793,12 +807,18 @@ mod tests {
     }
 
     #[test]
-    fn load_validates_workspace_and_does_not_accept_unimplemented_mcp_servers() {
+    fn load_validates_workspace_and_rejects_malformed_mcp_servers() {
         assert_eq!(requested_cwd(&json!({})).unwrap_err().code, INVALID_PARAMS);
         assert_eq!(requested_cwd(&json!({ "cwd": "relative" })).unwrap_err().code, INVALID_PARAMS);
-        assert!(validate_mcp_servers(&json!({ "mcpServers": [] })).is_ok());
-        assert!(validate_mcp_servers(&json!({ "mcpServers": [{ "command": "must-not-run" }] })).is_err());
-        assert!(validate_mcp_servers(&json!({ "mcpServers": null })).is_err());
+        let cwd = std::env::current_dir().unwrap();
+        let parse = |params: Value| crate::mcp::config::parse_acp_servers(&params, &cwd);
+        assert!(parse(json!({ "mcpServers": [] })).unwrap().unwrap().is_empty());
+        assert!(parse(json!({ "mcpServers": [{ "command": "must-not-run" }] })).is_err());
+        assert!(parse(json!({ "mcpServers": null })).is_err());
+        let servers = parse(json!({ "mcpServers": [{
+            "name": "pending", "command": std::env::current_exe().unwrap(), "args": [], "env": [],
+        }] })).unwrap().unwrap();
+        assert_eq!(servers[0].provenance, crate::mcp::Provenance::Acp);
         assert!(requested_session_id(&json!({ "sessionId": " " })).is_err());
     }
 

@@ -29,6 +29,7 @@
 
 mod content;
 mod history;
+mod mcp;
 
 use crate::agent::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, ToolApprovalDecision, ToolApprovalHandler,
@@ -188,6 +189,8 @@ struct AcpSessionState {
     /// out during prompt execution without holding the session lock.
     agent_session: Option<AgentSession>,
     cwd: PathBuf,
+    /// Remains reachable during a turn so EOF/exit can close external tools.
+    mcp: Option<Arc<mcp::SessionMcp>>,
 }
 
 // ============================================================================
@@ -366,6 +369,8 @@ async fn run(
         Arc::new(Mutex::new(HashMap::new()));
     let initialized = Arc::new(AtomicBool::new(false));
 
+    // Capture dispatch errors so every exit path still tears down MCP state.
+    let result: Result<()> = async {
     while let Ok(line) = in_rx.recv(&cx).await {
         let raw_message: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
@@ -442,6 +447,15 @@ async fn run(
                     continue;
                 }
 
+                // Validate the entire definition list before constructing state.
+                // The constructor repeats this for non-dispatch callers/tests.
+                let validated = history::requested_cwd(&request.params)
+                    .map_err(|error| error.message)
+                    .and_then(|cwd| crate::mcp::config::parse_acp_servers(&request.params, &cwd).map(|_| ()));
+                if let Err(error) = validated {
+                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                    continue;
+                }
                 let permission_client = AcpPermissionClient {
                     out_tx: out_tx.clone(),
                     pending: Arc::clone(&pending_permissions),
@@ -478,8 +492,11 @@ async fn run(
                         ];
 
                         let config_options = config_options_for(&state, &options.available_models);
+                        let mcp_state = state.mcp.clone();
                         let state_arc = Arc::new(Mutex::new(state));
-                        if let Ok(mut guard) = sessions.lock(&cx).await {
+                        {
+                            let mut guard = sessions.lock(&cx).await
+                                .map_err(|_| Error::session("Session registry is unavailable"))?;
                             guard.insert(session_id.clone(), state_arc);
                         }
 
@@ -495,6 +512,10 @@ async fn run(
                                 "modes": modes,
                             }),
                         ));
+                        if let Some(mcp_state) = mcp_state {
+                            mcp::announce(&mcp_state, &session_id, &out_tx).await
+                                .map_err(Error::session)?;
+                        }
                     }
                     Err(err) => {
                         let _ = out_tx.send(json_rpc_error(
@@ -544,6 +565,13 @@ async fn run(
                     continue;
                 };
 
+                let mcp_command = match mcp::command_from_prompt(prompt_blocks) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                        continue;
+                    }
+                };
                 let message_content = match content::extract_prompt_content(prompt_blocks) {
                     Ok(content) => content,
                     Err(err) => {
@@ -589,7 +617,9 @@ async fn run(
                 let _ = prompt_counter.fetch_add(1, Ordering::SeqCst);
 
                 let (abort_handle, abort_signal) = AbortHandle::new();
-                if let Ok(mut guard) = active_prompts.lock(&cx).await {
+                {
+                    let mut guard = active_prompts.lock(&cx).await
+                        .map_err(|_| Error::session("Active prompt registry is unavailable"))?;
                     guard.insert(session_id.clone(), abort_handle);
                 }
 
@@ -606,6 +636,7 @@ async fn run(
                     let stop_reason = run_prompt(
                         session_state,
                         message_content,
+                        mcp_command,
                         abort_signal,
                         out_tx_prompt.clone(),
                         prompt_session_id.clone(),
@@ -1017,8 +1048,16 @@ async fn run(
             }
         }
     }
-
     Ok(())
+    }.await;
+
+    let cleanup = AgentCx::for_request();
+    if let Ok(guard) = active_prompts.lock(&cleanup).await {
+        for abort in guard.values() { abort.abort(); }
+    }
+    if let Ok(mut pending) = pending_permissions.lock() { pending.clear(); }
+    mcp::shutdown(&sessions).await;
+    result
 }
 
 // ============================================================================
@@ -1218,7 +1257,7 @@ fn handle_initialize() -> Value {
             // reopen persisted stores when --session-dir is configured.
             "loadSession": true,
             "mcpCapabilities": {
-                "http": false,
+                "http": true,
                 "sse": false,
             },
             "promptCapabilities": content::prompt_capabilities(),
@@ -1429,16 +1468,21 @@ fn handle_session_new(
     options: &AcpOptions,
     permission_client: Option<&AcpPermissionClient>,
 ) -> Result<(String, AcpSessionState)> {
-    let cwd = params.get("cwd").and_then(Value::as_str).map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        PathBuf::from,
-    );
+    let cwd = history::requested_cwd(params).map_err(|error| Error::session(error.message))?;
+    let servers = crate::mcp::config::parse_acp_servers(params, &cwd)
+        .map_err(Error::session)?.unwrap_or_default();
 
     // Create the backing session. Persists to disk when --session-dir is set
     // (save_enabled), otherwise in-memory (existing default behavior).
     let (session, save_enabled) =
         new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
-    build_acp_session(session, save_enabled, cwd, options, permission_client)
+    let (id, mut state) = build_acp_session(session, save_enabled, cwd.clone(), options, permission_client)?;
+    let mcp_state = mcp::prepare(&cwd, &Config::global_dir(), servers);
+    if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
+        mcp::mount(agent, mcp_state);
+    }
+    state.mcp = mcp_state;
+    Ok((id, state))
 }
 
 /// New and reopened sessions use the same tool registry, approval handler,
@@ -1552,6 +1596,7 @@ fn build_acp_session(
         AcpSessionState {
             agent_session: Some(agent_session),
             cwd,
+            mcp: None,
         },
     ))
 }
@@ -1819,6 +1864,7 @@ async fn apply_set_config_option(
 async fn run_prompt(
     session_state: Arc<Mutex<AcpSessionState>>,
     message: Vec<ContentBlock>,
+    mcp_command: Option<mcp::Command>,
     abort_signal: AbortSignal,
     out_tx: std::sync::mpsc::SyncSender<String>,
     session_id: String,
@@ -1830,28 +1876,37 @@ async fn run_prompt(
     // Holding the session mutex across the whole turn would block session/cancel
     // and session/list. The concurrent-prompt guard upstream guarantees only one
     // task is in here per session at a time, so the Option swap is safe.
-    let mut agent_session = {
+    let (mut agent_session, mcp_state) = {
         let Ok(mut guard) = session_state.lock(&cx).await else {
             return ACP_STOP_REASON_ERROR;
         };
         let Some(agent) = guard.agent_session.take() else {
             return ACP_STOP_REASON_ERROR;
         };
-        agent
+        (agent, guard.mcp.clone())
     };
 
-    let result = agent_session
-        .run_with_content_with_abort(message, Some(abort_signal), event_handler)
-        .await;
+    let prepared = mcp::before_prompt(
+        mcp_state.as_ref(), &mut agent_session, mcp_command,
+        &abort_signal, &cx, &out_tx, &session_id,
+    ).await;
+    let stop_reason = if let Some(reason) = prepared {
+        reason
+    } else {
+        match agent_session
+            .run_with_content_with_abort(message, Some(abort_signal), event_handler)
+            .await
+        {
+            Ok(message) => map_stop_reason(message.stop_reason),
+            Err(_) => ACP_STOP_REASON_ERROR,
+        }
+    };
 
     if let Ok(mut guard) = session_state.lock(&cx).await {
         guard.agent_session = Some(agent_session);
     }
 
-    match result {
-        Ok(msg) => map_stop_reason(msg.stop_reason),
-        Err(_) => ACP_STOP_REASON_ERROR,
-    }
+    stop_reason
 }
 
 // ACP stopReason values per the protocol spec.
@@ -2294,7 +2349,7 @@ mod tests {
         // mcpCapabilities advertised explicitly so the client knows transports.
         assert_eq!(
             result["agentCapabilities"]["mcpCapabilities"]["http"],
-            false
+            true
         );
         assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["sse"], false);
         // Tool approval is exposed as implementation metadata; the standard
@@ -2764,6 +2819,7 @@ mod tests {
         let state = Arc::new(Mutex::new(AcpSessionState {
             agent_session: Some(agent_session),
             cwd: PathBuf::from("."),
+            mcp: None,
         }));
         (state, auth, registry)
     }
