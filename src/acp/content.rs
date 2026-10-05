@@ -222,20 +222,56 @@ fn append_resource(
 }
 
 /// ACP wraps a tool's display content in `type: content` envelopes.
-/// The agent's tool status remains owned by the event dispatcher.
+/// Preserve each block in order: joining only text silently discarded tool
+/// screenshots and all media. Private signatures, reasoning, and internal tool
+/// calls are not display content. Status remains owned by the event dispatcher.
 pub(super) fn tool_result_content(blocks: &[ContentBlock]) -> Vec<Value> {
-    let text = blocks
+    blocks
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
+        .filter_map(|block| {
+            let content = match block {
+                ContentBlock::Text(text) => json!({ "type": "text", "text": text.text }),
+                ContentBlock::Image(image) => json!({
+                    "type": "image", "data": image.data, "mimeType": image.mime_type,
+                }),
+                ContentBlock::Media(media) => match media.input_type() {
+                    Some(crate::provider::InputType::Audio) => json!({
+                        "type": "audio", "data": media.data, "mimeType": media.mime_type,
+                    }),
+                    Some(crate::provider::InputType::Video) => embedded_video(media),
+                    _ => json!({ "type": "text", "text": media.placeholder() }),
+                },
+                ContentBlock::Thinking(_)
+                | ContentBlock::RedactedThinking(_)
+                | ContentBlock::ToolCall(_) => return None,
+            };
+            Some(json!({ "type": "content", "content": content }))
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.is_empty() {
-        return Vec::new();
+        .collect()
+}
+
+/// ACP v1 has no video variant. Carry the bytes as an embedded binary resource
+/// rather than dropping them, labeling them as an image, or inventing a local
+/// file URL. This content-addressed URI identifies the inline data; it is not a
+/// separately fetchable resource or an authorization to read anything.
+fn embedded_video(media: &crate::model::MediaContent) -> Value {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"pi:acp:inline-video:v1\0");
+    for part in [&media.mime_type, &media.data] {
+        hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(part.as_bytes());
     }
-    vec![json!({ "type": "content", "content": { "type": "text", "text": text } })]
+    let hash = crate::package_manager::hex_encode(&hasher.finalize());
+    json!({
+        "type": "resource",
+        "resource": {
+            "uri": format!("urn:pi:acp:video:sha256:{hash}"),
+            "mimeType": media.mime_type,
+            "blob": media.data,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -418,5 +454,182 @@ mod tests {
         })])
         .unwrap();
         assert_eq!(text(&blocks[0]), "https://example.invalid/private");
+    }
+
+    #[test]
+    fn tool_results_preserve_text_image_audio_order_and_native_payloads() {
+        let blocks = [
+            ContentBlock::Text(TextContent::new("Before screenshot")),
+            ContentBlock::Image(ImageContent {
+                data: PNG.to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Text(TextContent::new("After screenshot")),
+            ContentBlock::Media(crate::model::MediaContent {
+                data: "UklGRg==".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: Some("voice.wav".to_string()),
+            }),
+        ];
+        let content = tool_result_content(&blocks);
+        assert_eq!(content.len(), 4);
+        assert!(content.iter().all(|block| block["type"] == "content"));
+        assert_eq!(content[0]["content"]["text"], "Before screenshot");
+        assert_eq!(content[1]["content"]["type"], "image");
+        assert_eq!(content[1]["content"]["data"], PNG);
+        assert_eq!(content[1]["content"]["mimeType"], "image/png");
+        assert_eq!(content[2]["content"]["text"], "After screenshot");
+        assert_eq!(content[3]["content"]["type"], "audio");
+        assert_eq!(content[3]["content"]["data"], "UklGRg==");
+        assert_eq!(content[3]["content"]["mimeType"], "audio/wav");
+    }
+
+    #[test]
+    fn video_tool_result_is_an_inline_resource_not_a_phantom_file_link() {
+        let media = crate::model::MediaContent {
+            data: "dmlkZW8=".to_string(),
+            mime_type: "video/mp4".to_string(),
+            name: Some("../../not-a-real-file.mp4".to_string()),
+        };
+        let content = tool_result_content(&[ContentBlock::Media(media.clone())]);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["content"]["type"], "resource");
+        let resource = &content[0]["content"]["resource"];
+        assert_eq!(resource["blob"], media.data);
+        assert_eq!(resource["mimeType"], "video/mp4");
+        let uri = resource["uri"].as_str().unwrap();
+        let digest = uri.strip_prefix("urn:pi:acp:video:sha256:").unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!uri.contains("not-a-real-file"));
+        assert_eq!(embedded_video(&media), content[0]["content"]);
+
+        let mut different = media.clone();
+        different.data = "b3RoZXI=".to_string();
+        assert_ne!(embedded_video(&different)["resource"]["uri"], resource["uri"]);
+        different = media;
+        different.mime_type = "video/webm".to_string();
+        assert_ne!(embedded_video(&different)["resource"]["uri"], resource["uri"]);
+    }
+
+    #[test]
+    fn tool_display_excludes_reasoning_signatures_and_internal_tool_calls() {
+        let blocks = [
+            ContentBlock::Text(TextContent {
+                text: "Public result".to_string(),
+                text_signature: Some("private-text-signature".to_string()),
+            }),
+            ContentBlock::Thinking(crate::model::ThinkingContent {
+                thinking: "private-tool-reasoning".to_string(),
+                thinking_signature: Some("private-thinking-signature".to_string()),
+            }),
+            ContentBlock::RedactedThinking(crate::model::RedactedThinkingContent {
+                data: "opaque-redacted-provider-state".to_string(),
+            }),
+            serde_json::from_value(json!({
+                "type": "toolCall", "id": "internal-id", "name": "bash",
+                "arguments": { "command": "private-internal-command" }
+            }))
+            .unwrap(),
+        ];
+        assert_eq!(
+            tool_result_content(&blocks),
+            vec![json!({
+                "type": "content", "content": { "type": "text", "text": "Public result" }
+            })]
+        );
+    }
+
+    #[test]
+    fn unsupported_media_is_explained_without_dumping_binary_into_text() {
+        let blocks = [ContentBlock::Media(crate::model::MediaContent {
+            data: "cHJpdmF0ZS1iaW5hcnk=".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            name: Some("attachment.bin".to_string()),
+        })];
+        let content = tool_result_content(&blocks);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["content"]["type"], "text");
+        let text = content[0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("media omitted"));
+        assert!(text.contains("attachment.bin"));
+        assert!(!text.contains("cHJpdmF0ZS1iaW5hcnk="));
+    }
+
+    #[test]
+    fn empty_tool_results_can_clear_prior_client_content() {
+        assert_eq!(tool_result_content(&[]), Vec::<Value>::new());
+        assert_eq!(
+            tool_result_content(&[ContentBlock::Text(TextContent::new(""))]),
+            vec![json!({ "type": "content", "content": { "type": "text", "text": "" } })]
+        );
+    }
+
+    fn screenshot_output() -> crate::tools::ToolOutput {
+        crate::tools::ToolOutput {
+            content: vec![ContentBlock::Image(ImageContent {
+                data: PNG.to_string(),
+                mime_type: "image/png".to_string(),
+            })],
+            details: Some(json!({ "private": "not-display-content" })),
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn acp_event_handler_sends_image_only_progress_and_final_results() {
+        use crate::agent::AgentEvent;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let handler = super::super::build_acp_event_handler(tx, "editor-session".to_string());
+        handler(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "capture-1".to_string(),
+            tool_name: "browser".to_string(),
+            args: json!({}),
+            partial_result: screenshot_output(),
+        });
+        handler(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "capture-1".to_string(),
+            tool_name: "browser".to_string(),
+            result: screenshot_output(),
+            is_error: false,
+        });
+        for status in ["in_progress", "completed"] {
+            let line = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            let message: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(message["method"], "session/update");
+            assert_eq!(message["params"]["sessionId"], "editor-session");
+            let update = &message["params"]["update"];
+            assert_eq!(update["sessionUpdate"], "tool_call_update");
+            assert_eq!(update["toolCallId"], "capture-1");
+            assert_eq!(update["status"], status);
+            assert_eq!(update["content"][0]["content"]["type"], "image");
+            assert_eq!(update["content"][0]["content"]["data"], PNG);
+            assert!(!line.contains("not-display-content"));
+        }
+        assert!(rx.try_recv().is_err(), "one notification per event");
+    }
+
+    #[test]
+    fn failed_tool_keeps_its_error_status_and_visual_evidence() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let handler = super::super::build_acp_event_handler(tx, "editor-session".to_string());
+        let mut result = screenshot_output();
+        result.is_error = true;
+        result
+            .content
+            .insert(0, ContentBlock::Text(TextContent::new("Visual check failed")));
+        handler(crate::agent::AgentEvent::ToolExecutionEnd {
+            tool_call_id: "failed-check".to_string(),
+            tool_name: "browser".to_string(),
+            result,
+            is_error: true,
+        });
+        let line = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let message: Value = serde_json::from_str(&line).unwrap();
+        let update = &message["params"]["update"];
+        assert_eq!(update["status"], "failed");
+        assert_eq!(update["content"][0]["content"]["text"], "Visual check failed");
+        assert_eq!(update["content"][1]["content"]["data"], PNG);
     }
 }
