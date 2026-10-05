@@ -27,6 +27,8 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::significant_drop_tightening)]
 
+mod content;
+
 use crate::agent::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, ToolApprovalDecision, ToolApprovalHandler,
     ToolApprovalRequest,
@@ -528,9 +530,9 @@ async fn run(
                     continue;
                 };
 
-                // ACP wire shape: `prompt` is a ContentBlock[]. Concatenate text
-                // blocks; anything we don't yet support (image/audio/resource)
-                // surfaces a clear capability error rather than silently dropping.
+                // Decode the complete ContentBlock[] before starting a turn.
+                // Images stay native image blocks, and embedded editor context
+                // retains its provenance without implicitly opening its URI.
                 let prompt_blocks = request.params.get("prompt").and_then(Value::as_array);
                 let Some(prompt_blocks) = prompt_blocks else {
                     let _ = out_tx.send(json_rpc_error(
@@ -541,8 +543,8 @@ async fn run(
                     continue;
                 };
 
-                let message_text = match extract_prompt_text(prompt_blocks) {
-                    Ok(text) => text,
+                let message_content = match content::extract_prompt_content(prompt_blocks) {
+                    Ok(content) => content,
                     Err(err) => {
                         let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
                         continue;
@@ -602,7 +604,7 @@ async fn run(
                 options.runtime_handle.spawn(async move {
                     let stop_reason = run_prompt(
                         session_state,
-                        message_text,
+                        message_content,
                         abort_signal,
                         out_tx_prompt.clone(),
                         prompt_session_id.clone(),
@@ -1253,11 +1255,7 @@ fn handle_initialize() -> Value {
                 "http": false,
                 "sse": false,
             },
-            "promptCapabilities": {
-                "audio": false,
-                "embeddedContext": false,
-                "image": false,
-            },
+            "promptCapabilities": content::prompt_capabilities(),
             // `session/list` is implemented (GH #245). `loadSession` stays
             // false: ACP's `session/load` must replay the whole conversation
             // as `session/update`s, and ours only re-attaches a live session.
@@ -1834,7 +1832,7 @@ async fn apply_set_config_option(
 /// `session/prompt` response (which only completes when the turn does).
 async fn run_prompt(
     session_state: Arc<Mutex<AcpSessionState>>,
-    message: String,
+    message: Vec<ContentBlock>,
     abort_signal: AbortSignal,
     out_tx: std::sync::mpsc::SyncSender<String>,
     session_id: String,
@@ -1857,7 +1855,7 @@ async fn run_prompt(
     };
 
     let result = agent_session
-        .run_text_with_abort(message, Some(abort_signal), event_handler)
+        .run_with_content_with_abort(message, Some(abort_signal), event_handler)
         .await;
 
     if let Ok(mut guard) = session_state.lock(&cx).await {
@@ -1891,11 +1889,8 @@ const fn map_stop_reason(reason: crate::model::StopReason) -> &'static str {
     }
 }
 
-/// Extract a single text string from an ACP `prompt: ContentBlock[]`.
-///
-/// Per the spec, baseline support is `text` and `resource_link` blocks. We accept
-/// either, concatenate text and link URIs in order, and reject any block whose
-/// type we did not advertise as supported in `agentCapabilities.promptCapabilities`.
+/// Extract baseline text/link content. Rich prompt blocks are handled by the
+/// content module and must never be flattened through this text-only helper.
 fn extract_prompt_text(blocks: &[Value]) -> std::result::Result<String, String> {
     let mut out = String::new();
     for block in blocks {
@@ -1913,8 +1908,7 @@ fn extract_prompt_text(blocks: &[Value]) -> std::result::Result<String, String> 
                 out.push_str(text);
             }
             "resource_link" => {
-                // Surface the URI inline. Clients that want richer handling can
-                // upgrade once we advertise embeddedContext: true.
+                // Surface the URI inline without implicitly opening it.
                 let Some(uri) = block.get("uri").and_then(Value::as_str) else {
                     return Err(
                         "Prompt block of type \"resource_link\" missing required field \"uri\""
@@ -1933,7 +1927,7 @@ fn extract_prompt_text(blocks: &[Value]) -> std::result::Result<String, String> 
             }
             other => {
                 return Err(format!(
-                    "Prompt block type \"{other}\" is not supported by this agent (advertised capabilities only allow text and resource_link)"
+                    "Prompt block type \"{other}\" is not supported by the text-only content decoder"
                 ));
             }
         }
@@ -1994,25 +1988,14 @@ fn build_acp_event_handler(
                 args: _,
                 partial_result,
             } => {
-                let content_text = partial_result
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let tool_content = content::tool_result_content(&partial_result.content);
                 let mut update = json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": tool_call_id,
                     "status": "in_progress",
                 });
-                if !content_text.is_empty() {
-                    update["content"] = json!([{
-                        "type": "content",
-                        "content": { "type": "text", "text": content_text },
-                    }]);
+                if !tool_content.is_empty() {
+                    update["content"] = json!(tool_content);
                 }
                 Some(update)
             }
@@ -2023,24 +2006,13 @@ fn build_acp_event_handler(
                 result,
                 is_error,
             } => {
-                let content_text = result
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let tool_content = content::tool_result_content(&result.content);
 
                 Some(json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": tool_call_id,
                     "status": if *is_error { "failed" } else { "completed" },
-                    "content": [{
-                        "type": "content",
-                        "content": { "type": "text", "text": content_text },
-                    }],
+                    "content": tool_content,
                 }))
             }
 
@@ -2320,14 +2292,18 @@ mod tests {
         assert_eq!(result["agentCapabilities"]["loadSession"], false);
         // GH #245: session/list is implemented, so it is advertised.
         assert!(result["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
-        // promptCapabilities advertise text/resource_link baseline only.
+        // Native image and embedded-context prompt decoding is wired to the agent.
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["audio"],
             false
         );
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["image"],
-            false
+            true
+        );
+        assert_eq!(
+            result["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            true
         );
         // mcpCapabilities advertised explicitly so the client knows transports.
         assert_eq!(
@@ -2484,8 +2460,8 @@ mod tests {
 
     #[test]
     fn extract_prompt_text_rejects_unsupported_block_type() {
-        // We advertise audio: false / image: false in agentCapabilities, so
-        // the only honest behavior on those blocks is a clear capability error.
+        // The text-only helper must not silently flatten images. Rich prompt
+        // decoding and native image preservation are covered by content tests.
         let blocks = vec![json!({ "type": "image", "data": "base64..." })];
         let err = extract_prompt_text(&blocks).expect_err("should reject");
         assert!(err.contains("not supported"), "got: {err}");
