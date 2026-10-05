@@ -1554,7 +1554,10 @@ pub enum UiCommand {
     SetThinking(Option<crate::model::ThinkingLevel>),
     /// `/fast [on|off|status]`: toggle, set or report fast mode (the
     /// `priority` service tier; OMP `/fast`).
-    Fast(FastRequest),
+    Fast(ToggleRequest),
+    /// `/skillful [on|off|status]`: list skills in the system prompt for
+    /// this session or leave them out (OMP `/skillful`).
+    Skillful(ToggleRequest),
     /// List the user messages on the current path for the rewind (or, with
     /// `fork`, fork) picker; the driver answers `PiMsg::MessagePicker`.
     MessagePicker { fork: bool },
@@ -3696,7 +3699,7 @@ impl PiFtuiModel {
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
-                     /thinking [level], /fast [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
+                     /thinking [level], /fast [on|off|status], /skillful [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
@@ -3933,20 +3936,23 @@ impl PiFtuiModel {
                 return true;
             }
             "/fast" => {
-                let request = match cmd_args.trim().to_ascii_lowercase().as_str() {
-                    "" | "toggle" => FastRequest::Toggle,
-                    "on" => FastRequest::On,
-                    "off" => FastRequest::Off,
-                    "status" => FastRequest::Status,
-                    _ => {
-                        self.push_entry(
-                            EntryRole::Error,
-                            String::from("Usage: /fast [on|off|status]"),
-                        );
-                        return true;
-                    }
-                };
-                self.send_command(UiCommand::Fast(request));
+                match ToggleRequest::parse(cmd_args) {
+                    Some(request) => self.send_command(UiCommand::Fast(request)),
+                    None => self.push_entry(
+                        EntryRole::Error,
+                        String::from("Usage: /fast [on|off|status]"),
+                    ),
+                }
+                return true;
+            }
+            "/skillful" => {
+                match ToggleRequest::parse(cmd_args) {
+                    Some(request) => self.send_command(UiCommand::Skillful(request)),
+                    None => self.push_entry(
+                        EntryRole::Error,
+                        String::from("Usage: /skillful [on|off|status]"),
+                    ),
+                }
                 return true;
             }
             "/thinking" | "/think" | "/t" => {
@@ -7164,13 +7170,66 @@ async fn run_rewind_command(
     }
 }
 
-/// What `/fast` was asked to do.
+/// What an `[on|off|status]` command (`/fast`, `/skillful`) was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FastRequest {
+pub enum ToggleRequest {
     Toggle,
     On,
     Off,
     Status,
+}
+
+impl ToggleRequest {
+    /// Parse the argument of an `[on|off|status]` command; bare or
+    /// `toggle` flips.
+    fn parse(arg: &str) -> Option<Self> {
+        match arg.trim().to_ascii_lowercase().as_str() {
+            "" | "toggle" => Some(Self::Toggle),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            "status" => Some(Self::Status),
+            _ => None,
+        }
+    }
+}
+
+/// OMP `/skillful`: list the available skills in the system prompt for this
+/// session, or leave them out (saves tokens with many skills). `block` is
+/// the skills block the session was built with; the live prompt is edited
+/// in place, so turning it off and on again restores the same listing.
+fn run_skillful_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    block: Option<&str>,
+    request: ToggleRequest,
+) -> PiMsg {
+    let Some(block) = block.filter(|block| !block.trim().is_empty()) else {
+        return PiMsg::System(String::from(
+            "No skills are loaded, so there is nothing to list.",
+        ));
+    };
+    let agent = &mut handle.session_mut().agent;
+    let prompt = agent.system_prompt().unwrap_or_default().to_string();
+    let listed = prompt.contains(block);
+    let want = match request {
+        ToggleRequest::Toggle => !listed,
+        ToggleRequest::On => true,
+        ToggleRequest::Off => false,
+        ToggleRequest::Status => {
+            return PiMsg::System(format!(
+                "Skill listing: {} for this session.",
+                if listed { "on" } else { "off" }
+            ));
+        }
+    };
+    if want && !listed {
+        agent.set_system_prompt(Some(format!("{prompt}{block}")));
+    } else if !want && listed {
+        agent.set_system_prompt(Some(prompt.replacen(block, "", 1)));
+    }
+    PiMsg::System(format!(
+        "Skill listing {} for this session.",
+        if want { "enabled" } else { "disabled" }
+    ))
 }
 
 /// How the current model's provider realizes fast mode, or `None` when it
@@ -7186,16 +7245,16 @@ fn fast_mode_realization(provider: &str) -> Option<&'static str> {
 /// Apply `/fast`. The tier lives in the session's stream options, so it
 /// survives model switches and simply goes unused on providers without one.
 /// Like OMP, turning it on is refused when the current model can't use it.
-fn run_fast_command(handle: &mut crate::sdk::AgentSessionHandle, request: FastRequest) -> PiMsg {
+fn run_fast_command(handle: &mut crate::sdk::AgentSessionHandle, request: ToggleRequest) -> PiMsg {
     let (provider, _) = handle.model();
     let realization = fast_mode_realization(&provider);
     let options = handle.session_mut().agent.stream_options_mut();
     let enabled = options.service_tier.as_deref() == Some("priority");
     let enable = match request {
-        FastRequest::Toggle => !enabled,
-        FastRequest::On => true,
-        FastRequest::Off => false,
-        FastRequest::Status => {
+        ToggleRequest::Toggle => !enabled,
+        ToggleRequest::On => true,
+        ToggleRequest::Off => false,
+        ToggleRequest::Status => {
             return PiMsg::System(match (enabled, realization) {
                 (true, Some(how)) => format!("Fast mode is on ({provider}: {how})."),
                 (true, None) => format!("Fast mode is on, but {provider} has no priority tier."),
@@ -8685,6 +8744,13 @@ pub fn run(
                         }
                         Ok(UiCommand::Fast(request)) => {
                             let _ = agent_tx.send(run_fast_command(&mut handle, request));
+                        }
+                        Ok(UiCommand::Skillful(request)) => {
+                            let _ = agent_tx.send(run_skillful_command(
+                                &mut handle,
+                                resume_template.skills_prompt.as_deref(),
+                                request,
+                            ));
                         }
                         Ok(UiCommand::Dump) => {
                             let _ = agent_tx.send(run_dump_command(&mut handle));
@@ -12813,6 +12879,75 @@ mod tests {
     /// `shell_command_prefix` from settings, as the classic stack does.
     #[cfg(unix)]
     #[test]
+    fn skillful_takes_the_skills_block_out_and_puts_it_back() {
+        let block = "\n\n<available_skills>skillful-marker</available_skills>";
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        runtime.block_on(async {
+            let mut handle = crate::sdk::create_agent_session(crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("dummy-key")),
+                working_directory: Some(cwd.path().to_path_buf()),
+                no_session: true,
+                skills_prompt: Some(block.to_string()),
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .expect("create session");
+            let listed = |handle: &crate::sdk::AgentSessionHandle| {
+                handle
+                    .session()
+                    .agent
+                    .system_prompt()
+                    .is_some_and(|p| p.contains("skillful-marker"))
+            };
+            let text = |msg: PiMsg| match msg {
+                PiMsg::System(text) => text,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert!(listed(&handle));
+            let before = handle.session().agent.system_prompt().map(str::to_string);
+            assert_eq!(
+                text(run_skillful_command(
+                    &mut handle,
+                    Some(block),
+                    ToggleRequest::Off
+                )),
+                "Skill listing disabled for this session."
+            );
+            assert!(!listed(&handle));
+            assert!(
+                text(run_skillful_command(
+                    &mut handle,
+                    Some(block),
+                    ToggleRequest::Status
+                ))
+                .contains("off")
+            );
+            run_skillful_command(&mut handle, Some(block), ToggleRequest::Toggle);
+            assert!(listed(&handle));
+            // Off then on keeps everything else in the prompt.
+            let after = handle.session().agent.system_prompt().map(str::to_string);
+            assert_eq!(
+                before.map(|p| p.replacen(block, "", 1)),
+                after.map(|p| p.replacen(block, "", 1))
+            );
+            // No skills loaded: says so and changes nothing.
+            assert!(
+                text(run_skillful_command(&mut handle, None, ToggleRequest::Off))
+                    .starts_with("No skills are loaded")
+            );
+            assert!(listed(&handle));
+        });
+        assert_eq!(ToggleRequest::parse(" ON "), Some(ToggleRequest::On));
+        assert_eq!(ToggleRequest::parse(""), Some(ToggleRequest::Toggle));
+        assert_eq!(ToggleRequest::parse("maybe"), None);
+    }
+
+    #[test]
     fn fast_command_sets_the_priority_tier_the_provider_sends() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -12838,27 +12973,27 @@ mod tests {
             };
 
             assert_eq!(
-                text(run_fast_command(&mut handle, FastRequest::Status)),
+                text(run_fast_command(&mut handle, ToggleRequest::Status)),
                 "Fast mode is off."
             );
             assert!(
-                text(run_fast_command(&mut handle, FastRequest::On))
+                text(run_fast_command(&mut handle, ToggleRequest::On))
                     .starts_with("Fast mode enabled")
             );
             assert_eq!(tier(&handle).as_deref(), Some("priority"));
             assert!(
-                text(run_fast_command(&mut handle, FastRequest::Status))
+                text(run_fast_command(&mut handle, ToggleRequest::Status))
                     .contains("service_tier=priority")
             );
             // Bare /fast toggles.
             assert_eq!(
-                text(run_fast_command(&mut handle, FastRequest::Toggle)),
+                text(run_fast_command(&mut handle, ToggleRequest::Toggle)),
                 "Fast mode disabled."
             );
             assert_eq!(tier(&handle), None);
-            run_fast_command(&mut handle, FastRequest::Toggle);
+            run_fast_command(&mut handle, ToggleRequest::Toggle);
             assert_eq!(tier(&handle).as_deref(), Some("priority"));
-            run_fast_command(&mut handle, FastRequest::Off);
+            run_fast_command(&mut handle, ToggleRequest::Off);
             assert_eq!(tier(&handle), None);
         });
 
@@ -13060,10 +13195,10 @@ mod tests {
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         for (typed, request) in [
-            ("/fast", FastRequest::Toggle),
-            ("/fast on", FastRequest::On),
-            ("/fast OFF", FastRequest::Off),
-            ("/fast status", FastRequest::Status),
+            ("/fast", ToggleRequest::Toggle),
+            ("/fast on", ToggleRequest::On),
+            ("/fast OFF", ToggleRequest::Off),
+            ("/fast status", ToggleRequest::Status),
         ] {
             type_str(&mut sim, typed);
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
