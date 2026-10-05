@@ -17,8 +17,10 @@ use crate::session_index::{SessionIndex, SessionMeta};
 use asupersync::channel::oneshot;
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, timeout, wall_now};
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -328,30 +330,186 @@ async fn replay_message(message: &Message, id: &str, out: &SyncSender<String>) -
     Ok(())
 }
 
-/// The live catalog is always usable, including non-persisted sessions.
-/// Disk discovery and pagination are layered onto this same management path.
+const CATALOG_PAGE_SIZE: usize = 50;
+const MAX_CURSOR_BYTES: usize = 4096;
+
+#[derive(Debug)]
+struct CatalogRow {
+    id: String,
+    cwd: PathBuf,
+    title: Option<String>,
+    updated_ms: i64,
+}
+
+impl CatalogRow {
+    fn to_value(&self) -> Value {
+        let mut row = json!({ "sessionId": self.id, "cwd": self.cwd });
+        if let Some(title) = self.title.as_deref() {
+            // Titles are display labels, not a channel for terminal controls
+            // or unbounded session content. Do not expose the backing path.
+            let title: String = title.chars()
+                .filter(|ch| !ch.is_control() && !matches!(ch,
+                    '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+                .take(256).collect();
+            if !title.trim().is_empty() {
+                row["title"] = json!(title);
+            }
+        }
+        if let Some(timestamp) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(self.updated_ms) {
+            row["updatedAt"] = json!(timestamp.to_rfc3339());
+        }
+        row
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogCursor {
+    version: u8,
+    scope: String,
+    updated_ms: i64,
+    id: String,
+}
+
+fn catalog_scope(root: Option<&Path>, cwd: Option<&Path>) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"pi:acp:session-list:v1\0");
+    for path in [root, cwd] {
+        hash.update([u8::from(path.is_some())]);
+        if let Some(path) = path {
+            let path = path.to_string_lossy();
+            hash.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hash.update(path.as_bytes());
+        }
+    }
+    crate::package_manager::hex_encode(&hash.finalize())
+}
+
+fn decode_cursor(params: &Value, scope: &str) -> HistoryResult<Option<CatalogCursor>> {
+    let raw = match params.get("cursor") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(raw) => raw,
+    };
+    let raw = raw.as_str().filter(|value| !value.is_empty() && value.len() <= MAX_CURSOR_BYTES)
+        .ok_or_else(|| HistoryError::invalid("Invalid session-list cursor"))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw)
+        .map_err(|_| HistoryError::invalid("Invalid session-list cursor"))?;
+    let cursor: CatalogCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| HistoryError::invalid("Invalid session-list cursor"))?;
+    if cursor.version != 1 || cursor.scope != scope || cursor.id.is_empty() || cursor.id.len() > 1024 {
+        return Err(HistoryError::invalid("Session-list cursor is invalid for this workspace or session root"));
+    }
+    Ok(Some(cursor))
+}
+
+/// Keyset pagination, not an offset into a changing catalog. A new session
+/// arriving ahead of the cursor cannot shift old rows onto the wrong page.
+fn catalog_page(mut rows: Vec<CatalogRow>, cursor: Option<&CatalogCursor>, scope: &str) -> HistoryResult<Value> {
+    rows.sort_by(|left, right| right.updated_ms.cmp(&left.updated_ms).then_with(|| left.id.cmp(&right.id)));
+    if let Some(cursor) = cursor {
+        rows.retain(|row| row.updated_ms < cursor.updated_ms
+            || (row.updated_ms == cursor.updated_ms && row.id > cursor.id));
+    }
+    let has_more = rows.len() > CATALOG_PAGE_SIZE;
+    rows.truncate(CATALOG_PAGE_SIZE);
+    let mut result = json!({ "sessions": rows.iter().map(CatalogRow::to_value).collect::<Vec<_>>() });
+    if has_more && let Some(last) = rows.last() {
+        let cursor = CatalogCursor {
+            version: 1, scope: scope.to_string(), updated_ms: last.updated_ms, id: last.id.clone(),
+        };
+        let bytes = serde_json::to_vec(&cursor)
+            .map_err(|error| HistoryError::internal(format!("Cannot encode session-list cursor: {error}")))?;
+        result["nextCursor"] = json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes));
+    }
+    Ok(result)
+}
+
+/// Live sessions and disk history share one catalog. Discovery does not
+/// construct providers, replay messages, or switch the client's session.
 pub(super) async fn list(
     params: &Value,
-    _options: &AcpOptions,
+    options: &AcpOptions,
     sessions: &AcpSessionsMap,
     cx: &AgentCx,
 ) -> HistoryResult<Value> {
-    let filter = if params.get("cwd").is_some() { Some(requested_cwd(params)?) } else { None };
+    let filter = match params.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(requested_cwd(params)?),
+    };
+    let root = options.session_dir.as_deref().map(|root| root.canonicalize()).transpose();
+    let root = match root {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(HistoryError::internal(format!("Cannot access configured session directory: {error}"))),
+    };
+    let scope = catalog_scope(root.as_deref(), filter.as_deref());
+    let cursor = decode_cursor(params, &scope)?;
+    let mut rows = HashMap::<String, CatalogRow>::new();
+    if let Some(root) = root.as_deref() {
+        let mut paths = HashSet::new();
+        for meta in saved_catalog(root).await? {
+            if meta.id.trim().is_empty() || meta.id.len() > 1024 {
+                continue;
+            }
+            // Cached metadata is only a discovery hint, not permission to
+            // expose sessions reached by a symlink outside the configured root.
+            let Ok(path) = Path::new(&meta.path).canonicalize() else { continue };
+            if !path.starts_with(root) || !path.is_file()
+                || crate::session::ensure_session_file_readable(&path).is_err()
+                || !paths.insert(path)
+            {
+                continue;
+            }
+            let Ok(cwd) = Path::new(&meta.cwd).canonicalize() else { continue };
+            if !cwd.is_dir() || filter.as_ref().is_some_and(|filter| filter != &cwd) {
+                continue;
+            }
+            if rows.contains_key(&meta.id) {
+                return Err(HistoryError::invalid("Ambiguous sessionId in saved catalog; multiple stores require resolution"));
+            }
+            rows.insert(meta.id.clone(), CatalogRow {
+                id: meta.id, cwd, title: meta.name, updated_ms: meta.last_modified_ms,
+            });
+        }
+    }
     let entries = {
         let guard = sessions.lock(cx).await
             .map_err(|_| HistoryError::internal("Session registry is unavailable"))?;
         guard.iter().map(|(id, state)| (id.clone(), Arc::clone(state))).collect::<Vec<_>>()
     };
-    let mut rows = Vec::new();
     for (id, state) in entries {
-        let state = state.lock(cx).await
+        let state = OwnedMutexGuard::lock(state, cx).await
             .map_err(|_| HistoryError::internal("Session state is unavailable"))?;
-        if filter.as_deref().is_none_or(|cwd| same_workspace(&state.cwd, cwd)) {
-            rows.push(json!({ "sessionId": id, "cwd": state.cwd }));
+        let cwd = state.cwd.canonicalize()
+            .map_err(|_| HistoryError::internal("Live session workspace is unavailable"))?;
+        if filter.as_ref().is_some_and(|filter| filter != &cwd) {
+            continue;
         }
+        let mut row = rows.remove(&id).unwrap_or_else(|| CatalogRow {
+            id: id.clone(), cwd: cwd.clone(), title: None, updated_ms: i64::MIN,
+        });
+        row.cwd = cwd;
+        if let Some(agent) = state.agent_session.as_ref() {
+            let session = OwnedMutexGuard::lock(Arc::clone(&agent.session), cx).await
+                .map_err(|_| HistoryError::internal("Live session metadata is unavailable"))?;
+            row.title = session.entries.iter().rev().find_map(|entry| match entry {
+                SessionEntry::SessionInfo(info) => info.name.clone(),
+                _ => None,
+            });
+            let latest = std::iter::once(session.header.timestamp.as_str())
+                .chain(session.entries.iter().map(|entry| entry.base().timestamp.as_str()))
+                .filter_map(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|timestamp| timestamp.timestamp_millis()).max();
+            if let Some(latest) = latest {
+                row.updated_ms = row.updated_ms.max(latest);
+            }
+        }
+        // A prompt temporarily takes the agent out of this state. Keep its
+        // catalog row visible and retain any known saved metadata while busy.
+        rows.insert(id, row);
     }
-    rows.sort_by(|left, right| left["sessionId"].as_str().cmp(&right["sessionId"].as_str()));
-    Ok(json!({ "sessions": rows }))
+    catalog_page(rows.into_values().collect(), cursor.as_ref(), &scope)
 }
 
 #[cfg(test)]
@@ -386,6 +544,213 @@ mod tests {
         session.append_model_message(user("Remember this conversation"));
         session.append_model_message(assistant("Preserved answer"));
         session
+    }
+
+    fn test_options(root: &Path, handle: asupersync::runtime::RuntimeHandle) -> AcpOptions {
+        let mut auth = AuthStorage::load(root.join("auth.json")).unwrap();
+        auth.set("anthropic", AuthCredential::ApiKey { key: "not-a-live-key".into() });
+        let registry = crate::models::ModelRegistry::load(&auth, None);
+        let entry = registry.find("anthropic", "claude-sonnet-4-5").unwrap();
+        AcpOptions {
+            config: crate::config::Config::default(), available_models: vec![entry],
+            model_registry: registry, auth, runtime_handle: handle,
+            session_dir: Some(root.into()), skills_prompt: None,
+        }
+    }
+
+    fn catalog_fixture(count: usize) -> Vec<CatalogRow> {
+        (0..count).rev().map(|index| CatalogRow {
+            id: format!("session-{index:03}"), cwd: PathBuf::from("/workspace"),
+            title: Some(format!("Conversation {index}")), updated_ms: 1000,
+        }).collect()
+    }
+
+    #[test]
+    fn catalog_pagination_keeps_older_rows_when_a_new_session_arrives() {
+        let scope = catalog_scope(None, Some(Path::new("/workspace")));
+        let first = catalog_page(catalog_fixture(105), None, &scope).unwrap();
+        assert_eq!(first["sessions"].as_array().unwrap().len(), 50);
+        assert_eq!(first["sessions"][0]["sessionId"], "session-000");
+        assert_eq!(first["sessions"][49]["sessionId"], "session-049");
+        let cursor = decode_cursor(&json!({ "cursor": first["nextCursor"] }), &scope).unwrap().unwrap();
+        let mut changed = catalog_fixture(105);
+        changed.push(CatalogRow {
+            id: "newer-session".into(), cwd: PathBuf::from("/workspace"),
+            title: None, updated_ms: 2000,
+        });
+        let second = catalog_page(changed, Some(&cursor), &scope).unwrap();
+        assert_eq!(second["sessions"].as_array().unwrap().len(), 50);
+        assert_eq!(second["sessions"][0]["sessionId"], "session-050");
+        assert_eq!(second["sessions"][49]["sessionId"], "session-099");
+        let cursor = decode_cursor(&json!({ "cursor": second["nextCursor"] }), &scope).unwrap().unwrap();
+        let third = catalog_page(catalog_fixture(105), Some(&cursor), &scope).unwrap();
+        assert_eq!(third["sessions"].as_array().unwrap().len(), 5);
+        assert_eq!(third["sessions"][4]["sessionId"], "session-104");
+        assert!(third.get("nextCursor").is_none());
+        assert!(catalog_page(Vec::new(), None, &scope).unwrap()["sessions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_cursors_reject_malformed_tokens_and_changed_scopes() {
+        let scope = catalog_scope(Some(Path::new("/sessions")), Some(Path::new("/one")));
+        let page = catalog_page(catalog_fixture(51), None, &scope).unwrap();
+        let params = json!({ "cursor": page["nextCursor"] });
+        for other in [
+            catalog_scope(Some(Path::new("/sessions")), Some(Path::new("/two"))),
+            catalog_scope(Some(Path::new("/other-sessions")), Some(Path::new("/one"))),
+            catalog_scope(Some(Path::new("/sessions")), None),
+        ] {
+            assert_eq!(decode_cursor(&params, &other).unwrap_err().code, INVALID_PARAMS);
+        }
+        for cursor in [json!(""), json!("not base64!"), json!(12), json!("x".repeat(MAX_CURSOR_BYTES + 1))] {
+            assert_eq!(decode_cursor(&json!({ "cursor": cursor }), &scope).unwrap_err().code, INVALID_PARAMS);
+        }
+        assert!(decode_cursor(&json!({ "cursor": null }), &scope).unwrap().is_none());
+        let mut forged = decode_cursor(&params, &scope).unwrap().unwrap();
+        forged.version = 2;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged).unwrap());
+        assert!(decode_cursor(&json!({ "cursor": raw }), &scope).is_err());
+    }
+
+    #[test]
+    fn catalog_titles_are_bounded_and_unknown_activity_is_not_invented() {
+        let row = CatalogRow {
+            id: "session".into(), cwd: PathBuf::from("/workspace"),
+            title: Some(format!("\u{1b}\n\u{202e}{}", "z".repeat(1000))),
+            updated_ms: i64::MIN,
+        }.to_value();
+        assert_eq!(row["title"].as_str().unwrap(), "z".repeat(256));
+        assert!(row.get("updatedAt").is_none());
+        assert!(row.get("path").is_none());
+    }
+
+    #[test]
+    fn list_discovers_saved_sessions_filters_workspaces_and_keeps_live_metadata() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let other_cwd = other.path().canonicalize().unwrap();
+            let mut saved = fixture(root.path(), &cwd);
+            saved.append_session_info(Some("Saved title".into()));
+            saved.save().await.unwrap();
+            let original_path = saved.path.clone().unwrap();
+            let original_bytes = std::fs::read(&original_path).unwrap();
+            let mut unrelated = fixture(root.path(), &other_cwd);
+            unrelated.save().await.unwrap();
+            let options = test_options(root.path(), handle);
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let cx = AgentCx::for_testing();
+            let all = list(&json!({}), &options, &sessions, &cx).await.unwrap();
+            assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
+            let selected = list(&json!({ "cwd": cwd }), &options, &sessions, &cx).await.unwrap();
+            assert_eq!(selected["sessions"].as_array().unwrap().len(), 1);
+            assert_eq!(selected["sessions"][0]["sessionId"], saved.header.id);
+            assert_eq!(selected["sessions"][0]["title"], "Saved title");
+            assert!(chrono::DateTime::parse_from_rfc3339(selected["sessions"][0]["updatedAt"].as_str().unwrap()).is_ok());
+            assert!(!selected.to_string().contains(original_path.file_name().unwrap().to_str().unwrap()));
+
+            saved.append_session_info(Some("Unsaved live title".into()));
+            let (id, state) = build_acp_session(saved, true, cwd.clone(), &options, None).unwrap();
+            sessions.lock(&cx).await.unwrap().insert(id.clone(), Arc::new(Mutex::new(state)));
+            let selected = list(&json!({ "cwd": cwd }), &options, &sessions, &cx).await.unwrap();
+            assert_eq!(selected["sessions"].as_array().unwrap().len(), 1);
+            assert_eq!(selected["sessions"][0]["sessionId"], id);
+            assert_eq!(selected["sessions"][0]["title"], "Unsaved live title");
+            assert_eq!(std::fs::read(original_path).unwrap(), original_bytes);
+        });
+    }
+
+    #[test]
+    fn listing_keeps_nonpersistent_busy_sessions_without_loading_global_history() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let mut saved = fixture(root.path(), &cwd);
+            saved.save().await.unwrap();
+            let mut options = test_options(root.path(), handle);
+            options.session_dir = None;
+            let sessions = Arc::new(Mutex::new(HashMap::from([(
+                "busy-session".to_string(), Arc::new(Mutex::new(super::super::AcpSessionState {
+                    agent_session: None, cwd: cwd.clone(),
+                })),
+            )])));
+            let cx = AgentCx::for_testing();
+            let result = list(&json!({ "cwd": null, "cursor": null }), &options, &sessions, &cx).await.unwrap();
+            assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+            assert_eq!(result["sessions"][0]["sessionId"], "busy-session");
+            assert!(result["sessions"][0].get("updatedAt").is_none());
+            options.session_dir = Some(root.path().join("not-created"));
+            assert_eq!(list(&json!({}), &options, &sessions, &cx).await.unwrap(), result);
+            assert!(!root.path().join("not-created").exists());
+        });
+    }
+
+    #[test]
+    fn catalog_reports_ambiguous_stores_instead_of_offering_the_wrong_session() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let mut saved = fixture(root.path(), &cwd);
+            saved.save().await.unwrap();
+            let path = saved.path.as_ref().unwrap();
+            std::fs::copy(path, path.with_file_name("same-id.jsonl")).unwrap();
+            let options = test_options(root.path(), handle);
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let cx = AgentCx::for_testing();
+            let error = list(&json!({}), &options, &sessions, &cx).await.unwrap_err();
+            assert_eq!(error.code, INVALID_PARAMS);
+            assert!(error.message.contains("Ambiguous"));
+        });
+    }
+
+    #[test]
+    fn dispatcher_lists_loads_and_resumes_after_a_restart_in_protocol_order() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let mut saved = fixture(root.path(), &cwd);
+            saved.save().await.unwrap();
+            let before = std::fs::read(saved.path.as_ref().unwrap()).unwrap();
+            let options = test_options(root.path(), handle);
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+            for request in [
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": 1 } }),
+                json!({ "jsonrpc": "2.0", "id": 2, "method": "session/list", "params": { "cwd": cwd } }),
+                json!({ "jsonrpc": "2.0", "id": 3, "method": "session/load", "params": { "sessionId": saved.header.id, "cwd": cwd, "mcpServers": [] } }),
+                json!({ "jsonrpc": "2.0", "id": 4, "method": "session/resume", "params": { "sessionId": saved.header.id, "cwd": cwd, "mcpServers": [] } }),
+                json!({ "jsonrpc": "2.0", "method": "exit" }),
+            ] {
+                in_tx.try_send(request.to_string()).unwrap();
+            }
+            super::super::run(options, in_rx, out_tx).await.unwrap();
+            let messages = out_rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
+            assert_eq!(messages.len(), 6);
+            assert_eq!(messages[0]["result"]["agentCapabilities"]["loadSession"], true);
+            assert_eq!(messages[1]["id"], 2);
+            assert_eq!(messages[1]["result"]["sessions"][0]["sessionId"], saved.header.id);
+            assert_eq!(messages[2]["params"]["update"]["sessionUpdate"], "user_message_chunk");
+            assert_eq!(messages[3]["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+            assert_eq!(messages[4]["id"], 3);
+            assert_eq!(messages[4]["result"]["configOptions"][1]["currentValue"], "off");
+            assert_eq!(messages[5]["id"], 4);
+            assert_eq!(messages[5]["result"]["resumed"], true);
+            assert!(messages.iter().all(|message| message["method"] != "session/request_permission"));
+            assert_eq!(std::fs::read(saved.path.as_ref().unwrap()).unwrap(), before);
+        });
     }
 
     #[test]
