@@ -323,7 +323,8 @@ async fn replay_message(message: &Message, id: &str, out: &SyncSender<String>) -
             })).await?;
         }
         Message::Custom(message) if message.display => {
-            replay_user_content(&message.content, "agent_message_chunk", id, out).await?;
+            // Native custom messages carry plain text, not UserContent blocks.
+            replay_text("agent_message_chunk", &message.content, id, out).await?;
         }
         Message::Custom(_) => {}
     }
@@ -927,7 +928,7 @@ mod tests {
             for display in [false, true] {
                 let message = Message::Custom(crate::model::CustomMessage {
                     custom_type: "extension-state".into(),
-                    content: UserContent::Text(if display { "visible" } else { "private" }.into()),
+                    content: if display { "visible" } else { "private" }.into(),
                     display, details: None, timestamp: 1,
                 });
                 replay_message(&message, "session", &tx).await.unwrap();
@@ -936,6 +937,44 @@ mod tests {
             assert_eq!(lines.len(), 1);
             assert!(lines[0].contains("visible"));
             assert!(!lines[0].contains("private"));
+        });
+    }
+
+    #[test]
+    fn custom_messages_round_trip_through_saved_history_without_private_metadata() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let mut session = Session::create_with_dir(Some(root.path().to_path_buf()));
+            session.header.cwd = root.path().display().to_string();
+            let visible = "Visible extension output: café 🦀\nsecond line";
+            for (display, text) in [(false, "hidden-extension-state"), (true, visible)] {
+                session.append_model_message(Message::Custom(crate::model::CustomMessage {
+                    content: text.to_string(),
+                    custom_type: "extension-status".to_string(),
+                    display,
+                    details: Some(json!({ "private": "private-custom-details" })),
+                    timestamp: 1,
+                }));
+            }
+            session.save().await.unwrap();
+            let path = session.path.as_ref().unwrap();
+            let before = std::fs::read(path).unwrap();
+            let restored = Session::open(path.to_str().unwrap()).await.unwrap();
+            let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            replay_session(&restored, &restored.header.id, &tx).await.unwrap();
+            let lines = rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1);
+            let notification: Value = serde_json::from_str(&lines[0]).unwrap();
+            assert_eq!(notification["method"], "session/update");
+            assert_eq!(notification["params"]["sessionId"], restored.header.id);
+            assert_eq!(notification["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+            assert_eq!(notification["params"]["update"]["content"], json!({
+                "type": "text", "text": visible,
+            }));
+            assert!(!lines[0].contains("hidden-extension-state"));
+            assert!(!lines[0].contains("private-custom-details"));
+            assert_eq!(std::fs::read(path).unwrap(), before);
         });
     }
 
