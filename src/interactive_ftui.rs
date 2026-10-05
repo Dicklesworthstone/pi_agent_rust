@@ -13220,6 +13220,39 @@ mod tests {
     }
 
     #[test]
+    fn skillful_slash_command_routes_to_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for (typed, request) in [
+            ("/skillful", ToggleRequest::Toggle),
+            ("/skillful toggle", ToggleRequest::Toggle),
+            ("/skillful on", ToggleRequest::On),
+            ("/skillful OFF", ToggleRequest::Off),
+            ("/skillful status", ToggleRequest::Status),
+        ] {
+            type_str(&mut sim, typed);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().expect("routed"),
+                UiCommand::Skillful(request),
+                "{typed}"
+            );
+        }
+        type_str(&mut sim, "/skillful maybe");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text.contains("Usage: /skillful"))
+        );
+    }
+
+    #[test]
     fn bash_ui_command_uses_configured_shell_and_prefix() {
         let config = crate::config::Config {
             shell_path: Some(String::from("/bin/sh")),
