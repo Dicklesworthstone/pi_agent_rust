@@ -9,6 +9,7 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
@@ -73,6 +74,10 @@ pub(super) struct SessionMcp {
     descriptions: Vec<(String, String)>,
     started: AtomicBool,
     refresh: StdMutex<CatalogRefresh>,
+    // ACP's host tool set is fixed at session construction. Preserve the
+    // actual handles and registry metadata, not newly constructed built-ins.
+    // Only this session's MCP overlay is replaced during catalog refresh.
+    host_registry: OnceLock<crate::tools::ToolRegistry>,
 }
 
 fn signatures(servers: &[ConfiguredServer], cwd: &Path) -> Vec<(String, String)> {
@@ -111,18 +116,36 @@ pub(super) fn prepare(
         descriptions,
         started: AtomicBool::new(false),
         refresh: StdMutex::new(CatalogRefresh::default()),
+        host_registry: OnceLock::new(),
     }))
 }
 
 pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
-    // Use the same first-class wrappers as the terminal and SDK surfaces.
-    // The manager remains owned by AcpSessionState, including during a turn.
-    // ToolRegistry::extend replaces a same-name entry and invalidates the
-    // agent's schema cache. Filtering existing names would permanently pin
-    // their old schemas/descriptions even after a successful tools/list.
-    // Retained wrappers for removed/denied tools still fail the native per-call
-    // catalog/trust check; this API does not remove registry entries.
-    agent.agent.extend_tools(crate::mcp::mount_tools(&state.manager));
+    let shared = agent.agent.shared_tools();
+    let current = shared.snapshot();
+    let host = state.host_registry.get_or_init(|| current.clone_shallow());
+    let mut next = host.clone_shallow();
+
+    // xdev promotions can change after construction. Keep those decisions
+    // without retaining the previous remote catalog. All tool handles, job
+    // scopes, workspace confinement, host picker, and undo recorder are shared
+    // by the shallow clone; none are reconstructed on an ordinary prompt.
+    for tool in host.tools() {
+        if !current.is_discoverable(tool.name()) {
+            next.mark_promoted(tool.name());
+        }
+    }
+
+    // The native manager exposes only complete, fresh, healthy, trusted
+    // catalogs. Replacing the overlay withdraws removed tools and resource/
+    // prompt context wrappers as well as adding or revising current tools.
+    // Do not filter by name prefix: a host tool is not owned by this manager
+    // merely because it has an MCP-looking name.
+    next.extend(crate::mcp::mount_tools(&state.manager));
+    shared.update(|registry| *registry = next);
+    // SharedToolRegistry's version invalidates the provider schema cache.
+    // Old snapshots held by an in-flight caller still use native per-call
+    // trust/catalog checks; publishing a new snapshot does not grant access.
 }
 
 /// Reattaching an existing live session must not silently swap out its tool
@@ -307,8 +330,7 @@ pub(super) async fn before_prompt(
             let Ok(text) = cancellable(signal, cx, execute(state, command)).await else {
                 return Some(ACP_STOP_REASON_CANCELLED);
             };
-            // Newly trusted tools become visible immediately. Old wrappers
-            // remain guarded by the manager's per-call trust check after deny.
+            // Publish the whole current overlay, including removals on deny.
             mount(agent, state);
             text
         } else {
@@ -550,7 +572,7 @@ mod tests {
                 entry.model.base_url = format!("{}/v1", server.url);
                 let provider = crate::providers::create_provider(&entry, None).unwrap();
                 let agent = crate::agent::Agent::new(
-                    provider, crate::tools::ToolRegistry::new(&[], root.path(), None),
+                    provider, crate::tools::ToolRegistry::new(&["read", "lsp"], root.path(), None),
                     crate::agent::AgentConfig {
                         stream_options: crate::provider::StreamOptions {
                             api_key: Some("local-fixture-only".into()),
@@ -564,6 +586,9 @@ mod tests {
                     crate::compaction::ResolvedCompactionSettings { enabled: false,
                         ..crate::compaction::ResolvedCompactionSettings::default() })
                     .with_runtime_handle(handle);
+                let shared = session.agent.shared_tools();
+                let host_snapshot = shared.snapshot();
+                assert!(host_snapshot.is_discoverable("lsp"));
                 let state = Arc::new(asupersync::sync::Mutex::new(super::super::AcpSessionState {
                     agent_session: Some(session), cwd: root.path().into(), mcp: Some(Arc::clone(&mcp)),
                 }));
@@ -581,6 +606,10 @@ mod tests {
                 let original = first["tools"].as_array().unwrap().iter()
                     .find(|tool| tool["function"]["name"] == name).unwrap();
                 assert!(original["function"]["parameters"]["properties"].get("old_field").is_some());
+                let admitted_snapshot = shared.snapshot();
+                // A real xdev promotion publishes through this same registry.
+                // Refresh must not reset it to the construction-time tier.
+                shared.update(|registry| registry.mark_promoted("lsp"));
 
                 *server.catalog.lock().unwrap() = json!({"tools": [
                     {"name":"echo", "description":"revised catalog description",
@@ -605,6 +634,8 @@ mod tests {
                     assert!(function["parameters"]["properties"].get("old_field").is_none());
                     assert_eq!(function["parameters"]["properties"]["new_field"]["type"], "integer");
                     assert!(tools.iter().any(|tool| tool["function"]["name"] == crate::mcp::mounted_name("remote", "added")));
+                    assert!(tools.iter().any(|tool| tool["function"]["name"] == "read"));
+                    assert!(tools.iter().any(|tool| tool["function"]["name"] == "lsp"));
                 }
 
                 // Advance the controller's clock seam, not native transport
@@ -618,12 +649,42 @@ mod tests {
                     tool["function"]["name"] == name && tool["function"]["description"].as_str()
                         .is_some_and(|description| description.contains("periodically refreshed description"))));
 
+                // Removal is not a schema update: the old name must disappear
+                // from both live dispatch and the next actual provider body.
+                *server.catalog.lock().unwrap() = json!({"tools":[{
+                    "name":"added", "inputSchema":{"type":"object"},
+                }]});
+                assert_eq!(run(Some(Command::Refresh)).await, ACP_STOP_REASON_END_TURN);
+                assert!(shared.snapshot().get(&name).is_none());
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                let removed = server.requests.lock().unwrap().last().unwrap().clone();
+                assert!(!provider_names(&removed).contains(&name));
+                // An already-held immutable snapshot is not retroactive
+                // authority. Its original wrapper still checks the manager.
+                let error = admitted_snapshot.get(&name).unwrap()
+                    .execute("obsolete-call", json!({"old_field":"value"}), None)
+                    .await.unwrap_err();
+                assert!(error.to_string().contains("MCP_UNKNOWN_TOOL"), "{error}");
+
+                // A valid zero-tool catalog keeps its resource/prompt context
+                // tool. An unavailable catalog, by contrast, withdraws all
+                // wrappers rather than advertising last-known-good authority.
+                *server.catalog.lock().unwrap() = json!({"tools":[]});
+                assert_eq!(run(Some(Command::Refresh)).await, ACP_STOP_REASON_END_TURN);
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                let empty = server.requests.lock().unwrap().last().unwrap().clone();
+                let names = provider_names(&empty);
+                assert!(!names.iter().any(|name| name.starts_with("mcp__remote__")));
+                assert!(names.iter().any(|name| name.starts_with("mcp_context_")));
+
                 // An invalid catalog genuinely retires the native connection.
                 // A later prompt must retry after its real first backoff,
                 // instead of treating the original startup as permanently done.
                 *server.catalog.lock().unwrap() = json!({"tools": null});
                 assert_eq!(run(Some(Command::Refresh)).await, ACP_STOP_REASON_END_TURN);
                 assert!(mcp.manager.list()[0].health.starts_with("unhealthy"));
+                assert!(!shared.snapshot().tools().iter().any(|tool|
+                    tool.name().starts_with("mcp__remote__") || tool.name().starts_with("mcp_context_")));
                 *server.catalog.lock().unwrap() = json!({"tools":[{
                     "name":"recovered", "description":"recovered catalog", "inputSchema":{"type":"object"},
                 }]});
@@ -633,6 +694,22 @@ mod tests {
                 let recovered = server.requests.lock().unwrap().last().unwrap().clone();
                 assert!(recovered["tools"].as_array().unwrap().iter().any(|tool|
                     tool["function"]["name"] == crate::mcp::mounted_name("remote", "recovered")));
+                assert!(!provider_names(&recovered).contains(&name));
+
+                // Persisted revocation by another owner is noticed at the next
+                // prompt, not only when this editor invokes /mcp deny.
+                crate::mcp::TrustStore::load(&root.path().join("mcp-trust.json")).unwrap()
+                    .deny("remote", &mcp.signatures[0].1, "operator").unwrap();
+                let lists_before_external_deny = server.lists.load(Ordering::Acquire);
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                assert_eq!(server.lists.load(Ordering::Acquire), lists_before_external_deny);
+                let denied = server.requests.lock().unwrap().last().unwrap().clone();
+                assert!(provider_names(&denied).iter().all(|name|
+                    !name.starts_with("mcp__remote__") && !name.starts_with("mcp_context_")));
+                assert_eq!(run(Some(Command::Trust("remote".into()))).await, ACP_STOP_REASON_END_TURN);
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                let trusted_again = server.requests.lock().unwrap().last().unwrap().clone();
+                assert!(provider_names(&trusted_again).contains(&crate::mcp::mounted_name("remote", "recovered")));
                 let refreshed_lists = server.lists.load(Ordering::Acquire);
                 assert_eq!(run(Some(Command::Deny("remote".into()))).await, ACP_STOP_REASON_END_TURN);
                 assert_eq!(run(Some(Command::Refresh)).await, ACP_STOP_REASON_END_TURN);
@@ -640,6 +717,19 @@ mod tests {
                     "refresh must never contact denied servers");
                 assert!(mcp.manager.call_tool("remote", "echo", json!({"new_field":1})).await
                     .unwrap_err().to_string().contains("MCP_TRUST_DENIED"));
+                assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN);
+                let denied = server.requests.lock().unwrap().last().unwrap().clone();
+                assert!(provider_names(&denied).iter().all(|name|
+                    !name.starts_with("mcp__remote__") && !name.starts_with("mcp_context_")));
+                let current = shared.snapshot();
+                for original in host_snapshot.tools() {
+                    let retained = current.tools().iter().find(|tool| tool.name() == original.name()).unwrap();
+                    assert!(Arc::ptr_eq(original, retained), "host tool was reconstructed: {}", original.name());
+                }
+                assert!(!current.is_discoverable("lsp"), "promotion survives removal, failure, and denial");
+                let version = shared.version();
+                current.shared_handle().unwrap().update(|_| {});
+                assert_eq!(shared.version(), version + 1, "the original shared registry remains authoritative");
                 assert!(receiver.try_iter().all(|line| !line.contains("local-fixture-only")));
                 mcp.manager.shutdown_all().await;
             };
@@ -652,6 +742,16 @@ mod tests {
                 }
             }
         });
+    }
+
+    fn provider_names(request: &Value) -> Vec<String> {
+        let names: Vec<_> = request["tools"].as_array().expect("host tool schemas remain present").iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert!(names.iter().any(|name| name == "read"));
+        assert!(names.iter().any(|name| name == "lsp"));
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "provider received duplicate tool names");
+        names
     }
 
     #[test]
