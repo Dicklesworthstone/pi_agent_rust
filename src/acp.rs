@@ -28,6 +28,7 @@
 #![allow(clippy::significant_drop_tightening)]
 
 mod content;
+mod history;
 
 use crate::agent::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, ToolApprovalDecision, ToolApprovalHandler,
@@ -207,9 +208,9 @@ pub struct AcpOptions {
     pub auth: AuthStorage,
     pub runtime_handle: RuntimeHandle,
     /// When set (from the `--session-dir` CLI flag), ACP sessions persist to
-    /// this directory and autosave is enabled, so they can be resumed later via
-    /// `pi --session`/`--resume` (#102). When `None`, ACP keeps its in-memory,
-    /// non-persisted behavior.
+    /// this directory and autosave is enabled. After an editor restart they
+    /// can be reopened by ID via `session/load` or `session/resume`, as well
+    /// as via `pi --session`/`--resume`. When `None`, sessions remain in-memory.
     pub session_dir: Option<PathBuf>,
     /// The "available skills" system-prompt block, rendered by the host from
     /// its resource loader (`--no-skills` and trust applied), so the model
@@ -657,114 +658,78 @@ async fn run(
             }
 
             "session/list" => {
-                let entries: Vec<(String, Arc<Mutex<AcpSessionState>>)> =
-                    sessions.lock(&cx).await.map_or_else(
-                        |_| Vec::new(),
-                        |guard| {
-                            guard
-                                .iter()
-                                .map(|(sid, state)| (sid.clone(), Arc::clone(state)))
-                                .collect()
-                        },
-                    );
-                // ACP SessionInfo requires `cwd` alongside `sessionId`.
-                let mut session_list: Vec<Value> = Vec::with_capacity(entries.len());
-                for (sid, state) in entries {
-                    let cwd = state
-                        .lock(&cx)
-                        .await
-                        .map(|guard| guard.cwd.display().to_string())
-                        .unwrap_or_default();
-                    session_list.push(json!({ "sessionId": sid, "cwd": cwd }));
+                if !initialized.load(Ordering::SeqCst) {
+                    let _ = out_tx.send(json_rpc_error(id, INVALID_REQUEST, "Server not initialized"));
+                    continue;
                 }
-
-                let _ = out_tx.send(json_rpc_ok(id, json!({ "sessions": session_list })));
+                let response = match history::list(&request.params, &options, &sessions, &cx).await {
+                    Ok(result) => json_rpc_ok(id, result),
+                    Err(error) => json_rpc_error(id, error.code, error.message),
+                };
+                history::send_line(&out_tx, response)
+                    .await
+                    .map_err(|error| Error::session(error.message))?;
             }
 
-            "session/load" => {
-                let session_id = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-
-                let Some(session_id) = session_id else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: sessionId",
-                    ));
+            "session/load" | "session/resume" => {
+                if !initialized.load(Ordering::SeqCst) {
+                    let _ = out_tx.send(json_rpc_error(id, INVALID_REQUEST, "Server not initialized"));
                     continue;
+                }
+                let session_id = match history::requested_session_id(&request.params) {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        let _ = out_tx.send(json_rpc_error(id, error.code, error.message));
+                        continue;
+                    }
                 };
-
-                let exists = sessions
+                // Check the reservation as well as agent_session: a spawned
+                // prompt may not yet have taken the agent out of its state.
+                let busy = active_prompts
                     .lock(&cx)
                     .await
-                    .is_ok_and(|guard| guard.contains_key(&session_id));
-
-                if exists {
-                    let models: Vec<AcpModel> = options
-                        .available_models
-                        .iter()
-                        .map(|entry| AcpModel {
-                            id: entry.model.id.clone(),
-                            name: entry.model.name.clone(),
-                            provider: Some(entry.model.provider.clone()),
-                        })
-                        .collect();
-
-                    let _ = out_tx.send(json_rpc_ok(
-                        id,
-                        json!({
-                            "sessionId": session_id,
-                            "models": models,
-                        }),
-                    ));
-                } else {
+                    .map_err(|error| Error::session(format!("Active prompt registry unavailable: {error}")))?
+                    .contains_key(session_id);
+                if busy {
                     let _ = out_tx.send(json_rpc_error(
                         id,
-                        SESSION_NOT_FOUND,
-                        format!("Session not found: {session_id}"),
-                    ));
-                }
-            }
-
-            "session/resume" => {
-                let session_id = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-
-                let Some(session_id) = session_id else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: sessionId",
+                        PROMPT_IN_PROGRESS,
+                        "Cannot load or resume a session while a prompt is in progress",
                     ));
                     continue;
-                };
-
-                let exists = sessions
-                    .lock(&cx)
-                    .await
-                    .is_ok_and(|guard| guard.contains_key(&session_id));
-
-                if exists {
-                    let _ = out_tx.send(json_rpc_ok(
-                        id,
-                        json!({
-                            "sessionId": session_id,
-                            "resumed": true,
-                        }),
-                    ));
-                } else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        SESSION_NOT_FOUND,
-                        format!("Session not found: {session_id}"),
-                    ));
                 }
+                let permission_client = AcpPermissionClient {
+                    out_tx: out_tx.clone(),
+                    pending: Arc::clone(&pending_permissions),
+                    request_counter: Arc::clone(&permission_counter),
+                    timeout: acp_permission_timeout(),
+                    cx: cx.clone(),
+                };
+                let replay = request.method == "session/load";
+                let result = history::load(
+                    &request.params,
+                    &options,
+                    &permission_client,
+                    &sessions,
+                    &cx,
+                    &out_tx,
+                    replay,
+                )
+                .await;
+                // All replay notifications precede this response. Resume is
+                // intentionally history-free for clients that kept their view.
+                let response = match result {
+                    Ok(mut result) => {
+                        if !replay {
+                            result["resumed"] = json!(true);
+                        }
+                        json_rpc_ok(id, result)
+                    }
+                    Err(error) => json_rpc_error(id, error.code, error.message),
+                };
+                history::send_line(&out_tx, response)
+                    .await
+                    .map_err(|error| Error::session(error.message))?;
             }
 
             // Dynamic, per-session model switch (#105). Switches the live
@@ -1249,16 +1214,14 @@ fn handle_initialize() -> Value {
             "version": version,
         },
         "agentCapabilities": {
-            // Sessions live only in-process; we do not rehydrate persisted history.
-            "loadSession": false,
+            // Loads replay the selected conversation before responding and
+            // reopen persisted stores when --session-dir is configured.
+            "loadSession": true,
             "mcpCapabilities": {
                 "http": false,
                 "sse": false,
             },
             "promptCapabilities": content::prompt_capabilities(),
-            // `session/list` is implemented (GH #245). `loadSession` stays
-            // false: ACP's `session/load` must replay the whole conversation
-            // as `session/update`s, and ours only re-attaches a live session.
             "sessionCapabilities": { "list": {} },
             "_meta": {
                 "pi.dev": {
@@ -1475,16 +1438,39 @@ fn handle_session_new(
     // (save_enabled), otherwise in-memory (existing default behavior).
     let (session, save_enabled) =
         new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
+    build_acp_session(session, save_enabled, cwd, options, permission_client)
+}
+
+/// New and reopened sessions use the same tool registry, approval handler,
+/// auth resolution, system prompt, and persistence owner. Restore the selected
+/// branch's settings instead of another branch's header tip or startup defaults.
+fn build_acp_session(
+    session: Session,
+    save_enabled: bool,
+    cwd: PathBuf,
+    options: &AcpOptions,
+    permission_client: Option<&AcpPermissionClient>,
+) -> Result<(String, AcpSessionState)> {
     let session_id = session.header.id.clone();
 
     let enabled_tools = acp_enabled_tools();
     let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config));
 
-    // ACP should respect the same configured default provider/model preference
-    // as the normal startup path instead of picking an arbitrary ready model.
-    let model_entry = select_acp_model_entry(&options.config, &options.available_models)
-        .ok_or_else(|| Error::provider("acp", "No models available"))?;
+    let model_entry = if let Some((provider, model)) = session.effective_model_for_current_path() {
+        options.model_registry.find(&provider, &model).ok_or_else(|| {
+            Error::provider("acp", format!("Saved session model is not registered: {provider}/{model}"))
+        })?
+    } else {
+        select_acp_model_entry(&options.config, &options.available_models)
+            .ok_or_else(|| Error::provider("acp", "No models available"))?
+    };
+    let thinking_level = match session.effective_thinking_level_for_current_path() {
+        Some(level) => model_entry.clamp_thinking_level(level.parse().map_err(|_| {
+            Error::session("Saved session has an invalid thinking level")
+        })?),
+        None => resolve_acp_thinking_level(&options.config, &model_entry),
+    };
 
     let provider = providers::create_provider(&model_entry, None)
         .map_err(|e| Error::provider("acp", e.to_string()))?;
@@ -1508,7 +1494,7 @@ fn handle_session_new(
 
     let stream_options = StreamOptions {
         api_key,
-        thinking_level: Some(resolve_acp_thinking_level(&options.config, &model_entry)),
+        thinking_level: Some(thinking_level),
         headers: model_entry.headers.clone(),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so ACP sessions honor the configured limit instead of the provider's
@@ -2288,8 +2274,8 @@ mod tests {
         assert_eq!(result["protocolVersion"], 1);
         assert_eq!(result["agentInfo"]["name"], "pi-agent");
         assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
-        // Sessions are in-process only — we never advertise loadSession.
-        assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        // Loading now replays history before returning its response.
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
         // GH #245: session/list is implemented, so it is advertised.
         assert!(result["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
         // Native image and embedded-context prompt decoding is wired to the agent.
