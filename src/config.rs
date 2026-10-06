@@ -594,6 +594,13 @@ pub struct SandboxSettings {
     /// Paths denied for writing (overrides `allowWrite`).
     #[serde(alias = "denyWrite")]
     pub deny_write: Option<Vec<String>>,
+    /// Windows only: paths explicitly granted read+execute for the sandbox
+    /// account. The Windows cross-account model has NO implicit read of the
+    /// user profile (unlike macOS/Linux same-user sandboxing), so
+    /// `~/.gitconfig`, tool caches, etc. need entries here. Ignored on
+    /// other platforms.
+    #[serde(alias = "allowRead")]
+    pub allow_read: Option<Vec<String>>,
 }
 
 impl SandboxSettings {
@@ -1750,6 +1757,7 @@ fn merge_sandbox(
             deny_read: other.deny_read.or(base.deny_read),
             allow_write: other.allow_write.or(base.allow_write),
             deny_write: other.deny_write.or(base.deny_write),
+            allow_read: other.allow_read.or(base.allow_read),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

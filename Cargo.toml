@@ -205,10 +205,23 @@ portable-pty = "0.9"
 # Prerequisite: defims/sandbox-runtime-rs@1e194a2 must be pushed (cargo
 # fetches git deps from the remote). For local builds before the push, a
 # workspace-root [patch] entry redirects to the local checkout.
-sandbox-runtime = { git = "https://github.com/defims/sandbox-runtime-rs", rev = "f662a4c5be5c23a9c720ce7a2b53101ca799073b" }
+# Unix-only (Seatbelt/bwrap + unix-socket proxy); on Windows the sandbox
+# module degrades per sandbox.rs::platform_supported. Declared in the
+# cfg(unix) target table below — the crate's proxy module does not compile
+# on Windows (tokio UnixStream).
 # Dedicated runtime hosting the sandbox crate's proxy tasks (kept separate
 # from asupersync; rt-only features, no networking of our own).
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread"] }
+
+# OS-level bash sandbox: macOS Seatbelt / Linux bwrap / Windows srt-win
+# (fork feat/windows-sandbox; MITM UnixStream path is unix-gated upstream).
+# Rev bumps only through an alignment pass per the fork's UPSTREAM_BASE.md;
+# the local [patch] workflow at the bottom of this file redirects to a local
+# checkout for development.
+# NOTE(rev): the Windows backend requires a fork rev >= feat/windows-sandbox;
+# until that lands on the fork's mainline, Windows builds need the [patch]
+# redirect. Unix builds are unchanged by this rev.
+sandbox-runtime = { git = "https://github.com/defims/sandbox-runtime-rs", rev = "f662a4c5be5c23a9c720ce7a2b53101ca799073b" }
 
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
@@ -541,3 +554,4 @@ module_name_repetitions = "allow"
 # charmed-glamour = { path = "../charmed_rust/crates/glamour" }
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
 # fsqlite = { path = "../frankensqlite/crates/fsqlite" }
+

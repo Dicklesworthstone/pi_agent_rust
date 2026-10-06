@@ -6390,6 +6390,12 @@ fn sandbox_block_markers(output: &str) -> Vec<&'static str> {
         "blocked by network allowlist",
         "CONNECT tunnel failed, response 403",
         "Connection blocked",
+        // Windows backend: ACL/fence denials surface as OS errors through
+        // the sandboxed child's own stderr; schannel revocation checks die
+        // behind the WFP fence (CRYPT_E_REVOCATION_OFFLINE).
+        "Access is denied",
+        "CRYPT_E_REVOCATION_OFFLINE",
+        "srt-win:",
     ];
     MARKERS
         .iter()
@@ -6474,11 +6480,20 @@ pub(crate) async fn run_bash_command(
         .as_ref()
         .map_or_else(|| command.to_string(), |p| p.command_line.clone());
 
-    let mut cmd = command_with_default_sigpipe_in_dir(shell, cwd)
-        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
-    cmd.arg("-c")
-        .arg(&command)
-        .current_dir(cwd)
+    // Windows sandbox: native srt-win spawn (the spec carries the --env
+    // overlay); everything else runs the shell line.
+    let mut cmd = if let Some(spec) = prepared.as_ref().and_then(|p| p.windows_spawn.as_ref()) {
+        let mut c = std::process::Command::new(&spec.program);
+        c.args(&spec.args);
+        c
+    } else {
+        let mut c = command_with_default_sigpipe_in_dir(shell, cwd)
+            .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
+        c.arg("-c").arg(&command);
+        c
+    };
+
+    cmd.current_dir(cwd)
         // 宿主运行时变量不得泄入模型驱动的 shell(pi-web #487
         // project-command-env 同款清洗:PORT / NODE_ENV / NEXT_*;Windows
         // 环境键不区分大小写)。上游 TS 经 bash operations 包装实现,本 fork
@@ -6847,6 +6862,23 @@ pub(crate) async fn run_bash_command_pty(
         }
         "sh"
     });
+
+    // Windows sandbox (fork N3 decision): the wrap is a native srt-win
+    // spawn spec — the two-hop cross-account launch cannot inherit this
+    // process's ConPTY, so a PTY is structurally impossible. Fall back to
+    // the pipe path (the child sees no TTY: a documented permanent gap).
+    if cfg!(windows) && sandbox.is_some_and(|s| s.mode() != crate::sandbox::SandboxMode::Off) {
+        return run_bash_command(
+            cwd,
+            shell_path,
+            command_prefix,
+            &command,
+            timeout_secs,
+            on_update,
+            sandbox,
+        )
+        .await;
+    }
 
     // OS sandbox: same wrap-after-composition contract as the pipe path.
     let prepared = match sandbox {
