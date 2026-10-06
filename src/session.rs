@@ -3,6 +3,8 @@
 //! Sessions are stored as JSONL files with a tree structure that enables
 //! branching and history navigation.
 
+pub(crate) mod attachments;
+
 use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -1404,12 +1406,13 @@ fn persist_jsonl_snapshot_locked(
     let original_perms = std::fs::metadata(path).ok().map(|meta| meta.permissions());
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+    let mut attachments = attachments::EntryEncoder::new(path);
     {
         let mut writer = std::io::BufWriter::with_capacity(1 << 20, temp_file.as_file());
         serde_json::to_writer(&mut writer, header)?;
         writer.write_all(b"\n")?;
         for entry in entries {
-            serde_json::to_writer(&mut writer, entry)?;
+            serde_json::to_writer(&mut writer, &attachments.encode(entry)?)?;
             writer.write_all(b"\n")?;
         }
         writer.flush()?;
@@ -1426,6 +1429,7 @@ fn persist_jsonl_snapshot_locked(
         .map_err(|e| crate::Error::Io(Box::new(e)))?;
     // The authoritative JSONL has not changed yet. Mark any current V2
     // sidecar dirty immediately before the atomic source replacement.
+    attachments.validate()?;
     mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
     temp_file
         .persist(path)
@@ -1472,7 +1476,6 @@ fn save_jsonl_full_rewrite_blocking(
 
 struct JsonlAppendPlan {
     ordered_entries: Vec<SessionEntry>,
-    serialized_entries: Vec<u8>,
     entries_appended: Vec<SessionEntry>,
     message_count: u64,
     session_name: Option<String>,
@@ -1534,7 +1537,6 @@ fn plan_jsonl_incremental_append(
     merged_entries.extend(pending_entries);
     ensure_session_parent_links_closed(&merged_entries)?;
     let ordered_entries = stable_parent_topological_order(merged_entries)?;
-    let mut serialized_entries = Vec::new();
     let mut entries_appended = Vec::new();
     let mut message_count = disk_session.cached_message_count;
     let mut session_name = disk_session.cached_name.clone();
@@ -1543,8 +1545,6 @@ fn plan_jsonl_incremental_append(
             .base_id()
             .is_some_and(|id| pending_entry_ids.contains(id))
     }) {
-        serde_json::to_writer(&mut serialized_entries, entry)?;
-        serialized_entries.push(b'\n');
         entries_appended.push(entry.clone());
         match entry {
             SessionEntry::Message(_) => message_count = message_count.saturating_add(1),
@@ -1557,7 +1557,6 @@ fn plan_jsonl_incremental_append(
 
     Ok(JsonlAppendPlan {
         ordered_entries,
-        serialized_entries,
         entries_appended,
         message_count,
         session_name,
@@ -1590,11 +1589,17 @@ fn append_jsonl_entries_blocking(
 
     let JsonlAppendPlan {
         ordered_entries,
-        serialized_entries,
         entries_appended,
         message_count,
         session_name,
     } = plan_jsonl_incremental_append(&disk_session, new_entries)?;
+
+    let mut attachments = attachments::EntryEncoder::new(path);
+    let mut serialized_entries = Vec::new();
+    for entry in &entries_appended {
+        serde_json::to_writer(&mut serialized_entries, &attachments.encode(entry)?)?;
+        serialized_entries.push(b'\n');
+    }
 
     let rewrite_unterminated = !serialized_entries.is_empty() && !jsonl_ends_with_newline(path)?;
     let index_generation = if serialized_entries.is_empty() {
@@ -1612,6 +1617,7 @@ fn append_jsonl_entries_blocking(
         ordered_entries
     } else {
         if !serialized_entries.is_empty() {
+            attachments.validate()?;
             mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
             let mut file = open_existing_session_file_for_append(path)?;
             file.write_all(&serialized_entries)?;
@@ -3733,6 +3739,9 @@ impl Session {
                 match Self::open_v2_with_diagnostics(&path).await {
                     Ok(result) => return Ok(result),
                     Err(e) => {
+                        if attachments::is_attachment_error(&e) {
+                            return Err(e);
+                        }
                         if matches!(
                             &e,
                             Error::Io(io_error)
@@ -3976,6 +3985,15 @@ impl Session {
         header: SessionHeader,
         mode: V2OpenMode,
     ) -> Result<(Self, SessionOpenDiagnostics)> {
+        Self::open_from_v2_with_source(store, header, mode, None)
+    }
+
+    fn open_from_v2_with_source(
+        store: &SessionStoreV2,
+        header: SessionHeader,
+        mode: V2OpenMode,
+        jsonl_source: Option<&Path>,
+    ) -> Result<(Self, SessionOpenDiagnostics)> {
         let index = store.read_index()?;
         let active_leaf = select_v2_active_leaf(&header, &index);
         let entry_count = u64::try_from(index.len()).unwrap_or(u64::MAX);
@@ -3987,9 +4005,11 @@ impl Session {
             mode,
             active_leaf.entry_id(),
             None,
+            jsonl_source,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_from_v2_with_active_leaf(
         store: &SessionStoreV2,
         index: &[session_store_v2::OffsetIndexEntry],
@@ -3997,6 +4017,7 @@ impl Session {
         mode: V2OpenMode,
         active_leaf_id: Option<&str>,
         validated_total_message_count: Option<u64>,
+        jsonl_source: Option<&Path>,
     ) -> Result<(Self, SessionOpenDiagnostics)> {
         header
             .validate()
@@ -4027,8 +4048,9 @@ impl Session {
         let mut diagnostics = SessionOpenDiagnostics::default();
         let mut entries = Vec::with_capacity(frames.len());
         for frame in &frames {
-            match session_store_v2::frame_to_session_entry(frame) {
+            match session_store_v2::frame_to_session_entry_with_source(frame, jsonl_source) {
                 Ok(entry) => entries.push(entry),
+                Err(error) if attachments::is_attachment_error(&error) => return Err(error),
                 Err(e) => {
                     diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
                         line_number: usize::try_from(frame.entry_seq).unwrap_or(0),
@@ -4399,8 +4421,12 @@ impl Session {
         migrate_jsonl_to_v2_locked(jsonl_path, "automatic-v2-full-rehydration-repair")?;
         let (store, _, manifest) = inspect_v2_store_without_recovery(v2_root)?;
         validate_v2_resume_manifest_jsonl_identity(&manifest, &self.header)?;
-        let (session, diagnostics) =
-            Self::open_from_v2(&store, self.header.clone(), V2OpenMode::Full)?;
+        let (session, diagnostics) = Self::open_from_v2_with_source(
+            &store,
+            self.header.clone(),
+            V2OpenMode::Full,
+            Some(jsonl_path),
+        )?;
         Ok((session, diagnostics, "v2"))
     }
 
@@ -4428,10 +4454,12 @@ impl Session {
                 V2OpenMode::Full,
                 index.last().map(|row| row.entry_id.as_str()),
                 Some(manifest.counters.messages_total),
+                self.path.as_deref(),
             )
         })();
         match inspected {
             Ok((session, diagnostics)) => Ok((session, diagnostics, "v2")),
+            Err(error) if attachments::is_attachment_error(&error) => Err(error),
             Err(error)
                 if matches!(
                     &error,
@@ -7390,6 +7418,19 @@ fn render_blocks(blocks: &[ContentBlock]) -> String {
                     "<p class=\"media\">{}</p>",
                     escape_html(&media.placeholder())
                 );
+                let element = match media.input_type() {
+                    Some(crate::provider::InputType::Video) => Some("video"),
+                    Some(crate::provider::InputType::Audio) => Some("audio"),
+                    _ => None,
+                };
+                if let Some(element) = element {
+                    let _ = write!(
+                        html,
+                        "<{element} controls preload=\"none\" src=\"data:{};base64,{}\"></{element}>",
+                        escape_html(&media.mime_type),
+                        escape_html(&media.data)
+                    );
+                }
             }
             ContentBlock::ToolCall(tool_call) => {
                 let args = serde_json::to_string_pretty(&tool_call.arguments)
@@ -7536,7 +7577,10 @@ fn open_jsonl_blocking_with_entry_limit(
     max_entry_line_bytes: usize,
 ) -> Result<(Session, SessionOpenDiagnostics)> {
     let path_buf = resolve_session_persistence_path(path)?;
-    let file = open_existing_session_file_for_read(&path_buf)?;
+    // Keep attachment resolution pinned to the same source as the JSONL file,
+    // including callers of this blocking entrypoint that pass a terminal link.
+    let path = path_buf.as_path();
+    let file = open_existing_session_file_for_read(path)?;
     let mut reader = std::io::BufReader::new(file);
 
     let Some(header_line) =
@@ -7595,17 +7639,18 @@ fn open_jsonl_blocking_with_entry_limit(
                                 let mut ok = Vec::with_capacity(chunk.len());
                                 let mut skip = Vec::new();
                                 for (line_num, line) in chunk {
-                                    match serde_json::from_str::<SessionEntry>(line) {
+                                    match attachments::decode_entry(Some(path), line) {
                                         Ok(entry) => ok.push(entry),
-                                        Err(e) => {
+                                        Err(Error::Json(e)) => {
                                             skip.push(SessionOpenSkippedEntry {
                                                 line_number: *line_num,
                                                 error: e.to_string(),
                                             });
                                         }
+                                        Err(error) => return Err(error),
                                     }
                                 }
-                                (ok, skip)
+                                Ok((ok, skip))
                             })
                         })
                         .collect::<Vec<_>>()
@@ -7625,7 +7670,7 @@ fn open_jsonl_blocking_with_entry_limit(
                                 Error::session(format!(
                                     "parallel session parse worker panicked: {panic_message}"
                                 ))
-                            })
+                            })?
                         })
                         .collect()
                 });
@@ -7638,14 +7683,15 @@ fn open_jsonl_blocking_with_entry_limit(
         } else {
             // Sequential path
             for (line_num, line) in &line_batch {
-                match serde_json::from_str::<SessionEntry>(line) {
+                match attachments::decode_entry(Some(path), line) {
                     Ok(entry) => entries.push(entry),
-                    Err(e) => {
+                    Err(Error::Json(e)) => {
                         diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
                             line_number: *line_num,
                             error: e.to_string(),
                         });
                     }
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -7789,7 +7835,9 @@ fn read_jsonl_header_for_v2(jsonl_path: &Path) -> Result<SessionHeader> {
     Ok(header)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hydrate_v2_resume(
+    jsonl_source: &Path,
     store: &SessionStoreV2,
     index: &[session_store_v2::OffsetIndexEntry],
     header: SessionHeader,
@@ -7822,6 +7870,7 @@ fn hydrate_v2_resume(
         mode,
         active_leaf.entry_id(),
         Some(total_message_count),
+        Some(jsonl_source),
     )?;
     if let Some(skipped) = diagnostics.skipped_entries.first() {
         return Err(Error::session(format!(
@@ -7860,6 +7909,7 @@ fn repair_v2_resume_locked(
     validate_v2_resume_manifest_jsonl_identity(&manifest, &locked_header)?;
     let active_leaf = select_v2_active_leaf(&locked_header, &index);
     hydrate_v2_resume(
+        jsonl_path,
         &store,
         &index,
         locked_header,
@@ -7924,6 +7974,7 @@ fn open_from_v2_store_blocking(jsonl_path: &Path) -> Result<(Session, SessionOpe
         validate_v2_resume_manifest_jsonl_identity(&manifest, &header)?;
         let active_leaf = select_v2_active_leaf(&header, &index);
         hydrate_v2_resume(
+            &jsonl_path,
             &store,
             &index,
             header.clone(),
@@ -7936,6 +7987,7 @@ fn open_from_v2_store_blocking(jsonl_path: &Path) -> Result<(Session, SessionOpe
 
     let hydration = match inspected {
         Ok(hydration) => hydration,
+        Err(error) if attachments::is_attachment_error(&error) => return Err(error),
         Err(inspection_error)
             if matches!(
                 &inspection_error,
@@ -8076,9 +8128,10 @@ fn build_v2_sidecar_from_jsonl_into(jsonl_path: &Path, v2_root: &Path) -> Result
         }
         let mut store = SessionStoreV2::create(v2_root, 64 * 1024 * 1024)?;
 
-        for entry in read_jsonl_entries_for_v2(&mut reader)? {
-            let (entry_id, parent_entry_id, entry_type, payload) =
+        for (entry, references) in read_jsonl_entries_for_v2(&mut reader, jsonl_path)? {
+            let (entry_id, parent_entry_id, entry_type, _) =
                 session_store_v2::session_entry_to_frame_args(&entry)?;
+            let payload = references.payload(&entry)?;
             store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
         }
 
@@ -8096,17 +8149,22 @@ fn build_v2_sidecar_from_jsonl_into(jsonl_path: &Path, v2_root: &Path) -> Result
 
 /// Strictly parse the entry portion of a JSONL session and apply the same
 /// deterministic legacy-ID synthesis used by normal JSONL loading.
-fn read_jsonl_entries_for_v2<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<SessionEntry>> {
+fn read_jsonl_entries_for_v2<R: std::io::BufRead>(
+    reader: &mut R,
+    jsonl_source: &Path,
+) -> Result<Vec<(SessionEntry, attachments::ReferencePlan)>> {
     let mut entries = Vec::new();
+    let mut references = Vec::new();
     while let Some(line) =
         read_capped_utf8_line(reader).map_err(|err| crate::Error::Io(Box::new(err)))?
     {
         if line.trim().is_empty() {
             continue;
         }
-        let entry = serde_json::from_str(&line)
-            .map_err(|err| crate::Error::session(format!("Bad JSONL entry: {err}")))?;
+        let (entry, plan) =
+            attachments::decode_entry_with_references(Some(jsonl_source), &line)?;
         entries.push(entry);
+        references.push(plan);
     }
     // Legacy rows without IDs must be normalized before validating the graph,
     // but migration must never turn an ambiguous authoritative JSONL history
@@ -8130,7 +8188,7 @@ fn read_jsonl_entries_for_v2<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<
     // log while using the same graph walk as JSONL rewrite reconciliation to
     // reject cycles.
     drop(stable_parent_topological_order(entries.clone())?);
-    Ok(entries)
+    Ok(entries.into_iter().zip(references).collect())
 }
 
 fn unique_sidecar_aux_path(v2_root: &Path, suffix: &str) -> PathBuf {
@@ -8341,17 +8399,18 @@ pub fn verify_v2_against_jsonl(
         crate::Error::session(format!("Invalid session header in JSONL: {reason}"))
     })?;
 
-    let entries = read_jsonl_entries_for_v2(&mut reader)?;
+    let entries = read_jsonl_entries_for_v2(&mut reader, jsonl_path)?;
     let mut jsonl_ids: Vec<String> = Vec::with_capacity(entries.len());
     let mut jsonl_chain_hash = V2_CHAIN_HASH_GENESIS.to_string();
 
-    for entry in entries {
+    for (entry, references) in entries {
         let id = entry
             .base_id()
             .cloned()
             .expect("V2 JSONL normalization assigns every entry an ID");
         jsonl_ids.push(id);
-        jsonl_chain_hash = session_entry_chain_hash_step(&jsonl_chain_hash, &entry)?;
+        jsonl_chain_hash =
+            session_payload_chain_hash_step(&jsonl_chain_hash, &references.payload(&entry)?)?;
     }
 
     // Read V2 store entries.
@@ -8368,7 +8427,7 @@ pub fn verify_v2_against_jsonl(
     // Check frame/index integrity and ensure the bounded manifest describes the
     // exact store that would become visible after migration.
     let index_consistent = store
-        .validate_session_integrity()
+        .validate_session_integrity_with_source(Some(jsonl_path))
         .and_then(|()| validate_v2_manifest_jsonl_identity(store, &header))
         .is_ok();
 
@@ -8492,10 +8551,9 @@ fn is_v2_sidecar_stale_read_only(jsonl_path: &Path, v2_root: &Path) -> Result<bo
     Ok(!v2_verification_is_complete(&verification))
 }
 
-fn session_entry_chain_hash_step(prev_chain: &str, entry: &SessionEntry) -> Result<String> {
-    let (_, _, _, payload) = session_store_v2::session_entry_to_frame_args(entry)?;
+fn session_payload_chain_hash_step(prev_chain: &str, payload: &Value) -> Result<String> {
     let payload_sha256 =
-        crate::package_manager::hex_encode(&Sha256::digest(serde_json::to_vec(&payload)?));
+        crate::package_manager::hex_encode(&Sha256::digest(serde_json::to_vec(payload)?));
     let mut hasher = Sha256::new();
     hasher.update(prev_chain.as_bytes());
     hasher.update(payload_sha256.as_bytes());
@@ -8626,7 +8684,7 @@ pub fn migration_status(jsonl_path: &Path) -> MigrationState {
 
     match inspector.read_index() {
         Ok(_) => match inspector
-            .validate_session_integrity()
+            .validate_session_integrity_with_source(Some(jsonl_path))
             .and_then(|()| validate_v2_manifest_jsonl_identity(&inspector, &header))
         {
             Ok(()) => match is_v2_sidecar_stale_read_only(jsonl_path, &v2_root) {
@@ -8679,9 +8737,10 @@ pub fn migrate_dry_run(jsonl_path: &Path) -> Result<session_store_v2::MigrationV
 
     // Exercise the exact entry-normalization contract used by a real
     // migration, including deterministic IDs for legacy ID-less rows.
-    for entry in read_jsonl_entries_for_v2(&mut reader)? {
-        let (entry_id, parent_entry_id, entry_type, payload) =
+    for (entry, references) in read_jsonl_entries_for_v2(&mut reader, jsonl_path)? {
+        let (entry_id, parent_entry_id, entry_type, _) =
             session_store_v2::session_entry_to_frame_args(&entry)?;
+        let payload = references.payload(&entry)?;
         store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
     }
     store.write_manifest(header.id, "jsonl_v3")?;

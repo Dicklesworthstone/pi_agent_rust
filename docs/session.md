@@ -31,6 +31,62 @@ Filename format: `YYYY-MM-DDTHH-MM-SS.sssZ_id.jsonl`
 - `label`: Metadata label assignment on an entry.
 - `custom`: Extension-defined structured payload.
 
+### Image, video, and audio attachments
+
+JSONL stores canonical image and media payloads larger than 64 KiB in a private
+sibling directory. For example, `example.jsonl` owns
+`example.jsonl.blobs/<sha256-hex>`. Identical decoded bytes share one immutable
+blob within the session, including when the same bytes appear in an image and a
+media block. Small payloads and historical noncanonical base64 remain inline.
+
+The persisted `data` field contains a typed reference:
+
+```json
+{
+  "type": "media",
+  "data": {
+    "$piBlob": "sha256:<64 lowercase hexadecimal characters>",
+    "sizeBytes": 123456,
+    "encoding": "base64"
+  },
+  "mimeType": "video/mp4",
+  "name": "clip.mp4"
+}
+```
+
+`encoding` is `base64` or `base64NoPad`; reopening preserves the original
+canonical spelling. Native messages returned to providers, extensions, SDK
+callers, and fork plans contain the complete payload. The reference format is
+internal to persistence and must not be sent directly to a provider.
+
+Blob bytes are synced before JSONL references are committed. Reads verify each
+blob's hash and size, reject symlinks and unsafe reference names, and bound the
+complete hydrated entry before allocating payloads. Missing or corrupt
+attachments produce `PI_SESSION_ATTACHMENT_INVALID` and prevent session open;
+they are not silently skipped. A later save never overwrites an existing corrupt
+blob. Per-blob admission remains 64 MiB and hydrated entries retain the existing
+100 MiB JSONL limit. The media input limit is unchanged.
+
+V2 sidecars retain compact references and resolve media only for the entries
+being hydrated, using the authoritative JSONL source path. A healthy V2 cache
+does not substitute cached media for a missing or corrupt referenced blob.
+Metadata listing does not read media payloads. Context-free low-level V2 frame
+decoding cannot resolve attachment references without a source path.
+
+Forking, or saving a hydrated session clone to a new path, writes the destination's
+own blobs. It can subsequently be opened without access to the parent session.
+HTML exports embed images and playable audio/video payloads and remain
+self-contained. For a filesystem copy or backup, carry **both the JSONL file and
+its `.blobs` directory**; rename the directory to match if the JSONL filename
+changes. The V2 index can be rebuilt from that pair. Copying only the JSONL file
+is insufficient when it contains attachment references.
+
+Compaction, branch navigation, and ordinary saves do not garbage-collect blobs.
+The existing session deletion flow removes the owned attachment directory after
+removing the primary session file. In-memory messages and RPC completion events
+still contain full payloads; this storage feature does not introduce lazy public
+message types or raise `media.maxBytes`.
+
 ### Tree structure
 
 Pi supports conversation branching. Each entry has an `id` and an optional `parent_id`.

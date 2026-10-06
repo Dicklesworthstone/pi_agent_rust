@@ -463,6 +463,7 @@ fn delete_session_file_with_trash_cmd(path: &Path, trash_cmd: &str) -> Result<()
         }
         remove_sqlite_sidecars_best_effort(path, trash_cmd)?;
         remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd)?;
+        remove_sidecar_dir_best_effort(&crate::session::attachments::sidecar_path(path), trash_cmd)?;
         return ensure_session_artifacts_removed(path);
     }
 
@@ -479,6 +480,7 @@ fn delete_session_file_with_trash_cmd(path: &Path, trash_cmd: &str) -> Result<()
 
     remove_sqlite_sidecars_best_effort(path, trash_cmd)?;
     remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd)?;
+    remove_sidecar_dir_best_effort(&crate::session::attachments::sidecar_path(path), trash_cmd)?;
     ensure_session_artifacts_removed(path)
 }
 
@@ -498,6 +500,9 @@ fn session_artifacts_exist(path: &Path) -> Result<bool> {
     let v2_exists =
         crate::session::session_path_entry_exists(&crate::session_store_v2::v2_sidecar_path(path))
             .map_err(|err| Error::Io(Box::new(err)))?;
+    let blobs_exist =
+        crate::session::session_path_entry_exists(&crate::session::attachments::sidecar_path(path))
+            .map_err(|err| Error::Io(Box::new(err)))?;
     #[cfg(feature = "sqlite-sessions")]
     let sqlite_sidecar_exists = sqlite_auxiliary_paths(path)
         .into_iter()
@@ -507,7 +512,7 @@ fn session_artifacts_exist(path: &Path) -> Result<bool> {
         .map_err(|err| Error::Io(Box::new(err)))?;
     #[cfg(not(feature = "sqlite-sessions"))]
     let sqlite_sidecar_exists = false;
-    Ok(primary_exists || v2_exists || sqlite_sidecar_exists)
+    Ok(primary_exists || v2_exists || blobs_exist || sqlite_sidecar_exists)
 }
 
 fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 7] {
@@ -1630,12 +1635,15 @@ mod tests {
         let session_path = tmp.path().join("noop-trash.sqlite");
         let [wal_path, shm_path, journal_path, ..] = sqlite_auxiliary_paths(&session_path);
         let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
+        let blobs_path = crate::session::attachments::sidecar_path(&session_path);
         fs::write(&session_path, "db").expect("write SQLite primary");
         fs::write(&wal_path, "wal").expect("write SQLite WAL");
         fs::write(&shm_path, "shm").expect("write SQLite SHM");
         fs::write(&journal_path, "journal").expect("write SQLite rollback journal");
         fs::create_dir(&v2_path).expect("create V2 sidecar");
         fs::write(v2_path.join("manifest.json"), "manifest").expect("write V2 manifest");
+        fs::create_dir(&blobs_path).expect("create attachment sidecar");
+        fs::write(blobs_path.join("retained-media"), "media").expect("write attachment");
 
         let trash_script = tmp.path().join("successful-noop-trash.sh");
         // The script records that it ran. Without that, a spawn failure — fork
@@ -1668,7 +1676,14 @@ mod tests {
         let error = outcome
             .expect_err("an exit-zero no-op trash command must not authorize sidecar deletion");
         assert!(error.to_string().contains("left the session in place"));
-        for artifact in [&session_path, &wal_path, &shm_path, &journal_path, &v2_path] {
+        for artifact in [
+            &session_path,
+            &wal_path,
+            &shm_path,
+            &journal_path,
+            &v2_path,
+            &blobs_path,
+        ] {
             assert!(
                 crate::session::session_path_entry_exists(artifact)
                     .expect("inspect preserved artifact"),
@@ -1676,6 +1691,35 @@ mod tests {
                 artifact.display()
             );
         }
+    }
+
+    #[test]
+    fn delete_jsonl_removes_owned_attachments_and_preserves_other_sessions() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let session_path = directory.path().join("deleted.jsonl");
+        let blob_root = crate::session::attachments::sidecar_path(&session_path);
+        let kept_path = directory.path().join("kept.jsonl");
+        let kept_blobs = crate::session::attachments::sidecar_path(&kept_path);
+        for path in [&session_path, &kept_path] {
+            fs::write(path, "session\n").expect("session fixture");
+        }
+        for path in [&blob_root, &kept_blobs] {
+            fs::create_dir(path).expect("attachment directory");
+            fs::write(path.join("media"), "attachment bytes").expect("attachment fixture");
+        }
+        delete_session_file_with_trash_cmd(
+            &session_path,
+            directory
+                .path()
+                .join("missing-trash-command")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .expect("delete session and its attachments");
+        assert!(!session_path.exists());
+        assert!(!blob_root.exists());
+        assert!(kept_path.is_file());
+        assert_eq!(fs::read(kept_blobs.join("media")).unwrap(), b"attachment bytes");
     }
 
     #[cfg(all(unix, feature = "sqlite-sessions"))]

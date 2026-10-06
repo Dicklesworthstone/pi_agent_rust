@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
-enum ArtifactWriteMode {
+pub(crate) enum ArtifactWriteMode {
     Append,
     CreateNew,
     Preserve,
@@ -441,7 +441,7 @@ fn open_nofollow(
     open_nofollow_componentwise(path, oflags, mode)
 }
 
-fn open_regular_file_for_read(path: &Path) -> Result<Option<File>> {
+pub(crate) fn open_regular_file_for_read(path: &Path) -> Result<Option<File>> {
     #[cfg(windows)]
     let (operation_path, parent_guards) = match open_or_create_windows_artifact_parent(path, false)
     {
@@ -583,7 +583,7 @@ fn validate_opened_regular_file_for_write(
     Ok(())
 }
 
-fn open_regular_file_for_write(
+pub(crate) fn open_regular_file_for_write(
     path: &Path,
     create: bool,
     write_mode: ArtifactWriteMode,
@@ -786,7 +786,7 @@ fn create_directory_tree_nofollow(path: &Path) -> Result<()> {
     }
 }
 
-fn open_private_directory(path: &Path, create: bool) -> Result<File> {
+pub(crate) fn open_private_directory(path: &Path, create: bool) -> Result<File> {
     #[cfg(unix)]
     if create {
         create_directory_tree_nofollow(path)?;
@@ -1052,7 +1052,7 @@ fn rename_regular_file(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rename_regular_file_no_replace(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn rename_regular_file_no_replace(source: &Path, target: &Path) -> Result<()> {
     rename_regular_file_no_replace_with(source, target, || Ok(()))
 }
 
@@ -4454,9 +4454,16 @@ impl SessionStoreV2 {
     /// cannot assume a session-entry schema. Session persistence and migration
     /// paths must use this stronger check.
     pub fn validate_session_integrity(&self) -> Result<()> {
+        self.validate_session_integrity_with_source(None)
+    }
+
+    pub(crate) fn validate_session_integrity_with_source(
+        &self,
+        jsonl_source: Option<&Path>,
+    ) -> Result<()> {
         self.validate_integrity()?;
         for frame in self.read_all_entries()? {
-            frame_to_session_entry(&frame)?;
+            frame_to_session_entry_with_source(&frame, jsonl_source)?;
         }
         Ok(())
     }
@@ -4641,14 +4648,27 @@ fn validate_parent_graph_acyclic(
 
 /// Convert a V2 `SegmentFrame` payload back into a `SessionEntry`.
 pub fn frame_to_session_entry(frame: &SegmentFrame) -> Result<SessionEntry> {
+    frame_to_session_entry_with_source(frame, None)
+}
+
+/// Reference-bearing frames are resolved only against their caller's verified
+/// authoritative source, never a path embedded in the frame or its payload.
+pub(crate) fn frame_to_session_entry_with_source(
+    frame: &SegmentFrame,
+    jsonl_source: Option<&Path>,
+) -> Result<SessionEntry> {
     // Deserialize directly from the RawValue to avoid extra allocation/copying.
-    // serde_json::from_str works on RawValue.get() which is &str.
-    let entry: SessionEntry = serde_json::from_str(frame.payload.get()).map_err(|e| {
-        Error::session(format!(
-            "failed to deserialize SessionEntry from frame entry_id={}: {e}",
-            frame.entry_id
-        ))
-    })?;
+    // Inline frames take the ordinary typed path; references hydrate on demand.
+    let entry = crate::session::attachments::decode_entry(jsonl_source, frame.payload.get())
+        .map_err(|e| {
+            if crate::session::attachments::is_attachment_error(&e) {
+                return e;
+            }
+            Error::session(format!(
+                "failed to deserialize SessionEntry from frame entry_id={}: {e}",
+                frame.entry_id
+            ))
+        })?;
 
     let base_id = entry
         .base_id()
