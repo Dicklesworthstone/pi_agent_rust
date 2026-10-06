@@ -1870,20 +1870,26 @@ async fn run_prompt(
     session_id: String,
     cx: AgentCx,
 ) -> &'static str {
+    if abort_signal.is_aborted() || cx.is_cancel_requested() {
+        return ACP_STOP_REASON_CANCELLED;
+    }
     let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
 
     // Take the agent_session out of the lock, run the prompt, then put it back.
     // Holding the session mutex across the whole turn would block session/cancel
     // and session/list. The concurrent-prompt guard upstream guarantees only one
     // task is in here per session at a time, so the Option swap is safe.
-    let (mut agent_session, mcp_state) = {
-        let Ok(mut guard) = session_state.lock(&cx).await else {
-            return ACP_STOP_REASON_ERROR;
-        };
-        let Some(agent) = guard.agent_session.take() else {
-            return ACP_STOP_REASON_ERROR;
-        };
-        (agent, guard.mcp.clone())
+    let taken = match session_state.lock(&cx).await {
+        Ok(mut guard) => guard
+            .agent_session
+            .take()
+            .map(|agent| (agent, guard.mcp.clone()))
+            .ok_or_else(|| Error::session("Agent session is unavailable while a prompt is active")),
+        Err(error) => Err(Error::from(error)),
+    };
+    let (mut agent_session, mcp_state) = match taken {
+        Ok(taken) => taken,
+        Err(error) => return report_prompt_error(&out_tx, &session_id, &error).await,
     };
 
     let prepared = mcp::before_prompt(
@@ -1897,8 +1903,17 @@ async fn run_prompt(
             .run_with_content_with_abort(message, Some(abort_signal), event_handler)
             .await
         {
+            Ok(message) if message.stop_reason == crate::model::StopReason::Error => {
+                let error = Error::provider(
+                    message.provider,
+                    message
+                        .error_message
+                        .unwrap_or_else(|| "Request failed".to_string()),
+                );
+                report_prompt_error(&out_tx, &session_id, &error).await
+            }
             Ok(message) => map_stop_reason(message.stop_reason),
-            Err(_) => ACP_STOP_REASON_ERROR,
+            Err(error) => report_prompt_error(&out_tx, &session_id, &error).await,
         }
     };
 
@@ -1909,13 +1924,54 @@ async fn run_prompt(
     stop_reason
 }
 
+/// ACP has no error stop reason. Emit one notice after the complete session
+/// outcome, including its save: stream terminals are deliberately not rendered
+/// by `build_acp_event_handler`, so `Error`/`MessageEnd`/`AgentEnd` events cannot
+/// duplicate this notice. MCP operator responses use their own completed path.
+async fn report_prompt_error(
+    out_tx: &std::sync::mpsc::SyncSender<String>,
+    session_id: &str,
+    error: &Error,
+) -> &'static str {
+    if matches!(error, Error::Aborted) {
+        return ACP_STOP_REASON_CANCELLED;
+    }
+    let summary = if error.is_session_persistence() {
+        "Session persistence failed. Further prompts are blocked for this session. \
+         Check storage space and permissions, then start a new session or resume the saved session."
+            .to_string()
+    } else if let Error::Provider { provider, message } = error {
+        let summary = crate::error::ProviderErrorSummary::from_error_text(Some(provider), message);
+        format!("{}\n{}", summary.headline(), summary.retry_note(None))
+    } else {
+        // Hint context and raw provider payloads can contain credentials,
+        // private prompts or paths. Only the public category summary is sent.
+        error.hints().summary
+    };
+    let _ = history::send_line(
+        out_tx,
+        json_rpc_notification(
+            "session/update",
+            json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": format!("\n\nError: {summary}\n") },
+                },
+            }),
+        ),
+    )
+    .await;
+    ACP_STOP_REASON_ERROR
+}
+
 // ACP stopReason values per the protocol spec.
 const ACP_STOP_REASON_END_TURN: &str = "end_turn";
 const ACP_STOP_REASON_MAX_TOKENS: &str = "max_tokens";
 const ACP_STOP_REASON_CANCELLED: &str = "cancelled";
 // Spec lists: end_turn | max_tokens | max_turn_requests | refusal | cancelled.
-// We collapse provider/local errors into end_turn so the response stays well-formed;
-// the error text has already been streamed via session/update.
+// Provider/local errors use end_turn to keep the response well-formed;
+// report_prompt_error publishes their safe summary before the response.
 const ACP_STOP_REASON_ERROR: &str = "end_turn";
 
 const fn map_stop_reason(reason: crate::model::StopReason) -> &'static str {
@@ -2116,9 +2172,286 @@ fn classify_tool_kind(tool_name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AssistantMessage, StopReason, StreamEvent, TextContent};
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone, Copy)]
+    enum PromptTestOutcome {
+        Complete,
+        OpenError,
+        StreamError,
+        Aborted,
+        StreamAborted,
+    }
+
+    struct PromptTestProvider {
+        outcome: PromptTestOutcome,
+        calls: AtomicUsize,
+        save_fault: Option<(Arc<Mutex<Session>>, PathBuf)>,
+    }
+
+    const PRIVATE_PROMPT_ERROR: &str =
+        "HTTP 503: {\"authorization\":\"PRIVATE-CREDENTIAL\",\"prompt\":\"PRIVATE-PROMPT\"}";
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for PromptTestProvider {
+        fn name(&self) -> &str {
+            "acp-test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "acp-test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "acp-test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((stored, path)) = &self.save_fault {
+                stored.try_lock().expect("prompt already persisted").path = Some(path.clone());
+            }
+            match self.outcome {
+                PromptTestOutcome::OpenError => {
+                    return Err(Error::provider(self.name(), PRIVATE_PROMPT_ERROR));
+                }
+                PromptTestOutcome::Aborted => return Err(Error::Aborted),
+                _ => {}
+            }
+            let partial = AssistantMessage {
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                api: self.api().to_string(),
+                ..AssistantMessage::default()
+            };
+            let mut message = partial.clone();
+            let mut events = vec![Ok(StreamEvent::Start { partial })];
+            if matches!(self.outcome, PromptTestOutcome::Complete) {
+                message.content = vec![ContentBlock::Text(TextContent::new("Provider reply"))];
+                events.push(Ok(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "Provider reply".to_string(),
+                }));
+                events.push(Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }));
+            } else {
+                message.stop_reason = if matches!(self.outcome, PromptTestOutcome::StreamAborted) {
+                    StopReason::Aborted
+                } else {
+                    StopReason::Error
+                };
+                message.error_message = Some(PRIVATE_PROMPT_ERROR.to_string());
+                events.push(Ok(StreamEvent::Error {
+                    reason: message.stop_reason,
+                    error: message,
+                }));
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    async fn prompt_test_state(
+        root: &std::path::Path,
+        outcome: PromptTestOutcome,
+        fail_after_provider: bool,
+    ) -> (
+        Arc<Mutex<AcpSessionState>>,
+        Arc<PromptTestProvider>,
+        Arc<Mutex<Session>>,
+    ) {
+        let mut stored = Session::create_with_dir_and_store(
+            Some(root.to_path_buf()),
+            SessionStoreKind::Jsonl,
+        );
+        stored.set_model_header(
+            Some("acp-test-provider".to_string()),
+            Some("acp-test-model".to_string()),
+            Some("off".to_string()),
+        );
+        stored.save().await.expect("persist initial metadata");
+        let stored = Arc::new(Mutex::new(stored));
+        let provider = Arc::new(PromptTestProvider {
+            outcome,
+            calls: AtomicUsize::new(0),
+            save_fault: fail_after_provider.then(|| (Arc::clone(&stored), root.to_path_buf())),
+        });
+        let agent = crate::agent::Agent::new(
+            Arc::clone(&provider) as Arc<dyn crate::provider::Provider>,
+            ToolRegistry::new(&[], root, None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::clone(&stored),
+            true,
+            ResolvedCompactionSettings {
+                enabled: false,
+                ..ResolvedCompactionSettings::default()
+            },
+        );
+        let state = Arc::new(Mutex::new(AcpSessionState {
+            agent_session: Some(session),
+            cwd: root.to_path_buf(),
+            mcp: None,
+        }));
+        (state, provider, stored)
+    }
+
+    async fn drive_test_prompt(
+        state: Arc<Mutex<AcpSessionState>>,
+        signal: AbortSignal,
+    ) -> (&'static str, Vec<Value>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let reason = run_prompt(
+            state,
+            vec![ContentBlock::Text(TextContent::new("editor prompt"))],
+            None,
+            signal,
+            tx,
+            "editor-session".to_string(),
+            AgentCx::for_current_or_request(),
+        )
+        .await;
+        let updates = rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).expect("ACP notification"))
+            .collect();
+        (reason, updates)
+    }
+
+    fn prompt_notice_text(update: &Value) -> &str {
+        assert_eq!(update["method"], "session/update");
+        assert_eq!(update["params"]["sessionId"], "editor-session");
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        update["params"]["update"]["content"]["text"]
+            .as_str()
+            .expect("text notice")
+    }
+
+    #[test]
+    fn prompt_errors_are_reported_once_without_private_provider_payloads() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for outcome in [PromptTestOutcome::OpenError, PromptTestOutcome::StreamError] {
+                let root = tempfile::tempdir().unwrap();
+                let (state, provider, _) = prompt_test_state(root.path(), outcome, false).await;
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) = drive_test_prompt(state, signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_ERROR);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    updates.len(),
+                    1,
+                    "stream terminal and result must not duplicate errors"
+                );
+                let text = prompt_notice_text(&updates[0]);
+                assert!(text.contains("HTTP 503"), "{text}");
+                assert!(!text.contains("PRIVATE-CREDENTIAL"));
+                assert!(!text.contains("PRIVATE-PROMPT"));
+            }
+        });
+    }
+
+    #[test]
+    fn prompt_save_failure_and_quarantine_are_visible_before_returning_to_the_editor() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for after_provider in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let (state, provider, stored) = prompt_test_state(
+                    root.path(),
+                    PromptTestOutcome::Complete,
+                    after_provider,
+                )
+                .await;
+                let original = stored.try_lock().unwrap().path.clone();
+                if !after_provider {
+                    stored.try_lock().unwrap().path = Some(root.path().to_path_buf());
+                }
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) = drive_test_prompt(Arc::clone(&state), signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_ERROR);
+                assert_eq!(updates.len(), if after_provider { 2 } else { 1 });
+                let text = prompt_notice_text(updates.last().unwrap());
+                assert!(text.contains("Session persistence failed"), "{text}");
+                assert!(text.contains("resume the saved session"));
+                assert!(!text.contains(&root.path().display().to_string()));
+
+                stored.try_lock().unwrap().path = original;
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) = drive_test_prompt(state, signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_ERROR);
+                assert_eq!(
+                    updates.len(),
+                    1,
+                    "rejected admission still needs a visible error"
+                );
+                assert!(prompt_notice_text(&updates[0]).contains("Session persistence failed"));
+                assert_eq!(
+                    provider.calls.load(Ordering::SeqCst),
+                    usize::from(after_provider)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn prompt_preflight_errors_do_not_expose_raw_error_context() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            stored.try_lock().unwrap().header.provider =
+                Some("PRIVATE-UNRESOLVED-PROVIDER".to_string());
+            let (_, signal) = AbortHandle::new();
+            let (reason, updates) = drive_test_prompt(state, signal).await;
+            assert_eq!(reason, ACP_STOP_REASON_ERROR);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(updates.len(), 1);
+            let text = prompt_notice_text(&updates[0]);
+            assert!(text.contains("Validation failed"));
+            assert!(!text.contains("PRIVATE-UNRESOLVED-PROVIDER"));
+        });
+    }
+
+    #[test]
+    fn prompt_cancellation_retains_cancelled_without_an_error_notice() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for outcome in [PromptTestOutcome::Aborted, PromptTestOutcome::StreamAborted] {
+                let root = tempfile::tempdir().unwrap();
+                let (state, provider, _) = prompt_test_state(root.path(), outcome, false).await;
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) = drive_test_prompt(Arc::clone(&state), signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
+                assert!(updates.is_empty());
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert!(state.try_lock().unwrap().agent_session.is_some());
+
+                let (abort, signal) = AbortHandle::new();
+                abort.abort();
+                let (reason, updates) = drive_test_prompt(state, signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
+                assert!(updates.is_empty());
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
 
     #[test]
     fn acp_offers_the_cli_default_tools_without_host_coupled_ones() {
