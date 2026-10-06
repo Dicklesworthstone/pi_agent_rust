@@ -376,7 +376,7 @@ fn apply_env_policy(cmd: &mut Command, policy: &EnvPolicy, env: &[(String, Strin
 /// transport flips dead and every pending request fails fast.
 #[allow(clippy::too_many_arguments)]
 fn reader_loop(
-    stdout: std::process::ChildStdout,
+    stdout: impl Read + Send + 'static,
     pending: std::sync::Arc<PendingMap>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     writer: std::sync::Arc<SharedWriter>,
@@ -391,7 +391,7 @@ fn reader_loop(
         let close_reason = loop {
             match read_frame_with_scratch(&mut reader, &mut scratch) {
                 Ok(Some(message)) => {
-                    handle_message(
+                    if let Err(err) = handle_message(
                         &message,
                         &pending,
                         &writer,
@@ -399,7 +399,13 @@ fn reader_loop(
                         &dropped,
                         &stderr_tail,
                         &handler,
-                    );
+                    ) {
+                        // A missing reply can strand the peer in a nested
+                        // request (configuration, applyEdit, MCP callbacks).
+                        // Retire pending work now, without waiting for EOF or
+                        // pretending the reply was delivered.
+                        break format!("server reply queue failed: {err}");
+                    }
                 }
                 Ok(None) => break "server closed stdout (EOF)".to_string(),
                 Err(err) => break format!("frame read error: {err}"),
@@ -579,8 +585,9 @@ impl JsonRpcClient {
     ///
     /// # Errors
     /// Returns an error for a dead transport, exhausted request slots/ids, or
-    /// outbound admission failure. Admission failure retires the transport so
-    /// later requests cannot use a connection with incomplete traffic.
+    /// outbound admission failure. A full queue refuses only this unposted
+    /// request; it has made no remote change and is not retried here. Broken
+    /// transport errors still retire the connection and all pending work.
     pub fn request(
         &self,
         method: &str,
@@ -623,7 +630,12 @@ impl JsonRpcClient {
         };
         if let Err(err) = write_result {
             lock(&self.pending).remove(&id);
-            self.kill();
+            // QueuedWriter admits complete frames atomically. WouldBlock
+            // means no bytes were accepted, unlike a partially written pipe:
+            // preserve earlier requests and document synchronization state.
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                self.kill();
+            }
             return Err(TransportError::Io(format!("request queue failed: {err}")));
         }
         Ok((id, rx))
@@ -730,7 +742,7 @@ fn handle_message<W: Write>(
     dropped: &AtomicU64,
     stderr_tail: &Mutex<TailBuffer>,
     handler: &Mutex<Option<ServerRequestHandler>>,
-) {
+) -> std::io::Result<()> {
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Value::as_str);
     let is_response = method.is_none() && id.is_some();
@@ -738,7 +750,7 @@ fn handle_message<W: Write>(
     if is_response {
         // Response to one of our requests (ids we mint are u64).
         let Some(numeric_id) = id.and_then(|v| v.as_u64()) else {
-            return;
+            return Ok(());
         };
         let sender = lock(pending).remove(&numeric_id);
         if let Some(sender) = sender {
@@ -758,7 +770,7 @@ fn handle_message<W: Write>(
             let _ = sender.send(outcome);
         }
         // Unknown id: response arrived after local timeout/cancel; drop.
-        return;
+        return Ok(());
     }
 
     if let (Some(id), Some(method)) = (id, method) {
@@ -767,7 +779,10 @@ fn handle_message<W: Write>(
         // result so the server never blocks on us (workspace/configuration,
         // registerCapability, workDoneProgress/create, showMessageRequest).
         // The id is echoed verbatim (servers may use string ids).
-        let custom = lock(handler).as_ref().and_then(|handler| {
+        // Never invoke host code under the registration lock. A handler may
+        // replace its registration or enter other client APIs while answering.
+        let handler = lock(handler).clone();
+        let custom = handler.as_ref().and_then(|handler| {
             handler(
                 method,
                 &message.get("params").cloned().unwrap_or(Value::Null),
@@ -780,9 +795,9 @@ fn handle_message<W: Write>(
         }));
         {
             let mut guard = lock(writer);
-            let _ = guard.write_all(&frame).and_then(|()| guard.flush());
+            guard.write_all(&frame).and_then(|()| guard.flush())?;
         }
-        return;
+        return Ok(());
     }
 
     if let Some(method) = method {
@@ -807,11 +822,69 @@ fn handle_message<W: Write>(
     }
     // Anything else is malformed traffic; keep the transport alive and
     // ignore it.
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_reply_write_failure_is_not_reported_as_success() {
+        let pending = Mutex::new(HashMap::new());
+        let (notification_tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let (reader, pipe) = std::io::pipe().expect("pipe");
+        drop(reader);
+        let result = handle_message(
+            &serde_json::json!({"jsonrpc":"2.0", "id":"server/7",
+                "method":"workspace/configuration", "params":{}}),
+            &pending,
+            &Mutex::new(pipe),
+            &notification_tx,
+            &AtomicU64::new(0),
+            &Mutex::new(TailBuffer::default()),
+            &Mutex::new(None),
+        );
+        assert_eq!(
+            result.expect_err("reply pipe is broken").kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn server_request_handler_can_replace_its_registration_without_deadlocking() {
+        let handlers = std::sync::Arc::new(Mutex::new(None::<ServerRequestHandler>));
+        let registration = std::sync::Arc::downgrade(&handlers);
+        *lock(&handlers) = Some(std::sync::Arc::new(move |method, params| {
+            assert_eq!(method, "workspace/configuration");
+            assert_eq!(params["section"], "rust");
+            let registration = registration.upgrade().expect("registration alive");
+            *registration
+                .try_lock()
+                .expect("callback must not hold registration lock") = None;
+            Some(serde_json::json!({"configured":true}))
+        }));
+        let (reader, pipe) = std::io::pipe().expect("pipe");
+        let (notification_tx, _rx) = std::sync::mpsc::sync_channel(1);
+        handle_message(
+            &serde_json::json!({"jsonrpc":"2.0", "id":"server/17",
+                "method":"workspace/configuration", "params":{"section":"rust"}}),
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(pipe),
+            &notification_tx,
+            &AtomicU64::new(0),
+            &Mutex::new(TailBuffer::default()),
+            &handlers,
+        )
+        .expect("reply admitted");
+        let response = read_frame(&mut BufReader::new(reader)).expect("reply frame");
+        assert_eq!(
+            response,
+            Some(serde_json::json!({"jsonrpc":"2.0", "id":"server/17",
+                "result":{"configured":true}}))
+        );
+        assert!(lock(&handlers).is_none());
+    }
 
     #[test]
     fn encode_frame_uses_content_length() {
@@ -893,7 +966,8 @@ mod tests {
             &dropped,
             &stderr_tail,
             &Mutex::new(None),
-        );
+        )
+        .expect("route response");
         let got = rx.try_recv().expect("completed");
         assert_eq!(
             got.ok().map(|v| v["value"].clone()),
@@ -920,7 +994,8 @@ mod tests {
             &dropped,
             &stderr_tail,
             &Mutex::new(None),
-        );
+        )
+        .expect("queue server reply");
         let frame = read_frame(&mut BufReader::new(reader))
             .expect("read")
             .expect("some");
@@ -964,7 +1039,8 @@ mod tests {
                 &dropped,
                 &stderr_tail,
                 &Mutex::new(None),
-            );
+            )
+            .expect("route notification");
         }
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
         assert!(notification_rx.try_recv().is_ok());
