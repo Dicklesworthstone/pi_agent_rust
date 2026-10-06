@@ -12,7 +12,13 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 
 use super::{MAX_FRAME_BYTES, PendingMap, TransportError, lock};
 
-const MAX_QUEUED_FRAMES: usize = 64;
+// A stalled pipe must still admit the traffic the client itself can generate:
+// all pending requests, their cancellations, and a close/open cycle for the
+// 128-document working set. The old 64-frame cap could retire a healthy server
+// halfway through invalidate_all(), before the writer got another timeslice.
+// This remains a hard count bound; the independent byte budget below is NOT
+// enlarged, including for the frame currently blocked in the pipe.
+const MAX_QUEUED_FRAMES: usize = 2 * super::MAX_PENDING_REQUESTS + 256;
 // Includes the frame being written, not just frames still in the channel.
 const MAX_OUTBOUND_BYTES: usize = MAX_FRAME_BYTES + 64 * 1024;
 
@@ -184,6 +190,163 @@ mod tests {
     use std::io::BufReader;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    fn lifecycle_burst() -> Vec<(Value, Option<u64>)> {
+        let mut frames = Vec::new();
+        for id in 1..=super::super::MAX_PENDING_REQUESTS {
+            let id = u64::try_from(id).expect("request id");
+            frames.push((
+                serde_json::json!({"jsonrpc":"2.0", "id":id, "method":"test/pending"}),
+                Some(id),
+            ));
+        }
+        for id in 1..=super::super::MAX_PENDING_REQUESTS {
+            frames.push((
+                serde_json::json!({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":id}}),
+                None,
+            ));
+        }
+        // Match the document cache's supported working set, not the outbound
+        // cap: reducing the queue back to 64 must make this regression fail.
+        for method in ["textDocument/didClose", "textDocument/didOpen"] {
+            for index in 0..128 {
+                let mut document = serde_json::json!({"uri":format!("file:///work/{index}.rs")});
+                if method == "textDocument/didOpen" {
+                    document["languageId"] = serde_json::json!("rust");
+                    document["version"] = serde_json::json!(1);
+                    document["text"] = serde_json::json!("fn main() {}\n");
+                }
+                frames.push((
+                    serde_json::json!({"jsonrpc":"2.0", "method":method,
+                        "params":{"textDocument":document}}),
+                    None,
+                ));
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn supported_lifecycle_burst_fits_without_receiver_progress_and_stays_bounded() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let (mut writer, receiver) =
+            QueuedWriter::channel(Arc::clone(&alive), MAX_QUEUED_FRAMES, MAX_OUTBOUND_BYTES);
+        let frames = lifecycle_burst();
+        let mut total_bytes = 0;
+        for (message, request_id) in &frames {
+            let encoded = super::super::encode_frame(message);
+            total_bytes += encoded.len();
+            writer
+                .enqueue(&encoded, *request_id)
+                .expect("burst admission");
+        }
+        assert!(alive.load(Ordering::Acquire));
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), total_bytes);
+        assert_eq!(
+            writer.write(b"overflow").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), total_bytes);
+        for (message, request_id) in frames {
+            let frame = receiver.try_recv().expect("accepted frame");
+            assert_eq!(frame.request_id, request_id);
+            let decoded = super::super::read_frame(&mut BufReader::new(frame.bytes.as_slice()))
+                .expect("complete frame");
+            assert_eq!(decoded, Some(message));
+        }
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
+        writer
+            .write_all(b"later")
+            .expect("capacity reusable after drainage");
+    }
+
+    struct PausedPipe {
+        pipe: std::io::PipeWriter,
+        entered: Option<SyncSender<()>>,
+        resume: Receiver<()>,
+    }
+
+    impl Write for PausedPipe {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).map_err(|_| closed())?;
+                self.resume
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "test writer was not released")
+                    })?;
+            }
+            self.pipe.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.pipe.flush()
+        }
+    }
+
+    #[test]
+    fn stalled_production_pump_preserves_a_complete_document_invalidation_burst() {
+        let (reader, pipe) = std::io::pipe().expect("pipe");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut writer = QueuedWriter::start(
+            PausedPipe {
+                pipe,
+                entered: Some(entered_tx),
+                resume: resume_rx,
+            },
+            Arc::clone(&pending),
+            Arc::clone(&alive),
+        )
+        .expect("production pump");
+        let first = serde_json::json!({"jsonrpc":"2.0", "method":"initialized"});
+        writer
+            .write_all(&super::super::encode_frame(&first))
+            .expect("first frame");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer is stalled");
+
+        let mut expected = vec![first];
+        for index in 0..128 {
+            let close = serde_json::json!({"jsonrpc":"2.0", "method":"textDocument/didClose",
+                "params":{"textDocument":{"uri":format!("file:///work/{index}.rs")}}});
+            writer
+                .write_all(&super::super::encode_frame(&close))
+                .expect("all closes admitted");
+            expected.push(close);
+        }
+        let (completion, _response) = std::sync::mpsc::sync_channel(1);
+        lock(&pending).insert(7, completion);
+        let lookup = serde_json::json!({"jsonrpc":"2.0", "id":7, "method":"workspace/symbol",
+            "params":{"query":"after invalidation"}});
+        writer
+            .write_request(&super::super::encode_frame(&lookup), 7)
+            .expect("lookup admitted");
+        expected.push(lookup);
+        assert!(alive.load(Ordering::Acquire));
+        let budget = Arc::clone(&writer.budget);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let reader_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            let mut received = Vec::new();
+            while let Some(frame) = super::super::read_frame(&mut reader).expect("read frame") {
+                received.push(frame);
+            }
+            finished_tx.send(received).expect("report frames");
+        });
+        resume_tx.send(()).expect("release writer");
+        drop(writer);
+        let received = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pump drained");
+        reader_thread.join().expect("reader completed");
+        assert_eq!(received, expected);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn admission_is_bounded_without_any_receiver_progress() {
