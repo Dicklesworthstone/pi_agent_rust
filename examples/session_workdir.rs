@@ -67,7 +67,9 @@ impl Launch {
     fn new(executable: &Path, workdir: PathBuf, session: Option<PathBuf>) -> PiResult<Self> {
         let executable = std::fs::canonicalize(executable)?;
         if !executable.is_file() {
-            return Err(Error::validation("--pi-binary must name an executable file"));
+            return Err(Error::validation(
+                "--pi-binary must name an executable file",
+            ));
         }
         Ok(Self {
             executable,
@@ -77,7 +79,8 @@ impl Launch {
     }
 
     fn command(&self) -> PiResult<Command> {
-        let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&self.workdir) else {
+        let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&self.workdir)
+        else {
             return Err(Error::session(
                 "PI_SESSION_WORKDIR_UNAVAILABLE: workdir disappeared before launch; no Pi process started",
             ));
@@ -117,7 +120,7 @@ async fn load_session(path: &Path) -> PiResult<(PathBuf, Session)> {
     let (session, diagnostics) = Session::open_with_diagnostics(text).await?;
     // Do not turn a read-time corruption recovery into an automatic rewrite
     // or a new model turn. The normal audit/reconcile tools remain available.
-    if diagnostics.warning_lines().into_iter().next().is_some() {
+    if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
         return Err(Error::session(
             "PI_SESSION_RECOVERY_DIAGNOSTICS: session needs inspection with --session-audit before workdir recovery",
         ));
@@ -158,7 +161,8 @@ async fn prepare(command: RecoveryCommand) -> PiResult<Prepared> {
         }
         RecoveryCommand::StartNew { workdir, pi_binary } => {
             let workdir = absolute_user_path(&workdir)?;
-            let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&workdir) else {
+            let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&workdir)
+            else {
                 return Err(Error::validation(format!(
                     "workdir {workdir:?} is not an accessible directory"
                 )));
@@ -265,8 +269,7 @@ mod tests {
     fn attach_requires_explicit_session_and_target() {
         assert!(Arguments::try_parse_from(["recover", "attach", "session.jsonl"]).is_err());
         assert!(
-            Arguments::try_parse_from(["recover", "attach", "session.jsonl", "/workspace"])
-                .is_ok()
+            Arguments::try_parse_from(["recover", "attach", "session.jsonl", "/workspace"]).is_ok()
         );
     }
 
@@ -301,7 +304,10 @@ mod tests {
         };
         let command = launch.command().expect("command");
         assert_eq!(command.get_args().count(), 0);
-        assert_eq!(std::fs::read_to_string(existing).expect("read"), "untouched");
+        assert_eq!(
+            std::fs::read_to_string(existing).expect("read"),
+            "untouched"
+        );
     }
 
     #[test]
@@ -325,10 +331,15 @@ mod tests {
         let arguments = [OsString::from("inspect"), OsString::from("a session.jsonl")];
         let command = full_hydration_command(&executable, arguments.clone());
         assert_eq!(command.get_program(), executable.as_os_str());
-        assert_eq!(command.get_args().collect::<Vec<_>>(), arguments.iter().map(OsString::as_os_str).collect::<Vec<_>>());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            arguments
+                .iter()
+                .map(OsString::as_os_str)
+                .collect::<Vec<_>>()
+        );
         assert!(command.get_envs().any(|(key, value)| {
-            key == std::ffi::OsStr::new(V2_OPEN_MODE)
-                && value == Some(std::ffi::OsStr::new("full"))
+            key == std::ffi::OsStr::new(V2_OPEN_MODE) && value == Some(std::ffi::OsStr::new("full"))
         }));
         assert_eq!(std::env::var_os(V2_OPEN_MODE), before);
     }
