@@ -1,8 +1,9 @@
 //! One owner and deadline from request admission through response delivery.
 //!
-//! The transport still performs synchronous pipe writes. These checks bound
-//! async lane/response/retry waits, not a blocked OS write. Abandonment sends
-//! the protocol cancellation notification; it does not undo server side effects.
+//! A dedicated transport pump owns blocking pipe writes. These checks bound
+//! async lane/response/retry waits, including time spent queued for that pump.
+//! Abandonment withdraws an unclaimed request or schedules protocol cancellation
+//! after a claimed write; it does not undo server side effects.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

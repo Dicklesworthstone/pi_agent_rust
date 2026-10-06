@@ -666,13 +666,24 @@ impl JsonRpcClient {
         Ok(())
     }
 
-    /// Retire a request exactly once, then queue `$/cancelRequest`. Safe from
-    /// completion-future drop: no synchronous pipe write occurs here. A queued
-    /// request not yet taken by the pump is skipped when its pending slot is gone.
+    /// Retire a request exactly once. Unclaimed frames are withdrawn without
+    /// reaching the server; a claimed frame is followed by `$/cancelRequest`
+    /// through reserved control capacity. Safe from completion-future drop:
+    /// neither a blocked pipe nor a full ordinary queue can block cancellation.
     pub fn cancel_request(&self, id: u64) {
-        let removed = lock(&self.pending).remove(&id).is_some();
-        if removed {
-            let _ = self.notify("$/cancelRequest", serde_json::json!({ "id": id }));
+        let result = {
+            // Hold admission until the retired request is withdrawn or its
+            // cancellation is queued. A newly admitted successor cannot
+            // overtake cancellation or consume its reserved control capacity.
+            let writer = lock(&self.writer);
+            if lock(&self.pending).remove(&id).is_some() {
+                writer.cancel_request(id)
+            } else {
+                Ok(())
+            }
+        };
+        if result.is_err() {
+            self.kill();
         }
     }
 

@@ -5,10 +5,10 @@
 //! response wait owns the request deadline, and failures retire the transport
 //! rather than retrying a frame whose delivery is uncertain.
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::{MAX_FRAME_BYTES, PendingMap, TransportError, lock};
 
@@ -19,7 +19,7 @@ use super::{MAX_FRAME_BYTES, PendingMap, TransportError, lock};
 // This remains a hard count bound; the independent byte budget below is NOT
 // enlarged, including for the frame currently blocked in the pipe.
 const MAX_QUEUED_FRAMES: usize = 2 * super::MAX_PENDING_REQUESTS + 256;
-// Includes the frame being written, not just frames still in the channel.
+// Includes the frame being written, not just frames still in the queue.
 const MAX_OUTBOUND_BYTES: usize = MAX_FRAME_BYTES + 64 * 1024;
 
 struct ByteBudget {
@@ -41,13 +41,86 @@ impl Drop for Reservation {
 struct Frame {
     bytes: Vec<u8>,
     request_id: Option<u64>,
-    _reservation: Reservation,
+    _reservation: Option<Reservation>,
+}
+
+struct QueueState {
+    frames: VecDeque<Frame>,
+    cancellations: VecDeque<u64>,
+    capacity: usize,
+    writer_closed: bool,
+    receiver_closed: bool,
+}
+
+impl QueueState {
+    fn take_next(&mut self) -> Option<Frame> {
+        if let Some(id) = self.cancellations.pop_front() {
+            // Cancellation controls contain only a u64 id. Their separate
+            // MAX_PENDING_REQUESTS bound reserves less than 128 KiB even when
+            // the ordinary byte budget is entirely held by a blocked write.
+            return Some(Frame {
+                bytes: super::encode_frame(&serde_json::json!({
+                    "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": id }
+                })),
+                request_id: None,
+                _reservation: None,
+            });
+        }
+        self.frames.pop_front()
+    }
+}
+
+struct Queue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+struct FrameReceiver {
+    queue: Arc<Queue>,
+}
+
+impl FrameReceiver {
+    fn recv(&self) -> io::Result<Frame> {
+        let mut state = lock(&self.queue.state);
+        loop {
+            if let Some(frame) = state.take_next() {
+                return Ok(frame);
+            }
+            if state.writer_closed {
+                return Err(closed());
+            }
+            state = self
+                .queue
+                .ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    #[cfg(test)]
+    fn try_recv(&self) -> Result<Frame, std::sync::mpsc::TryRecvError> {
+        let mut state = lock(&self.queue.state);
+        state.take_next().ok_or(if state.writer_closed {
+            std::sync::mpsc::TryRecvError::Disconnected
+        } else {
+            std::sync::mpsc::TryRecvError::Empty
+        })
+    }
+}
+
+impl Drop for FrameReceiver {
+    fn drop(&mut self) {
+        let mut state = lock(&self.queue.state);
+        state.receiver_closed = true;
+        state.frames.clear();
+        state.cancellations.clear();
+    }
 }
 
 /// A frame-admission writer. `flush` checks transport health; it does not wait
 /// for pipe drainage. Waiting for the protocol response establishes delivery.
 pub(super) struct QueuedWriter {
-    sender: SyncSender<Frame>,
+    queue: Arc<Queue>,
     budget: Arc<ByteBudget>,
     alive: Arc<AtomicBool>,
 }
@@ -67,22 +140,27 @@ pub(super) fn close_pending(pending: &PendingMap, alive: &AtomicBool, error: &Tr
 }
 
 impl QueuedWriter {
-    fn channel(
-        alive: Arc<AtomicBool>,
-        capacity: usize,
-        byte_limit: usize,
-    ) -> (Self, Receiver<Frame>) {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+    fn channel(alive: Arc<AtomicBool>, capacity: usize, byte_limit: usize) -> (Self, FrameReceiver) {
+        let queue = Arc::new(Queue {
+            state: Mutex::new(QueueState {
+                frames: VecDeque::new(),
+                cancellations: VecDeque::new(),
+                capacity,
+                writer_closed: false,
+                receiver_closed: false,
+            }),
+            ready: Condvar::new(),
+        });
         (
             Self {
-                sender,
+                queue: Arc::clone(&queue),
                 budget: Arc::new(ByteBudget {
                     used: AtomicUsize::new(0),
                     limit: byte_limit,
                 }),
                 alive,
             },
-            receiver,
+            FrameReceiver { queue },
         )
     }
 
@@ -94,7 +172,7 @@ impl QueuedWriter {
         let (writer, receiver) =
             Self::channel(Arc::clone(&alive), MAX_QUEUED_FRAMES, MAX_OUTBOUND_BYTES);
         // Intentional detach, just like the stdout/stderr pumps. Killing the
-        // owned child breaks a blocked write; dropping all senders ends recv.
+        // owned child breaks a blocked write; dropping the writer ends recv.
         let _writer_thread = std::thread::Builder::new()
             .name("pi-lsp-stdin".to_string())
             .spawn(move || {
@@ -105,15 +183,9 @@ impl QueuedWriter {
                     if !alive.load(Ordering::Acquire) {
                         break TransportError::Closed("server transport retired".to_string());
                     }
-                    // Do not start an abandoned request that was still queued.
-                    // Cancellation racing an already started write cannot undo
-                    // delivery; the cancel notification remains best effort.
-                    if frame
-                        .request_id
-                        .is_some_and(|id| !lock(&pending).contains_key(&id))
-                    {
-                        continue;
-                    }
+                    // Taking a frame and withdrawing a queued request share
+                    // one lock. Once claimed, complete the frame before any
+                    // cancellation control; never emit half a JSON-RPC frame.
                     if let Err(error) = pipe.write_all(&frame.bytes).and_then(|()| pipe.flush()) {
                         break TransportError::Io(format!("server pipe write failed: {error}"));
                     }
@@ -128,6 +200,34 @@ impl QueuedWriter {
 
     pub(super) fn write_request(&self, bytes: &[u8], id: u64) -> io::Result<()> {
         self.enqueue(bytes, Some(id)).map(|_| ())
+    }
+
+    /// Withdraw an unclaimed request, or cancel it immediately after the
+    /// current write. This never touches the pipe or the ordinary admission
+    /// budget. The caller holds request admission while retiring its pending
+    /// slot, so at most MAX_PENDING_REQUESTS written requests can await cancel.
+    pub(super) fn cancel_request(&self, id: u64) -> io::Result<()> {
+        let mut state = lock(&self.queue.state);
+        if !self.alive.load(Ordering::Acquire) || state.receiver_closed {
+            return Err(closed());
+        }
+        if let Some(index) = state
+            .frames
+            .iter()
+            .position(|frame| frame.request_id == Some(id))
+        {
+            // Dropping the removed frame immediately releases both count and
+            // byte capacity. There is no remote request to cancel.
+            drop(state.frames.remove(index));
+            return Ok(());
+        }
+        if state.cancellations.len() >= super::MAX_PENDING_REQUESTS {
+            return Err(io::Error::other("server cancellation limit exceeded"));
+        }
+        state.cancellations.push_back(id);
+        drop(state);
+        self.queue.ready.notify_one();
+        Ok(())
     }
 
     fn enqueue(&self, bytes: &[u8], request_id: Option<u64>) -> io::Result<usize> {
@@ -156,15 +256,29 @@ impl QueuedWriter {
         let frame = Frame {
             bytes: bytes.to_vec(),
             request_id,
-            _reservation: reservation,
+            _reservation: Some(reservation),
         };
-        self.sender.try_send(frame).map_err(|error| match error {
-            TrySendError::Full(_) => {
-                io::Error::new(io::ErrorKind::WouldBlock, "server writer frame queue full")
-            }
-            TrySendError::Disconnected(_) => closed(),
-        })?;
+        let mut state = lock(&self.queue.state);
+        if state.receiver_closed {
+            return Err(closed());
+        }
+        if state.frames.len() >= state.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "server writer frame queue full",
+            ));
+        }
+        state.frames.push_back(frame);
+        drop(state);
+        self.queue.ready.notify_one();
         Ok(bytes.len())
+    }
+}
+
+impl Drop for QueuedWriter {
+    fn drop(&mut self) {
+        lock(&self.queue.state).writer_closed = true;
+        self.queue.ready.notify_one();
     }
 }
 
@@ -189,6 +303,7 @@ mod tests {
     use std::collections::HashMap;
     use std::io::BufReader;
     use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, SyncSender};
     use std::time::Duration;
 
     #[test]
@@ -329,6 +444,111 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn abandoning_a_queued_request_releases_full_frame_and_byte_capacity() {
+        for byte_exhaustion in [false, true] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let client = super::super::JsonRpcClient::spawn("cat", &[], &[], root.path())
+                .expect("transport");
+            let frame = super::super::encode_frame(&serde_json::json!({
+                "jsonrpc":"2.0", "id":1, "method":"test/queued", "params":null
+            }));
+            let limit = if byte_exhaustion { frame.len() } else { 4096 };
+            let (queued, receiver) = QueuedWriter::channel(Arc::clone(&client.alive), 1, limit);
+            let budget = Arc::clone(&queued.budget);
+            let _original = std::mem::replace(&mut *lock(&client.writer), queued);
+            let (id, response) = client.request("test/queued", Value::Null).expect("request");
+            assert!(client.request("test/full", Value::Null).is_err());
+            assert_eq!(budget.used.load(Ordering::Acquire), frame.len());
+
+            // Use the real completion-owner drop path, with no receiver
+            // progress possible between admission and abandonment.
+            let started = std::time::Instant::now();
+            drop(super::super::await_completion(
+                response,
+                Duration::from_secs(5),
+                || client.cancel_request(id),
+            ));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            client.cancel_request(id);
+            assert!(client.is_alive());
+            assert!(lock(&client.pending).is_empty());
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+            assert!(
+                receiver.try_recv().is_err(),
+                "neither request nor cancel was sent"
+            );
+
+            let (successor, _response) = client
+                .request("test/next", Value::Null)
+                .expect("withdrawal immediately frees capacity");
+            let received = receiver.try_recv().expect("successor admitted");
+            assert_eq!(received.request_id, Some(successor));
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_written_requests_can_cancel_while_both_ordinary_limits_are_full() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let client =
+            super::super::JsonRpcClient::spawn("cat", &[], &[], root.path()).expect("transport");
+        let (queued, receiver) = QueuedWriter::channel(Arc::clone(&client.alive), 1, 4096);
+        let budget = Arc::clone(&queued.budget);
+        let _original = std::mem::replace(&mut *lock(&client.writer), queued);
+        let mut requests = Vec::new();
+        for _ in 0..super::super::MAX_PENDING_REQUESTS {
+            let (id, response) = client.request("test/pending", Value::Null).expect("request");
+            let frame = receiver.try_recv().expect("writer claims request");
+            assert_eq!(frame.request_id, Some(id));
+            drop(frame);
+            requests.push((id, response));
+        }
+        assert!(client.request("test/over-limit", Value::Null).is_err());
+        lock(&client.writer)
+            .write_all(&vec![b'x'; 4096])
+            .expect("hold the entire ordinary frame and byte budget");
+        for (id, response) in requests {
+            drop(super::super::await_completion(
+                response,
+                Duration::from_secs(5),
+                || client.cancel_request(id),
+            ));
+            client.cancel_request(id);
+        }
+        assert!(client.is_alive());
+        assert!(lock(&client.pending).is_empty());
+        assert_eq!(budget.used.load(Ordering::Acquire), 4096);
+        {
+            let writer = lock(&client.writer);
+            assert_eq!(
+                lock(&writer.queue.state).cancellations.len(),
+                super::super::MAX_PENDING_REQUESTS
+            );
+        }
+        for id in 1..=super::super::MAX_PENDING_REQUESTS {
+            let frame = receiver.try_recv().expect("reserved cancellation");
+            assert!(frame.bytes.len() < 128, "bounded control frame");
+            let decoded = super::super::read_frame(&mut BufReader::new(frame.bytes.as_slice()))
+                .expect("complete control")
+                .expect("control frame");
+            assert_eq!(decoded["method"], "$/cancelRequest");
+            assert_eq!(decoded["params"]["id"], serde_json::json!(id));
+        }
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("ordinary frame retained")
+                .bytes
+                .len(),
+            4096
+        );
+        assert!(receiver.try_recv().is_err(), "cancellation is exactly once");
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn lost_document_notification_still_retires_the_transport() {
         let root = tempfile::tempdir().expect("tempdir");
         let client =
@@ -443,6 +663,62 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             self.pipe.flush()
         }
+    }
+
+    #[cfg(unix)]
+    struct PausedTransport {
+        client: super::super::JsonRpcClient,
+        entered: Receiver<()>,
+        resume: SyncSender<()>,
+        reader: std::io::PipeReader,
+        _original: QueuedWriter,
+    }
+
+    #[cfg(unix)]
+    fn paused_transport(root: &std::path::Path) -> PausedTransport {
+        let client = super::super::JsonRpcClient::spawn("cat", &[], &[], root).expect("transport");
+        let (reader, pipe) = std::io::pipe().expect("pipe");
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (resume, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = QueuedWriter::start(
+            PausedPipe {
+                pipe,
+                entered: Some(entered_tx),
+                resume: resume_rx,
+            },
+            Arc::clone(&client.pending),
+            Arc::clone(&client.alive),
+        )
+        .expect("production pump");
+        let original = std::mem::replace(&mut *lock(&client.writer), writer);
+        PausedTransport {
+            client,
+            entered,
+            resume,
+            reader,
+            _original: original,
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_through_request(
+        pipe: std::io::PipeReader,
+        request_id: u64,
+    ) -> (Receiver<Vec<Value>>, std::thread::JoinHandle<()>) {
+        let (finished, received) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut reader = BufReader::new(pipe);
+            let mut frames = Vec::new();
+            while let Some(frame) = super::super::read_frame(&mut reader).expect("read frame") {
+                let last = frame.get("id").and_then(Value::as_u64) == Some(request_id);
+                frames.push(frame);
+                if last {
+                    break;
+                }
+            }
+            finished.send(frames).expect("report frames");
+        });
+        (received, reader)
     }
 
     #[test]
@@ -579,30 +855,124 @@ mod tests {
         assert_eq!(super::super::read_frame(&mut reader).expect("EOF"), None);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn queued_abandoned_requests_do_not_reach_the_pipe() {
-        let (reader, pipe) = std::io::pipe().expect("pipe");
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let alive = Arc::new(AtomicBool::new(true));
-        let mut writer = QueuedWriter::start(pipe, pending, alive).expect("pump");
-        // The wait owner has already removed request 7's pending slot.
-        let abandoned =
-            serde_json::json!({"jsonrpc":"2.0", "id":7, "method":"workspace/executeCommand"});
-        writer
-            .write_request(&super::super::encode_frame(&abandoned), 7)
-            .expect("queue");
-        let notification =
-            serde_json::json!({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":7}});
-        writer
-            .write_all(&super::super::encode_frame(&notification))
-            .expect("cancel");
-        drop(writer);
-        let mut reader = BufReader::new(reader);
+    fn queued_abandoned_requests_and_cancels_do_not_reach_the_pipe() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let PausedTransport {
+            client,
+            entered,
+            resume,
+            reader,
+            _original,
+        } = paused_transport(root.path());
+        client
+            .notify("initialized", Value::Null)
+            .expect("first frame");
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pipe is stalled");
+        let (id, response) = client
+            .request(
+                "workspace/executeCommand",
+                serde_json::json!({"command":"must-not-run"}),
+            )
+            .expect("queued request");
+        drop(super::super::await_completion(
+            response,
+            Duration::from_secs(5),
+            || client.cancel_request(id),
+        ));
+        let (successor, _response) = client.request("test/next", Value::Null).expect("successor");
+        assert!(client.is_alive());
+        assert_eq!(lock(&client.pending).len(), 1);
+        let (finished, reader_thread) = read_through_request(reader, successor);
+        resume.send(()).expect("release writer");
+        let frames = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pump drained");
+        reader_thread.join().expect("reader completed");
         assert_eq!(
-            super::super::read_frame(&mut reader).expect("notification"),
-            Some(notification)
+            frames.len(),
+            2,
+            "withdrawn work emits no request or cancellation"
         );
-        assert_eq!(super::super::read_frame(&mut reader).expect("EOF"), None);
+        assert_eq!(frames[0]["method"], "initialized");
+        assert_eq!(frames[1]["method"], "test/next");
+        assert!(client.is_alive());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_claimed_write_precedes_queued_traffic_without_waiting_for_the_pipe() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let PausedTransport {
+            client,
+            entered,
+            resume,
+            reader,
+            _original,
+        } = paused_transport(root.path());
+        let (id, response) = client
+            .request(
+                "workspace/executeCommand",
+                serde_json::json!({"command":"already-claimed"}),
+            )
+            .expect("request");
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("write has begun");
+        client
+            .notify(
+                "textDocument/didClose",
+                serde_json::json!({"textDocument":{"uri":"file:///closed.rs"}}),
+            )
+            .expect("queued lifecycle notification");
+        let (successor, successor_response) = client
+            .request("test/next", Value::Null)
+            .expect("successor");
+        let started = std::time::Instant::now();
+        drop(super::super::await_completion(
+            response,
+            Duration::from_secs(5),
+            || client.cancel_request(id),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        client.cancel_request(id);
+        assert!(client.is_alive());
+        assert_eq!(lock(&client.pending).len(), 1);
+        let (finished, reader_thread) = read_through_request(reader, successor);
+        resume.send(()).expect("release writer");
+        let frames = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pump drained");
+        reader_thread.join().expect("reader completed");
+        assert_eq!(frames.len(), 4, "one cancellation and no frame replay");
+        assert_eq!(frames[0]["id"], serde_json::json!(id));
+        assert_eq!(frames[0]["method"], "workspace/executeCommand");
+        assert_eq!(frames[1]["method"], "$/cancelRequest");
+        assert_eq!(frames[1]["params"]["id"], serde_json::json!(id));
+        assert_eq!(frames[2]["method"], "textDocument/didClose");
+        assert_eq!(frames[3]["id"], serde_json::json!(successor));
+        let (notification_tx, _notification_rx) = std::sync::mpsc::sync_channel(1);
+        super::super::handle_message(
+            &serde_json::json!({"jsonrpc":"2.0", "id":successor, "result":"completed"}),
+            &client.pending,
+            &client.writer,
+            &notification_tx,
+            &client.dropped_notifications,
+            &client.stderr_tail,
+            &client.server_request_handler,
+        )
+        .expect("unrelated response still routable");
+        assert_eq!(
+            successor_response
+                .try_recv()
+                .expect("response")
+                .expect("success"),
+            "completed"
+        );
+        assert!(client.is_alive());
     }
 
     #[test]

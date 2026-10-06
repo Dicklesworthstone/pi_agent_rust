@@ -2,6 +2,27 @@ use super::super::test_server::Fixture;
 use super::*;
 use serde_json::json;
 
+async fn observe_dispatched_request(peer: &Fixture, method: &str) {
+    // The application lane belongs to the request under test. Observe the
+    // actual peer through a separate transport request; a first Pending poll
+    // alone proves queue admission, not that the writer sent anything.
+    let (id, response) = peer.client.rpc.request("test/frames", json!({})).unwrap();
+    let frames = crate::lsp::jsonrpc::await_completion(response, Duration::from_secs(5), || {
+        peer.client.rpc.cancel_request(id);
+    })
+    .await
+    .expect("peer observation completed")
+    .expect("peer observation succeeded");
+    assert!(
+        frames
+            .as_array()
+            .expect("peer frames")
+            .iter()
+            .any(|frame| frame["method"] == method),
+        "the peer must observe the request before its owner abandons it"
+    );
+}
+
 #[test]
 fn zero_budget_never_dispatches_a_request() {
     let temp = tempfile::tempdir().unwrap();
@@ -51,7 +72,7 @@ fn serialized_lane_admission_spends_the_request_timeout() {
 }
 
 #[test]
-fn dropping_a_posted_request_cancels_it_before_the_next_dispatch() {
+fn dropping_a_written_request_cancels_it_before_the_next_dispatch() {
     let temp = tempfile::tempdir().unwrap();
     let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
         return;
@@ -63,6 +84,7 @@ fn dropping_a_posted_request_cancels_it_before_the_next_dispatch() {
             Duration::from_secs(30),
         ));
         assert!(futures::poll!(request.as_mut()).is_pending());
+        observe_dispatched_request(&peer, "test/hang").await;
         drop(request);
         assert_eq!(
             peer.client
@@ -102,13 +124,16 @@ fn timeout_cancels_once_and_releases_the_lane() {
     let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
         return;
     };
-    let error = peer
-        .runtime
-        .block_on(
-            peer.client
-                .call("test/hang", json!({}), Duration::from_millis(30)),
-        )
-        .unwrap_err();
+    let error = peer.runtime.block_on(async {
+        let mut request = Box::pin(peer.client.call(
+            "test/hang",
+            json!({}),
+            Duration::from_millis(30),
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        observe_dispatched_request(&peer, "test/hang").await;
+        request.await.unwrap_err()
+    });
     assert!(matches!(error, LspCallError::Timeout { timeout_ms: 30 }));
     let frames = peer.frames();
     let request = frames
